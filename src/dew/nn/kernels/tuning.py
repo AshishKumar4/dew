@@ -1483,8 +1483,9 @@ def _store(device_kind: str, picks) -> None:
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
-"""Each compile target's certification verdicts this process read from its store or stored there
-(`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
+"""Each store's certification verdicts this process read from it or stored there (`stored_verdict`), by its
+path (`_verdicts_path`: a compile target's in the compilation cache the process names now) and launch key, as
+the store holds them (`encoded`)."""
 
 
 def _verdicts_path(target: str) -> str:
@@ -1500,13 +1501,14 @@ def _verdicts_path(target: str) -> str:
 
 def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
                   target: str, key: str, label: str) -> Rebuilt | None:
-    """Read `key` from `_verdicts_path(target)` (cached in `cache`) and decode it."""
+    """Read `key` from `_verdicts_path(target)` (cached in `cache` by the store's path, so a process that
+    names another compilation cache reads that one's) and decode it."""
+    path = _verdicts_path(target)
     with _LOADING:
-        if target not in cache:
-            cache[target] = {entry[key_field]: entry[value_field]
-                             for entry in _stored(_verdicts_path(target))
-                             if isinstance(entry, dict) and key_field in entry}
-        found = cache[target].get(key)
+        if path not in cache:
+            cache[path] = {entry[key_field]: entry[value_field] for entry in _stored(path)
+                           if isinstance(entry, dict) and key_field in entry}
+        found = cache[path].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
@@ -1527,7 +1529,7 @@ def _store_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, val
         write_atomically(dest, json.dumps({"target": target,
                                            "data": [*kept, {key_field: key, value_field: written}]}))
     with _LOADING:
-        cache.setdefault(target, {})[key] = written
+        cache.setdefault(dest, {})[key] = written
 
 
 def stored_verdict(target: str, key: str) -> Rebuilt | None:
@@ -1544,8 +1546,8 @@ def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, assembled
 
 
 _CHOICES: dict[str, dict[str, _records.JSON]] = {}
-"""Each compile target's derived choices this process read from its store or stored there
-(`stored_choice`), by key, beside its certification verdicts (`_verdicts_path`)."""
+"""Each store's derived choices this process read from it or stored there (`stored_choice`), by its path
+and key, beside its certification verdicts (`_verdicts_path`)."""
 
 
 def stored_choice(target: str, key: str) -> Rebuilt | None:
