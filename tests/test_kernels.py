@@ -370,7 +370,9 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
         return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
 
-    attention_on_par(packed, dense, draw, "packed documents", split=by_document,
+    # A label a cell's own: a part's store of compiled truths holds one site a label.
+    label = f"packed documents {head_dim} {'causal' if causal else 'full'}{' sunk' if sunk else ''}"
+    attention_on_par(packed, dense, draw, label, split=by_document,
                      keep=kept(len(ids[0]), len(ids[0]), causal=causal, window=window, segment_ids=ids),
                      seeds=PACKED_SINK_SEEDS if sunk else ATTENTION_SEEDS)
 
