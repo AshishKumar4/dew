@@ -198,6 +198,12 @@ def test_inline_ptx_counts_by_its_instructions_and_an_unknown_one_is_unpriced():
         _counted(_ptx("dp4a.u32.u32"))
 
 
+def test_a_packed_conversion_counts_one_conversion_a_lane():
+    """A conversion of a packed pair (`cvt.rn.satfinite.bf16x2.f32`, `inline_forms.satfinite_bf16`'s) is one
+    F2FP a lane, as an element's conversion is: two a lane priced a pair's narrowing at twice its issues."""
+    assert _counted(_ptx("cvt.rn.satfinite.bf16x2.f32")) == Work(conversions=128)
+
+
 def test_a_warps_tensor_core_product_counts_its_operations_in_its_mode():
     """A TF32 matrix product a warp issues in inline PTX (mma.sync's m16n8k8, the recurrence solve's) counts
     2 M N K operations each warp, on the TF32 tensor cores."""
@@ -323,6 +329,37 @@ def test_a_forms_inline_block_compiles_for_an_h100(form):
                           num_threads=1, thread_name="wg")
     case = KernelCase(form, lambda: (launch, (jax.ShapeDtypeStruct(shape, jnp.uint32),)))
     assert not (failed := mosaic_failures(compile_mosaic_kernels([case], "sm90"))), failed
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100", "sm120"])
+def test_a_saturating_narrowing_compiles_and_counts_a_conversion_a_pair(generation):
+    """An fp32 tile narrowed to bf16 saturating (`inline_forms.satfinite_bf16`, PTX's
+    `cvt.rn.satfinite.bf16x2.f32` a register pair: a staged operand's parts, `Family.formed`) in the
+    family's register layout compiles for each GPU on any host, and its kernel counts one conversion a pair
+    and no clamp, where the clip it stands for issued two an element."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import bundles, inline_forms
+    from dew.nn.kernels.templates.cost import Stated
+
+    shape = (64, 16)
+    layout = bundles.of(generation, jnp.bfloat16).layout
+
+    def body(x_ref, out_ref):
+        out_ref[...] = inline_forms.satfinite_bf16(plgpu.layout_cast(x_ref[...], layout), layout)
+
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape, jnp.bfloat16), num_threads=1,
+                          thread_name="wg")
+    given = jax.ShapeDtypeStruct(shape, jnp.float32)
+    case = KernelCase("narrowed", lambda: (launch, (given,)))
+    assert not (failed := mosaic_failures(compile_mosaic_kernels([case], generation))), failed
+    traced = jax.make_jaxpr(launch)(jnp.zeros(shape, jnp.float32)).jaxpr
+    (kernel,) = [equation for equation in programs.equations(traced)
+                 if equation.primitive in programs.NATIVE_KERNELS]
+    counted = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+    assert (counted.conversions, counted.operations) == (shape[0] * shape[1] / 2, 0), counted
 
 
 def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():

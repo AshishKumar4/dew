@@ -26,31 +26,33 @@ class Issuing(Protocol):
     def interpret(self) -> bool: ...
 
 
-def staged(family: mosaic.Family, value: jax.Array, buffers: Sequence[mosaic.Ref], *,
+def formed(call: Issuing, value: jax.Array, count: int) -> tuple[jax.Array, ...]:
+    """`value` as the `count` parts its products take: its 16-bit parts where they are more than one
+    (`Family.formed`, natively a pair an instruction), itself in one."""
+    return call.family.formed(value, count, call.interpret) if count > 1 else (value,)
+
+
+def staged(call: Issuing, value: jax.Array, buffers: Sequence[mosaic.Ref], *,
            before: Callable[[mosaic.Ref], None] | None = None) -> "Parts":
-    """`value` staged once in shared memory as the parts its products take, one a buffer of `buffers`: its
-    16-bit parts where they are more than one (`product.formed`), itself in one (`Family.staged`), each
-    after `before(buffer)` (an issuer's wait for the products in flight that may read it): an issuer's
-    operands' staging (`Issuer._operand`)."""
-    values = product.formed(value, len(buffers)) if len(buffers) > 1 else (value,)
+    """`value` staged once in shared memory as the parts its products take (`formed`), one a buffer of
+    `buffers` (`Family.staged`), each after `before(buffer)` (an issuer's wait for the products in flight
+    that may read it): an issuer's operands' staging (`Issuer._operand`)."""
     refs = []
-    for part, buffer in zip(values, buffers, strict=True):
+    for part, buffer in zip(formed(call, value, len(buffers)), buffers, strict=True):
         if before is not None:
             before(buffer)
-        refs.append(family.staged(part, buffer))
+        refs.append(call.family.staged(part, buffer))
     return Parts(refs, value.dtype)
 
 
-def staged_all(family: mosaic.Family,
-               operands: Sequence[tuple[jax.Array, Sequence[mosaic.Ref]]]) -> list["Parts"]:
+def staged_all(call: Issuing, operands: Sequence[tuple[jax.Array, Sequence[mosaic.Ref]]]) -> list["Parts"]:
     """Each value of `operands` staged in shared memory as the parts its products take, one a buffer of its
     `buffers` (`staged`'s), every part written in one batch (`Family.staged_all`: an mma.sync issuer's one
     pair of barriers for all)."""
-    formed = [(product.formed(value, len(buffers)) if len(buffers) > 1 else (value,), buffers, value.dtype)
-              for value, buffers in operands]
-    family.staged_all([(part, buffer) for values, buffers, _ in formed
-                       for part, buffer in zip(values, buffers, strict=True)])
-    return [Parts(buffers, dtype) for _, buffers, dtype in formed]
+    parts = [(formed(call, value, len(buffers)), buffers, value.dtype) for value, buffers in operands]
+    call.family.staged_all([(part, buffer) for values, buffers, _ in parts
+                            for part, buffer in zip(values, buffers, strict=True)])
+    return [Parts(buffers, dtype) for _, buffers, dtype in parts]
 
 
 def _in_memory(x) -> bool:
@@ -121,7 +123,7 @@ class Issuer:
             return x.refs
         if isinstance(x, product.Exact):
             # One part, in the product's own tile for exact operands (`{name}.exact`).
-            return staged(self.call.family, x.value, self.buffers[f"{name}.exact"],
+            return staged(self.call, x.value, self.buffers[f"{name}.exact"],
                           before=functools.partial(self._settle, read=read)).refs
         if isinstance(x, product.Transposed):
             # Staged as it is and read transposed (`product.Transposed`).
@@ -138,7 +140,7 @@ class Issuer:
             place = min(free, key=lambda place: held[place][1])
             held[place] = [x, uses]
             buffers = buffers[place]
-        return staged(self.call.family, x, buffers, before=functools.partial(self._settle, read=read)).refs
+        return staged(self.call, x, buffers, before=functools.partial(self._settle, read=read)).refs
 
     def _settle(self, buffer, read: list | None) -> None:
         """Ahead of a staging into `buffer`: the products in flight done first where one may read it (`read`,
@@ -300,7 +302,7 @@ class Issuer:
         if not isinstance(value, jax.Array):
             # A shared tile (`Parts`), or an operand staged its own way (`product.Exact`, `Transposed`).
             return None
-        return product.formed(value, count) if count > 1 else (value,)
+        return formed(self.call, value, count)
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         """The product `lhs @ rhs`: its operands' parts' products (`product.terms`), each into its own

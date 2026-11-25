@@ -267,25 +267,32 @@ def bf16_part_count(dtype=jnp.float32, *, accurate: bool = True) -> int:
     return _BF16_PARTS[key]
 
 
-def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:
+def bf16_parts(x: jax.Array, count: int, *, saturating: int,
+               narrowed: Callable[[jax.Array], jax.Array] | None = None) -> Iterator[jax.Array]:
     """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact) and formed
     only as it is taken, so a mainloop retiring each part's product before the next holds one part's
     registers: three sum to `x` exactly, two to 16 of its significand's bits. The first `saturating`
     saturate at bf16's largest (an fp32 value past it rounds to infinity in bf16, its remainder then NaN),
     the next parts taking the difference; on a finite `x` the later ones never reach it, so only a
-    nonfinite one tells them apart."""
+    nonfinite one tells them apart. A saturating part is clipped then rounded, or `narrowed` where given:
+    the same bits in one step (a kernel's one instruction a pair, `mosaic.Family.formed`)."""
     rest = x
     for index in range(count):
-        held = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST) if index < saturating else rest
-        part = held.astype(jnp.bfloat16)
+        if index >= saturating:
+            part = rest.astype(jnp.bfloat16)
+        elif narrowed is None:
+            part = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)
+        else:
+            part = narrowed(rest)
         yield part
         if index + 1 < count:
             rest = rest - part.astype(jnp.float32)
 
 
-def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
-    """`bf16_parts` of `x`, every part saturating, all formed at once."""
-    return tuple(bf16_parts(x, count, saturating=count))
+def formed(x: jax.Array, count: int,
+           narrowed: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, ...]:
+    """`bf16_parts` of `x`, every part saturating (through `narrowed` where given), all formed at once."""
+    return tuple(bf16_parts(x, count, saturating=count, narrowed=narrowed))
 
 
 def whole(parts: Sequence[jax.Array]) -> jax.Array:

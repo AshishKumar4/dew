@@ -61,6 +61,7 @@ from dew.nn.float_bits import (
     raw_fields,
     split_bits,
     two_factor_reach,
+    whole_power2,
     widened_exactly,
 )
 from dew.nn.nested import nested
@@ -488,7 +489,8 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return power2(summed, n, reach=150)
 
 
-def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None, *,
+           integral: bool = False) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever `x` and the result are normal values of
     its format (`x`'s, at least float32's, `at_least_fp32`), by exact powers of two of `k`'s sign
     (`exact_power2`), `k` held within `reach` (by default the format's saturating bound, 279 in float32):
@@ -502,7 +504,12 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
     (base review 44e282c4f F1).
     Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
-    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half.
+    One stating `k` `integral` too (a floor's, `recurrence_algebra.raised`) in float32 takes them as floats,
+    `floor(k / 2)` and the rest, each set in its exponent bits by `whole_power2`, no integer conversion, the
+    rest first: below zero it is the truncated half the conversions take first, above it no factor rounds
+    short of an overflow either factor's order reaches, so the value is theirs bit for bit (a NaN `k`, no
+    integer, aside); a non-integral `k` keeps the conversions' truncation."""
     # Held at least in float32: an 8-bit float promotes implicitly to nothing.
     dtype = at_least_fp32(jnp.asarray(x).dtype)
     x = jnp.asarray(x, dtype)
@@ -515,6 +522,9 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
         k = min(max(k, -held), held)
     # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
     k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+    if held <= two_factor_reach(dtype) and integral and dtype == jnp.float32:
+        half = jnp.floor(k * np.float32(0.5))
+        return x * whole_power2(k - half) * whole_power2(half)
     if held <= two_factor_reach(dtype):
         # The half truncated by its conversion, an integer only at each factor's bias: an int32 half or a
         # float `trunc` spilled the A100's recurrence and attention launches (row 2519).
