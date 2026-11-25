@@ -146,3 +146,193 @@ def test_a_divisor_past_the_format_divides_its_cotangent_finite():
     out, pull = jax.vjp(lambda x: contract(form, x, big, big), big)
     np.testing.assert_array_equal(np.asarray(out), 0.5)
     np.testing.assert_array_equal(np.asarray(pull(big)[0]), 0.5)
+
+
+BATCHED_MEAN = Form(("bk", "bkd"), ((1, (((0, 1),), ((1, 1),))),), "bd", divisor=((1, (((0, 1),),)),),
+                   divided="b")
+"""`MEAN` a batch row apiece."""
+
+SPREAD = [[2.0 ** 127], [-(2.0 ** 127)], [2.0 ** -30], [0.0]]
+"""Values that cancel past fp32's range beside a part far beneath them (row 12452's witness)."""
+
+
+def test_a_part_beneath_values_that_cancel_survives_them_at_every_order():
+    """A mean of four unit masses over values `[2^127, -2^127, 2^-30, 0]` is `2^-32`: the values contracted a
+    band at a time into exponent bins (`scaled_contraction._banded`), where one exponent for the group
+    (`2^127`) flushed `2^-30` and gave 0 (row 12452). So is the tangent of a mean of values all `2^127`
+    along that direction (the reference's value-only tangent, the row's witness); the gradient along the
+    masses is `(v_k - mean) / 4`, and its tangent along the values the same of the direction, at second
+    order; each batch row's under `vmap` as alone."""
+    masses = jnp.ones(4, jnp.float32)
+    spread = jnp.asarray(SPREAD, jnp.float32)
+    large = jnp.full((4, 1), 2.0 ** 127, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, spread)), [2.0 ** -32])
+    _, tangent = jax.jvp(lambda v: contract(MEAN, masses, v), (large,), (spread,))
+    np.testing.assert_array_equal(np.asarray(tangent), [2.0 ** -32])
+    pulled = np.asarray([2.0 ** 125, -(2.0 ** 125), 3 * 2.0 ** -34, -(2.0 ** -34)], np.float32)
+    found = jax.grad(lambda m: contract(MEAN, m, spread)[0])(masses)
+    np.testing.assert_array_equal(np.asarray(found), pulled)
+    _, second = jax.jvp(lambda v: jax.grad(lambda m: contract(MEAN, m, v)[0])(masses), (large,), (spread,))
+    np.testing.assert_array_equal(np.asarray(second), pulled)
+    rows = jax.vmap(lambda v: contract(MEAN, masses, v))(jnp.stack([spread, large]))
+    np.testing.assert_array_equal(np.asarray(rows), [[2.0 ** -32], [2.0 ** 127]])
+
+
+def test_band_pairs_join_from_the_largest_whatever_their_order():
+    """A mean whose products are `+2^121`, `2^-54` and `-2^121` (masses `[2^-6, 2^-126, 2^50]`, values
+    `[2^127, 2^72, -2^71]`) is `2^-104`: the band pairs come in mixed-radix order, `2^-54`'s between the two
+    that cancel, and each lands in its own exponent bin, the bins joined from the largest, where joined as
+    they came `2^-54` was flushed beside `2^121` and the mean was 0 (review of #3967, P0)."""
+    masses = jnp.asarray([2.0 ** -6, 2.0 ** -126, 2.0 ** 50], jnp.float32)
+    values = jnp.asarray([[2.0 ** 127], [2.0 ** 72], [-(2.0 ** 71)]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, values)), [2.0 ** -104])
+
+
+def test_a_bin_whose_high_part_cancels_keeps_its_low_part():
+    """Scalar terms `(2^24 + 2) - 2^24` and `2^23 + 2^23 + 1 - 2^23 - 2^23`, beside a term whose keys' band
+    pairs cancel to zero (`2^32 - 2^32 + 0`, taking the sum banded), sum to 3: the second five land in one
+    exponent bin, `2^24 + 1` rounds its 1 into the low part and the subtractions cancel the high part, and
+    the bin renormalizes, so its 1 joins the first bin's 2, where its high part 0 read as an empty bin
+    beside a live total and dropped it (review of #3979, P0)."""
+    form = Form(("",) * 7 + ("k", "k"), (
+        (1, (((0, 1),),)), (-1, (((1, 1),),)), (1, (((2, 1),),)), (1, (((3, 1),),)), (1, (((4, 1),),)),
+        (-1, (((5, 1),),)), (-1, (((6, 1),),)), (1, (((7, 1),), ((8, 1),)))), "")
+    big, one = jnp.float32(2.0 ** 23), jnp.float32(1.0)
+    keys = jnp.asarray([2.0 ** 32, 2.0 ** 32, 2.0 ** -90], jnp.float32)
+    weights = jnp.asarray([1.0, -1.0, 0.0], jnp.float32)
+    found = contract(form, jnp.float32(2.0 ** 24 + 2), jnp.float32(2.0 ** 24), big, big, one, big, big, keys,
+                     weights)
+    np.testing.assert_array_equal(np.asarray(found), 3.0)
+
+
+def test_a_residue_beneath_the_terms_largest_reaches_its_quotient():
+    """Three factors over three keys, `2^381 - 2^381 + 2^-360`, over a divisor of `2^-300` is `2^-60`: the
+    bins reach as far beneath the terms' largest as three factors' products lie (`_span`), where a fixed
+    reach of 640 binades dropped the `2^-360` and the quotient was 0 (review of #3979, P0)."""
+    form = Form(("k", "k", "k", "", "", ""), ((1, (((0, 1),), ((1, 1),), ((2, 1),))),), "",
+                divisor=((1, (((3, 1), (4, 1), (5, 1)),)),), divided="")
+    factor = jnp.asarray([2.0 ** 127, 2.0 ** 127, 2.0 ** -120], jnp.float32)
+    negated = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -120], jnp.float32)
+    small = jnp.float32(2.0 ** -100)
+    np.testing.assert_array_equal(np.asarray(contract(form, factor, factor, negated, small, small, small)),
+                                  2.0 ** -60)
+
+
+def test_an_exponent_operands_cancelling_terms_leave_the_part_beneath_them():
+    """`2^400 - 2^400 + 1` (the two terms a unit raised by an exponent operand of 400) beside a term whose
+    keys cancel to zero across bands (taking the sum banded) is 1: the windows descend from `2^400`, the
+    first sums to zero and the next finds the 1, where bins reaching a span from the factors alone dropped
+    it beneath their last (review of #3979 v2, P0)."""
+    form = Form(("", "", "", "", "k"), (
+        (1, (((0, 1), (1, 0)),)), (-1, (((2, 1), (1, 0)),)), (1, (((3, 1),),)), (1, (((4, 1),),))), "")
+    one, raised = jnp.float32(1.0), jnp.int32(400)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, one, raised, one, one, keys)), 1.0)
+
+
+def test_six_groups_are_banded_a_digit_at_a_time():
+    """A product of six groups over three keys, the first `[2^127, -2^127, 2^-30]` and the rest ones, sums to
+    `2^-30`: its band tuples walked by a carry over their digits (nine of them), where a static bound on
+    their count past int32 took the term unbanded and flushed `2^-30` (review of #3979 v2, P0)."""
+    form = Form(("k",) * 6, ((1, tuple(((index, 1),) for index in range(6))),), "")
+    first = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, first, *(jnp.ones(3, jnp.float32),) * 5)),
+                                  2.0 ** -30)
+
+
+@pytest.mark.parametrize("power", [2 ** 30, -(2 ** 30), np.iinfo(np.int32).min],
+                         ids=["2^30", "-2^30", "int32 least"])
+def test_an_exponent_operand_past_any_sentinel_is_a_sums_like_any_other(power):
+    """`(2^E + 0) / 2^E` at an exponent operand `E` anywhere in int32, its numerator beside a term whose keys
+    cancel to zero across bands (taking the sum banded), is 1: windows open on the largest sum whatever its
+    exponent and join it by its presence, and a window at int32's least is the last, where a finite ceiling
+    beneath `2^30` missed it (review of #3988, P0), the join's sentinel above `-2^30` dropped it, and the
+    window's floor beneath `-2^31` wrapped and looped (review of #3991, P0)."""
+    form = Form(("", "", "k", "", ""), ((1, (((0, 1), (1, 0)),)), (1, (((2, 1),),))), "",
+                divisor=((1, (((3, 1), (4, 0)),)),), divided="")
+    one, raised = jnp.float32(1.0), jnp.int32(power)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, one, raised, keys, one, raised)), 1.0)
+
+
+def test_a_second_window_at_int32s_least_joins_the_first():
+    """`(2^(F + 24) + 1.5 2^F + 0) / 2^(F + 24)` at `F` int32's least is `1 + 2^-23`: the first window takes
+    `2^(F + 24)`, and the second at `F` lies within the total's reach, which saturates there, where it
+    wrapped positive and skipped the second window, giving 1 (review of #3991, P0)."""
+    form = Form(("", "", "", "", "k", "", ""),
+                ((1, (((0, 1), (1, 0)),)), (1, (((2, 1), (3, 0)),)), (1, (((4, 1),),))), "",
+                divisor=((1, (((5, 1), (6, 0)),)),), divided="")
+    least = np.iinfo(np.int32).min
+    one, above, below = jnp.float32(1.0), jnp.int32(least + 24), jnp.int32(least)
+    keys = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -126, -(2.0 ** -126)], jnp.float32)
+    found = contract(form, one, above, jnp.float32(1.5), below, keys, one, above)
+    np.testing.assert_array_equal(np.asarray(found), np.float32(1 + 2.0 ** -23))
+
+
+def test_a_windows_sums_add_exactly():
+    """Eight ones, `2^-22`, `2^-23 + 2^-46`, then their negations but `2^-46`, beside a term whose keys cancel
+    to zero across bands, sum to `2^-46`: one window holds them all, added as exact limbs, where a double
+    float's low part rounded `3 2^-23 + 2^-46` beside 8 and gave 0 (review of #3988, P0)."""
+    values = ([1.0] * 8 + [2.0 ** -22, 2.0 ** -23 + 2.0 ** -46]
+              + [-1.0] * 8 + [-(2.0 ** -22), -(2.0 ** -23)])
+    terms = tuple((1, (((index, 1),),)) for index in range(len(values) + 1))
+    form = Form(("",) * len(values) + ("k",), terms, "")
+    keys = jnp.asarray([2.0 ** 32, -(2.0 ** 32), 2.0 ** -90, -(2.0 ** -90)], jnp.float32)
+    found = contract(form, *(jnp.float32(value) for value in values), keys)
+    np.testing.assert_array_equal(np.asarray(found), 2.0 ** -46)
+
+
+def test_a_non_finite_row_leaves_the_others_banded():
+    """Beside a row whose value is infinite (its mean IEEE's, `inf`), a row whose values cancel past the
+    format keeps its `2^-32`: the banded sum reads non-finite values as none and the IEEE result is laid over
+    its own outputs alone, where one infinite value anywhere took every row unbanded (review of #3967, P2)."""
+    masses = jnp.ones((2, 4), jnp.float32)
+    values = jnp.asarray([SPREAD, [[jnp.inf], [1.0], [1.0], [1.0]]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(BATCHED_MEAN, masses, values)),
+                                  [[2.0 ** -32], [np.inf]])
+
+
+def test_nine_groups_walk_the_bands_their_values_occupy():
+    """A product of nine groups over two keys, the first group's values `[1, 2^-126]` and the others'
+    `[2^-126, 1]`, sums to `2^-126 + 2^-1008`, `2^-126`: the products' largest pairs the first group's last
+    band with the others' first, and the tuples walked are those of bands the values occupy (two a group),
+    never counted, where their count (15^9) wrapped negative in int32, the sum took its first tuple alone and
+    gave 0 (review of #3967, P1)."""
+    form = Form(("k",) * 9, ((1, tuple(((index, 1),) for index in range(9))),), "")
+    first = jnp.asarray([1.0, 2.0 ** -126], jnp.float32)
+    others = jnp.asarray([2.0 ** -126, 1.0], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, first, *(others,) * 8)), 2.0 ** -126)
+
+
+def test_a_banded_sum_holds_its_rows_varying_types_in_a_shard_map():
+    """Batch rows split over two devices in a `shard_map` with its varying types checked: each row's banded
+    mean its own (`2^-32` for the values that cancel, `2^127` for values all `2^127`), the band loops'
+    carries typed as the rows they sum (review of #3967, P1)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    rows = PartitionSpec("data")
+    masses, values = (jax.device_put(x, NamedSharding(mesh, rows)) for x in (
+        jnp.ones((2, 4), jnp.float32), jnp.asarray([SPREAD, [[2.0 ** 127]] * 4], jnp.float32)))
+    found = jax.jit(jax.shard_map(lambda m, v: contract(BATCHED_MEAN, m, v), mesh=mesh, in_specs=(rows, rows),
+                                  out_specs=rows, check_vma=True))(masses, values)
+    np.testing.assert_array_equal(np.asarray(found), [[2.0 ** -32], [2.0 ** 127]])
+    # One group's keys sharded and the other's replicated: every digit carried as the union varies (review
+    # of #3988, P1), the first device's keys banded (`2^-30` beneath two that cancel), the second's ones.
+    form = Form(("k", "k"), ((1, (((0, 1),), ((1, 1),))),), "")
+    keys = jax.device_put(jnp.asarray([2.0 ** 127, -(2.0 ** 127), 2.0 ** -30, 0.0] + [1.0] * 4, jnp.float32),
+                          NamedSharding(mesh, rows))
+    weights = jax.device_put(jnp.ones(4, jnp.float32), NamedSharding(mesh, PartitionSpec()))
+    halves = jax.jit(jax.shard_map(lambda k, w: contract(form, k, w)[None], mesh=mesh,
+                                   in_specs=(rows, PartitionSpec()), out_specs=rows,
+                                   check_vma=True))(keys, weights)
+    np.testing.assert_array_equal(np.asarray(halves), [2.0 ** -30, 4.0])
+
+
+def test_terms_that_cancel_keep_the_term_beneath_them():
+    """`x - y + z` at `x = y = 2^127`, `z = 2^-30` is `2^-30`: the terms joined as double floats at their own
+    powers, where joined at the largest's they flushed `z` and gave 0."""
+    form = Form(("", "", ""), ((1, (((0, 1),),)), (-1, (((1, 1),),)), (1, (((2, 1),),))), "")
+    big = jnp.float32(2.0 ** 127)
+    np.testing.assert_array_equal(np.asarray(contract(form, big, big, jnp.float32(2.0 ** -30))), 2.0 ** -30)
+

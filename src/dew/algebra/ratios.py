@@ -141,7 +141,7 @@ def _products_summed(operands, form: Ratio):
     exponent)` (`_ratio_sums`'s): each distinct sum formed once (`_streamed`: those over the states in one
     pass with the denominator, their factors formed once for all, those a state at a time in another), each
     product its coefficient times its sums in turn (`_times`, a double float's product, landing none), the
-    products joined (`_joined`); a reduced sum laid along the states' axis again where the form keeps it."""
+    products joined (`joined`); a reduced sum laid along the states' axis again where the form keeps it."""
     rank = max(operand.ndim for operand in operands)
     laid = [_laid_to(operand, rank) for operand in operands]
     states = max(operand.shape[form.axis] for operand in laid)
