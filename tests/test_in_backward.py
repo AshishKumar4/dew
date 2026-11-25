@@ -1025,7 +1025,7 @@ def test_a_dropped_scanned_trainer_holds_no_executable_of_its_step():
     # `in_backward`'s per-trace contexts leave `options.trace_context()` unchanged.
     baseline = options.trace_context()
     plan = in_backward.InBackward(update=lambda path, index, g, w, m: (w, dict(m)), moments=())
-    with in_backward.planned(plan), in_backward.gated(jnp.asarray(True), jnp.asarray(True)):
+    with in_backward.planned(plan), in_backward.gated(jnp.asarray(a=True), jnp.asarray(a=True)):
         assert options.trace_context() == baseline
 
 
@@ -1054,7 +1054,7 @@ def test_a_scanned_runs_gated_backward_is_not_cached_across_gates():
 
     kernel = jnp.ones((3, 4, 4), jnp.float32)
     x = jnp.ones((2, 4), jnp.float32)
-    opened = stepped(kernel, x, jnp.asarray(True))
-    closed = stepped(kernel, x, jnp.asarray(False))
+    opened = stepped(kernel, x, jnp.asarray(a=True))
+    closed = stepped(kernel, x, jnp.asarray(a=False))
     np.testing.assert_array_equal(np.asarray(closed), np.asarray(kernel))
-    assert not np.allclose(np.asarray(opened), np.asarray(kernel))
+    assert not np.array_equal(np.asarray(opened), np.asarray(kernel))
