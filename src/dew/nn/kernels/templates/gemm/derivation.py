@@ -46,7 +46,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     the call, its side operands' copies), and `launch_of(tile)` the launch whose ring and residency the
     planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`;
     `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
-    `hooked`, whether an epilogue's hook computes them (its side tiles and outputs beside the ring).
+    `hooked`, whether a column-local epilogue's hook computes them, its tile read out a chunk at a time
+    (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring).
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -226,10 +227,11 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 continue
             if outputs and ((tile.stages < busy and hooked and layout.stores_chunks)
                             or (tile.stages == busy and layout.feeds_itself)):
-                # A hooked epilogue's ring short of busy where its outputs stage in chunks (its outputs and
-                # side tiles beside it: the paired backward's pulled launch, three outputs and two sides, row
-                # 1958), or one its consumers feed at its least busy depth, deepened by a smaller staging of
-                # its outputs.
+                # A column-local epilogue's ring short of busy where its outputs stage in chunks (its
+                # outputs and side tiles beside it: the paired backward's pulled launch, three outputs and two
+                # sides, row 1958), or one its consumers feed at its least busy depth, deepened by a smaller
+                # staging of its outputs. An epilogue read out whole is not (the lightning flow's paired
+                # gate/up, three outputs at 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers).
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
                                     target=target, programs=programs,
                                     least=mosaic.HOOK_COLUMNS if tile.stages < busy else ACCUMULATOR_COLUMNS)

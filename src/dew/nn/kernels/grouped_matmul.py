@@ -442,7 +442,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
         run partial (`_partial_axes`)."""
-        from .templates.gemm import derivation, quantized
+        from .templates.gemm import derivation, hooks, quantized
 
         ba = self._aligned(ba, target, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
@@ -464,7 +464,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]), programs=programs,
                                       outputs=_stored_dtypes(ba),
-                                      hooked=(ba.arguments['hooks'].epilogue is not None
+                                      hooked=(hooks.column_local(ba.arguments['hooks'].epilogue)
                                               and not ba.arguments['hooks'].out_forms))
             if tile is not None:
                 return formed(tile)
