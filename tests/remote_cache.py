@@ -361,7 +361,10 @@ class RemoteCache:
                 # load, which the rest of its file's tests load. Pruned so, each part rewrote the bundle the
                 # next part's run had to compile again and rewrite (2026-11-24: one file's bundle written
                 # 7,459 times in a day, as often as it was read). A whole run prunes what it did not load.
-                keeps = file in self.blind or 2 * len(loaded) < len(every)
+                # One that loaded none of it and compiled as many as it held found it stale (its file's code
+                # changed): it prunes.
+                keeps = file in self.blind or (2 * len(loaded) < len(every)
+                                               and (bool(loaded) or len(written) < len(every)))
                 fetched = every if keeps else loaded
                 self.sealed.add(file)
                 # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its

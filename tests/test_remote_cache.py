@@ -530,7 +530,8 @@ def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothin
     """A run that loads under half of what its file's bundle holds (a part of the file's tests: a test node's
     row, a `-k`) keeps the bundle whole and, compiling nothing, writes nothing: pruned to its part, the next
     part's run compiled the rest again and rewrote it, each part's in turn (2026-11-24: one bundle written
-    7,459 times in a day). One that compiles a program keeps every fetched one beside it."""
+    7,459 times in a day). One that compiles a program keeps every fetched one beside it; one that loaded none
+    and compiled as many as the bundle held found it stale, and prunes it."""
     url, stored, _ = cache_worker
     bundle = "/jax/cpu/bundles/tests/part.py"
     stored[bundle] = remote_cache.packed([(f"jit_{name}-1", name.encode()) for name in "abcd"])
@@ -549,6 +550,14 @@ def test_a_run_of_part_of_a_files_tests_keeps_its_bundle_whole_and_writes_nothin
     grown.drain()
     kept = {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
     assert kept == {f"jit_{name}-1" for name in "abcde"}
+    stale = remote_cache.RemoteCache(tmp_path / "stale", url, "token", "jax/cpu")
+    stale.opened("tests/part.py")
+    for name in "vwxyz":
+        compiled(tmp_path / "stale", f"jit_{name}-2")
+    stale.closed("tests/part.py")
+    stale.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored[bundle])[0]}
+    assert kept == {f"jit_{name}-2" for name in "vwxyz"}
 
 
 def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
