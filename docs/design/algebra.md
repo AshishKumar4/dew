@@ -170,20 +170,22 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     perf-gate steps compiled ahead for an H100 it changes finetune-4b's program alone, whose timing with and
     without it is M-DC-14's; compile time once measured): a value the forward already
     computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
-    read once without a rule. The rules relate a new value to another the program holds: a quotient by a value
-    whose reciprocal it holds, `a / y` as `a (1/y)`, and by a root whose reciprocal root it holds, `a /
-    sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
-    `rsqrt(mean(x²) + eps)`). Over benchmark_step's and the parallelism matrix's step programs (2026-11-05,
-    every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
-    quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
-    y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
-    directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
-    floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
-    float's least normal power, `rules.least`) and either `|y| >= 1` (`floor >= 0`, so `0 < |1/y| <= 1` can
-    never overflow any finite dividend, with positivity required for reciprocal-root reuse) or the dividend
-    is bounded with the product under the reach (§6.3). Window formation (`program._windows`) pulls sibling
-    `rsqrt` and unit reciprocal equations sharing a division head's radicand or divisor into the window;
+    read once without a rule. The rules relate a new value to another the program holds or hoist a division
+    past a broadcast or square root: a quotient by a value whose reciprocal the program holds, `a / y` as
+    `a (1/y)`, a quotient by a broadcast divisor hoisted to a per-row reciprocal, `a / broadcast(y)` as
+    `a * broadcast(y^-1)` (`lax.integer_pow(..., -1)`), and a quotient by a root (directly or broadcast),
+    `a / sqrt(v)` as `a rsqrt(v)` (merging into any sibling `rsqrt(v)` when present). Over benchmark_step's
+    and the parallelism matrix's step programs (2026-11-05, every program the pass saw, bodies included) the
+    only pattern of note was a divisor shared by several quotients (42 to 452 of 423 to 794 divisions a
+    suite). A shared or hoisted reciprocal unguarded overflows where `a / y` is finite (a subnormal `y`),
+    makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient keeps its value, so each rule
+    fires only where its divisor is held away from zero (its floor, `rules.log2_floor`: an epsilon's, or
+    `_SoftmaxTrack`'s `sum(exp(x - max(x))) >= 1` for finite `x`) and bounded (`log2_bound`: the reciprocal a
+    normal float above the narrowest float's least normal power, `rules.least`) and either `|y| >= 1`
+    (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend, with positivity required for
+    reciprocal-root reuse) or the dividend is bounded with the product under the reach (§6.3). Window
+    formation (`program._windows`) pulls sibling `rsqrt` and unit reciprocal equations sharing a division
+    head's radicand or divisor into the window;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
     running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
     merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);

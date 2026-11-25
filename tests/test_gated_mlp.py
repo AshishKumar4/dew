@@ -469,3 +469,65 @@ def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, gather=table)
             assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, scatter=table)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
+@pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
+def test_the_wide_mlp_holds_check_1_with_its_gradients(generation_name, activation, limit):
+    """Formulation (C) (`wide_products`: interleaved wide gate+up split-epilogue + plain down) on the GEMM
+    template interpreted as `generation_name` holds check 1 for forward output and all four gradients
+    (rows, gate, up, down) against the apart products from float64 truth (row 1958)."""
+    from dew.nn.gated_mlp import wide_products
+
+    def wide_fn(x, gate, up, down):
+        return wide_products(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
+
+    label = f"wide {activation} MLP, limit {limit}, on {generation_name}"
+    apart, truth = (with_gradients(_apart(activation, limit, truth=truth)) for truth in (False, True))
+    with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
+        assert_as_exact(with_gradients(wide_fn), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
+def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
+    """`GATED_MLP` selects `'wide'` when named via `dew.kernels.use(Kernels(gated_mlp='wide'))`, hands off
+    biased, unaligned-hidden, and grouped cases to `'apart'`, and drops the saved wide residual when an
+    enclosing `recomputing((Residual.GATE_PROJ,))` rung is active."""
+    import dew
+    from dew.nn import gated_mlp, residuals
+    from dew.nn.mlp import GatedMLP
+
+    x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
+
+    def kernels(layer, **choose):
+        params = jax.eval_shape(layer.init, jax.random.key(0), x)
+        with generation.assumed(generation_name), dew.kernels.use(dew.kernels.Kernels(**choose)):
+            with generation.routes() as routes:
+                jax.eval_shape(layer.apply, params, x)
+        return [route.kernel for route in routes if route.choice == "gated_mlp"]
+
+    plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
+    biased = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, use_bias=True, dtype=jnp.bfloat16)
+    unaligned = GatedMLP(hidden_features=48, out_features=FEATURES, dtype=jnp.bfloat16)
+    assert kernels(plain, gated_mlp="wide") == ["wide"]
+    assert kernels(biased, gated_mlp="wide") == ["apart"]
+    assert kernels(unaligned, gated_mlp="wide") == ["apart"]
+
+    # Grouped experts hand off `'wide'` cleanly to `'apart'`.
+    g_rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    g_gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    g_down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    with generation.assumed(generation_name), generation.chosen(gated_mlp="wide"):
+        assert not gated_mlp.fuses_grouped(g_rows, (g_gate, g_down), None, activations.gated_hook("swiglu"))
+
+    # Remat `recomputing((Residual.GATE_PROJ,))` runs `wide_products` with `saved=False` and holds check 1.
+    def wide_recomputed(rows, gate, up, down):
+        with residuals.recomputing((residuals.Residual.GATE_PROJ,)):
+            return gated_mlp.wide_products(rows, (gate, up, down), "swiglu", interpret_on_cpu=True)
+
+    apart, truth = (with_gradients(_apart("swiglu", None, truth=t)) for t in (False, True))
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+        assert_as_exact(with_gradients(wide_recomputed), jax.jit(apart), _draw,
+                        f"wide swiglu recomputed on {generation_name}", seeds=SEEDS, truth_fn=truth)

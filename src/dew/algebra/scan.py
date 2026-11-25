@@ -52,6 +52,7 @@ from dew import _cache
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
+from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
 from dew.nn.precision import (
@@ -63,6 +64,7 @@ from dew.nn.precision import (
     twice_scaled,
     uncontracted,
     vanishing,
+    widened_reduction,
 )
 from dew.nn.programs import read_by
 
@@ -1162,13 +1164,39 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     return jnp.where(active, _factored(left, right, between, joined, issue, role, back=back), 0.0)
 
 
+def _channel_shift(left_blk: jax.Array, right_blk: jax.Array) -> jax.Array:
+    """Safe per-channel power-of-two shift `s` (`int32`, stopped for AD) balancing `left_blk * 2^-s` and
+    `right_blk * 2^+s` without overflowing or underflowing any finite nonzero entry of either block."""
+    limits = jnp.finfo(left_blk.dtype)
+    minexp, maxexp = int(limits.minexp), int(limits.maxexp - 1)
+    cap = min(-minexp, maxexp)
+
+    def bounds(arr: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        plain = jax.lax.stop_gradient(arr)
+        _, biased, fraction, _, exp = float_bits.float_bits(plain)
+        exp32 = exp.astype(jnp.int32)
+        finite_nz = jnp.isfinite(plain) & ((biased != 0) | (fraction != 0))
+        return (jnp.any(finite_nz, axis=0),
+                jnp.min(jnp.where(finite_nz, exp32, jnp.int32(maxexp)), axis=0),
+                jnp.max(jnp.where(finite_nz, exp32, jnp.int32(minexp)), axis=0))
+
+    has_l, min_l, max_l = bounds(left_blk)
+    has_r, min_r, max_r = bounds(right_blk)
+    s_lo = jnp.maximum(jnp.int32(-cap), jnp.maximum(max_l - maxexp, minexp - min_r))
+    s_hi = jnp.minimum(jnp.int32(cap), jnp.minimum(min_l - minexp, maxexp - max_r))
+    s_raw = ((min_l + max_l) - (min_r + max_r)) // 4
+    valid = has_l & has_r & (s_lo <= s_hi)
+    return jax.lax.stop_gradient(
+        jnp.where(valid, jnp.clip(s_raw, jnp.minimum(s_lo, s_hi), s_hi), jnp.int32(0)))
+
+
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
-    `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
-    across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
-    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
+    `(left_i 2^-s between_ip) (right_j 2^+s between_pj)` with a provably safe per-channel power-of-two shift
+    `s` (`_channel_shift`, row 12888), a matrix product `issue` makes; a sub-chunk's own pairs elementwise
+    via `twice_scaled` over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
     (`joined`: `between` less a strict pairing's diagonal). Decays a token `back` (`between_before`, row `i`
     `between`'s row `i - 1`) factor as `between_back_ip between_back_(p+1)j`, the key's factor read at the
     reference's next row, its own sub-chunk's first: `between_back_pj` is a token short of `p`, which the
@@ -1177,6 +1205,7 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
 
     count = left.shape[0]
     sub = recurrence_algebra.SUB
+    work = at_least_fp32(jnp.result_type(left, right, joined))
     starts = range(0, count, sub)
     rows = []
     for first in starts:
@@ -1185,15 +1214,21 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
         for start in starts:
             keys = slice(start, min(start + sub, count))
             if start > first:
-                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start),
-                                        at_least_fp32(jnp.result_type(left, right, joined))))
+                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), work))
             elif start == first:
-                blocks.append(_portable_einsum("ik,ijk->ij", left[own],
-                                               right[None, keys] * joined[own, keys]))
+                products = twice_scaled(
+                    left[own, None, :].astype(work),
+                    right[None, keys, :].astype(work),
+                    joined[own, keys].astype(work))
+                blocks.append(widened_reduction(lambda x: (jnp.sum(x, axis=-1),), products)[0])
             else:
                 reference = first - 1
-                blocks.append(issue(role, left[own] * between[own, reference],
-                                    (right[keys] * between[reference + back, keys]).T))
+                left_blk, right_blk = left[own].astype(work), right[keys].astype(work)
+                shift = _channel_shift(left_blk, right_blk)
+                left_scaled = left_blk * float_bits.exact_power2(-shift, work)[None, :]
+                right_scaled = right_blk * float_bits.exact_power2(shift, work)[None, :]
+                blocks.append(issue(role, left_scaled * between[own, reference],
+                                    (right_scaled * between[reference + back, keys]).T))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 

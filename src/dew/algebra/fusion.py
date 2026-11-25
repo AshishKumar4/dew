@@ -539,8 +539,8 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
     from dew.algebra import program
 
-    return program.structure(jcore.Jaxpr([], list(region.inputs), list(region.outputs),
-                                         [jaxpr.eqns[place] for place in region.replayed]))
+    return program.structure_of(region.inputs, [jaxpr.eqns[place] for place in region.replayed],
+                                region.outputs)
 
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,

@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import sympy
-from egglog import EGraph, Vec, declarations as decl, i64, set_
+from egglog import EGraph, String, Vec, declarations as decl, get_callable_args, i64, set_
 from jax import lax
 from reference_error import assert_as_exact
 
@@ -67,7 +67,7 @@ class Inadmissible(Exception):
 RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power",
                          "log2_floor", "least"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
-ROUNDING_FACTS = frozenset({"plain", "exact_scale", "narrowed"})
+ROUNDING_FACTS = frozenset({"plain", "exact_scale", "narrowed", "same_dtype"})
 """The facts a dtype or power-of-two condition reads: rounding's too (a narrow float's conversion back,
 `narrowed`, is the identity over the reals)."""
 
@@ -204,11 +204,11 @@ class Evaluated:
                 return np.vectorize(lambda a, b: relation(a, b, evaluate=False), otypes=[object])(x, y)
             return {"lt": np.less, "gt": np.greater, "eq": np.equal}[op](x, y)
         if name == "unary":
-            x, op, _ = values
+            x, op, param = values
+            if op == "integer_pow" and param == "reciprocal":
+                return 1 / x
             symbolic, numeric = _unary(op)
             return symbolic(x) if np.asarray(x).dtype == object else numeric(x)
-        if name == "convert":
-            return values[0]
         if name == "dot":
             return _dot(values[0], values[1], values[2])
         if name == "shaped":
@@ -434,13 +434,33 @@ def _instantiations(matched, conditions, symbolic: bool, shapes=SHAPES, candidat
     positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | POSITIVE
     term_names = sorted(n for n, role in roles.items() if role == "term" and n not in units)
     param_names = sorted(n for n, role in roles.items() if role != "term")
+    unit_num = {n: np.asarray(1.0, dtype=float) for n in units}
+    unit_sym = {n: np.asarray(1, dtype=object) for n in units} if symbolic else {}
     for taken in itertools.product(shapes, repeat=len(term_names)):
-        for chosen in itertools.product(*(candidates[roles[n]] for n in param_names)):
-            arrays = {n: _operand(n, shape, symbolic, positive=n in positive)
+        num_arrays = {n: _operand(n, shape, False, positive=n in positive)
                       for n, shape in zip(term_names, taken, strict=True)}
-            arrays.update({n: np.asarray(1 if symbolic else 1.0, dtype=object if symbolic else float)
-                           for n in units})
-            evaluated = Evaluated(arrays, dict(zip(param_names, chosen, strict=True)), symbolic)
+        num_arrays.update(unit_num)
+        sym_arrays = None
+        for chosen in itertools.product(*(candidates[roles[n]] for n in param_names)):
+            params = dict(zip(param_names, chosen, strict=True))
+            # Pre-filter admissibility in NumPy before constructing/evaluating SymPy arrays (row 12909):
+            # every condition and shape check agrees across NumPy and SymPy, rejecting ~95% of combos in us.
+            num_eval = Evaluated(num_arrays, params, False)
+            try:
+                num_value = num_eval.value(pattern)
+                num_eval.bound[name] = num_value
+                if not all(num_eval.holds(fact) for fact in conditions):
+                    continue
+            except (Inadmissible, ValueError, IndexError):
+                continue
+            if not symbolic:
+                yield num_eval, num_value
+                continue
+            if sym_arrays is None:
+                sym_arrays = {n: _operand(n, shape, True, positive=n in positive)
+                              for n, shape in zip(term_names, taken, strict=True)}
+                sym_arrays.update(unit_sym)
+            evaluated = Evaluated(sym_arrays, params, True)
             try:
                 value = evaluated.value(pattern)
                 evaluated.bound[name] = value
@@ -461,14 +481,18 @@ def _named(conditions, fact: str) -> set[str]:
     return found
 
 
+@functools.cache
 def _operand(name: str, shape: tuple, symbolic: bool, *, positive: bool = False):
     """A term's value: an array of fresh real symbols (positive ones where `positive`), or of distinct floats
-    (a fresh shape's check)."""
+    (a fresh shape's check), cached read-only."""
     count = math.prod(shape)
     if not symbolic:
-        return np.arange(1.0, count + 1.0).reshape(shape) + 0.5
-    symbols = sympy.symbols(f"{name}_0:{count}", real=True, positive=positive or None) if count else ()
-    return np.asarray(symbols, dtype=object).reshape(shape)
+        arr = np.arange(1.0, count + 1.0).reshape(shape) + 0.5
+    else:
+        symbols = sympy.symbols(f"{name}_0:{count}", real=True, positive=positive or None) if count else ()
+        arr = np.asarray(symbols, dtype=object).reshape(shape)
+    arr.flags.writeable = False
+    return arr
 
 
 POSITIVE = frozenset({"t"})
@@ -495,9 +519,14 @@ def test_every_rewrite_is_an_identity_over_the_reals(name, index, rule):
             other = evaluated.value(rhs)
             assert np.shape(other) == np.shape(value), f"{name}[{index}] changes {np.shape(value)}"
             difference = np.asarray(value - other, dtype=object).ravel()
-            assert all(sympy.simplify(sympy.expand(ordered)) == 0 for entry in difference
-                       for ordered in _ordered(sympy.sympify(entry))), (
-                f"{name}[{index}] differs: {difference[:2]}")
+            for entry in difference:
+                if entry == 0:
+                    continue
+                expr = sympy.sympify(entry)
+                if expr == 0:
+                    continue
+                assert all(sympy.simplify(sympy.expand(ordered)) == 0 for ordered in _ordered(expr)), (
+                    f"{name}[{index}] differs: {difference[:2]}")
         proven += 1
     assert proven, f"{name}[{index}]: no instantiation over the universe admits it"
 
@@ -654,7 +683,9 @@ class Traced(Evaluated):
             x, op, y, _ = values
             return {"lt": jnp.less, "gt": jnp.greater, "eq": jnp.equal}[op](x, y)
         if name == "unary":
-            x, op, _ = values
+            x, op, param = values
+            if op == "integer_pow" and param == "reciprocal":
+                return lax.integer_pow(x, -1)
             return {"exp": jnp.exp, "log": jnp.log, "log1p": jnp.log1p, "expm1": jnp.expm1,
                     "neg": jnp.negative, "tanh": jnp.tanh, "abs": jnp.abs, "sqrt": jnp.sqrt,
                     "rsqrt": lax.rsqrt}[op](x)
@@ -759,7 +790,14 @@ def _binding(rule, name: str):
     raise KeyError(name)
 
 
-SHAPE_FACTS = [(name, index, rule) for name, index, rule in RULES if name == "facts"]
+def _sets_name(rule, target: str) -> bool:
+    return any(kind == "set" and _set_name(action) == target for kind, action in _parts(rule)[2])
+
+
+SHAPE_FACTS = [(name, index, rule) for name, index, rule in RULES
+               if name == "facts" and not _sets_name(rule, "dtype")]
+DTYPE_FACTS = [(name, index, rule) for name, index, rule in RULES
+               if name == "facts" and _sets_name(rule, "dtype")]
 
 
 @pytest.mark.parametrize(("name", "index", "rule"), SHAPE_FACTS,
@@ -787,6 +825,61 @@ def test_every_shape_fact_is_the_shape_its_term_computes(name, index, rule):
                     assert tuple(evaluated.value(action.rhs)) == np.shape(value), f"{name}[{index}]"
             proven += 1
     assert proven, f"{name}[{index}]: no instantiation over the universe admits it"
+
+
+def test_every_dtype_fact_matches_jax_traced_output_dtype():
+    """Every `dtype` rule in `rules.FACTS` is covered and agrees with JAX's traced output dtype across all
+    unary, binary, comparison, cast, layout, reduction, product, select, and clamp constructors (12974)."""
+    assert len(SHAPE_FACTS) + len(DTYPE_FACTS) == sum(1 for n, _, _ in RULES if n == "facts")
+    assert len(DTYPE_FACTS) == 11
+
+    def fn(x, y, w):
+        cast_x = x.astype(jnp.float32)
+        cast_y = y.astype(jnp.float32)
+        added = cast_x + cast_y
+        neg = -added
+        fin = jnp.isfinite(neg)
+        cmp = cast_x < cast_y
+        bcast = jnp.broadcast_to(jnp.sum(cast_x, axis=-1, keepdims=True), cast_x.shape)
+        sel = jnp.where(cmp, neg, bcast)
+        clamped = lax.clamp(jnp.float32(-1.0), sel, jnp.float32(1.0))
+        prod = lax.dot_general(x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+        return clamped, fin, prod
+
+    x0 = jax.ShapeDtypeStruct((4, 8), jnp.bfloat16)
+    w0 = jax.ShapeDtypeStruct((8, 4), jnp.bfloat16)
+    closed = jax.make_jaxpr(fn)(x0, x0, w0)
+    region = terms.region(closed)
+    graph = EGraph()
+    roots = region.roots()
+    bundle = terms.Term.bundle(Vec[terms.Term](*roots))
+    # Register only leaf/literal dtypes and parameter facts so every compound dtype is derived by FACTS.
+    leaf_facts: list = [bundle]
+    for term, extent in region.shapes:
+        leaf_facts.append(set_(rules.shape(term)).to(Vec[i64](*(i64(s) for s in extent))))
+        named = terms.key(term)
+        is_base = named in region.literal_keys or get_callable_args(term, terms.Term.leaf) is not None
+        if is_base and named in region.dtypes:
+            leaf_facts.append(set_(rules.dtype(term)).to(String(np.dtype(region.dtypes[named]).name)))
+    for idx, (prim, params) in enumerate(region.params):
+        if prim is lax.convert_element_type_p:
+            dt_name = np.dtype(params["new_dtype"]).name
+            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(dt_name)))
+        elif prim is lax.dot_general_p and idx in region.products:
+            dt_name = np.dtype(region.products[idx].made).name
+            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(dt_name)))
+        elif prim is lax.is_finite_p:
+            leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String("bool")))
+        elif (op := terms.OPERATIONS.get(prim)) is not None and op.kind in ("unary", "binary"):
+            if (out_dt := params.get("out_dtype")) is not None:
+                leaf_facts.append(set_(rules.param_dtype(i64(idx))).to(String(np.dtype(out_dt).name)))
+            else:
+                leaf_facts.append(rules.same_dtype(i64(idx)))
+    graph.register(*leaf_facts)
+    graph.run(rules.FACTS.saturate())
+    for term, _ in region.shapes:
+        expected = jnp.dtype(region.dtypes[terms.key(term)])
+        assert cost.dtype_of(graph, term) == expected, (term, expected)
 
 
 READS = [(name, index, rule) for name, index, rule in RULES if name == "carrying"]

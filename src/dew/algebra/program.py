@@ -318,15 +318,10 @@ _DERIVED: collections.OrderedDict[Hashable, Held[Rewrite]] = collections.Ordered
 read first."""
 
 
-def structure(window: jcore.Jaxpr) -> Hashable:
-    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
-    type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
-    abstract value); each equation's primitive, its
-    parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
-    output's position, or a literal's value and type) and its outputs' types; and which values it yields.
-    Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
-    every compile's of one step."""
-    position = {var: index for index, var in enumerate(window.invars)}
+def structure_of(invars: Sequence[jcore.Var], eqns: Sequence[jcore.JaxprEqn],
+                 outvars: Sequence) -> Hashable:
+    """Structural key over `(invars, eqns, outvars)` without allocating a synthetic `Jaxpr`."""
+    position = {var: index for index, var in enumerate(invars)}
 
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
@@ -335,14 +330,25 @@ def structure(window: jcore.Jaxpr) -> Hashable:
         return position[atom]
 
     equations = []
-    for equation in window.eqns:
+    for equation in eqns:
         equations.append((terms.parameters_key(equation.primitive, equation.params),
                           tuple(map(operand, equation.invars)),
                           tuple(terms.parameter_key(var.aval) for var in equation.outvars)))
         for var in equation.outvars:
             position[var] = len(position)
-    return (tuple(terms.parameter_key(var.aval) for var in window.invars), tuple(equations),
-            tuple(map(operand, window.outvars)))
+    return (tuple(terms.parameter_key(var.aval) for var in invars), tuple(equations),
+            tuple(map(operand, outvars)))
+
+
+def structure(window: jcore.Jaxpr) -> Hashable:
+    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
+    type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
+    abstract value); each equation's primitive, its
+    parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
+    output's position, or a literal's value and type) and its outputs' types; and which values it yields.
+    Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
+    every compile's of one step."""
+    return structure_of(window.invars, window.eqns, window.outvars)
 
 
 def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
@@ -566,7 +572,10 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
             if out in returned or len(readers) > len(cluster) or any(r not in cluster for r in readers):
                 outputs.append(fresh[out])
                 yielded.append(out)
-        windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
+        win_debug = (jaxpr.debug_info._replace(arg_names=None, result_paths=None)
+                     if jaxpr.debug_info is not None
+                     else jcore.DebugInfo("algebra_window", "window", None, None))
+        windows.append((jcore.Jaxpr([], list(outside), outputs, equations, debug_info=win_debug), yielded))
     return windows
 
 
@@ -787,6 +796,21 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
             facts.append(rules.plain(i64(index)))
+        if primitive is jax.lax.convert_element_type_p and "new_dtype" in params:
+            facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(params["new_dtype"]).name)))
+        elif primitive is jax.lax.dot_general_p:
+            if (prod := region.products.get(index)) is not None:
+                facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(prod.made).name)))
+        elif primitive is jax.lax.is_finite_p:
+            facts.append(set_(rules.param_dtype(i64(index))).to(String("bool")))
+        elif (op := terms.OPERATIONS.get(primitive)) is not None:
+            if op.kind == "unary":
+                facts.append(rules.same_dtype(i64(index)))
+            elif op.kind == "binary":
+                if (out_dt := params.get("out_dtype")) is not None:
+                    facts.append(set_(rules.param_dtype(i64(index))).to(String(np.dtype(out_dt).name)))
+                else:
+                    facts.append(rules.same_dtype(i64(index)))
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
@@ -797,8 +821,12 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     sizes = {size for _, extent in region.shapes for size in extent}
     facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
     widened = {np.dtype(narrow): f"convert_{np.dtype(narrow).name}" for narrow in terms.WIDENED}
+    seen_terms: set[Hashable] = set()
     for term, _ in region.shapes:
         named = terms.key(term)
+        if named in seen_terms:
+            continue
+        seen_terms.add(named)
         bound = region.magnitudes.get(named)
         if bound is not None:
             facts += rules.made(term, i64(bound))
@@ -808,14 +836,16 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             if held.positive:
                 facts.append(rules.positive(term))
         dtype = region.dtypes.get(named)
-        if dtype is not None and (back := widened.get(dtype)) is not None:
-            facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
+        if dtype is not None:
+            if terms._extended_dtype(dtype) is None and dtype != jax.dtypes.float0:
+                facts.append(set_(rules.dtype(term)).to(String(np.dtype(dtype).name)))
+            if (back := widened.get(dtype)) is not None:
+                facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
             _, params = region.params[terms.integer(args[3])]
             extent = region.shape(args[0])
             length = math.prod(extent[axis] for axis in params["axes"])
             facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
-    # A bound of numbers alone (the declared ranges', the constants', and what the equations prove of them)
     # holds where the program's values are: a new intermediate under the narrowest float's largest power of
     # two is finite wherever the program is. A bound over an unbounded operand would bound nothing: the
     # program's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y at 3e38
@@ -1186,6 +1216,7 @@ class _Body:
     made: jcore.Jaxpr | None
     record: fusion.Recorded
     rewrites: tuple
+    provenance: str | None = None
 
 
 _REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, collections.OrderedDict[Hashable, Held[_Body]]] = (
@@ -1228,7 +1259,8 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         with kernel_report.recording() as regions:
             made, record = fusion.recorded(
                 lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned, _scope=scope))
-        fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
+        prov = None if made is closed else terms.provenance_key(closed)
+        fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten), prov))
         return fresh[0]
 
     def resolve() -> _Body:
@@ -1240,9 +1272,12 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         context_key = fusion.choice_context_of(scope.fusion_base) if kernels else None
         struct_key = (body_digest, key, context_key, bool(_cleaned))
         hit = _cache.holding(_STRUCTURAL_CLOSED, struct_key, rewrite, STRUCTURAL_HELD)
-        if hit.made is None or hit.made.debug_info == closed.debug_info:
+        if hit.made is None:
             return hit
-        return _Body(hit.made.replace(debug_info=closed.debug_info), hit.record, hit.rewrites)
+        prov = terms.provenance_key(closed)
+        if hit.provenance == prov:
+            return hit
+        return _cache.holding(_STRUCTURAL_CLOSED, (struct_key, prov), rewrite, STRUCTURAL_HELD)
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
     body = _cache.holding(rewrites, key, resolve, fusion.DECISIONS_HELD)
     reused = not fresh

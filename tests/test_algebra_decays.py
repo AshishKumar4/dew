@@ -332,3 +332,48 @@ def test_a_per_key_spreads_masked_key_carries_no_derivative():
     np.testing.assert_array_equal(np.asarray(out), np.zeros(3, np.float32))
     np.testing.assert_array_equal(np.asarray(tangent)[2], np.float32(0.0))
     np.testing.assert_array_equal(np.asarray(gradient)[..., 0], np.zeros(gradient.shape[:2], np.float32))
+
+
+def test_a_per_key_paired_faint_product_keeps_value_and_gradient_within_and_across_sub_chunks():
+    """`scan._paired` keeps a faint key (`2^-100`) paired with a large read (`2^100`) through a small decay
+    (`2^-60`) both within a sub-chunk (`twice_scaled`) and across `SUB` (`_channel_shift`), preserves mixed
+    sub-chunks without overflow/underflow, and holds `faint_read_call` on portable math (row 12888)."""
+    from test_recurrence_template_stability import faint_read_call
+
+    from dew.nn.kernels.recurrence_algebra import SUB
+
+    # 1. Diagonal (within sub-chunk) and off-diagonal (across SUB) faint pair value and reverse gradient.
+    for later in (1, SUB + 1):
+        length = later + 1
+        left = jnp.zeros((length, 2), jnp.float32).at[later, 0].set(np.float32(2.0 ** 100))
+        right = jnp.zeros((length, 2), jnp.float32).at[0, 0].set(np.float32(2.0 ** -100))
+        between = np.zeros((length, length, 2), np.float32)
+        between[later, 0, 0] = np.float32(2.0 ** -60)
+        if later >= SUB:
+            ref = (later // SUB) * SUB - 1
+            between[ref, 0, 0] = np.float32(2.0 ** -60)
+            between[later, ref, 0] = np.float32(1.0)
+        between_arr = jnp.asarray(between)
+        out, pullback = jax.vjp(lambda l_, r_: scan._paired(l_, r_, between_arr), left, right)
+        assert float(out[later, 0]) == float(np.float32(2.0 ** -60))
+        cot = jnp.zeros_like(out).at[later, 0].set(np.float32(-(2.0 ** 60)))
+        d_left, d_right = pullback(cot)
+        assert float(d_right[0, 0]) == float(np.float32(-(2.0 ** 100)))
+        assert float(d_left[later, 0]) == float(np.float32(-(2.0 ** -100)))
+
+    # 2. Mixed-magnitude adversarial sub-chunk (`[2^100, 2^-100]` vs `1.0`) across `SUB`.
+    n_mix = SUB + 2
+    left_mix = jnp.zeros((n_mix, 2), jnp.float32).at[SUB, 0].set(np.float32(2.0 ** 100)).at[
+        SUB + 1, 0].set(np.float32(2.0 ** -100))
+    right_mix = jnp.zeros((n_mix, 2), jnp.float32).at[0, 0].set(np.float32(1.0))
+    between_mix = jnp.ones((n_mix, n_mix, 2), jnp.float32)
+    out_mix = scan._paired(left_mix, right_mix, between_mix)
+    assert float(out_mix[SUB, 0]) == float(np.float32(2.0 ** 100))
+    assert float(out_mix[SUB + 1, 0]) == float(np.float32(2.0 ** -100))
+
+    # 3. Full `faint_read_call` witness on portable math (`xla`): output[1, col 0] == -1 and dk0[0] == -2^100.
+    (q, k, v, r), run = faint_read_call(64, 32)
+    out_faint = jax.jit(lambda k_: run("xla", q, k_, v, r))(k)
+    assert float(out_faint[0, 1, 0, 0]) == -1.0
+    dk_faint = jax.jit(jax.grad(lambda k_: run("xla", q, k_, v, r)[0, 1, 0, 0].astype(jnp.float32)))(k)
+    assert float(dk_faint[0, 0, 0, 0]) == float(np.float32(-(2.0 ** 100)))

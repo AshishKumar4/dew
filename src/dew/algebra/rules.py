@@ -49,6 +49,25 @@ from dew.algebra.terms import Term
 def shape(term: Term) -> Vec[i64]: ...
 
 
+@function(merge=lambda old, new: old)
+def dtype(term: Term) -> String: ...
+"""The scalar dtype name of `term` (`np.dtype(...).name`: `'float32'`, `'bfloat16'`, `'bool'`), stated for
+every traced term by `program.stated` and propagated by `FACTS` so `cost.work` prices conversions and
+divisions at their real dtypes (row 12974)."""
+
+
+@function(merge=lambda old, new: old)
+def param_dtype(params: i64) -> String: ...
+"""The fixed output dtype name of `params` (`convert_element_type`'s `new_dtype`, `dot_general`'s
+`Product.made`, `is_finite`'s `'bool'`, or a binary primitive's explicit `out_dtype`)."""
+
+
+@function
+def same_dtype(params: i64) -> Unit: ...
+"""Holds where a unary or binary operation's parameters preserve its operands' dtype (every unary except
+`is_finite`, and every binary without `out_dtype`)."""
+
+
 @function
 def along(params: i64, axis: i64) -> Unit: ...
 
@@ -341,13 +360,14 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, or over
-    an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along one axis its
-    operand's without that axis, a matrix's transpose its axes swapped, a matrix product its left operand's
-    rows by its right's columns; and each value of two axes a matrix (`matrix`)."""
-    term, x, y = vars_("term x y", Term)
+    """The shape and dtype of each value a rule makes: an elementwise term's shape over operands of one shape
+    theirs, or over an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along
+    one axis its operand's without that axis, a matrix's transpose its axes swapped, a matrix product its
+    left operand's rows by its right's columns, each value of two axes a matrix (`matrix`), and each term's
+    dtype (`dtype`) propagated from operands and parameter dtypes (`same_dtype`, `param_dtype`)."""
+    term, x, y, z = vars_("term x y z", Term)
     shaped, axes, left, right = vars_("shaped axes left right", Vec[i64])
-    name = var("name", String)
+    name, dt = vars_("name dt", String)
     params = var("params", i64)
     scalar = Vec[i64].empty()
     return ruleset(
@@ -367,6 +387,23 @@ def _facts() -> Ruleset:
              eq(right).to(shape(y)), eq(left.length()).to(i64(2)), eq(right.length()).to(i64(2))).then(
             set_(shape(term)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
         rule(eq(shaped).to(shape(term)), eq(shaped.length()).to(i64(2))).then(matrix(term)),
+        # Dtype propagation across every Term constructor (`cost.dtype_of`, row 12974).
+        rule(eq(term).to(x.binary(name, y, params)), same_dtype(params), eq(dt).to(dtype(x)),
+             eq(dtype(y)).to(dt)).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(dt).to(param_dtype(params))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.compare(name, y, params))).then(set_(dtype(term)).to(String("bool"))),
+        rule(eq(term).to(x.unary(name, params)), same_dtype(params), eq(dt).to(dtype(x))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.unary(name, params)), eq(dt).to(param_dtype(params))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.convert(params)), eq(dt).to(param_dtype(params))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.shaped(name, params)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.reduce(name, axes, params)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.dot(y, params)), eq(dt).to(param_dtype(params))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(z.select(x, y)), eq(dt).to(dtype(x)), eq(dtype(y)).to(dt)).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(z.clamp(x, y)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
         name="facts")
 
 
@@ -561,25 +598,26 @@ def _widened() -> tuple[RuleFamily, ...]:
 _FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
     rng.standard_normal(shape) if not drawn else np.maximum(np.abs(rng.standard_normal(shape)), 1e-3)))
 """A dividend and a divisor held away from zero (a norm floored by its epsilon, `max(|y|, 1e-3)`)."""
+_BROADCAST_FLOORED = Drawn(((64, 1024), (64, 1)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) if not drawn else np.maximum(np.abs(rng.standard_normal(shape)), 1e-3)))
+"""A dividend and a per-row broadcast divisor held away from zero (a softmax or row-norm denominator)."""
 
 
 def _reuse() -> tuple[RuleFamily, ...]:
-    """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
-    whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
-    `a / sqrt(v)` as `a rsqrt(v)` (directly or broadcast along trailing axes: a norm's `x / sqrt(v)[:, None]`
-    beside `rsqrt(v)`, a normalization's `x / max(|y|, eps)` or `x / sum(...)` beside its reciprocal). Each
+    """A value the program already computed read in a new one's place (§1.4's reuse) and guarded hoisting of
+    broadcast divisors and reciprocal roots: `a / y` as `a (1 / y)` when `1 / y` is already held,
+    `a / broadcast(y)` as `a * broadcast(y^-1)` when `y` is broadcast (e.g. softmax `e / sum(e)`), and
+    `a / sqrt(v)` (directly or broadcast) as `a * rsqrt(v)` (merging into any sibling `rsqrt(v)`). Each
     reorders a rounding, and each fires only where the reciprocal is a normal finite float and the product
     finite (§6.3's dominance rule): the divisor held away from zero (`log2_floor`: its reciprocal at most
     `2**-floor`, under the program's reach) and bounded (`log2_bound`: its reciprocal at least `2**-bound`,
     above the narrowest float's least normal power, so no flushing lane reads it as zero), and either the
     divisor is at least 1 (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend `a`) or
-    the dividend's bound with the reciprocal's stays under the reach. A reciprocal of an unguarded divisor
-    overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero dividend, so it is
-    never shared (the reuse probe, 2026-11-05)."""
+    the dividend's bound with the reciprocal's stays under the reach."""
     a, u, w, v, one, t, r = vars_("a u w v one t r", Term)
     axes, extent = vars_("axes extent", Vec[i64])
-    divided, inverted, rooted, reciprocal, multiplied, made, laid = vars_(
-        "divided inverted rooted reciprocal multiplied made laid", i64)
+    divided, inverted, rooted, reciprocal, multiplied, made, laid, inv = vars_(
+        "divided inverted rooted reciprocal multiplied made laid inv", i64)
     floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
     common = (eq(reached).to(reach()), eq(lowest).to(least()), eq(multiplied).to(stock("mul")),
               plain(divided), eq(shape(a)).to(shape(t)))
@@ -604,35 +642,52 @@ def _reuse() -> tuple[RuleFamily, ...]:
                     *dividend_guard).then(
                     union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
             ]
+    inv_v = v.unary("integer_pow", inv)
+    inv_laid = inv_v.shaped("broadcast_in_dim", laid)
+    hoisted_reciprocals = [
+        rule(
+            eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid), divided)),
+            eq(inv).to(stock("reciprocal")), eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
+            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+            *dividend_guard).then(
+            union(t).with_(a.binary("mul", inv_laid, multiplied)),
+            set_(shape(inv_laid)).to(extent))
+        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,))
+    ]
+    rsq = v.unary("rsqrt", reciprocal)
+    rsq_laid = rsq.shaped("broadcast_in_dim", laid)
     roots = []
     for dividend_guard in ((eq(held).to(log2_bound(a)), held + (i64(0) - floor).max(i64(0)) <= reached),
                            (i64(0) <= floor,)):
         roots += [
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v), eq(shape(v)).to(shape(t)),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
-                *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
+                *dividend_guard).then(union(t).with_(a.binary("mul", rsq, multiplied))),
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(extent).to(shape(v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid))),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
                 *dividend_guard).then(
-                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                union(t).with_(a.binary("mul", rsq_laid, multiplied)), set_(shape(rsq_laid)).to(extent)),
             rule(
                 eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid).unary("sqrt", rooted), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
                 *dividend_guard).then(
-                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                union(t).with_(a.binary("mul", rsq_laid, multiplied)), set_(shape(rsq_laid)).to(extent)),
         ]
     return (
         RuleFamily("a quotient by a value whose reciprocal the program holds", tuple(reciprocals),
                    (lambda a, y: a / jnp.maximum(y, 1e-3), lambda a, y: a * (1 / jnp.maximum(y, 1e-3)),
                     _FLOORED)),
-        RuleFamily("a quotient by a root whose reciprocal the program holds", tuple(roots),
+        RuleFamily("a quotient by a broadcast divisor hoisted to a reciprocal product",
+                   tuple(hoisted_reciprocals),
+                   (lambda a, y: a / y, lambda a, y: a * jax.lax.integer_pow(y, -1), _BROADCAST_FLOORED)),
+        RuleFamily("a quotient by a root as a reciprocal root product", tuple(roots),
                    (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
 

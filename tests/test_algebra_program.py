@@ -2498,3 +2498,185 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
         closed = jax.make_jaxpr(bad_fn)(jax.ShapeDtypeStruct(shape, dt))
         held, apart = terms.proven(closed.jaxpr, targets=(closed.jaxpr.outvars[0],), deep=True)
         assert held[closed.jaxpr.outvars[0]] is None and not apart[closed.jaxpr.outvars[0]].unit_norm
+
+
+def test_program_priced_uses_real_operand_dtypes_for_casts_divisions_and_mixed_regions():
+    """`program.priced` reads per-term e-graph dtype facts (`rules.dtype`, `rules.param_dtype`, rows 12974
+    and 13033): a real `bf16 -> fp32` cast counts conversions (no synthetic fp32 drop), a same-dtype cast
+    counts none, an fp32 division inside a mixed `bf16`/`fp32` region prices as `IEEE_DIVISION`, a native
+    `bf16` division prices as 0 exponentials, and `integer_pow(..., -1)` in fp32 prices as `IEEE_DIVISION`."""
+    from dew.nn.kernels.templates import emission
+
+    hopper = generation.TARGETS["sm90"]
+    bf16 = jax.ShapeDtypeStruct((64, 128), jnp.bfloat16)
+    fp32 = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    idx = jax.ShapeDtypeStruct((64, 128), jnp.int32)
+    elements = 64 * 128
+
+    cast_bf16 = jax.make_jaxpr(lambda x: x.astype(jnp.float32))(bf16).jaxpr
+    assert program.priced(cast_bf16, hopper).work.conversions == elements
+    cast_noop = jax.make_jaxpr(lambda x: jax.lax.convert_element_type(x, jnp.float32))(fp32).jaxpr
+    assert program.priced(cast_noop, hopper).work.conversions == 0
+
+    mixed_div = jax.make_jaxpr(lambda x, y: x.astype(jnp.float32) / y.astype(jnp.float32))(bf16, bf16).jaxpr
+    mixed_work = program.priced(mixed_div, hopper).work
+    assert mixed_work.conversions == 2 * elements
+    assert (mixed_work.exponentials, mixed_work.operations) == (elements, 6 * elements)
+
+    recip = jax.make_jaxpr(lambda x: jax.lax.integer_pow(x, -1))(fp32).jaxpr
+    recip_work = program.priced(recip, hopper).work
+    assert (recip_work.exponentials, recip_work.operations) == (elements, 6 * elements)
+
+    xla_forms = getattr(emission, "XLA_FORMS", None)
+    if xla_forms is not None:
+        expected_log = xla_forms[jax.lax.log_p]
+        mixed_log = jax.make_jaxpr(lambda x: jnp.log(x.astype(jnp.float32)))(bf16).jaxpr
+        log_work = program.priced(mixed_log, hopper).work
+        assert log_work.conversions == elements + expected_log.conversions * elements
+        assert log_work.operations == expected_log.operations * elements
+        assert log_work.integer_operations == expected_log.integer_operations * elements
+        assert log_work.exponentials == 0
+        indexed_log = jax.make_jaxpr(lambda x, i: (jnp.log(x), i + 1))(fp32, idx).jaxpr
+        idx_work = program.priced(indexed_log, hopper).work
+        assert idx_work.operations == expected_log.operations * elements + elements
+        assert idx_work.conversions == expected_log.conversions * elements
+        assert idx_work.integer_operations == expected_log.integer_operations * elements
+        assert idx_work.exponentials == 0
+
+
+def test_structural_closed_preserves_equation_source_info_and_nested_body_provenance():
+    """`program._STRUCTURAL_CLOSED` declines whole-body substitution of a modified body across differing
+    equation `source_info` (`name_stack` / traceback) or nested body provenance (row 13020), while still
+    reusing exact-provenance retraces and unchanged bodies."""
+    from jax._src import source_info_util
+
+    from dew.nn.kernels.templates import report as kernel_report
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+
+    @jax.jit
+    def inner_left(y):
+        with jax.named_scope("inner_left_scope"):
+            return y + jnp.bfloat16(1.0)
+
+    @jax.jit
+    def inner_right(y):
+        with jax.named_scope("inner_right_scope"):
+            return y + jnp.bfloat16(1.0)
+
+    def fn_left(x, w):
+        with jax.named_scope("left_branch"):
+            return inner_left(_bf16_rms(x, w)) + jnp.bfloat16(2.0)
+
+    def fn_right(x, w):
+        with jax.named_scope("right_branch"):
+            return inner_right(_bf16_rms(x, w)) + jnp.bfloat16(2.0)
+
+    cl = jax.make_jaxpr(fn_left)(*shapes)
+    cr = jax.make_jaxpr(fn_right)(*shapes)
+    assert terms.body_key(cl) == terms.body_key(cr)
+    assert terms.provenance_key(cl) != terms.provenance_key(cr)
+    with generation.assumed("sm90"):
+        out_l = program._closed(cl, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        out_r = program._closed(cr, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert out_l is not cl and out_r is not cr and out_l is not out_r
+    assert out_l.debug_info == cl.debug_info and out_r.debug_info == cr.debug_info
+    add_l = [eq for eq in out_l.jaxpr.eqns if eq.primitive is jax.lax.add_p]
+    add_r = [eq for eq in out_r.jaxpr.eqns if eq.primitive is jax.lax.add_p]
+    assert add_l and add_r
+    assert "left_branch" in str(add_l[-1].source_info.name_stack)
+    assert "right_branch" in str(add_r[-1].source_info.name_stack)
+    assert source_info_util.user_frame(add_l[-1].source_info.traceback) != source_info_util.user_frame(
+        add_r[-1].source_info.traceback)
+    pjit_l = next(eq for eq in out_l.jaxpr.eqns if eq.primitive.name == "jit")
+    pjit_r = next(eq for eq in out_r.jaxpr.eqns if eq.primitive.name == "jit")
+    sub_l, sub_r = pjit_l.params["jaxpr"], pjit_r.params["jaxpr"]
+    assert sub_l.debug_info.func_name == "inner_left" and sub_r.debug_info.func_name == "inner_right"
+    assert "inner_left_scope" in str(sub_l.jaxpr.eqns[0].source_info.name_stack)
+    assert "inner_right_scope" in str(sub_r.jaxpr.eqns[0].source_info.name_stack)
+
+    # Identical provenance retraced from one site reuses the cached rewritten body directly.
+    def trace_once():
+        return jax.make_jaxpr(fn_left)(*shapes)
+
+    c1, c2 = trace_once(), trace_once()
+    assert c1 is not c2 and terms.provenance_key(c1) == terms.provenance_key(c2)
+    with generation.assumed("sm90"), kernel_report.recording():
+        r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert r2 is r1
+
+    # Unchanged bodies with different provenance both return themselves intact without substitution.
+    def noop_a(x):
+        with jax.named_scope("noop_a"):
+            return x + jnp.float32(1.0)
+
+    def noop_b(x):
+        with jax.named_scope("noop_b"):
+            return x + jnp.float32(1.0)
+
+    s1 = jax.ShapeDtypeStruct((16,), jnp.float32)
+    na, nb = jax.make_jaxpr(noop_a)(s1), jax.make_jaxpr(noop_b)(s1)
+    oa = program._closed(na, accurate=False, saturation=algebra.SATURATION, kernels=False)
+    ob = program._closed(nb, accurate=False, saturation=algebra.SATURATION, kernels=False)
+    assert oa is na and ob is nb
+    assert "noop_b" in str(ob.jaxpr.eqns[0].source_info.name_stack)
+
+
+def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warning():
+    """`_SoftmaxTrack` proves `sum(exp(x - max(x))) >= 1` finite/bounded (rejecting misaligned axes and lossy
+    casts), `reuse` hoists `jax.nn.softmax` broadcast division to `integer_pow(-1)` and standalone
+    `x / sqrt(v)` to `x * rsqrt(v)` without pre-existing siblings while holding Check 1, and rewriting emits
+    zero JAX `missing a DebugInfo` DeprecationWarnings."""
+    import warnings
+
+    def softmax_sum(x):
+        m = jax.lax.stop_gradient(jnp.max(x, axis=-1, keepdims=True))
+        return jnp.sum(jnp.exp(x - m), axis=-1)
+
+    def bad_axis_sum(x):
+        m = jnp.max(x, axis=0)
+        return jnp.sum(jnp.exp(x - m[:, None]), axis=-1)
+
+    def lossy_max_sum(x):
+        m = jnp.max(x, axis=-1, keepdims=True).astype(jnp.bfloat16).astype(jnp.float32)
+        return jnp.sum(jnp.exp(x - m), axis=-1)
+
+    sq = jax.ShapeDtypeStruct((16, 16), jnp.float32)
+    c_good = jax.make_jaxpr(softmax_sum)(sq)
+    held_g, apart_g = terms.proven(c_good.jaxpr)
+    out_g = c_good.jaxpr.outvars[0]
+    assert held_g[out_g] is not None and apart_g[out_g].positive and apart_g[out_g].floor == 0
+    for bad_fn in (bad_axis_sum, lossy_max_sum):
+        c_bad = jax.make_jaxpr(bad_fn)(sq)
+        _, apart_b = terms.proven(c_bad.jaxpr)
+        assert apart_b[c_bad.jaxpr.outvars[0]].floor is None
+
+    def standalone_root(x, z):
+        v = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1, keepdims=True) + jnp.float32(1e-5)
+        return x / jnp.sqrt(v)
+
+    x0, z0 = rows(0, (16, 64), (16, 64))
+    with algebra.rules.enabling_dev("reuse"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", DeprecationWarning)
+            sm_before = list(equations(jax.make_jaxpr(jax.nn.softmax)(x0).jaxpr))
+            sm_after = list(equations(jax.make_jaxpr(algebra.rewritten(jax.nn.softmax))(x0).jaxpr))
+            rt_after = list(equations(jax.make_jaxpr(algebra.rewritten(standalone_root))(x0, z0).jaxpr))
+            with generation.assumed("sm90"):
+                rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                              jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+                program._closed(jax.make_jaxpr(_bf16_rms)(*rms_shapes), accurate=False,
+                                saturation=algebra.SATURATION, kernels=True)
+        debug_warns = [w for w in caught if "DebugInfo" in str(w.message)]
+        assert not debug_warns, [str(w.message) for w in debug_warns]
+        assert any(eq.primitive is jax.lax.div_p for eq in sm_before)
+        assert not any(eq.primitive is jax.lax.div_p for eq in sm_after)
+        assert any(eq.primitive is jax.lax.integer_pow_p and eq.params.get("y") == -1 for eq in sm_after)
+        assert not any(eq.primitive is jax.lax.sqrt_p for eq in rt_after)
+        assert not any(eq.primitive is jax.lax.div_p for eq in rt_after)
+        assert any(eq.primitive is jax.lax.rsqrt_p for eq in rt_after)
+        assert_as_exact(jax.jit(algebra.rewritten(jax.nn.softmax)), jax.jit(jax.nn.softmax),
+                        lambda seed: rows(seed, (16, 64)), "reuse softmax hoist", seeds=8)
+        assert_as_exact(jax.jit(algebra.rewritten(standalone_root)), jax.jit(standalone_root),
+                        lambda seed: rows(seed, (16, 64), (16, 64)), "reuse standalone root", seeds=8)

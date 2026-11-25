@@ -212,10 +212,11 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
     ordered candidate identities (`Candidate.key`, distinguishing regions whose outer proofs drop candidates),
     the numerics' forms, and the context its kernels are chosen in (`fusion.choice_context`)."""
     inputs = fusion.region_inputs(jaxpr, places)
-    window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
     candidate_keys = tuple(candidate.key for candidate in members)
-    return program.structure(window), held, candidate_keys, accurate, fusion.choice_context_of(_base)
+    return (program.structure_of(inputs, [jaxpr.eqns[place] for place in places], outputs),
+            held, candidate_keys, accurate, fusion.choice_context_of(_base))
+
 
 def _digest(value) -> Hashable:
     """A constant by its type and bits (`terms.held_bits`: a typed PRNG key's its key data); a traced one (a
@@ -522,7 +523,11 @@ def _window(index: fusion.Index, places: Sequence[int], inputs: Sequence[jcore.V
     `outputs`, and those constants' values: its constants passed as its leading arguments, as a program
     closing over them computes them."""
     held = [var for var in index.consts if _reads(index, places, var)]
-    window = jcore.Jaxpr([], [*held, *inputs], list(outputs), [index.jaxpr.eqns[place] for place in places])
+    win_debug = (index.jaxpr.debug_info._replace(arg_names=None, result_paths=None)
+                 if index.jaxpr.debug_info is not None
+                 else jcore.DebugInfo("algebra_recognize", "window", None, None))
+    window = jcore.Jaxpr([], [*held, *inputs], list(outputs), [index.jaxpr.eqns[place] for place in places],
+                         debug_info=win_debug)
     return jcore.jaxpr_as_fun(jcore.Jaxpr(window, [])), [index.consts[var] for var in held]
 
 
