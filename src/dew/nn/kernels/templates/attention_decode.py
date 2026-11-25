@@ -248,9 +248,11 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         # its streaming walk's own config at those slices, certified (`_streamed`).
         proposed = _proposed(query, key, value, spans, walked, scale=scale, target=target, table=table,
                              sources=sources, scales=scales, splits=slices, chosen=chosen, in_key=in_key)
-        certified = None if proposed is None else proposed[1]._certified(proposed[2], tile)
-        if isinstance(certified, attention_mosaic.Tiles):
-            return planned(certified, proposed[1], proposed[2], slices)
+        if proposed is not None:
+            _, sliced_op, sliced_ba = proposed
+            certified = sliced_op._certified(sliced_ba, tile)
+            if isinstance(certified, attention_mosaic.Tiles):
+                return planned(certified, sliced_op, sliced_ba, slices)
     else:
         # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
         # at most those it holds), where the cost model prices no step of them.
@@ -279,16 +281,19 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     proposals = {count: _proposed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                                   sources=sources, scales=scales, splits=count, chosen=chosen, in_key=in_key)
                  for count in (1, *counts)}
-    if proposals[1] is None:
+    first = proposals[1]
+    if first is None:
         return None
-    _, op, ba = proposals[1]
-    prices = {(1, single): op.price_config(ba, single, target, issued=True)}
-    if prices[1, single] is None:
+    _, op, ba = first
+    alone = op.price_config(ba, single, target, issued=True)
+    if alone is None:
         return None
+    prices = {(1, single): alone}
     for count in counts:
-        if proposals[count] is None:
+        proposal = proposals[count]
+        if proposal is None:
             continue
-        tiles, sliced_op, sliced_ba = proposals[count]
+        tiles, sliced_op, sliced_ba = proposal
         for tile in tiles:
             walk = sliced_op.price_config(sliced_ba, tile, target, issued=True)
             if walk is None:
