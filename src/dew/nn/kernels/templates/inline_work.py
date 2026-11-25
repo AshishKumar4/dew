@@ -55,12 +55,12 @@ _MEMORY = frozenset({"memref.load", "memref.store", "vector.load", "vector.store
 
 _FREE_PREFIXES = ("llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
                   "gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "nvvm.read.ptx.sreg", "nvvm.barrier",
-                  "nvvm.bar.", "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync", "nvvm.mbarrier",
+                  "nvvm.bar.", "nvvm.fence", "nvvm.elect.sync", "nvvm.mbarrier",
                   "nvvm.cp.async.commit", "nvvm.cp.async.wait", "nvvm.cp.async.mbarrier")
-"""Ops that move a value between registers or name a thread's place (a shuffle's lanes, a barrier's wait),
-which compute nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic),
-a thread's indices, synchronization and a shuffle's exchange, which `emission` prices for no reduction
-either."""
+"""Ops that move a value between registers or name a thread's place (a barrier's wait), which compute
+nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic), a thread's
+indices and synchronization. A shuffle (`nvvm.shfl.sync`) issues on every lane of its warps
+(`Work.shuffles`)."""
 
 _FREE = frozenset({
     "arith.constant", "arith.index_cast", "arith.index_castui", "arith.extsi", "arith.extui", "arith.trunci",
@@ -385,6 +385,8 @@ class _Lanes:
                         if active.any() and len(known) == len(places) else moving)
             moved = _bytes(value) * distinct
             return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
+        if name.startswith("nvvm.shfl.sync"):
+            return Work(shuffles=issued)
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
         if name == "llvm.inline_asm":
@@ -429,7 +431,7 @@ class _Lanes:
 # counts `precision.correctly_rounded_divide`'s.
 _PTX_FLOAT = ("fma.", "mul.", "add.", "sub.", "max.", "min.", "neg.", "abs.", "div.")
 _PTX_SPECIAL = ("ex2.", "lg2.", "rcp.", "rsqrt.", "sqrt.", "tanh.", "sin.", "cos.")
-_PTX_FREE = ("shfl.", "mov.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
+_PTX_FREE = ("mov.", "bar.", "barrier.", "fence.", "membar.", "elect.", "vote.",
              "activemask.", "mbarrier.", "cp.async.commit_group", "cp.async.wait_group", "cp.async.wait_all",
              "cp.async.mbarrier")
 _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.", "shr.", "bfe.", "bfi.",
@@ -553,6 +555,9 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
     mnemonic = words[0]
     elements = 2 if "x2" in mnemonic else 1
     floating = any(kind in mnemonic for kind in ("f32", "f16", "bf16", "f64"))
+    if mnemonic.startswith("shfl."):
+        # A lane exchange (`across.uniform`'s `shfl.sync.idx`): a shuffle on every lane of its warps.
+        return Work(shuffles=issued)
     if mnemonic.startswith(("setp.", "selp.")):
         # A compare's or a select's one issue: FSETP or FSEL on the fp32 lanes, ISETP or SEL on the ALU.
         return Work(operations=elements * issued) if floating else Work(integer_operations=elements * issued)

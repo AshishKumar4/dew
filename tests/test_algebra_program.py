@@ -1148,6 +1148,33 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
     assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
 
 
+def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
+    """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
+    (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
+    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
+    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
+    process's own target, every division at fp32)."""
+    hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
+    elements = 64 * 128
+
+    def priced(dtype, target):
+        rows = jax.ShapeDtypeStruct((64, 128), dtype)
+        closed = jax.make_jaxpr(lambda x, y: jax.lax.div(x, y))(rows, rows).jaxpr
+        return program.priced(closed, target).work
+
+    assert (priced(jnp.float32, hopper).exponentials, priced(jnp.float32, hopper).operations) == (
+        elements, 6 * elements)
+    for dtype, target in ((jnp.float32, tpu), (jnp.int32, hopper), (jnp.bfloat16, hopper)):
+        assert priced(dtype, target).exponentials == 0, (dtype, target)
+    # A masked fp32 division (its mask's bools beside its fp32 values) is fp32's.
+    rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
+    assert program.priced(masked, hopper).work.exponentials == elements
+    # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
+    # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
+    assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
+
+
 def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
     """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
     work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper
@@ -2222,7 +2249,7 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
     """`program._STRUCTURAL_CLOSED` and `terms.body_key` distinguish `pure_callback` closures from the same
     factory, same-tag `define_prng_impl` specs with distinct implementations, and decline structural sharing
     without touching device memory when a nested `pjit` holds a concrete `jax.Array`."""
-    from jax.core import eval_jaxpr
+    from jax.core import ShapedArray, eval_jaxpr
     from jax.extend import random as jrandom
 
     def make_cb_body(offset: float):
@@ -2289,7 +2316,8 @@ def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
         rp_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
         rp_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert rp_a is not p_a and rp_b is not p_b and rp_a.jaxpr is not rp_b.jaxpr
-    assert rp_a.in_avals[0].dtype != rp_b.in_avals[0].dtype
+    a0, b0 = rp_a.in_avals[0], rp_b.in_avals[0]
+    assert isinstance(a0, ShapedArray) and isinstance(b0, ShapedArray) and a0.dtype != b0.dtype
     cpu_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
     cpu_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
     assert int(eval_jaxpr(cpu_a.jaxpr, cpu_a.consts, key_a, x_in, w_in)[0][0]) == 11
@@ -2398,3 +2426,74 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
     arr_ref = run_in_scope()
     gc.collect()
     assert arr_ref() is None
+
+
+def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layouts():
+    """Executable callable dataclasses (factory-made AND same-class stateless `eq=False` distinguishing by
+    `self is first`) never reuse structurally in `_STRUCTURAL_CLOSED` and keep distinct in-process digests;
+    `_NormTrack` rejects both permuting reshapes and singleton-axis broadcast expansion."""
+    import dataclasses
+
+    import dew
+
+    def make_factory_callback(offset: float):
+        @dataclasses.dataclass(frozen=True)
+        class OffsetCallback:
+            def __call__(self, arr):
+                return arr + np.float32(offset)
+
+        return OffsetCallback()
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class IdentityCallback:
+        def __call__(self, arr):
+            return arr + np.float32(1.0 if self is id_first else 2.0)
+
+    id_first, id_second = IdentityCallback(), IdentityCallback()
+    rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    x_in = jnp.ones((256, 256), jnp.bfloat16)
+    w_in = jnp.ones((256,), jnp.bfloat16)
+
+    def make_body(cb):
+        def fn(x, w):
+            normed = _bf16_rms(x, w).astype(jnp.float32)
+            return jax.pure_callback(cb, jax.ShapeDtypeStruct(normed.shape, normed.dtype), normed)
+
+        return fn
+
+    for cb1, cb2 in ((make_factory_callback(1.0), make_factory_callback(2.0)), (id_first, id_second)):
+        f1, f2 = make_body(cb1), make_body(cb2)
+        c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
+        k1, k2 = terms.body_key(c1), terms.body_key(c2)
+        assert k1 is not None and k2 is not None and k1 != k2
+        assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
+        with generation.assumed("sm90"):
+            r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r1.jaxpr != r2.jaxpr
+        y1, y2 = dew.jit(f1)(x_in, w_in), dew.jit(f2)(x_in, w_in)
+        np.testing.assert_array_equal(np.asarray(y1), np.full((256, 256), 2.0, np.float32))
+        np.testing.assert_array_equal(np.asarray(y2), np.full((256, 256), 3.0, np.float32))
+
+    # 2. A same-shape permuting reshape `(0, 2, 1, 3)` on a norm denominator proves no unit bound.
+    def swapped_norm(x):
+        denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
+        swapped = jax.lax.reshape(denom, (4, 2, 2, 1), dimensions=(0, 2, 1, 3))
+        return x * jax.lax.rsqrt(swapped)
+
+    closed_swap = jax.make_jaxpr(swapped_norm)(jax.ShapeDtypeStruct((4, 2, 2, 8), jnp.float32))
+    swap_out = closed_swap.jaxpr.outvars[0]
+    held_s, apart_s = terms.proven(closed_swap.jaxpr, targets=(swap_out,), deep=True)
+    assert held_s[swap_out] is None and not apart_s[swap_out].unit_norm
+
+    # 3. Normalizing a singleton `[4, 2, 2, 1]` numerator and expanding its reciprocal to `[4, 2, 2, 64]`
+    # produces 64 copies of a unit scalar (squared norm 64) and must NOT be certified as `unit_norm`.
+    def expanded_singleton_norm(x):
+        denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
+        inv = jax.lax.broadcast_in_dim(jax.lax.rsqrt(denom), (4, 2, 2, 64), (0, 1, 2, 3))
+        return x * inv
+
+    closed_exp = jax.make_jaxpr(expanded_singleton_norm)(jax.ShapeDtypeStruct((4, 2, 2, 1), jnp.float32))
+    exp_out = closed_exp.jaxpr.outvars[0]
+    held_e, apart_e = terms.proven(closed_exp.jaxpr, targets=(exp_out,), deep=True)
+    assert held_e[exp_out] is None and not apart_e[exp_out].unit_norm

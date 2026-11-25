@@ -33,16 +33,18 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.core import lift, meta
 from flax.core.scope import DenyList
 from flax.linen.transforms import lift_direct_transform
 from jax.sharding import NamedSharding
 
-from dew.batch import sows_appended, unboxed
+from dew.batch import Coordinates, sows_appended, unboxed
 from dew.mesh import FSDP_AXIS, spec_axes
 from dew.nn.dense import captures_any_method
 
+from ..kv_cache import row_axis
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXIT_PASSES, EXITS, fixed_remat
 from ..sharding import explicit_over, gathered_over, placed_layout, typed_on
@@ -323,12 +325,26 @@ def _exit_state(model, x, step: int, *, train: bool, decode: bool, store=None, *
 
 
 def _coda_reads_block(model) -> bool:
-    """Whether the layers after a loop's block may read what a layer of the block publishes (`kv_store`:
-    keys and values a sharing layer reads, a publishing mixer's): a provider in the block and a coda after
-    it. Its coda then reads the last pass's publications, as the unlooped stack's reads its provider's
-    (`_Passes.fixed` traces that pass unrolled)."""
+    """Whether a layer after a loop's block reads what a layer of the block publishes (`kv_store`): a
+    sharing layer after it whose provider (`kv_sharing`) lies in the block, or a layer after it reading a key
+    whose last writer before it, from the block's start, lies in the block (`MixerBase.publications`: CSA2's
+    Reindex reading the entries a Full layer wrote, a Reuse layer the selection a Reindex layer wrote).
+    Its coda then reads the last pass's publications, as the unlooped stack's reads its provider's
+    (`_Passes.fixed` traces that pass unrolled); a coda reading none, or only what it writes itself, drops
+    them across the passes' scan."""
     first, end = model.loop.layers or (0, model.num_layers)
-    return end < model.num_layers and any(spec.provider is not None for spec in model.specs[first:end])
+    specs, providers = model.specs, model.kv_sharing
+    if any(first <= providers.get(layer, -1) < end for layer in range(end, model.num_layers)):
+        return True
+    written: dict[str, int] = {}
+    for layer in range(first, model.num_layers):
+        mixer = specs[layer].kind.mixer or model.mixer
+        reads, writes = (frozenset(), frozenset()) if mixer is None else mixer.publications(
+            kv_shared=specs[layer].kv_shared)
+        if layer >= end and any(first <= written.get(key, -1) < end for key in reads):
+            return True
+        written.update(dict.fromkeys(writes, layer))
+    return False
 
 
 def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):
@@ -373,6 +389,12 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if passes is not None and _coda_reads_block(model):
         raise ValueError("a count of passes given per call runs its passes under one scan, which leaves no "
                          "publication of its last pass for the layers after the block, which read one")
+    if (loop.exit_threshold is not None and loop.exit_at == "block" and loop.steps > 1
+            and _coda_reads_block(model)):
+        raise ValueError("a gate on the block's output runs the coda once over its tokens' exiting states, "
+                         "each exiting pass's publications its own: a coda reading the block's exits at the "
+                         "coda (Loop.exit_at='coda')")
+    valid = None if (metadata := inputs.get('attention_metadata')) is None else metadata.valid
 
     def every_pass(module, x, inputs, passes, prelude):
         # The block's passes, first and later, what each exits, and the publications the last leaves.
@@ -382,7 +404,7 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
             run.run_block, mapped_collections=WRITTEN, trans_in_fn=run.shared.first,
             trans_out_fn=run.shared.outside, mutable=True)
         x, bank, run.left = first_pass(module, module.norm(x + run.injected) if loop.reinject else x,
-                                       **inputs)
+                                       store=prelude, **inputs)
         x, _ = run.counted(x, bank, passes) if passes is not None else run.fixed(x, bank)
         return x, run.exited, run.left
 
@@ -401,16 +423,30 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         x, exited, left = every_pass(model, x, inputs, passes, prelude)
     if loop.reinject:
         x = model.norm(x)
-    chosen = loop.exit_threshold is not None and not model.is_mutable_collection(EXITS)
-    if chosen and loop.exit_at == "block":
+    if loop.exit_gate and loop.exit_at == "block":
+        # The last pass's gate reads its block output as every earlier pass's does (`gate_logit`).
+        _final_gate(model, model.exit_states(x), valid)
+    # A collecting call runs every pass, whatever its threshold.
+    threshold = None if model.is_mutable_collection(EXITS) else loop.exit_threshold
+    if threshold is not None and loop.exit_at == "block":
         # A gate on the block's output: each row's exiting pass's block output, the coda run once on them.
-        x = _handed_on(model, exited, x, loop.exit_threshold)
+        x = _handed_on(model, exited, x, threshold)
     if end < layers:
         x = model.stack(x, span=(end, layers), train=train, decode=decode,
                         kv_store=None if left is None else dict(left), **inputs)
-    if not chosen or loop.exit_at == "block":
+    if loop.exit_gate and loop.exit_at == "coda":
+        _final_gate(model, model.exit_states(x), valid)
+    if threshold is None or loop.exit_at == "block":
         return x
-    return _handed_on(model, exited, x, loop.exit_threshold)
+    return _handed_on(model, exited, x, threshold)
+
+
+def _final_gate(model, states: jax.Array, valid: jax.Array | None) -> None:
+    """The last pass's exit-gate logit of its normed exit `states` (`gate_logit`, pooled and placed as every
+    earlier pass's), sown into `exits` after theirs."""
+    logit = gate_logit(model, states, valid)
+    if not model.is_initializing():
+        model.sow(EXITS, 'logits', logit)
 
 
 def _gathered_passes(model, every_pass: Callable, x, inputs: dict, passes, prelude, gathered: Callable):
@@ -532,9 +568,10 @@ class _Passes:
         self.stops = (self.exit_states and not self.train and loop.steps > 1
                       and (not self.decode or (loop.shared_cache and self.gates_block)))
         # Scoring exiting by row runs a pass over its rows still looping alone, where nothing it writes beside
-        # its state (a collection) holds a row of each (`compacted`).
+        # its state (a collection) holds a row of each (`compacted`): a decision model's scoring opens the
+        # exit passes alone (`DecisionModel.exit_logits`), sown once over every row after the passes.
         self.compacts = (self.stops and not self.decode and loop.exit_by == "row"
-                         and model.scope is not None and model.scope.mutable is False)
+                         and model.scope is not None and _writes_exit_passes_alone(model.scope.mutable))
         if loop.exit_gate and loop.exit_by == "row":
             # A row's gate pools its tokens: whole-row scoring's (`Loop.exit_by`).
             coordinates = (None if (metadata := self.inputs.get('attention_metadata')) is None
@@ -543,6 +580,13 @@ class _Passes:
                 raise ValueError("a row's exit gate pools the row's tokens, which in decode are the tokens "
                                  "so far and in a packed row its documents': exit by token there "
                                  "(Loop.exit_by='token')")
+        _, end = self.span
+        if (self.decode and self.gates_block and model.is_mutable_collection(EXITS) and loop.steps > 1
+                and end < model.num_layers):
+            # Each earlier pass's coda would run for its exit, in a cache a gate on the block keeps none of
+            # (`pass_entries`).
+            raise ValueError("a cached call collecting every pass's exit runs each pass's coda, whose cache "
+                             "a gate on the block's output keeps none of: collect its exits uncached")
         # A threshold reading a gate on the block's output runs no pass's coda (`Loop.exit_at`).
         self.exit_outputs = loop.exiting and (model.is_mutable_collection(EXITS) or model.is_initializing()
                                               or (self.exit_states and not self.gates_block))
@@ -587,10 +631,11 @@ class _Passes:
                 module.sow(EXITS, 'states', module.head_states(output))
         return logit
 
-    def pass_block(self, module, x, bank=None, **inputs):
+    def pass_block(self, module, x, bank=None, *, store=None, **inputs):
+        """One pass of the block (`_passed`) over `x` and `bank`, reading `store`'s publications."""
         block = None if self.loop.layers is None else self.span
-        return _passed(module, x, bank, block=block, train=self.train, decode=self.decode,
-                       store=self.prelude, **inputs)
+        return _passed(module, x, bank, block=block, train=self.train, decode=self.decode, store=store,
+                       **inputs)
 
     def entering(self, module, x, bank, *, stop: bool, normed=None, theta=None):
         return _entered(module, x, bank, self.injected, stop=stop, normed=normed, theta=theta)
@@ -611,8 +656,15 @@ class _Passes:
         those after it scanned; under a shared cache the last after the scan, as the first runs. A loop
         that may stop at its threshold (`stops`) runs `stopping` instead."""
         if self.stops and (not self.decode or x.shape[1] == 1):
-            # A cached call of several tokens runs every pass (`Loop`'s doc).
-            return self.stopping(x, bank)
+            # A cached call of several tokens runs every pass (`Loop`'s doc); a capture of any method keeps
+            # what no switch returns (a method's non-array return), each pass unrolled, where no cache keeps
+            # each row's exiting pass's writes (`_kept_exits`).
+            if not captures_any_method(self.model):
+                return self.stopping(x, bank)
+            if self.decode:
+                raise ValueError("a cached call keeps each row's exiting pass's cache by switches, which "
+                                 "return no method's non-array: capture the modules' calls "
+                                 "(capture_intermediates=True)")
         loop, shared = self.loop, self.shared
         # A coda reading the block's publications reads the last pass's, which it leaves traced unrolled, and
         # an exiting pass's coda its own pass's: each pass unrolled (`_coda_reads_block`).
@@ -652,13 +704,18 @@ class _Passes:
         scoring each pass runs over the rows still looping alone (`compacted`, row 12927); a cached call's
         rows keep their exiting passes' cache writes (`_kept_exits`, row 12928)."""
         model, loop = self.model, self.loop
+        threshold = loop.exit_threshold
+        assert threshold is not None, "a loop stops at its threshold (`stops`)"
         _, end = self.span
         real = jnp.ones(x.shape[:2], bool) if self.valid is None else self.valid.astype(bool)
         caches = [self.block_cache(model)] if self.decode else []
         selected, output, gated = self.exit_of(model, x, 0, stop=False)
-        logits = [self.sown(model, output, gated)]
-        self.exited.append((selected, logits[0]))
-        exited = reached(logits, loop.exit_threshold)
+        first = self.sown(model, output, gated)
+        assert first is not None, "a loop stopping at its threshold gates its exits"
+        assert selected is not None, "a threshold selects a state: the coda's, or the block's own"
+        logits = [first]
+        self.exited.append((selected, first))
+        exited = reached(logits, threshold)
         normed_output = end == model.num_layers and model.normed_output
         for step in range(1, loop.steps):
             done = jnp.all(exited | ~real)
@@ -671,15 +728,15 @@ class _Passes:
             if step == loop.steps - 1:
                 break
             held = (jnp.zeros_like(selected), None if output is None else jnp.zeros_like(output),
-                    jnp.full(logits[0].shape, NEVER_EXITS, logits[0].dtype))
+                    jnp.full(first.shape, NEVER_EXITS, first.dtype))
             selected, output, logit = _sown_switch(
                 (~done).astype(jnp.int32), (lambda module, x, held=held: held,
                                             functools.partial(self.stopped_exit, step=step)), model, x)
             self.exited.append((selected, logit))
             logits.append(logit)
-            exited = exited | reached(logits, loop.exit_threshold)
+            exited = exited | reached(logits, threshold)
         if self.decode:
-            self._kept_exits(model, caches, logits)
+            self._kept_exits(model, caches, logits, threshold)
         return x, bank
 
     def held_pass(self, module, carry):
@@ -688,20 +745,30 @@ class _Passes:
 
     def stopped_pass(self, module, carry, *, step: int, normed, rows):
         """Pass `step` of `stopping` over its own collections (`own_view`), from the state and bank `carry`,
-        the step norm reading the exit's `normed` output: over the rows still looping alone where it compacts
-        them (`compacts`, `rows` the rows already exited), else over all."""
-        def ran(module, carry, normed):
-            x, bank = carry
-            entered, bank = self.entering(module, x, bank, stop=False, normed=normed,
-                                          theta=_theta(module, self.loop, range(step, step + 1)))
-            view = self.own_view(step)
-            run = nn.map_variables(self.run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                                   trans_out_fn=view.outside, mutable=True)
-            out, bank, left = run(module, entered, bank, **self.inputs)
-            return (_stepped(self.loop, out, entered, self.injected), bank), left
-        if not self.compacts:
-            return ran(module, carry, normed)
+        the step norm reading the exit's `normed` output (`transition`): over the rows still looping alone
+        where it compacts them (`compacts`, `rows` the rows already exited, the call's every row-holding
+        array holding its tokens beside them: `_token_aligned`), else over all."""
+        def ran(module, carry, normed, inputs, store, injected):
+            return self.transition(module, carry, step=step, view=self.own_view(step), normed=normed,
+                                   enter_stop=False, inputs=inputs, store=store, injected=injected)
+        if not self.compacts or not _token_aligned(self, carry[0]):
+            return ran(module, carry, normed, self.inputs, self.prelude, self.injected)
         return compacted(ran, module, carry, normed, rows, self)
+
+    def transition(self, module, carry, *, step: int, view, normed, enter_stop: bool, inputs: dict, store,
+                   injected):
+        """Pass `step` from the state and bank `carry` the pass before left: entered (`_entered`, `injected`
+        its block's input), its block run over `view`'s collections (`run_block`) reading `store`'s
+        publications and the call's `inputs`, and stepped (`_stepped`). Its state and bank, and the
+        publications it leaves: the one transition the unrolled and stopping drivers run, each handing it
+        its own rows' operands (`compacted`)."""
+        x, bank = carry
+        entered, bank = _entered(module, x, bank, injected, stop=enter_stop, normed=normed,
+                                 theta=_theta(module, self.loop, range(step, step + 1)))
+        run = nn.map_variables(self.run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+                               trans_out_fn=view.outside, mutable=True)
+        out, bank, left = run(module, entered, bank, store=store, **inputs)
+        return (_stepped(self.loop, out, entered, injected), bank), left
 
     def stopped_exit(self, module, x, *, step: int):
         """Pass `step`'s exit in `stopping` (`exit_of`): its selected state, normed output and gate logit."""
@@ -715,27 +782,31 @@ class _Passes:
         return {name: value for name, value in module.variables.get('cache', {}).items()
                 if (run := group_layers(name)) is not None and first <= run.start and run.stop <= end}
 
-    def _kept_exits(self, module, caches: list[dict], logits) -> None:
+    def _kept_exits(self, module, caches: list[dict], logits, threshold: float) -> None:
         """Each row's cache entries of the block as its exiting pass left them (`exit_choice`, one pass a
         row under `exit_by='row'`), of `caches`, each pass's (`block_cache`): a later call's tokens read each
         earlier row's exiting pass's keys, values and states. An entry holding no row axis (a pool of pages)
         keeps no row's pass, and is refused."""
-        choice = exit_choice(logits, self.loop.exit_threshold)[:, 0]
+        choice = exit_choice(logits, threshold)[:, 0]
         batch = choice.shape[0]
 
-        def kept(*passes):
+        def kept(axis: int, *passes):
+            # `axis` an entry's rows: after its layers in a banked run's (`row_axis`).
             last = passes[-1]
-            if last.ndim == 0 or all(each is last for each in passes):
+            if last.ndim <= axis or all(each is last for each in passes):
                 return last
-            if last.shape[0] != batch:
+            if last.shape[axis] != batch:
                 raise ValueError("a cached call skipping its passes keeps each row's exiting pass's cache, "
                                  f"and an entry of shape {last.shape} holds no row of its {batch}: a pool of "
                                  "pages; serve a looped decoder's early exit over a dense cache")
             stacked = jnp.stack(passes)
-            index = choice.reshape(1, batch, *(1,) * (last.ndim - 1))
+            index = choice.reshape(1, *(1,) * axis, batch, *(1,) * (last.ndim - axis - 1))
             return jnp.take_along_axis(stacked, index, axis=0)[0]
         for name in caches[-1]:
-            module.put_variable('cache', name, jax.tree.map(kept, *(cache[name] for cache in caches)))
+            module.put_variable('cache', name, jax.tree_util.tree_map_with_path(
+                lambda path, *passes, name=name: kept(row_axis((jax.tree_util.DictKey(name), *path)),
+                                                      *passes),
+                *(cache[name] for cache in caches)))
 
     def own_view(self, step: int):
         first, end = self.span
@@ -753,12 +824,10 @@ class _Passes:
             if logit is not None:  # a gated exit, which the threshold's choice weighs (`_exited`)
                 self.exited.append((selected, logit))
             normed = output if end == model.num_layers and model.normed_output else None
-        x, bank = self.entering(model, x, bank, stop=enter_stop, normed=normed,
-                                theta=_theta(model, loop, range(step, step + 1)))
-        run = nn.map_variables(self.run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                               trans_out_fn=view.outside, mutable=True)
-        out, bank, self.left = run(model, x, bank, **self.inputs)
-        return _stepped(loop, out, x, self.injected), bank
+        (x, bank), self.left = self.transition(model, (x, bank), step=step, view=view, normed=normed,
+                                               enter_stop=enter_stop, inputs=self.inputs, store=self.prelude,
+                                               injected=self.injected)
+        return x, bank
 
     def stepped(self, module, carry, theta, *, exit_stop, enter_stop, block=None):
         """One later pass inside the scan over its step's collections: the exit of the pass before it
@@ -774,7 +843,7 @@ class _Passes:
             selected, output, gated = self.exit_of(module, x, None, stop=exit_stop)
             normed = output if end == module.num_layers and module.normed_output else None
         x, bank = self.entering(module, x, bank, stop=enter_stop, normed=normed, theta=theta)
-        out, bank, _ = (block or self.run_block)(module, x, bank, **self.inputs)
+        out, bank, _ = (block or self.run_block)(module, x, bank, store=self.prelude, **self.inputs)
         exits = (selected if self.exit_states else None, output if self.exit_outputs else None, gated)
         return (_stepped(loop, out, x, self.injected), bank), exits
 
@@ -881,13 +950,54 @@ class _Passes:
         return stepping(module, carry, step, passes)
 
 
+def _writes_exit_passes_alone(mutable) -> bool:
+    """Whether a call's mutable collections (Flax's filter, as its scope holds it) are none or the exit
+    passes alone (`EXIT_PASSES`), which `_handed_on` sows once over every row after the passes: what no
+    pass over fewer rows writes. Every other filter (all, a deny list, any other collection) may name one a
+    pass writes a row of."""
+    if mutable is False:
+        return True
+    names = (mutable,) if isinstance(mutable, str) else mutable
+    return isinstance(names, list | tuple | set | frozenset) and set(names) <= {EXIT_PASSES}
+
+
+def _token_aligned(passes: _Passes, x: jax.Array) -> bool:
+    """Whether every array, JAX's or the host's, of the call's inputs, the prelude's publications and the
+    last pass's that holds the call's rows holds its tokens beside them (`[B, S, ...]`), as `compacted`
+    gathers and scatters them: a cross-attention's context `[B, C, D]`, its lengths `[B]`, a bias over heads
+    `[B, H, S, S]` or a CSA2 layer's compressed entries `[B, S // rate, D]` holds the rows alone, and a pass
+    reading or leaving one runs over every row."""
+    batch, length = x.shape[:2]
+    return all(_coordinates(leaf) or not isinstance(leaf, jax.Array | np.ndarray) or leaf.ndim == 0
+               or leaf.shape[0] != batch or leaf.shape[:2] == (batch, length)
+               for leaf in jax.tree.leaves((passes.inputs, passes.prelude, passes.left),
+                                           is_leaf=_coordinates))
+
+
+def _coordinates(node) -> bool:
+    """Whether `node` is a call's token coordinates (`dew.batch.Coordinates`), whose arrays are its rows'
+    own (its tokens' fields `[B, S]`, its documents' `firsts` and forks' parents `[B, D]`, each numbered
+    within its row) but for positions every row shares (`[S]`, `Coordinates.places`): `compacted` gathers
+    them by row (`_coordinates_of_rows`)."""
+    return isinstance(node, Coordinates)
+
+
+def _coordinates_of_rows(coordinates: Coordinates, picked: jax.Array) -> Coordinates:
+    """`coordinates` of the rows `picked`: each array of a row a field (two axes or more) gathered by row,
+    the positions every row shares (one axis, `[S]`) kept."""
+    return jax.tree.map(lambda array: jnp.asarray(array)[picked] if jnp.ndim(array) >= 2 else array,
+                        coordinates)
+
+
 def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Passes):
     """`ran`'s pass (`_Passes.stopped_pass`) over the rows of `carry` (its state and bank) still looping
     (`rows` those already exited), gathered into the smallest of the batch's halvings that holds them (`[B,
     B // 2, ..., 1]`, one program a size under `lax.switch`), with every array of the call's inputs, the
     prelude's publications, the block's input and the step norm's `normed` whose leading axes are the
     call's rows and tokens, and scattered back: a pass over fewer rows computes fewer, a row that exited
-    none (row 12927). A row in the bucket beside them runs the pass too, its state no output reads."""
+    none (row 12927). The call's coordinates gather by row (`_coordinates_of_rows`). A row in the bucket
+    beside them runs the pass too, its state no output reads. A call holding a row-holding array beside
+    them (`_token_aligned`) runs its passes over every row."""
     x, _ = carry
     batch, length = x.shape[:2]
     sizes = [batch]
@@ -901,10 +1011,14 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     def rowed(leaf) -> bool:
         # A row's array: its leading axes the call's rows and tokens (a state, its bank, an input, a mask, a
         # publication), not a table of the tokens' (a position's rotation), whatever its sizes.
-        return isinstance(leaf, jax.Array) and leaf.shape[:2] == (batch, length)
+        return isinstance(leaf, jax.Array | np.ndarray) and leaf.shape[:2] == (batch, length)
 
     def taken(tree, picked):
-        return jax.tree.map(lambda leaf: leaf[picked] if rowed(leaf) else leaf, tree)
+        def row_of(leaf):
+            if _coordinates(leaf):
+                return _coordinates_of_rows(leaf, picked)
+            return jnp.asarray(leaf)[picked] if rowed(leaf) else leaf
+        return jax.tree.map(row_of, tree, is_leaf=_coordinates)
 
     def put(whole, part, picked):
         return jax.tree.map(lambda full, each: full.at[picked].set(each) if rowed(full) else each,
@@ -913,12 +1027,8 @@ def compacted(ran: Callable, module, carry, normed, rows: jax.Array, passes: _Pa
     def bucket(size: int):
         def run(module, carry):
             picked = order[:size]
-            held = passes.inputs, passes.prelude, passes.injected
-            passes.inputs, passes.prelude, passes.injected = taken(held, picked)
-            try:
-                state, left = ran(module, taken(carry, picked), taken(normed, picked))
-            finally:
-                passes.inputs, passes.prelude, passes.injected = held
+            inputs, store, injected = taken((passes.inputs, passes.prelude, passes.injected), picked)
+            state, left = ran(module, taken(carry, picked), taken(normed, picked), inputs, store, injected)
             kept = left if passes.left is None else put(passes.left, left, picked)
             return put(carry, state, picked), kept
         return run
@@ -1031,9 +1141,11 @@ def gate_logit(model, output: jax.Array, valid: jax.Array | None) -> jax.Array:
         return model.early_exit_gate(output)
     # Over the tokens' axis, a scan's passes stacked before it alike.
     wide = at_least_fp32(output.dtype)
-    weights = (jnp.ones(output.shape[-3:-1], wide) if valid is None else valid.astype(wide))[..., None]
-    pooled = jnp.sum(output.astype(wide) * weights, axis=-2, keepdims=True) / jnp.maximum(
-        jnp.sum(weights, axis=-2, keepdims=True), 1)
+    # Selected, not weighed: a padding token's state is unspecified (`AttentionMetadata.valid`), a NaN among
+    # them, whose product with zero is NaN.
+    real = (jnp.ones(output.shape[-3:-1], bool) if valid is None else valid.astype(bool))[..., None]
+    pooled = jnp.sum(jnp.where(real, output.astype(wide), 0), axis=-2, keepdims=True) / jnp.maximum(
+        jnp.sum(real, axis=-2, keepdims=True).astype(wide), 1)
     return jnp.broadcast_to(model.early_exit_gate(pooled.astype(output.dtype)), (*output.shape[:-1], 1))
 
 

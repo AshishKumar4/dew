@@ -124,7 +124,14 @@ class CrossPassMerge(nn.Module):
                 *((self.added,) if self.spec.additive else ()))
 
     def __call__(self, read: jax.Array, bank: jax.Array) -> jax.Array:
-        """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype."""
+        """`read` `[B, S, D]` with `bank` `[B, S, blocks, D]` merged in, in `read`'s dtype: as it is where a
+        quantization may own it (a rule over its depth mixture's path among them) or a caller watches it or
+        its depth mixture, each product in the merge's own scope, else as a block's sites read their bank
+        together (`merged_sites`)."""
+        if watched_or_owned(self) or watched_or_owned(self.depth):
+            # The bank in the read's dtype, as the sites read it together.
+            return _merged(read, self.depth(bank.astype(read.dtype)), self.controller(), self.spec,
+                           self.norm_eps)
         return merged_sites((self,), read, bank)[0]
 
 
@@ -144,10 +151,9 @@ def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array | tuple[jax.A
         raise ValueError(f"{len(reads)} reads for {len(merges)} sites' merges")
     spec, eps, depth = first.spec, first.norm_eps, first.depth
     if any(watched_or_owned(merge) or watched_or_owned(merge.depth) for merge in merges):
-        # A merge a quantization may own (a rule over its depth mixture's path among them) or a caller
-        # watches, it or its depth mixture, runs as it is, each apart.
-        return tuple(_merged(each, merge.depth(bank), merge.controller(), spec, eps)
-                     for each, merge in zip(reads, merges, strict=True))
+        # A merge a quantization may own or a caller watches runs through its module, each apart: its call
+        # captured, intercepted and quantized as any module's (`CrossPassMerge.__call__`).
+        return tuple(merge(each, bank) for each, merge in zip(reads, merges, strict=True))
 
     # The read's and the bank's cotangents leave only with the merges' parameters' gradients formed, their
     # states recomputed from their operands in the reverse mode (`portable_formed`): XLA otherwise puts the

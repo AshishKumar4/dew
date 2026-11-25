@@ -171,7 +171,7 @@ def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
     none = cost.Seconds(Work(), schedule)
 
     def marginal(graph: EGraph, node) -> Priced:
-        work = cost.work(graph, node, region)
+        work = cost.work(graph, node, region, on=schedule.facts)
         operands = next((args for constructor in terms.LANGUAGE
                          if (args := get_callable_args(node, constructor)) is not None), ())
         if any(isinstance(operand, Term) and graph.lookup_function_value(reads(operand)) is not None

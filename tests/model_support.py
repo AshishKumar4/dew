@@ -94,6 +94,12 @@ def recorded_site(path: Path, site: str, inputs_of, truth_fn):
     return (*indexed_recording(recording(path), site, seeds, inputs_of=inputs_of, truth_fn=truth_fn), seeds)
 
 
+def method_run(model, method):
+    """`model`'s `method` as a jitted `(variables, ids)` forward: the form a test unrolls a model's
+    computation by hand in, held against the model's own forward."""
+    return jax.jit(lambda variables, ids: model.apply(variables, ids, method=method))
+
+
 def model_draw(model, shape: tuple[int, ...], vocab: int):
     """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
     `vocab`, the variables initialized compiled."""

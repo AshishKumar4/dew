@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.extend import core as jex_core
 from map_judge import marked_seeds
 from model_support import (
     TINY_DECODER,
@@ -25,7 +24,7 @@ from model_support import (
     model_draw,
     with_logit_cotangent,
 )
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -181,23 +180,6 @@ def test_a_merge_is_its_formula(spec):
 
     assert_as_exact(jax.jit(merge.apply), by_hand(jnp.float32), draw, "a merge", seeds=SEEDS["merge"],
                     truth_fn=by_hand(jnp.float64))
-
-
-def equations(closed) -> list:
-    """Every equation of `closed`'s jaxpr, those of the jaxprs its equations hold among them."""
-    found = []
-
-    def walk(jaxpr):
-        for eqn in jaxpr.eqns:
-            found.append(eqn)
-            for value in eqn.params.values():
-                for each in value if isinstance(value, (tuple, list)) else (value,):
-                    if isinstance(each, jex_core.ClosedJaxpr):
-                        walk(each.jaxpr)
-                    elif isinstance(each, jex_core.Jaxpr):
-                        walk(each)
-    walk(closed.jaxpr)
-    return found
 
 
 def products(closed) -> list:
@@ -837,3 +819,18 @@ def test_a_rule_over_a_merges_own_path_owns_its_matmuls_and_not_its_depth_mixtur
               "op_names": (op,)} for op in ("dot_general", "einsum")]
     _, unused = qwix_owned("qt", rules, dataclasses.replace(MESSAGES, additive=False))
     assert [tuple(rule.op_names) for rule in unused] == [("einsum",)]
+
+
+def test_a_watched_merge_reads_its_bank_as_its_sites_do():
+    """A merge a caller watches (`capture_intermediates`) runs through its module, and reads its bank in
+    the read's dtype as the merges a block reads together do: a bf16 read beside a float32 bank merges
+    alike, bit for bit, watched or not."""
+    merge = CrossPassMerge(MESSAGES, 16, 1e-6)
+    rng = np.random.default_rng(0x3A7)
+    read = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.bfloat16)
+    bank = jnp.asarray(rng.normal(size=(2, 5, 3, 16)), jnp.float32)
+    variables = merge.init(jax.random.key(0), read, bank)
+    variables = jax.tree.map(lambda leaf: leaf + 0.1, variables)
+    plain = merge.apply(variables, read, bank)
+    watched, _ = merge.apply(variables, read, bank, capture_intermediates=True, mutable=["intermediates"])
+    np.testing.assert_array_equal(np.asarray(watched), np.asarray(plain))

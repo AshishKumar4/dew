@@ -96,17 +96,11 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     # supplied layout; the scan's init=True pass would draw over it first.
     if (decoder.is_initializing() and stages == 1 and not decode
             and not decoder.has_variable('params', f'layers_{first}')):
-        # A run draws its layers under one scan where they draw alike: a layer whose start is its own
-        # (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) draws apart, and its run
-        # stacks it after.
-        drawn = tuple(decoder.drawn_like(index) for index in range(decoder.num_layers))
-        groups = tuple((first + start, count)
-                       for start, count in scan_groups(drawn[first:end], decoder.bank_layers))
-        if any(count > 1 for _, count in groups):
-            view = StackView(groups)
-            run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
-                                   trans_out_fn=view.unstack, init=True, mutable=True)
-            return run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank)
+        drawn = _drawn_in_runs(decoder, x, (first, end), train=train, decode=decode,
+                               per_layer_input=per_layer_input,
+                               attention_metadata=attention_metadata, prior_bank=prior_bank, store=store)
+        if drawn is not None:
+            return drawn
     if decoder.is_initializing() or (stages == 1 and not scanned()):
         return unrolled()
     staged = stored_by_stage(decoder.variables)
@@ -144,7 +138,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = pipelined(decoder, x, stages, decode=decode, banked=banked, span=span)
     dtype = decoder.residual_dtype(
         x, train=train, decode=decode, per_layer_input=per_layer_input,
-        attention_metadata=attention_metadata, first=first)
+        attention_metadata=attention_metadata, first=first, kv_store=store)
     # A carried collapse stays fp32, as the reference keeps it.
     x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
     run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
@@ -161,23 +155,47 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
             attention_metadata=attention_metadata)
 
     x = outside(x, 0, split.prefix)
-    # A loop's part's store passes in; else the run makes its own, inside the transform that maps its view.
-    x = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, kv_store)
+    # One store across the layers around the run and the run's own: a loop's part's, passed in, or the
+    # stack's own.
+    x, left = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
+    _taken_back(store, left)
     return outside(x, decoder.num_layers - split.suffix, decoder.num_layers)
+
+
+def _drawn_in_runs(decoder: CausalTransformer, x, span: tuple[int, int], *, train: bool, decode: bool,
+                   per_layer_input, attention_metadata, prior_bank, store):
+    """An initialization's layers [first, end) drawn under one scan a run where they draw alike, a layer
+    whose start is its own (DEX's heads and lambda_init, an adapter's own factors: `drawn_like`) apart and
+    its run stacking it after; None where no run scans. Its providers write `store`, which the layers
+    after the span read (a loop's next part)."""
+    first, end = span
+    drawn = tuple(decoder.drawn_like(index) for index in range(decoder.num_layers))
+    groups = tuple((first + start, count)
+                   for start, count in scan_groups(drawn[first:end], decoder.bank_layers))
+    if not any(count > 1 for _, count in groups):
+        return None
+    view = StackView(groups)
+    run = nn.map_variables(stacked, mapped_collections=True, trans_in_fn=view.stack,
+                           trans_out_fn=view.unstack, init=True, mutable=True)
+    x, left = run(decoder, view, x, train, decode, per_layer_input, attention_metadata, prior_bank, store)
+    _taken_back(store, left)
+    return x
 
 
 @nn.compact
 def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode: bool, per_layer_input,
             attention_metadata=None, prior_bank=None, kv_store=None):
     """The stack inside `view`: scanned runs, or the pipeline over stages; compact, so the stages it builds
-    are the decoder's own."""
+    are the decoder's own. With the publications its providers leave (`kv_store`, the store it read, which
+    leaves the transform mapping its view as an output: an argument passes in rebuilt, its writes its own),
+    None where none publishes."""
     if view.stages == 1:
         store = kv_store if kv_store is not None else ({} if decoder.provides else None)
         return run_stack(
             decoder.layers, decoder.block, decoder.specs, view.groups, x,
             train=train, decode=decode, kv_store=store,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-            banked='params' in view.banked, periods=view.periods, prior_bank=prior_bank)
+            banked='params' in view.banked, periods=view.periods, prior_bank=prior_bank), store
     return run_pipeline(
         decoder,
         view,
@@ -187,7 +205,13 @@ def stacked(decoder: CausalTransformer, view: StackView, x, train: bool, decode:
                                      groups=view.groups, train=train, offset=view.offset, name='stages'),
         layered=per_layer_input,
         rows=attention_metadata,
-    )
+    ), None
+
+
+def _taken_back(store: dict | None, left: dict | None) -> None:
+    """The publications a mapped run left (`stacked`), written back into the caller's `store`."""
+    if store is not None and left is not None:
+        store.update(left)
 
 
 def pipelined(decoder: CausalTransformer, x, stages: int, *, decode: bool, banked: tuple[str, ...],
