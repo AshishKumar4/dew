@@ -1078,9 +1078,9 @@ class MosaicGmm(_Mosaic):
     def _slice_bytes(self, ba, config: tiling.Tiles, target) -> int:
         """One depth slice's fp32 partials as a split launch at `config` declares them
         (`mosaic_gpu._declared`, `_swapped_launch`), from the call's extents alone (no operand padded): its
-        walked rows (a gathered call's table's, else its rows'; `mosaic_gpu._walked_rows`) by its width in
-        whole column units (`_whole_extents`), or swapped, its width walked as the rows by its rows padded
-        to whole column tiles."""
+        walked rows (a gathered call's table's, else its rows'; `mosaic_gpu._walked_rows`) by its width as
+        `_aligned` launches it, or swapped, its width walked as the rows by its rows padded to whole column
+        tiles."""
         from .templates.gemm import mosaic_gpu, pricing
 
         dtype = ba.arguments['tokens'].dtype
@@ -1088,7 +1088,12 @@ class MosaicGmm(_Mosaic):
         rows = ba.arguments['tokens'].shape[0] if gather is None else gather.shape[0]
         width = ba.arguments['kernel'].shape[1 if ba.arguments['trans_rhs'] else 2]
         if layouts := self._families(ba, target):
-            width = self._whole_extents(ba, layouts[0])[1].get('width', width)
+            # The width `_aligned` launches: its whole column units, or as it is where it runs its last
+            # column tile partial (`_partial_axes`).
+            extents, whole = self._whole_extents(ba, layouts[0])
+            if 'width' in whole:
+                partial = whole != extents and self._partial_axes(ba, layouts[0], target)[1]
+                width = extents['width'] if partial else whole['width']
         unswapped = dataclasses.replace(config, swapped=False)
         family = pricing.family_of(unswapped, dtype, target)
         unit = mosaic_gpu.row_unit(family, dtype)

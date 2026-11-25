@@ -7,7 +7,6 @@ import dataclasses
 import functools
 import importlib
 import itertools
-import math
 import sys
 
 import jax
@@ -1665,40 +1664,43 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
-@pytest.mark.parametrize("swapped", [False, True], ids=["rows", "swapped"])
-def test_a_splits_partials_are_priced_as_its_launch_declares_them(swapped, monkeypatch):
-    """A split's fp32 partials as its legality and its price count them (`MosaicGmm._slice_bytes`, row
-    12850) are the ones its launch declares (`mosaic_gpu._declared`), its width in whole column units and,
-    swapped, its rows padded to whole column tiles: an A100's 264 x 1985 product (its width launched 2016
-    wide) and a 16-row decode by 20,480 columns swapped."""
-    from dew.nn.kernels.templates.gemm import mosaic_gpu
+@pytest.mark.parametrize(("swapped", "within", "past"), [(False, 248, 264), (True, 12288, 20480)],
+                         ids=["rows", "swapped"])
+def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace(swapped, within, past):
+    """A pinned two-way split runs where its fp32 partials, as its launch declares them, fit the 4 MiB an
+    A100's cuBLAS GEMM's workspace is (`GpuTarget.reference_workspace`, row 12850), and is refused
+    (`tuning.Unpinnable`) where one thing grows them past it: a 1985-wide product launched 2016 wide, its
+    rows 248 (3.8 MiB) or 264 (4.1 MiB); a 16-row decode swapped, its rows padded to a 32-column tile, by
+    12,288 columns (3 MiB) or 20,480 (5 MiB)."""
+    from dew.nn.kernels import tuning
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
-    rows, depth, width = (16, 4096, 20480) if swapped else (264, 1024, 1985)
-    declared = []
-    real = mosaic_gpu._declared
 
-    def recording(*args, **kwargs):
-        found = real(*args, **kwargs)
-        declared.extend(each for each in found if each.dtype == jnp.float32)
-        return found
+    def shapes(grown):
+        rows, depth, width = (16, 4096, grown) if swapped else (grown, 1024, 1985)
+        return bf16((rows, depth)), bf16((depth, width))
 
-    monkeypatch.setattr(mosaic_gpu, "_declared", recording)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        ba = launch.bind(bf16((rows, depth)), bf16((1, depth, width)), one, out_dtype="bfloat16",
-                         trans_rhs=False, interpret=False, dense=True)
-        if swapped:
-            tile = dataclasses.replace(launch._derived(launch._swapped(ba, target), target), swapped=True)
-        else:
-            tile = launch.derived(ba, target)
+        x, w = shapes(within)
+        ba = launch.bind(x, bf16((1, *w.shape)), one, out_dtype="bfloat16", trans_rhs=False,
+                         interpret=False, dense=True)
+        tile = (dataclasses.replace(launch._derived(launch._swapped(ba, target), target), swapped=True)
+                if swapped else launch.derived(ba, target))
         tile = dataclasses.replace(tile, splits=2)
-        fn, args = launch.lowering(ba, tile)
-        jax.eval_shape(fn, *args)
-        assert len(declared) == 1, declared
-        assert 2 * launch._slice_bytes(ba, tile, target) == math.prod(declared[0].shape) * 4, declared
+
+        def run(x, w):
+            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+        with generation.chosen(grouped_matmul="mosaic"):
+            with tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches:
+                jax.jit(run).trace(*shapes(within))
+            assert tile in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                            if isinstance(op, grouped_matmul.MosaicGmm)}
+            with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
+                jax.jit(run).trace(*shapes(past))
 
 
 def _traced_on(target, fn, args):
