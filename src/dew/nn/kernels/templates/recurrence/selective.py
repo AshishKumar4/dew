@@ -328,12 +328,13 @@ BACKWARD_STATE = ("B", "C", "decay", "write", "states before", "C dy", "cotangen
 the state's operands, its decay and write, the states before each token, C dy and the cotangent after each
 token, counted from `backward`."""
 
-BACKWARD_FORKED = ("firsts", "entered", "lasts", "isolated", "products", "injected")
+BACKWARD_FORKED = ("firsts", "cut", "entered", "lasts", "isolated", "products", "injected")
 """The token vectors a forked call's state turn holds beside `BACKWARD_STATE` (`DocumentsBack.scans`): its
-documents' first tokens, the states they enter and the tokens ending them, the isolated cotangents, each
-token's suffix product of its document's decays and the cotangents injected at the next document's first:
-uncounted, an H100's forked backward at its plan spilled 288 bytes a thread and an A100's at 16 tokens and
-two programs 1,200 (row 12905)."""
+documents' first tokens and their complement (`cut`, read by both reverse scans), the states they enter and
+the tokens ending them, the isolated cotangents, each token's suffix product of its document's decays and
+the cotangents injected at the next document's first: uncounted, an H100's forked backward at its plan
+spilled 288 bytes a thread and an A100's at 16 tokens and two programs 1,200; `cut` uncounted, an A100's
+16 (row 12905)."""
 
 BACKWARD_SCALARS = {"addresses": 20, "block scan": 8, "state loop": 12}
 """The registers a backward thread holds apart from its token vectors and a thread's control
