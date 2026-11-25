@@ -1195,41 +1195,14 @@ class StepCompiler[L, E]:
         """The step of a run that draws its pass count per microbatch (`PhasePasses.sampled`): `cap`, the one
         program at its cap (`compile`, which plans it with a count a microbatch, `_plan`), drawing under the
         run's `key`. A window that replays its microbatches replays each at the count it drew, which its
-        held batch carries (`dew.batch.LOOP_PASSES`), as one that pools them by their mean (row 12867)."""
+        held batch carries (`dew.batch.LOOP_PASSES`), as one that pools them by their mean; statistics of a
+        step's whole batch read each part at its own count, cut from the whole batch that carries them
+        (`Transaction._step_attempt`'s `part_at`; row 12867, where both were refused, rows 7884 and
+        10770)."""
         sampled, planned = self.phase_passes.sampled, cap.planned
         assert sampled is not None and planned is not None and cap.step is not None
-        self._refuse_sampled_window(planned)
         words = tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
         return DrawingStep(planned.split, sampled, words, cap.step_flops, run=cap.step)
-
-    def _refuse_sampled_window(self, cap: Planned) -> None:
-        """Refused where a run and a build ahead (`compile_ahead`) both build a sampled run's step, as its
-        plan was refused before it searched (`_sampled_splits`): statistics of a step's whole batch read at
-        a split its plan reached otherwise (a record's)."""
-        sampled = self.phase_passes.sampled
-        assert sampled is not None, "a run that draws its pass count per microbatch"
-        window = cap.candidate.prepared.window
-        if window is not None and window.batch_statistics is not None and cap.split > 1 and sampled.cap > 1:
-            raise ValueError(self._whole_batch_refusal())
-
-    def _whole_batch_refusal(self) -> str:
-        return (f"{type(self.objective).__name__}'s statistics of a step's whole batch (`batch_statistics`) "
-                "are computed at its first part, by that part's count, and read by every part: a pass count "
-                "drawn per microbatch reads them one part a step (split 1), until each part's count computes "
-                "its own (row 10770's audit)")
-
-    def _sampled_splits(self, candidates: list[int], fixed: int | None) -> list[int]:
-        """The splits a sampled run's plan may search (`_planned`), decided before it searches any: where its
-        objective computes statistics of a step's whole batch (`batch_statistics`) and its law draws more
-        than one count, the batch whole alone, a run that fixes another refused at once, where it was
-        refused once its search ended (row 12867: a 4B run climbed its ladder for 80 minutes first)."""
-        sampled = self.phase_passes.sampled
-        whole_batch = type(self.objective).batch_statistics is not Objective.batch_statistics
-        if sampled is None or sampled.cap <= 1 or not whole_batch:
-            return candidates
-        if fixed is not None and fixed > 1:
-            raise ValueError(self._whole_batch_refusal())
-        return [split for split in candidates if split == 1]
 
     def whole_program(self) -> OuterProgram:
         """The program a split step's whole runs on its microbatches' outputs (`whole_step_program`), each
@@ -1379,9 +1352,7 @@ class StepCompiler[L, E]:
         settings = stepping.settings
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
-        candidates = self._sampled_splits(
-            splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split),
-            stepping.shape.split)
+        candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
         stepping = self.loss_shaped(stepping, schedule)
 
         def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
