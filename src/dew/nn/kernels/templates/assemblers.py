@@ -87,19 +87,24 @@ ones among them)."""
 
 def nvjitlink_libraries() -> list[str] | None:
     """Each libnvJitLink the process's dynamic loader could open by soname, as XLA's nvJitLink stub opens
-    one: those in `LD_LIBRARY_PATH`'s directories, the linker cache's (`ldconfig -p`) and the loader's
-    default directories, each by the name it is found by, the file that name resolves to, and that file's
-    size and modification, so a system library updated in place where no wheel provides one, or a soname
-    pointed at another file, keys its launches afresh (row 12166). None where the linker cache cannot be
-    listed (no `ldconfig`): the inventory unknown, no verdict of a Triton launch is stored."""
+    one: those in `LD_LIBRARY_PATH`'s directories (split as the loader splits it), the linker cache's
+    (`ldconfig -p`) and the loader's default directories, each by the name it is found by, the file that
+    name resolves to, and that file's size and modification, so a system library updated in place where no
+    wheel provides one, or a soname pointed at another file, keys its launches afresh (row 12166). None where
+    the linker cache cannot be listed (no `ldconfig`) or a directory is one the loader expands: the
+    inventory unknown, no verdict of a Triton launch is stored."""
     ldconfig = shutil.which("ldconfig") or "/sbin/ldconfig"
     try:
         listed = subprocess.run([ldconfig, "-p"], capture_output=True, text=True, timeout=60,
                                 check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    searched = [directory for directory in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
-                if directory]
+    # The loader splits LD_LIBRARY_PATH at ':' and ';', an empty entry the working directory; one it
+    # expands (`$ORIGIN`, `$LIB`, `$PLATFORM`) is no directory this reads: the inventory unknown.
+    given = os.environ.get("LD_LIBRARY_PATH")
+    searched = [] if given is None else [directory or os.getcwd() for directory in re.split(r"[:;]", given)]
+    if any("$" in directory for directory in searched):
+        return None
     paths = [str(path) for directory in (*searched, *DEFAULT_LIBRARY_DIRECTORIES)
              for path in sorted(Path(directory).glob("libnvJitLink.so*"))]
     paths += re.findall(r"^\s*libnvJitLink\.so\S*\s.*=>\s*(\S+)$", listed, flags=re.M)
