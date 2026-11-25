@@ -1245,15 +1245,16 @@ def _compiled(
         tail=tail(train, build),
         order_records=ordered,
         reading=Reading(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
-                        faster=_faster(original, build)),
+                        faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 
 
-def _faster(original: Pipeline, build: _Build) -> Read | None:
-    """`memory`, where `original` is read otherwise, every source it reads can be read into memory and its
-    chain lowers there, as the analysis's own refusals state (`_lowers`): an interleave of a stream's shards
-    does not (`Reading.faster`); None otherwise."""
-    if build.read == "memory" or _unsupported((original,), "memory") or not _lowers((original,), "memory"):
+def _faster(branches: tuple[Pipeline, ...], build: _Build) -> Read | None:
+    """`memory`, where the run's `branches` (its training branch, then its validation's) are read otherwise,
+    every source they read can be read into memory and both lower there, as the analysis's own refusals
+    state (`_lowers`): an interleave of a stream's shards in either does not (`Reading.faster`); None
+    otherwise. One read serves both, so a read either refuses is none to name."""
+    if build.read == "memory" or _unsupported(branches, "memory") or not _lowers(branches, "memory"):
         return None
     return "memory"
 

@@ -273,9 +273,9 @@ def test_a_loader_explains_the_read_its_readers_run():
     (`Loader.explain`): the read and who chose it, the sources, the chain or the compile; the workers its
     batches are made in, as many as the processes that make them; and a faster read, memory, where
     another was asked of sources that can all be read into memory and a chain that lowers there, which
-    reads the same batches and names none faster, and none for an interleave of a stream's shards, which
-    a memory read refuses. Its explanation names each of these and each fact its plan's order records
-    (row 1563)."""
+    reads the same batches and names none faster, and none where the training or the validation branch
+    interleaves a stream's shards, which a memory read refuses. Its explanation names each of these and
+    each fact its plan's order records (row 1563)."""
     rows = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered()).map(_Where()).batch(4)
     auto = Loading(workers="auto", host=TWO_CPUS)
 
@@ -305,9 +305,15 @@ def test_a_loader_explains_the_read_its_readers_run():
                 for batch in made]
 
     assert drawn(batches(faster)) == drawn(batches(indexed))
-    interleaved = Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2).repeat().batch(4)
-    streamed = compile(interleaved, steps=10**6, loading=auto, read="streamed")
-    assert streamed.reading.faster is None
+    interleaved = Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2)
+    plain = Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4)
+    streamed = {"alone": compile(plain, steps=10**6, loading=Loading(workers=0), read="streamed"),
+                "training": compile(interleaved.repeat().batch(4), steps=10**6, loading=auto,
+                                    read="streamed"),
+                "validation": compile(plain, validation=interleaved.batch(4), steps=10**6,
+                                      loading=Loading(workers=0), read="streamed")}
+    assert {name: loader.reading.faster for name, loader in streamed.items()} == {
+        "alone": "memory", "training": None, "validation": None}
 
 
 @dataclasses.dataclass(frozen=True)
