@@ -1688,3 +1688,116 @@ def test_recurrence_recognition_preserves_fp32_entering_state_cancellation():
         np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
         np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
         assert float(np.asarray(got_out, np.float32)[0, 0, 0, 0]) == float(jnp.bfloat16(-(2.0 ** -19)))
+
+
+def test_recurrence_recognition_guards_later_chunk_carry_lossy_norm_and_reads_kernel_layout():
+    """`RECURRENCES` preserves multi-chunk scans whose carried fp32 state would narrow at chunk 1+, rejects
+    keys normalized through lossy bf16->fp16 denominators, and reads Mosaic intermediate precision directly
+    from `chunk_forward.prepared` (`sm80` TF32 vs `sm90` 2-part bf16 vs unrounded 3-part fp32)."""
+    import dew
+    from dew.nn.kernels import recurrence, recurrence_chunk
+
+    batch, hv, dk, dv = 1, 2, 64, 64
+    step = _gdn_make_step(batch, hv)
+
+    # 1. 128-token bf16-initializer carry cancellation across chunk boundary (token 0 writes -> token 64).
+    seq128 = 128
+    shapes128 = (
+        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq128, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq128, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq128, batch, hv, dv), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq128, batch, hv), jnp.float32),
+        jax.ShapeDtypeStruct((seq128, batch, hv), jnp.bfloat16),
+    )
+
+    def scan_bf16_init_128(state, q, k, v, g, beta):
+        s_in = _bounded_box(state, 0.125).astype(q.dtype).astype(jnp.float32)
+        return jax.lax.scan(step, s_in, (_bounded_box(q, 0.125), _bounded_box(k, 0.125), _bounded_box(v),
+                                         jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+
+    with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_bf16_init_128).trace(*shapes128))
+    with generation.assumed("sm90"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_bf16_init_128).trace(*shapes128))
+
+    s0 = jnp.zeros((batch, hv, dk, dv), jnp.float32).at[:, :, 0, 0].set(np.float32(0.0625)).at[
+        :, :, 1, 0].set(np.float32(-0.0625))
+    q128 = jnp.zeros((seq128, batch, hv, dk), jnp.bfloat16).at[64, :, :, :2].set(jnp.bfloat16(0.125))
+    k128 = jnp.zeros((seq128, batch, hv, dk), jnp.bfloat16).at[0, :, :, 1].set(jnp.bfloat16(0.125))
+    v128 = jnp.zeros((seq128, batch, hv, dv), jnp.bfloat16).at[0, :, :, 0].set(jnp.bfloat16(-33.0 / 4096.0))
+    g128 = jnp.zeros((seq128, batch, hv), jnp.float32)
+    b128 = jnp.zeros((seq128, batch, hv), jnp.bfloat16)
+    with generation.chosen(gated_delta_rule="fla"):
+        fla_out, _ = recurrence_chunk.chunk(
+            recurrence.Hooks(decay="scalar", delta=True),
+            recurrence_chunk.Chunk(
+                state=s0, query=jnp.swapaxes(q128, 0, 1), key=jnp.swapaxes(k128, 0, 1),
+                value=jnp.swapaxes(v128, 0, 1), log_decay=jnp.swapaxes(g128, 0, 1),
+                beta=jnp.swapaxes(jax.nn.sigmoid(b128), 0, 1)), dtype=jnp.bfloat16)
+        assert float(np.asarray(fla_out, np.float32)[0, 64, 0, 0]) == 0.0
+        ref_fin, ref_out = jax.jit(scan_bf16_init_128)(s0, q128, k128, v128, g128, b128)
+        got_fin, got_out = dew.jit(scan_bf16_init_128)(s0, q128, k128, v128, g128, b128)
+        np.testing.assert_array_equal(np.asarray(got_fin), np.asarray(ref_fin))
+        np.testing.assert_array_equal(np.asarray(got_out, np.float32), np.asarray(ref_out, np.float32))
+        assert float(np.asarray(got_out, np.float32)[64, 0, 0, 0]) == float(jnp.bfloat16(-(2.0 ** -19)))
+
+    # 2. Lossy bf16 -> fp16 -> fp32 norm denominator must not certify unit_norm or admit FLA WY overflow.
+    seq64 = 64
+    shapes64 = (
+        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dv), jnp.bfloat16),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.bfloat16),
+    )
+
+    def scan_lossy_norm_key(state, q, k, v, g, beta):
+        k_f16 = k.astype(jnp.float16).astype(jnp.float32)
+        inv = jax.lax.rsqrt(jnp.sum(jnp.square(k_f16), axis=-1, keepdims=True) + jnp.float32(2.0 ** -100))
+        k_bad = (k.astype(jnp.float32) * inv).astype(jnp.bfloat16)
+        return jax.lax.scan(step, jnp.zeros_like(state), (
+            jnp.zeros_like(q), k_bad, jnp.zeros_like(v), jnp.minimum(g, 0.0), jax.nn.sigmoid(beta)))
+
+    with generation.assumed("sm90"), generation.chosen(gated_delta_rule="fla"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_lossy_norm_key).trace(*shapes64))
+    with generation.assumed("sm90"):
+        assert not _routes("gated_delta_rule", lambda: dew.jit(scan_lossy_norm_key).trace(*shapes64))
+    z_s = jnp.zeros((batch, hv, dk, dv), jnp.float32)
+    z_q = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16)
+    k_sub = jnp.zeros((seq64, batch, hv, dk), jnp.bfloat16).at[:, :, :, 0].set(jnp.bfloat16(2.0 ** -26))
+    z_v = jnp.zeros((seq64, batch, hv, dv), jnp.bfloat16)
+    z_g = jnp.zeros((seq64, batch, hv), jnp.float32)
+    z_b = jnp.zeros((seq64, batch, hv), jnp.bfloat16)
+    with generation.chosen(gated_delta_rule="fla"):
+        ref_f, ref_o = jax.jit(scan_lossy_norm_key)(z_s, z_q, k_sub, z_v, z_g, z_b)
+        got_f, got_o = dew.jit(scan_lossy_norm_key)(z_s, z_q, k_sub, z_v, z_g, z_b)
+        np.testing.assert_array_equal(np.asarray(got_f), np.asarray(ref_f))
+        np.testing.assert_array_equal(np.asarray(got_o, np.float32), np.asarray(ref_o, np.float32))
+
+    # 3. Mosaic layout reader derives TF32 (sm80), 2-part bf16 (sm90), and 3-part unrounded precision live.
+    f32_shapes = (
+        jax.ShapeDtypeStruct((batch, hv, dk, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dk), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv, dv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.float32),
+        jax.ShapeDtypeStruct((seq64, batch, hv), jnp.float32),
+    )
+    vars_f32 = jax.make_jaxpr(lambda *xs: xs)(*f32_shapes).jaxpr.invars
+    vars_bf16 = jax.make_jaxpr(lambda *xs: xs)(*shapes64).jaxpr.invars
+    roles = (("query", 1), ("key", 2), ("value", 3), ("log_decay", 4), ("beta", 5))
+    delta_hooks = recurrence.Hooks(decay="scalar", delta=True)
+    wg_hooks = recurrence.Hooks(decay="scalar", delta=False, write_gate=True)
+    with generation.assumed("sm80"):
+        sm80_delta = recognize._recurrence_kernel_layout(
+            "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
+    with generation.assumed("sm90"):
+        sm90_delta = recognize._recurrence_kernel_layout(
+            "mosaic_gpu", delta_hooks, roles, vars_f32, jnp.float32, jnp.float32, keeps=False)
+        sm90_wg = recognize._recurrence_kernel_layout(
+            "mosaic_gpu", wg_hooks, roles, vars_bf16, jnp.bfloat16, jnp.bfloat16, keeps=False)
+    assert sm80_delta is not None and sm80_delta[:2] == (jnp.dtype(jnp.float32), 10)
+    assert sm90_delta is not None and sm90_delta[:2] == (jnp.dtype(jnp.float32), 15)
+    assert sm90_wg is not None and sm90_wg[:2] == (jnp.dtype(jnp.float32), 23)

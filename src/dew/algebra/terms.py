@@ -483,55 +483,76 @@ def _abstract_key(value: ShapedArray) -> Hashable:
             parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
 
 
+def _cycle_guard(value, kind: type, seen: set[int], *, reject_device: bool,
+                 build: Callable[[], Hashable]) -> Hashable:
+    """Run `build()` with `id(value)` on active ancestor stack `seen`; on a cycle raise `_Unshareable` when
+    `reject_device` else key `value` by identity."""
+    obj_id = id(value)
+    if obj_id in seen:
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    seen.add(obj_id)
+    try:
+        return build()
+    finally:
+        seen.discard(obj_id)
+
+
+def _container_param_key(value, kind: type, recurse: Callable, seen: set[int], *,
+                         reject_device: bool) -> Hashable | None:
+    """Cycle-safe structural key for Python containers and `functools.partial`, or None for other types."""
+    if isinstance(value, functools.partial):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "partial", recurse(value.func), recurse(value.args), recurse(value.keywords)))
+    if isinstance(value, (tuple, list)) and not isinstance(value, jax.sharding.PartitionSpec):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "sequence", _named(kind), tuple(recurse(part) for part in value)))
+    if isinstance(value, (set, frozenset)):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "set", tuple(sorted((recurse(part) for part in value), key=repr))))
+    if isinstance(value, Mapping):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "mapping", tuple(sorted(((recurse(k), recurse(v)) for k, v in value.items()), key=repr))))
+    return None
+
+
 def parameter_key(value) -> Hashable:
-    """An equation's parameter as what it is, the one structural key the algebra pass (`parameters_key`,
-    `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
-    every process, tagged with its kind. A number by its value whatever its Python or NumPy type (a float by
-    its bits, so a NaN is one key and -0.0 another than 0.0); a sequence's parts, a named tuple's with its
-    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity); a
-    dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
-    its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
-    its mesh, partitions, memory and logical device order; an abstract value by its shape, dtype, weak type,
-    placement (partitions, mesh axes, memory), memory space, layout and the manual axes it varies over,
-    reduces or leaves unreduced; a layout by its dimension order, tiling and sub-byte element size; an array
-    by its dtype, shape and bytes' digest; a function by its module and name, a partial one with its bound
-    arguments. Any other object is its type's name and the object itself, compared by its own equality, never
-    by its printed form, which a key kept in another process cannot read (`opaque`); an object that cannot be
-    hashed (JAX's `WrappedFun` of a derivative rule, hashing an `Unhashable` tree) by its identity, held alive
-    by the key (`_Identity`), so it is equal to itself alone. `value` is any parameter JAX's primitives take,
-    which share no type."""
+    """Structural parameter key (`parameters_key`, `program.structure`, `tuning.program`): plain data across
+    processes; unhashable, cyclic, or identity-equality objects by identity."""
+    return _parameter_key(value, None)
+
+
+def _parameter_key(value, seen: set[int] | None) -> Hashable:
     kind = type(value)
-    if value is None or kind is bool or kind is str:
+    if value is None or kind in (bool, str, int):
         return kind.__name__, value
-    if kind is int:
-        return "int", value
     if kind is float:
         return "float", value.hex()
-    if kind is tuple:
-        return "sequence", "builtins.tuple", tuple(parameter_key(part) for part in value)
     if kind is ShapedArray:
         return _abstract_key(value)
-    if kind is list:
-        return "sequence", "builtins.list", tuple(parameter_key(part) for part in value)
+    if kind in (tuple, list):
+        active = set() if seen is None else seen
+        return _cycle_guard(value, kind, active, reject_device=False, build=lambda: (
+            "sequence", _named(kind), tuple(_parameter_key(part, active) for part in value)))
     if isinstance(value, jcore.Jaxpr):
         digest, opaques = jaxpr_digest(value)
         held = ("object", "subkey", _SubKey(digest, opaques)) if opaques else ()
         consts = tuple(_nested_const_key(const) for const in value.consts) if value.consts else ()
         return "jaxpr", digest, held, consts
-    return _parameter_key_other(value, kind)
+    return _parameter_key_other(value, kind, set() if seen is None else seen)
 
 
 def _array_key(value, kind: type) -> Hashable:
     """Cross-process array digest (`parameter_key`), never transferring non-addressable global shards."""
     if isinstance(value, jax.Array) and not value.is_fully_addressable:
         return "object", _named(kind), _Identity(value)
-    # The key type's printed form, which a key kept in another process can read.
     _, array = held_bits(value)
     return ("array", str(value.dtype), array.shape, str(array.dtype),
             hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
 
 
-def _parameter_key_other(value, kind: type) -> Hashable:
+def _parameter_key_other(value, kind: type, seen: set[int]) -> Hashable:
     """`parameter_key` fallback for NumPy scalars/arrays, enums, layouts, shardings, dataclasses, mappings,
     and opaque objects."""
     if isinstance(value, (bool, str)):
@@ -551,61 +572,49 @@ def _parameter_key_other(value, kind: type) -> Hashable:
     if isinstance(value, ShapedArray):
         return _abstract_key(value)
     if value is Layout.AUTO:
-        # The layout XLA chooses, one singleton.
         return "layout", "auto"
     if isinstance(value, Layout):
-        return ("layout", parameter_key(value.major_to_minor), parameter_key(value.tiling),
+        return ("layout", _parameter_key(value.major_to_minor, seen), _parameter_key(value.tiling, seen),
                 value.sub_byte_element_size_in_bits)
     if isinstance(value, jax.sharding.Mesh):
-        # An empty mesh (a jit's context outside any) holds no devices.
         devices = () if value.empty else value.device_ids
-        return ("mesh", parameter_key(devices), parameter_key(value.axis_names),
-                parameter_key(value.axis_types))
+        return ("mesh", _parameter_key(devices, seen), _parameter_key(value.axis_names, seen),
+                _parameter_key(value.axis_types, seen))
     if isinstance(value, jax.sharding.AbstractMesh):
-        return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
-                parameter_key(value.axis_types), parameter_key(value.abstract_device))
+        return ("abstract mesh", _parameter_key(value.axis_sizes, seen),
+                _parameter_key(value.axis_names, seen), _parameter_key(value.axis_types, seen),
+                _parameter_key(value.abstract_device, seen))
     if isinstance(value, jax.sharding.NamedSharding):
-        # Its mesh, partitions, memory and logical device order, as JAX pickles it, which its equality reads.
         _, arguments = value.__reduce__()
-        return "named sharding", parameter_key(arguments)
-    if isinstance(value, functools.partial):
-        return "partial", parameter_key(value.func), parameter_key(value.args), parameter_key(value.keywords)
+        return "named sharding", _parameter_key(arguments, seen)
     if isinstance(value, jax.sharding.PartitionSpec):
-        return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
-                parameter_key(value.reduced), parameter_key(value.unreduced_kind))
+        return ("partitions", _parameter_key(tuple(value), seen), _parameter_key(value.unreduced, seen),
+                _parameter_key(value.reduced, seen), _parameter_key(value.unreduced_kind, seen))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (("object", _named(kind), _Identity(value)) if kind.__eq__ is object.__eq__ else
-                ("record", _named(kind), tuple((f.name, parameter_key(getattr(value, f.name)))
-                                               for f in dataclasses.fields(value))))
-    if isinstance(value, (tuple, list)):
-        # A named tuple's type names its fields, which its parts take in order.
-        return "sequence", _named(kind), tuple(parameter_key(part) for part in value)
-    if isinstance(value, (set, frozenset)):
-        return "set", tuple(sorted((parameter_key(part) for part in value), key=repr))
-    if isinstance(value, Mapping):
-        return "mapping", tuple(sorted(((parameter_key(name), parameter_key(part))
-                                        for name, part in value.items()), key=repr))
+        if kind.__eq__ is object.__eq__:
+            return "object", _named(kind), _Identity(value)
+        return _cycle_guard(value, kind, seen, reject_device=False, build=lambda: (
+            "record", _named(kind), tuple((f.name, _parameter_key(getattr(value, f.name), seen))
+                                          for f in dataclasses.fields(value))))
+    if (boxed := _container_param_key(value, kind, lambda part: _parameter_key(part, seen), seen,
+                                      reject_device=False)) is not None:
+        return boxed
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
     try:
         hash(value)
     except TypeError:
-        # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
-        # them: keyed by its identity.
         return "object", _named(kind), _Identity(value)
     return "object", _named(kind), value
 
 
 class _SubKey:
-    """Memoized structural key for a `jcore.Jaxpr` with O(1) cached hash and DAG-bounded equality
-    (`_subkeys_equal`), held by child reference so shared nested-jit DAGs stay O(V) in work and slots."""
+    """DAG-memoized structural key for a `jcore.Jaxpr` with O(1) hash and O(V) equality."""
 
     __slots__ = ("_hash", "digest", "opaques")
 
     def __init__(self, digest: str, opaques: tuple[Hashable, ...]) -> None:
-        self.digest = digest
-        self.opaques = opaques
-        self._hash = hash((digest, opaques))
+        self.digest, self.opaques, self._hash = digest, opaques, hash((digest, opaques))
 
     def __repr__(self) -> str:
         return f"_SubKey({self.digest!r})"
@@ -614,15 +623,11 @@ class _SubKey:
         return self._hash
 
     def __eq__(self, other) -> bool:
-        if self is other:
-            return True
-        if not isinstance(other, _SubKey) or self._hash != other._hash or self.digest != other.digest:
-            return False
-        return _subkeys_equal(self, other)
+        return (self is other or (isinstance(other, _SubKey) and self._hash == other._hash
+                                  and self.digest == other.digest and _subkeys_equal(self, other)))
 
 
 def _subkey_child(entry) -> _SubKey | None:
-    """Return the child `_SubKey` wrapped by `("object", "subkey", child)`, or None."""
     if (isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "object"
             and entry[1] == "subkey" and isinstance(entry[2], _SubKey)):
         return entry[2]
@@ -657,36 +662,27 @@ def _subkeys_equal(left: _SubKey, right: _SubKey) -> bool:
 
 _JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]]] = (
     weakref.WeakKeyDictionary())
-"""Cross-process `(blake2b_hex, opaque_objects)` digest per `jcore.Jaxpr`, held while the jaxpr lives."""
-
 _IN_PROCESS_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, _SubKey] = weakref.WeakKeyDictionary()
-"""In-process DAG-memoized `_SubKey` per `jcore.Jaxpr` (`jaxpr_digest(..., in_process=True)`)."""
-
 _BODY_KEYS: weakref.WeakKeyDictionary[jcore.Jaxpr, _SubKey | None] = weakref.WeakKeyDictionary()
-"""In-process structural key per const-free `jcore.Jaxpr` (`body_key`), None when unshareable."""
 
 
 class _Unshareable(Exception):
-    """Raised internally by `body_key` when a body holds nested consts or device arrays."""
+    """Raised internally by `body_key` when a body holds nested consts, cycles, or device arrays."""
 
 
 def _nested_const_key(const) -> Hashable:
-    """Key a nested `Jaxpr.consts` entry without transferring device arrays to host."""
     if isinstance(const, jax.Array) and not isinstance(const, jax_core.Tracer):
         return "object", _named(type(const)), _Identity(const)
     return parameter_key(const)
 
 
 def _extended_dtype(dtype) -> Hashable | None:
-    """Return an opaque entry for extended JAX dtypes (such as typed PRNG specs) that share a tag,
-    without calling `jnp.issubdtype` on plain `np.dtype` (including `float0`) or string tags."""
     if isinstance(dtype, (str, np.dtype)):
         return None
     return ("object", "extended_dtype", dtype) if jnp.issubdtype(dtype, jax.dtypes.extended) else None
 
 
 def _in_process_digest(jaxpr: jcore.Jaxpr) -> _SubKey:
-    """Return the DAG-memoized `_SubKey` for `jaxpr` (`jaxpr_digest(..., in_process=True)`)."""
     inner = jaxpr.jaxpr
     if (cached := _IN_PROCESS_DIGESTS.get(inner)) is not None:
         return cached
@@ -696,7 +692,6 @@ def _in_process_digest(jaxpr: jcore.Jaxpr) -> _SubKey:
 
 
 def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
-    """Return the DAG-memoized `_SubKey` for const-free `jaxpr`, or None when unshareable."""
     if jaxpr.consts or jaxpr.constvars:
         return None
     inner = jaxpr.jaxpr
@@ -710,28 +705,26 @@ def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
     return made
 
 
-def _dataclass_param_key(value, kind: type, *, reject_device: bool) -> Hashable:
-    """In-process structural key for a dataclass instance preserving exact class identity, identity-equality
-    (`eq=False` / `object.__eq__`), and non-field attributes while declining opaque objects in body keys."""
-    if kind.__eq__ is object.__eq__:
-        if reject_device:
-            raise _Unshareable
-        return "object", _named(kind), _Identity(value)
+def _dataclass_param_key(value, kind: type, *, reject_device: bool, seen: set[int]) -> Hashable:
+    """In-process structural key for a dataclass preserving class, identity-eq, extra attrs, and cycles."""
     fields = dataclasses.fields(value)
     names = {field.name for field in fields}
     inst = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
     extra_slots = any(
         not set((s,) if isinstance(s, str) else s).issubset(names | {"__dict__", "__weakref__"})
         for cls in kind.__mro__ if (s := cls.__dict__.get("__slots__")) is not None)
-    if (inst is not None and not set(inst).issubset(names)) or extra_slots:
+    if kind.__eq__ is object.__eq__ or (inst is not None and not set(inst).issubset(names)) or extra_slots:
         if reject_device:
             raise _Unshareable
         return "object", _named(kind), _Identity(value)
-    return "record", ("object", "class", kind), tuple(
-        (f.name, _in_process_param_key(getattr(value, f.name), reject_device=reject_device)) for f in fields)
+    return _cycle_guard(
+        value, kind, seen, reject_device=reject_device,
+        build=lambda: ("record", ("object", "class", kind), tuple(
+            (f.name, _in_process_param_key(getattr(value, f.name), reject_device=reject_device, seen=seen))
+            for f in fields)))
 
 
-def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
+def _in_process_param_key(value, *, reject_device: bool, seen: set[int] | None = None) -> Hashable:
     """In-process structural key for an equation parameter preserving executable callable, primitive, and
     extended-dtype identities while never copying `jax.Array` device buffers to host."""
     kind = type(value)
@@ -753,24 +746,15 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         if reject_device:
             raise _Unshareable
         return "object", _named(kind), _Identity(value)
-    if isinstance(value, functools.partial):
-        return ("partial", _in_process_param_key(value.func, reject_device=reject_device),
-                _in_process_param_key(value.args, reject_device=reject_device),
-                _in_process_param_key(value.keywords, reject_device=reject_device))
     if isinstance(value, (types.FunctionType, types.BuiltinFunctionType)):
         return "object", _named(kind), value
+    active = set() if seen is None else seen
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _dataclass_param_key(value, kind, reject_device=reject_device)
-    if isinstance(value, (tuple, list)):
-        return "sequence", _named(kind), tuple(
-            _in_process_param_key(part, reject_device=reject_device) for part in value)
-    if isinstance(value, (set, frozenset)):
-        return "set", tuple(sorted(
-            (_in_process_param_key(part, reject_device=reject_device) for part in value), key=repr))
-    if isinstance(value, Mapping):
-        return "mapping", tuple(sorted(((_in_process_param_key(k, reject_device=reject_device),
-                                         _in_process_param_key(v, reject_device=reject_device))
-                                        for k, v in value.items()), key=repr))
+        return _dataclass_param_key(value, kind, reject_device=reject_device, seen=active)
+    if (boxed := _container_param_key(
+            value, kind, lambda part: _in_process_param_key(part, reject_device=reject_device, seen=active),
+            active, reject_device=reject_device)) is not None:
+        return boxed
     if callable(value) and not isinstance(value, (type, np.dtype, jax.sharding.Mesh)):
         if reject_device:
             raise _Unshareable
@@ -781,7 +765,7 @@ def _in_process_param_key(value, *, reject_device: bool) -> Hashable:
         except TypeError:
             return "object", _named(kind), _Identity(value)
         return "object", _named(kind), value
-    return _parameter_key_other(value, kind)
+    return _parameter_key_other(value, kind, active)
 
 
 def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
@@ -1207,13 +1191,25 @@ def _aligned_unit_axes(kept: tuple[int | None, ...], rank: int) -> bool:
             and all(entry in (axis, None) for axis, entry in enumerate(kept)))
 
 
-def _lossless_float_cast(source, out) -> bool:
-    """Whether `convert_element_type` is a same-width or widening floating cast (exact value preserved)."""
-    if not (isinstance(source.aval, ShapedArray) and isinstance(out.aval, ShapedArray)):
+def dtype_lossless_in(src_dtype, dst_dtype) -> bool:
+    """Whether every finite value (normal or subnormal) of floating `src_dtype` is exact in `dst_dtype`."""
+    src_dt, dst_dt = jnp.dtype(src_dtype), jnp.dtype(dst_dtype)
+    if src_dt == dst_dt:
+        return True
+    if not (jnp.issubdtype(src_dt, jnp.floating) and jnp.issubdtype(dst_dt, jnp.floating)):
         return False
-    src_dt, dst_dt = source.aval.dtype, out.aval.dtype
-    return (jnp.issubdtype(src_dt, jnp.floating) and jnp.issubdtype(dst_dt, jnp.floating)
-            and jnp.dtype(dst_dt).itemsize >= jnp.dtype(src_dt).itemsize)
+    src, dst = jnp.finfo(src_dt), jnp.finfo(dst_dt)
+    return (int(src.nmant) <= int(dst.nmant)
+            and int(src.minexp) >= int(dst.minexp)
+            and int(src.minexp) - int(src.nmant) >= int(dst.minexp) - int(dst.nmant)
+            and int(src.maxexp) <= int(dst.maxexp)
+            and float(src.min) >= float(dst.min) and float(src.max) <= float(dst.max))
+
+
+def _lossless_float_cast(source, out) -> bool:
+    """Whether `convert_element_type` preserves every finite floating value losslessly."""
+    return (isinstance(source.aval, ShapedArray) and isinstance(out.aval, ShapedArray)
+            and dtype_lossless_in(source.aval.dtype, out.aval.dtype))
 
 
 class _NormTrack:

@@ -1191,22 +1191,6 @@ _STATE_PASSTHROUGH = frozenset({
 })
 
 
-def _dtype_lossless_in(src_dtype, dst_dtype) -> bool:
-    """Whether every finite value (normal or subnormal) of floating `src_dtype` is exact in `dst_dtype`."""
-    src_dt, dst_dt = jnp.dtype(src_dtype), jnp.dtype(dst_dtype)
-    if src_dt == dst_dt:
-        return True
-    if not (jnp.issubdtype(src_dt, jnp.floating) and jnp.issubdtype(dst_dt, jnp.floating)):
-        return False
-    src, dst = jnp.finfo(src_dt), jnp.finfo(dst_dt)
-    return (int(src.nmant) <= int(dst.nmant)
-            and int(src.minexp) >= int(dst.minexp)
-            and int(src.minexp) - int(src.nmant) >= int(dst.minexp) - int(dst.nmant)
-            and int(src.maxexp) <= int(dst.maxexp)
-            and float(src.min) >= float(dst.min)
-            and float(src.max) <= float(dst.max))
-
-
 def _state_source_dtype(index: fusion.Index, var: jcore.Var):
     """Narrowest floating source dtype losslessly widened into `var` through pure view/copy ops."""
     current = aval(var).dtype
@@ -1227,7 +1211,8 @@ def _state_source_dtype(index: fusion.Index, var: jcore.Var):
             if not isinstance(src, jcore.Var):
                 break
             cur = src
-        elif eq_.primitive is jax.lax.convert_element_type_p and _dtype_lossless_in(src.aval.dtype, current):
+        elif (eq_.primitive is jax.lax.convert_element_type_p
+              and terms.dtype_lossless_in(src.aval.dtype, current)):
             current = src.aval.dtype
             if not isinstance(src, jcore.Var):
                 break
@@ -1246,25 +1231,107 @@ _RECURRENCE_ROUTES: collections.OrderedDict[Hashable, Held[tuple[bool, frozenset
     collections.OrderedDict())
 """Selected forward or training recurrence kernels by `(kind, operand shapes/dtypes, options, context)`."""
 
+_RECURRENCE_LAYOUTS: collections.OrderedDict[Hashable, Held[tuple[jnp.dtype, int, int, int] | None]] = (
+    collections.OrderedDict())
+"""Kernel held-state layout `(inter_dtype, inter_nmant, stored_sub_exp, chunk_size)` per route/context."""
 
-def _recurrence_inter_precision(kernel: str, hooks, common):
-    """`(inter_dtype, inter_nmant)` for selected recurrence `kernel` (`scores`, entered state, `corrected`),
-    or None for any unrecognized kernel (which keeps the plain scan intact). Accounts for TF32/2-part fp32
-    rounding so an IEEE fp32 scan is never narrowed."""
+
+def _operand_precision(operand) -> tuple[jnp.dtype, int, int]:
+    """`(inter_dtype, inter_nmant, stored_sub_exp)` represented by a recurrence `mainloop.Operand`: 1-part
+    fp32 is TF32 (10 mantissa bits); 1-part 16-bit is its native mantissa; multi-part splits hold
+    `parts * (stored.nmant + 1) - 1` mantissa bits down to `stored`'s subnormal floor."""
+    dt = jnp.dtype(operand.dtype)
+    stored_info = jnp.finfo(operand.stored)
+    sub_exp = int(stored_info.minexp) - int(stored_info.nmant)
+    if operand.parts == 1:
+        return dt, (10 if dt == jnp.float32 else int(jnp.finfo(dt).nmant)), sub_exp
+    part_bits = int(stored_info.nmant) + 1
+    return dt, min(int(jnp.finfo(dt).nmant), operand.parts * part_bits - 1), sub_exp
+
+
+def _mosaic_layout(hooks, roles: tuple[tuple[str, int], ...], operands: Sequence[jcore.Var],
+                   common, out_dtype, *, keeps: bool) -> tuple[jnp.dtype, int, int, int] | None:
+    """Read `(inter_dtype, inter_nmant, stored_sub_exp, chunk_size)` directly from `chunk_forward.prepared`'s
+    `Call.held` and `Call.chunk` for forward (`keeps=False`) or training (`keeps=True`), without compiling
+    any kernel (`mainloop.PLANNED`)."""
     from dew.nn.kernels import recurrence_chunk
+    from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
     common_dt = jnp.dtype(common)
+    by_name = {name: jax.ShapeDtypeStruct((a.shape[1], a.shape[0], *a.shape[2:]), a.dtype)
+               for name, pos in roles for a in (aval(operands[pos]),)}
+    q, k, v = by_name["query"], by_name["key"], by_name["value"]
+    work = aval(operands[0]).dtype
+    g = by_name.get("log_decay", jax.ShapeDtypeStruct((*q.shape[:2], v.shape[2]), work))
+    beta = by_name.get("beta", jax.ShapeDtypeStruct(v.shape[:3], work))
+    state = _shape(operands[0])
+    epilogue = hooks.output is not None or jnp.dtype(out_dtype) != common_dt
+    fused_wide = (hooks.skip or epilogue) if hooks.delta else epilogue
+    values_gated = recurrence_chunk.simple_gla(hooks)
+    rounded = recurrence_chunk.chunk_rounding(hooks.delta, common_dt, released=values_gated)
+    scale = (k.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
+    bound_call, _ = recurrence_chunk.template_bind(
+        q, k, v, g, beta, state, scale=scale, delta=hooks.delta, wide=fused_wide,
+        bound=hooks.inverse_bound, rounded=rounded, apart=hooks.apart, values_gated=values_gated)
+    impl, ba = bound_call.bound["mosaic_gpu"]
+    tiles = impl.taken(ba)
+    if tiles is None:
+        return None
+    active_tiles = tiles if keeps else (tiles.forward or tiles)
+    family, interpret = mainloop.issued(common_dt)
+    args = ba.arguments
+    ranged = template.ranged(common_dt, args.get("delta", True), args.get("bound"))
+    captured: list[mainloop.Call] = []
+
+    def probe(q_, k_, v_, g_, beta_, h0_):
+        token = mainloop.PLANNED.set([])
+        try:
+            run = chunk_forward.prepared(
+                q_, k_, v_, g_, beta_, h0_, starts=None, max_segments=None, scale=args.get("scale"),
+                delta=args.get("delta", True), tiles=active_tiles, family=family, interpret=interpret,
+                keeps=keeps, rounded=args.get("rounded", False), apart=args.get("apart", 0),
+                values_gated=args.get("values_gated", False), ranged=ranged,
+                out_dtype=jnp.float32 if args.get("wide", False) else None)
+            captured.append(run.call)
+        finally:
+            mainloop.PLANNED.reset(token)
+        return run.h
+
+    jax.eval_shape(probe, args["query"], args["key"], args["value"], args["g"], args["beta"], args["state"])
+    call = captured[0]
+    return (*_operand_precision(call.held), int(call.chunk))
+
+
+def _recurrence_kernel_layout(kernel: str, hooks, roles: tuple[tuple[str, int], ...],
+                              operands: Sequence[jcore.Var], common, out_dtype, *,
+                              keeps: bool) -> tuple[jnp.dtype, int, int, int] | None:
+    """`(inter_dtype, inter_nmant, stored_sub_exp, chunk_size)` from the selected kernel's own operand layout
+    (`chunk_forward.prepared` for `mosaic_gpu`, `fla_gdn`/`recurrence_chunk.CHUNK_SIZE` for `fla`), or None
+    for any unrecognized kernel."""
+    from dew.nn.kernels import recurrence_chunk
+
     if kernel == "fla":
-        return common_dt, (10 if common_dt == jnp.float32 else int(jnp.finfo(common_dt).nmant))
-    if kernel == "mosaic_gpu":
-        rounded = recurrence_chunk.chunk_rounding(
-            hooks.delta, common_dt, released=recurrence_chunk.simple_gla(hooks))
-        if common_dt == jnp.float32:
-            return common_dt, (10 if rounded else 23)
-        if hooks.delta or rounded:
-            return common_dt, int(jnp.finfo(common_dt).nmant)
-        return jnp.dtype(jnp.float32), 23
-    return None
+        common_dt = jnp.dtype(common)
+        info = jnp.finfo(common_dt)
+        nmant = 10 if common_dt == jnp.float32 else int(info.nmant)
+        return common_dt, nmant, int(info.minexp) - int(info.nmant), recurrence_chunk.CHUNK_SIZE
+    if kernel != "mosaic_gpu":
+        return None
+    key = (kernel, keeps, tuple((aval(var).shape, aval(var).dtype) for var in operands),
+           hooks, roles, jnp.dtype(out_dtype), fusion.choice_context())
+    return _cache.holding(
+        _RECURRENCE_LAYOUTS, key,
+        lambda: _mosaic_layout(hooks, roles, operands, common, out_dtype, keeps=keeps),
+        fusion.DECISIONS_HELD)
+
+
+def _lossless_in_layout(src_dtype, inter_dtype, inter_nmant: int, stored_sub_exp: int) -> bool:
+    """Whether every finite value of `src_dtype` is exact in a kernel layout `(inter_dtype, inter_nmant,
+    stored_sub_exp)`."""
+    if not terms.dtype_lossless_in(src_dtype, inter_dtype):
+        return False
+    src = jnp.finfo(src_dtype)
+    return int(src.nmant) <= inter_nmant and int(src.minexp) - int(src.nmant) >= stored_sub_exp
 
 
 def _norm_bits(bound: terms.Magnitude, apart: terms.Apart, half_key_bits: int) -> int:
@@ -1280,12 +1347,13 @@ def _recurrence_bounded(
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
     v_bound: terms.Magnitude | None, v_apart: terms.Apart,
     beta_bound: terms.Magnitude | None, beta_apart: terms.Apart, *,
-    seq_len: int, key_width: int, inter_dtype, inter_nmant: int, state_source_dtype, out_dtype,
-    scale: float | None, delta: bool, has_beta: bool,
+    seq_len: int, key_width: int, inter_dtype, inter_nmant: int, stored_sub_exp: int, chunk_size: int,
+    state_dtype, state_source_dtype, out_dtype, scale: float | None, delta: bool, has_beta: bool,
+    decay: str,
 ) -> bool:
-    """Whether the selected chunked kernel's intermediate precision (`_recurrence_inter_precision`) preserves
-    lossless entering-state reads, upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive WY
-    inverse, peak state/readout), and lower-range non-underflow into `out_dtype` (row 3450)."""
+    """Whether the selected chunked kernel's operand layout (`_recurrence_kernel_layout`) preserves lossless
+    entering-state and inter-chunk carries, upper-range finiteness (ungated `K @ K^T`, `Q @ K^T`, contractive
+    WY inverse, peak state/readout), and lower-range non-underflow into `out_dtype` (row 3450)."""
     if (state_bound is None or q_bound is None or k_bound is None or v_bound is None
             or not (state_apart.finite and q_apart.finite and k_apart.finite and v_apart.finite)
             or (scale is not None and (not math.isfinite(scale) or scale <= 0.0 or scale > 1.0))
@@ -1294,9 +1362,8 @@ def _recurrence_bounded(
     inter_info, out_info = jnp.finfo(inter_dtype), jnp.finfo(out_dtype)
     if inter_nmant < int(out_info.nmant):
         return False
-    if state_bound != terms.NOTHING and (
-            not _dtype_lossless_in(state_source_dtype, inter_dtype)
-            or int(jnp.finfo(state_source_dtype).nmant) > inter_nmant):
+    if state_bound != terms.NOTHING and not _lossless_in_layout(
+            state_source_dtype, inter_dtype, inter_nmant, stored_sub_exp):
         return False
     work_cap = min(56, int(inter_info.maxexp) - 4)
     v_cap = int(out_info.minexp) - int(inter_info.minexp)
@@ -1326,6 +1393,13 @@ def _recurrence_bounded(
     write_bits = (terms.NOTHING if v_bound == terms.NOTHING or k_norm == terms.NOTHING
                   or (has_beta and beta_bound == terms.NOTHING)
                   else v_bound + k_norm + beta_bits + seq_bits)
+    state_unchanged = write_bits == terms.NOTHING and (
+        state_bound == terms.NOTHING
+        or (decay == "none" and (not delta or k_norm == terms.NOTHING
+                                 or (has_beta and beta_bound == terms.NOTHING))))
+    if seq_len > chunk_size and not state_unchanged and not _lossless_in_layout(
+            state_dtype, inter_dtype, inter_nmant, stored_sub_exp):
+        return False
     state_peak = (write_bits if h0_norm == terms.NOTHING
                   else h0_norm if write_bits == terms.NOTHING
                   else max(h0_norm, write_bits) + 1)
@@ -1447,7 +1521,8 @@ def _recurrence_kernels(call: Callable, operands: Sequence[jcore.Var], options: 
 
 
 def _recurrence_route_admits(
-    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks, *,
+    call: Callable, operands: Sequence[jcore.Var], options: Hashable, hooks,
+    roles: tuple[tuple[str, int], ...], *,
     state_bound: terms.Magnitude | None, state_apart: terms.Apart, state_source_dtype,
     q_bound: terms.Magnitude | None, q_apart: terms.Apart,
     k_bound: terms.Magnitude | None, k_apart: terms.Apart,
@@ -1456,25 +1531,26 @@ def _recurrence_route_admits(
     seq_len: int, key_width: int, common, out_dtype, scale: float | None, delta: bool, has_beta: bool,
 ) -> bool:
     """Validate training VJP eligibility and numerical range against each ACTUAL selected forward and
-    training kernel's intermediate arithmetic (`_recurrence_inter_precision`), checked only after token
-    equivalence is proven; under `precision="accurate"` leaves plain token scans intact."""
+    training kernel's operand layout (`_recurrence_kernel_layout`), checked only after token equivalence is
+    proven; under `precision="accurate"` leaves plain token scans intact."""
     if generation.numerics().forms == "accurate":
         return False
     fwd_ok, fwd_kernels = _recurrence_kernels(call, operands, options, vjp=False)
     bwd_ok, bwd_kernels = _recurrence_kernels(call, operands, options, vjp=True)
     if not (fwd_ok and bwd_ok):
         return False
-    active = fwd_kernels | bwd_kernels
+    active = {*((kernel, False) for kernel in fwd_kernels), *((kernel, True) for kernel in bwd_kernels)}
     if not active:
         return False
-    for kernel in active:
-        precision = _recurrence_inter_precision(kernel, hooks, common)
-        if precision is None or not _recurrence_bounded(
+    state_dtype = aval(operands[0]).dtype
+    for kernel, keeps in active:
+        layout = _recurrence_kernel_layout(kernel, hooks, roles, operands, common, out_dtype, keeps=keeps)
+        if layout is None or not _recurrence_bounded(
                 state_bound, state_apart, q_bound, q_apart, k_bound, k_apart, v_bound, v_apart,
                 beta_bound, beta_apart, seq_len=seq_len, key_width=key_width,
-                inter_dtype=precision[0], inter_nmant=precision[1],
-                state_source_dtype=state_source_dtype, out_dtype=out_dtype,
-                scale=scale, delta=delta, has_beta=has_beta):
+                inter_dtype=layout[0], inter_nmant=layout[1], stored_sub_exp=layout[2], chunk_size=layout[3],
+                state_dtype=state_dtype, state_source_dtype=state_source_dtype, out_dtype=out_dtype,
+                scale=scale, delta=delta, has_beta=has_beta, decay=hooks.decay):
             return False
     return True
 
@@ -1541,7 +1617,7 @@ def _recurrence_candidates(
                                                  out_dtype=ys_aval.dtype)
                         opts = (hooks, roles, ys_aval.dtype)
                         admit = functools.partial(
-                            _recurrence_route_admits, call, operands, opts, hooks,
+                            _recurrence_route_admits, call, operands, opts, hooks, roles,
                             state_bound=state_bound, state_apart=state_apart,
                             state_source_dtype=state_source_dtype,
                             q_bound=q_bound, q_apart=q_apart, k_bound=k_bound, k_apart=k_apart,
