@@ -76,6 +76,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
@@ -1681,9 +1682,8 @@ class RunConfig:
             microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
             advanced=training.TrainerAdvanced(
                 layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
-                skip_nonfinite=trainer.skip_nonfinite,
-                dynamic_scale=trainer.precision.scales_loss(self.compute_dtype()),
-                tune_kernels=self.diagnostics.tune_kernels, param_dtype=self.drawn_dtype(),
+                skip_nonfinite=trainer.skip_nonfinite, numerics=self.trained_numerics(),
+                tune_kernels=self.diagnostics.tune_kernels,
                 inspection=trainer.inspection, diloco=trainer.diloco,
                 **{"links": self.diagnostics.links, **resources}))
 
@@ -1693,13 +1693,15 @@ class RunConfig:
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
-    def drawn_dtype(self) -> str | None:
-        """The dtype the run stores the parameters it draws fresh in (`Trainer`'s `param_dtype`): its
-        numerics' `dtypes.params` where that is not Flax's own float32 and its model's record states
-        none; None leaves each module's own."""
-        params = self.trainer.precision.dtypes.params
-        return None if "param_dtype" in self.model.fields or jax.numpy.dtype(params) == jax.numpy.float32 \
-            else params
+    def trained_numerics(self) -> Numerics:
+        """The run's numerics as its trainer reads them (`TrainerAdvanced.numerics`): its precision, with
+        the compute dtype its model computes in (`compute_dtype`) and the parameters' its model's record
+        states in their place, which the model then draws them in itself."""
+        precision = self.trainer.precision
+        stated = self.model.fields.get("param_dtype")
+        params = precision.dtypes.params if stated is None else jax.numpy.dtype(stated).name
+        return dataclasses.replace(precision, dtypes=dataclasses.replace(
+            precision.dtypes, compute=jax.numpy.dtype(self.compute_dtype()).name, params=params))
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,

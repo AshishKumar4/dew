@@ -25,7 +25,7 @@ import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import struct
+from flax import linen, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
@@ -50,7 +50,7 @@ from dew.nn.inspection import (
 )
 from dew.nn.kernels.options import abstract_signature, owned_program, program, trace_context
 from dew.nn.moe import fixed_routers
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Numerics, at_least_fp32
 from dew.nn.programs import called, computed
 from dew.nn.sharding import constrained, rows_spec
 from dew.objectives.base import (
@@ -814,6 +814,31 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
         return dynamic_scale
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
+def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                   numerics: Numerics) -> tuple[bool, str | None]:
+    """Whether a trainer under `numerics` scales its loss dynamically and the dtype it stores the parameters
+    it draws fresh in (`TrainerAdvanced.numerics`): the one resolution of both, a run config's among them
+    (`dew.config.RunConfig.trained_numerics`). A model computes in the dtype it was built with, a field of
+    its own the trainer cannot set, so a module `objective` trains that computes in another dtype than
+    `numerics`' compute is refused (Flax's None, in its parameters')."""
+    modules = [entry.module for entry in objective.program_key()
+               if entry.trained and isinstance(entry.module, linen.Module)]
+    fields = [{field.name: getattr(module, field.name) for field in dataclasses.fields(module)}
+              for module in modules]
+    drawn = numerics.drawn_dtype([held["param_dtype"] for held in fields
+                                  if held.get("param_dtype") is not None])
+    compute = jnp.dtype(numerics.dtypes.compute)
+    for module, held in zip(modules, fields, strict=True):
+        if "dtype" not in held:
+            continue
+        computed = jnp.dtype(numerics.dtypes.params if held["dtype"] is None else held["dtype"])
+        if computed != compute:
+            raise ValueError(f"{type(module).__name__} computes in {computed} and the run's numerics in "
+                             f"{compute}: build the model with dtype={compute.name}, or name its dtype in "
+                             "the numerics (Dtypes.compute)")
+    return numerics.scales_loss(), drawn
 
 
 def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):

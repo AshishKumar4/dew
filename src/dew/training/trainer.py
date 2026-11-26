@@ -70,6 +70,7 @@ from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
+from dew.nn.precision import Numerics
 from dew.nn.sharding import Link, Schedule, boxed, explicit_placement, tracing
 from dew.objectives.base import (
     Aux,
@@ -151,6 +152,7 @@ from dew.training.distributed import (
     check_stream,
     marked,
     microbatch_shapes,
+    numbered,
     placed_start,
     ruled,
     stage_microbatches,
@@ -188,6 +190,7 @@ from dew.training.transaction import (
     Transaction,
     checked,
     loss_scale,
+    numerics_read,
     refuse_unpassed_progress,
     traced_loss,
 )
@@ -287,6 +290,13 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """What the run watches at its sampled steps (`dew.training.inspection`)."""
     param_dtype: str | None = None
     """The dtype fresh parameters are stored in (Flax's `param_dtype`); None, each module's own."""
+    numerics: Numerics | None = None
+    """The run's numerics (`dew.nn.precision.Numerics`), a run config's `trainer.precision`: every program
+    the trainer traces runs under its products, forms, low-precision recipe and outputs
+    (`generation.run_precision`), the parameters it draws fresh are stored in its `dtypes.params` and its
+    `loss_scaling` scales the loss (`numerics_read`); a model it trains that computes in another dtype than
+    its `dtypes.compute` is refused. It states what `param_dtype` and `dynamic_scale` state, so it is set
+    without them."""
     diloco: DiLoCo | None = None
     """Trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`)."""
     phase_passes: Sequence[int] | None = None
@@ -364,6 +374,12 @@ class Trainer(Generic[Loss, Effects]):
         layout, rollout, step, record = advanced.layout, advanced.rollout, advanced.step, advanced.record
         inspection, diloco, sampled_passes = advanced.inspection, advanced.diloco, advanced.sampled_passes
         dynamic_scale, links, data_resume = advanced.dynamic_scale, advanced.links, advanced.data_resume
+        param_dtype, self.numerics = advanced.param_dtype, advanced.numerics
+        if self.numerics is not None:
+            if param_dtype is not None or dynamic_scale is not False:
+                raise ValueError("a run's numerics name its parameter dtype and loss scaling: set "
+                                 "TrainerAdvanced's numerics, or its param_dtype and dynamic_scale")
+            dynamic_scale, param_dtype = numerics_read(objective, self.numerics)
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
@@ -394,7 +410,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = advanced.profile
         self.lower_for, self.tune_kernels = advanced.lower_for, advanced.tune_kernels
-        self.inspection, self.param_dtype, self.diloco = inspection, advanced.param_dtype, diloco
+        self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         self.phase_passes = PhasePasses.of(objective, advanced.phase_passes, sampled_passes)
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
@@ -439,6 +455,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
 
+    @numbered
     def initial_state(self, initializer: Initializer | None = None,
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`),
@@ -714,6 +731,7 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
+    @numbered
     @ruled
     def validate(self, batch: Batch | None = None, *, steps: int | None = None) -> Validation:
         """What `fit` checks of the state before it places it (`Layout.validate`), read without
@@ -776,6 +794,7 @@ class Trainer(Generic[Loss, Effects]):
             return agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed))
 
+    @numbered
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
@@ -1075,6 +1094,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(f"an update of {self.update.tokens} tokens pools the data's token batches, "
                              "which no loader has stated yet: fit it with a loader, which states one")
 
+    @numbered
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
         """Compile a transaction over the state and one produced global batch (`StepCompiler.compile`).
@@ -1176,6 +1196,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         return dropped(state)
 
+    @numbered
     @ruled
     def fit(
         self,
