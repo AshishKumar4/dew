@@ -340,17 +340,16 @@ class StageLocal:
         from dew.state import apart, together  # read where called, as this module reads dew.state's types
         from dew.training.planning import released
 
-        # Placed whole giving the handed arrays over (`donate`), where a placement other than theirs copies
-        # them, so no handed array outlives its copy; then stacked giving the copies over.
-        (moving, frozen), (moving_laid, frozen_laid) = apart(state), apart(laid)
-        moving = jax.device_put(moving, moving_laid, donate=True)
-        frozen = jax.device_put(frozen, frozen_laid)
+        # Placed whole giving the handed arrays over (`donate`, where a placement other than theirs copies
+        # them), then stacked giving the placed ones over; the handed arrays no placement or stacking
+        # aliased are freed after (`planning.released`), as nothing reads the handed state again: a
+        # placement JAX reshards by slicing gives nothing over, and a layer stacked anew aliases nothing.
+        (handed, frozen), (moving_laid, frozen_laid) = apart(state), apart(laid)
+        moving = jax.device_put(handed, moving_laid, donate=True)
         stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
                                  out_shardings=placement, donate_argnums=0)
-        stacked = stacking(moving, frozen)
-        # A layer stacked anew aliases no buffer it was given, which XLA leaves alive: freed too
-        # (`planning.released`), as nothing reads the handed state again.
-        released(moving)
+        stacked = stacking(moving, jax.device_put(frozen, frozen_laid))
+        released([leaf for leaf in jax.tree.leaves((moving, handed)) if isinstance(leaf, jax.Array)])
         return stacked, placement
 
     @overload

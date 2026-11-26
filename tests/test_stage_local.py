@@ -991,13 +991,14 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     model, optimizer = decoder(), optax.adam(1e-2)
     trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
     stored = on_host(trainer(model, optimizer, STAGED, 8).stored(trained).variables)
-    four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
-    restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
-    assert int(restarted.step) == 2
+    # Read before the four-stage fit takes the state over (`Trainer.fit`'s `state`).
     flat = Trainer(LMObjective(model, SEQ, variables=trained.variables), optimizer, key=jax.random.key(0),
                    mesh=MeshSpec(fsdp=2), advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
                    tracker=None)
     started = on_host(flat.initial_state().variables)
+    four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
+    restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
+    assert int(restarted.step) == 2
     assert jax.tree.structure(started) == jax.tree.structure(stored)
     for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
         np.testing.assert_array_equal(mine, theirs)
@@ -1131,4 +1132,18 @@ def test_a_fit_handed_a_scanned_runs_state_holds_it_once():
     assert seen and max(seen) < 1.5, seen
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state.variables["params"]))
     assert not any(leaf.is_deleted() for leaf in frozen)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_staged_run_handed_a_state_on_another_placement_frees_what_it_was_handed():
+    """A two-stage run handed a state on one device, which its placement reshards over its stages and fsdp
+    shards by slicing (JAX gives nothing over there), takes it over all the same: every handed moving array
+    is freed once the run has placed and stacked it (`Staging.supplied`), and the run trains from it (row
+    12463's review)."""
+    model, optimizer = decoder(), optax.adam(1e-2)
+    trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
+    handed = jax.device_put(trained, jax.devices()[0])
+    restarted = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=2, log_every=1, state=handed)
+    assert int(restarted.step) == 2
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(handed.variables["params"]))
 

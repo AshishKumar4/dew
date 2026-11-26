@@ -1194,7 +1194,9 @@ class Trainer(Generic[Loss, Effects]):
         a directory that already holds a run (`Checkpoints.resumed`). An explicit `state` is the run's
         initial state, in place of initializing one and of restoring a checkpoint (a float64 truth's widened
         copy of another run's, say), not a continuation, which is a checkpoint's alone: its input reader
-        starts at the position `dataset` supplies.
+        starts at the position `dataset` supplies. The run takes it over: its moving arrays are the run's
+        to step and free (its frozen trees, which the objective holds, aside), so a caller reads the state
+        `fit` returns, not the one it handed, as JAX's donated arguments go.
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
         The run's length is one of `steps`, `epochs`, `tokens` and `examples` (`Horizon`). `tokens` stops at
