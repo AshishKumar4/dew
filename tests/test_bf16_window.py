@@ -62,10 +62,9 @@ def test_a_group_past_its_escapes_is_refused():
 
 
 def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_back():
-    """A bfloat16 Dense whose kernel `bf16_windows` stores as its window computes its kernel's product (each
-    value dyadic, so every order sums it exactly in fp32, its bias added and rounded once), its kernel
-    decoded back bitwise by
-    `decoded_bf16_windows`, the collection gone."""
+    """A bfloat16 Dense whose kernel `bf16_windows` stores as its window computes what it computes over its
+    kernel, bit for bit (its product of exact dyadic values, its bfloat16 bias added past it as Dense adds
+    one), and `decoded_bf16_windows` gives its kernel back bitwise, the collection gone."""
     rng = np.random.default_rng(5387)
     kernel = (rng.integers(-64, 64, (256, 64)) / 16.0).astype(jnp.bfloat16)
     bias = (rng.integers(-8, 8, (64,)) / 4.0).astype(jnp.float32)
@@ -74,11 +73,8 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
     variables = {"params": {"kernel": jnp.asarray(kernel), "bias": jnp.asarray(bias, jnp.bfloat16)}}
     windowed = quantization.bf16_windows(variables, sites=[""])
     assert "kernel" not in windowed["params"]
-    rounded = np.asarray(bias.astype(jnp.bfloat16), np.float64)
-    want = np.asarray(x, np.float64) @ np.asarray(kernel, np.float64) + rounded
-    # Its fp32 sum exact, plus its bias, rounded once to the layer's bfloat16.
-    np.testing.assert_array_equal(np.asarray(jax.jit(layer.apply)(windowed, x), np.float32),
-                                  np.asarray(want.astype(jnp.bfloat16), np.float32))
+    np.testing.assert_array_equal(np.asarray(jax.jit(layer.apply)(windowed, x)).view(np.uint16),
+                                  np.asarray(jax.jit(layer.apply)(variables, x)).view(np.uint16))
     back = quantization.decoded_bf16_windows(windowed)
     assert set(back) == {"params"}
     np.testing.assert_array_equal(np.asarray(back["params"]["kernel"]).view(np.uint16),
@@ -285,22 +281,27 @@ def test_a_bf16_dense_with_a_narrow_bias_served_its_window_rounds_as_its_kernel(
 
 def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_as_its_kernel():
     """A bfloat16 Dense stating a dot algorithm that narrows its operands (`F16_F16_F32`: a bfloat16 input of
-    `2**-30` is zero in fp16) over a unit kernel computes what it computes over its kernel, served its window
-    too, bit for bit: the window's product multiplies its operands whole, so the layer's own product runs."""
+    `2**-30` is zero in fp16) over a unit kernel, and one stating `F32_F32_F32` under a run's narrowing one
+    (the window's dot reading the run's), compute what they compute over their kernel, served their window
+    too, bit for bit, or refuse alike where the backend runs no such algorithm (a CPU): the window's product
+    multiplies its operands whole, so each layer's own product runs."""
     kernel = np.zeros((128, 64), jnp.bfloat16)
     kernel[0, 0] = 1.0
-    layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
-                  precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)
     variables = {"params": {"kernel": jnp.asarray(kernel)}}
     x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
-    plain = jax.jit(layer.apply)(variables, x)
-    served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
-    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
-    # The run's algorithm narrowing them beneath a layer stating F32_F32_F32: the window's dot would read the
-    # run's, so the layer's own product runs.
+    narrowing = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
+                      precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)
     whole = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
                   precision=jax.lax.DotAlgorithmPreset.F32_F32_F32)
-    with jax.default_matmul_precision("F16_F16_F32"):
-        plain = jax.jit(whole.apply)(variables, x)
-        served = jax.jit(whole.apply)(quantization.bf16_windows(variables, sites=[""]), x)
-    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
+    for layer, run in ((narrowing, None), (whole, "F16_F16_F32")):
+        with jax.default_matmul_precision(run):
+            outs = []
+            for held in (variables, quantization.bf16_windows(variables, sites=[""])):
+                try:
+                    outs.append(np.asarray(jax.jit(layer.apply)(held, x)).view(np.uint16))
+                except ValueError as refused:
+                    outs.append(type(refused))
+        if isinstance(outs[0], np.ndarray):
+            np.testing.assert_array_equal(outs[1], outs[0])
+        else:
+            assert outs[1] is outs[0]

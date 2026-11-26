@@ -45,7 +45,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
-from jax.custom_derivatives import SymbolicZero, zero_from_primal
+from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
 from dew.nn.derivatives import (
@@ -93,7 +93,6 @@ from dew.nn.precision import (
     accumulated,
     asks_default_precision,
     at_least_fp32,
-    effective_precision,
     exact_products,
     twice_scaled,
 )
@@ -850,7 +849,7 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
                       trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
 
     def portable(r: jax.Array, w: jax.Array, s: jax.Array, *rest) -> jax.Array:
-        return decoded_dot(r, decoded(w, *rest), None if dense else s)
+        return xla_products.decoded_dot(r, decoded(w, *rest), None if dense else s)
 
     def forward(r: jax.Array, w: jax.Array, s: jax.Array, *rest):
         with xla_products.interpreted_context(interpret):
@@ -878,39 +877,6 @@ def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
     decoded = (matrix.unscaled(jnp.bfloat16) if isinstance(matrix, TernaryWeights)
                else matrix.decoded())
     return decoded, group_sizes
-
-
-def decoded_dot(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None) -> jax.Array:
-    """A packed matrix's decoded product as XLA's own dot: bf16 `rows` times its decoded `matrix`, summed in
-    fp32, dense (XLA's dot at the configured precision, its transpose too) or grouped by `group_sizes`
-    (`_decoded_ragged_dot`); no nested `gemm`, whose native transpose of an fp32 cotangent may round it."""
-    if group_sizes is None:
-        return jax.lax.dot(rows, matrix, preferred_element_type=jnp.float32)
-    return _decoded_ragged_dot(rows, matrix, group_sizes)
-
-
-def _ragged_value(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array) -> jax.Array:
-    return xla_products.xla_ragged_dot(rows, matrix, group_sizes, preferred_element_type=jnp.float32)
-
-
-def _ragged_tangent(primals, tangents):
-    rows, matrix, group_sizes = primals
-    d_rows = tangents[0]
-    # The rows' direction whole, widening the matrix beside it, at the configured precision, which reverse
-    # mode transposes into the whole cotangent's product (`xla_ragged_dot` multiplies two 16-bit operands at
-    # the default alone, which a TPU's kernel takes at no other); frozen, the matrix moves nothing.
-    tangent = (jnp.zeros((rows.shape[0], matrix.shape[-1]), jnp.float32) if isinstance(d_rows, SymbolicZero)
-               else xla_products.xla_ragged_dot(d_rows.astype(jnp.float32), matrix, group_sizes,
-                                                precision=effective_precision(None),
-                                                preferred_element_type=jnp.float32))
-    return _decoded_ragged_dot(rows, matrix, group_sizes), tangent
-
-
-_decoded_ragged_dot = contracted("test_a_window_product_holds_every_order")(
-    declared_tangent(KernelGlue(), _ragged_value, _ragged_tangent, symbolic_zeros=True))
-"""`decoded_dot`'s grouped product: `xla_products.xla_ragged_dot` (every backend's ragged dot alike, the rows
-past the groups masked), its rows' tangent the ragged dot of the whole fp32 direction at the configured
-precision, whose transpose multiplies the whole cotangent; frozen, its matrix takes none."""
 
 
 def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,

@@ -1228,7 +1228,7 @@ def _check_ternary_weight_product_contract(edge: str) -> None:
 def test_a_window_product_holds_every_order(edge):
     """`gemm.window_product` (a lossless bfloat16 window decoded in the template's stages, `linear_tangent`,
     row 5387): every order in its rows finite against the decoded matrix's plain product, interpreted on the
-    template's route, and grouped on XLA's (`gemm.decoded_dot`'s ragged dot and its declared transpose; its
+    template's route, and grouped on XLA's (`xla_products.decoded_dot`'s ragged dot and its declared transpose; its
     frozen weights take no tangent)."""
     from dew.nn.kernels import formats
     from dew.nn.sharding import automatic_axes

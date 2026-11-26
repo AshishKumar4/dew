@@ -37,7 +37,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     dense, or `[groups, depth, width]` grouped by `group_sizes`): `lhs` rounded to bfloat16, each product of
     a decoded weight (its stored bits again) exact, summed in fp32 and rounded once to `out_dtype` (`lhs`'s
     where None); decoded a stage at a time in the GEMM mainloop where the selector takes it (`WINDOW`), else
-    the decoded matrix's XLA dot (`gemm.decoded_dot`). Frozen: its gradient is the rows' alone."""
+    the decoded matrix's XLA dot (`xla_products.decoded_dot`). Frozen: its gradient is the rows' alone."""
     if not isinstance(window.form, Tracer):
         window.checked()
     dense = group_sizes is None
@@ -67,7 +67,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
         operands = (words, sizes, meta)
     else:
-        product = gemm.decoded_dot
+        product = xla_products.decoded_dot
         operands = (window.decoded(), group_sizes)
     summed = gemm._interpreted(product, interpret_on_cpu, rows, *operands)
     return summed.astype(lhs.dtype if out_dtype is None else out_dtype)
