@@ -119,8 +119,9 @@ class InklingProcessor:
         if text is None or {"audio", "videos", "video_metadata"} & kwargs.keys() \
                 or kwargs.get("return_tensors", "np") != "np":
             raise ValueError("Inkling 2's processor here reads text and raw images into NumPy fields")
-        given = [rgb(image) for image in ([] if images is None else
-                                         images if isinstance(images, Sequence) else [images])]
+        # A path or URL is one image, not a sequence of its characters.
+        atomic = images is None or isinstance(images, str | bytes) or not isinstance(images, Sequence)
+        given = [rgb(image) for image in ([] if images is None else [images] if atomic else images)]
         processed = [merged_blocks(image, self.side) for image in given]
         remaining = iter(processed)
         rows = []
