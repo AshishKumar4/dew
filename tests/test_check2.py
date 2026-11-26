@@ -792,9 +792,11 @@ def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_ro
     """lax.one_minus_square (tanh's derivative) certifies as the program JAX lowers it to, (1 + x)(1 - x):
     the lane's own result within its three roundings of the exact 1 - x², its overflow past fp32's range,
     its NaN and its infinities as that program makes them; a result four steps off is refused."""
-    # Past fp32's range the product overflows (2^64 and 2^100 to -inf) where 1 - x² itself is finite.
+    # Past fp32's range the product overflows (2^64 and 2^100 to -inf) where 1 - x² itself is finite; just
+    # below 2^64 its rounded factors' product, 2^128 - 2^105 + 2^80, is finite and so is its result.
+    below = np.nextafter(np.float32(2.0 ** 64), np.float32(0))
     values = np.float32([0.0, 0.5, -0.999, 1.0, 3.0, 1e-20, 2.0 ** -70, np.inf, np.nan, 1.8e19, 2.0 ** 64,
-                         2.0 ** 100])
+                         2.0 ** 100, below])
     assert ct.certified(jax.lax.one_minus_square, values)[1] == []
     native = np.asarray(jax.lax.one_minus_square(values))
     contract = ct.CONTRACTS[jax.lax.one_minus_square_p]
@@ -803,6 +805,11 @@ def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_ro
     for _ in range(4):
         stepped[1] = np.nextafter(stepped[1], np.float32(np.inf))
     assert list(np.flatnonzero(~contract({}, [values], stepped, oc.FLOAT32))) == [1]
+    # An infinity where the product is finite, and a finite value where it overflows, are refused.
+    mutant = native.copy()
+    mutant[-1], mutant[-2] = -np.inf, np.float32(-3e38)
+    assert list(np.flatnonzero(~contract({}, [values], mutant, oc.FLOAT32))) == [len(values) - 2,
+                                                                                 len(values) - 1]
 
 
 def test_clz_holds_a_scalar_as_an_array():
@@ -834,8 +841,10 @@ def test_a_scatter_extremum_folds_its_updates_by_the_lanes_order_of_zeros_and_na
     lane's own min or max: two updates of one element, a zero of each sign, a NaN in the operand and in an
     update; an element left at its operand's value past its updates, or a number where a NaN propagates, is
     refused."""
-    # The last element no update lands on, a subnormal: moved as it is, whether the lane flushes or not.
-    operands = [np.float32([1, 0.0, np.nan, 5, 1e-40]), np.int32([[0], [1], [2], [0], [3]]),
+    # The last elements no update lands on, a subnormal and a NaN of its own payload: moved as they are,
+    # whether the lane flushes or not.
+    payload = np.uint32(0x7FC00123).view(np.float32)
+    operands = [np.float32([1, 0.0, np.nan, 5, 1e-40, payload]), np.int32([[0], [1], [2], [0], [3]]),
                 np.float32([2, -0.0, 3, -1, np.nan])]
     assert ct.certified(fn, *operands)[1] == []
     params, given, (native,) = _first_equation(fn, operands, primitive)
@@ -843,8 +852,8 @@ def test_a_scatter_extremum_folds_its_updates_by_the_lanes_order_of_zeros_and_na
     native = np.asarray(native)
     assert np.all(contract(params, given, native, oc.FLOAT32))
     wrong = native.copy()
-    wrong[0], wrong[3] = 1.0, 5.0
-    assert list(contract(params, given, wrong, oc.FLOAT32)) == [False, True, True, False, True]
+    wrong[0], wrong[3], wrong[5] = 1.0, 5.0, np.uint32(0x7FC00456).view(np.float32)
+    assert list(contract(params, given, wrong, oc.FLOAT32)) == [False, True, True, False, True, False]
     # A rank-zero scatter: a scalar operand, an empty index vector, every update landing on it.
     numbers = jax.lax.ScatterDimensionNumbers((), (), ())
     scattered = (jax.lax.scatter_min if primitive is jax.lax.scatter_min_p else jax.lax.scatter_max)

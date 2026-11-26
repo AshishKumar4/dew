@@ -531,9 +531,9 @@ def _rounding(primitive, integral):
 def _one_minus_square(params, operands, result, fmt):
     """lax.one_minus_square's result, the program JAX lowers it to, (1 + x)(1 - x): its two factors' and
     their product's roundings within γ_3 of the exact 1 - x² relative to it (Higham §3.1), with 2^-50 for
-    its float64 evaluation, and each rounding's underflow; an infinity of the exact value's sign where that
-    allowance reaches past the format's largest finite value (its product overflowing); a non-finite value
-    as its program makes it; of integers, wrapped."""
+    its float64 evaluation, and each rounding's underflow; an infinity of its sign where the product of the
+    two factors as the format rounds them (exact in float64) reaches the format's overflow, and a finite
+    value nowhere else; a non-finite value as its program makes it; of integers, wrapped."""
     (x,) = operands
     if fmt is None:
         x = np.asarray(x)
@@ -545,11 +545,14 @@ def _one_minus_square(params, operands, result, fmt):
         exact = (1 + value) * (1 - value)
     native = np.asarray(result, np.float64)
     slack = (gamma(3, fmt) + 2.0 ** -50) * np.abs(exact) + 3 * underflow(fmt, flushes)
-    largest = (2 - 2.0 ** (1 - fmt.precision)) * 2.0 ** fmt.emax
     with np.errstate(invalid="ignore", over="ignore"):
-        close = np.abs(native - exact) <= np.nextafter(slack, np.inf)
-        overflowed = (np.abs(exact) + slack >= largest) & _same(native, np.copysign(np.inf, exact))
-    return np.where(np.isfinite(exact), close | overflowed, _same(native, exact))
+        ones = np.ones_like(value)
+        factors = [rounded(*two_sum(ones, sign * value), fmt) for sign in (1, -1)]
+        product = factors[0] * factors[1]
+        close = np.isfinite(native) & (np.abs(native - exact) <= np.nextafter(slack, np.inf))
+        overflowed = _same(native, np.copysign(np.inf, product))
+    return np.where(np.isfinite(exact), np.where(np.abs(product) >= fmt.overflow, overflowed, close),
+                    _same(native, exact))
 
 
 def _correctly_divided(params, operands, result, fmt):
@@ -1473,7 +1476,10 @@ def _scatter_extremum(choose, integral):
                 at = tuple(target)
                 folded[at] = fold(folded[at] if touched[at] else read[at], update)
                 touched[at] = True
-        return np.asarray(result) == folded if fmt is None else _same(result, folded)
+        if fmt is None:
+            return np.asarray(result) == folded
+        # An element no update landed on is moved: its bits, a NaN's payload among them.
+        return np.where(touched, _same(result, folded), _bits(result) == _bits(operand))
     return contract
 
 
