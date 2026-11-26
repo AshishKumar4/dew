@@ -35,12 +35,13 @@ PREPARE_TARGETS = 4
 """How many of the plan's targets a dry prepare's task may take before its file is prepared in groups
 (`groups_of`), as the tier's run cuts it, each group a task of its own."""
 PREPARE_WALL = 600.0
-"""A dry prepare task's shared budget (`run`), whatever its deadline: its topology, baseline lookups and
-processes draw on it, its last records' publication and its restorations may run past it. It sits under a
-train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
-margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
-(`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
-their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
+"""A dry prepare task's shared budget (`run`), whatever its deadline: its topology, baseline lookups,
+processes and their records' publication draw on it (a baseline unwritten by its end leaving its row stale,
+row 13014); its restorations, local git calls, may run past it. It sits under a train's wall bound, 626 to 696
+s (its 900 s target less its warm-up and plan, its finish and a margin). Its groups are cut to its cap
+(`cap_after`), which holds a group however unevenly its count cut (`prepared_cut`) spreads its work (rows
+12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at their task's 1,680 s, ran 665 to 1,650 s
+and set their trains' walls)."""
 CUT_SHORT = 0.75
 """The share of a dry prepare's full cap (`cap_after` of `PREPARE_WALL`) past which a timed row ran out of its
 time (`planned`): what it took is no more than a floor of its work, which counts twice. A tuning heuristic,
@@ -182,7 +183,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
-    `PREPARE_HOLDS`); a part's never, whose run reads every program it prepares."""
+    `PREPARE_HOLDS`), its records published within what is `left` (`tested`'s `publish_by`); a part's never,
+    whose run reads every program it prepares."""
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
@@ -199,7 +201,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged,
-                     recycle_at=RECYCLE_AT if capped else None, written=written)
+                     recycle_at=RECYCLE_AT if capped else None, written=written,
+                     publish_by=time.monotonic() + left if capped else None)
 
 
 CAP_MARGIN = 240.0

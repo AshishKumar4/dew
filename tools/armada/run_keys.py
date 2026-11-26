@@ -199,20 +199,24 @@ def head_commit() -> str | None:
     return (found.stdout.strip() or None) if found.returncode == 0 else None
 
 
-def baselined(python: str, place: str, held: str, token: str, ran: Mapping) -> bool:
+def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
+              until: float | None = None) -> bool:
     """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
-    written now, tried once, or none is due; a green row with none stands stale (`unbaselined`)."""
+    written now, tried once within `until` where one is given, or none is due; a green row with none stands
+    stale (`unbaselined`)."""
     if (commit := head_commit()) is None or ran.get("exitCode") != 0 or "unprepared" not in ran:
         return True
     return written(baseline_key(commit, python, place, held), token,
-                   json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1)
+                   json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1, until=until)
 
 
-def named_at_commit(python: str, place: str, held: str, key: str, token: str) -> None:
+def named_at_commit(python: str, place: str, held: str, key: str, token: str,
+                    until: float | None = None) -> None:
     """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once; a
     dry prepare's only once its baseline is written (`baselined`), so a name alone is a baseline lost."""
     if (commit := head_commit()) is not None:
-        written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1)
+        written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1,
+                until=until)
 
 
 def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]:
@@ -387,7 +391,8 @@ def drawn_whole(spans: Sequence[tuple[int, ...]], start: int, stop: int) -> bool
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           changed: Collection[str] = (), began_in: Mapping[str, str | None] | None = None) -> set[str]:
+           changed: Collection[str] = (), began_in: Mapping[str, str | None] | None = None,
+           until: float | None = None) -> set[str]:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -397,8 +402,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
     (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's). A green
     row is written only within the epoch it began in (`began_in`, `epochs_of`): one a red run rotated while
-    it ran is an older verdict, and is kept nowhere (row 12180). Returns the green rows whose baseline the
-    store did not take (`baselined`), which stand stale (`unbaselined`)."""
+    it ran is an older verdict, and is kept nowhere (row 12180). Every read and write within `until` where
+    one is given (a dry prepare's task's shared budget, row 13014), a write past it not made. Returns the
+    green rows whose baseline the store did not take (`baselined`), which stand stale (`unbaselined`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
@@ -411,7 +417,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
         # A green dry prepare's baseline, whatever of its admission to reuse below (record, key, epoch).
-        if not baselined(python, row_["name"], held, token, row_):
+        if not baselined(python, row_["name"], held, token, row_, until):
             unnamed.add(row_["name"])
         name = parsed_row(row_["name"])[1]
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
@@ -451,11 +457,12 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
         # neither was read or written.
         try:
-            current, tag = epoch(python, row_["name"], held, common, token)
+            current, tag = epoch(python, row_["name"], held, common, token, until)
         except Unread:
             current, tag = UNREAD, None
         if row_["exitCode"] != 0:
-            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag) == UNREAD:
+            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag,
+                                          until=until) == UNREAD:
                 continue
             current = None
         elif began_in is not None and (began_in.get(row_["name"], UNREAD) == UNREAD
@@ -463,7 +470,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             # Not the epoch it began in (a red's rotation while it ran, or one unread): no green of it stands.
             continue
         elif current is None:
-            current = begun(python, row_["name"], held, common, token, fresh_only=True)
+            current = begun(python, row_["name"], held, common, token, fresh_only=True, until=until)
         stated = (why or None) if key is None and row_["exitCode"] == 0 else None
         body = json.dumps({"key": key, "why": stated,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
@@ -472,16 +479,16 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                            "epoch": current}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
-        if written(record_key(python, row_["name"], held, common), token, body):
-            written(record_key(python, row_["name"], held), token, body)
+        if written(record_key(python, row_["name"], held, common), token, body, until=until):
+            written(record_key(python, row_["name"], held), token, body, until=until)
             # The run of exactly these inputs, kept by their key (`green_key`): a green one, or a red one,
             # which replaces a green row of the same inputs so no later run reuses it (a flaky red).
             ran_on = key if key is not None else None if ran["depends"] is None or green else cache_key(
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
-                written(green_key(python, row_["name"], held, ran_on), token, body)
+                written(green_key(python, row_["name"], held, ran_on), token, body, until=until)
             if key is not None and row_["name"] not in unnamed:
-                named_at_commit(python, row_["name"], held, key, token)
+                named_at_commit(python, row_["name"], held, key, token, until)
     return unnamed
 
 

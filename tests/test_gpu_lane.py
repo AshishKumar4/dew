@@ -868,6 +868,31 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
         (set(), True) if taken else ({place}, False))
 
 
+def test_a_dry_prepares_records_publish_within_its_budget_a_stalled_baseline_leaving_its_row_stale(
+        ci, monkeypatch, tmp_path, cache_worker):
+    """A dry prepare's row publishes its records within its task's budget (`tested`'s `publish_by`, row
+    13014): a Worker that stalls on every write holds the task no longer than its budget (each write tried
+    again past a stall otherwise, 10 s a try), and its green row, its baseline unwritten, stands stale
+    (`unbaselined`), never named the commit's."""
+    import time
+
+    url, stored, seen = cache_worker
+    cached(monkeypatch, url)
+    (tmp_path / "tests/test_gpu_a.py").write_text("def test_a():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    commit(tmp_path, "the commit")
+    seen.stalling["/testcache/"] = 30.0
+    out = tmp_path / "rows.json"
+    began = time.monotonic()
+    ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "off", 5.0, "common", {},
+              variant=ci.prepares.variant("sm90", users=False), publish_by=time.monotonic() + 20.0,
+              judged=lambda rows: [{**each, "unprepared": ["a @ x"]} for each in rows])
+    [row] = json.loads(out.read_text())["rows"]
+    assert time.monotonic() - began < 45.0
+    assert row.get("kind") == ci.grading.STALE
+    assert not [key for key in stored if "-main/" in key]
+
+
 @pytest.mark.parametrize(("exit_code", "taken"), [(0, True), (1, True), (0, False)])
 def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci, monkeypatch, tmp_path,
                                                                           cache_worker, exit_code, taken):
