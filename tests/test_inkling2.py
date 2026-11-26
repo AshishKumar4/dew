@@ -81,3 +81,32 @@ def test_a_config_it_cannot_compute_is_refused(change):
     translate_config(RELEASE)
     with pytest.raises(ValueError):
         translate_config({**RELEASE, 'text_config': {**RELEASE['text_config'], **change}})
+
+
+@attending("reference")
+def test_a_cached_decode_at_given_places_scores_as_its_whole_call():
+    """The release-layout load decoding at places the caller gives from 100 on (24 prefilled, then one a
+    call), on par with its whole call at those places (check 1, the whole call in float64 the truth): its
+    relative bias reads each token's slot in the stream against each key's, as transformers' does
+    (`get_relative_distance`), and its temperatures the places themselves."""
+    loaded = load('inkling2-tiny')
+    model, variables = loaded.model, loaded.variables
+    places = jnp.broadcast_to(jnp.arange(SHAPE[1]) + 100, SHAPE)
+
+    def stepped(variables, ids):
+        cache = allocated_cache(model, variables, ids.shape[0])
+        prefilled, state = model.apply({**variables, 'cache': cache}, ids[:, :STEPPED], decode=True,
+                                       positions=places[:, :STEPPED], mutable=['cache'])
+        each, cache = [prefilled], state['cache']
+        for index in range(STEPPED, SHAPE[1]):
+            logits, state = model.apply({**variables, 'cache': cache}, ids[:, index:index + 1], decode=True,
+                                        positions=places[:, index:index + 1], mutable=['cache'])
+            each.append(logits)
+            cache = state['cache']
+        return jnp.concatenate(each, axis=1)
+
+    wide = model.clone(dtype=jnp.float64)
+    whole = jax.jit(lambda variables, ids: model.apply(variables, ids, positions=places))
+    truth = jax.jit(lambda variables, ids: wide.apply(widened(variables), ids, positions=places))
+    assert_as_exact(jax.jit(stepped), whole, lambda seed: (variables, draw(seed)),
+                    'Inkling 2 at given places', seeds=8, truth_fn=truth)

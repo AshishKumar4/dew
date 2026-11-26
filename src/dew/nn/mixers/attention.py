@@ -907,9 +907,10 @@ class CausalSelfAttention(nn.Module):
         form = temperature_scale if self.temperature_form == 'floored' else log_ratio_scale
         return form(places, *self.temperature_tuning, dtype=dtype)
 
-    def _relative_bias(self, x, places, key_places) -> jax.Array:
-        """`relative_bias`'s fp32 `[B, H, Q, K]` bias of the queries' input `x` at their `places` against
-        the keys at `key_places` (`relative_logits`)."""
+    def _relative_bias(self, x, places, query_slots, key_slots) -> jax.Array:
+        """`relative_bias`'s `[B, H, Q, K]` bias of the queries' input `x` (its states tuned by the queries'
+        `places` under `temperature`) at `query_slots` against the keys at `key_slots`
+        (`relative_logits`)."""
         spec = self.relative_bias
         assert spec is not None, "a relative bias is read where the layer computes one"
         B, S, _ = x.shape
@@ -920,7 +921,7 @@ class CausalSelfAttention(nn.Module):
             scale = self._temperature(places, at_least_fp32(states.dtype))
             states = states * (scale[..., None, None] if scale.ndim == 2
                                else scale[None, :, None, None]).astype(states.dtype)
-        return relative_logits(states, self.relative_bank, places, key_places)
+        return relative_logits(states, self.relative_bank, query_slots, key_slots)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
@@ -1167,7 +1168,10 @@ class CausalSelfAttention(nn.Module):
             position_bias = attention_metadata.position_bias
             bias = position_bias if bias is None else bias + position_bias
         if self.relative_bias is not None:
-            relative = self._relative_bias(x, places, masking.key_places)
+            # Its distances in the stream's slots, as the reference's (`get_relative_distance`): a cached
+            # step's write slot against the cache's, a scored row's tokens counted within their documents
+            # against its keys' (`counted`), whatever places the caller gives.
+            relative = self._relative_bias(x, places, positions if decode else counted, masking.key_places)
             bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
@@ -1659,9 +1663,8 @@ class CausalSelfAttention(nn.Module):
 
     @property
     def _reads_places(self) -> bool:
-        """Whether the layer reads its keys' places, a chunk, ALiBi or a relative bias (`relative_bias`, its
-        distances the queries' places less the keys'), so its cache keeps them."""
-        return self.ctx.attention_chunk is not None or self.alibi or self.relative_bias is not None
+        """Whether the layer reads its keys' places, a chunk or ALiBi, so its cache keeps them."""
+        return self.ctx.attention_chunk is not None or self.alibi
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
         """The attention output through the kernel the masking chose: the
@@ -2110,6 +2113,13 @@ class AttentionMixer(MixerBase):
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout, and its cached keys by their documents.
     mixed_step = True
     packed_cache = True
+
+    def fork_refusal(self) -> str | None:
+        """Its short convolutions read each document's own inputs (`ShortConvSite`), where a fork's first
+        tokens would read its parent's tail."""
+        if self.short_convs is not None:
+            return "its short convolutions read each document's own inputs, none of a fork's parent's"
+        return super().fork_refusal()
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
         if self.relative_bias is not None or self.projected_sinks or self.short_convs is not None:

@@ -99,41 +99,24 @@ class ShortConvSite(nn.Module):
     @nn.nowrap
     def _dynamic(self, x, taps, projected, tokens, history):
         """`x` convolved by `taps` `[features, kernel]` plus each token's own (`projected`, the `dynamic`
-        projection of the dynamic input, a head's shared by its channels), in at least fp32: the window of
-        each token's last `kernel` inputs (behind `history` where held, zeros else), a padding token's
-        input zero and another document's tokens read as zero; and the history the next call holds."""
+        projection of the dynamic input, a head's shared by its channels), in at least fp32, and the history
+        the next call holds. Each window position is the static convolution's of a one-hot tap
+        (`held_conv1d`: the input that many places back, behind `history`), so the windows read padding,
+        gaps, packed documents and the held history by the static route's own rules, and its history is
+        the one that route keeps."""
         batch, length, features = x.shape
         heads, k = self.dynamic_heads, self.kernel
         assert heads is not None, "dynamic taps are a dynamic site's"
-        if tokens.valid is not None and not tokens.right_padded:
-            raise ValueError("a short convolution with dynamic taps convolves rows whose real tokens come "
-                             "first (right-padded): its windows read no gap past a padding slot")
         wide = at_least_fp32(x.dtype)
-        inputs = x.astype(wide)
-        if tokens.valid is not None:
-            inputs = jnp.where(jnp.asarray(tokens.valid, bool)[..., None], inputs, 0)
-        before = (jnp.zeros((batch, k - 1, features), wide) if history is None else history.astype(wide))
-        padded = jnp.concatenate([before, inputs], axis=1)
-        # Window position j of token t reads input t - (k - 1) + j: oldest first, the token itself last.
-        windows = jnp.stack([padded[:, j:j + length] for j in range(k)], axis=-1)
-        documents = None
-        if tokens.segments is not None:
-            # The held inputs are the first document's, which the call continues (`held_conv1d`'s rule).
-            segments = jnp.asarray(tokens.segments, jnp.int32)
-            documents = jnp.concatenate([jnp.broadcast_to(segments[:, :1], (batch, k - 1)), segments], axis=1)
-            same = jnp.stack([documents[:, j:j + length] for j in range(k)], axis=-1) == documents[
-                :, k - 1:, None]
-            windows = jnp.where(same[:, :, None, :], windows, 0)
+        windows, held = [], history
+        for place in range(k):
+            # Window position `place` of token t reads input t - (k - 1) + place: the token itself last.
+            unit = jnp.zeros((features, k), wide).at[:, place].set(1)
+            window, held = held_conv1d(x, unit, tokens.valid, history, segments=tokens.segments,
+                                       right_padded=tokens.right_padded, dtype=wide, activation=False)
+            windows.append(jnp.asarray(window, wide))
+        stacked = jnp.stack(windows, axis=-1).reshape(batch, length, heads, features // heads, k)
         own = projected.astype(wide).reshape(batch, length, heads, 1, k)
         weights = taps.astype(wide).reshape(heads, features // heads, k)[None, None] + own
-        convolved = jnp.sum(windows.reshape(batch, length, heads, features // heads, k) * weights, axis=-1)
-        # The row's last real inputs, as the static convolution keeps them (`held_conv1d`): a right-padded
-        # row's padding enters no history, and of packed documents only the last real token's does.
-        ends = (jnp.full((batch,), length, jnp.int32) if tokens.valid is None
-                else jnp.sum(jnp.asarray(tokens.valid, jnp.int32), axis=1))
-        rows = ends[:, None] + jnp.arange(k - 1)[None]
-        history = jnp.take_along_axis(padded, rows[..., None], axis=1)
-        if documents is not None:
-            last = jnp.take_along_axis(documents, ends[:, None] + k - 2, axis=1)
-            history = jnp.where((jnp.take_along_axis(documents, rows, axis=1) == last)[..., None], history, 0)
-        return convolved.reshape(batch, length, features), history.astype(x.dtype)
+        convolved = jnp.sum(stacked * weights, axis=-1)
+        return convolved.reshape(batch, length, features), held

@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, decode_steps, model_draw
+from model_support import TINY_DECODER, decode_steps, decode_with, model_draw
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates
@@ -93,15 +93,15 @@ def test_a_sites_history_carries_its_rows_real_inputs_alone(dynamic):
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 def test_a_packed_prompts_last_document_continues_through_the_sites_history(dynamic):
-    """A cached prompt packing two documents (segments 1 then 2), then the next tokens stated as the second
-    document's (segment 2): they convolve as one call over the second document alone does, bit for bit,
-    the history holding its tokens alone."""
+    """A cached prompt packing two documents (four tokens of segment 1, then one of segment 2), then the
+    next tokens stated as the second document's (segment 2): they convolve as one call over the second
+    document alone does, bit for bit, its history holding none of the first's inputs."""
     site = ShortConvSite(FEATURES, KERNEL, HEADS if dynamic else None)
     rng = np.random.default_rng(0xC11)
     x = jnp.asarray(rng.normal(size=(1, 8, FEATURES)), jnp.float32)
     side = jnp.asarray(rng.normal(size=(1, 8, 5)), jnp.float32)
-    variables = nn.unbox(site.init(jax.random.key(0), x[:, :6],
-                                   dynamic_input=side[:, :6] if dynamic else None))
+    variables = nn.unbox(site.init(jax.random.key(0), x[:, :5],
+                                   dynamic_input=side[:, :5] if dynamic else None))
     params = {"params": variables["params"]}
     cache = {"cache": {"conv_state": jnp.zeros((1, KERNEL - 1, FEATURES), jnp.float32)}}
 
@@ -109,12 +109,30 @@ def test_a_packed_prompts_last_document_continues_through_the_sites_history(dyna
         segments = jnp.asarray([segments], jnp.int32)
         return MixerCall(AttentionMetadata(coordinates=coordinates(segments.shape, segments=segments)),
                          decode=True)
-    _, held = site.apply({**params, **cache}, x[:, :6], call([1, 1, 2, 2, 2, 2]),
-                         side[:, :6] if dynamic else None, mutable=["cache"])
-    stepped, _ = site.apply({**params, **held}, x[:, 6:], call([2, 2]), side[:, 6:] if dynamic else None,
+    _, held = site.apply({**params, **cache}, x[:, :5], call([1, 1, 1, 1, 2]),
+                         side[:, :5] if dynamic else None, mutable=["cache"])
+    stepped, _ = site.apply({**params, **held}, x[:, 5:], call([2, 2, 2]), side[:, 5:] if dynamic else None,
                             mutable=["cache"])
-    whole = site.apply(params, x[:, 2:], dynamic_input=side[:, 2:] if dynamic else None)
-    np.testing.assert_array_equal(np.asarray(stepped), np.asarray(whole[:, -2:]))
+    whole = site.apply(params, x[:, 4:], dynamic_input=side[:, 4:] if dynamic else None)
+    np.testing.assert_array_equal(np.asarray(stepped), np.asarray(whole[:, -3:]))
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_a_gapped_row_convolves_its_real_tokens_alone(dynamic):
+    """A row whose valid slots hold gaps (`right_padded` unstated, as native generation states a step's
+    rows): each real token convolves the real tokens before it, as a call over them alone does, bit for
+    bit."""
+    site = ShortConvSite(FEATURES, KERNEL, HEADS if dynamic else None)
+    rng = np.random.default_rng(0xC12)
+    x = jnp.asarray(rng.normal(size=(1, 7, FEATURES)), jnp.float32)
+    side = jnp.asarray(rng.normal(size=(1, 7, 5)), jnp.float32)
+    params = nn.unbox(site.init(jax.random.key(0), x, dynamic_input=side if dynamic else None))
+    valid = jnp.asarray([[True, False, True, True, False, False, True]])
+    laid = MixerCall(AttentionMetadata(coordinates=coordinates(valid.shape, valid=valid)))
+    gapped = site.apply(params, x, laid, side if dynamic else None)
+    real = np.flatnonzero(np.asarray(valid[0]))
+    alone = site.apply(params, x[:, real], dynamic_input=side[:, real] if dynamic else None)
+    np.testing.assert_array_equal(np.asarray(gapped[:, real]), np.asarray(alone))
 
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
@@ -127,16 +145,27 @@ def test_a_layer_with_short_convolutions_decodes_as_it_prefills(dynamic):
                                  "layer_types": ("full_attention",) * TINY_DECODER["num_layers"],
                                  "kinds": {"full_attention": LayerKind(mixer_conv=KERNEL,
                                                                        feedforward_conv=KERNEL)}})
-    made, step = decode_steps(model)
+    steps = decode_steps(model)
 
     def decoded(variables, ids):
-        cache = made(variables, ids.shape[0])
-        logits, cache = step(variables, cache, ids[:, :5])
-        each = [logits]
-        for index in range(5, ids.shape[1]):
-            logits, cache = step(variables, cache, ids[:, index:index + 1])
-            each.append(logits)
-        return jnp.concatenate(each, axis=1)
+        return decode_with(steps, variables, ids[:, :5], ids[:, 5:], prefilled=True)
     assert_as_exact(decoded, jax.jit(model.apply), model_draw(model, (2, 9), 64),
                     "a short-convolving layer's decode", seeds=SEEDS["decode"],
                     truth_fn=jax.jit(model.clone(dtype=jnp.float64).apply))
+
+
+def test_a_convolving_decoder_refuses_forks_and_mixed_steps_before_any_call():
+    """A decoder whose blocks convolve (`LayerKind.mixer_conv`) refuses a forked call and a server's mixed
+    step, and one whose attention convolves its keys and values refuses a forked call, as their sites read
+    each row's own inputs and history: routing reads the refusals before it picks either path, where the
+    same decoder without convolutions takes both."""
+    def decoder(mixer, kind):
+        types = ("full_attention",) * TINY_DECODER["num_layers"]
+        return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "num_kv_heads": 2, "dtype": "float32",
+                                    "mixer": mixer, "layer_types": types, "kinds": {"full_attention": kind}})
+    plain = decoder(AttentionMixer(), LayerKind())
+    blocks = decoder(AttentionMixer(), LayerKind(mixer_conv=KERNEL))
+    keys = decoder(AttentionMixer(short_convs=ShortConvs(KERNEL)), LayerKind())
+    assert plain.fork_refusal() is None and plain.mixed_admission_refusal() is None
+    assert blocks.fork_refusal() is not None and blocks.mixed_admission_refusal() is not None
+    assert keys.fork_refusal() is not None
