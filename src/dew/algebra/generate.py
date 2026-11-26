@@ -142,18 +142,16 @@ def _widened(value) -> jax.Array:
 
 @dataclasses.dataclass(frozen=True)
 class _Chosen:
-    """One generated function: its declaration's name, its policy, target and case, the case's operands, and
-    the candidate chosen."""
+    """One checked source body and its declared dispatch key and return convention."""
 
     name: str
     policy: str
     target: str
     case: int
     operands: tuple[jax.ShapeDtypeStruct, ...]
-    candidate: error.Candidate = dataclasses.field(hash=False, compare=False)
+    body: str = dataclasses.field(hash=False, compare=False)
     single: bool = dataclasses.field(hash=False, compare=False)
     """Whether the declaration returns one array (its form's one output), else a tuple of them."""
-    body: str | None = dataclasses.field(default=None, hash=False, compare=False)
 
 
 def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
@@ -170,15 +168,18 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
                 label = f"{qualified} ({policy}, {target}, {case})"
                 if isinstance(form, ComponentForm):
                     single, text = _component(form, operands, policy, target, label)
-                    candidate = error.Candidate("as written", 0.0, form.function)
                 else:
                     gate = admits(form.function, operands, form.cases, label)
                     with algebra.passes(target=target):
                         choice = error.choose(form.function, operands, accurate=policy == "accurate",
                                               saturation=algebra.SATURATION, admits=gate)
-                    candidate, single = choice.chosen, _single(form.function, operands)
-                    text = None
-                found.append(_Chosen(name, policy, target, case, operands, candidate, single, text))
+                    candidate = choice.chosen
+                    single = _single(form.function, operands)
+                    closed = jax.make_jaxpr(candidate.form or candidate.function)(*operands)
+                    text, _ = printed.source(closed, "form", compensated=candidate.compensated)
+                if found and found[0].single != single:
+                    raise ValueError(f"{label}: the same declaration must keep its array or tuple result convention")
+                found.append(_Chosen(name, policy, target, case, operands, text, single))
     return found
 
 
@@ -234,10 +235,6 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     printed_by: dict[tuple[str, str], str] = {}
     for found in chosen:
         text = found.body
-        if text is None:
-            form = found.candidate.form or found.candidate.function
-            closed = jax.make_jaxpr(form)(*found.operands)
-            text, _ = printed.source(closed, "form", compensated=found.candidate.compensated)
         if (found.name, text) not in printed_by:
             function = f"_{found.name}_{sum(name == found.name for name, _ in printed_by)}"
             printed_by[found.name, text] = function

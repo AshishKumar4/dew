@@ -80,6 +80,19 @@ def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
         generate._chosen("bad.components", form)
 
 
+def test_a_component_preserves_one_result_convention_across_cases():
+    def changed(x):
+        return x if x.shape == (1,) else (x, x + 1)
+
+    def draw(seed, operands):
+        return (np.full(operands[0].shape, seed, np.float32),)
+
+    shapes = tuple((jax.ShapeDtypeStruct((n,), jnp.float32),) for n in (1, 2))
+    cases = generate.Cases(shapes, draw, seeds=2)
+    with pytest.raises(ValueError):
+        generate._chosen("bad.component", generate.ComponentForm(changed, changed, cases))
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

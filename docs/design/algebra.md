@@ -22,10 +22,9 @@ the program a user composed, including its autodiff output. Nothing runs at runt
 
 ### 1.1 Two modes
 
-**The dev-time mode** (§6.11) generates stable numeric forms (`StableForm`), the first of them §1.5's
-acceptance cases (`dew.algebra.acceptance`, rows 9035 and 9037). A template's derived forms still run at
-trace time (`derive`, `scan`: built where a template calls them), and a surrogate's bodies are traced where
-they are declared: neither is generated yet.
+**The dev-time mode** (§6.11) generates stable numeric forms (`StableForm`, including §1.5's acceptance
+cases) and checks flat component pilots. Production still derives a template's forms at trace time and
+traces each surrogate's written bodies, not its pilot's generated functions.
 
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
