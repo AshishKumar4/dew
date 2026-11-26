@@ -17,7 +17,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
-from dew.nn.kernels.templates.gemm.factored import factored, raised_factor
+from dew.nn.kernels.templates.gemm.factored import factored, lowered_product, raised_factor
 from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -128,8 +128,9 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         # A raised row's output lowered back by its shift and its raised scale's (`raised_factor`: a
         # subnormal scale formed among the normals, row 13340), rounded once (`lowered_rounded`), past FTZ.
         factor, raise_by = raised_factor(factor_of(s))
-        raised = precision.twice_scaled(prod, peak_raised[:, None], factor)
-        return float_bits.lowered_rounded(raised, shift[:, None] + raise_by), prod
+        # `precision.twice_scaled`'s order, its last multiply exact and rounded once with the lowering.
+        left, right = precision.twice_scaled_operands(prod, peak_raised[:, None], factor)
+        return lowered_product(left, right, shift[:, None] + raise_by), prod
 
     def ste_derivative(primals, tangents, value):
         a, s = primals

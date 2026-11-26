@@ -106,21 +106,32 @@ def test_a_ternary_product_at_a_subnormal_scale_keeps_its_values(quantize, colum
                                       err_msg=f"interpret={interpret}")
 
 
-@pytest.mark.parametrize(("quantize", "row", "scale", "want"), [
-    (True, 2.0 ** 127, 2.0 ** -63, 2.0 ** 66), (False, 2.0 ** -65, 2.0 ** -62, 2.0 ** -127)],
-    ids=["int8 rows past the scale's raise", "bf16 rows to a subnormal"])
-def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, row, scale, want):
-    """+1 codes at a normal scale times rows of equal entries: four `2**127` entries quantized to int8 at
-    `2**-63` give `2**66` (the int8 epilogue's order keeps it finite), and one `2**-65`
-    entry unquantized at `2**-62` the subnormal `2**-127` (the scaled product rounds once past a flushing
-    CPU, `factored.scaled_exactly`), on the XLA route and the interpreted Mosaic one."""
+_MIDPOINT_SCALE = float(np.asarray(0x0040003F, np.uint32).view(np.float32))
+"""A subnormal scale whose product with `129 / 128` lies just under a subnormal midpoint, past which a product
+rounded twice (to fp32, then at the subnormal place) rounds up."""
+
+EDGES = {
+    "int8 rows past the scale's raise": (True, (2.0 ** 127,) * 4, 2.0 ** -63),
+    "bf16 rows to a subnormal": (False, (2.0 ** -65,), 2.0 ** -62),
+    "bf16 rows at a subnormal midpoint": (False, (129 / 128,), _MIDPOINT_SCALE),
+    "int8 rows at a subnormal midpoint": (True, (129 / 128,), _MIDPOINT_SCALE),
+    "an infinite row at a subnormal scale": (False, (np.inf,), 2.0 ** -127),
+}
+
+
+@pytest.mark.parametrize(("quantize", "entries", "scale"), EDGES.values(), ids=EDGES.keys())
+def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entries, scale):
+    """+1 codes times a row of equal entries (each its row's peak, so an int8 code holds it exactly) at a
+    scale: the product IEEE's float64 sum and one rounding to fp32 give, on the XLA route and the interpreted
+    Mosaic one: an int8 epilogue's order kept finite past a normal scale; a normal scale's subnormal result;
+    a product next to a subnormal midpoint rounded once, quantized or not; an infinite row at a subnormal
+    scale infinite (`factored.lowered_product`, row 13340)."""
     values = np.zeros((256, 2), np.float32)
-    count = 4 if quantize else 1
-    values[:count] = 1.0
+    values[:len(entries)] = 1.0
     weights = formats.TernaryWeights.of(values, scale=np.float32(scale))
     rows = np.zeros((1, 256), np.float32)
-    rows[0, :count] = row
-    expected = np.full((1, 2), want, np.float32)
+    rows[0, :len(entries)] = entries
+    expected = np.full((1, 2), np.float64(sum(entries)) * np.float64(np.float32(scale))).astype(np.float32)
     for interpret in (False, True):
         ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
         with ctx:
