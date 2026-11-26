@@ -353,7 +353,8 @@ def test_two_words_at_narrow_underflow_and_overflow_boundaries_round_once(dtype)
     halfway = limits.minexp - limits.nmant - 1
     exponents = np.asarray([halfway, halfway, halfway, limits.maxexp - 1, limits.maxexp - 1], np.int32)
     landed = jax.jit(lambda a, b, e: windows._landed((a, b, e), dtype))(heads, tails, exponents)
-    expected = np.asarray([0, limits.smallest_subnormal, -limits.smallest_subnormal, limits.max, np.inf], dtype)
+    smallest = limits.smallest_subnormal
+    expected = np.asarray([0, smallest, -smallest, limits.max, np.inf], dtype)
     np.testing.assert_array_equal(np.asarray(landed).view(np.uint16), expected.view(np.uint16))
 
 

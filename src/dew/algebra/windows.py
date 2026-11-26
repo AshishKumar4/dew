@@ -639,14 +639,15 @@ def _narrow_landed(high, low, exponent, dtype):
                     jnp.where(b.significand == 0, a.exponent, jnp.maximum(a.exponent, b.exponent)))
     # A much smaller limb can only settle an exact narrow midpoint. Align it no lower than a
     # normal fp32 power that is still far below half an ulp of the larger limb.
-    left, right = (word.significand * exact_power2(jnp.maximum(word.exponent - top, -64), jnp.float32)
+    left, right = (word.significand * exact_power2(jnp.clip(word.exponent - top, -64, 0), jnp.float32)
                    for word in (a, b))
     head, tail = two_sum(left, right)
     _, sign, biased, fraction = raw_fields(head)
     significand = fraction | jnp.where(biased != 0, np.uint32(1 << 23), np.uint32(0))
     power = exponent + top + jnp.maximum(biased.astype(jnp.int32), 1) - 150
     direction = jnp.where(sign == 0, tail, -tail)
-    out = rounded_binary(sign, significand, power, dtype, tail=direction,
+    last = power + 23 - jnp.finfo(dtype).nmant
+    out = rounded_binary(sign, significand, power, dtype, tail=direction, last=last,
                          infinite=jnp.isinf(head), nan=jnp.isnan(head))
     bits, signed, _, _ = raw_fields(out)
     return jnp.where(bits == signed, jnp.zeros_like(out), out)
