@@ -128,7 +128,7 @@ def _rounding_case(name, dtype):
         _cases(((16, 32),), ((8, 64),))), {(): ComponentForm(
             functools.partial(_tangent, dtype=dtype), _tangent_truth,
             _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))]))},
-                         output_tree=jax.tree.structure(0))
+                         output_tree=(jax.tree.structure(0),))
 
 
 def _online_step(acc, peak, total, logits, values):
@@ -476,7 +476,7 @@ def _recompute_form(function, truth, *, keys_first, dropped):
 
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
-ROUNDED = SurrogateBodies(precision._rounded, precision._rounded_tangent, (1,), False, {
+ROUNDED = SurrogateBodies(precision._rounded, precision._rounded_tangent, (1,), symbolic_zeros=False, cases={
     (jnp.bfloat16,): _rounding_case("rounded", jnp.bfloat16),
     (jnp.float16,): _rounding_case("rounded_fp16", jnp.float16),
 }).declared(__name__)

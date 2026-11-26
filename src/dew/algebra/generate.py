@@ -81,6 +81,8 @@ class ComponentForm:
     truth: Callable
     cases: Cases
 
+_Tree = tuple[jax.tree_util.PyTreeDef]
+
 
 @dataclasses.dataclass(frozen=True)
 class SurrogateCase:
@@ -89,12 +91,12 @@ class SurrogateCase:
     name: str
     forward: ComponentForm
     tangents: Mapping[tuple[int, ...], ComponentForm]
-    output_tree: jax.tree_util.PyTreeDef
-    input_tree: jax.tree_util.PyTreeDef | None = None
+    output_tree: _Tree
+    input_tree: _Tree | None = None
 
     def restore(self, flat):
         leaves = flat if isinstance(flat, tuple) else (flat,)
-        return jax.tree.unflatten(self.output_tree, leaves)
+        return jax.tree.unflatten(self.output_tree[0], leaves)
 
     def tangent_name(self, inactive: tuple[int, ...]) -> str:
         suffix = "_zero_" + "_".join(map(str, inactive)) if inactive else ""
@@ -132,9 +134,9 @@ class SurrogateBodies:
             fixed = tuple(values[index] for index in fixed_at)
             case = self.cases.get(fixed)
             dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
-            if case is not None and (flat := _case_leaves(case, dynamic)) is not None:
-                if _case_admitted(case.forward.cases, flat, policy, target):
-                    return case.restore(emitted(case.name)(*flat, policy=policy, target=target))
+            if (case is not None and (flat := _case_leaves(case, dynamic)) is not None
+                    and _case_admitted(case.forward.cases, flat, policy, target)):
+                return case.restore(emitted(case.name)(*flat, policy=policy, target=target))
             return self.forward(*values)
 
         def tangent(*values):
@@ -142,7 +144,7 @@ class SurrogateBodies:
             case = self.cases.get(tuple(fixed))
             leaves = jax.tree.leaves(directions, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
             inactive = tuple(i for i, leaf in enumerate(leaves) if isinstance(leaf, SymbolicZero))
-            if case is None or jax.tree.structure(value) != case.output_tree:
+            if case is None or jax.tree.structure(value) != case.output_tree[0]:
                 return self.tangent(*values)
             component = case.tangents.get(inactive)
             if component is not None and (flat := _case_leaves(case, primals)) is not None:
@@ -162,7 +164,7 @@ def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
     if case.input_tree is None:
         return dynamic  # The array admission below rejects a nested value in a flat declaration.
     leaves, tree = jax.tree.flatten(dynamic)
-    return tuple(leaves) if tree == case.input_tree else None
+    return tuple(leaves) if tree == case.input_tree[0] else None
 
 
 def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:

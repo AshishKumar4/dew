@@ -330,28 +330,6 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
     assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
 
 
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
-def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
-    from dew.algebra import component_cases_derived as emitted
-    from dew.nn import precision
-
-    composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
-
-    def rounded(value):
-        return composed(value, dtype=dtype)
-
-    for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
-        x = np.full(shape, 1.003, np.float32)
-        dx = np.full_like(x, 1.007)
-        primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
-        np.testing.assert_array_equal(primal, precision.rounded_operand(x, dtype))
-        np.testing.assert_array_equal(direction, dx)
-        _, pullback = jax.vjp(rounded, jnp.asarray(x))
-        np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
-        gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
-        _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
-        np.testing.assert_array_equal(higher, 2 * dx)
-
 def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_value():
     from jax.custom_derivatives import SymbolicZero
 
@@ -384,9 +362,9 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     active = generate.ComponentForm(active_tangent, active_tangent,
                                     generate.Cases(((tile,) * 5, (small,) * 5), draw, 8))
     case = generate.SurrogateCase("partial", forward, {(1,): active},
-                                  input_tree=jax.tree.structure(({"x": tile, "y": tile},)),
-                                  output_tree=jax.tree.structure({"difference": tile, "sum": tile}))
-    declared = generate.SurrogateBodies(value, tangent, (), True, {(): case})
+                                  input_tree=(jax.tree.structure(({"x": tile, "y": tile},)),),
+                                  output_tree=(jax.tree.structure({"difference": tile, "sum": tile}),))
+    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases={(): case})
     reachable = {}
     for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
         _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)

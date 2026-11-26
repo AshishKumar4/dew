@@ -8,7 +8,18 @@ from collections.abc import Collection, Iterator
 import numpy as np
 from jax import lax
 
-from dew.algebra.printed import Binding, Body, Call, Extent, Layout, Literal, Operand, Primitive, Ref
+from dew.algebra.printed import (
+    Binding,
+    Body,
+    Call,
+    Extent,
+    Layout,
+    Literal,
+    Operand,
+    Primitive,
+    Ref,
+    StaticTuple,
+)
 
 _MIN_SHARED = 6
 _MIN_WHOLE = 3
@@ -40,7 +51,7 @@ class _Fragment:
             if all(name not in self.bound for name in _reads(value)):
                 return self.input(value)
             return Layout(tuple(n if isinstance(n, int) else self.dimension(n) for n in value.dimensions))
-        if isinstance(value, tuple) and all(type(n) is int for n in value):
+        if isinstance(value, StaticTuple) and all(type(n) is int for n in value.values):
             return self.input(value)
         if isinstance(value, Literal) and value.integer is not None:
             original = value.integer
@@ -80,12 +91,13 @@ class _Fragment:
 
 def _static_parameter(name: str, value: Operand) -> bool:
     return ((name == "new_dtype" and isinstance(value, np.dtype))
-            or (name in _GEOMETRY and isinstance(value, tuple) and all(type(n) is int for n in value)))
+            or (name in _GEOMETRY and isinstance(value, StaticTuple)
+                and all(type(n) is int for n in value.values)))
 
 
 def _eligible(node: Binding | str) -> bool:
     return isinstance(node, Binding) and (isinstance(node.value, Call)
-                                          or isinstance(node.value, Literal) and not node.constant)
+                                          or (isinstance(node.value, Literal) and not node.constant))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,7 +133,7 @@ class _Span:
 def _spans(bodies: dict[str, Body]) -> list[_Span]:
     candidates = []
     for name, body in bodies.items():
-        runs = itertools.groupby(enumerate(body.statements), key=lambda item: _eligible(item[1]))
+        runs = itertools.groupby(enumerate(body.statements), key=lambda numbered: _eligible(numbered[1]))
         for eligible, group in runs:
             if not eligible:
                 continue
@@ -238,8 +250,8 @@ def bound_call(body: Body, shared_names: set[str], shapes: tuple[tuple[int, ...]
         if any(name not in sizes for name in _reads(value)) or isinstance(value, Ref | Literal | Call):
             return None
         if isinstance(value, Layout):
-            value = tuple(sizes[dim.operand.name][dim.axis] if isinstance(dim, Extent) else dim
-                          for dim in value.dimensions)
+            value = StaticTuple(tuple(sizes[dim.operand.name][dim.axis] if isinstance(dim, Extent) else dim
+                                      for dim in value.dimensions))
         elif isinstance(value, Extent):
             value = sizes[value.operand.name][value.axis]
         fixed.append((f"p{position}", value))

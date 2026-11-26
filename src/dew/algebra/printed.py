@@ -14,7 +14,7 @@ import enum
 import functools
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -94,10 +94,13 @@ class ScalarParameter:
 
     value: bool | str
 
+@dataclasses.dataclass(frozen=True)
+class StaticTuple:
+    values: tuple[Operand, ...]
 
 
-type Operand = (Ref | Extent | Layout | Literal | Primitive | Call | ScalarParameter | int | str
-                | bool | float | tuple | np.dtype | enum.Enum | None)
+type Operand = (Ref | Extent | Layout | Literal | Primitive | Call | ScalarParameter | StaticTuple
+                | int | str | np.dtype | enum.Enum | None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,8 +160,8 @@ def expression(value: Operand) -> str:
         return f"{_callee(value.callee)}({', '.join(_arguments(value))})"
     if isinstance(value, Layout):
         return _tuple(map(expression, value.dimensions))
-    if isinstance(value, tuple):
-        return _tuple(map(expression, value))
+    if isinstance(value, StaticTuple):
+        return _tuple(map(expression, value.values))
     if isinstance(value, Literal):
         dtype = np.dtype(value.dtype)
         if isinstance(value.integer, Ref):
@@ -319,12 +322,12 @@ def _layout(printer: _Printer, value) -> Operand:
     """Identical emitted bodies may share extents read from their declared input shapes."""
     if not printer.dimensions or not isinstance(value, tuple) or not all(isinstance(n, int) for n in value):
         return _parameter(value)
-    return Layout(tuple(printer.dimensions[n] if n in printer.dimensions else n for n in value))
+    return Layout(tuple(printer.dimensions.get(n, n) for n in value))
 
 
 def _parameter(value) -> Operand:
     if isinstance(value, tuple | list):
-        return tuple(map(_parameter, value))
+        return StaticTuple(tuple(map(_parameter, value)))
     if isinstance(value, type) and issubclass(value, np.generic):
         return np.dtype(value)
     if isinstance(value, bool):
@@ -454,7 +457,7 @@ def reprinted(function: Callable, operands, tree) -> Callable | None:
     return lambda *values: jax.tree.unflatten(tree, list(flat(*values)))
 
 
-def loaded_module(text: str, name: str) -> dict[str, object]:
+def loaded_module(text: str, name: str) -> Mapping[str, object]:
     """Compile the rendered module once, so every case runs its actual dispatch entrypoint."""
     from dew.algebra import _generated
     from dew.nn import precision
