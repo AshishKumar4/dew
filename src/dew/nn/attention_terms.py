@@ -7,6 +7,7 @@ relative-position bias (`RelativeBias`), each general and each its own field of 
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -37,27 +38,53 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     `threshold` (`QKClip`), in at least fp32 and returned in `x`'s dtype."""
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
-    # A head past 2^cut, `cut` = (maxexp - bits(D)) // 2 - 1, whose D squares' sum can overflow (1e20's square
-    # is fp32's infinity, row 13137), has its length taken over `y = x s`, `s` = 2^(cut - maxexp), so its
-    # largest is at most 2^cut: a power of two whose reciprocal is normal. Its gain `min(threshold / (|x| +
-    # eps), 1)` is `min(threshold s / (|y| + eps s), 1)`, which multiplies the head itself, its small
-    # components kept, where it is normal; where it is subnormal (a head near fp32's largest under a small
-    # threshold, which XLA's products flush to zero), `y * min(threshold / (|y| + eps s), 1 / s)`, the same
-    # clip with no factor below normal. `s` is held constant (`stop_gradient`): the clip is the same at
-    # either, and so its derivative; a head within 2^cut takes `s` = 1, its arithmetic unchanged.
+    return _clip(x_wide, threshold, eps).astype(x.dtype)
+
+
+def _scaled_length(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`x`'s length taken over `y = x s` (row 13137): `s` = 2^(cut - maxexp) for a head past 2^cut, `cut` =
+    (maxexp - bits(D)) // 2 - 1, whose D squares' sum can overflow (1e20's square is fp32's infinity), so
+    its largest is at most 2^cut, a power of two whose reciprocal is normal; else 1. `s` is held constant
+    (`stop_gradient`): the clip is the same at either, and so its derivative. Returns `s`, `y` and `|y|`;
+    a zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's
+    constant region), where the square root's would be infinite times zero."""
+    wide = x.dtype
     maxexp = jnp.finfo(wide).maxexp
     cut = (maxexp - x.shape[-1].bit_length()) // 2 - 1
-    largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x_wide), axis=-1, keepdims=True))
+    largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x), axis=-1, keepdims=True))
     factor = jnp.where(largest > 2.0 ** cut, jnp.asarray(2.0 ** (cut - maxexp), wide), jnp.asarray(1, wide))
-    scaled = x_wide * factor
+    scaled = x * factor
     squared = jnp.sum(jnp.square(scaled), axis=-1, keepdims=True)
-    # A zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's
-    # constant region), where the square root's would be infinite times zero.
     held = squared > 0
-    length = jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
+    return factor, scaled, jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
+
+
+def _rescaled(x: jax.Array, threshold: float, eps: float) -> jax.Array:
+    """The clip of `x` in its scaled space (`_scaled_length`): `y * min(threshold / (|y| + eps s), 1 / s)`,
+    `x * min(threshold / (|x| + eps), 1)` with no value below normal nor past the largest, and so its
+    derivative too."""
+    factor, scaled, length = _scaled_length(x)
+    return scaled * jnp.minimum(threshold / (length + eps * factor), 1 / factor)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1, 2))
+def _clip(x: jax.Array, threshold: float, eps: float) -> jax.Array:
+    """`x`'s clip (`clipped`): its gain `min(threshold / (|x| + eps), 1)`, taken over its scaled length as
+    `min(threshold s / (|y| + eps s), 1)`, multiplying `x` itself where it is normal, so a small component
+    beside a large one is kept; where it is subnormal (a head near the largest under a small threshold,
+    which XLA's products flush to zero), the clip in its scaled space (`_rescaled`). Its derivative is
+    always the scaled space's (`_clip_jvp`): `x` times a cotangent can overflow where the clip cannot. A
+    head within 2^cut takes `s` = 1, its arithmetic and derivative unchanged."""
+    factor, _, length = _scaled_length(x)
     gain = jnp.minimum(threshold * factor / (length + eps * factor), 1)
-    rescaled = scaled * jnp.minimum(threshold / (length + eps * factor), 1 / factor)
-    return jnp.where(gain >= jnp.finfo(wide).tiny, x_wide * gain, rescaled).astype(x.dtype)
+    return jnp.where(gain >= jnp.finfo(x.dtype).tiny, x * gain, _rescaled(x, threshold, eps))
+
+
+@_clip.defjvp
+def _clip_jvp(threshold: float, eps: float, primals, tangents):
+    (x,), (tangent,) = primals, tangents
+    _, moved = jax.jvp(lambda x: _rescaled(x, threshold, eps), (x,), (tangent,))
+    return _clip(x, threshold, eps), moved
 
 
 def log_ratio_scale(positions, floor: float, scale: float, *, dtype: DTypeLike) -> jax.Array:
