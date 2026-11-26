@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from lane_environment import outside_any_cluster
 from process_support import coordinator_port, output, owned
 
@@ -123,29 +124,47 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
 
 
 
-def test_dew_launch_shows_each_process_its_own_gpus_alone():
+LISTING = """GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-0a11)
+GPU 1: NVIDIA H100 80GB HBM3 (UUID: GPU-1b22)
+GPU 2: NVIDIA H100 80GB HBM3 (UUID: GPU-2c33)
+GPU 3: NVIDIA H100 80GB HBM3 (UUID: GPU-3d44)
+"""
+"""A host's four GPUs as `nvidia-smi -L` lists them."""
+
+
+def test_dew_launch_shows_each_process_its_own_gpus_alone(monkeypatch):
     """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`), numbered
-    from 0 for JAX, so a process of one GPU opens no neighbour's whatever pool it joins and keeps XLA's CUDA
-    graphs (row 12761: every rank counted the host's eight): the host's own ordinals where the pool states
-    none, or its places in a pool's list known to name the host's GPUs alone, as CUDA enumerates it (up to an
-    index naming none, row 13104). A list not known so (the host's GPUs uncounted) is split by place, the
-    pool's list left whole, so no process sees a GPU the pool hid; a pool kept off its GPUs likewise. The
-    hosts are a remote one that answers nothing (`gpu-host.invalid`), whatever machine runs this."""
+    from 0 for JAX, so a process of one GPU opens no neighbour's whether or not it joins them and keeps
+    XLA's CUDA graphs (row 12761: every rank counted the host's eight): the host's own ordinals where the pool
+    states none; else its places among the GPUs the pool's list shows as CUDA enumerates it on the host's
+    `nvidia-smi -L` listing, by index or UUID, up to an entry naming none of them (row 13104: `0,2,-1,1`
+    shows 0 and 2); refused before any process starts where the list shows too few, or the host lists none
+    of its GPUs. A pool kept off its GPUs takes its devices by their places. The host answers through
+    `subprocess`, whatever machine runs this."""
+    import subprocess
+
+    from dew._cli import launch as launching
     from dew._cli.launch import Launch
-    from dew._pool import verified_visible
     from dew.clusters import LOCAL_DEVICES
 
-    cases = (("4,5,6,7", 8), ("0,2,-1,1", 4), ("0,99,1", 2), ("0,1", None), ("GPU-3f2a,1", 4))
-    shown = [verified_visible(*case) for case in cases]
-    assert shown == [["4", "5", "6", "7"], ["0", "2"], ["0"], None, None]
+    def pool(listing: str | None, *env: str) -> list[tuple[str, str]]:
+        def run(argv, **_):
+            if listing is None or "nvidia-smi -L" not in " ".join(argv):
+                raise OSError("no answer")
+            return subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")
 
-    def pool(*env: str) -> list[tuple[str, str]]:
+        monkeypatch.setattr(subprocess, "run", run)
+        launching.listed_on.cache_clear()
         launch = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
                         port=8476, env=env)
         return [(process.env.get("CUDA_VISIBLE_DEVICES", ""), process.env[LOCAL_DEVICES])
                 for process in launch.pool(["gpu-host.invalid"])]
 
-    assert pool("JAX_PLATFORMS=cuda") == [("0", "0"), ("1", "0")]
-    hidden = "CUDA_VISIBLE_DEVICES=0,2,-1,1"
-    assert pool("JAX_PLATFORMS=cuda", hidden) == [("0,2,-1,1", "0"), ("0,2,-1,1", "1")]
-    assert pool("JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=") == [("", "0"), ("", "1")]
+    assert pool(None, "JAX_PLATFORMS=cuda") == [("0", "0"), ("1", "0")]
+    assert pool(LISTING, "JAX_PLATFORMS=cuda", "CUDA_VISIBLE_DEVICES=0,2,-1,1") == [("0", "0"), ("2", "0")]
+    by_uuid = pool(LISTING, "JAX_PLATFORMS=cuda", "CUDA_VISIBLE_DEVICES=GPU-3d44,GPU-1b")
+    assert by_uuid == [("GPU-3d44", "0"), ("GPU-1b", "0")]
+    for listing, visible in ((LISTING, "0,99,1"), (None, "0,1"), (LISTING, "GPU-9f,0")):
+        with pytest.raises(ValueError):
+            pool(listing, "JAX_PLATFORMS=cuda", f"CUDA_VISIBLE_DEVICES={visible}")
+    assert pool(None, "JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=") == [("", "0"), ("", "1")]

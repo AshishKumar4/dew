@@ -6,6 +6,7 @@ node, and whether a process joins a pool at all (`joins_pool`), from the schedul
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import logging
 import os
 import signal
@@ -80,28 +81,49 @@ def visible_gpus(visible: str) -> int:
     return len(visible_list(visible))
 
 
-def visible_list(visible: str, physical: int | None = None) -> list[str]:
+@dataclasses.dataclass(frozen=True)
+class GpuListing:
+    """A host's GPUs as `nvidia-smi -L` lists them, whatever any process's CUDA_VISIBLE_DEVICES: each GPU's
+    UUID by its index, and each MIG device's."""
+
+    gpus: tuple[str, ...]
+    migs: tuple[str, ...] = ()
+
+    @classmethod
+    def of(cls, listed: str) -> GpuListing:
+        """The listing `nvidia-smi -L` printed: a `GPU i: ... (UUID: GPU-...)` line a GPU, an indented MIG
+        line a MIG device."""
+        uuids = [(line.lstrip().split()[0], line.rsplit("UUID: ", 1)[1].rstrip(")").strip())
+                 for line in listed.splitlines() if "UUID: " in line]
+        return cls(tuple(uuid for kind, uuid in uuids if kind == "GPU"),
+                   tuple(uuid for kind, uuid in uuids if kind == "MIG"))
+
+    def names(self, entry: str) -> bool:
+        """Whether a CUDA_VISIBLE_DEVICES entry names one of these: an index below their count, or a UUID or
+        the start of exactly one, as CUDA reads it."""
+        if entry.isdigit():
+            return int(entry) < len(self.gpus)
+        return sum(uuid.startswith(entry) for uuid in (*self.gpus, *self.migs)) == 1
+
+
+def visible_list(visible: str, listing: GpuListing | None = None) -> list[str]:
     """The GPUs a CUDA_VISIBLE_DEVICES value makes visible, in order: its entries up to the first that names
     no GPU, past which CUDA enumerates none (row 13104): an empty or negative one (`0,2,-1,1` shows `0` and
-    `2` alone), or, where the host's `physical` GPUs are counted, an index past them (`0,99,1` on two shows
-    `0` alone). An identifier by UUID is kept as listed."""
+    `2` alone), or, where the host's GPUs are listed, one naming none of them (`0,99,1` on two shows `0`
+    alone); an entry by UUID is kept as listed where they are not."""
     shown = []
     for entry in (part.strip() for part in visible.split(",")):
-        index = int(entry) if entry.lstrip("-").isdigit() else None
-        if not entry or (index is not None and (index < 0 or (physical is not None and index >= physical))):
+        negative = entry.startswith("-") and entry[1:].isdigit()
+        if not entry or negative or (listing is not None and not listing.names(entry)):
             break
         shown.append(entry)
     return shown
 
 
-def verified_visible(visible: str, physical: int | None) -> list[str] | None:
-    """The GPUs `visible` makes visible on a host of `physical` GPUs (`visible_list`) where each is known to
-    be one of them, an index below their count; None where that is not known: the host's GPUs uncounted, or
-    an entry by UUID, which only its driver resolves."""
-    if physical is None:
-        return None
-    shown = visible_list(visible, physical)
-    return shown if all(entry.isdigit() for entry in shown) else None
+def verified_visible(visible: str, listing: GpuListing | None) -> list[str] | None:
+    """The GPUs `visible` makes visible on a host whose GPUs `listing` lists (`visible_list`), each known to
+    be one of them; None where they are not listed."""
+    return None if listing is None else visible_list(visible, listing)
 
 
 def cuda_driver() -> ctypes.CDLL | None:
