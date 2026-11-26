@@ -607,26 +607,22 @@ def _selective_adjoint_draw(seed, operands):
     return cotangent, before, decay, written, step, value, b, dy, rate
 
 
-def _kda_write(key, high, low, end, end_low):
-    return recurrence_algebra.key_decayed_write(key, (high, low), (end, end_low))
+def _kda_strict_band(bands):
+    return recurrence_algebra.block_masked(bands, strict=True, scale=1.0)
 
 
-def _kda_write_truth(key, high, low, end, end_low):
-    return key * jnp.exp2((end + end_low) - (high + low))
+def _kda_band_truth(bands):
+    sub = bands.shape[1]
+    return jnp.tril(bands.reshape(-1, sub, sub), k=-1).reshape(bands.shape)
 
 
-def _kda_write_draw(seed, operands):
-    rng = np.random.default_rng(seed)
-    key, _, _, _, _ = _arrays(seed, operands)
-    length, width = key.shape
-    steps = rng.uniform(0.02, 0.2, (length, width))
-    prefix = np.cumsum(-steps, axis=0, dtype=np.float64)
-    if seed % 2:
-        prefix -= 2 ** 24  # The stored whole words often agree; the lows still distinguish tokens.
-    high = prefix.astype(np.float32)
-    low = (prefix - high).astype(np.float32)
-    key[0, :] = 0
-    return key, high, low, high[-1].copy(), low[-1].copy()
+def _kda_band_draw(seed, operands):
+    (bands,) = _arrays(seed, operands)
+    # The inverse must never read the diagonal or an upper entry of a sub-chunk.
+    token = np.arange(bands.shape[0]) % bands.shape[1]
+    columns = np.arange(bands.shape[1])
+    bands[columns[None, :] >= token[:, None]] = np.nan if seed % 2 else np.inf
+    return (bands,)
 
 
 def _gdn_values_truth(cotangent, values, beta):
@@ -725,8 +721,9 @@ SLIDING_VISIBILITY = declare(__name__, "sliding_visibility", ComponentForm(
 SELECTIVE_ADJOINT = declare(__name__, "selective_adjoint", ComponentForm(
     recurrence_algebra.selective_adjoint, _selective_adjoint_truth, dataclasses.replace(
         _cases(*[((n,),) * 8 + ((),) for n in (128, 256)]), draw=_selective_adjoint_draw)))
-KDA_WRITE = declare(__name__, "kda_write", ComponentForm(_kda_write, _kda_write_truth, dataclasses.replace(
-    _cases(*[((c, k),) * 3 + ((k,), (k,)) for c, k in ((32, 64), (64, 128))]), draw=_kda_write_draw)))
+KDA_STRICT_BAND = declare(__name__, "kda_strict_band", ComponentForm(
+    _kda_strict_band, _kda_band_truth, dataclasses.replace(
+        _cases(((32, recurrence_algebra.SUB),), ((64, recurrence_algebra.SUB),)), draw=_kda_band_draw)))
 GDN_VALUE_PULLBACK = declare(__name__, "gdn_value_pullback", ComponentForm(
     recurrence_algebra.gated_values_back, _gdn_values_truth, dataclasses.replace(
         _cases(*[((c, v), (c, v), (c,)) for c, v in ((32, 64), (64, 128))]), draw=_gdn_values_draw)))

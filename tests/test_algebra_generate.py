@@ -67,7 +67,8 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
 @pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",
                                   "key_dropped_cotangents", "selective_decay", "key_memory_decay",
                                   "softcap_tile", "sink_state", "sliding_visibility", "selective_adjoint",
-                                  "kda_write", "gdn_value_pullback", "ssd_chunk_forward", "ssd_chunk_pullback",
+                                  "kda_strict_band", "gdn_value_pullback", "ssd_chunk_forward",
+                                  "ssd_chunk_pullback",
                                   "gemm_partial_scale", "fp8_epilogue"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
