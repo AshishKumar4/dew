@@ -227,21 +227,19 @@ def _media_reader(tmp_path):
 def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
     """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
     (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
-    answers 404, a body past `URL_BYTES`, and a redirect off HTTP (to FTP, which a read could not hold to
-    its deadline) are each refused."""
+    answers 404 and a redirect off HTTP (to FTP, which a read could not hold to its deadline) are each
+    refused by name, and so is a body past the cap a read holds it to (`opened`'s `url_bytes`)."""
     import http.server
     import threading
 
     from PIL import Image
 
-    from dew.interop.inkling_media import URL_BYTES
+    from dew.interop.inkling_media import opened
 
     _, rgba, read = _media_reader(tmp_path)
     served = tmp_path / 'served'
     served.mkdir()
     Image.fromarray(rgba).save(served / 'transparent.png')
-    with open(served / 'large.png', 'wb') as large:
-        large.truncate(URL_BYTES + 1)
 
     class Served(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -263,9 +261,15 @@ def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
         fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
         for field, value in fetched.items():
             np.testing.assert_array_equal(value, stored[field], err_msg=field)
-        for refused in ('missing.png', 'large.png', 'elsewhere.png'):
-            with pytest.raises(ValueError):
+        for refused, named in (('missing.png', 'HTTP 404'), ('elsewhere.png', 'HTTP 302')):
+            with pytest.raises(ValueError) as refusal:
                 read(f'{url}/{refused}')
+            assert named in str(refusal.value), refusal.value
+        size = (served / 'transparent.png').stat().st_size
+        assert opened(f'{url}/transparent.png', url_bytes=size).size == (24, 16)
+        with pytest.raises(ValueError) as refusal:
+            opened(f'{url}/transparent.png', url_bytes=size - 1)
+        assert f'past {size - 1} bytes' in str(refusal.value), refusal.value
     finally:
         server.shutdown()
         server.server_close()

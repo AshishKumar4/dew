@@ -67,7 +67,7 @@ URL_SECONDS = 60.0
 """The time an image a URL names is read within, from connecting to its last byte (`bounded_read`)."""
 
 
-def opened(image: str | Path | bytes | bytearray):
+def opened(image: str | Path | bytes | bytearray, *, url_bytes: int = URL_BYTES):
     """An encoded image as PIL opens it, in its own mode, from each form transformers' `load_image` reads:
     a URL's bytes fetched within a deadline and a size (`URL_SECONDS`, `URL_BYTES`, `bounded_read`), a
     file's path, a base64 string or data URI
@@ -82,11 +82,11 @@ def opened(image: str | Path | bytes | bytearray):
     if isinstance(image, str) and image.startswith(("http://", "https://")):
         from dew.data.sources.urls import bounded_read
 
-        status, payload = bounded_read(image, URL_BYTES + 1, URL_SECONDS, web_only=True)
+        status, payload = bounded_read(image, url_bytes + 1, URL_SECONDS, web_only=True)
         if not 200 <= status < 300:
             raise ValueError(f"the image at {image} answered HTTP {status}")
-        if len(payload) > URL_BYTES:
-            raise ValueError(f"the image at {image} is past {URL_BYTES} bytes")
+        if len(payload) > url_bytes:
+            raise ValueError(f"the image at {image} is past {url_bytes} bytes")
         image = payload
     elif isinstance(image, str) and (image.startswith("data:image/") or not os.path.isfile(image)):
         # Inline before any path probe (a long data URI is no path, `os.path.isfile` False where
