@@ -106,14 +106,16 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
                      denominator: jax.Array) -> jax.Array:
     """The size of `n / d`'s tangent in its denominator, `t n / d^2`, a linear map of `t` that is its own
     transpose (`generation.linear_map`, so reverse mode evaluates it alike): `t (q / d)` of the division's
-    quotient `q` as PyTorch's backward divides, each quotient rounded once, where `q`, `q / d` and the
-    product are normal or `t` is zero, or an operand is special (a zero, an infinity, a NaN: IEEE's result);
-    else `balanced(t, (n,), (d, d))` (2^20 / 2^-60 under 2^-60 is 2^80; 4 / 2^-128 under 2^-149 is 2^109;
-    2^-149 / 2^-140 under 2^-12 is 2^119 and pulls 2^-145 back to 2^-14; 2^-100 / 2^30 under 2^100 is
-    2^-60, where `n / d` underflows; a zero seed is zero beside an infinite `q / d`: the 2026-11-26 audit
-    and its review). Its contract: every first derivative (the tangent and its pullback) exact across
-    fp32's full range; higher orders are JAX's derivatives of PyTorch's order where it is taken, and none
-    where the balanced one is (`balanced` holds its operands constant), row 13232's."""
+    quotient `q` as PyTorch's backward divides, each quotient rounded once, wherever that product is a
+    normal value or `t` is zero, or an operand is special (a zero, an infinity, a NaN: IEEE's result);
+    else, where PyTorch's product overflows or flushes, `balanced(t, (n,), (d, d))` (2^20 / 2^-60 under
+    2^-60 is 2^80; 4 / 2^-128 under 2^-149 is 2^109; 2^-149 / 2^-140 under 2^-12 is 2^119 and pulls 2^-145
+    back to 2^-14; 2^-100 / 2^30 under 2^100 is 2^-60; a zero seed is zero beside an infinite `q / d`: the
+    2026-11-26 audit and its review). Its contract: every first derivative (the tangent and its pullback)
+    finite and exact where PyTorch's is a normal value, as PyTorch's order rounds it, and across fp32's
+    range where PyTorch's overflows or flushes; higher orders are JAX's derivatives of PyTorch's order where
+    it is taken (`2^-126 / 16` under `2^40`, differentiated in its numerator, is `2^32`: row 13247), and
+    none where the balanced one is (`balanced` holds its operands constant), row 13232's."""
     from .kernels.generation import linear_map
 
     def apply(residuals, moving):
@@ -124,8 +126,10 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
         product = held_moving * twice
         special = ~(finite_nonzero(held_numerator) & finite_nonzero(held_denominator)) | ~jnp.isfinite(
             held_moving)
-        clean = normal(held_quotient) & normal(twice) & (normal(product) | ~finite_nonzero(held_moving))
-        torch = special | clean
+        # PyTorch's order wherever its product is a normal value (its quotients subnormal or not, each
+        # rounded once as PyTorch's are, and its derivatives JAX's of that order at every order: row 13247),
+        # or the seed is zero; the balanced one only where that product overflows or flushes.
+        torch = special | normal(product) | ~finite_nonzero(held_moving)
         # Each branch's operands where the other is chosen held at one, so neither's derivative meets the
         # other's infinities.
         kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))

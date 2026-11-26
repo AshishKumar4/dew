@@ -851,6 +851,24 @@ def test_a_correctly_rounded_divisions_zero_seed_is_zero_beside_an_overflowing_c
     np.testing.assert_array_equal(np.asarray(gradient), np.float32([0, -1]))
 
 
+def test_a_correctly_rounded_divisions_denominator_derivative_keeps_its_derivative_in_the_numerator():
+    """`n / 16` at `n = 2^-126`, its quotient subnormal and its tangent in the denominator under `2^40`
+    normal (`2^-94`): that tangent's derivative in the numerator is `-2^40 / 16^2 = -2^32`, bit for bit,
+    forward over forward and reverse over forward, as PyTorch's order differentiates it, where the
+    balanced order, holding its operands constant, gave 0 (row 13247)."""
+    from dew.nn.precision import divided
+
+    seed, denominator = np.float32(2.0 ** 40), np.float32(16)
+
+    def tangent(n):
+        return jax.jvp(lambda d: divided(n, d), (denominator,), (seed,))[1]
+
+    numerator = np.float32(2.0 ** -126)
+    assert float(tangent(numerator)) == -(2.0 ** -94)
+    assert float(jax.jvp(tangent, (numerator,), (np.float32(1),))[1]) == -(2.0 ** 32)
+    assert float(jax.grad(tangent)(numerator)) == -(2.0 ** 32)
+
+
 @pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])
 def test_a_subnormal_beside_a_special_divides_as_ieee_division(lowered):
     """A subnormal operand beside a zero, an infinity or a NaN gives IEEE division's result, either order
