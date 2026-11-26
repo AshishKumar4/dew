@@ -652,8 +652,10 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
         return out
 
     with nn.intercept_methods(read):
-        _, pull = jax.vjp(apply_of(layer), params, x)
-    held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)]
+        apply_of(layer)(params, x)
+    _, pull = jax.vjp(apply_of(layer), params, x)
+    held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
+            if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
 
     def holds(value) -> bool:
         value = np.asarray(value)
