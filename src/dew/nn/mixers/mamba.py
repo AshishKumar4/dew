@@ -182,8 +182,9 @@ def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, h
     each from the state entering it, the chunk's own where its document continued from the chunk before,
     else its document's, taken up from the table at its first token (the stored slots as the segments
     before left them, so a document stores and a later one of the same chunk loads); each segment its
-    chunk's scan with every other token the identity step (dt zero: a unit decay, no write), its state
-    stored in its document's slot where it ends a storing document and carried where it ends the chunk.
+    chunk's scan with every other token the identity step (its operands zero: a unit decay, no write, no
+    read), its state stored in its document's slot where it ends a storing document and carried on, the
+    state a segment opening the next chunk continues.
     Its operands a row's chunks `[NC, C, ...]`, each token's load and store `[NC, C]`
     (`chunked_launch.Forked.tokens`), its table's given states `[S', D, N]`; `(outputs [NC, C, D], the
     row's last state)`. The segments are at most the chunks and the documents, each a chunk's work; the
@@ -198,23 +199,22 @@ def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, h
     checkpointed = jax.checkpoint(scanned)
 
     def walked(carried, at):
-        (memory_in, held_chunk, leaving), table = carried
+        state, table = carried
         first = origins[at]
         real = first < chunks * count
         chunk, origin, through = chunked_launch.Forked.segment_span(first, origins[at + 1], chunks, count)
-        # Entering a new chunk, its state is the one the chunk before left.
-        memory_in = jnp.where(chunk != held_chunk, leaving, memory_in)
+        # A segment taking no table load opens its chunk and continues the one before: the last segment's
+        # state, its chunk's end.
         load = loads[chunk, origin]
-        memory = jnp.where(load < 0, memory_in, recurrence_forked.table_read(given, table, load))
+        memory = jnp.where(load < 0, state, recurrence_forked.table_read(given, table, load))
+        # Every token outside the segment the identity step, its operands zero before any arithmetic: a
+        # value of another document's (an infinite write, B = inf at dt = 0) is no NaN here, forward or back.
         inside = (place >= origin) & (place <= through)
-        step = (x[chunk], jnp.where(inside[:, None], dt[chunk], 0.0), B[chunk], C[chunk],
-                jnp.zeros((count,), bool))
-        left, read = checkpointed(memory[None], tuple(t[None] for t in step))
+        step = tuple(jnp.where(inside[:, None], t[chunk], 0.0) for t in (x, dt, B, C))
+        left, read = checkpointed(memory[None], tuple(t[None] for t in (*step, jnp.zeros((count,), bool))))
         table = recurrence_forked.table_stored(table, jnp.where(real, stores[chunk, through], 0), left[0])
-        leaving = jnp.where(real & (through == count - 1), left[0], leaving)
         reads = jnp.where((inside & real)[:, None], read[0], 0.0)
-        placed = chunk.astype(jnp.int32)
-        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table), (placed, reads)
+        return (jnp.where(real, left[0], state), table), (chunk.astype(jnp.int32), reads)
 
     def skipped(carried, at):
         del at
@@ -224,8 +224,7 @@ def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, h
         return jax.lax.cond(at < segments, walked, skipped, carried, at)
 
     table = jnp.zeros((held, *zero.shape), zero.dtype)
-    ((_, _, last), _), (placed, reads) = jax.lax.scan(step, ((zero, jnp.asarray(-1), zero), table),
-                                                      jnp.arange(chunks + documents))
+    (last, _), (placed, reads) = jax.lax.scan(step, (zero, table), jnp.arange(chunks + documents))
     outputs = jnp.zeros((chunks, count, x.shape[-1]), reads.dtype).at[placed].add(reads)
     return outputs, last
 

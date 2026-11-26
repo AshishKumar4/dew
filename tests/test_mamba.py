@@ -283,6 +283,33 @@ DECODE_SEEDS = 8
 sized by `seeds_for` on armada."""
 
 
+def test_forked_documents_in_one_chunk_read_none_of_each_others_operands():
+    """Two one-token documents in one chunk of a forked call (`selective_scan`'s `forked`, walked in place
+    a segment a document), each entering a zero memory: the first's infinite write (B = inf) reaches no
+    value of the second's, whose output and final state are its own token's, 1, and whose output's
+    gradient along its own operands is finite (its token's x, dt, B and C each 1). A segment's other tokens
+    take zero operands before any arithmetic (`mamba._forked_row`): its step zero alone left `dt x B` at
+    0 * inf, NaN (head review of cadac1879). The first's own operands take its infinite state times a
+    zero cotangent in its own segment's pullback, NaN, as the documents laid from chunks' edges took it."""
+    from dew.nn.kernels.chunked_launch import Forked
+
+    ones = jnp.ones((1, 2, 1), jnp.float32)
+    B = jnp.asarray([[[jnp.inf], [1.0]]], jnp.float32)
+    A, D = -jnp.ones((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32)
+    firsts, slots = jnp.asarray([[0, 1]], jnp.int32), jnp.zeros((1, 2), jnp.int32)
+    forked = Forked(firsts, slots, slots, None, 0)
+    given = jnp.zeros((1, 1, 1, 1), jnp.float32)
+
+    def second(x, dt, B, C):
+        out, final = selective_scan(x, dt, A, B, C, D, given, forked=forked)
+        return out[0, 1, 0], final
+
+    (out, final) = second(ones, ones, B, ones)
+    assert float(out) == 1.0 and float(final[0, 0, 0]) == 1.0, (out, final)
+    grads = jax.grad(lambda *operands: second(*operands)[0], argnums=(0, 1, 2, 3))(ones, ones, B, ones)
+    assert [float(grad[0, 1, 0]) for grad in grads] == [1.0] * 4, grads
+
+
 @pytest.mark.parametrize('chunk', [0, UNROLLED + 1])
 def test_a_chunk_outside_its_straight_line_block_is_refused(chunk):
     """A chunk of no tokens, or past the tokens `ssm.affine_states` runs straight-line (`ssm.UNROLLED`, row
