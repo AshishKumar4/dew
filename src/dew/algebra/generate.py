@@ -89,6 +89,14 @@ class SurrogateCase:
     name: str
     forward: ComponentForm
     tangents: Mapping[tuple[int, ...], ComponentForm]
+    input_tree: jax.tree_util.PyTreeDef | None = None
+    output_tree: jax.tree_util.PyTreeDef | None = None
+
+    def restore(self, flat):
+        if self.output_tree is None:
+            return flat
+        leaves = flat if isinstance(flat, tuple) else (flat,)
+        return jax.tree.unflatten(self.output_tree, leaves)
 
     def tangent_name(self, inactive: tuple[int, ...]) -> str:
         suffix = "_zero_" + "_".join(map(str, inactive)) if inactive else ""
@@ -126,27 +134,37 @@ class SurrogateBodies:
             fixed = tuple(values[index] for index in fixed_at)
             case = self.cases.get(fixed)
             dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
-            if case is not None and _case_admitted(case.forward.cases, dynamic, policy, target):
-                return emitted(case.name)(*dynamic, policy=policy, target=target)
+            if case is not None and (flat := _case_leaves(case, dynamic)) is not None:
+                if _case_admitted(case.forward.cases, flat, policy, target):
+                    return case.restore(emitted(case.name)(*flat, policy=policy, target=target))
             return self.forward(*values)
 
         def tangent(*values):
             *fixed, primals, directions, value = values
             case = self.cases.get(tuple(fixed))
-            inactive = tuple(i for i, direction in enumerate(directions)
-                             if isinstance(direction, SymbolicZero))
-            component = None if case is None else case.tangents.get(inactive)
-            if case is not None and component is not None:
-                active = tuple(direction for direction in directions
-                               if not isinstance(direction, SymbolicZero))
-                operands = (*primals, *active, *jax.tree.leaves(value))
+            leaves = jax.tree.leaves(directions, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+            inactive = tuple(i for i, leaf in enumerate(leaves) if isinstance(leaf, SymbolicZero))
+            if case is None:
+                return self.tangent(*values)
+            component = case.tangents.get(inactive)
+            if component is not None and (flat := _case_leaves(case, primals)) is not None:
+                active = tuple(leaf for leaf in leaves if not isinstance(leaf, SymbolicZero))
+                operands = (*flat, *active, *jax.tree.leaves(value))
                 if _case_admitted(component.cases, operands, policy, target):
-                    return emitted(case.tangent_name(inactive))(*operands, policy=policy, target=target)
+                    run = emitted(case.tangent_name(inactive))
+                    return case.restore(run(*operands, policy=policy, target=target))
             return self.tangent(*values)
 
         return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
             surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
                       symbolic_zeros=self.symbolic_zeros))
+
+
+def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
+    if case.input_tree is None:
+        return dynamic  # The array admission below rejects a nested value in a flat declaration.
+    leaves, tree = jax.tree.flatten(dynamic)
+    return tuple(leaves) if tree == case.input_tree else None
 
 
 def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:

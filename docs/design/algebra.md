@@ -1432,7 +1432,8 @@ the written trace and independent truth. Sharing and case selection add no run-t
   `dew.nn.derivatives.surrogate`, their separate cases and their nondifferentiable arguments. A tangent
   component traces over primals, active tangents and the original forward value; the case key includes
   static arguments and which tangents are symbolic zeros. Generate each body against its own reference.
-  The opt-in assembly uses the existing surrogate wrapper for the value dependency at higher orders.
+  The opt-in assembly uses the existing surrogate wrapper for the value dependency at higher orders and
+  restores the declared output PyTree from the flat body.
   An unknown static, activity or array case still uses its written body. CPU checks hold both BF16 and
   FP16 of `dew.nn.precision.rounded_operand`: the value preserves its rounding barrier and its tangent
   remains the input tangent, including after another differentiation. Production has not switched.

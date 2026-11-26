@@ -355,25 +355,32 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
 def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_value():
     from jax.custom_derivatives import SymbolicZero
 
-    def value(x, y):
-        return x + y
+    def value(operands):
+        x, y = operands["x"], operands["y"]
+        return {"difference": x - y, "sum": x + y}
 
     def tangent(primals, directions, written):
-        dx, dy = (jnp.zeros_like(p) if isinstance(d, SymbolicZero) else d
-                  for p, d in zip(primals, directions, strict=True))
-        return written * (dx + dy)
+        (operands,), (directions_by_name,) = primals, directions
+        dx, dy = (jnp.zeros_like(operands[name]) if isinstance(d, SymbolicZero) else d
+                  for name, d in directions_by_name.items())
+        return {"difference": written["difference"] * (dx - dy), "sum": written["sum"] * (dx + dy)}
 
-    def active_tangent(x, y, dx, written):
-        return written * dx
+    def flat_value(x, y):
+        return x - y, x + y
+
+    def active_tangent(x, y, dx, difference, total):
+        return difference * dx, total * dx
 
     def draw(seed, operands):
         return tuple(np.random.default_rng(seed + i).standard_normal(part.shape).astype(np.float32)
                      for i, part in enumerate(operands))
 
     tile = jax.ShapeDtypeStruct((8,), jnp.float32)
-    forward = generate.ComponentForm(value, value, generate.Cases(((tile, tile),), draw, 8))
-    active = generate.ComponentForm(active_tangent, active_tangent, generate.Cases(((tile,) * 4,), draw, 8))
-    case = generate.SurrogateCase("partial", forward, {(1,): active})
+    forward = generate.ComponentForm(flat_value, flat_value, generate.Cases(((tile, tile),), draw, 8))
+    active = generate.ComponentForm(active_tangent, active_tangent, generate.Cases(((tile,) * 5,), draw, 8))
+    case = generate.SurrogateCase("partial", forward, {(1,): active},
+                                  input_tree=jax.tree.structure(({"x": tile, "y": tile},)),
+                                  output_tree=jax.tree.structure({"difference": tile, "sum": tile}))
     declared = generate.SurrogateBodies(value, tangent, (), True, {(): case})
     reachable = {}
     for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
@@ -385,22 +392,22 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     def emitted(name):
         fn = reachable[name]
         called.add(fn)
-
-        def array(*operands, policy, target):
-            (result,) = fn(*operands)
-            return result
-
-        return array
+        return lambda *operands, policy, target: fn(*operands)
 
     composed = declared.assembled(emitted)
     x = np.arange(8, dtype=np.float32)
     y = np.full_like(x, 3.5)
     dx = np.full_like(x, 2.25)
-    primal, moved = jax.jit(lambda x, y, dx: jax.jvp(lambda z: composed(z, y), (x,), (dx,)))(x, y, dx)
-    np.testing.assert_array_equal(primal, x + y)
-    np.testing.assert_array_equal(moved, (x + y) * dx)
-    assert called == set(reachable.values())
 
+    def moved(x, y, dx):
+        return jax.jvp(lambda z: composed({"x": z, "y": y}), (x,), (dx,))
+
+    primal, direction = jax.jit(moved)(x, y, dx)
+    np.testing.assert_array_equal(primal["difference"], x - y)
+    np.testing.assert_array_equal(primal["sum"], x + y)
+    np.testing.assert_array_equal(direction["difference"], (x - y) * dx)
+    np.testing.assert_array_equal(direction["sum"], (x + y) * dx)
+    assert called == set(reachable.values())
 
 
 def nested(x, y):
