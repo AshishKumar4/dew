@@ -357,7 +357,7 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
         start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order, axes)
         # A copy each draw, as each step donates the state it is handed, held as the trainer holds it:
         # a pipelined run stacked by stage (`Trainer.staged`).
-        state = trainer.staged(start)
+        state = trainer._as_step(start)
         batch = shard_batch(trainer.device_mesh, prepare_counts(
             trainer.objective, wide(case, raw) if exact else raw, count_model=False))
         if len(built) == 1:

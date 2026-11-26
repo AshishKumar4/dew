@@ -351,7 +351,6 @@ class Trainer(objective: Objective[Loss, Effects], optimizer: OptimizerSpec | Op
   .place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]
   .plan: property -> JSON
   .shardings(self, state: TrainState) -> Placement[TrainState]
-  .staged(self, state: TrainState) -> TrainState
   .state_mesh: cached property -> Mesh
   .step_flops: property -> StepFlops | None
   .stored(self, state: TrainState) -> TrainState

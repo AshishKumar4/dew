@@ -9,6 +9,8 @@ from flax import linen as nn, struct
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding
+from dew.nn.kernels import generation
+from dew.nn.precision import DTYPE_PRESETS, Numerics
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.training import Trainer, TrainerAdvanced
 
@@ -381,6 +383,147 @@ def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
     assert float(rejected.scale.scale) == .5
     assert all(not np.any(np.asarray(leaf)) for leaf in rejected.accumulation.statistics)
     compare(rejected.variables, prefix_params, exact=True)
+
+
+class Fitted(Objective):
+    """A regression of `model`, the one module it trains."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def fresh_variables(self, key, held):
+        return nn.unbox(self.model.init(key, jnp.ones((1, 2), jnp.float32)))
+
+    def loss(self, variables, batch, step):
+        prediction = self.model.apply(variables, batch["x"]).astype(jnp.float32)
+        return jnp.mean((prediction - batch["y"]) ** 2), Aux({})
+
+
+def numerics_reader(traced: list):
+    """A dense model computing in its `dtype` whose every trace records the numerics it runs under."""
+
+    class Read(nn.Module):
+        dtype: jax.typing.DTypeLike | None
+
+        @nn.compact
+        def __call__(self, x):
+            traced.append(generation.numerics())
+            return nn.Dense(1, dtype=self.dtype)(x)
+    return Read
+
+
+@pytest.mark.parametrize("preset", ["16-mixed", "bf16-true"])
+def test_a_trainer_given_numerics_traces_draws_and_scales_under_them(preset):
+    """A Python trainer given a run's numerics (`TrainerAdvanced.numerics`) applies each of them, as a run
+    config's does: its programs, the state's draw and the step's, trace under their products, forms and
+    outputs; the parameters it draws fresh are stored in their `dtypes.params`; and a float16 compute scales
+    the loss, a bf16 one not (`loss_scaling` "auto")."""
+    numerics = Numerics(DTYPE_PRESETS[preset], matmul="highest", forms="accurate")
+    traced = []
+    trainer = Trainer(Fitted(numerics_reader(traced)(numerics.dtypes.compute)), optax.sgd(.1),
+                      key=jax.random.key(0), advanced=TrainerAdvanced(numerics=numerics))
+    state = trainer.initial_state()
+    assert (state.scale is not None) == (preset == "16-mixed")
+    assert {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])} == {
+        jnp.dtype(numerics.dtypes.params)}
+    drawn = len(traced)
+    rows = 2 * jax.device_count()
+    trainer.compile(state, {"x": jnp.ones((rows, 2), jnp.float32), "y": jnp.zeros((rows, 1), jnp.float32)})
+    assert 0 < drawn < len(traced) and all(seen == numerics for seen in traced)
+
+
+def test_numerics_store_every_fresh_parameter_where_one_module_states_its_storage_and_another_none():
+    """Under `bf16-true`, two trained modules computing in bf16, one stating its storage as bf16 and one (a
+    wrapper) stating none, its layer drawing float32: every fresh parameter is stored in bf16, the
+    numerics' storage applied where a module's own is unknown (review of row 11935)."""
+    from dew.objectives.base import ProgramModule
+
+    numerics = Numerics(DTYPE_PRESETS["bf16-true"])
+    stated = nn.Dense(1, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+    read = numerics_reader([])(jnp.bfloat16)
+
+    class Two(Fitted):
+        def __init__(self):
+            self.model, self.other = stated, read
+
+        def program_key(self):
+            return (ProgramModule(self.model, None, trained=True),
+                    ProgramModule(self.other, None, trained=True))
+
+        def fresh_variables(self, key, held):
+            x = jnp.ones((1, 2), jnp.float32)
+            first, second = jax.random.split(key)
+            return {"params": {"model": nn.unbox(self.model.init(first, x))["params"],
+                               "other": nn.unbox(self.other.init(second, x))["params"]}}
+
+        def loss(self, variables, batch, step):
+            params = variables["params"]
+            prediction = (jnp.asarray(self.model.apply({"params": params["model"]}, batch["x"]))
+                          + jnp.asarray(self.other.apply({"params": params["other"]}, batch["x"])))
+            prediction = prediction.astype(jnp.float32)
+            return jnp.mean((prediction - batch["y"]) ** 2), Aux({})
+
+    state = Trainer(Two(), optax.sgd(.1), key=jax.random.key(0),
+                    advanced=TrainerAdvanced(numerics=numerics)).initial_state()
+    assert {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])} == {jnp.dtype(jnp.bfloat16)}
+
+
+def test_a_step_compiled_ahead_traces_under_its_trainers_numerics():
+    """A trainer's step compiled ahead from Python (`compile_ahead`) for compile-only GPUs traces its start
+    and its step under the trainer's numerics, as its fit does (`under_numerics`)."""
+    from test_compile_ahead import gpus
+
+    from dew.training import MeshSpec
+    from dew.training.ahead import compile_ahead
+
+    numerics = Numerics(DTYPE_PRESETS["bf16-true"], matmul="highest", forms="accurate")
+    traced = []
+    trainer = Trainer(Fitted(numerics_reader(traced)(numerics.dtypes.compute)), optax.sgd(.1),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpus("sm90")),
+                      advanced=TrainerAdvanced(numerics=numerics))
+    compile_ahead(trainer, {"x": jnp.ones((8, 2), jnp.float32), "y": jnp.zeros((8, 1), jnp.float32)})
+    assert traced and all(seen == numerics for seen in traced)
+
+
+def test_a_trainer_refuses_numerics_its_model_computes_outside_or_beside_their_own_knobs():
+    """Numerics whose compute dtype the model it trains states another of, or states none of, are refused,
+    the model's dtype being its own field, as numerics set beside the `param_dtype` and `dynamic_scale` they
+    state are."""
+    numerics = Numerics(DTYPE_PRESETS["16-mixed"])
+    read = numerics_reader([])
+    # Stating float32; or none (Flax's None), inferring it from its inputs and parameters, under numerics
+    # whose compute its float32 parameters' matches too.
+    full = Numerics(DTYPE_PRESETS["32-true"])
+    for dtype, stated in ((jnp.float32, numerics), (None, numerics), (None, full)):
+        with pytest.raises(ValueError):
+            Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=stated))
+
+    class Branches(nn.Module):
+        """A wrapper of two branches, one stating float16 and one inferring its compute."""
+
+        first: nn.Module
+        second: nn.Module
+
+        def __call__(self, x):
+            return self.first(x) + self.second(x)
+
+    class Compact(nn.Module):
+        """A wrapper stating no dtype whose float16 layer its body alone builds."""
+
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(1, dtype=jnp.float16)(x)
+
+    # A wrapper states no compute of its own, whatever its branches state.
+    for wrapper in (Branches(nn.Dense(1, dtype=jnp.float16), nn.Dense(1)), Compact()):
+        with pytest.raises(ValueError):
+            Trainer(Fitted(wrapper), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
+    for knobs in ({"param_dtype": "bfloat16"}, {"dynamic_scale": True}):
+        with pytest.raises(ValueError):
+            Trainer(Fitted(read(jnp.float16)), optax.sgd(.1),
+                    advanced=TrainerAdvanced(numerics=numerics, **knobs))
+    assert Trainer(Fitted(read(jnp.float16)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics)
+                   ).dynamic_scale
 
 
 @pytest.mark.parametrize("decay", [0.5, 0.999, 0.9999])

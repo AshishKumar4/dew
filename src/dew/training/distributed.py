@@ -6,6 +6,7 @@ is `dew.distributed.placement`'s."""
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -39,6 +40,7 @@ from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology, placed_shapes
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Compiling, OuterProgram, Placements, compiling, owned_program
+from dew.nn.precision import Numerics
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Held, Initializer
 from dew.objectives.drawn import Parts, drawing, drawn_rest, reassembled
@@ -74,6 +76,30 @@ def ruled[Owner: Ruled, **Arguments, Result](
     @functools.wraps(method)
     def run(owner: Owner, *args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
         with nn.logical_axis_rules(owner.layout.axis_rules):
+            return method(owner, *args, **kwargs)
+    return run
+
+
+class Numbered(Protocol):
+    numerics: Numerics | None
+
+
+def under_numerics(numerics: Numerics | None) -> contextlib.AbstractContextManager[None]:
+    """The block every program a trainer traces is traced within, under its numerics where it holds any
+    (`TrainerAdvanced.numerics`, `generation.run_precision`): their products, forms, recipe and outputs. Its
+    entry points take it (`numbered`), and the preamble a step compiled ahead shares (`ahead._targeted`)."""
+    from dew.nn.kernels.generation import run_precision
+
+    return contextlib.nullcontext() if numerics is None else run_precision(numerics)
+
+
+def numbered[Owner: Numbered, **Arguments, Result](
+        method: Callable[Concatenate[Owner, Arguments], Result]
+) -> Callable[Concatenate[Owner, Arguments], Result]:
+    """`method`, every program it traces traced under its owner's numerics (`under_numerics`)."""
+    @functools.wraps(method)
+    def run(owner: Owner, *args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
+        with under_numerics(owner.numerics):
             return method(owner, *args, **kwargs)
     return run
 

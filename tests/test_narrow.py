@@ -697,7 +697,7 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     need, temporaries = free - probe["headroom"], probe["temp"]
     _, batch = _decoder(remat="full")
     with chosen(narrow_copies="on"):
-        staged = roomy.staged(trained)
+        staged = roomy._as_step(trained)
         stepped, *_ = roomy.compile(staged, batch)(staged, batch)
     copies = sorted(leaf.nbytes for leaf in jax.tree.leaves(stepped.compute))
     assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
