@@ -2043,6 +2043,26 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
 
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
+def test_a_chunked_server_over_row_groups_shares_pages_below_the_crossover():
+    """A server sharing prompts' pages (`PagedKV(shared=True)`) whose prompts prefill in pieces (`chunk`)
+    over a mesh's two row groups keeps its pages below the measured crossover (`SHARED_PAGES_FROM`): whole
+    rows prefill a piece only in the mixed admitting step, which row groups refuse, so the crossover is no
+    choice there (row 13539); each row draws what the task alone draws."""
+    from dew.inference.serving import SHARED_PAGES_FROM, PagedRows
+
+    sampling = Sampling(temperature=0, eos_token_ids=EOS)
+    lone = banked_task(sampling)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    assert 128 < SHARED_PAGES_FROM
+    server, tickets = served_alongside(banked_task(sampling, devices=2), cache=PagedKV(shared=True), chunk=16)
+    assert server.groups == 2 and isinstance(server.rows, PagedRows)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_draws(ticket.result(), row)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.mesh(devices=4)
 def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
     """A banked server whose slots split into two row groups, paged, prefills its prompts in a forward of
     their own (`mixed_refusal`): each piece's page table and cursor land in its row of every layer of the

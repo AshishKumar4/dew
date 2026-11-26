@@ -1047,7 +1047,7 @@ class Server:
         mesh = _served_mesh(task)
         policy = task.controls()
         transforms, stopping, strategy = policy.components()
-        layout = _laid(task.model, cache, capacity, strategy, prefill_mesh)
+        layout = _laid(task.model, cache, capacity, strategy, prefill_mesh, chunk)
         # What the server keeps of its prompts' prefixes: a paged cache's, as it names it.
         kept = cache if isinstance(cache, PagedKV) else PagedKV()
         prefix_cache = (_reuses_prefixes(task.model, layout, strategy, prefill_mesh)
@@ -1901,7 +1901,7 @@ def _reuses_prefixes(model: nn.Module, kv_cache: KVCache | None, strategy: Strat
 
 
 def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: Strategy,
-          prefill_mesh: Mesh | None) -> KVCache | None:
+          prefill_mesh: Mesh | None, chunk: int | None = None) -> KVCache | None:
     """The layout a server lays its rows' cache in for `from_task`'s `cache`, None for a model of no
     layout, whose rows are whole: for None the model's own; for `DenseKV` the model's own unpaged, each
     row's cache whole; for `PagedKV` the model's own in pages of its `page_size` (the model's own, else
@@ -1932,19 +1932,21 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     paged = dataclasses.replace(base, page_size=size, pages=pages, groups=1)
     if not cache.shared or base.page_size is not None:
         return paged
-    measured = _measured(cache, base)
+    measured = _measured(cache, base, chunk)
     pays = _pages_pay(model, paged, capacity, strategy, prefill_mesh, measured=measured)
     return paged if pays else unpaged(base)
 
 
-def _measured(cache: ServedCache | None, base: KVCache | None) -> bool:
+def _measured(cache: ServedCache | None, base: KVCache | None, chunk: int | None = None) -> bool:
     """Whether shared pages over `base` (`PagedKV.shared`) are chosen over whole rows by the measured
     crossover (`SHARED_PAGES_FROM`): where pages are the server's own choice, not a layout's (`base`'s own
-    pages, the model's or the cache's) nor a requirement the cache states, a prefix cache it names
-    (`prefix_cache`) or pages it offloads (`host_pages`), which hold at any capacity as before the crossover
-    (row 13278). One policy `_laid` and `served_layout` read."""
+    pages, the model's or the cache's) nor a requirement the caller states, a prefix cache it names
+    (`prefix_cache`), pages it offloads (`host_pages`) or a prompt prefilled in pieces (`chunk`), which
+    whole rows prefill only in a mixed admitting step a model or a mesh's row groups may refuse: each holds
+    at any capacity as before the crossover (rows 13278, 13539). One policy `_laid` and `served_layout`
+    read."""
     stated = isinstance(cache, PagedKV) and (cache.prefix_cache is not None or cache.host_pages > 0)
-    return not stated and (base is None or base.page_size is None)
+    return not stated and chunk is None and (base is None or base.page_size is None)
 
 
 SHARED_PAGES_FROM = 2048
