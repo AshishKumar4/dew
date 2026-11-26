@@ -513,8 +513,8 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
 def test_an_msa_decoder_of_a_top_of_one_selects_each_querys_own_block_alone():
     """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): it
     builds and runs, each query's one slot its own block (`msa_selection`'s forcing), as it sows it."""
-    model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8),
-                 dtype="float32")
+    model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1,
+                                    index_width=8), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
     params = model.init(jax.random.key(1), tokens)
     logits, sown = model.apply(params, tokens, mutable=[SELECTIONS])
