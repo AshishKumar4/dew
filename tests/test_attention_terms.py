@@ -367,6 +367,34 @@ def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_c
     np.testing.assert_array_equal(run(places), run(None))
 
 
+def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_out():
+    """A layer scored with no places given (its places its indices) biases its attention by the band about
+    each query (`relative_band`, row 13138), which holds `Q band_width` entries a head: its output and its
+    gradients are, bit for bit, the same call's with its places stated (`positions`, which takes the
+    written-out bias, `relative_logits`), its QK-Clip maxima too."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+    from dew.nn.inspection import QK
+
+    layer = _layer()
+    rng = np.random.default_rng(0xBA4D)
+    x = jnp.asarray(rng.normal(size=(ROWS, LENGTH, FEATURES)), jnp.float32)
+    params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(scale=0.5, size=leaf.shape), leaf.dtype),
+                          nn.unbox(layer.init(jax.random.key(0), x)))
+    stated = MixerCall(AttentionMetadata(coordinates=coordinates(
+        (ROWS, LENGTH), positions=jnp.broadcast_to(jnp.arange(LENGTH), (ROWS, LENGTH)))))
+
+    def run(call):
+        def loss(params, x):
+            out, sown = layer.apply(params, x, call, mutable=[QK])
+            return jnp.sum(out ** 2), (out, sown)
+        (_, (out, sown)), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(params, x)
+        return jax.tree.leaves((out, sown, grads))
+
+    for banded, written in zip(run(MixerCall()), run(stated), strict=True):
+        np.testing.assert_array_equal(np.asarray(banded), np.asarray(written))
+
+
 def test_a_bidirectional_layer_holds_no_relative_bias():
     """A relative bias reads each query's backward distance in the stream's slots, which a bidirectional
     canvas over a frozen prefix places otherwise: a layer that is not causal refuses it as it is built,
