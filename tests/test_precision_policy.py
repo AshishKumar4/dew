@@ -811,7 +811,9 @@ def test_a_correctly_rounded_division_of_subnormal_operands_is_their_values_quot
 @pytest.mark.parametrize(("numerator", "denominator", "tangent", "cotangent", "moved", "pulled"), [
     (2.0 ** 20, 2.0 ** -60, 2.0 ** -60, 2.0 ** -60, -(2.0 ** 80), -(2.0 ** 80)),
     (2.0 ** -149, 2.0 ** -140, 2.0 ** -12, 2.0 ** -145, -(2.0 ** 119), -(2.0 ** -14)),
-], ids=["its-twice-quotient-overflows", "a-subnormal-numerator-either-order-overflows"])
+    (4.0, 2.0 ** -128, 2.0 ** -149, 2.0 ** -149, -(2.0 ** 109), -(2.0 ** 109)),
+], ids=["its-twice-quotient-overflows", "a-subnormal-numerator-either-order-overflows",
+        "its-quotient-overflows-under-a-subnormal-seed"])
 def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_its_value_is(
         numerator, denominator, tangent, cotangent, moved, pulled):
     """The derivative of `n / d` in `d`, `-t n / d^2`, where `(n / d) / d` overflows: a tangent and a
@@ -825,6 +827,24 @@ def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_it
     assert float(forward) == moved
     _, pull = jax.vjp(lambda d: divided(numerator, d), denominator)
     assert float(pull(np.float32(cotangent))[0]) == pulled
+
+
+def test_a_correctly_rounded_divisions_denominator_derivative_holds_its_second_order_and_its_specials():
+    """`2^20 / d` at `2^-60`, its tangent in `d` taken twice under seeds `2^-60`: `2 n / d^3` times both,
+    `2^81`, where the balanced first derivative held no derivative of its own and gave 0; and `0 / 0`'s
+    tangent in its denominator is IEEE's NaN, both ways, not a finite value of the operands' bits (row
+    13163's review)."""
+    from dew.nn.precision import divided
+
+    seed, numerator = np.float32(2.0 ** -60), np.float32(2.0 ** 20)
+
+    def first(d):
+        return jax.jvp(lambda d: divided(numerator, d), (d,), (seed,))[1]
+
+    assert float(jax.jvp(first, (np.float32(2.0 ** -60),), (seed,))[1]) == 2.0 ** 81
+    zero = np.float32(0)
+    assert np.isnan(float(jax.jvp(lambda d: divided(zero, d), (zero,), (np.float32(1),))[1]))
+    assert np.isnan(float(jax.vjp(lambda d: divided(zero, d), zero)[1](np.float32(1))[0]))
 
 
 @pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])
