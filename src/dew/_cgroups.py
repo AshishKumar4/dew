@@ -31,11 +31,11 @@ def own(root: Path = ROOT, membership: Path = MEMBERSHIP) -> Path:
     return group if group.is_dir() else root
 
 
-def _read(path: Path) -> str | None:
-    """`path`'s text, None where it cannot be read: a group removed or made unreadable as it is read (a
-    process moved out of one), which leaves its other limits readable."""
+def _read(path: Path) -> bytes | None:
+    """`path`'s bytes as the kernel wrote them, None where it cannot be read: a group removed or made
+    unreadable as it is read (a process moved out of one), which leaves its other limits readable."""
     try:
-        return path.read_text()
+        return path.read_bytes()
     except OSError as error:
         _log.debug("cgroup file %s unreadable: %s", path, error)
         return None
@@ -43,9 +43,11 @@ def _read(path: Path) -> str | None:
 
 def _memberships(membership: Path) -> list[tuple[str, str]]:
     """Each hierarchy `membership` names this process in: its controllers ('' for v2's unified one) and its
-    group's path, verbatim (a group's name may end in a space); none where the file is absent or unreadable
-    (a host that is not Linux)."""
-    lines = (_read(membership) or "").splitlines()
+    group's path, verbatim: the file's lines its bytes, each ending in a newline alone, a group's name any
+    byte but '/' and a newline (one ending in a space, holding a carriage return or U+2028, which a text read
+    or `str.splitlines` splits on, or no UTF-8, `os.fsdecode`'s escapes); none where the file is absent or
+    unreadable (a host that is not Linux)."""
+    lines = [os.fsdecode(line) for line in (_read(membership) or b"").split(b"\n") if line]
     return [(controllers, path) for _, controllers, path in (line.split(":", 2) for line in lines)]
 
 
@@ -91,13 +93,12 @@ def usable_cpus(group: Path | None = None, root: Path = ROOT) -> int:
     return usable
 
 
-def memory(level: Path) -> int | None:
-    """The bytes `level`'s limit (`memory.max`) allows, None where it states none."""
-    maximum = level / "memory.max"
-    if not maximum.is_file():
-        return None
-    limit = maximum.read_text().strip()
-    return None if limit == "max" else int(limit)
+def _limit(stated: Path) -> int | None:
+    """The bytes the limit file `stated` allows: None where it states none (v2's 'max') or cannot be read
+    (`_read`)."""
+    text = _read(stated)
+    limit = b"" if text is None else text.strip()
+    return None if limit in (b"", b"max") else int(limit)
 
 
 MEMORY_LIMITS = {"": ("", "memory.max"), "memory": ("memory", "memory.limit_in_bytes")}
@@ -105,13 +106,13 @@ MEMORY_LIMITS = {"": ("", "memory.max"), "memory": ("memory", "memory.limit_in_b
 its mount) and v1's memory controller's (`memory.limit_in_bytes`, at its own mount beside it)."""
 
 
-def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]:
-    """The memory limits on every cgroup this process runs in (`membership`: v2's unified group, v1's memory
-    controller's), each group's own and every ancestor's up to its hierarchy's mount under `root`, any of
-    which bounds it: a group its mount does not show (a container's, whose own group is its mount's root)
-    states its limit at that root, an ancestor that does. v2's 'max' states none, nor a file unreadable as it
-    is read (`_read`)."""
-    limits = []
+def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> Iterator[tuple[Path, int]]:
+    """Each cgroup directory whose memory limit bounds this process, and that limit in bytes: in every
+    hierarchy `membership` names it in that bounds memory (v2's unified group, v1's memory controller's), its
+    group and every ancestor up to the hierarchy's mount under `root`. A group its mount does not show (a
+    container's, whose own group is its mount's root) states its limit at that root, an ancestor that does.
+    The one walk of them a CPU call's memory share (`dew.nn.kernels.generation`), a data host's sizing
+    (`dew.data.dataset.Host`) and CI's limit key (tools/armada/host.py) take."""
     for controllers, path in _memberships(membership):
         hierarchy = next((controller for controller in ("", "memory")
                           if controller == controllers or controller in controllers.split(",")), None)
@@ -120,10 +121,9 @@ def memory_limits(root: Path = ROOT, membership: Path = MEMBERSHIP) -> list[int]
         mount, name = MEMORY_LIMITS[hierarchy]
         parts = [part for part in path.split("/") if part]
         for depth in range(len(parts), -1, -1):
-            stated = _read(root.joinpath(mount, *parts[:depth], name))
-            if stated is not None and (limit := stated.strip()) not in ("", "max"):
-                limits.append(int(limit))
-    return limits
+            level = root.joinpath(mount, *parts[:depth])
+            if (limit := _limit(level / name)) is not None:
+                yield level, limit
 
 
 def memory_peak(level: Path) -> int | None:
@@ -144,13 +144,20 @@ def oom_kills(level: Path) -> int | None:
     return int(counts["oom_kill"]) if "oom_kill" in counts else None
 
 
+CHARGES = {"memory.current": "inactive_file", "memory.usage_in_bytes": "total_inactive_file"}
+"""Where each hierarchy states a group's charge, and the `memory.stat` counter of the inactive page cache that
+charge holds: cgroup v2's (`memory.current`, whose stat counts every descendant's), and v1's memory
+controller's (`memory.usage_in_bytes`, which counts every descendant's as its `total_` counters do)."""
+
+
 def memory_held(level: Path) -> int | None:
-    """The bytes `level` holds that its kernel will not reclaim first: its charge (`memory.current`) less
-    its inactive page cache (`memory.stat`'s `inactive_file`), as the kubelet counts a container's working
-    set; None where it states no charge."""
-    current, stat = level / "memory.current", level / "memory.stat"
-    if not current.is_file():
-        return None
-    stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
-    reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
-    return int(current.read_text()) - reclaimed
+    """The bytes `level` holds that its kernel will not reclaim first: its charge (`CHARGES`: v2's or v1's)
+    less the inactive page cache in it, as the kubelet counts a container's working set, none where the cache
+    read after the charge is past it (v1's charge is approximate; cAdvisor's floor); None where it states no
+    charge, or its charge cannot be read (`_read`)."""
+    for charge, inactive in CHARGES.items():
+        if (current := _read(level / charge)) is not None:
+            stated = [line.split() for line in (_read(level / "memory.stat") or b"").splitlines()]
+            reclaimed = next((int(value) for name, value in stated if name == inactive.encode()), 0)
+            return max(0, int(current) - reclaimed)
+    return None

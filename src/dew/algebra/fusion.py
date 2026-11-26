@@ -326,11 +326,10 @@ def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: 
 
 
 def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
-    """The places of the product at `start`'s prologue (`_regions`): the elementwise equations of its left
-    operand's shape (`_elementwise`) that make it, walked back from it to a value of another shape or kind or
-    an equation another region holds (`claimed`), with the layout equations of their captured operands only
-    they read (`CAPTURED`: a row statistic broadcast over the depth, a scale over the rows); none for a
-    product whose left operand is not its rows (a kernel gradient's xᵀ @ dy)."""
+    """The product's entrywise producers, including a marked gated activation, before the first
+    equation of another shape or kind or one another region holds (claimed); include their captured
+    layout equations when nothing else reads them (a row statistic broadcast over the depth, a scale over
+    the rows). A product whose left operand is not its rows (Xᵀ @ dY) has no prologue."""
     jaxpr, producer = index.jaxpr, index.producer
     equation = jaxpr.eqns[start]
     form, lhs = _form(equation), equation.invars[0]
@@ -339,11 +338,13 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     shape, members, frontier = _shape(lhs), set(), [lhs]
     while frontier:
         place = producer.get(frontier.pop())
-        if place is None or place in members or place in claimed or not _elementwise(jaxpr.eqns[place],
-                                                                                      shape):
+        if place is None or place in members or place in claimed:
+            continue
+        producer_eqn = jaxpr.eqns[place]
+        if not (_elementwise(producer_eqn, shape) or _activation(producer_eqn, shape)):
             continue
         members.add(place)
-        frontier.extend(var for var in jaxpr.eqns[place].invars if isinstance(var, jcore.Var))
+        frontier.extend(var for var in producer_eqn.invars if isinstance(var, jcore.Var))
     return tuple(sorted(members | _captured(index, sorted(members), members, claimed)))
 
 
@@ -539,8 +540,8 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
     from dew.algebra import program
 
-    return program.structure(jcore.Jaxpr([], list(region.inputs), list(region.outputs),
-                                         [jaxpr.eqns[place] for place in region.replayed]))
+    return program.structure_of(region.inputs, [jaxpr.eqns[place] for place in region.replayed],
+                                region.outputs)
 
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,

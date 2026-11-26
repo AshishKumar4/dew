@@ -21,6 +21,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.gemm import quantized
+from dew.nn.kernels.templates.hooks import Hook
 
 GROUP = 32
 """The columns of each run of gate or up columns in a wide matrix (the module's docstring)."""
@@ -98,7 +99,8 @@ class Gated:
 
 
 def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
-                  name: str | None = "gate_up", precision=None, interpret_on_cpu: bool = False) -> jax.Array:
+                  name: str | tuple[str, ...] | None = "gate_up", precision=None,
+                  interpret_on_cpu: bool = False) -> jax.Array:
     """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix (`[in, 2
     * hidden]`, their columns interleaved a `GROUP` at a time, `interleaved`): one product, one accumulator,
     whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in `out_dtype`, each
@@ -117,7 +119,7 @@ def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype
 
     dtype = jnp.dtype(out_dtype)
     named = (name, None) if saved else ()
-    outs = gemm.gemm(rows, wide, None, epilogue=Gated(hook, dtype, saved), out_dtype=dtype,
+    outs = gemm.gemm(rows, wide, None, epilogue=Hook(Gated(hook, dtype, saved)), out_dtype=dtype,
                      out_dtypes=(dtype,) * (1 + saved), precision=precision,
                      interpret_on_cpu=interpret_on_cpu, named=named)
     return outs[0]

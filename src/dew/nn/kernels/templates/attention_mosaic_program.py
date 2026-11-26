@@ -44,7 +44,6 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     PaddedCall,
-    Param,
     block_map,
     differentiable,
     drops_in_place,
@@ -52,10 +51,12 @@ from dew.nn.kernels.templates.attention import (
     head_width,
     kept_dtype,
     key_tiles,
+    kind_of,
     shared_place,
     whole,
 )
 from dew.nn.kernels.templates.cost import Stated, stored
+from dew.nn.kernels.templates.hooks import Side
 from dew.nn.programs import called, equations
 
 
@@ -698,12 +699,12 @@ def hook_reduces(hooks: Hooks | None) -> bool:
     launch's hook) counted so. Gemma 2's softcap forms none, so its launches reserve no scratch: its
     backward's one launch 256 wide on an H100 fits beside it (row 3704: 233,568 bytes with it, past the
     block's 232,448). False without a hook."""
-    if hooks is None or hooks.score_mod is None:
+    if hooks is None or hooks.score.fn is None:
         return False
-    if not callable(hooks.score_mod):
+    if not callable(hooks.score.fn):
         return True
-    params = param_types(hooks.score_params)
-    return _hook_reduces(hooks.score_mod, params)
+    params = param_types(hooks.score.sides)
+    return _hook_reduces(hooks.score.fn, params)
 
 
 @functools.lru_cache(maxsize=256)
@@ -734,22 +735,22 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
     query prologue where the launch takes it on its query tile, `query`'s `(rows, D, dtype)`
     (`attention_mosaic_forward._prologued`: its parameters as the tile's entries, each in its own dtype)."""
     traced = []
-    if query is not None and callable(hooks.query_mod):
+    if query is not None and callable(hooks.query.fn):
         rows, width, dtype = query
-        traced.append(jax.make_jaxpr(hooks.query_mod)(
+        traced.append(jax.make_jaxpr(hooks.query.fn)(
             jax.ShapeDtypeStruct((rows, width), dtype), jax.ShapeDtypeStruct((rows, 1), jnp.int32),
-            *(jax.ShapeDtypeStruct(() if param.kind is Kind.HEAD else (rows, width), param.value.dtype)
-              for param in hooks.query_params)).jaxpr)
+            *(jax.ShapeDtypeStruct(() if param.axes == Kind.HEAD else (rows, width), param.value.dtype)
+              for param in hooks.query.sides)).jaxpr)
     # A keyed launch's hook is its fingerprint (`tuning.program`), whose lowering its live call established.
-    if callable(hooks.score_mod):
-        traced += _score_jaxprs(hooks.score_mod, tuple((param.kind, param.value.dtype)
-                                                       for param in hooks.score_params),
+    if callable(hooks.score.fn):
+        traced += _score_jaxprs(hooks.score.fn, tuple((param.axes, param.value.dtype)
+                                                       for param in hooks.score.sides),
                                 tile, differentiated=differentiated)
-    if callable(hooks.output_mod):
-        traced.append(jax.make_jaxpr(hooks.output_mod)(
+    if callable(hooks.output.fn):
+        traced.append(jax.make_jaxpr(hooks.output.fn)(
             jax.ShapeDtypeStruct((tile[0], value_width), jnp.float32),
-            *(_entries(param.kind, param.value.dtype, (tile[0], value_width))
-              for param in hooks.output_params)).jaxpr)
+            *(_entries(kind_of(param), param.value.dtype, (tile[0], value_width))
+              for param in hooks.output.sides)).jaxpr)
     return traced
 
 
@@ -786,10 +787,10 @@ them."""
 def score_places(hooks: Hooks | None) -> tuple[bool, bool]:
     """Whether the score hook reads its queries' places and its keys' (its `q_pos`, `k_pos`): traced, never
     run, on a tile."""
-    if hooks is None or not callable(hooks.score_mod):
+    if hooks is None or not callable(hooks.score.fn):
         return False, False
-    params = param_types(hooks.score_params)
-    return _score_places(hooks.score_mod, params)
+    params = param_types(hooks.score.sides)
+    return _score_places(hooks.score.fn, params)
 
 
 @functools.lru_cache(maxsize=256)
@@ -832,10 +833,10 @@ def varying_slopes(hooks: Hooks | None, graded: tuple[Kind, ...]) -> int:
     holds no tile of: the fast dQ under a query's temperature and a head's bias, ET-PINPAD, 224 unspilled
     where four slopes priced 258); traced, never run, on a tile, each slope along its own input alone, or
     where the hook takes no forward derivative (a `jax.custom_vjp`'s) counted varying. None without a hook."""
-    if hooks is None or not callable(hooks.score_mod):
+    if hooks is None or not callable(hooks.score.fn):
         return 0
-    params = param_types(hooks.score_params)
-    return _varying_slopes(hooks.score_mod, params, graded)
+    params = param_types(hooks.score.sides)
+    return _varying_slopes(hooks.score.fn, params, graded)
 
 
 @functools.lru_cache(maxsize=256)
@@ -918,10 +919,10 @@ def transposable(hooks: Hooks) -> bool:
     (`layout.Untransposable`), and at each one entry at a time in the logits and its floating parameters
     (`_entrywise`), as the slopes the backward multiplies its cotangents by assume
     (`attention_gradient.scored`)."""
-    if not callable(hooks.score_mod):
+    if not callable(hooks.score.fn):
         return True
-    params = param_types(hooks.score_params)
-    return _transposable(hooks.score_mod, params)
+    params = param_types(hooks.score.sides)
+    return _transposable(hooks.score.fn, params)
 
 
 @functools.lru_cache(maxsize=256)
@@ -980,7 +981,7 @@ def _columns(array: jax.Array, unit: int) -> jax.Array:
 
 class _Hooked(NamedTuple):
     """A call's hooks as its programs read them: the score hook's parameters and the output hook's, as their
-    kinds lay them out (`Hooks.score_params`', `[H]`, `[B, H, Qp]`, `[B, H, Kp]`, `[B, H, Qp, Kp]` or
+    kinds lay them out (`Hooks.score`'s sides', `[H]`, `[B, H, Qp]`, `[B, H, Kp]`, `[B, H, Qp, Kp]` or
     `[B, Qp, H, Dv]`), and the softmax's initial state, its maximum and denominator `[B, H, Qp]` and sums
     `[B, H, Qp, Dv]` (None where it starts from none), and probability dropout's draws (`Dropout`, None where
     the call drops nothing)."""
@@ -997,7 +998,7 @@ class _Hooked(NamedTuple):
     columns (`attention_mosaic_forward._largest`), read a key tile's columns at a time as the keys' scales
     are; None where a launch reads them from its value slots (a cache's walk)."""
     query: tuple[jax.Array, ...] = ()
-    """The query prologue's parameters (`Hooks.query_params`'), `[H]`, `[B, H, Qp]` or `[H, D]`, which a
+    """The query prologue's parameters (`Hooks.query`'s sides'), `[H]`, `[B, H, Qp]` or `[H, D]`, which a
     consumer reads once a query tile where it takes the prologue (`attention_mosaic_forward._query_of`)."""
 
 
@@ -1010,8 +1011,8 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
         widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
         acc = jnp.pad(call.rows(state.acc), widened)
         initial = call.rows(state.m, -jnp.inf), call.rows(state.total), _columns(acc, unit)
-    output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
-                   for value, param in zip(call.output_params, hooks.output_params, strict=True))
+    output = tuple(_columns(value, unit) if param.axes == Kind.OUTPUT else value
+                   for value, param in zip(call.output_params, hooks.output.sides, strict=True))
     return _Hooked(call.score_params, output, initial,
                    placed_draws(hooks.drop, call.query.shape[1], call.key_rows), query=call.query_params)
 
@@ -1031,9 +1032,10 @@ def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | Non
     return dataclasses.replace(drop, queries=padded(drop.queries, queries), keys=padded(drop.keys, keys))
 
 
-def param_types(params: Iterable[Param]) -> tuple:
-    """Score-hook parameters as a launch's kernels load them: each its `Kind` and dtype (`kept_dtype`)."""
-    return tuple((param.kind, kept_dtype(param.value.dtype)) for param in params)
+def param_types(params: Iterable[Side]) -> tuple:
+    """Score-hook parameters as a launch's kernels load them: each its `Kind` (`kind_of`, a plain tuple of
+    axes named as the kind it is) and dtype (`kept_dtype`)."""
+    return tuple((kind_of(param), kept_dtype(param.value.dtype)) for param in params)
 
 
 def streams_operands(family: mosaic.Family) -> bool:
@@ -1053,10 +1055,10 @@ def score_stream(index: int) -> str:
 def riding(family: mosaic.Family, kinds: Iterable[Kind], along: str) -> tuple[int, ...]:
     """The score-hook parameters, by index among `kinds`, that ride a launch's stream along its axis `along`
     (the keys of the forward's and dQ's walks, the queries of dK/dV's): each whose kind lays that axis
-    (`Kind.axes`), where `family` loads its operands so (`streams_operands`)."""
+    (its `Kind`), where `family` loads its operands so (`streams_operands`)."""
     if not streams_operands(family):
         return ()
-    return tuple(index for index, kind in enumerate(kinds) if along in kind.axes)
+    return tuple(index for index, kind in enumerate(kinds) if along in kind)
 
 
 def score_streams(family: mosaic.Family, params: tuple, along: str, held: int, step: int) -> dict:
@@ -1098,8 +1100,8 @@ def held_params(family: mosaic.Family, refs: tuple, kinds: tuple, row, head, fir
         if kind is not vector:
             return None
         shared_row, shared_head = shared_place(ref.shape, row, head)
-        places = {"batch": shared_row, "heads": shared_head, kind.axes[-1]: pl.ds(first, count)}
-        return family.rows_of(ref.at[axes.placed(kind.axes, places)])
+        places = {"batch": shared_row, "heads": shared_head, kind[-1]: pl.ds(first, count)}
+        return family.rows_of(ref.at[axes.placed(kind, places)])
 
     return tuple(held(ref, kind) for ref, kind in zip(refs, kinds, strict=True))
 
@@ -1131,9 +1133,9 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
         return ref[head]
     if kind is not Kind.OUTPUT:
         row, head = shared_place(ref.shape, row, head)
-    # Its block at the tile's place along each of its axes (`Kind.axes`), a tile parameter's keys-first
+    # Its block at the tile's place along each of its axes (its `Kind`), a tile parameter's keys-first
     # copy's keys before its queries.
-    laid = kind.axes[:2] + kind.axes[2:][::-1] if keys_first and kind is Kind.TILE else kind.axes
+    laid = kind[:2] + kind[2:][::-1] if keys_first and kind is Kind.TILE else kind
     places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "keys": pl.ds(k_first, keys)}
     block = ref.at[axes.placed(laid, places)]
     if kind in (Kind.TILE, Kind.OUTPUT):
