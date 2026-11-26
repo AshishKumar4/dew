@@ -58,9 +58,12 @@ def written(root: Path, files: dict[str, str]) -> None:
 
 
 def cached(monkeypatch, url: str) -> None:
-    """The shared test cache at `url`, as CI's environment names it."""
+    """The shared test cache at `url`, as a train's environment names it, its records kept: a suspect's
+    word to its own run to keep none (ci.py's `RECORDS`, ops queue/suspect.sh) is no word to the run under
+    test, whose records the test reads."""
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.delenv("DEW_RECORDS", raising=False)
 
 
 def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str],

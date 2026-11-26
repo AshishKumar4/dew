@@ -204,10 +204,6 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             _traced(declaration, declaration.update, names, chunk),
             _traced(declaration, declaration.readout, names, chunk), saturation), derive.FORMS_HELD)
 
-    def parts(chunk: Mapping, window=None):
-        affine = affine_of(chunk)
-        return affine, _segment_parts(declaration, names, affine, chunk, window)
-
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
     # as declared left each chunk wider than it entered.
@@ -225,7 +221,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
     def prepare(chunk, issue=None, transition: bool = False, window=None):
-        affine, (exponent, *values) = parts(chunk, window)
+        affine = affine_of(chunk)
+        (exponent, *values), unlanded = _segment_parts(declaration, names, affine, chunk, window)
         read = declaration if window is None else _unreset(declaration)
         decays = _started(_decays(exponent, affine.base2), None if read.reset is None else chunk[read.reset])
         natural = _walked(exponent, affine.base2)
@@ -235,18 +232,21 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                                       affine.values_read, apart, affine.across is not None, affine.before,
                                       affine.erase is not None)
         corrected = affine.correction is not None
-        form = _form(extents, corrected, saturation)
-        # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
-        # operands of its function, whose state the carry reads (`carry.split`).
-        held = _prepared(form, tokens, decays, issue or _issued)
-        given = (*_flat_decays(decays), *(tokens[name] for name in TOKENS), *held.values())
-        # A split is priced and traced where it is derived (`derive.context`): one derived under another
-        # target, precision, numerics or mesh is none of this one's.
-        key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
-               extents.before, extents.erased, *((value.shape, str(value.dtype)) for value in given))
-        split = _cache.holding(splits, key, lambda: _split(
-            declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
-            extents.tokens, saturation), splits_held)
+        if unlanded:
+            split = _unlanded_split(extents, corrected=corrected, base2=affine.base2,
+                                    scale=affine.reader_scale)
+            given, entering = (tokens, decays, entering), None
+        else:
+            form = _form(extents, corrected, saturation)
+            # The largest values that read no state: operands of the function the carry reads.
+            held = _prepared(form, tokens, decays, issue or _issued)
+            given = (*_flat_decays(decays), *(tokens[name] for name in TOKENS), *held.values())
+            # A split is priced and traced in its own target, precision, numerics and mesh.
+            key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
+                   extents.before, extents.erased, *((value.shape, str(value.dtype)) for value in given))
+            split = _cache.holding(splits, key, lambda: _split(
+                declaration, names, chunk, affine, form, tuple(held), given,
+                jax.ShapeDtypeStruct(shape, carried), extents.tokens, saturation), splits_held)
         across = _walked(tokens["E"], affine.base2) if extents.across else None
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
                             entering=entering, values_read=affine.values_read, across=across)
@@ -300,7 +300,8 @@ def _segment_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mappi
     reading the state entering it (`Scan.reads`) at the origin reads the memory the window enters with."""
     if window is None:
         return _token_parts(declaration, names, affine, chunk)
-    return _windowed(_token_parts(_unreset(declaration), names, affine, chunk), window)
+    parts, unlanded = _token_parts(_unreset(declaration), names, affine, chunk)
+    return _windowed(parts, window), unlanded
 
 
 def _unreset(declaration: Scan) -> Scan:
@@ -393,11 +394,13 @@ def _walked_tokens(declaration: Scan, chunk: Mapping) -> tuple[dict, dict]:
     return along, {name: chunk[name] for name in declaration.operands if name not in along}
 
 
-def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
-    """A chunk's tokens' exponents and the affine map's parts at each (`_at_token`), every token at once."""
+def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple[tuple, bool]:
+    """A chunk's tokens' parts and whether its reader scale stays apart until the contraction."""
     along, every = _walked_tokens(declaration, chunk)
-    return _with_reader_scale(
-        affine, jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along))
+    parts = jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along)
+    reader = parts[1 + TOKENS.index("Q")]
+    unlanded = _subnormal_scale(affine.reader_scale, jnp.result_type(affine.reader_scale, reader))
+    return (parts if unlanded else _with_reader_scale(affine, parts)), unlanded
 
 
 def _with_reader_scale(affine, parts: tuple) -> tuple:
@@ -607,12 +610,12 @@ def _read_entering(declaration: Scan, chunk: Mapping, tokens: dict) -> tuple[dic
     return {**tokens, "Q": following, "R": jnp.zeros_like(tokens["R"])}, (readers[0], tokens["R"])
 
 
-def _entered(outputs, entering: tuple, values_read: bool, h):
+def _entered(outputs, entering: tuple, values_read: bool, h, *, scale: float | np.floating = 1.0):
     """A chunk's outputs whose tokens read the state entering them (`_read_entering`, its `entering`): the
     forms' outputs each the next token's, the first token's read of the state `h` entering the chunk before
     them, and every token's part free of the state added."""
     reader, free = entering
-    first = _read(h, reader, values_read, 1.0)
+    first = _read(h, reader, values_read, scale)
     return jnp.concatenate([first[None].astype(outputs.dtype), outputs[:-1]]) + free
 
 
@@ -744,12 +747,30 @@ def _looped_split(form: linear_scan.Form, held: tuple, values_read: bool, base2:
     from the state entering the chunk. Its chunk function unrolled was a chain of every token's step, which
     the split's e-graph saturated and extracted whole: a 256-token chunk's 6,917 equations, 20 minutes, and
     egglog's extraction past Python's stack (row 7201)."""
+    return _direct_split(lambda prepared, h: _chunk(form, held, values_read, base2, h, *prepared))
+
+
+def _unlanded_split(extents: linear_scan.Extents, *, corrected: bool, base2: bool,
+                    scale: float | np.floating) -> carry.Split:
+    """Keep a subnormal reader scale in each read, not in the prepared query vector."""
+    def run(prepared, prepared_state):
+        tokens, decays, entering = prepared
+        across = _exp(base2, tokens["E"]) if extents.across else None
+        out, h = _looped(tokens, decays, prepared_state, tokens["U"], corrected=corrected,
+                         values_read=extents.values_read, apart=extents.apart, across=across,
+                         before=extents.before, erased=extents.erased, reader_scale=scale)
+        if entering is not None:
+            out = _entered(out, entering, extents.values_read, prepared_state, scale=scale)
+        return out, h
+
+    return _direct_split(run)
+
+
+def _direct_split(ran: Callable) -> carry.Split:
+    """A token loop reads its operands and entering state without a derived carry split."""
     def prepare(*given, issue=None):
         del issue
         return given
-
-    def ran(prepared: tuple, h):
-        return _chunk(form, held, values_read, base2, h, *prepared)
 
     def carried(prepared: tuple, h, issue=None) -> tuple:
         del issue
@@ -964,7 +985,8 @@ def _elementwise(node, of: Callable):
 
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False,
-            apart: int = 0, across=None, before: bool = False, erased: bool = False):
+            apart: int = 0, across=None, before: bool = False, erased: bool = False,
+            reader_scale: float | np.floating | None = None):
     """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
     it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`), its corrections
@@ -1002,8 +1024,11 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
             h = h - strength * a[:, None] * (_portable(c[None, :], h) if entered is None else entered)
         h = h + b[:, None] * value[None, :]
         read_from = held if apart else h
-        read = (_portable(read_from, q[:, None])[:, 0] if values_read
-                else _portable(q[None, :], read_from)[0])
+        if reader_scale is not None:
+            read = _read(read_from, q, values_read, reader_scale)
+        else:
+            read = (_portable(read_from, q[:, None])[:, 0] if values_read
+                    else _portable(q[None, :], read_from)[0])
         return (h, held, index + 1), read + r
 
     (h, _, _), outputs = lax.scan(step, (h, h, 0), (stepped, B, s, C, Q, R, values, valued, A, back))
@@ -1074,6 +1099,10 @@ def token_terms(parts, token: tuple, states: int = 1) -> tuple[tuple[int, ...], 
     return shape, along
 
 
+def _subnormal_scale(scale: float | np.floating, dtype) -> bool:
+    return jnp.issubdtype(dtype, jnp.floating) and 0 < abs(float(scale)) < float(jnp.finfo(dtype).tiny)
+
+
 def _subnormal_contract(axes: Sequence[str], output: str, operands: tuple, scale, dtype):
     """Contract operands and a subnormal scale as unlanded factors, not as an underflowed input."""
     reduced = tuple(dict.fromkeys(tag for used in axes for tag in used if tag not in output))
@@ -1107,7 +1136,7 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
     def value(*operands):
         factor = scale if scale_dtype is None else jnp.asarray(scale, dtype=scale_dtype)
         first = jnp.result_type(factor, operands[0])
-        if jnp.issubdtype(first, jnp.floating) and 0 < abs(float(scale)) < jnp.finfo(first).tiny:
+        if _subnormal_scale(scale, first):
             return _subnormal_contract(axes, output, operands, scale, jnp.result_type(factor, *operands))
         return _portable_einsum(subscripts, factor * operands[0], *operands[1:])
 

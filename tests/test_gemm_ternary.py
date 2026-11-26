@@ -634,3 +634,23 @@ def test_a_dense_layer_of_no_depth_serves_its_packed_ternary_kernel():
     out = Dense(64, dtype=jnp.float32).apply({QUANTIZATION: {"kernel": weights}, "params": {"bias": bias}},
                                              jnp.zeros((2, 3, 0), jnp.float32))
     np.testing.assert_array_equal(np.asarray(out), np.broadcast_to(np.asarray(bias), (2, 3, 64)))
+
+
+def test_a_ternary_matrix_at_a_subnormal_scale_is_refused_where_packed_and_where_restored():
+    """A BitNet b1.58 matrix's fp32 scale is zero or normal (row 13340): a subnormal one given to
+    `TernaryWeights.of` is refused by name, as is one a restored matrix holds (`checked`, which its product
+    calls), where a process that flushes a subnormal operand (XLA's CPU) read its products as zeros; zero and
+    the least normal scale pack, and a traced scale is checked where it is restored."""
+    weights = np.zeros((256, 2), np.float32)
+    weights[0] = [1.0, -1.0]
+    with pytest.raises(ValueError, match="TernaryWeights scale .* is subnormal"):
+        formats.TernaryWeights.of(weights, scale=np.float32(2.0 ** -127))
+    packed = formats.TernaryWeights.of(weights, scale=np.float32(1.0))
+    stored = dataclasses.replace(packed, scale=np.float32(2.0 ** -127))
+    with pytest.raises(ValueError, match="TernaryWeights scale .* is subnormal"):
+        stored.checked()
+    with pytest.raises(ValueError, match="TernaryWeights scale .* is subnormal"):
+        gemm.ternary_weight_product(jnp.ones((1, 256), jnp.float32), stored, quantize_activations=False)
+    for scale in (0.0, float(np.finfo(np.float32).tiny)):
+        formats.TernaryWeights.of(weights, scale=np.float32(scale)).checked()
+    jax.jit(lambda s: formats.TernaryWeights.of(weights, scale=s).words)(jnp.float32(2.0 ** -127))

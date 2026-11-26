@@ -1282,6 +1282,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
   what it replaces in the same change: no switch keeps a hand form beside its derived one.
 - The coupled walk keeps its ordinary local dot when finite. If that dot exceeds the format, its
   scaled readout carries the score's exponent through the chunk weight and corrected value before landing.
+  A subnormal static reader scale stays in the scaled sum of its memory, momentum and local reads;
+  the token replay likewise carries it into the whole contraction.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;
@@ -1292,8 +1294,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
-    A subnormal static readout scale participates in the unlanded product of all factors, including in
-    transpose: multiplying it into one operand first can erase an otherwise normal read.
+    A subnormal static readout scale stays in the unlanded contraction, including in transpose:
+    the prepared chunk uses the token loop for that case instead of scaling its reader before a dot.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
@@ -1550,6 +1552,8 @@ signed integer digits and becomes a significand with its power of two; a large t
 words is normalized before joining a product. The evaluator visits the occupied bin combinations in bounded
 chunks and reduces the signed products before dividing and landing. This preserves lower terms when a
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
+Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
+directions. A finite observation at zero weight retains its one-sided weight derivative.
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded
