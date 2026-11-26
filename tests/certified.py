@@ -15,6 +15,7 @@ from jax.extend.core import primitives
 from op_certificates import (
     DTYPES,
     EXP_RANGE,
+    FLOAT16,
     FORMATS,
     Format,
     exact_sum,
@@ -957,6 +958,11 @@ def _exact_integer(values) -> tuple[np.ndarray, np.ndarray]:
     return hi, lo
 
 
+_HALF = np.dtype(np.float16)
+_FLOAT = np.dtype(np.float32)
+_HALF_CONVERSIONS = frozenset({(_HALF, _FLOAT), (_FLOAT, _HALF)})
+
+
 def _converted(params, operands, result, fmt):
     """A cast, as XLA's CPU lowering casts: between float formats correctly rounded, subnormals kept
     (bit manipulation); to a float from an integer or boolean correctly rounded from the exact integer;
@@ -965,6 +971,9 @@ def _converted(params, operands, result, fmt):
     (value,) = operands
     value, result = np.asarray(value), np.asarray(result)
     source = _format(value.dtype)
+    if (value.dtype, result.dtype) in _HALF_CONVERSIONS:
+        source = FLOAT16 if value.dtype == _HALF else source
+        fmt = FLOAT16 if result.dtype == _HALF else fmt
     if fmt is not None:
         exact = _exact_integer(value) if source is None else (value.astype(np.float64), np.zeros(value.shape))
         return _same(result, rounded(*exact, fmt))
@@ -2217,8 +2226,13 @@ def _held(eqn, operands, results, findings, at) -> None:
     hosted_results = [_host(result) for result in results]
     raw_bitcast = (primitive is jax.lax.bitcast_convert_type_p
                    and (hosted[0].dtype, hosted_results[0].dtype) in _RAW_BITCAST_PAIRS)
+    half_storage = (primitive is jax.lax.optimization_barrier_p
+                    or (primitive is jax.lax.convert_element_type_p
+                        and (hosted[0].dtype, hosted_results[0].dtype) in _HALF_CONVERSIONS))
     for value in () if raw_bitcast else (*hosted, *hosted_results):
         dtype = getattr(value, "dtype", None)
+        if dtype == _HALF and half_storage:
+            continue
         keyed = dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")

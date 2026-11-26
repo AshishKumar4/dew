@@ -11,6 +11,7 @@ from dew.algebra import printed
 
 _MIN_SHARED = 6
 """Smaller fragments would add a call and arguments for little source reduction."""
+_MIN_WHOLE = 3
 _MAX_SHARED = 64
 """Long repeats can share several readable helpers rather than one oversized body."""
 
@@ -18,7 +19,8 @@ _MAX_SHARED = 64
 class _Fragment(ast.NodeTransformer):
     """Alpha-rename a fragment without changing its caller's geometry or logical shift direction."""
 
-    def __init__(self, scope: set[str]):
+    def __init__(self, scope: set[str], fragments: set[str]):
+        self.fragments = fragments
         self.scope = scope
         self.inputs: dict[str, str] = {}
         self.bound: dict[str, str] = {}
@@ -44,6 +46,10 @@ class _Fragment(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
+        if isinstance(node.func, ast.Name) and node.func.id in self.fragments:
+            operands = [self._input(ast.unparse(arg)) if isinstance(arg, ast.Tuple)
+                        and _extent(arg, self.bound) else self.visit(arg) for arg in node.args]
+            return ast.Call(func=node.func, args=operands, keywords=node.keywords)
         found = self.generic_visit(node)
         assert isinstance(found, ast.Call)
         call = found.func
@@ -56,6 +62,10 @@ class _Fragment(ast.NodeTransformer):
         return found
 
     def visit_keyword(self, node: ast.keyword) -> ast.AST:
+        if (node.arg == "new_dtype" and isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func) == "jnp.dtype" and len(node.value.args) == 1
+                and isinstance(node.value.args[0], ast.Constant)):
+            return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
         if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):
             return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
         return self.generic_visit(node)
@@ -110,6 +120,7 @@ class _Span:
     first: int
     available: int
     normal: _Fragment
+    whole: bool
     statements: list[_Assignment] = dataclasses.field(default_factory=list)
 
     def extend(self, nodes: list[ast.stmt], width: int) -> tuple[_Assignment, ...]:
@@ -160,11 +171,16 @@ def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]
         for accepted, group in runs:
             if accepted:
                 indices = [index for index, _ in group]
-                candidates.extend(_Span(name, first, indices[-1] + 1 - first, _Fragment(body.scope))
-                                  for first in indices[:len(indices) - _MIN_SHARED + 1])
+                last = indices[-1] + 1
+                whole = (indices[0] == 0 and last == len(body.statements) - 1
+                         and isinstance(body.statements[last], ast.Return))
+                minimum = _MIN_WHOLE if whole else _MIN_SHARED
+                candidates.extend(_Span(name, first, last - first, _Fragment(body.scope, fragments),
+                                        whole and first == 0)
+                                  for first in indices[:len(indices) - minimum + 1])
     best: tuple[_Copy, ...] = ()
     saved = 0
-    for width in range(_MIN_SHARED, _MAX_SHARED + 1):
+    for width in range(_MIN_WHOLE, _MAX_SHARED + 1):
         by_body: dict[tuple[_Assignment, ...], list[_Span]] = defaultdict(list)
         for span in candidates:
             if span.available >= width:
@@ -183,6 +199,8 @@ def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]
             if len(copies) < 2:
                 continue
             candidates.extend(entries)
+            if width < _MIN_SHARED:
+                copies = [span for span in copies if span.whole and span.available == width]
             avoided = width * (len(copies) - 1)
             if avoided > saved:
                 best, saved = tuple(span.snapshot() for span in copies), avoided
