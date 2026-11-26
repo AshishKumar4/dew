@@ -330,14 +330,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     scored = "scores" in products
     # The system's rows the reads where the call erases along them (`intra.intra_rows`), its columns the keys.
     reading = reads is not None and "system" in products
-    def plan(*, anchors: bool) -> tuple:
-        return (functools.partial(_own_held, call, outputs=len(products), anchors=anchors),
-                functools.partial(_own_staged, call, products=products, reads=reading, anchors=anchors),
-                functools.partial(pair_streams, call, queries=scored, reads=reading))
-
-    # Fitted with the anchored products' reduction scratch it launches with, so a device whose block budget
-    # holds no anchored block keeps its pairs each their own decay (train 1337's review, row 13495).
-    anchors, keys = anchored_plan(call, anchored.anchoring(call, reading=reading), plan, widest=False)
+    anchors, keys = own_plan(call, products, reads=reads)
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
@@ -800,6 +793,27 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                                    for p in range(fp32_operand(call).parts)})(
         *inputs, *factored, *memory, *decays, ending, *(() if clamp is None else (clamp,)), *read_grads,
         *(anchored.back_inputs(d_scores, d_system, chunk=chunk) if anchors else ()))
+
+
+def own_plans(call: Call, products: tuple[str, ...], reads=None) -> Callable[..., tuple]:
+    """`intra_own`'s plan at `anchors` (`plan(anchors=...)`): its held, staged and streamed callables."""
+    scored, reading = "scores" in products, reads is not None and "system" in products
+
+    def plan(*, anchors: bool) -> tuple:
+        return (functools.partial(_own_held, call, outputs=len(products), anchors=anchors),
+                functools.partial(_own_staged, call, products=products, reads=reading, anchors=anchors),
+                functools.partial(pair_streams, call, queries=scored, reads=reading))
+
+    return plan
+
+
+def own_plan(call: Call, products: tuple[str, ...], reads=None) -> tuple[bool, int]:
+    """`intra_own`'s `(anchors, keys)` (`anchored_plan`): fitted with the anchored products' reduction scratch
+    it launches with, so a device whose block budget holds no anchored block keeps its pairs each their own
+    decay (train 1337's review, row 13495)."""
+    reading = reads is not None and "system" in products
+    return anchored_plan(call, anchored.anchoring(call, reading=reading), own_plans(call, products, reads),
+                         widest=False)
 
 
 def _key_own_plan(call: Call, summed: Operand, *, reading: bool) -> tuple[bool, int]:
