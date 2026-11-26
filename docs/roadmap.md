@@ -89,7 +89,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- A documented nonfinite empty anchor remains eligible for the merge’s mass hull when its stale total is positive. [13293]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
