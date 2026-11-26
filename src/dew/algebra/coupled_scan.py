@@ -47,6 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.custom_batching import custom_vmap
 
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, scaled, terms
@@ -563,6 +564,33 @@ def _stepped(state, chunk: Chunked, issue=None):
     return (decay, jnp.stack([memory, momentum])), w
 
 
+@custom_vmap
+def _scored(queries, keys, dots, values, weights):
+    """Keep the scaled recovery conditional even when chunks and heads are vmapped."""
+    def ordinary(q, k, local, inputs, factors):
+        del k
+        return _summed(_outer, (local.T, inputs), (q.shape[0], inputs.shape[-1]), factors)
+
+    def recover(q, k, local, inputs, factors):
+        # The ordinary score may overflow before its decay and corrected value bring it into range.
+        made = _read(q, k.T)
+        kept = scaled.where(jnp.isfinite(local), scaled.scaled(local), made)
+        transposed = scaled.Scaled(kept.significand.T[..., None], kept.exponent.T[..., None], kept.reach)
+        factors = scaled.mul(factors, transposed)
+        return _summed(lambda v: (None, v[None, :]), (inputs,), (q.shape[0], inputs.shape[-1]), factors)
+
+    for _ in range(dots.ndim - 2):
+        ordinary, recover = jax.vmap(ordinary), jax.vmap(recover)
+    return lax.cond(jnp.any(~jnp.isfinite(dots)), recover, ordinary, queries, keys, dots, values, weights)
+
+
+@_scored.def_vmap
+def _batch_scored(size, batched, *operands):
+    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)), operands, tuple(batched))
+    found = _scored(*placed)
+    return found, jax.tree.map(lambda _: True, found)
+
+
 def _mapped(chunk: Chunked, state, w, issue=None):
     """A chunk's outputs from the pair entering it and the inputs its step solved (`derive_coupled`'s
     `mapped`): each token's query's reads of the entering memory and momentum weighed by their factors, its
@@ -572,18 +600,7 @@ def _mapped(chunk: Chunked, state, w, issue=None):
     pair = state[1]
     weights = scaled.Scaled(chunk.sums.significand.T[..., None], chunk.sums.exponent.T[..., None],
                             chunk.sums.reach)
-    shape = chunk.dots.shape[0], w.shape[-1]
-
-    def recover():
-        # The ordinary score can exceed the format even when its contribution to the state read is
-        # finite. Keep the score's exponent through the weight and corrected value, then sum.
-        dots = _read(chunk.queries, chunk.keys.T)
-        transposed = scaled.Scaled(dots.significand.T[..., None], dots.exponent.T[..., None], dots.reach)
-        scaled_weights = scaled.mul(transposed, weights)
-        return _summed(lambda values: (None, values[None, :]), (w,), shape, scaled_weights)
-
-    scored = lax.cond(jnp.any(~jnp.isfinite(chunk.dots)), recover,
-                      lambda: _summed(_outer, (chunk.dots.T, w), shape, weights))
+    scored = _scored(chunk.queries, chunk.keys, chunk.dots, w, weights)
     memory = scaled.mul(_read(chunk.queries, pair[0]), _column(chunk.kept_to))
     momentum = scaled.mul(_read(chunk.queries, pair[1]), _column(chunk.momentum))
     scores, flushed = _weighed(chunk.dots, chunk.sums)

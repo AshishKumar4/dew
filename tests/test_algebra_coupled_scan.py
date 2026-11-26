@@ -99,7 +99,8 @@ def test_a_coupled_chunks_replay_is_its_token_scan():
     np.testing.assert_array_equal(np.asarray(leaving), np.asarray(jnp.stack(pair)))
 
 
-def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read():
+@pytest.mark.parametrize("batched", [False, True], ids=["one chunk", "mapped chunks"])
+def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(batched):
     spec = declaration(1.0, 2, 1, jnp.float32, reset=False, bound=1.0)
     forms = scan.derive_scan(spec, saturation=SATURATION)
     q = np.asarray([[0, 0], [2.0 ** 127, 2.0 ** 127]], np.float32)
@@ -107,7 +108,6 @@ def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read():
     v = np.asarray([[0.25], [0]], np.float32)
     z = np.zeros(2, np.float32)
 
-    @jax.jit
     def run(q, k, v, z):
         tokens = dict(q=q, k=k, v=v, g=z, beta=jnp.ones_like(z), p=jnp.zeros_like(k), mu=z)
         state = forms.init({})
@@ -119,12 +119,17 @@ def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read():
         _, gradient = forms.backward(tokens, state, jnp.zeros_like(end[1]), cotangent)
         return out, read, gradient["q"]
 
-    out, replayed, adjoint = run(q, k, v, z)
     # Both token products are normal: 2^127 times ±0.5, not q times the bare key (±2^128).
-    exact = q.astype(np.float64) @ (k[0].astype(np.float64) * float(v[0, 0]))[:, None]
-    np.testing.assert_array_equal(out, exact)
-    np.testing.assert_array_equal(replayed, exact)
-    np.testing.assert_array_equal(adjoint, [[0, 0], [0.5, -0.5]])
+    state = (k[0].astype(np.float64) * float(v[0, 0]))[:, None]
+    if batched:
+        q = np.stack((q, np.asarray([[0, 0], [3, 1]], q.dtype)))
+        run = jax.vmap(run, in_axes=(0, None, None, None))
+    out, replayed, adjoint = jax.jit(run)(q, k, v, z)
+    expected = q.astype(np.float64) @ state
+    np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(replayed, expected)
+    derivative = np.asarray([[0, 0], [0.5, -0.5]], np.float32)
+    np.testing.assert_array_equal(adjoint, np.broadcast_to(derivative, q.shape))
 
 
 def uncoupled(pair, q, k, v, g, beta, p, mu):
