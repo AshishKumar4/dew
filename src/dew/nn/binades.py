@@ -32,7 +32,7 @@ def finite_nonzero(value: jax.Array) -> jax.Array:
 def divided_in(numerator: jax.Array, denominator: jax.typing.ArrayLike) -> jax.Array:
     """`numerator / denominator` correctly rounded (`precision.correctly_rounded_divide`) in float32, a
     subnormal operand and result included; IEEE's division in a wider format."""
-    from .precision import correctly_rounded_divide
+    from .division import correctly_rounded_divide
 
     if jnp.result_type(numerator) == jnp.float32:
         return correctly_rounded_divide(numerator, denominator)
