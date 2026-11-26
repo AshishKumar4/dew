@@ -873,9 +873,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         block = mainloop.block_of(family)
         keys = joined.keys.halved({name: joined.keys.of(name) or block for name in keyed},
                                   family.narrowest_columns(jnp.bfloat16))
-        if keys is None:
-            return None
-        return _limited(joined, producers=joined.producers, residents=joined.residents, keys=keys)
+        # Its key blocks alone: every other cap, its forward's tiles too, as `joined` has them.
+        return None if keys is None else dataclasses.replace(joined, keys=keys)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
