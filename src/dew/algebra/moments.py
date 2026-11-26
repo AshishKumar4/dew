@@ -8,7 +8,7 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Sequence
-from typing import Literal, cast
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -245,21 +245,24 @@ def _streamed_tangents(
         d_cov = tangent(cov, (cx0, w0, present, unit, sign), (dx0, dw0, *fixed), _VAR_FORM)
     else:
         cy0 = centered(y0, mu_y)
-        x_still, y_still = isinstance(dx0, SymbolicZero), isinstance(dy0, SymbolicZero)
-        if x_still != y_still or (x_still and held):
-            d_mx = tangent(mu_x, (cx0, w0, present, unit), (dx0, dw0, *fixed[:2]), _MEAN_FORM)
-            d_my = tangent(mu_y, (cy0, w0, present, unit), (dy0, dw0, *fixed[:2]), _MEAN_FORM)
+        if not isinstance(dx0, SymbolicZero) and not isinstance(dy0, SymbolicZero):
+            d_columns = jnp.stack((dx0, dy0), axis=-1)
         else:
-            # Both outputs take the same linear form, with one value column per mean and shared weights.
+            d_columns = None
+        shared = d_columns is not None or (not held and isinstance(dx0, SymbolicZero)
+                                           and isinstance(dy0, SymbolicZero))
+        if shared:
+            # The same linear form makes both means with shared weights, one column per mean.
             centers = jnp.stack((cx0, cy0), axis=-1)
-            directions = cast(tuple[jax.Array, jax.Array], (dx0, dy0))
-            d_centers = (SymbolicZero(jax.typeof(centers).to_tangent_aval()) if x_still
-                         else jnp.stack(directions, axis=-1))
+            d_centers = SymbolicZero(jax.typeof(centers).to_tangent_aval()) if d_columns is None else d_columns
             weight = dw0 if held else dw0[..., None]
-            moving = (1,) if x_still else (0,) if held else (0, 1)
+            moving = (1,) if d_columns is None else (0,) if held else (0, 1)
             means = _ratio_jvp_only((centers, w0[..., None], present[..., None], unit[..., None]),
                                     (d_centers, weight, *fixed[:2]), _MEAN_FORM, moving)
             d_mx, d_my = means[..., 0], means[..., 1]
+        else:
+            d_mx = tangent(mu_x, (cx0, w0, present, unit), (dx0, dw0, *fixed[:2]), _MEAN_FORM)
+            d_my = tangent(mu_y, (cy0, w0, present, unit), (dy0, dw0, *fixed[:2]), _MEAN_FORM)
         d_cov = tangent(cov, (cx0, cy0, w0, present, unit, sign), (dx0, dy0, dw0, *fixed), _COV_FORM)
     d_n_out = SymbolicZero(jax.typeof(n).to_tangent_aval()) if held else jnp.sum(dw0, axis=0)
     return d_mx, d_my, d_cov, d_n_out
