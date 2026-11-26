@@ -543,7 +543,7 @@ def _refuse_reshaped(template, stored, where: str) -> None:
 def _packed_checked(tree) -> None:
     """Refuse a restored tree holding a packed bank (`NvFp4`/`TernaryWeights`) whose form
     version or scale shape fails `.checked`, gathering forms in one collective (rows 8958, 12161)."""
-    from dew._coordination import collective_host
+    from dew._coordination import agreed, collective_host
     from dew.nn.kernels.formats import NvFp4, TernaryWeights
 
     kinds = (NvFp4, TernaryWeights)
@@ -554,11 +554,16 @@ def _packed_checked(tree) -> None:
     if not packed:
         return
     forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
-    for (name, leaf), form in zip(packed, forms, strict=True):
-        try:
-            leaf.checked(form)
-        except ValueError as error:
-            raise ValueError(f"{name}: {error}") from error
+
+    def checked() -> None:
+        for (name, leaf), form in zip(packed, forms, strict=True):
+            try:
+                leaf.checked(form)
+            except ValueError as error:
+                raise ValueError(f"{name}: {error}") from error
+
+    # A restore is pool-wide: a scale its owner alone reads (`TernaryWeights.checked`) refused on every rank.
+    agreed("packed checks", checked)
 
 
 def _paths(tree) -> set[str]:

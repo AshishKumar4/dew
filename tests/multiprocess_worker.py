@@ -869,6 +869,7 @@ def mode_ternary_scale(args) -> dict:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     from dew import _coordination
+    from dew.checkpoints import _packed_checked
     from dew.nn.kernels.formats import TernaryWeights
 
     width = jax.device_count()  # a column a device, the last process's devices last
@@ -891,10 +892,18 @@ def mode_ternary_scale(args) -> dict:
     # A normal scale on process 0's devices alone: its owner scans it, the other holds none, neither waits.
     first = [device for device in jax.devices() if device.process_index == 0]
     alone_on = NamedSharding(Mesh(np.asarray(first), ("columns",)), PartitionSpec())
-    owned = jax.make_array_from_callback((width,), alone_on, lambda index: np.ones(width, np.float32)[index])
-    alone = outcome(owned)
+    def on_first(values: np.ndarray) -> jax.Array:
+        return jax.make_array_from_callback((width,), alone_on, lambda index: values[index], dtype=np.float32)
+
+    alone = outcome(on_first(np.ones(width, np.float32)))
+    # A subnormal on process 0's devices alone, at a pool-wide restore's check: refused on both ranks.
+    try:
+        _packed_checked({"kernel": TernaryWeights(packed.words, on_first(host), packed.form)})
+        restored = "admitted"
+    except (ValueError, _coordination.PeerFailure) as error:
+        restored = type(error).__name__
     after = _coordination.agreed("after the scale checks", lambda: True)
-    return {"outcome": spanning, "alone": alone, "after": after}
+    return {"outcome": spanning, "alone": alone, "restored": restored, "after": after}
 
 
 def mode_profile_failure(args) -> dict:

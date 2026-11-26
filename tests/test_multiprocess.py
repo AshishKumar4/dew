@@ -1881,10 +1881,12 @@ def test_a_ternary_scale_spanning_processes_is_refused_on_every_rank_where_one_h
     """A packed ternary matrix's per-column scale sharded over both processes, a subnormal on process 1's
     columns alone: process 1 refuses it and process 0 hears of it (`PeerFailure`), neither admitting it nor
     left at its next collective; a normal scale on process 0's devices alone is admitted on each, neither
-    waiting on the other (row 13340's review)."""
+    waiting on the other, and a subnormal one there refused on both at a restore's pool-wide check (row
+    13340's review)."""
     reports = run_pool("ternary_scale", tmp_path / "pool", 2, timeout=180)
     assert [report["outcome"] for report in reports] == ["PeerFailure", "ValueError"]
     assert [report["alone"] for report in reports] == ["admitted", "admitted"]
+    assert [report["restored"] for report in reports] == ["ValueError", "PeerFailure"]
     assert [report["after"] for report in reports] == [True, True]
 
 
