@@ -309,7 +309,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
                  gate: bool = False, dtype=jnp.bfloat16, natural: bool = False, seeds: int | None = None,
                  width: int = 64, param_rows: int | None = None, pins: tuple | None = None,
                  target: generation.GpuTarget | None = None, routed: bool = True,
-                 keys: int | None = None):
+                 keys: int | None = None, precision: str | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -318,7 +318,8 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's); its launches at the forward's and backward's configs `pins` where given
     (`_pinned`), interpreted for `target` where given (`_device`), the backward the one the route takes
-    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read)."""
+    where `routed`, else this mainloop's (a TPU core's, which the route's CUDA facts do not read); the native
+    arm alone at `precision` where given (`jax.default_matmul_precision`), the reference at the suite's."""
     rows, queries, heads, _ = shape
     make_spans = spans if callable(spans) else (lambda: spans)
     if keys is not None:
@@ -348,7 +349,8 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
         hooks = hooked(params, initial)
-        with _device_at(interpret, where), _pinned(*pinned):
+        stated = contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision)
+        with _device_at(interpret, where), _pinned(*pinned), stated:
             if not backward:
                 return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -1777,9 +1779,8 @@ def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
     (`product.terms`), on par with the reference path in fp32 (check 1), under no hook and a score hook."""
     spans = template.spans(128, 128, 1, **CALLS[call])
     # Its parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
-    with jax.default_matmul_precision("default"):
-        _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score,
-                     dtype=jnp.float32)
+    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32,
+                 precision="default")
 
 
 def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
