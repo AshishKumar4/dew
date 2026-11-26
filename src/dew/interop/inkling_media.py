@@ -82,7 +82,7 @@ def opened(image: str | Path | bytes | bytearray):
     if isinstance(image, str) and image.startswith(("http://", "https://")):
         from dew.data.sources.urls import bounded_read
 
-        status, payload = bounded_read(image, URL_BYTES + 1, URL_SECONDS)
+        status, payload = bounded_read(image, URL_BYTES + 1, URL_SECONDS, web_only=True)
         if not 200 <= status < 300:
             raise ValueError(f"the image at {image} answered HTTP {status}")
         if len(payload) > URL_BYTES:

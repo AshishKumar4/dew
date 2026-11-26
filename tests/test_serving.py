@@ -1955,10 +1955,10 @@ def expert_generation(dispatch: str, params, *, layers: int) -> TextGeneration:
 @pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global", "exchange"])
 def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode_steps):
-    """A mixture layer on an expert mesh runs its dispatch, the exchange in a shard_map, and a call's steps
-    carry each step's draw checks into the next step's model call through it (jax-ml/jax#40907, fixed in
-    the pinned jax): either dispatch serves what the global one draws alone on one device, one step a call
-    or several."""
+    """A mixture layer on an expert mesh runs its dispatch, the exchange in a shard_map, each of a call's
+    steps checking its own draws (`serving_kernel._stepped`): either dispatch serves what the global one
+    draws alone on one device, one step a call or several (a check carried into a later model call is the
+    speculative server's witness)."""
     def generation(dispatch, params):
         return expert_generation(dispatch, params, layers=1)
 

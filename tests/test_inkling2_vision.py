@@ -227,19 +227,35 @@ def _media_reader(tmp_path):
 def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
     """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
     (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
-    answers 404 is refused."""
-    import functools
+    answers 404, a body past `URL_BYTES`, and a redirect off HTTP (to FTP, which a read could not hold to
+    its deadline) are each refused."""
     import http.server
     import threading
 
     from PIL import Image
 
+    from dew.interop.inkling_media import URL_BYTES
+
     _, rgba, read = _media_reader(tmp_path)
     served = tmp_path / 'served'
     served.mkdir()
     Image.fromarray(rgba).save(served / 'transparent.png')
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    with open(served / 'large.png', 'wb') as large:
+        large.truncate(URL_BYTES + 1)
+
+    class Served(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(served), **kwargs)
+
+        def do_GET(self):
+            if self.path == '/elsewhere.png':
+                self.send_response(302)
+                self.send_header('Location', 'ftp://127.0.0.1/transparent.png')
+                self.end_headers()
+                return
+            super().do_GET()
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Served)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -247,10 +263,12 @@ def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
         fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
         for field, value in fetched.items():
             np.testing.assert_array_equal(value, stored[field], err_msg=field)
-        with pytest.raises(ValueError):
-            read(f'{url}/missing.png')
+        for refused in ('missing.png', 'large.png', 'elsewhere.png'):
+            with pytest.raises(ValueError):
+                read(f'{url}/{refused}')
     finally:
         server.shutdown()
+        server.server_close()
         thread.join()
 
 

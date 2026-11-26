@@ -56,7 +56,7 @@ from ..inputs import (
 )
 from ..kv_cache import CacheSpec, cache_of
 from ..mlp import GatedMLP
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
@@ -330,12 +330,6 @@ class Mixture:
             return ("a capacity counts the row's tokens routed before each, which a window of forks "
                     "counts otherwise")
         return None
-
-    def dispatch_over(self, shards: int) -> str:
-        """The dispatch its layers run over `shards` expert shards (`moe.resolved_dispatch`): `'auto'` the
-        exchange where the shards divide the experts, the global dispatch anywhere else, either other as
-        named."""
-        return resolved_dispatch(self.dispatch, self.experts, shards)
 
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None: block routing, which
