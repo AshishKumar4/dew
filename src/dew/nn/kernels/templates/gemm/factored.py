@@ -94,9 +94,9 @@ def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
     """`left * right * 2**-k` (fp32 operands, `k` int32 at least 0, broadcast) rounded once to nearest even in
     fp32, however far below its least normal, whatever the platform flushes: each operand's significand in
-    `[1, 2)` read from its bits (`_held_apart`, a subnormal's normalized), their product formed exactly into a rounded
-    product and its residual (`precision.two_product`, every part of it a normal float32), its exponents
-    carried apart and the product rounded once at its own place, the residual deciding a tie
+    `[1, 2)` read from its bits (`_held_apart`, a subnormal's normalized), their product formed exactly
+    into a rounded product and its residual (`precision.two_product`, every part of it a normal float32),
+    its exponents carried apart and the product rounded once at its own place, the residual deciding a tie
     (`float_bits.rounded_binary`'s `tail`); a zero, an infinity or a NaN multiplied as IEEE's."""
     left, right = jnp.broadcast_arrays(jnp.asarray(left, jnp.float32), jnp.asarray(right, jnp.float32))
     (left, left_exponent), (right, right_exponent) = _held_apart(left), _held_apart(right)
