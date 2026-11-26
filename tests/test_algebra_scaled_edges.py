@@ -77,6 +77,39 @@ CONSTRUCT_CELLS = [(name, a, b) for name in CONSTRUCT for a, b in itertools.prod
                    if name != "div" or POINTS[b] != 0]
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_base2_exponent_in_the_top_binade_keeps_its_finite_product_and_differentials(dtype):
+    factor = math.log2(math.e)
+    top = 2.0 ** (np.finfo(dtype).maxexp - 1)
+    x = np.asarray([top, -top, top / 2, -top / 2], dtype)
+    direction = np.asarray([1, -2, 0, 4], dtype)
+
+    def orders(x, direction):
+        value, tangent = jax.jvp(scaled.base2, (x,), (direction,))
+        _, pullback = jax.vjp(scaled.base2, x)
+        (cotangent,) = pullback((direction, direction))
+        return value, tangent, cotangent
+
+    with jax.enable_x64(dtype is np.float64):
+        (high, low), (dh, dl), cotangent = jax.jit(orders)(x, direction)
+    leading = dtype(factor)
+    residual = dtype(factor - float(leading))
+    # Normalizing each limb before comparison avoids overflowing the float64 oracle's own product.
+    normalized = x / top
+    np.testing.assert_array_equal(np.asarray(high) / top, normalized * leading)
+    np.testing.assert_array_equal(np.asarray(low) / top, normalized * residual)
+    np.testing.assert_array_equal(dh, direction * leading)
+    np.testing.assert_array_equal(dl, direction * residual)
+    np.testing.assert_array_equal(cotangent, direction * leading)
+
+
+def test_nonfinite_base2_exponents_have_no_rounding_residual():
+    x = np.asarray([-np.inf, np.inf, np.nan, np.finfo(np.float32).max], np.float32)
+    high, low = jax.jit(scaled.base2)(x)
+    np.testing.assert_array_equal(np.asarray(high), [-np.inf, np.inf, np.nan, np.inf])
+    np.testing.assert_array_equal(np.asarray(low), np.zeros_like(x))
+
+
 @pytest.mark.parametrize(("name", "x", "y"), CONSTRUCT_CELLS,
                          ids=[f"{n}-{a}-{b}" for n, a, b in CONSTRUCT_CELLS])
 def test_a_scaled_operation_at_degenerate_inputs_lands_its_float64_truth(name, x, y):

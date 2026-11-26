@@ -1476,9 +1476,10 @@ its output, a mean over its channels, its anchor and its total there. States of 
 
 `M` the largest anchor and `f_k = exp(s (m_k - M))` the walk's own factor from `m_k` to it in its units
 (`means.Units`), a scaled value aligned once: its base-2 exponent, the anchors' difference taken exactly and
-converted exactly in the accurate form (a fold's rounded as its kernels round it; a difference past the format
-whose scaled value lies within it taken at half each and doubled after, the same bits), split into its nearest
-integer, the value's power of two, and its remainder in [-1/2, 1/2], whose exponential is the significand, so a
+converted in two words in the accurate form (a fold's rounded as its kernels round it; a difference past
+the format whose scaled value fits is taken at half each and doubled after). In the top binade the
+conversion doubles its two result words, not the input, to avoid intermediate overflow. The exponent's
+nearest integer gives the power of two; its remainder in [-1/2, 1/2] through exp2 gives the significand. A
 factor is held exactly to `2^-65536` and is zero below it (`means.FLOOR`). The law is one **ratio of sums of
 products** of its float operands (`ratios.ratio_p`, its form `ratios.Ratio`):
 `sum_k o_k l_k f_k / sum_k l_k f_k`. A term is a double float at a power of two: each factor's

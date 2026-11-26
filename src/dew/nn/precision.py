@@ -1659,8 +1659,8 @@ def _two_product(left, right, *, bit_split: bool, subtract: bool,
 
     def split(value) -> tuple[jax.Array, jax.Array]:
         if bit_split and isinstance(value, np.generic | np.ndarray):
-            # A known factor splits on the host at its stored dtype, not at float32.
-            constant = np.asarray(value, jax.dtypes.canonicalize_dtype(value.dtype))
+            # A known factor still splits on the host, at the product's already promoted dtype.
+            constant = np.asarray(value)
             unsigned, mask, low = split_bits(constant.dtype)
             kept = masked(constant.view(unsigned), constant.dtype, unsigned, mask, low)
             high = kept.view(constant.dtype)
@@ -1678,13 +1678,26 @@ def _two_product(left, right, *, bit_split: bool, subtract: bool,
             high = scaled - (scaled - operand)
         return high, rounded(operand - high)
 
+    dtype = jnp.result_type(left, right)
+
+    def promoted(value):
+        stored = getattr(value, "dtype", None)
+        if stored == dtype:
+            return value
+        if isinstance(value, np.generic | np.ndarray):
+            return np.asarray(value, dtype)
+        return value if stored is None and jax.typeof(value).dtype == dtype else jnp.asarray(value, dtype)
+
+    # Split in the same format that rounds the product. Splitting a narrower operand at its top
+    # binade can overflow even when the product (and its split in the wider format) fits.
+    left, right = promoted(left), promoted(right)
     scale = None
-    if bit_split and _odd(jnp.result_type(left, right)):
+    if bit_split and _odd(dtype):
         # A rounded cut of the top binade's last values carries past the largest float, and two cuts
         # rounded up carry a product in the top binade past it ((2 - 2^-52) 2^511 squared, the head inf):
         # such an operand, and the larger of such a product's, is halved first, its product and residual
         # doubled back after (each exact, a power of two; train 1018's review F1).
-        top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
+        top = 2.0 ** (jnp.finfo(dtype).maxexp - 1)
         large = jnp.abs(left * right) >= top
         larger = jnp.abs(left) >= jnp.abs(right)
         halves = [(jnp.abs(left) >= top) | (large & larger), (jnp.abs(right) >= top) | (large & ~larger)]
