@@ -206,26 +206,45 @@ def _directions_summed(plans, values, arrays, count: int, rank: int, form: Ratio
     return tuple(jnp.squeeze(part, form.axis) for part in value)
 
 
-def _banded_sum(each: Summed, arrays, count: int, rank: int, form: Ratio, dtype):
-    """An independent direction's exact dyadic bins, computed once before multiplying other sums."""
+def _banded_sums(expanded: tuple[Summed, ...], arrays, count: int, rank: int, form: Ratio, dtype):
+    """Keep each directional sum's bins separate, sharing factors and digit extraction across sums
+    that have the same number of terms. The common grid encloses every sum in a group."""
     load, chunks = arrays
     number = scaled.format_of(dtype)
     capacity = min(jnp.iinfo(jnp.int32).bits - 1, number.mantissa + 1)
-    terms_per_bin = 2 * count * len(each.terms)
-    width = max(1, min(16, capacity - terms_per_bin.bit_length()))
-    powers = [(math.frexp(coefficient)[1], len(factors)) for coefficient, factors in each.terms]
-    lower = min(exponent - (degree + 2) * number.reach - number.mantissa for exponent, degree in powers)
-    upper = max(exponent + (degree + 1) * (number.largest + 2) for exponent, degree in powers)
-    summation = _Sum(each.terms, form.axis, (), count)
+    groups: dict[int, list[Summed]] = {}
+    for each in expanded:
+        groups.setdefault(len(each.terms), []).append(each)
+    made = {}
+    for size, group in groups.items():
+        terms_per_bin = 2 * count * size
+        width = max(1, min(16, capacity - terms_per_bin.bit_length()))
+        powers = [(math.frexp(coefficient)[1], len(factors))
+                  for each in group for coefficient, factors in each.terms]
+        lower = min(exponent - (degree + 2) * number.reach - number.mantissa for exponent, degree in powers)
+        upper = max(exponent + (degree + 1) * (number.largest + 2) for exponent, degree in powers)
+        may_round = terms_per_bin * ((1 << width) - 1) > 1 << (number.mantissa + 1)
+        summations = tuple(_Sum(each.terms, form.axis, (), count) for each in group)
 
-    def terms(chunk):
-        inputs, valid = load(chunk)
-        factors = windows._factor_values(inputs, form.units, rank)
-        return summation._placed_summands(inputs, factors, valid, dtype, empty_exponent=0)
+        def terms(chunk, summations=summations):
+            inputs, valid = load(chunk)
+            factors = windows._factor_values(inputs, form.units, rank)
+            terms_by_sum = [each._placed_summands(inputs, factors, valid, dtype, empty_exponent=0)
+                            for each in summations]
+            if len(terms_by_sum) == 1:
+                return terms_by_sum[0]
+            return tuple(tuple(jnp.stack(jnp.broadcast_arrays(*part), axis=-1)
+                               for part in zip(*pieces, strict=True))
+                         for pieces in zip(*terms_by_sum, strict=True))
 
-    may_round = terms_per_bin * ((1 << width) - 1) > 1 << (number.mantissa + 1)
-    return bands.summed(terms, chunks, axis=form.axis, width=width, lower=lower,
-                        bins=(upper - lower) // width + 1, dtype=dtype, may_round=may_round)
+        placed, live = bands.summed(terms, chunks, axis=form.axis, width=width, lower=lower,
+                                    bins=(upper - lower) // width + 1, dtype=dtype, may_round=may_round)
+        if len(group) == 1:
+            made[group[0]] = placed, live
+        else:
+            for at, each in enumerate(group):
+                made[each] = tuple(part[..., at, :] for part in placed), live[..., at]
+    return made
 
 
 def _band_products(products, values, expanded, dtype):
@@ -313,7 +332,7 @@ def _products_summed(operands, form: Ratio):
                   for each, value in values.items()}
     dtype = laid[0].dtype
     if expanded:
-        values_by_band = {each: _banded_sum(each, arrays, count, rank, form, dtype) for each in expanded}
+        values_by_band = _banded_sums(expanded, arrays, count, rank, form, dtype)
         if not form.reduced:
             values_by_band = {each: jax.tree.map(lambda part: jnp.expand_dims(part, form.axis), band)
                               for each, band in values_by_band.items()}
