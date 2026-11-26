@@ -1516,9 +1516,9 @@ def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | No
     or in other threads, keep their own: none for a trace running neither `layers` nor `loop`, whose
     layers run as their own forwards even nested in another's, at the first pass (`_PASS`). Under `layers`,
     each call traced as a
-    program of its own over its tensor arguments and torchax's key (`dew.nn.nested.nested`), returning its
-    outputs and the key's successor, each program `layers` takes: what `_accumulating` recomputes in a step's
-    backward (`TorchCausalLM.remat`), its draws (its dropout) the forward's, from the same key. Under
+    program of its own over its tensor arguments (`dew.nn.nested.nested`), each program `layers` takes:
+    what `_accumulating` recomputes in a step's backward (`TorchCausalLM.remat`); a layer that draws (its
+    dropout) is refused, as its program would hold the draw's key, which torchax carries past it. Under
     `loop`, the block `loop.layers` runs `loop.steps` times: past its last layer's first call, its later
     passes, each layer called with the arguments its own first pass took (the call's masks and rotary
     tables, which differ by layer kind), its hidden input the pass before's output, the decoder's `norm`
