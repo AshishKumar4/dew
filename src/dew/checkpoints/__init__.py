@@ -562,7 +562,8 @@ def _packed_checked(tree) -> None:
             except ValueError as error:
                 raise ValueError(f"{name}: {error}") from error
 
-    # A restore is pool-wide: a scale its owner alone reads (`TernaryWeights.checked`) refused on every rank.
+    # A restore is pool-wide: each rank checks its own shards (a gathered form's `checked`), and one agreement
+    # refuses every leaf on every rank where a rank refuses one.
     agreed("packed checks", checked)
 
 

@@ -486,22 +486,23 @@ class TernaryWeights:
         return cls(packed_words, scale_arr, ternary_form_version())
 
     @staticmethod
-    def _scale_admitted(scale) -> None:
+    def _scale_admitted(scale, *, agreeing: bool = True) -> None:
         """Refuse an fp32 `scale` holding an entry neither zero nor a finite normal (a subnormal, an
         infinity, a NaN), read on the host: its products then normal wherever their values are, as a
         process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). Each rank reads its own
         shards; a scale spanning every process is refused on every rank where one refuses it (`agreed`:
         each rank holds it, so each calls this), none raising alone, and one on some processes but not all
-        refused on each. A traced scale is checked where concrete."""
+        refused on each; read on this rank alone where its caller agrees around it (not `agreeing`). A traced
+        scale is checked where concrete."""
         if isinstance(scale, Tracer):
             return
         # The processes holding it, the same set on every rank (its sharding's): several of them agree.
         owners = ({device.process_index for device in scale.sharding.device_set}
                   if isinstance(scale, jax.Array) else set())
-        if 1 < len(owners) < jax.process_count():
+        if agreeing and 1 < len(owners) < jax.process_count():
             raise ValueError(f"a TernaryWeights scale on {len(owners)} of {jax.process_count()} processes: "
                              "its admission agrees across the whole pool: place it on one process or all")
-        spans = len(owners) > 1
+        spans = agreeing and len(owners) > 1
         pieces = ([shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array)
                   else [scale])
 
@@ -532,11 +533,13 @@ class TernaryWeights:
 
     def checked(self, form=None) -> "TernaryWeights":
         """Verify stored `form` version (every addressable shard; a traced one where concrete), scale shape
-        and its zero or finite normal entries (`_scale_admitted`) match this Dew's encoder."""
+        and its zero or finite normal entries (`_scale_admitted`) match this Dew's encoder. Given the
+        gathered `form` a collective restore hands it, its scale is read on this rank alone, the restore
+        agreeing on every leaf's outcome at once (`checkpoints._packed_checked`)."""
         if not isinstance(self.form if form is None else form, Tracer):
             _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
         scale_checked(jnp.shape(self.scale), self.shape)
-        self._scale_admitted(self.scale)
+        self._scale_admitted(self.scale, agreeing=form is None)
         return self
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:

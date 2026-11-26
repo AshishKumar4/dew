@@ -898,7 +898,11 @@ def mode_ternary_scale(args) -> dict:
     alone = outcome(on_first(np.ones(width, np.float32)))
     # A subnormal on process 0's devices alone, at a pool-wide restore's check: refused on both ranks.
     try:
-        _packed_checked({"kernel": TernaryWeights(packed.words, on_first(host), packed.form)})
+        # The bad one-owner leaf first, a valid pool-wide one after: one agreement for both.
+        _packed_checked({"a": TernaryWeights(packed.words, on_first(host), packed.form),
+                         "b": TernaryWeights(packed.words, jax.make_array_from_callback(
+                             (width,), NamedSharding(mesh, PartitionSpec("columns")),
+                             lambda index: np.ones(width, np.float32)[index]), packed.form)})
         restored = "admitted"
     except (ValueError, _coordination.PeerFailure) as error:
         restored = type(error).__name__
