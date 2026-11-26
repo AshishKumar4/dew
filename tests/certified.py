@@ -1468,7 +1468,7 @@ def _leading_zeros(params, value):
     value = np.asarray(value)
     unsigned = value.view(np.dtype(f"u{value.dtype.itemsize}")).astype(np.uint64)
     lengths = np.frompyfunc(int.bit_length, 1, 1)(unsigned.astype(object)).astype(np.int64)
-    return (8 * value.dtype.itemsize - lengths).astype(value.dtype)
+    return (np.int64(8 * value.dtype.itemsize) - lengths).astype(value.dtype)
 
 
 def _integral_extremum(reduce, extreme: str):

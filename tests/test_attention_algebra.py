@@ -1835,13 +1835,15 @@ def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form):
     `form` (its keys whole, causal, in a causal window of 8, in two packed documents), plain and under Gemma
     2's cap (`template.Capped`), run one primitive at a time, every element of every operation within its
     own operation's certified contract (check 2, tests/certified.py), over drawn queries, keys, values and
-    output cotangents, its tiles cutting the call into three of each. The library's own program: in a
-    process of its own without the test lane's wide CPU arithmetic, so no program the suite traced under it
-    is taken in its place."""
+    output cotangents, its tiles cutting the call into three of each. The library's own program as its users
+    run it: in a process of its own at JAX's default matmul precision without the test lane's wide CPU
+    arithmetic (the lane's `highest` takes fp32 products through float64 programs a check-2 bind of one
+    primitive at a time does not run), so no program the suite traced is taken in its place."""
     import process_support
 
     from dew.nn import precision
 
     findings = process_support.fresh(PLAIN_JAX_CERTIFIED, dtype, form, platforms="cpu",
-                                     variables={precision.WIDE_CPU_ARITHMETIC: "0"})
+                                     variables={precision.WIDE_CPU_ARITHMETIC: "0",
+                                                "JAX_DEFAULT_MATMUL_PRECISION": "default"})
     assert findings == {}, findings
