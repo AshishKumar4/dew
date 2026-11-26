@@ -2259,10 +2259,10 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     declaration reduces the rounded logits, including any ties they form. The exponent's argument can
     use one fused multiply-add a logit (`rules._contracted`). Its derived forms (`derived_forms`) compute
     the walk (`plain_step`, `merge`, `finish`), on par with XLA's against float64 (docs/design/algebra.md).
-    The accurate form's (`natural`, `Forward.natural`) exponential (`natural_exp`) and rescale
-    (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
-    none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
-    (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
+    For the accurate form (`natural`, `Forward.natural`), the derivation evaluates its exponential
+    (`natural_exp`) and compensated rescale (`natural_carried`) as written. Over scaled logits it holds
+    the largest weight to 1 (`softmax_of`'s `held`); over raw products (`Forward.raw`), it scales each
+    difference by the `raw` scale, which the exponential carries and the
     rescale compensates. Its total is held from 0 where a query may see no key (`guarded`, `softmax_of`).
     """
     tile = ("keys", "rows") if keys_first else ("rows", "keys")
