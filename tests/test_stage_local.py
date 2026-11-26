@@ -999,6 +999,9 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
     restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
     assert int(restarted.step) == 2
+    # The four-stage run took the two-stage state over, its banks cut to four stages freed (row 12463's
+    # review: the banks it cut stayed alive beside their stacks).
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(trained.variables["params"]))
     assert jax.tree.structure(started) == jax.tree.structure(stored)
     for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
         np.testing.assert_array_equal(mine, theirs)

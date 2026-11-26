@@ -321,7 +321,7 @@ class StageLocal:
         return jax.eval_shape(functools.partial(self.state, convert=self.staged), state)
 
     def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState], *,
-                 consumed: bool = False) -> tuple[TrainState, TrainState]:
+                 consumed: bool = False, sources: TrainState | None = None) -> tuple[TrainState, TrainState]:
         """A state given whole, wherever its arrays are (one device's, another mesh's), its runs stacked by
         stage onto the placement `validated` gives the stacked state's shapes, and that placement: placed
         whole on this mesh first, as `validated` places it, and stacked there. A state the caller hands on
@@ -329,7 +329,9 @@ class StageLocal:
         moving arrays to the stacking (`apart`), so its leaves the stacking keeps alias theirs and its
         layers' are freed as their stacks are made: borrowed, the devices held the state twice through
         the run's plan search (row 12463: a second fit of a 4B run held 69 GiB, 34.6 GiB its state, and
-        fit no rung). Its frozen trees, which the objective's tree shares, are never given."""
+        fit no rung). Its frozen trees, which the objective's tree shares, are never given. `sources`, the
+        state as its caller handed it where `state` was made of it (`received`'s banks cut to another stage
+        count, `afresh`'s schedules), gives its moving arrays over the same way."""
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(self.stacked_shapes(state))
         if not self.sites:
@@ -351,7 +353,8 @@ class StageLocal:
         stacked = stacking(moving, jax.device_put(frozen, frozen_laid))
         # Never one the stacked state holds itself (an input a program hands back as its output).
         kept = {id(leaf) for leaf in jax.tree.leaves(stacked)}
-        released([leaf for leaf in jax.tree.leaves((moving, handed))
+        given = () if sources is None else apart(sources)[0]
+        released([leaf for leaf in jax.tree.leaves((moving, handed, given))
                   if isinstance(leaf, jax.Array) and id(leaf) not in kept])
         return stacked, placement
 

@@ -1559,6 +1559,7 @@ class Trainer(Generic[Loss, Effects]):
             # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
             # run reads its data afresh: a clock of examples starts at none consumed, a run on another clock
             # keeps none, and its schedules take the run's own form (`reclocked`).
+            handed = initial
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(self._boxed_axes())):
@@ -1569,7 +1570,7 @@ class Trainer(Generic[Loss, Effects]):
             # devices (`_fitting`), as a fresh or resumed one is.
             return (int(initial.step), None,
                     lambda begun=None: self._staging.supplied(
-                        initial, lambda staged: self._validated(staged)[0], consumed=True),
+                        initial, lambda staged: self._validated(staged)[0], consumed=True, sources=handed),
                     self._staging.stacked_shapes(initial), None)
         start = streaming.laid_start(self, run, dataset, resume)
         if checkpoints is not None and checkpoints.latest is not None:
