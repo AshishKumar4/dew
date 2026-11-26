@@ -820,13 +820,25 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
     hasher = hashlib.blake2b(digest_size=20)
     opaques: list[Hashable] = []
     ctx_keys: dict[int, Hashable] = {}
-    plain_types: dict[int, Hashable] = {}
+    plain_types: dict[int, int] = {}
     primitive_keys: dict[int, Hashable] = {}
     binders: dict[jcore.Var, bytes] = {}
+    descriptors: dict[Hashable, int] = {}
 
     def feed(part: Hashable) -> None:
         hasher.update(repr(part).encode())
         hasher.update(b"\0")
+
+    def descriptor(key: Hashable) -> int:
+        # These ordinals are local to one process-only digest and assigned by first use of the
+        # canonical value, not by the encounter pattern of object identities. Persistent digests
+        # still write the full descriptor at every use.
+        ordinal = descriptors.get(key)
+        if ordinal is None:
+            ordinal = len(descriptors)
+            descriptors[key] = ordinal
+            feed(("descriptor", key))
+        return ordinal
 
     def bind(variables: Sequence[jcore.Var]) -> None:
         # Encode each ordinal once. Preserve both the in-process tag and persistent textual format.
@@ -846,7 +858,8 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
         before = len(opaques)
         key = _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
         if len(opaques) == before:
-            plain_types[identity] = key
+            plain_types[identity] = ordinal = descriptor(key)
+            return ordinal
         return key
 
     def feed_atom(atom) -> None:
@@ -891,11 +904,14 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
         params_key: Hashable = ()
         if params:
             if in_process:
+                before = len(opaques)
                 parameters_by_name = params.items()
                 ordered = sorted(parameters_by_name) if len(params) > 1 else parameters_by_name
                 params_key = tuple(
                     (name, _collect_opaque(_in_process_param_key(part, reject_device=reject_device), opaques))
                     for name, part in ordered)
+                if len(opaques) == before:
+                    params_key = descriptor(params_key)
             else:
                 params_key = _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
