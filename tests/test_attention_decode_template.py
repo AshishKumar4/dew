@@ -1206,6 +1206,50 @@ def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
         assert op.price_config(ba, tiles, target) is not None
 
 
+@pytest.mark.parametrize("rows, keys, width", [(1, 32768, 128), (8, 4096, 64)])
+def test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller(rows, keys, width):
+    """A decode step on an A100, bf16, 32 heads over 8, a cache full to its length, as the planner prices it
+    (`attention_decode.plan`): its query packed over the key heads (`packed`), priced over every key, at each
+    slice count the plan weighs (powers of two to its bound: four programs a multiprocessor, two of its
+    ring's stages a slice), its walk's issued price (`MosaicForward.price_config`) at each key tile it
+    streams at; the larger tile at or below the smaller at every such count. The smaller tile's programs are
+    two a multiprocessor, priced at one program's issue interval on an A100
+    (`Multiprocessor.programs_hide_issue`): priced over both programs' warps, the smaller tile ranked below
+    and walked slower at these cells (M-NA-27c-a100: +20.5% and +40.5%, row 5274)."""
+    target = generation.gpu_target("sm80")
+    query = jnp.zeros((rows, 1, 32, width), jnp.bfloat16)
+    key = jnp.zeros((rows, keys, 8, width), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, keys, rows)
+    compared = 0
+    with generation.assumed(target):
+        packed, packed_spans, _ = attention_decode.packed(query, spans, 8)
+        every = (packed_spans if packed_spans.form == "full"
+                 else attention_decode.key_spans(packed.shape[1], packed_spans.keys, packed.shape[0]))
+        walk = attention_decode.WALKS["plain"]
+        single_op, single_ba = attention_decode._stream_op(packed, key, key, every, None, scale=None,
+                                                           table=None, sources=None, scales=None,
+                                                           out_dtype=None, chosen=walk, in_key=False)
+        single = single_op.streaming(single_ba, single_op.remaining(single_ba), target)
+        programs = attention_decode.launch_programs(packed, single)
+        longest = math.ceil(keys / single.block_k) // (2 * min(single.stages, 2))
+        most = min(longest, max(2, 4 * target.multiprocessors // programs))
+        for count in (1 << power for power in range(1, most.bit_length()) if 1 << power <= most):
+            op, ba = attention_decode._bound(packed, key, key, every, None, scale=None, table=None,
+                                             sources=None, scales=None, splits=count, chosen=walk,
+                                             in_key=False)
+            derived = op.derived(ba, target)
+            if derived is None:
+                continue
+            prices = {tile.block_k: op.price_config(ba, tile, target, issued=True)
+                      for tile in op.streamings(ba, derived, target)}
+            if len(prices) < 2:
+                continue
+            ranked = [prices[block] for block in sorted(prices)]
+            assert None not in ranked and ranked[-1] <= ranked[0], (count, prices)
+            compared += 1
+    assert compared, "no slice count the plan weighs streams at two key tiles"
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])

@@ -271,7 +271,10 @@ class Multiprocessor:
     §16.6.1 to §16.8.1 for compute capabilities 7.x to 9.0; 10.x and 12.x, which no edition of it describes,
     taken alike), the clocks between one warp's issues in a walk (`issue_interval`: its instructions'
     dependent latency over a walk's mix, so `issue_interval` warps a scheduler keep it issuing; measured, None
-    where not), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    where not), whether pricing lets the warps of programs resident beside each other hide each other's
+    issue intervals as one program's own warps do (`programs_hide_issue`: a pricing policy, the measured
+    walks' conservative reading where they disagree with it, not a stated fact of the hardware), and the
+    range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
     to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
     on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
@@ -291,6 +294,7 @@ class Multiprocessor:
     shared_bytes_per_clock: int = 128
     issue_per_clock: int = 4 * 32
     issue_interval: float | None = None
+    programs_hide_issue: bool = True
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
@@ -417,9 +421,13 @@ _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
                        # backwards under ncu (sm__inst_executed a multiprocessor a clock over the warps each
                        # scheduler held), the template's at one warp a scheduler and FA2's at two alike, d64
                        # 6.9 and 6.6, d128 9.1 and 8.0, d256 12.0 and 11.0: their geometric mean, the
-                       # interval growing with the head width's mix.
+                       # interval growing with the head width's mix. Its resident programs are priced at one
+                       # program's warps, a pricing policy pending M-FS-93 (row 5274), which separates
+                       # residency from issue: two decode walks a multiprocessor ran 1.54x the interval priced
+                       # over both programs' warps, where one program's warps priced right (M-NA-27c-a100:
+                       # B1/K32768/d128 at one program 113.7 us walked, 108.9 priced; at two 140.3, 91.2).
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None,
-                                      issue_interval=8.7),
+                                      issue_interval=8.7, programs_hide_issue=False),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS,
                        integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
                        global_reduction_bytes_per_clock=3.0)
