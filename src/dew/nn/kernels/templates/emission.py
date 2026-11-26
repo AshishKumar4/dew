@@ -551,16 +551,22 @@ class _Place:
     stop: _Bound
     parity: int
     plus: int = 0
+    consulted: set[str] = dataclasses.field(default_factory=set, compare=False, repr=False)
+    """What a trip's count read of it: "at" where a guard read which trip it is, "parity" where its
+    remainder by two; every place of one trip (`plus` past it) records into one."""
 
     def compared(self, primitive, other) -> bool | int | None:
         """`self <primitive> other` where the place decides it: equal to its range's start at its first
         trip alone, one past it short of its range's stop at every trip but its last, its remainder by two
         its parity; None otherwise."""
         if primitive is lax.eq_p and self.plus == 0 and other == self.start:
+            self.consulted.add("at")
             return self.at == "first"
         if primitive is lax.lt_p and self.plus == 1 and other == self.stop:
+            self.consulted.add("at")
             return self.at != "last"
         if primitive is lax.rem_p and other == 2:
+            self.consulted.add("parity")
             return (self.parity + self.plus) % 2
         return None
 
@@ -898,13 +904,14 @@ class _Counting:
         # Its constants keep their provenance in every trip; a carried value is none past the first.
         static = [*given[params["cond_nconsts"]:][:params["body_nconsts"]], *([False] * carry)]
         ranged = _ranged(params, held)
+        consulted: set[str] = set()
 
         def trip(at: str, parity: int) -> "_Counting":
             # A carried value is unknown past the first trip, but a range's counter and stop (`_ranged`).
             inputs = [*consts, *([None] * carry)]
             if ranged is not None:
                 counter, start, stop, bound = ranged
-                inputs[len(consts) + counter] = _Place(at, start, stop, parity)
+                inputs[len(consts) + counter] = _Place(at, start, stop, parity, consulted=consulted)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals, lanes=self.lanes,
@@ -914,7 +921,12 @@ class _Counting:
             self.arrivals.left(trial.landing)
             return trial
 
-        steady, odd = trip("steady", 0), trip("steady", 1)
+        # A trip whose count read nothing of its place (`_Place.consulted`) is every trip: its count holds the
+        # same values and shared state (layouts fixed before the count, a landing kept once), so one at
+        # another place or parity retraces it to the bit; where it read its parity alone, so does one at the
+        # other trips' places.
+        steady = trip("steady", 0)
+        odd = trip("steady", 1) if "parity" in consulted else steady
         self.fixed = self.fixed + steady.fixed
         self.walks.extend(steady.walks)
         found = _Loop(_mean([steady.loops[-1].work, odd.loops[-1].work]), steady.loops[-1].marks)
@@ -922,7 +934,8 @@ class _Counting:
         if ranged is not None and found.marks and not self.loops:
             # The first and last trips each take their own work in place of a steady one's.
             for at in _PLACES[1:]:
-                taken = _mean([trip(at, parity).loops[-1].work for parity in (0, 1)])
+                taken = (_mean([trip(at, parity).loops[-1].work for parity in (0, 1)]) if "at" in consulted
+                         else found.work)
                 self.fixed = self.fixed + taken + repeated(found.work, -1)
 
     def warps(self, equation, values: list, given: list[bool]) -> None:

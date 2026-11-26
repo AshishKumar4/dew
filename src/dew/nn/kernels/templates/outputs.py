@@ -16,6 +16,8 @@ from collections.abc import Sequence
 
 import jax
 
+from dew.nn.kernels.templates.axes import whole
+
 OUTPUT_DIMS = "output_dims"
 """The frontend attribute a kernel's custom call states its outputs' dimensions by (`stated`): JSON, a list an
 output (in the call's order of its stated outputs), an entry a dimension, each the `[operand, axis]` pairs it
@@ -42,7 +44,7 @@ class Dim:
             return self.stated
         product = self.constant * math.prod(operand.shape[index] for operand, index in self.axes)
         quotient = -(-product // self.divisor) if self.ceil else product // self.divisor
-        return -(-quotient // self.multiple) * self.multiple
+        return whole(quotient, self.multiple)
 
     def __mul__(self, other: Dim | int) -> Dim:
         if self.divisor != 1 or self.multiple != 1:

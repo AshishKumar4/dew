@@ -44,6 +44,7 @@ from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import scaled_contraction
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
 from dew.nn.precision import (
     at_least_fp32,
@@ -349,7 +350,7 @@ def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
     from dew.nn.visibility import block_ends, block_starts
 
     floor, bound = document
-    for groups, whole in ((block_groups, True), (image_groups, False)):
+    for groups, from_start in ((block_groups, True), (image_groups, False)):
         if groups is None:
             continue
         groups = jnp.asarray(groups)
@@ -357,7 +358,7 @@ def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
         inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
         ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
         end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
-        if whole:
+        if from_start:
             begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
             start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
     return start, end
@@ -1697,11 +1698,6 @@ def interpreted_rows(a: jax.Array, b: jax.Array) -> jax.Array:
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
-
-
-def whole(count: int, block: int) -> int:
-    """`count` rounded up to whole `block`s."""
-    return -(-count // block) * block
 
 
 WIDEST_POWER = 256
