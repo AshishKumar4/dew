@@ -165,9 +165,9 @@ class InklingProcessor:
             rows.append(list(self.tokenizer.encode(expanded)))
         if next(remaining, None) is not None:
             raise ValueError(f"the prompts hold fewer image placeholders than their {len(given)} images")
-        from dew.interop.processors import tokenizer_padding
+        from dew.interop.processors import row_padding
 
-        pad, side = tokenizer_padding(self.tokenizer)
+        pad, side = row_padding(self)
         padded, valid = pad_token_rows(rows, pad_id=pad, padding_side=side)
         fields = {"input_ids": padded, **valid}
         if processed:

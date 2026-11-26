@@ -220,6 +220,8 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
 
     from PIL import Image
 
+    from dew.interop.inkling_media import InklingProcessor
+
     directory = _bundle_with_tokenizer(tmp_path)
     (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
     loaded = Pretrained.load(directory, dtype='float32')
@@ -261,6 +263,8 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
     upright = read(np.asarray(Image.open(turned).transpose(Image.Transpose.ROTATE_270)))
     for field, value in read(turned).items():
         np.testing.assert_array_equal(value, upright[field], err_msg=field)
-    loaded.processor._media_reference.tokenizer.padding_side = 'middle'
+    media = loaded.processor._media_reference
+    assert isinstance(media, InklingProcessor)
+    media.tokenizer.padding_side = 'middle'
     with pytest.raises(ValueError):
         loaded.processor('w1 <|image|>', images=[rgba])

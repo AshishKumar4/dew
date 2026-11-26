@@ -17,6 +17,9 @@ pytestmark = [pytest.mark.gpu(reason="TF32 is a GPU's default float32 product"),
 
 AT_RUN = "torchax models and a tier-3 source, no check-1 site"
 """Why the first two cells compile at their run (`Cell.at_run`)."""
+PLACED_AT_LOAD = ("a tier-3 load places the source's tensors on the device as it loads "
+                  "(MakeArraysFromHostBufferShards), which a prepare's compile-only device refuses")
+"""Why the bf16 Qwen3-Next cell, whose check-1 site follows its load, compiles at its run (`Cell.at_run`)."""
 
 
 def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):
@@ -31,5 +34,5 @@ def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):
         # On a Hopper, whose measured cells give bf16 rows the fused norm and SiLU product (`NORM_CELLS`).
         Cell("a bf16 tier-3 Qwen3-Next steps through Dew's native kernels as exactly as transformers",
              lambda: fallback.a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(
-                 tmp_path / "kernels"), "sm90"),
+                 tmp_path / "kernels"), "sm90", at_run=PLACED_AT_LOAD),
     ])

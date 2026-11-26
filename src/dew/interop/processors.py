@@ -319,32 +319,24 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
     return streams
 
 
-class Padding(Protocol):
-    """A tokenizer's padding as transformers' `PreTrainedTokenizerBase` states it."""
-
-    @property
-    def pad_token_id(self) -> int | None: ...
-
-    @property
-    def padding_side(self) -> str: ...
-
-
 def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
     """Return the id and the side to pad text rows with, at the boundary a host
     processor draws: it delegates text to the tokenizer it wraps, a tokenizer
-    is its own (`tokenizer_padding`)."""
-    return tokenizer_padding(getattr(reference, "tokenizer", reference))
-
-
-def tokenizer_padding(tokenizer: Padding) -> tuple[int, Literal["left", "right"]]:
-    """The id and the side a tokenizer pads text rows with, narrowed once for the rows: its pad id 0 where
-    it states none, its side refused unless left or right."""
-    side = tokenizer.padding_side
+    is its own, and either may state neither field, so both names are read off
+    the object here and narrowed once for the rows.
+    """
+    tokenizer = getattr(reference, "tokenizer", reference)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    side = getattr(tokenizer, "padding_side", "right")
     if side not in ("left", "right"):
         raise ValueError("the tokenizer padding_side must be left or right")
-    pad_id = tokenizer.pad_token_id
     return (0 if pad_id is None else _records.integer(pad_id, "pad_token_id"),
             "left" if side == "left" else "right")
+
+
+row_padding = _row_padding
+"""The padding policy a processor of Dew's own pads its text rows by (`InklingProcessor`), the host
+processors' own (`_row_padding`): one owner of it."""
 
 
 def _row_start(reference: HostProcessor) -> int | None:
