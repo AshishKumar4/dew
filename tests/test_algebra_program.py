@@ -188,9 +188,7 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
                          ids=lambda dtype: jnp.dtype(dtype).name)
 def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
     """A literal 2 of each float dtype, numpy's own (float32) and ml_dtypes' (bfloat16, float8), which numpy's
-    type tree does not place among its floats: its magnitude (`terms.region`) and its power of two's exact and
-    positive scale (`rules.exact_scale`, `rules.positive_scale`) stated alike, where a bfloat16 or float8
-    literal had none."""
+    type tree does not place among its floats: its magnitude and its positive scale are stated alike."""
     from egglog import EGraph, i64
 
     closed = jax.make_jaxpr(lambda x: x * jnp.asarray(2.0, dtype))(jnp.ones((4,), dtype))
@@ -199,7 +197,6 @@ def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
     graph = EGraph()
     program.stated(graph, region)
     assert region.magnitudes[terms.key(literal)] == 1
-    assert graph.check_bool(algebra.rules.exact_scale(literal))
     assert graph.check_bool(algebra.rules.positive_scale(literal))
 
 
@@ -418,17 +415,16 @@ def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
                                   jax.jit(algebra.rewritten(two_sums))(*operands))
 
 
-def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
-    """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
-    way and counts one reduction's operations and one addition fewer joined, so the pass splices a form it
-    prices cheaper, and the program computes what it computes (check 1)."""
-    def two(x, y):
-        return jnp.sum(jnp.tanh(x), axis=-1) + jnp.sum(jnp.tanh(y), axis=-1)
+def test_floating_counts_stay_separate_when_the_combined_count_could_round():
+    def counted(x, y):
+        return jnp.sum((x > 0).astype(x.dtype)) + jnp.sum((y > 0).astype(y.dtype))
 
-    shapes = ((64, 128), (64, 128))
-    assert cheaper_spliced(two, *rows(3, *shapes))
-    assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
-                    "two sums", seeds=16)
+    x = jnp.ones((129,), jnp.bfloat16)
+    y = x.at[0].set(0)
+    run = algebra.rewritten(counted)
+    traced = jax.make_jaxpr(run)(x, y)
+    assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in equations(traced.jaxpr)) == 2
+    np.testing.assert_array_equal(jax.jit(run)(x, y), jax.jit(counted)(x, y))
 
 
 def _clamped_products(x, a, b, lower, upper, operand=jnp.tanh):
@@ -654,19 +650,16 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     with report.refusals():
         options.program(joined).compiled(x, y, a)
         [made] = report.rewrites()
-    assert made.fired.get("linear", 0) > 0
+    assert made.fired.get("joined", 0) > 0
     assert made.after < made.before
     assert made.seconds > 0
     assert made.spliced == 1
 
 
 def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
-    """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
-    them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
-    records) are rewritten without it by `joined`, the other set that joins them, and by no `linear` match,
-    and without both by none at all, their program computing what the program with no pass computes. A
-    derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
-    and a name no set registers are refused, as an arm without them would measure nothing."""
+    """A pass that leaves sets out admits none of their rewrites: only `joined` can join these counts.
+    Without it they compute what the program with no pass computes. A derivation's named set can be
+    left out; a dev-time set, a derivation's defining set and an unregistered name are refused."""
     from dew.algebra.program import passes
 
     def joined(x, y, a):
@@ -1144,11 +1137,10 @@ def test_an_algebra_span_joins_the_windows_around_it():
     marked call left, and the program computes what it computes (check 1)."""
     from dew.nn.derivatives import Algebra, marked
 
-    def inside(x, a):
-        return jnp.sum(jnp.tanh(a) * jnp.tanh(x), axis=-1)
+    from test_algebra import count_above
 
     def spanning(x, y, a):
-        return marked(Algebra(), inside)(x, a) + jnp.sum(jnp.tanh(a) * jnp.tanh(y), axis=-1)
+        return marked(Algebra(), count_above)(x, a) + count_above(y, a)
 
     assert cheaper_spliced(spanning, *rows(13, *SHAPES_MARKED))
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []

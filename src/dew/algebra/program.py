@@ -861,10 +861,12 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             if (back := widened.get(dtype)) is not None:
                 facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
-            _, params = region.params[terms.integer(args[3])]
+            primitive, params = region.params[terms.integer(args[3])]
             extent = region.shape(args[0])
             length = math.prod(extent[axis] for axis in params["axes"])
             facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
+            if primitive is jax.lax.reduce_sum_p and _counts_exactly(region, args[0], dtype, length):
+                facts.append(rules.counting_sum(term))
     # holds where the program's values are: a new intermediate under the narrowest float's largest power of
     # two is finite wherever the program is. A bound over an unbounded operand would bound nothing: the
     # program's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y at 3e38
@@ -879,6 +881,18 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         facts.append(set_(rules.least()).to(i64(int(jnp.finfo(narrowest).minexp))))
     if facts:
         graph.register(*facts)
+
+
+def _counts_exactly(region: terms.Region, operand: terms.Term, dtype, length: int) -> bool:
+    """Two counts of predicate elements fit the unit-spaced integer range of the accumulator."""
+    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+        return False
+    cast = get_callable_args(operand, terms.Term.convert)
+    if cast is None or region.dtypes.get(terms.key(cast[0])) != jnp.bool_:
+        return False
+    limits = jnp.finfo(dtype)
+    return (region.dtypes.get(terms.key(operand)) == dtype
+            and 2 * length <= 2 ** min(limits.nmant + 1, limits.maxexp - 1))
 
 
 def _products(region: terms.Region) -> list:
@@ -929,8 +943,6 @@ def _products(region: terms.Region) -> list:
         if terms.typed_key(value):
             continue
         literal = terms.Term.literal(i64(index))
-        if _power_of_two(value):
-            facts.append(rules.exact_scale(literal))
         # A finite positive real alone: an infinite scale keeps no order (a zero times it is NaN, where the
         # maximum taken first is finite), so an extremum takes it out of none (spec alignment, 8992).
         if (np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value > 0
@@ -1308,15 +1320,6 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         for made_report in body.rewrites:
             kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))
     return closed if body.made is None else body.made
-
-
-def _power_of_two(value) -> bool:
-    """Whether a literal is a scalar power of two, a multiply by which rounds nothing: a float's of any dtype,
-    ml_dtypes' (bfloat16, float8) among them, which numpy's own type tree does not place among its floats."""
-    if np.ndim(value) != 0 or not jnp.issubdtype(np.asarray(value).dtype, jnp.floating):
-        return False
-    mantissa, _ = np.frexp(float(value))
-    return mantissa in (0.5, -0.5)
 
 
 def node_count(graph: EGraph) -> int:

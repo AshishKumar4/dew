@@ -150,14 +150,14 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
   as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
-  - **linear algebra** (compile time and dev time): linearity of sums (`joined`: it changes no shipped
-    program today, and the pass runs 12% slower without it, the rule-set survey of 2026-11-14, which is its
-    receipt), a laid factor hoisted out
-    of a sum, distributivity, a product's bilinearity (a shared operand out of two products, a power of two's
-    scale on either operand), a row or column scale lifted out of a matrix product along the axis the product
-    keeps (a dequant's: `(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`), and a positive scale out of a maximum or a minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign
-    its fact): attention's derived step takes its raw products' maximum and scales it once, as the hand step
-    does;
+  - **linear algebra** (compile time and dev time): join sums of floating counts when their partial
+    counts fit the dtype exactly (`joined`); keep ordinary rounded reductions separate (row 13161).
+    Hoist a laid factor out of a sum, distribute, or factor a shared operand out of two products.
+    A scalar power of two crossing a contraction needs a proof that the reordered intermediates
+    neither flush nor overflow (row 13162); that move is not admitted today. A row or column scale
+    can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
+    comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
+    attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
     a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
     simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not

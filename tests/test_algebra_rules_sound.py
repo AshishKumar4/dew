@@ -67,9 +67,8 @@ class Inadmissible(Exception):
 RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power",
                          "log2_floor", "least"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
-ROUNDING_FACTS = frozenset({"plain", "exact_scale", "narrowed", "same_dtype"})
-"""The facts a dtype or power-of-two condition reads: rounding's too (a narrow float's conversion back,
-`narrowed`, is the identity over the reals)."""
+ROUNDING_FACTS = frozenset({"plain", "counting_sum", "narrowed", "same_dtype"})
+"""Dtype and exactness conditions, which a real identity reads nothing of."""
 
 
 class _Magnitude:
@@ -479,7 +478,10 @@ def _named(conditions, fact: str) -> set[str]:
         inner = _inner(condition.typed_expr) if isinstance(condition, decl.ExprFactDecl) else None
         named = getattr(inner.callable, "ident", None) if isinstance(inner, decl.CallDecl) else None
         if named is not None and named.name == fact:
-            found.add(_inner(inner.args[0]).name)
+            argument = _inner(inner.args[0])
+            if fact == "counting_sum":
+                argument = _inner(argument.args[0])
+            found.add(argument.name)
     return found
 
 
@@ -571,7 +573,7 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
     logged: list[str] = []
     _logged(matched[1], logged)
     positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | set(logged)
-    exact = _named(conditions, "exact_scale")
+    counted = _named(conditions, "counting_sum")
     drawn = sorted(operand for operand in admitted.arrays if operand not in units)
 
     def draw(seed):
@@ -579,7 +581,7 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
         operands = []
         for operand in drawn:
             shape = np.shape(admitted.arrays[operand])
-            value = 2.0 ** rng.integers(-3, 4, shape) if operand in exact else rng.standard_normal(shape)
+            value = rng.integers(0, 2, shape) if operand in counted else rng.standard_normal(shape)
             operands.append(jnp.asarray(np.abs(value) + 0.5 if operand in positive else value, jnp.float32))
         return tuple(operands)
 

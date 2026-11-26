@@ -113,11 +113,8 @@ minimum of a scaled value is the scaled maximum or minimum (`_linear`)."""
 
 
 @function
-def exact_scale(term: Term) -> Unit: ...
-"""Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
-dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
-states it). A scale of any other value moved so reorders rounding, which the gate refused on the gated delta
-rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
+def counting_sum(term: Term) -> Unit: ...
+"""A sum of floating 0/1 values whose worst-case count doubled fits exactly in its dtype."""
 
 
 @function(merge=lambda old, new: old)
@@ -692,12 +689,11 @@ def _reuse() -> tuple[RuleFamily, ...]:
 
 
 def _linear() -> tuple[RuleFamily, ...]:
-    """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a positive scalar's
-    scale taken out of a maximum or a minimum it keeps the order of (`positive_scale`: `max(c x) = c max(x)`,
-    each element's one rounding of `c x` kept as the reduced one's, so it reorders no rounding and makes no
-    new magnitude), a product's bilinearity
-    (two products sharing an operand, one product of the summed others, and a power of two's scale of the
-    product on either operand instead), each over arithmetic in its operands' dtype (`plain`), and a value a
+    """Distributivity over operands of one shape, a positive scalar's scale out of a maximum or minimum
+    (the same element wins, with its original rounding), and two matrix products sharing an operand as
+    one product with the others summed. A scalar stays on its original side of a contraction: a power
+    of two can flush an operand or product even when the final written result is normal (row 13162).
+    A value a
     broadcast lays along every axis but a sum's taken out of the sum where the other factor has the product's
     shape (the broadcast's extent along the axis the product's or 1, as an elementwise product broadcasts a
     unit axis), and a matrix product of an operand scaled along its kept axis (a dequant's row or column
@@ -707,24 +703,6 @@ def _linear() -> tuple[RuleFamily, ...]:
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
     params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
-    scalar = Vec[i64].empty()
-    families = []
-    # A contraction scaled by a power of two: the scale on either operand, the product linear in each. The
-    # new operand and the new contraction over it each under the program's reach: a scale moved into a
-    # contraction's operand scales each of its products before its sum (2**120 x times 2 summed past 2**128).
-    for side, scaled, other, made_of, moved in (
-            ("left", x, y, lambda s: s.dot(y, params), lambda x, y, a: jnp.dot(x * 0.5, y.T)),
-            ("right", y, x, lambda s: x.dot(s, params), lambda x, y, a: jnp.dot(x, (y * 0.5).T))):
-        facts, power = product_magnitude(magnitude(scaled, "s"), magnitude(a, "a"), 0)
-        new = scaled.binary("mul", a, multiplied)
-        bounds, contracted = product_magnitude(([], power), magnitude(other, "other"),
-                                               var("replaced_length", i64))
-        families.append(RuleFamily(f"a power of two's scale into a contraction's {side} operand", (rule(
-            eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied), *facts, *dominated(power, "new"),
-            eq(var("replaced_length", i64)).to(contracted_length(x.dot(y, params))), *bounds,
-            *dominated(contracted, "replaced")).then(union(t).with_(made_of(new)), *made(new, power)),),
-            (lambda x, y, a: jnp.dot(x, y.T) * 0.5, moved, _ROWS)))
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
     # The factored product too: `a (x + y)` rounds `x + y` before the product, so it may pass the float's
@@ -732,7 +710,7 @@ def _linear() -> tuple[RuleFamily, ...]:
     # `x + y` rounds to `1 + 2**-22`, and `a (1 + 2**-22)` overflows where the written sum rounds to the
     # largest). Under the reach it is finite for every `a` its bound holds: `|a| 2**(max(x, y) + 1)`.
     more, factored = product_magnitude(magnitude(a, "a"), ([], power), 0)
-    families += [
+    families = [
         RuleFamily("distributivity", (rule(
             eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
@@ -844,24 +822,23 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
 
 
 def _joined() -> tuple[RuleFamily, ...]:
-    """Two sums along one axis of operands of one shape as one sum of their terms (linearity), in their
-    operands' dtype (`plain`), where the new sum of terms and the new reduction of it, its length's power
-    (`sum_length`) above them, are each under the program's reach (`dominated`): `sum(x) + sum(y)` may be
-    finite where `sum(x + y)` is not (float32's `x = [2**126, 2**126]` and
-    `y = [2**126 - 2**102, 2**126 - 2**103]`)."""
+    """Join two counts of the same shape and axes when every partial sum in both orders is exact.
+
+    An upper magnitude alone does not make ordinary floating-point sums safe to join. Adding their
+    entries first can erase a contribution which would survive cancellation (row 13161)."""
     x, y, t = vars_("x y t", Term)
     axes = var("axes", Vec[i64])
     params, added = vars_("params added", i64)
-    length = var("length", i64)
-    facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    power = i64(1)
     new = x.binary("add", y, added)
     reduced = new.reduce("sum", axes, params)
-    summed_x = x.reduce("sum", axes, params)
-    return (RuleFamily("two sums along an axis", (rule(
-        eq(t).to(summed_x.binary("add", y.reduce("sum", axes, params), added)), eq(shape(x)).to(shape(y)),
-        plain(added), eq(length).to(sum_length(summed_x)), *facts, *dominated(power + length, "new")).then(
+    left, right = x.reduce("sum", axes, params), y.reduce("sum", axes, params)
+    return (RuleFamily("two counts along an axis", (rule(
+        eq(t).to(left.binary("add", right, added)), eq(shape(x)).to(shape(y)), plain(added),
+        counting_sum(left), counting_sum(right), eq(length).to(sum_length(left))).then(
         union(t).with_(reduced), *made(new, power), *made(reduced, power + length)),),
-        (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1), lambda x, y, a: jnp.sum(x + y, -1), _ROWS)),)
+        (lambda x, y, a: jnp.sum((x > a).astype(x.dtype), -1) + jnp.sum((y > a).astype(y.dtype), -1),
+         lambda x, y, a: jnp.sum((x > a).astype(x.dtype) + (y > a).astype(y.dtype), -1), _ROWS)),)
 
 
 CONTRACTED = {"mul": "fmul", "add": "fadd", "sub": "fsub"}
