@@ -349,7 +349,10 @@ class StageLocal:
         stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
                                  out_shardings=placement, donate_argnums=0)
         stacked = stacking(moving, jax.device_put(frozen, frozen_laid))
-        released([leaf for leaf in jax.tree.leaves((moving, handed)) if isinstance(leaf, jax.Array)])
+        # Never one the stacked state holds itself (an input a program hands back as its output).
+        kept = {id(leaf) for leaf in jax.tree.leaves(stacked)}
+        released([leaf for leaf in jax.tree.leaves((moving, handed))
+                  if isinstance(leaf, jax.Array) and id(leaf) not in kept])
         return stacked, placement
 
     @overload
