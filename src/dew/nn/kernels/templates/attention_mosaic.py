@@ -1616,7 +1616,6 @@ def producer_raised(family: mosaic.Family, target: generation.GpuTarget) -> bool
         return family.registers(family.consumers) > resources.entry_registers(held)
 
 
-@dataclasses.dataclass(frozen=True)
 def _columns_legal(ba: tokamax.BoundArguments, config: BackwardTiles, family: mosaic.Family, dtype) -> bool:
     """Whether a backward config's consumers and programs split the call's widths as `family` stages them
     (`MosaicBackward.legal`'s last part): a shared key block's consumers each their share of the columns, a
@@ -1647,6 +1646,7 @@ def _columns_legal(ba: tokamax.BoundArguments, config: BackwardTiles, family: mo
         (width / config.columns) % unit == 0 for width, unit in zip(widths, units, strict=True)))
 
 
+@dataclasses.dataclass(frozen=True)
 class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
