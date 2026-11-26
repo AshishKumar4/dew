@@ -1830,6 +1830,20 @@ def test_a_portable_per_key_pair_keeps_the_finite_sum_and_left_adjoint(crossed):
     np.testing.assert_array_equal(adjoint, [[0, 1]] if crossed else [[2, -2]])
 
 
+def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land():
+    row = np.ones((2, 1), np.float32)
+    keys = np.asarray([[2.0 ** 127], [-2.0 ** 127]], np.float32)
+    decay = np.asarray([[[1.0], [-0.0]], [[1.0], [1.0]]], np.float32)
+    cotangent = np.asarray([[0, 0], [2, 2]], np.float32)
+
+    @jax.jit
+    def pull(q, k, factors, ct):
+        _, back = jax.vjp(lambda x: scan._portable_pairs(x, k, factors, None), q)
+        return back(ct)[0]
+
+    np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
+
+
 DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}
 """The isolated write's size and its three gates (`isolated_draw`): about 2^100 through gates of -39 to -41
 (`e^-120`, past fp32's least normal, row 9660), or about 2^127 through three of -58.375 (`e^-175.125`, past

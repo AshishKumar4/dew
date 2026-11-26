@@ -41,7 +41,8 @@ class Ratio:
     """A ratio of sums of products of float operands (`ratio_p`): `sum numerator / sum denominator`, each a
     tuple of terms `(coefficient, factors)`, a factor `("v", i)` operand `i`, `("e", i, j)` the factor
     `exp(s (operand_i - operand_j))` of `units` (`_factors_value`) or `("s",)` the units' scale `s` in the
-    operands' format. The numerator is summed over the operands' `axis` where `reduced` (the result without
+    operands' format, or `("m", i)` a held zero/one term mask. The numerator is summed over the operands'
+    `axis` where `reduced` (the result without
     it), else taken a state at a time; the denominator is always summed over it (none: one). The numerator
     is summed too over `over`, further axes of the operands' domain, each term over its own extent there (a
     term of none counted once), the result one along them: a transpose's cotangent summed over the axes its
@@ -391,10 +392,12 @@ def _exceptional_products(operands, form: Ratio, rank: int):
     axes = (*form.over, form.axis) if form.reduced else form.over
     terms = []
     for coefficient, factors in form.numerator:
-        values = [held[index] for _, index in factors]
+        values = [held[index] for kind, index in factors if kind != "m"]
+        masks = [_laid_to(operands[index], rank) != 0 for kind, index in factors if kind == "m"]
         finite = functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        present = functools.reduce(jnp.logical_and, masks, True)
         sign = functools.reduce(jnp.multiply, (value for _, value in values), coefficient)
-        terms.append(jnp.sum(jnp.where(finite, 0.0, sign), axis=axes, keepdims=True))
+        terms.append(jnp.sum(jnp.where(present & ~finite, sign, 0.0), axis=axes, keepdims=True))
     total = functools.reduce(jnp.add, terms)
     total = jnp.sum(total, axis=form.across, keepdims=True)
     return jnp.squeeze(total, form.axis) if form.reduced else total
@@ -464,7 +467,7 @@ def _derived(term, tangent_of: dict[int, int]) -> list:
     coefficient, factors = term
     made = []
     for place, factor in enumerate(factors):
-        if factor[0] == "s":
+        if factor[0] in ("s", "m"):
             continue
         if factor[0] == "v":
             if factor[1] in tangent_of:

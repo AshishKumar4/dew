@@ -1166,9 +1166,9 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
 
 
 def _pair_sum(factors: tuple[jax.Array, ...]) -> jax.Array:
-    """Contract the leading key axis without landing a product before it meets the other factors."""
-    form = ratios.Ratio(((1.0, tuple(("v", i) for i in range(len(factors)))),), (), 0,
-                        reduced=True, units=windows.Units(), ieee_products=True)
+    """Contract the leading key axis, keeping the crossed mask as a held last factor."""
+    term = (*(("v", i) for i in range(len(factors) - 1)), ("m", len(factors) - 1))
+    form = ratios.Ratio(((1.0, term),), (), 0, reduced=True, units=windows.Units(), ieee_products=True)
     return ratios.ratio(list(factors), form)
 
 
@@ -1189,8 +1189,8 @@ def _pair_factors(left, right, decay, after):
     else:
         factors = (first[..., :, None], second[..., None, :])
         active = ~(_crossed(factors[0]) | _crossed(factors[1]))
-    operands = (left[..., :, None], right[..., None, :], *factors)
-    return tuple(jnp.where(active, factor, 0) for factor in operands)
+    # Keep the broadcast axes on the numeric inputs: the ratio's transpose reduces them before landing.
+    return left[..., :, None], right[..., None, :], *factors, active.astype(left.dtype)
 
 
 def _portable_pair_jvp(primals, tangents):

@@ -125,7 +125,7 @@ def _factor_values(operands, units: Units, rank: int) -> Callable[[tuple], Scale
 
     def value(factor: tuple) -> Scaled:
         if factor not in held:
-            if factor[0] == "v":
+            if factor[0] in ("v", "m"):
                 held[factor] = scaled.scaled(_laid_to(operands[factor[1]], rank))
             elif factor[0] == "s":
                 dtype = at_least_fp32(operands[0].dtype)

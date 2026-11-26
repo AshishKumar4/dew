@@ -321,7 +321,8 @@ def test_a_merge_keeps_tiny_units_at_opposite_binade_edges(dtype, power, shift):
         return (np.asarray([[0.], [2.]], dtype), np.asarray(rng.uniform(0.75, 1.25, 2), dtype),
                 np.asarray([-2.0 ** power, 2.0 ** power], dtype), np.asarray([1, 0], dtype))
 
-    assert_as_exact(found, reference, draw, "tiny merge units and mass derivatives", seeds=8, truth_fn=reference)
+    assert_as_exact(found, reference, draw, "tiny merge units and mass derivatives",
+                    seeds=8, truth_fn=reference)
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
@@ -333,6 +334,18 @@ def test_a_narrow_finished_state_lands_mean_and_mass_in_its_own_format(dtype):
     for result, expected in zip(jax.jit(run)(*inputs), ([1.5], 4, 1), strict=True):
         assert result.dtype == dtype
         np.testing.assert_array_equal(result, np.asarray(expected, dtype))
+
+
+def test_a_narrow_mass_relocates_before_rounding_past_its_last_binade():
+    totals, anchors = np.asarray([65504, 16], np.float16), np.zeros(2, np.float16)
+    total, anchor = jax.jit(lambda t, a: means.merged_total(t, a, windows.Units(), 0))(totals, anchors)
+    move = 2 * math.log(2)
+    landed_at = np.float16(move)
+    if float(landed_at) < move:
+        landed_at = np.nextafter(landed_at, np.float16(np.inf))
+    reconstructed = np.float64(totals).sum() * np.exp(-float(landed_at))
+    np.testing.assert_array_equal(anchor, landed_at)
+    np.testing.assert_array_equal(total, np.float16(reconstructed))
 
 
 @pytest.mark.parametrize(("outputs", "totals", "anchors"), [((2, 2, 1), (1, 2), (2, 2)),
