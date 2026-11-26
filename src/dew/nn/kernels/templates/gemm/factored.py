@@ -11,9 +11,10 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.custom_derivatives import SymbolicZero
 
-from dew.nn import float_bits
+from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.sharding import explicit_spec, varying_like
@@ -53,42 +54,89 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     return generation.linear_map(apply, pullback, (factor, operands, (gather, wide_operands)), rows)
 
 
+FLUSHING = ('cpu', 'tpu')
+"""The platforms whose float32 arithmetic flushes subnormal operands and results to zero (XLA's CPU, row 4023,
+and TPU), where a packed product's scales are applied in software (`scaled_exactly`, `raised_factor`); every
+other keeps them, its own multiply IEEE's."""
+
 FACTOR_RAISE = 62
-"""The power of two `raised_factor` raises a factor below `2**-FACTOR_RAISE` by: the least subnormal
-(`2**-149`) into the normals (`2**-87`), the largest it raises below 1, so no product of it overflows that the
-factor itself would not."""
+"""The power of two `raised_factor` raises a subnormal factor by: the least (`2**-149`) into the normals
+(`2**-87`), the largest still below `2**-64`, so no product of it overflows that the plain one would not."""
+
+PRODUCT_FLOOR = -100
+"""The binade `scaled_exactly` raises a product below to at least: its residual (24 bits below) still a normal
+float32, so the tie's direction it carries survives a flushing platform."""
+
+
+def flushes() -> bool:
+    """Whether the platform the context places work on flushes float32 subnormals (`FLUSHING`)."""
+    return generation.placed_platform() in FLUSHING
 
 
 def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp32 `factor` as `(raised, k)`, `factor = raised * 2**-k`, exactly: raised by `2**FACTOR_RAISE`
-    from its bits where it lies below `2**-FACTOR_RAISE` (`float_bits.raised_exactly`: a subnormal read as
-    it is, which a process flushing subnormal operands reads as zero, XLA's CPU), as it is elsewhere (`k`
-    0), so a product of it is formed among the normals and lowered once (`scaled_exactly`)."""
+    """An fp32 `factor` as `(raised, k)`, `factor = raised * 2**-k`, exactly: a subnormal one raised by
+    `2**FACTOR_RAISE` from its bits (`float_bits.raised_exactly`) where the platform flushes it (`flushes`),
+    every other as it is (`k` 0), so the int8-row epilogue forms its products among the normals and lowers
+    them by `k` with its rows' shift (`ternary.ternary_weight_product`)."""
     factor = jnp.asarray(factor, jnp.float32)
+    if not flushes():
+        return factor, jnp.zeros(factor.shape, jnp.int32)
     binade = float_bits.binade_of(factor)
-    k = jnp.where((binade < -FACTOR_RAISE) & (binade > -1024), jnp.int32(FACTOR_RAISE), jnp.int32(0))
+    k = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024), jnp.int32(FACTOR_RAISE),
+                  jnp.int32(0))
     return float_bits.raised_exactly(factor, k), k
 
 
 def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
-    raised, k = raised_factor(factor)
-    return float_bits.lowered_rounded(product.astype(jnp.float32) * raised, k)
+    product = product.astype(jnp.float32)
+    factor = jnp.asarray(factor, jnp.float32)
+    if not flushes():
+        return product * factor
+    factor = jnp.broadcast_to(factor, product.shape)
+    # Read from the bits, as a flushing platform's compare of a subnormal with zero reads none.
+    product_binade, factor_binade = float_bits.binade_of(product), float_bits.binade_of(factor)
+    live = (product_binade > -1024) & (factor_binade > -1024)
+    # A subnormal product raised into the normals from its bits, then the factor so their product lies at or
+    # past `PRODUCT_FLOOR`'s binade: the factor never raised past 2**26, the product past 2**-62.
+    tiny = jnp.finfo(jnp.float32).minexp
+    raise_product = jnp.where(live & (product_binade < tiny), FACTOR_RAISE, 0).astype(jnp.int32)
+    raise_factor = jnp.where(live, jnp.clip(PRODUCT_FLOOR - product_binade - raise_product - factor_binade,
+                                            0, None), 0).astype(jnp.int32)
+    k = raise_product + raise_factor
+    high, low = precision.two_product(float_bits.raised_exactly(product, raise_product),
+                                      float_bits.raised_exactly(factor, raise_factor))
+    _, sign, biased, fraction = float_bits.raw_fields(high)
+    biased = biased.astype(jnp.int32)
+    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
+    exponent = jnp.maximum(biased, 1) - 150 - k
+    # The exact product's residual decides a tie at the lowered place, so it rounds once.
+    tail = jnp.where(low == 0, 0, jnp.where((low > 0) == (high > 0), 1, -1)).astype(jnp.int32)
+    top = biased == 0xFF
+    return float_bits.rounded_binary(sign, significand, exponent, jnp.float32, tail=tail,
+                                     last=jnp.maximum(exponent, -149), infinite=top & (fraction == 0),
+                                     nan=top & (fraction != 0))
 
 
 def _scaled_tangent(primals, tangents):
-    product, factor = primals
-    d_product, d_factor = tangents
-    # The product's own derivative, linear in both directions (a higher order's, `linear_map`'s residuals).
-    return _scaled_value(product, factor), (d_product.astype(jnp.float32) * factor
-                                            + product.astype(jnp.float32) * d_factor)
+    (product, factor), (d_product, d_factor) = primals, tangents
+    value = scaled_exactly(product, factor)
+    # Each perturbed operand's term alone (`_Transpose.tangent`'s rule): a factor held still meets no
+    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero.
+    terms = [*(() if isinstance(d_product, SymbolicZero) else (d_product.astype(jnp.float32) * factor,)),
+             *(() if isinstance(d_factor, SymbolicZero) else (product.astype(jnp.float32) * d_factor,))]
+    if not terms:
+        return value, jnp.zeros_like(value)
+    return value, jnp.broadcast_to(functools.reduce(jnp.add, terms), value.shape)
 
 
 scaled_exactly = contracted("test_a_ternary_weight_product_holds_every_order")(
-    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent))
-"""`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: the
-product times the raised factor (`raised_factor`), lowered back and rounded at the result's own place
-(`float_bits.lowered_rounded`), so a subnormal scale (a packed matrix's `2**-127`) or a result below fp32's
-least normal survives a process that flushes them (row 13340); its derivative the plain product's."""
+    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent, symbolic_zeros=True))
+"""`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: where the
+platform flushes subnormals (`flushes`), the product and the factor raised so their product lies among the
+normals, multiplied exactly into a rounded product and its residual (`precision.two_product`), lowered back
+and rounded once at the result's own place, the residual deciding a tie (`float_bits.rounded_binary`), so a
+subnormal scale (a packed matrix's `2**-127`) or a subnormal result survives (row 13340); elsewhere the
+plain multiply. Its derivative is the plain product's, each perturbed operand's term alone."""
 
 
 @dataclasses.dataclass(frozen=True)

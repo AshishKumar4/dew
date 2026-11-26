@@ -75,8 +75,10 @@ class Tail:
         # The tail tile's slot of its first program's partial (`mosaic.Family.fixed_up`'s `firsts`): a slot a
         # tile, which a segment past the tail's tiles (walking none) reads as its last.
         slot = jnp.minimum(jnp.where(whole, 0, tail_tile), self.tiles - 1)
+        # A whole wave's tile is its program's alone, whatever the tail's partitions: a program past them
+        # (idle in the tail, `_partitions`' split) still stores its whole waves' tiles.
         return (jnp.minimum(tile, tiles - 1), start, jnp.maximum(end - start, 0),
-                (first, jnp.minimum(gathered, self.partitions), slot))
+                (first, jnp.where(whole, gathered, jnp.minimum(gathered, self.partitions)), slot))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,10 +138,11 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *, handoff
         return (_rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
                 + 2 * candidate.partials() * partial_bytes / traffic.bandwidth + drift)
 
-    candidates = (Tail(waves, iterations, partitions, steps)
-                  for partitions in _partitions(tail, steps, programs))
-    priced = min(candidates, key=shared)
-    return priced if shared(priced) < _walked(steps, rows, columns, traffic) else None
+    # The cheapest, the first of equal prices (stream-K's), each priced once.
+    price, partitions = min(((shared(Tail(waves, iterations, partitions, steps)), at, partitions)
+                             for at, partitions in enumerate(_partitions(tail, steps, programs))))[::2]
+    return (Tail(waves, iterations, partitions, steps) if price < _walked(steps, rows, columns, traffic)
+            else None)
 
 
 def _partitions(tail: int, steps: int, programs: int) -> tuple[int, ...]:

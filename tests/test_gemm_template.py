@@ -1148,6 +1148,22 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
         assert len(decided) == 1, steps
 
 
+def test_a_tail_split_over_fewer_ranges_than_programs_leaves_each_its_whole_waves():
+    """A balanced tail whose tiles' depth is split alike over fewer ranges than the launch's programs
+    (`tail._partitions`): every program's whole-wave tile is its own, fixed up by it alone (its gathered
+    programs one: the native epilogue stores it), and the programs past the ranges walk no tail step."""
+    from dew.nn.kernels.templates import tail as tail_of
+
+    programs, steps, tiles = 8, 4, 11
+    split = tail_of.Tail(waves=1, iterations=3 * steps, partitions=6, steps=steps)
+    for program in range(programs):
+        tile, start, count, (first, gathered, _) = split.segment((0, program), programs, tiles)
+        assert (int(tile), int(start), int(count)) == (program, 0, steps)
+        assert (int(first), int(gathered)) == (program, program + 1)
+        if program >= split.partitions:
+            assert int(split.segment((1, program), programs, tiles)[2]) == 0
+
+
 BALANCED_TAILS = tuple((*shape, dtype) for shape in ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
                        for dtype in (jnp.bfloat16, jnp.float32) if (*shape, dtype)[2:] != (1408, jnp.float32))
 """Dense kernel gradients' rows, depth, width and dtype whose 11 output tiles leave a Hopper part of 8

@@ -106,6 +106,31 @@ def test_a_ternary_product_at_a_subnormal_scale_keeps_its_values(quantize, colum
                                       err_msg=f"interpret={interpret}")
 
 
+@pytest.mark.parametrize(("quantize", "row", "scale", "want"), [
+    (True, 2.0 ** 127, 2.0 ** -63, 2.0 ** 66), (False, 2.0 ** -65, 2.0 ** -62, 2.0 ** -127)],
+    ids=["int8 rows past the scale's raise", "bf16 rows to a subnormal"])
+def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, row, scale, want):
+    """+1 codes at a normal scale times rows of equal entries: four `2**127` entries quantized to int8 at
+    `2**-63` give `2**66` (the int8 epilogue's order keeps it finite), and one `2**-65`
+    entry unquantized at `2**-62` the subnormal `2**-127` (the scaled product rounds once past a flushing
+    CPU, `factored.scaled_exactly`), on the XLA route and the interpreted Mosaic one."""
+    values = np.zeros((256, 2), np.float32)
+    count = 4 if quantize else 1
+    values[:count] = 1.0
+    weights = formats.TernaryWeights.of(values, scale=np.float32(scale))
+    rows = np.zeros((1, 256), np.float32)
+    rows[0, :count] = row
+    expected = np.full((1, 2), want, np.float32)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = jax.jit(functools.partial(gemm.ternary_weight_product, quantize_activations=quantize,
+                                            out_dtype=jnp.float32, interpret_on_cpu=interpret))(
+                jnp.asarray(rows, jnp.bfloat16), weights)
+        np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32),
+                                      expected.view(np.uint32), err_msg=f"interpret={interpret}")
+
+
 def test_ternary_weight_product_holds_check_1_on_both_routes():
     """`gemm.ternary_weight_product` holds check 1 on both the default XLA and the interpreted Mosaic route
     at a per-column scale (row 1464)."""
