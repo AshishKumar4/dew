@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import SymbolicZero
 import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
@@ -893,25 +894,24 @@ def _ragged_value(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array) ->
     return xla_products.xla_ragged_dot(rows, matrix, group_sizes, preferred_element_type=jnp.float32)
 
 
-def _ragged_forward(rows, matrix, group_sizes):
-    return _ragged_value(rows, matrix, group_sizes), (matrix, group_sizes, rows.dtype)
+def _ragged_tangent(primals, tangents):
+    rows, matrix, group_sizes = primals
+    d_rows = tangents[0]
+    # The rows' direction whole, widening the matrix beside it, at the configured precision, which reverse
+    # mode transposes into the whole cotangent's product (`xla_ragged_dot` multiplies two 16-bit operands at
+    # the default alone, which a TPU's kernel takes at no other); frozen, the matrix moves nothing.
+    tangent = (jnp.zeros((rows.shape[0], matrix.shape[-1]), jnp.float32) if isinstance(d_rows, SymbolicZero)
+               else xla_products.xla_ragged_dot(d_rows.astype(jnp.float32), matrix, group_sizes,
+                                                precision=effective_precision(None),
+                                                preferred_element_type=jnp.float32))
+    return _decoded_ragged_dot(rows, matrix, group_sizes), tangent
 
 
-def _ragged_backward(residuals, cotangent):
-    matrix, group_sizes, dtype = residuals
-    # The cotangent whole, widening the matrix beside it, at the configured precision (`xla_ragged_dot`
-    # multiplies 16-bit operands at the default alone, which a TPU's kernel takes at no other).
-    d_rows = xla_products.xla_ragged_dot(cotangent, jnp.swapaxes(matrix, 1, 2), group_sizes,
-                                         precision=effective_precision(None),
-                                         preferred_element_type=jnp.float32)
-    return d_rows.astype(dtype), jnp.zeros_like(matrix), None
-
-
-_decoded_ragged_dot = contracted("test_a_window_product_holds_every_order")(jax.custom_vjp(_ragged_value))
+_decoded_ragged_dot = contracted("test_a_window_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _ragged_value, _ragged_tangent, symbolic_zeros=True))
 """`decoded_dot`'s grouped product: `xla_products.xla_ragged_dot` (every backend's ragged dot alike, the rows
-past the groups masked), its rows' cotangent the ragged dot of the whole fp32 cotangent at the configured
-precision; frozen, its matrix takes none."""
-_decoded_ragged_dot.defvjp(_ragged_forward, _ragged_backward)
+past the groups masked), its rows' tangent the ragged dot of the whole fp32 direction at the configured
+precision, whose transpose multiplies the whole cotangent; frozen, its matrix takes none."""
 
 
 def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
