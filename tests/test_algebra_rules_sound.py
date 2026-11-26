@@ -730,8 +730,9 @@ def test_every_stated_magnitude_is_at_least_the_tables(name, index, rule):
                     continue
                 made = action.call.args[0]
                 stated = _power(action.rhs, rule, stated_powers, evaluated)
-                operands = [jnp.asarray(np.floor(evaluated.arrays[n]) % 2 if n in counted else evaluated.arrays[n],
-                                        jnp.float32) for n in names]
+                values = [evaluated.arrays[n] for n in names]
+                operands = [jnp.asarray(np.floor(value) % 2 if n in counted else value, jnp.float32)
+                            for n, value in zip(names, values, strict=True)]
 
                 def computed(*values, made=made, names=names, evaluated=evaluated):
                     return Traced(evaluated, dict(zip(names, values, strict=True)),
