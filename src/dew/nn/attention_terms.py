@@ -14,6 +14,7 @@ from jax.typing import DTypeLike
 
 from .binades import balanced, normal
 from .derivatives import Protected, contracted, declared_tangent
+from .float_bits import exact_power2, float_bits
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -117,19 +118,27 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
 
     def moved(residuals, tangent):
         direction, radial_share, ratio, factor, denominator = residuals
-        radial = direction * jnp.sum(direction * tangent, axis=-1, keepdims=True)
-        kept = (tangent - radial) + radial * radial_share
+        # The seed over a power of two `2^m` of its largest (`m` = its binade, held, where past 2^60; else
+        # 0), so its projection's sum stays in range (four seeds 2^127 along a head of four equal channels
+        # sum past the largest), and `2^m` a factor of the gain's product (`binades.balanced`) at the end.
+        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(tangent), axis=-1, keepdims=True))
+        power = jnp.where(normal(largest) & (largest >= 2.0 ** 60), largest, 1)
+        power = exact_power2(jnp.where(power > 1, float_bits(power)[4], 0), tangent.dtype)
+        bounded = tangent / power
+        radial = direction * jnp.sum(direction * bounded, axis=-1, keepdims=True)
+        kept = (bounded - radial) + radial * radial_share
         gain = jnp.minimum(ratio, 1)
-        # A subnormal gain's product over the operands' significands (`binades.balanced`): `kept threshold`
-        # overflows where the result is near one (four channels of 2^127 under 2, a tangent 2^127 across:
-        # row 13169). Each branch's operands held at one where the other is chosen.
-        whole = normal(gain) | ~jnp.isfinite(kept)
-        held = (jnp.where(whole, 1, operand) for operand in (jnp.full_like(denominator, threshold), factor,
-                                                              denominator))
-        threshold_held, factor_held, denominator_held = held
+        # The gain's product, `kept g 2^m`: whole where `g` is normal and the seed was not scaled; else over
+        # the operands' significands (`binades.balanced`), `kept threshold` overflowing where the result is
+        # near one (four channels of 2^127 under 2, a tangent 2^127 across: row 13169). Each branch's
+        # operands held at one where the other is chosen.
+        whole = (normal(gain) & (power == 1)) | ~jnp.isfinite(kept)
+        subnormal = ~normal(gain)
+        operands = (jnp.where(subnormal, threshold, gain), jnp.where(subnormal, factor, 1), power)
+        multipliers = tuple(jnp.where(whole, 1, operand) for operand in operands)
+        divisors = (jnp.where(whole | ~subnormal, 1, denominator),)
         scaled_down = jnp.where(whole, kept * jnp.where(whole, gain, 1),
-                                balanced(jnp.where(whole, 0, kept), (threshold_held, factor_held),
-                                         (denominator_held,)))
+                                balanced(jnp.where(whole, 0, kept), multipliers, divisors))
         return jnp.where(ratio > 1, tangent, scaled_down)
 
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)

@@ -82,7 +82,9 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     and the binades' sum set back last (`_scaled_by`), so no intermediate leaves the range where the result
     does not (`2^-12 * 2^-149 / 2^-140 / 2^-140` is `2^119`, where `2^-12 / 2^-140` overflows and
     `2^-12 * 2^-149` flushes). Each step a product or a division by a significand or an exact power, held
-    constant: exact to the result's range as a map of `value`; its derivatives in the other operands are JAX's
+    constant: kept in the result's range as a map of `value`, rounded once a step (a product, two quotients
+    and the rescale: as many roundings as PyTorch's order, so a result within those ulps of the largest
+    finite value may round past it); its derivatives in the other operands are JAX's
     of this expression, whose terms may leave the range at its edges (row 13232). A float64 subnormal is its
     value only where the backend keeps one."""
     exponent = _binade(value)
