@@ -811,6 +811,19 @@ def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
     return key if rebuilt is None else tuple(rebuilt)
 
 
+def _digest_parameters(equation: jcore.JaxprEqn, opaques: list[Hashable],
+                       descriptor: Callable[[Hashable], int] | None, reject_device: bool) -> Hashable:
+    params = equation.params
+    if descriptor is None:
+        return _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
+    before = len(opaques)
+    parameters_by_name = params.items()
+    ordered = sorted(parameters_by_name) if len(params) > 1 else parameters_by_name
+    key = tuple((name, _collect_opaque(_in_process_param_key(part, reject_device=reject_device), opaques))
+                for name, part in ordered)
+    return descriptor(key) if len(opaques) == before else key
+
+
 def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                  reject_device: bool = False) -> tuple[str, tuple[Hashable, ...]]:
     """Compute `(blake2b_hex, opaques)` for `jaxpr`. With `in_process=True`, executable callables,
@@ -900,20 +913,8 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                     str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis,
                     ctx.no_collectives, ctx.cur_abstract_mesh)), opaques)
             ctx_keys[id(ctx)] = ctx_key
-        params = equation.params
-        params_key: Hashable = ()
-        if params:
-            if in_process:
-                before = len(opaques)
-                parameters_by_name = params.items()
-                ordered = sorted(parameters_by_name) if len(params) > 1 else parameters_by_name
-                params_key = tuple(
-                    (name, _collect_opaque(_in_process_param_key(part, reject_device=reject_device), opaques))
-                    for name, part in ordered)
-                if len(opaques) == before:
-                    params_key = descriptor(params_key)
-            else:
-                params_key = _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
+        params_key = (_digest_parameters(equation, opaques, descriptor if in_process else None, reject_device)
+                      if equation.params else ())
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
         primitive = equation.primitive
         if in_process:
