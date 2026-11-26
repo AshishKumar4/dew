@@ -284,6 +284,32 @@ def _chunk_level_draw(seed, operands):
     inverse = np.linalg.solve(diagonal + identity, identity).astype(system.dtype)
     return system, inverse, np.asarray(level, np.int32)
 
+def _inverse_pullback(lower, cotangent):
+    def issue(_, left, right):
+        return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION,
+                          preferred_element_type=jnp.float32)
+
+    return recurrence_algebra.key_system_back(cotangent, lower, lower.dtype, issue)
+
+
+def _inverse_pullback_truth(lower, cotangent):
+    inverse = jnp.eye(lower.shape[0], dtype=lower.dtype) + lower
+    return jnp.tril(-(inverse.T @ jnp.tril(cotangent, -1)) @ inverse.T, -1)
+
+
+def _inverse_pullback_draw(seed, operands):
+    values, cotangent = _arrays(seed, operands)
+    lower = np.tril(values / (2 * values.shape[0]), -1)
+    if seed % 2:
+        cotangent[np.triu_indices(values.shape[0], 1)] = np.nan
+        np.fill_diagonal(cotangent, np.inf)
+    else:
+        lower[:2], lower[2:, :2] = 0, 0
+        cotangent[:2], cotangent[2:, :2] = 0, 0
+        cotangent[1, 0] = 2.0 ** 127
+    return lower, cotangent
+
+
 
 def _chunk_weighted(lower, values, strengths):
     return recurrence_algebra.weighted("apply_u", lower, values, strengths, _carry_product)
@@ -360,3 +386,6 @@ VALUES_GRADIENT = declare(__name__, "values_gradient", ComponentForm(
     _value_gradient, _value_gradient_truth, dataclasses.replace(
         _cases(*[((q, k), (q, v), (q,), (q,)) for q, k, v in ((32, 64, 128), (64, 128, 256))]),
         draw=_value_gradient_draw)))
+CHUNK_INVERSE_PULLBACK = declare(__name__, "chunk_inverse_pullback", ComponentForm(
+    _inverse_pullback, _inverse_pullback_truth,
+    dataclasses.replace(_cases(*[((c, c), (c, c)) for c in (16, 32, 64)]), draw=_inverse_pullback_draw)))

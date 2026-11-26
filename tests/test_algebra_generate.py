@@ -142,19 +142,26 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
                         seeds=8, truth_fn=whole)
 
 
+def _generated_inverse(system):
+    from dew.algebra.component_cases_derived import chunk_solve_level
+
+    size = system.shape[0]
+    place = jnp.arange(size)
+    identity = jnp.eye(size, dtype=system.dtype)
+    paired = (place[:, None] % 2 == 1) & (place[None, :] == place[:, None] - 1)
+    inverse = identity - jnp.where(paired, system, 0)
+    for level in range(1, size.bit_length() - 1):
+        inverse = chunk_solve_level(system, inverse, jnp.asarray(level, jnp.int32))
+    return inverse - identity
+
+
 @pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
 def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
-    from dew.algebra.component_cases_derived import chunk_solve_level, chunk_weighted
+    from dew.algebra.component_cases_derived import chunk_weighted
     from dew.nn.kernels import recurrence_algebra
 
     def generated(system, values, strengths):
-        place = jnp.arange(size)
-        identity = jnp.eye(size, dtype=system.dtype)
-        paired = (place[:, None] % 2 == 1) & (place[None, :] == place[:, None] - 1)
-        inverse = identity - jnp.where(paired, system, 0)
-        for level in range(1, size.bit_length() - 1):
-            inverse = chunk_solve_level(system, inverse, jnp.asarray(level, jnp.int32))
-        return chunk_weighted(inverse - identity, values, strengths)
+        return chunk_weighted(_generated_inverse(system), values, strengths)
 
     def written(system, values, strengths):
         lower = recurrence_algebra.solved(system, component_cases._carry_product)
@@ -173,6 +180,36 @@ def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_s
         return system, rhs, strength
 
     assert_as_exact(generated, written, draw, "generated recurrence solve and value application",
+                    seeds=8, truth_fn=truth)
+
+
+@pytest.mark.parametrize("size", [16, 32, 64])
+def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
+    from dew.algebra.component_cases_derived import chunk_inverse_pullback
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, cotangent):
+        return chunk_inverse_pullback(_generated_inverse(system), cotangent)
+
+    def written(system, cotangent):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
+
+    def truth(system, cotangent):
+        identity = jnp.eye(size, dtype=system.dtype)
+
+        def solve(a):
+            return jax.lax.linalg.triangular_solve(a, identity, left_side=True, lower=True, unit_diagonal=True)
+
+        _, pull = jax.vjp(solve, system)
+        return pull(jnp.tril(cotangent, -1))[0]
+
+    def draw(seed):
+        system = component_cases._chunk_system(seed, size)
+        cotangent = np.random.default_rng(seed + 23).standard_normal(system.shape).astype(system.dtype)
+        return system, cotangent
+
+    assert_as_exact(generated, written, draw, "generated inverse VJP of a triangular solve",
                     seeds=8, truth_fn=truth)
 
 

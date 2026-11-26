@@ -1367,9 +1367,10 @@ The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat com
 split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents, its
 key-first weight consumer and value-gradient tile, recurrence scores, compensated prefix differences,
 chunk carries and reverse carries with gated keys and queries, the strict-lower solver's shared doubling
-stage and its weighted value application. Recurrence cases include padded tokens and top-binade
-values; the checked stage composes a complete solve. Attention's forward cases include a wholly masked
-tile, empty slices, and a large shared maximum with separate masses. The same writer checks rounded-operand
+stage, weighted value application, and whole-tile inverse adjoint. Recurrence cases include padded tokens
+and top-binade values; the checked stages compose a complete solve and a strict-lower pullback.
+Attention's forward cases include a wholly masked tile, empty slices, and a large shared maximum
+with separate masses. The same writer checks rounded-operand
 forward and tangent bodies and holds every generated case against its own reference.
 Production still uses the trace-time derivations and original surrogates (row 3272).
 
