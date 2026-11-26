@@ -30,7 +30,7 @@ INLINED = frozenset({"pjit", "jit", "closed_call", "core_call"})
 """The call primitives whose body is printed in their place: a call that computes its body, no rule of its
 own (a custom derivative's call is refused, its rule not a value's)."""
 
-IMPORTS = ({"Callable": "from collections.abc import Callable"},
+IMPORTS = ({"functools": "import functools", "Callable": "from collections.abc import Callable"},
            {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": "from jax import lax"},
            {"_generated": "from dew.algebra import _generated", "precision": "from dew.nn import precision"})
 """The imports a printed function or a generated module may read, by the name it reads, in the tree's

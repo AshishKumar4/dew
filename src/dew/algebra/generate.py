@@ -323,8 +323,18 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             emitted[function] = text.replace("def form(", f"def {function}(", 1)
         named[found] = printed_by[found.name, text]
     declared = sorted({found.name for found in chosen})
+    bound: dict[_Chosen, list[str]] = {}
     if all(isinstance(DECLARATIONS[name], ComponentForm) for name in names):
+        wrappers = set(emitted)
         emitted = _component_sharing.shared(emitted, reserved=declared)
+        helpers = set(emitted) - wrappers
+        for found in chosen:
+            args = _component_sharing.bound_call(emitted[named[found]], helpers,
+                                                 tuple(arg.shape for arg in found.operands))
+            if args is not None:
+                bound[found] = args
+        needed = {named[found] for found in chosen if found not in bound}
+        emitted = {name: text for name, text in emitted.items() if name in helpers or name in needed}
     for source in emitted.values():
         body += ["", "", *source.splitlines()]
     for name in declared:
@@ -337,7 +347,13 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             operands = [repr(operand) for operand in case_of(found.operands)]
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"        {named[found]},")
+            binding = bound.get(found)
+            if binding is None:
+                body.append(f"        {named[found]},")
+            elif len(binding) == 1:
+                body.append(f"        {binding[0]},")
+            else:
+                body += printed.wrapped("        functools.partial(", binding, "),")
         body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]

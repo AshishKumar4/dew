@@ -254,3 +254,48 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
             call = printed.wrapped(f"    {assigned}{name}(", list(found.arguments), ")")
             lines = forms[found.name].splitlines()
             forms[found.name] = "\n".join([*lines[:begin], *call, *lines[end:]])
+
+
+def bound_call(source: str, helpers: set[str], shapes: tuple[tuple[int, ...], ...]) -> list[str] | None:
+    """Bind a tail call's known case arguments instead of emitting a redundant wrapper function."""
+    (function,) = ast.parse(source).body
+    assert isinstance(function, ast.FunctionDef)
+    if len(function.body) != 2:
+        return None
+    binding, returned = function.body
+    if (not isinstance(binding, ast.Assign) or not isinstance(returned, ast.Return)
+            or not isinstance(binding.value, ast.Call) or returned.value is None
+            or ast.unparse(binding.targets[0]) != ast.unparse(returned.value)):
+        return None
+    call = binding.value
+    if not isinstance(call.func, ast.Name) or call.func.id not in helpers or call.keywords:
+        return None
+    names = tuple(arg.arg for arg in function.args.args)
+    if tuple(ast.unparse(arg) for arg in call.args[:len(names)]) != names:
+        return None
+    dimensions = dict(zip(names, shapes, strict=True))
+    static = [_static_argument(arg, dimensions) for arg in call.args[len(names):]]
+    if any(value is None for value in static):
+        return None
+    return [call.func.id, *(f"p{index}={value}" for index, value in enumerate(static, len(names)))]
+
+
+def _static_argument(expr: ast.expr, dimensions: dict[str, tuple[int, ...]]) -> str | None:
+    if isinstance(expr, ast.Constant):
+        return repr(expr.value)
+    if isinstance(expr, ast.Tuple):
+        parts = [_static_argument(part, dimensions) for part in expr.elts]
+        if any(part is None for part in parts):
+            return None
+        return f"({', '.join(part for part in parts if part is not None)}{',' if len(parts) == 1 else ''})"
+    if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Attribute) and expr.value.attr == "shape":
+        base = expr.value.value
+        if (isinstance(base, ast.Name) and base.id in dimensions and isinstance(expr.slice, ast.Constant)
+                and type(expr.slice.value) is int):
+            return repr(dimensions[base.id][expr.slice.value])
+    if isinstance(expr, ast.Attribute) and ast.unparse(expr) in ("lax.shift_left_p", "lax.shift_right_logical_p"):
+        return ast.unparse(expr)
+    if (isinstance(expr, ast.Call) and ast.unparse(expr.func) == "jnp.dtype"
+            and len(expr.args) == 1 and isinstance(expr.args[0], ast.Constant)):
+        return ast.unparse(expr)
+    return None

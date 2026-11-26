@@ -689,7 +689,7 @@ def test_half_widening_and_barrier_keep_all_codes_at_their_conversion_boundary()
     with np.errstate(invalid="ignore"):
         expected = half.astype(np.float32).view(np.uint32)
     bits = codes[nan].astype(np.uint32)
-    # The one-op conversion widens all payload bits; the compiled CPU conversion quiets signaling NaNs.
+    # The bind widens every payload bit; compiled CPU execution quiets signaling NaNs.
     expected[nan] = ((bits & 0x8000) << 16) | 0x7f800000 | ((bits & 0x3ff) << 13)
 
     def widen(value):
@@ -697,8 +697,9 @@ def test_half_widening_and_barrier_keep_all_codes_at_their_conversion_boundary()
 
     value, findings = ct.certified(widen, half)
     assert not findings, findings
-    np.testing.assert_array_equal(np.asarray(value).view(np.uint32), expected)
+    np.testing.assert_array_equal(np.asarray(widen(half)).view(np.uint32), expected)
     expected[nan] |= np.uint32(0x400000)
+    np.testing.assert_array_equal(np.asarray(value).view(np.uint32), expected)
     np.testing.assert_array_equal(np.asarray(jax.jit(widen)(half)).view(np.uint32), expected)
     stored, findings = ct.certified(jax.lax.optimization_barrier, half)
     assert not findings, findings
