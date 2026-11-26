@@ -1147,6 +1147,28 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
     assert (cell in attention_kernels.DECLARED) == declared
 
 
+@pytest.mark.parametrize(("rows", "heads", "kv_heads", "dtype", "causal", "declared"), [
+    (1, 32, 8, jnp.bfloat16, True, True), (2, 32, 8, jnp.bfloat16, True, False),
+    (1, 8, 2, jnp.bfloat16, True, False), (1, 32, 8, jnp.float16, True, False),
+    (1, 32, 8, jnp.bfloat16, False, False)],
+    ids=["measured", "two-rows", "8/2", "float16", "full"])
+def test_a_g4s_declared_cell_holds_only_the_call_its_receipt_timed(rows, heads, kv_heads, dtype, causal,
+                                                                    declared):
+    """A call of 4096 tokens, 64 wide, on an RTX PRO 6000, whose cell names FlashAttention-2 for the one
+    call its receipt timed (`attention_kernels.MEASURED`, M-NA-35-prefill-g4: one row, 32 query heads over
+    8, bf16, causal, its forward and its training step): that call is in that cell; another row count,
+    head layout or 16-bit dtype, or a full call (its training untimed), is a cell none declares, which
+    takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((rows, 4096, heads, 64), dtype)
+    key = jax.ShapeDtypeStruct((rows, 4096, kv_heads, 64), dtype)
+    with generation.assumed("sm120"):
+        cell = attention_case(query, key, causal=causal).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
 @pytest.mark.parametrize(("heads", "kv_heads", "declared"), [
     (32, 8, True), (16, 4, True), (32, 32, False), (64, 8, False)], ids=["32/8", "16/4", "mha", "8-group"])
 def test_a_b200s_declared_cell_holds_only_its_receipts_head_layouts(heads, kv_heads, declared):
