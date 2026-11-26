@@ -16,6 +16,19 @@ from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
 from dew.nn.kernels.templates.gemm import tiling
 
 
+@pytest.mark.parametrize(("target", "kernel"), [("sm90", "mosaic"), ("sm80", "xla")])
+def test_a_blockwise_fp8_forward_takes_the_template_where_a_receipt_timed_it(target, kernel):
+    """Unnamed, a blockwise FP8 product's forward takes the template on Hopper, where M-NS-13 timed it far
+    ahead of XLA's arm of the same arithmetic (`gemm.BLOCKWISE_FORWARD_MEASURED`, row 4518), and XLA's arm on
+    a generation no receipt timed; the routes it records say which."""
+    sizes = blockwise_matrix._sizes(1)
+    operands = blockwise_matrix._operands({"columns": "128", "groups": "1"}, 0)
+    with generation.assumed(target), generation.routes() as routes:
+        jax.eval_shape(lambda *ops: gemm.blockwise_fp8_product(*ops[:2], sizes, *ops[2:],
+                                                               out_dtype=jnp.float32), *operands)
+    assert ("blockwise_fp8", kernel) in {(route.choice, route.kernel) for route in routes}
+
+
 @pytest.mark.parametrize("groups", ["1", "4"])
 @pytest.mark.parametrize("columns", ["128", "1"])
 def test_a_blockwise_fp8_product_through_the_template_is_on_par(columns, groups):
