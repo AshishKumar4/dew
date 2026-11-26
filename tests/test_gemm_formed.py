@@ -296,8 +296,8 @@ def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
     x, *kernels, _ = draw(0)
 
     def held_bytes(module) -> int:
-        """The bytes of the arrays `module`'s reverse mode holds (its jitted pullback's leaves of more than one
-        entry: no launch's one-entry table of group sizes)."""
+        """The bytes of the arrays `module`'s reverse mode holds (its jitted pullback's leaves of more than
+        one entry: no launch's one-entry table of group sizes)."""
         _, pull = jax.vjp(jax.jit(applied(module)), x, *kernels)
         return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(pull) if leaf.size > 1)
 
