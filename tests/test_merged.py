@@ -1022,7 +1022,7 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
                                                              template.Kind.KEY),))
 
 
-def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context(monkeypatch):
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
     """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
     batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
     and `launch_work` keys hook pricing on the active JAX trace context, its plan held by what its hook
@@ -1106,19 +1106,22 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
     # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
     # array is planned once for its program, as one that holds none is.
-    planned = []
-    compute = merged._compute_planned_block
-    monkeypatch.setattr(merged, "_compute_planned_block",
-                        lambda *args: planned.append(args) or compute(*args))
     captured = jnp.ones((), jnp.float32)
 
     def closing(o, g):
         return o + g + captured
 
+    def newest():
+        # The plan last read and what holds it: a plan made again is held anew.
+        key = next(reversed(merged._PLANNED))
+        return key, merged._PLANNED[key]
+
+    held = []
     for _ in range(2):
         merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
                            output_mod=closing, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
-    assert len(planned) == 1
+        held.append(newest())
+    assert held[0][0] == held[1][0] and held[0][1] is held[1][1]
     # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; its pricing reads the held plan.
     op_prep = merged.MergedPadded(
         units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
@@ -1127,9 +1130,9 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     with generation.assumed("sm100"):
         ba_prep = op_prep.bind(p_s, s_s, (g_s,))
         op_prep._get_heuristics_config(ba_prep)
-        made = len(planned)
+        made = newest()
         op_prep._get_heuristics_config(ba_prep)
-    assert len(planned) == made
+        assert newest()[0] == made[0] and newest()[1] is made[1]
 
 
 @COMPILES_ON_CPU

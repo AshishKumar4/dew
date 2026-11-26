@@ -538,6 +538,7 @@ def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others
     import model_flows
     import tier_wire
     from arm_store import _unlowered_arm, armed
+    from contract_support import normal_drawn
     from generation_support import node_target
     from reference_error import assert_as_exact
     from truths_ahead import CompiledTruths, arm_role, prepared
@@ -547,10 +548,7 @@ def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others
     def attend(implementation):
         return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation))
 
-    def draw(seed):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        return tuple(jax.random.normal(stream, (1, 128, 2, 64), jnp.bfloat16) for stream in streams)
-
+    draw = normal_drawn(0xC0D, *((1, 128, 2, 64),) * 3, dtype=jnp.bfloat16)
     cudnn, xla = attend("cudnn"), attend("xla")
     label = "cuDNN beside XLA"
     monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
