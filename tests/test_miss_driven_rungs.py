@@ -84,3 +84,62 @@ def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_sho
     assert asked == ([None, "save_dot_except_mlp"] if stack == "plain"
                      else [None, "minimal", "save_dot_except_mlp"]), probes
     assert [probe["fits"] for probe in probes] == [False] * (len(asked) - 1) + [True], probes
+
+
+def test_a_place_past_the_copies_is_asked_after_the_rest_where_what_the_search_measured_predicts_it_short():
+    """Past the narrow copies' climb, a place is predicted short by its remat's shortfall with the copies
+    less what each change it makes freed where the search measured it (`predicted_short`): the 4B GH200
+    start's figures (row 12463, UB-4B-COLDPLAN, GiB), whose search asked 41 places, predict every place it
+    missed at short and its fitting one, save_dot_except_mlp with its head tiled, as fitting; a place whose
+    change no rung measured yet is asked as the ladder orders it."""
+    import flax.linen as nn
+
+    from dew.training.planning import Rung, predicted_short
+
+    remats = {name: (nn.Dense(width),) for width, name in enumerate(
+        ("none", "minimal_with_scan_and_conv", "minimal", "save_dot_except_mlp", "full"), start=1)}
+    tile = (4096, 8192)
+
+    def at(remat: str, *, narrow: bool = True, tiled: bool = False) -> Rung:
+        return Rung(remats[remat], tile if tiled else None, fused=False, xla_defaults=False, narrow=narrow)
+
+    start = at("none")
+
+    measured = [(at("none"), 162), (at("minimal_with_scan_and_conv"), 62), (at("minimal"), 44),
+                (at("save_dot_except_mlp"), 8), (at("full"), 2),
+                (at("none", narrow=False), 158), (at("none", narrow=False, tiled=True), 132)]
+    assert predicted_short(at("minimal", narrow=False, tiled=True), measured, start) > 0
+    assert predicted_short(at("minimal_with_scan_and_conv", narrow=False), measured, start) > 0
+    assert predicted_short(at("save_dot_except_mlp", narrow=False), measured, start) > 0
+    assert predicted_short(at("save_dot_except_mlp", narrow=False, tiled=True), measured, start) <= 0
+    # A change no rung was measured both ways is no prediction: the place is asked in its turn.
+    assert predicted_short(at("minimal", narrow=False, tiled=True), measured[:6], start) is None
+
+
+def test_every_process_defers_a_place_any_predicts_short_and_asks_it_after_the_rest():
+    """Past the narrow copies every process defers a place where any predicts it short (`FitSearch.gather`),
+    so each asks the same place at once, whatever its own room predicts; a deferred place is asked once the
+    rest miss (`FitSearch.past_copies`): here this process predicts nothing, another process predicts the
+    first place short, so both ask the second first and the first after it, which fits."""
+    import flax.linen as nn
+
+    from dew.training.planning import FitSearch, Rung
+
+    model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=1, num_heads=2,
+                         mlp_features=32, max_seq_len=8)
+    first = Rung((nn.Dense(1),), None, fused=False, xla_defaults=False, narrow=False)
+    second = Rung((nn.Dense(2),), None, fused=False, xla_defaults=False, narrow=False)
+    others = iter([True, False, False])
+    search = FitSearch(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
+                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
+                       ns_group=None, base=None, resumed=None, gather=lambda mine: [mine, next(others)])
+    named: list[str] = []
+
+    def ask(rung: Rung, said: str) -> int | None:
+        search.asked.append(rung)
+        named.append(str(len(named)))
+        return 2 if rung == first else None
+
+    assert search.past_copies([first, second], second, named, ask, lambda rung: None) == 2
+    assert search.asked == [second, first]
+

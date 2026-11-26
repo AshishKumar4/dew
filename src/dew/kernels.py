@@ -36,6 +36,7 @@ class Kernels:
     block's alike (`use(Kernels(attention="xla"))`), where a mapping of names held any string a parse never
     checked (api03)."""
 
+    # The kernel choices, written by tools/kernel_choices.py from the selectors: edit none by hand.
     attention: Literal['cudnn', 'flash', 'flash_inference', 'inference', 'reference', 'template', 'tpu',
                        'triton', 'xla'] | None = None
     attention_mainloop: Literal['mosaic', 'portable', 'triton'] | None = None
@@ -69,6 +70,7 @@ class Kernels:
     swiglu: Literal['pallas', 'xla'] | None = None
     syrk: Literal['mosaic', 'xla'] | None = None
     wkv4: Literal['mosaic_gpu', 'xla'] | None = None
+    # End of the kernel choices.
 
     def named(self) -> dict[str, str]:
         """The ops it names and the kernel each runs, those it leaves to their picks omitted."""

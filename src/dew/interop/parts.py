@@ -866,6 +866,17 @@ def _read_shared_moe(view: PartView) -> Mapping[str, object]:
     return {}
 
 
+def _read_gated_shared_moe(view: PartView) -> Mapping[str, object]:
+    """A routed block beside one shared expert its output weighs by `sigmoid(shared_expert_gate(x))`, a
+    bias-free Linear to one scalar a token (Qwen3-Next's, Qwen3.5-MoE's: `Mixture.shared_gate`)."""
+    gate = view.shared_expert_gate
+    if gate.out_features != 1 or gate.bias is not None:
+        biased = ', biased' if gate.bias is not None else ''
+        raise Ambiguous(f"the shared expert's gate maps to {gate.out_features} values{biased}, where Dew's "
+                        "weighs it by one bias-free scalar")
+    return {_LAYER: {'shared_gate': True}}
+
+
 def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
     """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
     width = int(view.gate_proj.out_features)
@@ -1214,7 +1225,7 @@ KNOWN: tuple[KnownPart, ...] = (
           KnownPart('model', f'{module}:{prefix}{"TextModel" if prefix == "Qwen3_5" else "Model"}',
                     _MODEL_CHILDREN, _read_llama_model),
           KnownPart('layer', f'{module}:{prefix}DecoderLayer',
-                    {'linear_attn': ('gated_delta_net',), 'self_attn': ('attention',), 'mlp': ('mlp',),
+                    {'linear_attn': ('gated_delta_net',), 'self_attn': ('attention',), 'mlp': ('mlp', 'moe'),
                      'input_layernorm': ('norm',), 'post_attention_layernorm': ('norm',)}, _read_nothing),
           KnownPart('attention', f'{module}:{prefix}Attention',
                     {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
@@ -1226,6 +1237,12 @@ KNOWN: tuple[KnownPart, ...] = (
           KnownPart('delta_norm', f'{module}:{prefix}RMSNormGated', {}, _read_gated_norm, ('weight',)),
           KnownPart('rotary', f'{module}:{prefix}{"Text" if prefix == "Qwen3_5" else ""}RotaryEmbedding', {},
                     _read_grid_rotary, whole=True))),
+    # Qwen3-Next's routed block: its experts and router Mixtral's and Qwen3-MoE's by code, beside one shared
+    # expert weighted by a learned scalar sigmoid (row 13143).
+    KnownPart('moe', f'{_QWEN3_NEXT}:Qwen3NextSparseMoeBlock',
+              {'gate': ('router',), 'experts': ('experts',), 'shared_expert': ('shared',),
+               'shared_expert_gate': ('linear',)},
+              _read_gated_shared_moe, canonical={'shared_expert': 'shared_experts'}),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -1574,11 +1591,12 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
         width = _records.integer(mixture['expert_features'], 'expert_features')
-        # A router's scores, scaling and correction bias and a block's shared experts, where its parts
-        # state them (DeepSeek's routing, HY-3's).
+        # A router's scores, scaling and correction bias and a block's shared experts and their gate, where
+        # its parts state them (DeepSeek's routing, HY-3's, Qwen3-Next's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
-                                                'groups', 'groups_per_token', 'weight_sum_epsilon',
-                                                'weight_sum_min', 'router_softcap', 'excluded_group_score')
+                                                'shared_gate', 'groups', 'groups_per_token',
+                                                'weight_sum_epsilon', 'weight_sum_min', 'router_softcap',
+                                                'excluded_group_score')
                   if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),

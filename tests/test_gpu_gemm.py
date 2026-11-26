@@ -232,7 +232,7 @@ def _syrk_and_tail_cells():
              fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
         *(Cell(f"an XLA fallback's {product} tangent sums its terms before rounding",
                functools.partial(TANGENT_SUMS, product),
-               "sm90", fault=CUBLAS_BF16,
+               "sm90", fault=CUBLAS_BF16, at_run=EXACT_TANGENT,
                native={"launch": "xla fallback", "pass": f"{product} tangent"})
           for product in ("gemm", "gemm_t")),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
@@ -258,6 +258,15 @@ CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads 
 
 TANGENT_SUMS = declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding
 """The tangent's cancellation check (tests/test_declared_cells_memory.py), run on CUDA's fallback."""
+
+EXACT_TANGENT = "an exact value its run compiles and reads, no check-1 site for a prepare to compile ahead"
+"""Why the fallback's tangent cells run their programs at run (`Cell.at_run`): each asserts one exact
+tangent, bitwise, where a compile-only prepare's program has no device to run on (main f37f47cdf's sm90
+prepare: 'Executable' object has no attribute 'local_devices')."""
+
+EXACT_OVERFLOW = "an exact finite value its run compiles and reads, no check-1 site for a prepare to compile"
+"""Why the blockwise FP8 overflow witness runs at its run (`Cell.at_run`): it asserts one exact value of a
+native launch, which a compile-only prepare's device cannot run (row 13257)."""
 
 CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
 """Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
@@ -294,9 +303,11 @@ def _toolkit_cells() -> list[Cell]:
     ]
 
 
-KERNEL_PARTS = 4
+KERNEL_PARTS = 6
 """The kernels flow's parts (`in_parts`): its prepare alone 164 s warm on a GH200's host (MAINGPU-63d4814e1),
-and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound."""
+and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound; six
+since its native tail and fallback cells, whose sm90 prepare group took 647 s against a 606 s bound
+(row 13037), so a group packs smaller parts under it."""
 
 JOIN_PARTS = 2
 """The join matrix's parts (`in_parts`): its prepare 153 s warm on a GH200's host (MAINGPU-63d4814e1)."""
@@ -341,7 +352,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, jnp.bfloat16, "sm80",
                                  tiling.Tiles(*tile, warpgroups=1, cluster=1, family="mma.sync", programs=2)),
-               "sm80", fault=BALANCED_TAIL)
+               # An A100's cp.async pipelines, which a GPU copying by TMA lowers as another kernel and refuses
+               # (`lowers_as`; main's GH200 tier, rows 13127, 13129, 13130).
+               "sm80", mosaic=True, fault=BALANCED_TAIL)
           for rows, depth, width, tile in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
@@ -351,6 +364,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
+        Cell("a blockwise FP8 product at large finite scales is finite",
+             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",

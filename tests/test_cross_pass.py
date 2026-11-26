@@ -834,3 +834,12 @@ def test_a_watched_merge_reads_its_bank_as_its_sites_do():
     plain = merge.apply(variables, read, bank)
     watched, _ = merge.apply(variables, read, bank, capture_intermediates=True, mutable=["intermediates"])
     np.testing.assert_array_equal(np.asarray(watched), np.asarray(plain))
+
+
+def test_a_positional_spelling_keeps_the_fields_it_named_before_inkling_2s_options():
+    """`CrossPass` spelled by position as before Inkling 2's options (`normalize_message`, `scaled`,
+    `gained`) fills the fields it filled then, its input RMS and epsilon, those options at their defaults
+    (row 13136), where options placed between them took its last values."""
+    positions = (4, 64, True, True, False, 1e-5)
+    assert CrossPass(*positions) == CrossPass(block_size=4, rank=64, additive=True, normalize_values=True,
+                                              scale_by_input_rms=False, norm_eps=1e-5)

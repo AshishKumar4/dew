@@ -55,6 +55,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.product import Support
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
 from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
@@ -1299,19 +1300,28 @@ class Issuer[Accumulator](abc.ABC):
     def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
-        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
-        by an IEEE add."""
+        fp32 sum of its products, scaled by `scale(start, columns, partial)` where given (its columns' scaling
+        of the partial from `start`, which takes the partial so it can order its scales to keep the
+        intermediate normal: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`, row 13257),
+        added into `running` by an IEEE add."""
         rows, columns = running.shape
         fresh = self.product(lhs, rhs, (rows, columns))
-        return running + (fresh if scale is None else fresh * scale(0, columns))
+        return running + (fresh if scale is None else scale(0, columns, fresh))
 
     @abc.abstractmethod
-    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
-                 ) -> Accumulator:
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True,
+                 support: Support | None = None) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
-        done)."""
+        done); of `support`'s terms alone where given, which only an issuer whose instructions each take a
+        tile of their own (`term_tile`) issues, its others refusing it (`whole_products`)."""
+
+    @property
+    def term_tile(self) -> tuple[int, int] | None:
+        """The tile of a product's outputs each of its instructions takes, rows by columns, every thread's
+        share of it issued together, so an instruction skipped is skipped for every thread alike (`products`'
+        `support`); None where its instructions take the whole product at once (a warpgroup's, a CTA's)."""
+        return None
 
     def issued_unless(self, idle: jax.Array, acc, issue: Callable):
         """`issue()`'s accumulator, its products issued only where `idle` (traced, one value across the
@@ -1410,12 +1420,14 @@ class Issuer[Accumulator](abc.ABC):
             return value
         return value[:, first:first + (value.shape[1] - first if columns is None else columns)]
 
-    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
+    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool, *,
+               support: Support | None = None) -> Accumulator:
         """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
         shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
-        (`products`)."""
+        (`products`), of `support`'s terms alone where given (a part of a zero is zero)."""
         for i, j in product.terms(len(left), len(right)):
-            acc = self.products(acc, left[i], right[j])
+            acc = self.products(acc, left[i], right[j]) if support is None else self.products(
+                acc, left[i], right[j], support=support)
         return acc
 
     def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
@@ -2155,6 +2167,13 @@ class Transport[Allocated, Opened](abc.ABC):
         """The semaphores of `shape` a tile's partials are signalled on across programs (`fixed_up`); none
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
+
+
+def whole_products(issuer: Issuer, support: Support | None) -> None:
+    """Refuses a product of a `support` (`Issuer.products`') on `issuer`, whose instructions take
+    its products whole (`Issuer.term_tile` None)."""
+    if support is not None:
+        raise NotImplementedError(f"{type(issuer).__name__} issues its products whole, none of a support")
 
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):

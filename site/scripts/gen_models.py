@@ -111,6 +111,7 @@ WRAPPERS = {
     "mimo_v2": ("MiMo-V2.6", "Images, video, audio"),
     "kimi_k25": ("Kimi K2.5", "Images, video"),
     "kimi_k3": ("Kimi K3", "Images, video"),
+    **dict.fromkeys(("inkling2_loop", "inkling2_loop_text"), ("Inkling 2 Mini", "Images")),
     "qwen2_vl": ("Qwen2-VL", "None yet: its language model alone (`text_only`)"),
     "qwen2_5_vl": ("Qwen2.5-VL", "None yet: its language model alone (`text_only`)"),
     "qwen3_vl": ("Qwen3-VL", "None yet: its language model alone (`text_only`)"),

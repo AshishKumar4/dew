@@ -226,11 +226,31 @@ def stated_digest(lowered: jax.stages.Lowered,
 def taken(lowered: jax.stages.Lowered,
           options: jax.stages.CompilerOptions | None) -> Callable[[], jax.stages.Compiled] | None:
     """The executable a block hands (`taking`) for the program `lowered` is under `options`, by its
-    fingerprint (`program_digest`), None where the block hands none or holds none for it: a program whose
-    trees no file can hold (`stated_digest`) among them."""
+    fingerprint (`program_digest`) on the devices it was lowered over (`placed`), or by its fingerprint
+    alone where it was handed so (a step compiled ahead, loaded onto its run's devices); None where the
+    block hands none or holds none for it: a program whose trees no file can hold (`stated_digest`) among
+    them."""
     if (programs := _TAKEN.get()) is None or (digest := stated_digest(lowered, options)) is None:
         return None
-    return programs.get(digest)
+    return programs.get(placed(digest, lowered_devices(lowered))) or programs.get(digest)
+
+
+def placed(digest: str, devices: Sequence[int] | None) -> str:
+    """A program's fingerprint (`program_digest`) beside the ids of the devices an executable of it runs on,
+    in their order: what a kept executable is handed by (`dew.training.ahead.kept`), as it is loaded onto
+    those devices alone. The fingerprint holds no device, so one program lowered over another device of one
+    target is another executable (row 13168: two one-device placements of a two-device host ran the kept
+    executable of the first on its device)."""
+    return digest if devices is None else f"{digest}@{','.join(map(str, devices))}"
+
+
+def lowered_devices(lowered: jax.stages.Lowered) -> tuple[int, ...] | None:
+    """The ids of the devices `lowered` compiles for, in their order; None where it states none."""
+    from jax._src.interpreters import pxla
+
+    lowering = lowered._lowering
+    devices = lowering._device_list if isinstance(lowering, pxla.MeshComputation) else None
+    return None if devices is None else tuple(device.id for device in devices)
 
 
 @contextlib.contextmanager

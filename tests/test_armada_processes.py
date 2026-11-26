@@ -100,7 +100,7 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
                        "def test_c():\n    ran()\n",
                        recorded=True)
     # Recorded as a blind watch's (no inputs, so no key), its red's epoch and its green's baseline kept.
-    [(_, [recorded_row], *_, opened, _, _, _)] = recorded
+    [(_, [recorded_row], _, _, _, opened, *_)] = recorded
     assert opened is None and recorded_row["name"] == row["name"]
     assert len(set((tmp_path / "pids").read_text().split())) == 3
     assert sorted(row["tests"]) == [f"tests/test_recycled.py::test_{name}" for name in "abc"]

@@ -104,6 +104,18 @@ def _truth(format_: str, groups: int):
                           jnp.float64)
 
 
+def _reference(case: tuple[str, ...]):
+    """A case's reference arm: MXFP8's the decoded operands' whole product at its output dtype (its portable
+    branch sums block by block, `xla_products.exponent_scaled`, which the native kernel's error is not judged
+    against); NVFP4's its own XLA route's."""
+    combination = dict(zip(AXES["mxfp8"], case, strict=True))
+    format_, groups, out_dtype = combination["format"], int(combination["groups"]), combination["out_dtype"]
+    if format_ != "mxfp8":
+        return _product(format_, groups, out_dtype, "xla")
+    decoded = values_product(mx_values, 128 * _blocks(groups))
+    return lambda rows, matrices: decoded(rows, matrices).astype(out_dtype)
+
+
 def values_product(values, sizes, wide=jnp.float32):
     """`run(rows, matrices)`: each group's rows (`sizes` of them) times its matrix, each operand quantized
     to its format's values (`values`: `mx_values`, `nvfp4_values`), summed in `wide` at the highest
@@ -125,8 +137,7 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["mxfp8"], case, strict=True))
     format_, groups, out_dtype = combination["format"], int(combination["groups"]), combination["out_dtype"]
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic")),
-                        jax.jit(_product(format_, groups, out_dtype, "xla")),
+        assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic")), jax.jit(_reference(case)),
                         lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
                         truth_fn=_truth(format_, groups))
     recorded = {(found.choice, found.kernel) for found in routes}

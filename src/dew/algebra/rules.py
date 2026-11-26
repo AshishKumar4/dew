@@ -72,10 +72,24 @@ def same_dtype(params: i64) -> Unit: ...
 def along(params: i64, axis: i64) -> Unit: ...
 
 
+@function(merge=lambda old, new: old)
+def matrix_product(params: i64) -> i64: ...
+"""The RHS kept axis of a plain matrix product with the left columns contracted."""
+
+
 @function
-def matrix_product(params: i64) -> Unit: ...
-"""A product's parameters (`Term.dot`) contracting its left operand's last axis with its right's first, no
-batch, in its operands' dtype (`plain`): `x @ y` of matrices (`matrix`)."""
+def exact_int8_product(term: Term) -> Unit: ...
+"""This short full-fp32 dot, exact on byte casts; a parameter index does not encode its length."""
+
+
+@function
+def int8_values(term: Term) -> Unit: ...
+"""Float32 values obtained by widening intact integer bytes."""
+
+
+@function
+def dyadic_scale(term: Term) -> Unit: ...
+"""Every scale is a positive power of two from 2**-100 through 2**100."""
 
 
 @function
@@ -365,7 +379,7 @@ def _facts() -> Ruleset:
     term, x, y, z = vars_("term x y z", Term)
     shaped, axes, left, right = vars_("shaped axes left right", Vec[i64])
     name, dt = vars_("name dt", String)
-    params = var("params", i64)
+    params, kept = vars_("params kept", i64)
     scalar = Vec[i64].empty()
     return ruleset(
         rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(shaped)).then(
@@ -380,9 +394,9 @@ def _facts() -> Ruleset:
              ).then(set_(shape(term)).to(shaped.remove(axes[i64(0)]))),
         rule(eq(term).to(x.shaped(String("transpose"), params)), eq(left).to(shape(x)),
              eq(left.length()).to(i64(2))).then(set_(shape(term)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
-        rule(eq(term).to(x.dot(y, params)), matrix_product(params), eq(left).to(shape(x)),
+        rule(eq(term).to(x.dot(y, params)), eq(kept).to(matrix_product(params)), eq(left).to(shape(x)),
              eq(right).to(shape(y)), eq(left.length()).to(i64(2)), eq(right.length()).to(i64(2))).then(
-            set_(shape(term)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
+            set_(shape(term)).to(Vec[i64](left[i64(0)], right[kept]))),
         rule(eq(shaped).to(shape(term)), eq(shaped.length()).to(i64(2))).then(matrix(term)),
         # Dtype propagation across every Term constructor (`cost.dtype_of`, row 12974).
         rule(eq(term).to(x.binary(name, y, params)), same_dtype(params), eq(dt).to(dtype(x)),
@@ -567,7 +581,7 @@ def _moved_scales() -> tuple[RuleFamily, ...]:
                 x.dot(before, params), after.dot(y, params))
             # The other operand's extent bound first: a rule's actions look up no function's value.
             moved.append(rule(
-                eq(t).to(written), matrix_product(params), plain(scaled), matrix(x), matrix(y),
+                eq(t).to(written), eq(matrix_product(params)).to(i64(1)), plain(scaled), matrix(x), matrix(y),
                 along(laid, i64(0 if on_left else 1)), eq(extent).to(shape(target)),
                 eq(spread).to(lifted(extent, i64(0 if on_left else 1)))).then(
                 union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(extent)))
@@ -793,30 +807,31 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     product = x.dot(y, params)
     # The scaled product too, which rounds the product before its scale (distributivity's).
     more, scaled_power = product_magnitude(magnitude(s, "s"), ([], power), 0)
-    lifted_by: dict[str, list] = {"row": [], "column": []}
-    for scaled, laid_axis, lift_axis, lift in (
-            (lambda: x.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied).dot(y, params), 1, 0,
-             row_lift),
-            (lambda: s.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).dot(y, params), 1, 0,
-             row_lift),
-            (lambda: x.dot(y.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied), params), 0, 1,
-             column_lift),
-            (lambda: x.dot(s.shaped("broadcast_in_dim", laid).binary("mul", y, multiplied), params), 0, 1,
-             column_lift)):
-        lifted_by["row" if lift is row_lift else "column"].append(rule(
-            eq(t).to(scaled()), matrix_product(params), plain(multiplied), matrix(x), matrix(y),
-            along(laid, i64(laid_axis)), eq(product_extent).to(shape(t)),
-            eq(lift).to(lifted(product_extent, i64(lift_axis))),
-            *contracted, *facts, *dominated(power, "new"), *more, *dominated(scaled_power, "scaled")).then(
-            union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
-            # The lifted broadcast lays the scale over the product's extent: its shape, so it is priced.
-            set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
-            *made(product, power)))
+    lifted_by: tuple[list, list] = ([], [])
+    for kept_axis in (1, 0):
+        proof = () if kept_axis == 1 else (
+            exact_int8_product(t), int8_values(x), int8_values(y), dyadic_scale(s))
+        for lift_axis, laid_axis, lift in ((0, 1, row_lift), (1, 1 - kept_axis, column_lift)):
+            side = s.shaped("broadcast_in_dim", laid)
+            operand = x if lift_axis == 0 else y
+            for scaled_operand in (operand.binary("mul", side, multiplied),
+                                   side.binary("mul", operand, multiplied)):
+                written = scaled_operand.dot(y, params) if lift_axis == 0 else x.dot(scaled_operand, params)
+                lifted_by[lift_axis].append(rule(
+                    eq(t).to(written), eq(matrix_product(params)).to(i64(kept_axis)), *proof,
+                    plain(multiplied), matrix(x), matrix(y), along(laid, i64(laid_axis)),
+                    eq(shape(scaled_operand)).to(shape(operand)),
+                    eq(product_extent).to(shape(t)), eq(lift).to(lifted(product_extent, i64(lift_axis))),
+                    *contracted, *facts, *dominated(power, "new"), *more,
+                    *dominated(scaled_power, "scaled")).then(
+                    union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
+                    set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
+                    *made(product, power)))
     return (
-        RuleFamily("a row scale out of a product", tuple(lifted_by["row"]),
+        RuleFamily("a row scale out of a product", tuple(lifted_by[0]),
                (lambda x, s, y: jnp.dot(x * s[:, None], y.T), lambda x, s, y: jnp.dot(x, y.T) * s[:, None],
                 _ROW_SCALED)),
-        RuleFamily("a column scale out of a product", tuple(lifted_by["column"]),
+        RuleFamily("a column scale out of a product", tuple(lifted_by[1]),
                (lambda x, s, y: jnp.dot(x, (y * s[:, None]).T), lambda x, s, y: jnp.dot(x, y.T) * s[None, :],
                 _ROW_SCALED)))
 

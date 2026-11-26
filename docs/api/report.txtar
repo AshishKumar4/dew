@@ -960,11 +960,11 @@ dew.nn.cross_pass.CrossPass
   rank: int = 64
   additive: bool = True
   normalize_values: bool = True
+  scale_by_input_rms: bool = True
+  norm_eps: float | None = None
+  normalize_message: bool = True
   scaled: bool = False
   gained: bool = True
-  scale_by_input_rms: bool = True
-  normalize_message: bool = True
-  norm_eps: float | None = None
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None
@@ -1452,4 +1452,4 @@ dew.telemetry.records.TrialFinished
   overrides: Mapping[str, JSON]
   value: float
 dew.data.generation.GENERATION_SCHEMA = 2
-dew.training.rungs.RECORD_VERSION = 3
+dew.training.rungs.RECORD_VERSION = 4

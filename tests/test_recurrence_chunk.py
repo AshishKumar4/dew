@@ -236,40 +236,41 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
-         value_heads: int = VALUE_HEADS, value_width: int | None = None) -> tuple[Chunk]:
+         value_heads: int = VALUE_HEADS, value_width: int | None = None, key_heads: int = KEY_HEADS,
+         key_width: int = KEY_WIDTH) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries (of unit
     norm where the hooks declare them), keys and values (`NORMED_WIDTH` wide under the norm), a log decay a
     head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory entering, `length` tokens over
-    `value_heads` value heads, the values `value_width` wide where given, and with `packed` documents
-    starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
-    chunk's first token."""
+    `value_heads` value heads and `key_heads` key heads `key_width` wide, the values `value_width` wide where
+    given, and with `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the
+    second, 48 a chunk's first token."""
     rng = np.random.default_rng(seed)
     normal = np.random.default_rng([seed, 1]).standard_normal
     width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
-    key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
+    key_order, value_order = rng.permutation(key_width), rng.permutation(width)
     turned = {}
     if hooks.turns:
         # A turned state's symmetry: its turned pairs permuted among themselves, each pair's keys adjacent
         # and its turn moved with it, the unturned keys among themselves; a turn of up to 3 radians a token.
         pairs = rng.permutation(hooks.turns)
         key_order = np.concatenate([np.stack([2 * pairs, 2 * pairs + 1], axis=-1).reshape(-1),
-                                    2 * hooks.turns + rng.permutation(KEY_WIDTH - 2 * hooks.turns)])
+                                    2 * hooks.turns + rng.permutation(key_width - 2 * hooks.turns)])
         turn = rng.uniform(-3.0, 3.0, (ROWS, length, value_heads, hooks.turns))
         turned = {'turn': hosted(turn[..., pairs])}
-    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))
+    query = normal((ROWS, length, key_heads, key_width))
     # Unit queries where the hooks declare them (`recurrence.Hooks.unit_queries`, Kimi Linear's l2-normed).
     query = (unit(query) if hooks.unit_queries else query)[..., key_order]
-    key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
+    key = unit(normal((ROWS, length, key_heads, key_width)))[..., key_order]
     value = normal((ROWS, length, value_heads, width))[..., value_order]
     vector = hooks.decay == 'vector'
-    log_decay = -softplus(normal((ROWS, length, value_heads) + ((KEY_WIDTH,) if vector else ())) - 1.0)
+    log_decay = -softplus(normal((ROWS, length, value_heads) + ((key_width,) if vector else ())) - 1.0)
     if vector:
         log_decay = log_decay[..., key_order]
     written = normal((ROWS, length, value_heads))
     beta = sigmoid(written)
     skip = normal((value_heads,))
-    state = (0.3 * normal((ROWS, value_heads, KEY_WIDTH, width)))[:, :, key_order][..., value_order]
+    state = (0.3 * normal((ROWS, value_heads, key_width, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
@@ -285,7 +286,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
-    own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
+    own = {'own': hosted(0.5 * normal((value_heads, key_width))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,

@@ -2,9 +2,10 @@
 its cases, saturated with every rule set dev time runs (`rules.admitted(dev=True)`), its candidates measured
 against its float64 truth on its cases' draws (check 1, `dew.parity.judge`) and the cheapest its policy
 admits chosen (`dew.algebra.error.choose`, §1.5) under each policy, priced for each target; the choices
-written beside the declaring module as ordinary Python (`<module>_derived.py`: plain JAX, no import of
-`dew.algebra`, `printed.source`), headed by the declarations, the sets and their receipts and the egglog
-version. `python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
+written beside the declaring module as ordinary Python (`<module>_derived.py`, `printed.source`). The
+generated module uses only `dew.algebra._generated` for case dispatch, not the registry, rules or
+extractor. Its header names the declarations, rule sets, receipts and egglog version.
+`python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
 where a written module differs, which tests/test_algebra_generate.py runs on every train.
 
 A declaration's choice is the platform's that measures it: the draws are seeded and fixed, so generation is
@@ -25,9 +26,14 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from jax.core import ShapedArray
+from jax.extend import core as jcore
 
 from dew import parity
 from dew.algebra import error, printed, rules
+from dew.algebra._generated import case_of
+from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 
 POLICIES = ("default", "accurate")
 """The precision policies a declaration is generated for (§1.5): under default numerics a candidate is
@@ -37,8 +43,8 @@ TESTS = "tests/test_algebra_generate.py"
 """The suite every generated module is held by: its forms on par with their declarations (check 1) and the
 written module what generation writes (`--check`)."""
 
-DECLARING = ("dew.algebra.acceptance",)
-"""The modules that declare stable forms (`declare`), imported before generation reads `DECLARATIONS`."""
+DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases")
+"""Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +71,16 @@ class StableForm:
 
 
 @dataclasses.dataclass(frozen=True)
+class ComponentForm:
+    """A flat template or surrogate component. The surrounding wrapper, static arguments and initializer
+    stay with their owner. A separate fixture is required for each bound static form."""
+
+    function: Callable
+    truth: Callable
+    cases: Cases
+
+
+@dataclasses.dataclass(frozen=True)
 class Generated:
     """A generated module: the declarations it holds, its path, the suite that holds it (`TESTS`), the rule
     sets and their receipts it was saturated with, and the egglog version."""
@@ -76,11 +92,11 @@ class Generated:
     egglog: str
 
 
-DECLARATIONS: dict[str, StableForm] = {}
-"""Every declared stable form, by its declaring module and name (`declare`)."""
+DECLARATIONS: dict[str, StableForm | ComponentForm] = {}
+"""Generated functions by their declaring module and name (`declare`)."""
 
 
-def declare(module: str, name: str, form: StableForm) -> StableForm:
+def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: Form) -> Form:
     """`form` registered under its declaring `module` and `name`, generated into `<module>_derived.py` as a
     function of that name."""
     DECLARATIONS[f"{module}.{name}"] = form
@@ -128,36 +144,79 @@ def _widened(value) -> jax.Array:
 
 @dataclasses.dataclass(frozen=True)
 class _Chosen:
-    """One generated function: its declaration's name, its policy, target and case, the case's operands, and
-    the candidate chosen."""
+    """One checked source body and its declared dispatch key and return convention."""
 
     name: str
     policy: str
     target: str
     case: int
     operands: tuple[jax.ShapeDtypeStruct, ...]
-    candidate: error.Candidate = dataclasses.field(hash=False, compare=False)
+    body: str = dataclasses.field(hash=False, compare=False)
     single: bool = dataclasses.field(hash=False, compare=False)
     """Whether the declaration returns one array (its form's one output), else a tuple of them."""
 
 
-def _chosen(qualified: str, form: StableForm) -> list[_Chosen]:
-    """Each policy's choice for `form` at each of its cases and targets (`error.choose`)."""
+def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
+    """Stable forms are selected by error and price; components preserve the traced arithmetic."""
     from dew import algebra
 
     name = qualified.rsplit(".", 1)[1]
+    if isinstance(form, ComponentForm):
+        _check_cases(form.cases)
     found = []
     for target in form.cases.targets:
         for case, operands in enumerate(form.cases.operands):
             for policy in form.cases.policies:
                 label = f"{qualified} ({policy}, {target}, {case})"
-                gate = admits(form.function, operands, form.cases, label)
-                with algebra.passes(target=target):
-                    choice = error.choose(form.function, operands, accurate=policy == "accurate",
-                                          saturation=algebra.SATURATION, admits=gate)
-                found.append(_Chosen(name, policy, target, case, operands, choice.chosen,
-                                     _single(form.function, operands)))
+                if isinstance(form, ComponentForm):
+                    single, text = _component(form, operands, policy, target, label)
+                else:
+                    gate = admits(form.function, operands, form.cases, label)
+                    with algebra.passes(target=target):
+                        choice = error.choose(form.function, operands, accurate=policy == "accurate",
+                                              saturation=algebra.SATURATION, admits=gate)
+                    candidate = choice.chosen
+                    single = _single(form.function, operands)
+                    closed = jax.make_jaxpr(candidate.form or candidate.function)(*operands)
+                    text, _ = printed.source(closed, "form", compensated=candidate.compensated)
+                if found and found[0].single != single:
+                    raise ValueError(f"{label}: a declaration must keep its array or tuple result convention")
+                found.append(_Chosen(name, policy, target, case, operands, text, single))
     return found
+
+
+def _check_cases(cases: Cases) -> None:
+    if any(arg.sharding is not None or arg.weak_type for operands in cases.operands for arg in operands):
+        raise printed.Unprintable("a flat component case must be unplaced and strongly typed")
+    for variants in (tuple(map(case_of, cases.operands)), cases.policies, cases.targets):
+        if len(set(variants)) != len(variants):
+            raise ValueError("a component has duplicate dispatch keys")
+
+
+def _component(form: ComponentForm, operands, policy: str, target: str, label: str) -> tuple[bool, str]:
+    from dew import algebra
+
+    with (algebra.passes(target=target),
+          generation.run_precision(Numerics(forms="accurate" if policy == "accurate" else "fast"))):
+        closed, shaped = jax.make_jaxpr(form.function, return_shape=True)(*operands)
+    if closed.effects:
+        raise printed.Unprintable(f"{label}: a component has effects")
+    for atom in (*closed.jaxpr.invars, *closed.jaxpr.outvars):
+        if not isinstance(aval := atom.aval, ShapedArray) or not aval.sharding.mesh.empty:
+            raise printed.Unprintable(f"{label}: a flat component cannot preserve placement")
+    single = _single_result(shaped)
+    text, _ = printed.source(closed, "form", borrow_shapes=True)
+    flat, reference = printed.loaded(text, "form"), jcore.jaxpr_as_fun(closed)
+
+    def arm(fn):
+        def run(*values):
+            output = fn(*values)
+            return output[0] if single else tuple(output)
+        return run
+
+    if not admits(form.truth, operands, form.cases, label)(arm(flat), arm(reference)):
+        raise ValueError(f"{label}: the printed component did not pass Check 1")
+    return single, text
 
 
 def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> str:
@@ -177,44 +236,42 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     named: dict[_Chosen, str] = {}
     printed_by: dict[tuple[str, str], str] = {}
     for found in chosen:
-        form = found.candidate.form or found.candidate.function
-        closed = jax.make_jaxpr(form)(*found.operands)
-        text, _ = printed.source(closed, "form", compensated=found.candidate.compensated)
+        text = found.body
         if (found.name, text) not in printed_by:
             function = f"_{found.name}_{sum(name == found.name for name, _ in printed_by)}"
             printed_by[found.name, text] = function
-            body += ["", "", *printed.source(closed, function, compensated=found.candidate.compensated)[0]
-                     .rstrip("\n").split("\n")]
+            emitted = text.replace("def form(", f"def {function}(", 1)
+            body += ["", "", *emitted.rstrip("\n").split("\n")]
         named[found] = printed_by[found.name, text]
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
         single = own[0].single
-        body += ["", "", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
-                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
-                 "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
-                 "    forms: dict[tuple, Callable[..., tuple]] = {"]
+        policy, target = own[0].policy, own[0].target
+        table = f"_{name}_forms"
+        body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
         for found in own:
-            operands = [repr(operand) for operand in _case(found.operands)]
-            body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
+            operands = [repr(operand) for operand in case_of(found.operands)]
+            body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"            {named[found]},")
-        body += ["    }", f"    return forms[(policy, target, case)](*operands){'[0]' if single else ''}"]
+            body.append(f"        {named[found]},")
+        body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
+                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
+                 f"    return _generated.call({table}, operands, policy, target, single={single})"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
 
 
 def _single(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...]) -> bool:
     """Whether `function` returns one array over `operands`, else a tuple of them; another structure is
     refused, a generated form returning its outputs as a tuple."""
-    shaped = jax.eval_shape(function, *operands)
+    return _single_result(jax.eval_shape(function, *operands))
+
+
+def _single_result(shaped) -> bool:
     if isinstance(shaped, jax.ShapeDtypeStruct):
         return True
     if isinstance(shaped, tuple) and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shaped):
         return False
     raise ValueError(f"a declaration returns an array or a tuple of arrays, not {jax.tree.structure(shaped)}")
-
-
-def _case(operands: tuple[jax.ShapeDtypeStruct, ...]) -> tuple:
-    return tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
 
 
 def _flowed(lines: list[str]) -> list[str]:

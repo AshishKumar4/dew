@@ -562,12 +562,13 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
                 loop.then()
         return state[0], accumulators
 
-    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True, released=None
-                 ) -> Accumulator:
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True, released=None,
+                 support=None) -> Accumulator:
         """`Issuer.products`: the left operand from shared memory, or from tensor memory (an `Accumulator` a
         role wrote, tcgen05's TS form: FlashAttention 4's P·V), the right from shared memory, issued over its
         `topology`'s CTAs; `released`, where given, a barrier the product arrives at once it has read its
         operands (a stage's release, which a walk of its own gives back by it: attention's on Blackwell)."""
+        mosaic.whole_products(self, support)
         mosaic.issuing()
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, released,
@@ -1330,8 +1331,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         found = found if shape[1] >= PADDED else found[:, :shape[1]]
         return found if carried is None or onto else carried + found
 
-    def products(self, acc: Accumulator | jax.Array, lhs, rhs, *, accumulate: bool = True
+    def products(self, acc: Accumulator | jax.Array, lhs, rhs, *, accumulate: bool = True, support=None
                  ) -> Accumulator | jax.Array:
+        mosaic.whole_products(self, support)
         if not isinstance(acc, Accumulator):
             # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
             return self._summed((acc.shape[0], acc.shape[1]), lambda fresh: self.products(fresh, lhs, rhs),

@@ -342,6 +342,10 @@ def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
     mixed_work = program.priced(mixed, hopper).work
     assert (mixed_work.conversions, mixed_work.exponentials, mixed_work.operations) == (
         2 * elements, elements, 6 * elements)
+    reciprocal = jax.make_jaxpr(lambda x: jax.lax.integer_pow(x.astype(jnp.float32), -1))(narrow).jaxpr
+    reciprocal_work = program.priced(reciprocal, hopper).work
+    assert (reciprocal_work.conversions, reciprocal_work.exponentials, reciprocal_work.operations) == (
+        elements, elements, 6 * elements)
     # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
     # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
     assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)

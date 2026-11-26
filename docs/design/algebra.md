@@ -22,25 +22,22 @@ the program a user composed, including its autodiff output. Nothing runs at runt
 
 ### 1.1 Two modes
 
-**The dev-time mode** (§6.11) generates stable numeric forms (`StableForm`), the first of them §1.5's
-acceptance cases (`dew.algebra.acceptance`, rows 9035 and 9037). A template's derived forms still run at
-trace time (`derive`, `scan`: built where a template calls them), and a surrogate's bodies are traced where
-they are declared: neither is generated yet.
+**The dev-time mode** (§6.11) generates stable numeric forms (`StableForm`, including §1.5's acceptance
+cases) and checks flat component pilots. Production still derives a template's forms at trace time and
+traces each surrogate's written bodies, not its pilot's generated functions.
 
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
-| Dev time | `python -m dew.algebra.generate` | registered `StableForm` declarations and cases | dev-time rules, with sampled error (§1.5) | checked-in Python modules with a shared accuracy and regeneration suite |
+| Dev time | `python -m dew.algebra.generate` | stable forms and flat component pilots | search and sample stable forms; check components as written (§1.5) | checked-in modules with a shared accuracy and regeneration suite |
 | Dev time (planned) | the same generator, as a declaration changes | template reduction and scan declarations, and the two bodies of a declared surrogate | dev-time rules with the family's independent accuracy and performance gates | checked-in Python and its Check 1, Check 2 and regeneration coverage (§6.11) |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
-- **Dev time** generates stable forms registered with `declare`. The generator writes `*_derived.py`
-  beside the declaring module, with a header naming the declarations, rule sets and egglog version.
-  `tests/test_algebra_generate.py` checks each generated function against the declaration in float64 and
-  runs `generate(check=True)` on the recorded platform. Changes to a rule or declaration show up as a
-  reviewed diff. Template algebra and surrogate gradients remain part of the dev-time design: a
-  template's forward and backward tiles, online step and combine, and a surrogate's two bodies will
-  be generated when those families are adopted (rows 3272, 6109). Today they trace where they are used.
+- **Dev time** generates stable forms and checked component pilots registered with `declare`. The
+  generator writes `*_derived.py` beside the declaring module. `tests/test_algebra_generate.py` checks
+  each function against independent truth and regenerates on the recorded platform. The recurrence score
+  tile and rounded-operand bodies do not replace production forms. Forward and backward template tiles,
+  online step and combine, and surrogate cutover remain measured work (rows 3272, 6109).
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -144,11 +141,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
 
 ### 1.4 Facts and rules
 
-- **Facts about each value** (e-class analyses): its shape, and a bound on its magnitude where the program
-  proves one (§6.3). Its dtype and parameters are the region's tables (`terms.Region`). Constant and sharded
-  axes and a rounding class per value are not built: a hoisting rule reads a broadcast's laid axes, no price
-  reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
-  as a fact (§1.5).
+- **Facts about each value** (e-class analyses): shape, scalar dtype, and magnitude where the program
+  proves it (§6.3). The region's traced types and parameter table seed dtype propagation (§6.3).
+  Constant and sharded axes and a rounding class per value are not built: a hoisting rule reads a
+  broadcast's laid axes, no price reads a link, and a rule set states its rounding class (§6.4).
+  Error is measured per candidate, never held as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): join sums of floating counts when their partial
     counts fit the dtype exactly (`joined`); keep ordinary rounded reductions separate (row 13161).
@@ -158,6 +155,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
     comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
     attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
+    The direct transposed byte product distinguishes the RHS kept axis. It lifts a positive dyadic
+    scale only over exact byte casts and full float32 accumulation with at most 256 contracted entries
+    (row 13172): every integer partial sum fits, and the shift stays normal for each nonzero term.
+    The enclosing proof follows literal scales through broadcasts and selection. Arbitrary scales,
+    unproven modes and explicit/manual placements do not take this transposed rewrite.
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
     a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
     simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
@@ -342,6 +344,11 @@ fitted to them, and a rule set ships only with measured receipts.
   The paired form and the products apart are its comparisons. At model width, check the output and the
   input and three weight cotangents against float64 truth; a target uses a fused form by default only on
   native parity or better and with timing separated from the session's A/A noise where a gain is claimed.
+  For the decode launch-control experiment (row 6107), `decode_regions` reports a dense gate/up/down
+  region around a gated activation when the two projections share their row input and the intermediate
+  values have no other reader. It rejects mixed equation contexts and any intervening effects. The report
+  does not replace the dots, cross a rematerialization name, or choose a launch. Compare it with the
+  command-buffer baseline in M-AL-3 before using it to select a generated decode kernel.
 - **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
   attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is
   proven to compute that call, by its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each
@@ -1344,9 +1351,12 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-The registry covers stable forms (`StableForm`, rows 9035 and 9037), including §1.5's acceptance cases
-(`dew.algebra.acceptance`). Template reductions and scans still derive their forms at trace time;
-surrogate bodies trace at their declaration. Generating those families remains parked (row 3272).
+The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
+(`ComponentForm`, rows 6109 and 6110). The component pilots cover attention backward's masked
+query-first cotangents and its key-first weight consumer, recurrence scores and compensated prefix
+differences, and two shapes of rounded-operand forward and tangent bodies. One `--check` writer holds
+all cases against their own references. Production still uses the trace-time derivations and original
+surrogates (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1370,34 +1380,60 @@ class StableForm:                     # a numeric function of Dew's own
     function: Callable                # its math as written: the form as written and, at float64, the truth
     cases: Cases
 
-DECLARATIONS: dict[str, StableForm]  # each key is the declaring module and function name
+DECLARATIONS: dict[str, StableForm | ComponentForm]
 
-def declare(module: str, name: str, form: StableForm) -> StableForm: ...
+def declare(module: str, name: str, form: StableForm | ComponentForm): ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
-**Planned families (row 3272).** The same registry will accept a template's `Declaration` (a
-`Reduction` or `Scan`) and `SurrogateBodies` (row 3271). A surrogate declaration records its
-`forward` and `derivative` callables and their `Cases`; generation optimizes each body independently,
-never replaces the declared derivative with autodiff of the forward. Template generation emits the
-forward/backward tiled forms and their step, merge and finish as ordinary Python. Both families will
-emit checked-in modules with a gate site for every served case and deterministic `--check` regeneration;
-replacing an existing form requires the accuracy and efficiency bars in §4. Neither family is registered
-in the built `dict[str, StableForm]` yet.
+**Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
+its independent reference and its cases. The shared registry emits it without substituting an autodiff or
+lower-price implementation. Larger template and surrogate declarations will group such components and
+their trees and flags. The pilots add no run-time dispatch to the algebra engine.
 
-- `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
-  saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
-  error on its cases' draws against the declaration at float64 (check 1, `dew.parity.judge`: the gate's one
-  implementation), extracts per §1.5 under each policy the cases name (`dew.algebra.error.choose`), priced
-  for each target, and writes the module, one function a declaration picking its form by policy, target and
-  its operands' case. The suite that holds every generated module is one hand-written file
-  (`tests/test_algebra_generate.py`, `Generated.tests`): each form's check 1 site against its declaration.
+- **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
+  operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
+  order. Print value-taking components of `forms.Derived` (prepare, step, merge, finish, mapped, and
+  backward where present) over a flat array signature. The wrapper restores the named state and operand
+  trees. The existing initializer still owns the actual slot values, including reduction floors and
+  corrected scans' identity matrices; slot metadata records their order and types. For a template with
+  a product issuer, emit its pure factors and finish expressions; the template still owns the dot, tile
+  schedule and accumulation callbacks. A callback that cannot be separated from its math is not a
+  printable case. Declared reduction backward tiles use their own declarations; scan
+  backward retains its incoming state, output cotangent and outgoing state cotangent inputs. Do not use a
+  derivative of the generated forward in place of either.
+- **Surrogates.** A `SurrogateBodies` entry names the forward and tangent bodies passed to
+  `dew.nn.derivatives.surrogate`, their separate cases and their nondifferentiable arguments. A tangent
+  component traces over primals, active tangents and the original forward value; the case key includes
+  static arguments and which tangents are symbolic zeros. Generate each body against its own reference.
+  The existing surrogate wrapper still supplies the value dependency at higher orders and reassembles
+  the original PyTree. Hold tangent linearity and forward/reverse and higher-order behavior through that
+  wrapper. `dew.nn.precision.rounded_operand` is the first consumer: the value preserves its rounding
+  barrier; the derivative remains the input tangent, including after another differentiation.
+- **Admission and cutover.** Use the existing `printed.source` and reject effects, unprintable
+  primitives, or a changed component's state layout, output tree or placed types. Key by component, target,
+  precision policy, operand shapes and dtypes, and only the declared static flags that change its program.
+  Unknown cases continue through the current implementation; a named case not generated is a regeneration
+  error. Stage one of the ordinary attention reduction cells from M-ET-85 first: compare two different
+  tilings, an online walk and a merged walk, and all backward outputs with the trace-time and independent
+  float64 references. Then run Check 1 and Check 2 at the real launch, and compare latency and memory
+  against the existing template on the same device before activating it (§4). The checked-in module,
+  typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
+  no replacement. Production integration of later components needs those receipts, not just a generated file.
+
+- `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it
+  saturates with the dev-time sets, measures error against the declaration at float64 and selects
+  by accuracy and price (`dew.algebra.error.choose`). For a component it checks the printed arithmetic
+  against the traced form and its declared reference, without searching for an alternative form. The
+  shared writer emits one function per declaration, keyed by policy, target and operand shapes and
+  dtypes. `tests/test_algebra_generate.py` holds Check 1 and checks regeneration in both processes.
 - The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
   parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
-  measured, a compensated form's sums through `dew.nn.precision`, with no import of `dew.algebra`, linted
-  and typed as any module, and a header naming the declarations, the sets, their receipts and the egglog
-  version. Nothing of the engine is imported at runtime. A program with an equation no plain call writes (a
-  custom derivative's call) is refused.
+  measured, with a compensated form's sums through `dew.nn.precision`. Its only Algebra-package
+  dependency is `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
+  target without importing the registry, rules or extractor. Generated modules are linted and typed
+  as usual; their headers name the declarations, rule sets, receipts and egglog version. The writer
+  refuses equations it cannot print as plain calls, such as a call with a custom derivative rule.
 - `--check` regenerates in memory and fails where the checked-in output differs; it runs as a test
   (`generate(check=True)`) on every train, so a changed rule, chooser or declaration lands as a reviewed diff of
   generated code, with no step of the lint lane's own.

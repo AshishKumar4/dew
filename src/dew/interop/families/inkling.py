@@ -39,12 +39,14 @@ from dew.interop.config_records import HF_METADATA, native_fields
 from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     IGNORED_FIELDS,
+    NO_AUDIO,
     SERIALIZED_TEXT_FIELDS,
     DecoderFamily,
     DecoderFields,
     KindFields,
     Leaves,
     MixtureFields,
+    WrapperFields,
     context_lengths,
     record_float,
     record_int,
@@ -52,6 +54,7 @@ from dew.interop.decoder_parts import (
     spelled,
 )
 from dew.interop.layouts import Renames, Route, Slot, Table
+from dew.interop.towers.inkling import translate_inkling_projector_config, translate_inkling_vision_config
 from dew.interop.unread import Stored
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
@@ -389,6 +392,30 @@ def _message_queries(queries: Stored, tensors: Mapping[str, Stored], config: Map
     return placed
 
 
+def _inkling2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read Inkling 2's release whole (`inkling2_loop`, Inkling2LoopForConditionalGeneration at transformers
+    3a96649): its text decoder (`model.llm.`), its vision trunk (`model.visual.backbone.`) and merger
+    (`model.visual.proj_in`, `proj_out`). Each image's merged patches fill its `image_token_id`
+    placeholders in order, each token one position on (Inkling2LoopModel.forward, its positions a plain
+    count). The multi-token-prediction draft (`mtp_config`, the release's `mtp.safetensors`) is no model of
+    this bundle's."""
+    text = _inkling2_config(hf_config, used)
+    width = record_int(text, 'emb_features')
+    vision = bool(hf_config.get('vision_config'))
+    used.update(('image_token_id', 'vision_config'))
+    return {'model_type': 'inkling2_loop', 'text_model_type': 'inkling2_loop', 'text': text,
+            'tower': translate_inkling_vision_config(hf_config) if vision else None,
+            'projector': translate_inkling_projector_config(hf_config, width) if vision else None,
+            'image_token_id': (_records.integer(hf_config.get('image_token_id', IMAGE_TOKEN),
+                                                'image_token_id') if vision else None),
+            'tokens_per_image': None, 'video_token_id': None, 'extra_placeholder_ids': (),
+            'text_unprefixed': ('llm.',), **NO_AUDIO}
+
+
+IMAGE_TOKEN = 200054
+"""The id of an image's placeholders, Inkling2LoopConfig's default (`<|unused_200054|>`)."""
+
+
 INKLING2 = DecoderFamily(
     ('inkling2_loop', 'inkling2_loop_text'),
     read_only(_inkling2_config, "Inkling 2 is read from its release alone; no model matches it on export"),
@@ -398,5 +425,7 @@ INKLING2 = DecoderFamily(
     routes=_ROUTES,
     prepare=_inkling2_prepare,
     preserve_source_layout=True,
+    wrapper=_inkling2_wrapper,
 )
-"""Inkling 2 (`inkling2_loop`): the release's text decoder, its wrapper's or alone."""
+"""Inkling 2 (`inkling2_loop`): the release's text decoder, its wrapper's or alone, and the wrapper's
+vision tower and merger (`_inkling2_wrapper`)."""

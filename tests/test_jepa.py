@@ -473,6 +473,49 @@ def test_representation_health_is_the_float64_statistics():
     assert all(float(collapsed[name].mean()[0]) < 1e-6 for name in ("repr_std", "repr_cov_offdiag"))
 
 
+def test_representation_health_counts_no_row_filling_a_batch():
+    """A batch's collapse measures over its real rows (`Objective.real_rows`), a repeat filling it marked
+    out (`VALID_ROWS`), are those of its real rows alone, whatever the filler holds (a NaN too), to check 1's
+    gates against numpy's float64 statistics of the real rows (the 2026-11-26 audit, where the filler's rows
+    moved both); the moments count the real rows exactly, a part of filler alone none, and microbatches of
+    filler alone pooled before the real rows read as the real rows do."""
+    from dew.objectives.base import Moments
+
+    def filled(z):
+        """`z`'s first 24 rows, then 8 rows of NaN filler marked out."""
+        return np.concatenate([z[:24], np.full((8, z.shape[1]), np.nan, np.float32)])
+
+    def marked(z):
+        health = representation_health(jnp.asarray(z), jnp.arange(32) < 24)
+        return jnp.stack([health[name].mean()[0] for name in ("repr_std", "repr_cov_offdiag")])
+
+    def pooled(z):
+        empty = representation_health(jnp.asarray(z[24:]), jnp.zeros(8, bool))
+        alone = representation_health(jnp.asarray(z[:24]))
+        return jnp.stack([Moments.pooled([empty[name], empty[name], alone[name]]).mean()[0]
+                          for name in ("repr_std", "repr_cov_offdiag")])
+
+    def draw(seed):
+        return (filled(redundant_embeddings(seed)[0]),)
+
+    truth = as_given(lambda z: health_in(z[:24], z.dtype))
+    assert_as_exact(jax.jit(marked), truth, draw, "representation health over marked rows",
+                    seeds=HEALTH_SEEDS)
+    assert_as_exact(jax.jit(pooled), truth, draw, "representation health pooled past filler",
+                    seeds=HEALTH_SEEDS)
+    (z,) = draw(0)
+    counted = representation_health(jnp.asarray(z), jnp.arange(32) < 24)
+    empty = representation_health(jnp.asarray(z[24:]), jnp.zeros(8, bool))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        assert int(counted[name].count.sum()) == 24 and int(empty[name].count.sum()) == 0, name
+    # An empty part beside one real row of a magnitude whose square overflows, either order: the row's
+    # spread, zero, where the empty part's center left an infinite correction weighed by none.
+    large = representation_health(jnp.full((1, z.shape[1]), 2.0 ** 70, jnp.float32))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        for parts in ([empty[name], large[name]], [large[name], empty[name]]):
+            assert float(Moments.pooled(parts).mean()[0]) == 0.0, name
+
+
 # --- EMA target encoder ----------------------------------------------------
 
 def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):

@@ -1812,6 +1812,11 @@ def recording(path) -> dict[str, np.ndarray]:
     return {name: value.copy() for name, value in _read_recording(str(path)).items()}
 
 
+def recorded_names(path) -> frozenset[str]:
+    """The arrays a recording (`recording`) holds, by name: read once a process, none copied."""
+    return frozenset(_read_recording(str(path)))
+
+
 @functools.cache
 def _read_recording(path: str) -> dict[str, np.ndarray]:
     from tool_support import load
