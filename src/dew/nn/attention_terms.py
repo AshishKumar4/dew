@@ -37,15 +37,17 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     `threshold` (`QKClip`), in at least fp32 and returned in `x`'s dtype."""
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
-    # A head past 2^(maxexp/2), whose squares can overflow (1e20's is fp32's infinity, row 13137), is scaled
-    # by `s` = 2^-(maxexp/2 + 6) first, a power of two whose reciprocal is normal: the clip is then
-    # `y * min(threshold / (|y| + eps s), 1 / s)` of `y = x s`, which is `x * min(threshold / (|x| + eps), 1)`
-    # with no reciprocal of the head's size (XLA turns a division by it into a product by its reciprocal,
-    # subnormal past 2^126 in fp32 and flushed to zero). `s` is held constant (`stop_gradient`): the clip is
-    # the same at either, and so its derivative.
-    half = jnp.finfo(wide).maxexp // 2
+    # A head past 2^cut, `cut` = (maxexp - bits(D)) // 2 - 1, whose D squares' sum can overflow (1e20's square
+    # is fp32's infinity, row 13137), is scaled by `s` = 2^(cut - maxexp) first, so its largest is at most
+    # 2^cut: a power of two whose reciprocal is normal. The clip is then `y * min(threshold / (|y| + eps s),
+    # 1 / s)` of `y = x s`, which is `x * min(threshold / (|x| + eps), 1)` with no reciprocal of the head's
+    # size (XLA turns a division by it into a product by its reciprocal, subnormal past 2^126 in fp32 and
+    # flushed to zero). `s` is held constant (`stop_gradient`): the clip is the same at either, and so its
+    # derivative; a head within 2^cut takes `s` = 1, its arithmetic unchanged.
+    maxexp = jnp.finfo(wide).maxexp
+    cut = (maxexp - x.shape[-1].bit_length()) // 2 - 1
     largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x_wide), axis=-1, keepdims=True))
-    factor = jnp.where(largest > 2.0 ** half, jnp.asarray(2.0 ** -(half + 6), wide), jnp.asarray(1, wide))
+    factor = jnp.where(largest > 2.0 ** cut, jnp.asarray(2.0 ** (cut - maxexp), wide), jnp.asarray(1, wide))
     scaled = x_wide * factor
     squared = jnp.sum(jnp.square(scaled), axis=-1, keepdims=True)
     # A zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's

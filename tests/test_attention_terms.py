@@ -124,18 +124,20 @@ def test_a_zero_head_passes_its_gradient_through_the_clip():
 
 
 def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold():
-    """Heads of one fp32 component 2^66 or -2^127, whose squares overflow fp32 (the second's reciprocal is
-    subnormal too), clip to length 8 along it, `[8, 0, ...]` and `[-8, 0, ...]` bit for bit (powers of two,
-    which the clip's arithmetic keeps exact), with a finite gradient, where their summed squares' infinity
-    clipped them to zero (row 13137)."""
+    """fp32 heads of eight whose squares' sum overflows, one component 2^66 or -2^127 (whose reciprocal is
+    subnormal too) or four of 2^63, and four of 2^61 just inside the bound past which the clip prescales,
+    clip to length 8 along themselves, bit for bit (powers of two, which the clip's arithmetic keeps exact),
+    with a finite gradient, where their summed squares' infinity clipped the first three to zero (row
+    13137)."""
     from dew.nn.attention_terms import clipped
 
-    x = jnp.zeros((2, 8), jnp.float32).at[0, 0].set(2.0 ** 66).at[1, 3].set(-(2.0 ** 127))
-    out, pull = jax.vjp(lambda x: clipped(x, 8.0, 1e-6), x)
-    expected = np.zeros((2, 8), np.float32)
-    expected[0, 0], expected[1, 3] = 8, -8
+    x = np.zeros((4, 8), np.float32)
+    x[0, 0], x[1, 3], x[2, :4], x[3, 4:] = 2.0 ** 66, -(2.0 ** 127), 2.0 ** 63, 2.0 ** 61
+    out, pull = jax.vjp(lambda x: clipped(x, 8.0, 1e-6), jnp.asarray(x))
+    expected = np.zeros((4, 8), np.float32)
+    expected[0, 0], expected[1, 3], expected[2, :4], expected[3, 4:] = 8, -8, 4, 4
     np.testing.assert_array_equal(np.asarray(out), expected)
-    (gradient,) = pull(jnp.arange(16, dtype=jnp.float32).reshape(2, 8))
+    (gradient,) = pull(jnp.arange(32, dtype=jnp.float32).reshape(4, 8))
     assert bool(jnp.all(jnp.isfinite(gradient)))
 
 

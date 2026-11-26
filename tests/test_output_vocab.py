@@ -126,3 +126,39 @@ def test_an_unscored_column_enters_no_product_of_a_bf16_models_head(tied):
     assert logits.shape[-1] == SCORED and bool(jnp.all(jnp.isfinite(gradient)))
     np.testing.assert_array_equal(np.asarray(logits, np.float32), np.asarray(zero_logits, np.float32))
     np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.asarray(zero_gradient, np.float32))
+
+
+def test_a_narrow_heads_call_keeps_its_adapters_its_watchers_and_its_promotion():
+    """An untied head scoring 48 of its 64 columns: under an adapter set adapting it (`dew.lora.AdapterSet`,
+    each row its own adapter), a capture of its call (`capture_intermediates`), and over states of a dtype
+    other than the model's (bf16 into a float32 model, promoted as its layer promotes them), its logits are,
+    bit for bit, the full head's first 48 under the same, and the capture sees its call (row 13135's
+    review: the scored product runs where nothing else takes or watches the head's call)."""
+    from dew.lora import AdapterSet, LoRA
+
+    narrow, full = _decoder(tied=False, output_vocab=SCORED), _decoder(tied=False)
+    rng = np.random.default_rng(0x0B4)
+    ids = jnp.asarray(rng.integers(1, SCORED, (2, 9)), jnp.int32)
+    variables = nn.unbox(full.init(jax.random.key(0), ids))
+
+    def drawn(model, key):
+        adapter = LoRA(rank=2, modules=("lm_head",)).apply(model, variables, key=key)
+        params = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (jax.random.normal(jax.random.key(key), leaf.shape, leaf.dtype)
+                                if jax.tree_util.keystr(path).endswith("'lora_B']") else leaf),
+            adapter.variables["params"])
+        return dataclasses.replace(adapter, variables={**adapter.variables, "params": params})
+
+    rows = jnp.asarray([0, 1], jnp.int32)
+    narrow_set, full_set = (AdapterSet.of({"first": drawn(model, 1), "second": drawn(model, 2)})
+                            for model in (narrow, full))
+    np.testing.assert_array_equal(
+        np.asarray(narrow_set.model.apply(narrow_set.variables, ids, adapters=rows)),
+        np.asarray(full_set.model.apply(full_set.variables, ids, adapters=rows))[..., :SCORED])
+    logits, state = narrow.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
+    assert "lm_head" in state["intermediates"]
+    np.testing.assert_array_equal(np.asarray(logits), np.asarray(full.apply(variables, ids))[..., :SCORED])
+    hidden = jnp.asarray(rng.normal(size=(2, 9, TINY_DECODER["emb_features"])), jnp.bfloat16)
+    np.testing.assert_array_equal(
+        np.asarray(narrow.apply(variables, hidden, method="logits_from_hidden")),
+        np.asarray(full.apply(variables, hidden, method="logits_from_hidden"))[..., :SCORED])
