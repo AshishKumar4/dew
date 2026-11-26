@@ -59,7 +59,7 @@ from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import base, copies
 from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
-from .templates.product import SCALE_DEPTH, Product, eight
+from .templates.product import NVFP4, SCALE_DEPTH, Product, eight
 
 if TYPE_CHECKING:
     import tokamax
@@ -451,11 +451,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         del ba
         return None
 
-    def _derived(self, ba, target, admits=None, *, programs: int | None = None) -> tiling.Tiles | None:
+    def _derived(self, ba, target, admits=None, *, programs: int | None = None,
+                 operands: Callable | None = None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
-        run partial (`_partial_axes`)."""
+        run partial (`_partial_axes`); its tiles priced by `operands` where given (a swapped binding's by
+        the call's own swapped walk: `MosaicGmm._tile`), else `ba`'s (`_priced_operands`)."""
         from .templates.gemm import derivation, hooks, quantized
 
         # A compile's refusals are the call's own (`report.refuse_launch` of its bound arguments), read so
@@ -484,7 +486,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       outputs=_stored_dtypes(ba),
                                       hooked=(hooks.column_local(ba.arguments['hooks'].epilogue)
                                               and not ba.arguments['hooks'].out_forms),
-                                      operands=self._priced_operands(ba))
+                                      operands=self._priced_operands(ba) if operands is None else operands)
             if tile is not None:
                 return formed(tile)
         return None
@@ -1081,8 +1083,10 @@ class MosaicGmm(_Mosaic):
                         and (split := self._decode_split(ba, alt, target)) is not None):
                     candidates.append(split)
         swapped = self._swapped(ba, target)
+        # Its tiles priced as its walk is (`_contraction`): the call's own operands, swapped.
         tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
-            self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS))
+            self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS), operands=lambda tile: (
+                self._operand_bytes(ba, dataclasses.replace(tile, swapped=True))))
         if tile is not None:
             tile = dataclasses.replace(tile, swapped=True)
             splits = (1 if ba.arguments['exact_sums'] or self._scaled else pricing.split_count(
@@ -1482,10 +1486,6 @@ class MosaicPackedGmm(MosaicGmm):
                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
                             return_residuals=return_residuals)
 
-    def _priced_operands(self, ba) -> Callable | None:
-        # A swapped call's binding (`packed_rows`) states no packed matrix of its own (`_operand_bytes`).
-        return None if ba.arguments['packed_rows'] else super()._priced_operands(ba)
-
     def _streamed_matrix(self, kernel: _PackedMatrix, trans_rhs: bool) -> tuple:
         # Its words, K-major whatever orientation its decoded shape states, and its block scales, which each
         # stage decodes (`mosaic_gpu.gmm`'s `scales`).
@@ -1525,8 +1525,9 @@ class MosaicPackedGmm(MosaicGmm):
         # read (`gmm`'s `scales`, its decoded dtype's: one its consumers share or each one's own,
         # `packed.decoding`), or swapped, in registers into them, each consumer its rows (`packed_rows`).
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        stored = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize
-                     for leaf in (kernel.words, kernel.scales)) / math.prod(kernel.shape)
+        # A value's: its code's half byte and its sixteen depths' one E4M3 scale (the format's geometry,
+        # whatever the bank's size, an empty one's too).
+        stored = 0.5 + jnp.dtype(kernel.scales.dtype).itemsize / NVFP4.depth
         rows, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
         if tile.swapped:
             return (stored, rows), ((0, 1), None)

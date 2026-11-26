@@ -56,7 +56,7 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
+from dew.nn.kernels.formats import PACKED_FORMATS, MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
@@ -151,7 +151,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    if isinstance(rhs, (NvFp4, TernaryWeights)):
+    if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
                             refused=(transpose_rhs, prologue.fn, prologue.sides, paired, prologue_jvp,

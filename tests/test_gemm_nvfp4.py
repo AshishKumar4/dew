@@ -1129,3 +1129,15 @@ def test_an_amax_history_is_a_whole_number_of_steps(history):
 
     with pytest.raises(ValueError):
         LowPrecision(recipe="nvfp4", tensor_scaling="delayed", amax_history=history)
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
+    """A grouped NVFP4 product of rows of no depth and a bank of one empty matrix `[1, 0, 64]` is zeros,
+    its launch priced by its format's bytes a value (a bank of no values, row 5387's review: a byte count
+    divided by its size raised before its route was chosen)."""
+    matrix = formats.NvFp4.of(jnp.zeros((1, 0, 64), jnp.float32))
+    with generation.assumed(generation_name):
+        out = gemm.nvfp4_product(jnp.zeros((8, 0), jnp.float32), matrix, jnp.asarray([8], jnp.int32),
+                                 out_dtype=jnp.float32, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 64), np.float32))
