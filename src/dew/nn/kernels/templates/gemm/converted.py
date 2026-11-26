@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import typing
 from typing import ClassVar
 
 import jax
@@ -17,10 +18,10 @@ import jax.numpy as jnp
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted
-from dew.nn.precision import EXACT_FLOAT32
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
+from dew.nn.precision import EXACT_FLOAT32
 from dew.nn.sharding import automatic_axes
 
 FP8_CODES_ROW = "ledger 8548"
@@ -70,8 +71,9 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family):
         from dew.nn.kernels.templates.gemm import mosaic_gpu
 
+        kernel = typing.cast(Codes, ba.arguments['kernel'])
         return mosaic_gpu.gmm_allocations(
-            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=ba.arguments['kernel'].codes.dtype,
+            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=kernel.codes.dtype,
             transpose_rhs=True, prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
             dtypes=(ba.arguments['out_dtype'],))
 
@@ -147,23 +149,29 @@ def fp8_codes_product(lhs: jax.Array, rhs: jax.Array, *, out_dtype, interpret_on
     widened = jnp.pad(lhs, ((0, 0), (0, padded_depth - depth))).astype(jnp.bfloat16)
     sizes = jnp.asarray([rows], jnp.int32)
     product = contracted("test_an_fp8_codes_product_holds_every_order")(
-        generation.linear_tangent(*_rules(launch, interpret_on_cpu), live_cotangents=True, kind=KernelGlue()))
+        generation.linear_tangent(*_rules(launch, codes.dtype, interpret_on_cpu), live_cotangents=True,
+                                  kind=KernelGlue()))
+    # The codes as their bytes: an integer operand, which takes no tangent (a frozen matrix's).
     with xla_products.interpreted_context(interpret_on_cpu):
-        return product(widened, codes, sizes)[:, :width].astype(out_dtype)
+        return product(widened, jax.lax.bitcast_convert_type(codes, jnp.uint8), sizes)[:, :width].astype(
+            out_dtype)
 
 
-def _rules(launch: MosaicConvertedGmm, interpret: bool) -> tuple:
+def _rules(launch: MosaicConvertedGmm, dtype, interpret: bool) -> tuple:
     """`(forward, backward, portable)` of the converting launch's product of bfloat16 rows and K-major
-    `[1, width, depth]` codes (`generation.linear_tangent`'s): the rows' cotangent the cotangent times the
-    codes' exact values in fp32, the codes' and the sizes' none."""
+    `[1, width, depth]` codes of `dtype` given as their bytes (`generation.linear_tangent`'s): the rows'
+    cotangent the cotangent times the codes' exact values in fp32, the codes' and the sizes' none."""
+
+    def coded(codes):
+        return jax.lax.bitcast_convert_type(codes, dtype)
 
     def kernel(rows, codes, sizes, *, interpret: bool):
-        return launch(rows, Codes(codes), sizes, (), (), None, None, None, out_dtype='float32',
+        return launch(rows, Codes(coded(codes)), sizes, (), (), None, None, None, out_dtype='float32',
                       trans_rhs=False, interpret=interpret, dense=True, exact_sums=False)
 
     def portable(rows, codes, sizes):
         del sizes
-        return jax.lax.dot_general(rows, codes[0].astype(jnp.bfloat16), (((1,), (1,)), ((), ())),
+        return jax.lax.dot_general(rows, coded(codes)[0].astype(jnp.bfloat16), (((1,), (1,)), ((), ())),
                                    preferred_element_type=jnp.float32)
 
     def forward(rows, codes, sizes):
@@ -172,7 +180,7 @@ def _rules(launch: MosaicConvertedGmm, interpret: bool) -> tuple:
     def backward(saved, operands, cotangent, live):
         del saved
         rows, codes, sizes = operands
-        d_rows = jnp.dot(cotangent, codes[0].astype(jnp.float32), precision=EXACT_FLOAT32,
+        d_rows = jnp.dot(cotangent, coded(codes)[0].astype(jnp.float32), precision=EXACT_FLOAT32,
                          preferred_element_type=jnp.float32)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(codes), zero_from_primal(sizes))
         return tuple(leaves[index] for index in live)
