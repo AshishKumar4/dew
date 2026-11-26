@@ -81,7 +81,7 @@ def _trimmed(padded, stacked, *, queries: int, width: int) -> tuple[jax.Array, j
 def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
            raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
            output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-           normalized: bool = False):
+           merge: str | None = None, normalized: bool = False):
     """The law's merge of a split walk's padded slices (`_trimmed`), optional raw `Initial` state, and
     optional fused `output_mod`/`output_params`, delegated directly to `algebra.merged_state`. When
     `out_dtype` and `out_heads` are given (row 7926), finishes, ungroups, applies `output_mod` with
@@ -117,7 +117,7 @@ merged_padded_p.multiple_results = True
 
 @merged_padded_p.def_abstract_eval
 def _abstract(padded, stacked, *extra, units, queries, width, raw_scale=None, out_dtype=None,
-              out_heads=None, output_mod=None, output_kinds=(), normalized=False):
+              out_heads=None, output_mod=None, output_kinds=(), merge=None, normalized=False):
     """The merge's result types, its value's (`_value`) as JAX types it: its shapes and dtypes, and the
     operands' shardings and manual axes (`shard_map`'s varying ones) as the law's own rules carry them.
     Types made fresh dropped them, so a scan of the law's output into this merge's was refused, its manual
@@ -230,11 +230,14 @@ def _normalized(initial: Initial | None) -> bool:
 
 def _launched(units, queries, width, raw_scale, out_dtype, out_heads, output_mod, output_kinds, normalized,
               *operands):
-    """`merged_padded_p`'s value: one launch on a GPU (`_kernel`), the law's path elsewhere."""
+    """`merged_padded_p`'s value: one launch on a GPU (`_kernel`), the law's path elsewhere, its lowering
+    the one `generation.chosen(merge=...)` names as it traces (`_named_merge`), held in its parameters so a
+    lowering past the block takes it (row 13170: one lowered outside `dew.kernels.use(merge='mosaic')`
+    took Pallas Triton's)."""
     return tuple(merged_padded_p.bind(*operands, units=units, queries=queries, width=width,
                                       raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads,
                                       output_mod=output_mod, output_kinds=output_kinds,
-                                      normalized=normalized))
+                                      merge=_named_merge(), normalized=normalized))
 
 
 def _tangent(units, queries, width, raw_scale, out_dtype, out_heads, output_mod, output_kinds, normalized,
@@ -394,12 +397,11 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
                            target: generation.GpuTarget, has_initial: bool, raw_scale: float | None,
                            out_dtype, out_heads: int | None, output_mod: Callable | None,
                            output_kinds: tuple[Kind, ...],
-                           output_specs: tuple[jax.ShapeDtypeStruct, ...], normalized: bool
+                           output_specs: tuple[jax.ShapeDtypeStruct, ...], mosaic: bool, normalized: bool
                            ) -> tuple[int, cost.Work]:
     _, slices, _, _, _ = padded.shape
     total_slices = slices + int(has_initial)
-    family = (generation.family(target.generation)
-              if _uses_mosaic(target, output_mod) else None)
+    family = generation.family(target.generation) if mosaic else None
     blocks = _candidate_blocks(width, total_slices)
 
     candidates = {block: _launch_for_block(
@@ -420,9 +422,11 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                    queries: int, width: int, target: generation.GpuTarget, has_initial: bool = False,
                    raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-                   output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False
+                   output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False,
+                   merge: str | None = None
                    ) -> tuple[int, cost.Work]:
     """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
+    on the lowering `merge` names (`_uses_mosaic`),
     held through `_cache.holding` (the one owner of what a process derives once and the facts it read, row
     12420) by the call's shapes, the target, the output hook as its epilogue computes it at each candidate
     block (`_epilogue_programs`) and the context a kernel of Dew's is chosen in (`fusion.choice_context`), the
@@ -432,14 +436,14 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
     total_slices = padded.shape[1] + int(has_initial)
     blocks = _candidate_blocks(width, total_slices)
     # Traced for the target its launch is counted for (`_launch_for_block`), whatever the ambient one.
+    mosaic = _uses_mosaic(target, output_mod, merge)
     with generation.as_target(target):
-        hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks,
-                                    mosaic=_uses_mosaic(target, output_mod))
+        hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks, mosaic=mosaic)
     key = (units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
-           output_kinds, output_specs, hooked, normalized, fusion.choice_context())
+           output_kinds, output_specs, hooked, mosaic, normalized, fusion.choice_context())
     return _cache.holding(_PLANNED, key, lambda: _compute_planned_block(
         units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
-        output_mod, output_kinds, output_specs, normalized), PLANNED_HELD)
+        output_mod, output_kinds, output_specs, mosaic, normalized), PLANNED_HELD)
 
 
 def _epilogue_programs(output_mod: Callable | None, output_kinds: tuple[Kind, ...],
@@ -480,7 +484,7 @@ def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtyp
     a row's whole channels left a decode step's few rows on a few multiprocessors (B1: 32 rows of a GH200's
     132, merged_padded 19.2 us at 4096 keys, row 8439)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
-                          raw_scale, out_dtype, out_heads)[0]
+                          raw_scale, out_dtype, out_heads, merge=_named_merge())[0]
 
 
 def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
@@ -488,14 +492,16 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
                 has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                 out_heads: int | None = None, output_mod: Callable | None = None,
                 output_kinds: tuple[Kind, ...] = (),
-                output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False) -> cost.Work:
+                output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False, *,
+                traced: bool = False, merge: str | None = None) -> cost.Work:
     """One native `merged_padded` launch's device work at `_channel_block`'s chosen block (`_planned_block`,
     row 8779): common-path arithmetic across the grid, valid device traffic with row-stat stores counted once
     per row (row 8809), span `3 * chunks`, one kernel; its initial state its output where `normalized`
-    (`template.Initial.normalized`)."""
+    (`template.Initial.normalized`); on the lowering `merge` names where `traced` (a traced merge's own,
+    `merged_padded_p`'s `merge`), else the one named here (`_named_merge`)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
                           raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs,
-                          normalized)[1]
+                          normalized, merge=merge if traced else _named_merge())[1]
 
 
 MOSAIC_SLOWER = frozenset({"sm80", "sm90"})
@@ -507,17 +513,27 @@ against 14.5 us, fp16 K32768 d128 84.0 against 21.8), an A100's 1.4 to 3.9 times
 `generation.chosen(merge=...)` overrides (`_uses_mosaic`)."""
 
 
-def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None) -> bool:
+def _named_merge() -> str | None:
+    """The lowering `generation.chosen(merge=...)` names where a merge traces, None where none names one."""
+    from dew import _cache
+
+    return dict(_cache.KERNEL_CHOICES.value).get(generation.Choice.MERGE)
+
+
+def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None, merge: str | None = None
+                 ) -> bool:
     """Whether `target` lowers `merged_padded` on Mosaic GPU (NVIDIA sm80+ instruction families) rather than
     the Pallas Triton launch, kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795) and, by default,
     for an unhooked merge on the generations where Mosaic's measured slower (`MOSAIC_SLOWER`, a merge of no
-    output hook); `generation.chosen(merge=...)` names either on a Mosaic GPU family, as an A/B of the two
-    does (row 12480: a held config's pin flipped it unseen)."""
+    output hook); `merge`, the lowering `generation.chosen(merge=...)` named where the merge traced
+    (`_named_merge`, held in its parameters), names either on a Mosaic GPU family, as an A/B of the two does
+    (row 12480: a held config's pin flipped it unseen; row 13170: the choice read as it lowered, past the
+    block it was named in)."""
     family = generation.family(target.generation)
     if family is None or family == "tpu":
         return False
     default = "triton" if target.generation in MOSAIC_SLOWER and output_mod is None else "mosaic"
-    return generation.chosen_kernel(generation.Choice.MERGE, default) == "mosaic"
+    return (merge or default) == "mosaic"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -567,7 +583,7 @@ class MergedPadded(tuning.KernelOp):
         block, _ = _planned_block(
             self.units, padded_s, stacked_s, self.queries, self.width, generation.gpu_target(),
             bool(init_args), self.raw_scale, self.out_dtype, self.out_heads, self.output_mod,
-            self.output_kinds, out_specs, self.normalized)
+            self.output_kinds, out_specs, self.normalized, merge="mosaic")
         return MergeConfig(block)
 
     def remaining(self, ba) -> MergeConfig | None:
@@ -610,7 +626,7 @@ class MergedPadded(tuning.KernelOp):
 def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
             raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
             output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-            normalized: bool = False):
+            merge: str | None = None, normalized: bool = False):
     """`_value` as one CUDA launch (`MergedPadded` on sm80+ Mosaic GPU families, `_launch` Triton fallback
     on pre-Ampere CUDA GPUs), a program a row's block of channels (`_channel_block`)."""
     batch, _, _, heads, _ = padded.shape
@@ -621,7 +637,7 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
     init_args, out_args = merged_mosaic.split_extra(extra, output_kinds)
     target = generation.gpu_target()
     out_specs = tuple(jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in out_args)
-    if _uses_mosaic(target, output_mod):
+    if _uses_mosaic(target, output_mod, merge):
         dtype = None if out_dtype is None else jnp.dtype(out_dtype)
         family = generation.family(target.generation) or "mma.sync"
         out_dtypes = tuple(kept_dtype(arg.dtype) for arg in out_args)
@@ -633,7 +649,7 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
                            for operand in (padded, stacked))
     block, _ = _planned_block(units, padded_s, stacked_s, queries, width, target, bool(init_args),
                               raw_scale, out_dtype, out_heads, output_mod, output_kinds, out_specs,
-                              normalized)
+                              normalized, merge=merge)
     return _launch(
         padded, stacked, *extra, units=units, queries=queries, width=width, block=block,
         raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod,
@@ -757,7 +773,7 @@ def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: 
 def _on_cuda(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
              raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
              output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-            normalized: bool = False):
+             merge: str | None = None, normalized: bool = False):
     """The merge on a CUDA GPU: one launch (`_kernel`) of fp32 states (with bf16/fp16/fp32/int output hook
     parameters); the law's path (`_value`) of any other's, a float64 truth's among them, whose constants
     Triton's float32 kernel holds none of."""
@@ -767,7 +783,7 @@ def _on_cuda(padded, stacked, *extra, units: windows.Units, queries: int, width:
     run = _kernel if native else _value
     return run(padded, stacked, *extra, units=units, queries=queries, width=width, raw_scale=raw_scale,
                out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
-               normalized=normalized)
+               merge=merge, normalized=normalized)
 
 
 mlir.register_lowering(merged_padded_p, mlir.lower_fun(_on_cuda, multiple_results=True), platform="cuda")

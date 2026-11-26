@@ -396,6 +396,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     resources, else the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
     them (`rounded` False, `_Config.operand_dtype`). `interpret` runs the GPU mainloops on the CPU, as the
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
+    walked_initial(hooks.initial)
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": scale, "natural": natural, "accurate": accurate}
     on_mosaic = _on_mosaic() or interpret

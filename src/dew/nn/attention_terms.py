@@ -173,3 +173,45 @@ def relative_logits(states: jax.Array, bank: jax.Array, query_places: jax.Array,
                              (profile.shape[0], profile.shape[1], *distance.shape[1:]))
     read = jnp.take_along_axis(profile, index, axis=-1)
     return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, 0.0)
+
+
+def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
+    """`relative_logits`' bias as a band (`attention.BandBias`): each query's relative states `states` `[B, Q,
+    H, rank]` against `bank` `[rank, extent]`, read at the query's place less each key's within its band and
+    zero outside `[0, extent)`, the keys at their indices and each query at its index plus `offset` (`[]` or
+    `[B]` int32: 0 for a prefill from the first key, a chunk's first place for a chunked one). Formed a
+    `template.BAND_GROUP` of queries at a time, each group's `[B, H, BAND_GROUP, extent]` products gathered
+    into its band and dropped, so no call holds every query's products beside the band they are read into
+    (an Inkling 2 prefill's 32768 queries' would hold 3.2 GiB a layer beside it). A caller whose places are
+    not their indices so (counted places, `attention_key_positions`) takes `relative_logits`."""
+    from .attention import BandBias
+    from .kernels.templates import attention as template
+
+    batch, queries, heads, _ = states.shape
+    extent = bank.shape[-1]
+    wide = at_least_fp32(jnp.result_type(states, bank))
+    width = template.band_width(extent)
+    group = max(1, min(queries, template.BAND_GROUP))
+    groups = -(-queries // group)
+    padded = jnp.pad(states, ((0, 0), (0, groups * group - queries), (0, 0), (0, 0)))
+    offset = jnp.asarray(offset, jnp.int32)
+    origins = template.band_origins(offset, groups * group, extent)
+    places = jnp.reshape(offset, (-1, 1))
+
+    def banded(index):
+        first = index * group
+        rows = jax.lax.dynamic_slice_in_dim(padded, first, group, axis=1)
+        products = computed_einsum("bqhr,re->bhqe", rows, bank, dtype=wide)
+        # Column c's distance: the query's place less its key's (`band_origins`' origin plus c).
+        queries_at = first + jnp.arange(group, dtype=jnp.int32)
+        lead = places + queries_at[None, :] - jax.lax.dynamic_slice_in_dim(origins, first, group, axis=1)
+        distance = lead[:, :, None] - jnp.arange(width, dtype=jnp.int32)[None, None, :]
+        read_at = jnp.broadcast_to(jnp.clip(distance, 0, extent - 1)[:, None], (batch, heads, group, width))
+        read = jnp.take_along_axis(products, read_at, axis=-1)
+        return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, jnp.zeros((), wide))
+
+    if groups == 0:
+        return BandBias(jnp.zeros((batch, heads, 0, width), wide), offset, extent)
+    band = jax.lax.map(banded, jnp.arange(groups))
+    values = jnp.moveaxis(band, 0, 2).reshape(batch, heads, groups * group, width)[:, :, :queries]
+    return BandBias(values, offset, extent)

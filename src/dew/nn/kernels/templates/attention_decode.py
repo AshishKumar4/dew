@@ -609,7 +609,8 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 equation.params["queries"], equation.params["width"], target,
                 has_initial=len(equation.invars) > 2, raw_scale=equation.params.get("raw_scale"),
                 out_dtype=equation.params.get("out_dtype"), out_heads=equation.params.get("out_heads"),
-                normalized=equation.params.get("normalized", False)))
+                normalized=equation.params.get("normalized", False), traced=True,
+                merge=equation.params.get("merge")))
     all_launches = launches + merges
     return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
 
