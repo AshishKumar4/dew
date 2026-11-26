@@ -378,7 +378,7 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     no QK-Clip maxima sown, biases its attention by the band about each query (`relative_band`, row 13138):
     on the attention template, which reads the band a tile at a time, its program stages no `[B, H, Q, K]`
     bias or score, where the same call with its places stated (`positions`, which takes the bias written
-    out, `relative_logits`) stages it; a route that writes the bias out (a forced reference or XLA) stages
+    out, `relative_logits`) stages it; a route that writes the bias out (a forced reference) stages
     no band and computes the stated call's output bit for bit (row 13503); and its output and every
     gradient are on par with that call's on the template (check 1, the written-out call in float64 the
     truth)."""
@@ -420,20 +420,20 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     quadratic = (1, HEADS, BANDED, BANDED)
     with generation.chosen(attention="template"):
         assert quadratic not in staged(MixerCall()) and quadratic in staged(stated)
-    # A route that writes the bias out (a forced reference or XLA's own) stages no band, the bias written
-    # out as the stated call writes it, its output the stated call's bit for bit (row 13503).
+    # A route that writes the bias out (a forced reference: this layer's sinks hand XLA's to it too) stages
+    # no band, the bias written out as the stated call writes it, its output the stated call's bit for bit
+    # (row 13503).
     from dew.nn.kernels.templates import band
 
     params, x = draw(0)
     spec = TERMS["relative_bias"]
     assert isinstance(spec, RelativeBias)
     banded = (1, HEADS, BANDED, band.band_width(spec.extent))
-    for route in ("reference", "xla"):
-        with generation.chosen(attention=route):
-            assert banded not in staged(MixerCall()) and quadratic in staged(MixerCall()), route
-            routed, written = (np.asarray(jax.jit(lambda params, x, call=call: layer.apply(params, x, call))(
-                params, x)) for call in (MixerCall(), stated))
-            np.testing.assert_array_equal(routed, written, err_msg=route)
+    with generation.chosen(attention="reference"):
+        assert banded not in staged(MixerCall()) and quadratic in staged(MixerCall())
+        routed, written = (np.asarray(jax.jit(lambda params, x, call=call: layer.apply(params, x, call))(
+            params, x)) for call in (MixerCall(), stated))
+        np.testing.assert_array_equal(routed, written)
     # The truth over the draw the harness widens (`assert_as_exact`).
     wide = stepped(layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64)), stated)
     assert_as_exact(attending("template")(stepped(layer, MixerCall())),
