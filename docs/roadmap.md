@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12850]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12850, 13557]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010, 12426]
 - The kernel challenge's lessons in the templates. [5271, 3611]
@@ -34,11 +34,13 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
 - A forked chunked call whose readout reads the memory entering its token or weighs its own write (recurrence.Hooks.reads 'before', Hooks.own_weight: RWKV6's)…. [6267]
 - Block-selected attention's other selections as mixers. [6301]
+- resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
+- Dew's DC-AE ReLU linear attention (src/dew/nn/autoencoders/dc_ae.py linear_attention) on a CPU's float32 sums leaves its queries', keys' and values' gradients…. [13524]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
@@ -46,7 +48,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A Mosaic GPU kernel's reduction along a tile's rows issues its butterfly's shuffles (SHFL) and cross-lane combines, which emission does not count. [12889]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
-- resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 
