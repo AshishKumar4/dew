@@ -229,7 +229,8 @@ SOURCES = {
         f"{family}_hybrid", f"{family}_hybrid",
         lambda family=family, prefix=prefix: _hybrid(family, prefix)[0], _hybrid(family, prefix)[1],
         "HybridConfig", "HybridForCausalLM")
-       for family, prefix in (("qwen3_5", "Qwen3_5"), ("qwen3_next", "Qwen3Next"))},
+       for family, prefix in (("qwen3_5", "Qwen3_5"), ("qwen3_next", "Qwen3Next"),
+                              ("kimi_linear", "KimiLinear"))},
 }
 """Each source: its model_type, its modules' stem (`modeling_<stem>.py` and `configuration_<stem>.py`), its
 modeling code, its configuration code, and its config and causal LM classes."""
@@ -238,12 +239,18 @@ FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
           "qwen3-5-hybrid": _DELTA_NETS,
           # Every layer's feed-forward dense (`mlp_only_layers`), which a hybrid's routed block is not read.
           "qwen3-next-hybrid": {**_DELTA_NETS, "mlp_only_layers": [0, 1]},
+          # A delta attention layer beside a latent one, both feed-forwards dense (`mlp_layer_types`).
+          "kimi-linear-hybrid": {"linear_num_heads": 2, "linear_head_dim": 16, "linear_conv_kernel_dim": 4,
+                                 "layer_types": ["linear_attention", "full_attention"],
+                                 "mlp_layer_types": ["dense", "dense"], "q_lora_rank": None,
+                                 "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
+                                 "v_head_dim": 16},
           # The rotary turns DeepSeek's rotated slice of each head (`qk_rope_head_dim`).
           "latent": {"head_dim": 8, "num_key_value_heads": 4}}
 """Each source's config fields beside `TINY`."""
 
 SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8, "qwen3-5-hybrid": 8,
-         "qwen3-next-hybrid": 8}
+         "qwen3-next-hybrid": 8, "kimi-linear-hybrid": 8}
 """Each source's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
