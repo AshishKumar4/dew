@@ -118,6 +118,8 @@ class Runs:
         inputs = self.host.from_hf(dict(batch))
         mine = self.loaded.text_generation()(inputs, CONTINUATION, key=jax.random.key(0),
                                              sampling=Sampling(temperature=0))
+        if generated.logits is None:
+            raise ValueError("the reference's generation returned no logits (`output_logits`)")
         return (np.asarray(mine.tokens)[:, -CONTINUATION:], generated.sequences.numpy()[:, -CONTINUATION:],
                 np.stack([step.numpy() for step in generated.logits], axis=1))
 

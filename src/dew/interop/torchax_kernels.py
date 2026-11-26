@@ -196,9 +196,10 @@ def _dew_chunk_rule(original: Callable) -> Callable:
         # delta net): the projections' where the kernel takes them (`kernel_routed`, a bf16 source on a
         # GPU), float32 for the portable arithmetic (row 13280).
         narrow = given[0].dtype
+        rounded_q, rounded_k, rounded_v = (x.astype(narrow) for x in (q, k, v))
         if narrow != jnp.float32 and q.shape[1] > 1 and kernel_routed(
-                *(x.astype(narrow) for x in (q, k, v)), decay, write, unit_queries=use_qk_l2norm_in_kernel):
-            q, k, v = (x.astype(narrow) for x in (q, k, v))
+                rounded_q, rounded_k, rounded_v, decay, write, unit_queries=use_qk_l2norm_in_kernel):
+            q, k, v = rounded_q, rounded_k, rounded_v
         state = None if initial_state is None else jax_view(initial_state).astype(jnp.float32)
         # Attested causal over the queries' positions (`sequence_causality.CAUSAL_ATTENTION`): each token's
         # output reads its own and earlier tokens' queries, keys, values, decays and writes and the whole

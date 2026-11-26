@@ -614,12 +614,15 @@ def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[
     for group in groups:
         # A record section read off `record` steps by its declared dataclass; any other mapping (a run's
         # `TrainerConfig.links`) holds no group a path names.
-        known = (dataclasses.is_dataclass(kind) and group in _names(kind) if isinstance(held, Mapping)
-                 else dataclasses.is_dataclass(held) and group in _names(held))
-        if not known:
-            raise KeyError(f"{path} names no group of the run record")
-        owner = kind if isinstance(held, Mapping) else held
-        value = held.get(group) if isinstance(held, Mapping) else getattr(held, group)
+        owner: DataclassInstance | type[DataclassInstance]
+        if isinstance(held, Mapping):
+            if not (dataclasses.is_dataclass(kind) and group in _names(kind)):
+                raise KeyError(f"{path} names no group of the run record")
+            owner, value = kind, held.get(group)
+        else:
+            if not (dataclasses.is_dataclass(held) and group in _names(held)):
+                raise KeyError(f"{path} names no group of the run record")
+            owner, value = held, getattr(held, group)
         stated = node.get(group) if isinstance(node, Mapping) else None
         if value is None and isinstance(stated, Mapping):
             declared = registry.declared_type(kind, group)
