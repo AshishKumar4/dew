@@ -384,8 +384,11 @@ M_EM_2 = ("M-EM-2 (A100-SXM4-40GB at 1095 MHz, base/kernels 59b96a9b4c2, 400 rol
           "45131ca01): Qwen3-30B-A3B down 1.025, up 1.181, GPT-OSS-20B up 1.138")
 """The A100's grouped forward, which CUTLASS's launches hold (row 5623)."""
 
-FOUR_B_TIMED = Timed(frozenset(FOUR_B), 24576, 49152)
-"""The rows M-EM-36, M-EM-52 and em35d timed the 4B's projections over (`FOUR_B_CELLS`)."""
+FOUR_B_TIMED = Timed(frozenset(FOUR_B), 24576, 24576)
+"""The rows M-EM-36, M-EM-52, em35d and the B200 grid timed the 4B's projections at (`FOUR_B_CELLS`): 24,576
+tokens each, no other count, so the cells hold there alone and a product over other rows takes its kind's
+route (kernel-templates.md §1: a cell over its timed rows; row 13167's audit: 24,576 to 49,152 claimed,
+32,768 never timed; M-EM-54's 49,152 a whole step's, not each product's)."""
 
 NORMED = ((Timed(frozenset(NORMED_08B), 12288, 12288), M_EM_65, ('sm80', 'sm90')),
           (Timed(frozenset(NORMED_4B_8B), 4096, 12288), M_EM_67, ('sm90',)))
@@ -491,7 +494,7 @@ FOUR_B_CELLS: dict[tuple[str, Made, tuple[int, int]], tuple[str, str]] = {
     ('sm100', Made.KERNEL_GRADIENT, (2560, 1024)): (
         REFERENCE, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
 }
-"""The 4B's projections (`FOUR_B`) at 24,576 to 49,152 tokens: (generation, what the product makes, its
+"""The 4B's projections (`FOUR_B`) at 24,576 tokens: (generation, what the product makes, its
 matrix) to its winner's route and the receipt, each a cell where its winner is not its kind's route
 (`grouped_matmul.DECLARED`)."""
 
