@@ -49,14 +49,52 @@ from dew.algebra.terms import Term
 def shape(term: Term) -> Vec[i64]: ...
 
 
+@function(merge=lambda old, new: old)
+def dtype(term: Term) -> String: ...
+"""The scalar dtype name of `term` (`np.dtype(...).name`: `'float32'`, `'bfloat16'`, `'bool'`), stated for
+every traced term by `program.stated` and propagated by `FACTS` so `cost.work` prices conversions and
+divisions at their real dtypes (row 12974)."""
+
+
+@function(merge=lambda old, new: old)
+def param_dtype(params: i64) -> String: ...
+"""The fixed output dtype name of `params` (`convert_element_type`'s `new_dtype`, `dot_general`'s
+`Product.made`, `is_finite`'s `'bool'`, or a binary primitive's explicit `out_dtype`)."""
+
+
+@function
+def same_dtype(params: i64) -> Unit: ...
+"""Holds where a unary or binary operation's parameters preserve its operands' dtype (every unary except
+`is_finite`, and every binary without `out_dtype`)."""
+
+
 @function
 def along(params: i64, axis: i64) -> Unit: ...
 
 
+@function(merge=lambda old, new: old)
+def matrix_product(params: i64) -> i64: ...
+"""The RHS kept axis of a plain matrix product with the left columns contracted."""
+
+
 @function
-def matrix_product(params: i64) -> Unit: ...
-"""A product's parameters (`Term.dot`) contracting its left operand's last axis with its right's first, no
-batch, in its operands' dtype (`plain`): `x @ y` of matrices (`matrix`)."""
+def exact_int8_product(term: Term) -> Unit: ...
+"""This short full-fp32 dot, exact on byte casts; a parameter index does not encode its length."""
+
+
+@function
+def int8_values(term: Term) -> Unit: ...
+"""Float32 values obtained by widening intact integer bytes."""
+
+
+@function
+def exact_roundtrip(narrow: Term, original: Term) -> Unit: ...
+"""The actual casts preserve the input's shape, placement and floating-point bits."""
+
+
+@function
+def dyadic_scale(term: Term) -> Unit: ...
+"""Every scale is a positive power of two from 2**-100 through 2**100."""
 
 
 @function
@@ -94,11 +132,8 @@ minimum of a scaled value is the scaled maximum or minimum (`_linear`)."""
 
 
 @function
-def exact_scale(term: Term) -> Unit: ...
-"""Holds where a term is a scalar literal of a power of two: a multiply by it rounds nothing (but past the
-dtype's range), so moving it through a contraction leaves every rounding as it was (`program.rewrite`
-states it). A scale of any other value moved so reorders rounding, which the gate refused on the gated delta
-rule's adjoint (1.575 times the reference's error, past 1.5): it waits for error-aware extraction (§1.5)."""
+def counting_sum(term: Term) -> Unit: ...
+"""A sum of floating 0/1 values whose worst-case count doubled fits exactly in its dtype."""
 
 
 @function(merge=lambda old, new: old)
@@ -341,14 +376,15 @@ class Rules:
 
 
 def _facts() -> Ruleset:
-    """The shape of each value a rule makes: an elementwise term's over operands of one shape theirs, or over
-    an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along one axis its
-    operand's without that axis, a matrix's transpose its axes swapped, a matrix product its left operand's
-    rows by its right's columns; and each value of two axes a matrix (`matrix`)."""
-    term, x, y = vars_("term x y", Term)
+    """The shape and dtype of each value a rule makes: an elementwise term's shape over operands of one shape
+    theirs, or over an operand and a scalar the operand's, a layout-keeping one its operand's, a sum along
+    one axis its operand's without that axis, a matrix's transpose its axes swapped, a matrix product its
+    left operand's rows by its right's columns, each value of two axes a matrix (`matrix`), and each term's
+    dtype (`dtype`) propagated from operands and parameter dtypes (`same_dtype`, `param_dtype`)."""
+    term, x, y, z = vars_("term x y z", Term)
     shaped, axes, left, right = vars_("shaped axes left right", Vec[i64])
-    name = var("name", String)
-    params = var("params", i64)
+    name, dt = vars_("name dt", String)
+    params, kept = vars_("params kept", i64)
     scalar = Vec[i64].empty()
     return ruleset(
         rule(eq(term).to(x.binary(name, y, params)), eq(shaped).to(shape(x)), eq(shape(y)).to(shaped)).then(
@@ -363,16 +399,44 @@ def _facts() -> Ruleset:
              ).then(set_(shape(term)).to(shaped.remove(axes[i64(0)]))),
         rule(eq(term).to(x.shaped(String("transpose"), params)), eq(left).to(shape(x)),
              eq(left.length()).to(i64(2))).then(set_(shape(term)).to(Vec[i64](left[i64(1)], left[i64(0)]))),
-        rule(eq(term).to(x.dot(y, params)), matrix_product(params), eq(left).to(shape(x)),
+        rule(eq(term).to(x.dot(y, params)), eq(kept).to(matrix_product(params)), eq(left).to(shape(x)),
              eq(right).to(shape(y)), eq(left.length()).to(i64(2)), eq(right.length()).to(i64(2))).then(
-            set_(shape(term)).to(Vec[i64](left[i64(0)], right[i64(1)]))),
+            set_(shape(term)).to(Vec[i64](left[i64(0)], right[kept]))),
         rule(eq(shaped).to(shape(term)), eq(shaped.length()).to(i64(2))).then(matrix(term)),
+        # Dtype propagation across every Term constructor (`cost.dtype_of`, row 12974).
+        rule(eq(term).to(x.binary(name, y, params)), same_dtype(params), eq(dt).to(dtype(x)),
+             eq(dtype(y)).to(dt)).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.binary(name, y, params)), eq(dt).to(param_dtype(params))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.compare(name, y, params))).then(set_(dtype(term)).to(String("bool"))),
+        rule(eq(term).to(x.unary(name, params)), same_dtype(params), eq(dt).to(dtype(x))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.unary(name, params)), eq(dt).to(param_dtype(params))).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.convert(params)), eq(dt).to(param_dtype(params))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.shaped(name, params)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.reduce(name, axes, params)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(x.dot(y, params)), eq(dt).to(param_dtype(params))).then(set_(dtype(term)).to(dt)),
+        rule(eq(term).to(z.select(x, y)), eq(dt).to(dtype(x)), eq(dtype(y)).to(dt)).then(
+            set_(dtype(term)).to(dt)),
+        rule(eq(term).to(z.clamp(x, y)), eq(dt).to(dtype(x))).then(set_(dtype(term)).to(dt)),
         name="facts")
 
 
 _ROWS, _SCALED = Drawn(((64, 1024), (64, 1024), (64, 1024))), Drawn(((64, 1024), (64,)))
 _SMALL = Drawn(((64, 1024),), scale=lambda rng, shape, drawn: (rng.uniform(-0.5, 0.5, shape)
                                                                * 10.0 ** rng.uniform(-6, 0, shape)))
+
+
+def _half_normals(rng: np.random.Generator, shape: tuple[int, ...], drawn: list[np.ndarray]) -> np.ndarray:
+    """Draw both signs of f16's normal encodings; the adversarial families add zeros."""
+    del drawn
+    magnitude = rng.integers(0x0400, 0x7C00, shape, dtype=np.uint16)
+    sign = rng.integers(0, 2, shape, dtype=np.uint16) << 15
+    return (sign | magnitude).view(np.float16)
+
+
+_HALF_ROWS = Drawn(_ROWS.shapes, scale=_half_normals, dtype=jnp.float16)
 
 
 def _fold(rng: np.random.Generator, shape: tuple[int, ...], drawn: list[np.ndarray]) -> np.ndarray:
@@ -533,7 +597,7 @@ def _moved_scales() -> tuple[RuleFamily, ...]:
                 x.dot(before, params), after.dot(y, params))
             # The other operand's extent bound first: a rule's actions look up no function's value.
             moved.append(rule(
-                eq(t).to(written), matrix_product(params), plain(scaled), matrix(x), matrix(y),
+                eq(t).to(written), eq(matrix_product(params)).to(i64(1)), plain(scaled), matrix(x), matrix(y),
                 along(laid, i64(0 if on_left else 1)), eq(extent).to(shape(target)),
                 eq(spread).to(lifted(extent, i64(0 if on_left else 1)))).then(
                 union(t).with_(made), set_(shape(s.shaped("broadcast_in_dim", spread))).to(extent)))
@@ -561,88 +625,106 @@ def _widened() -> tuple[RuleFamily, ...]:
 _FLOORED = Drawn(((64, 1024), (64, 1024)), scale=lambda rng, shape, drawn: (
     rng.standard_normal(shape) if not drawn else np.maximum(np.abs(rng.standard_normal(shape)), 1e-3)))
 """A dividend and a divisor held away from zero (a norm floored by its epsilon, `max(|y|, 1e-3)`)."""
+_BROADCAST_FLOORED = Drawn(((64, 1024), (64, 1)), scale=lambda rng, shape, drawn: (
+    rng.standard_normal(shape) if not drawn else np.maximum(np.abs(rng.standard_normal(shape)), 1e-3)))
+"""A dividend and a per-row broadcast divisor held away from zero (a softmax or row-norm denominator)."""
 
 
 def _reuse() -> tuple[RuleFamily, ...]:
-    """A value the program already computed read in a new one's place (§1.4's reuse): a quotient by a value
-    whose reciprocal the program holds, `a / y` as `a (1 / y)`, and by a root whose reciprocal root it holds,
-    `a / sqrt(v)` as `a rsqrt(v)` (directly or broadcast along trailing axes: a norm's `x / sqrt(v)[:, None]`
-    beside `rsqrt(v)`, a normalization's `x / max(|y|, eps)` or `x / sum(...)` beside its reciprocal). Each
+    """A value the program already computed read in a new one's place (§1.4's reuse) and guarded hoisting of
+    broadcast divisors and reciprocal roots: `a / y` as `a (1 / y)` when `1 / y` is already held,
+    `a / broadcast(y)` as `a * broadcast(y^-1)` when `y` is broadcast (e.g. softmax `e / sum(e)`), and
+    `a / sqrt(v)` (directly or broadcast) as `a * rsqrt(v)` (merging into any sibling `rsqrt(v)`). Each
     reorders a rounding, and each fires only where the reciprocal is a normal finite float and the product
     finite (§6.3's dominance rule): the divisor held away from zero (`log2_floor`: its reciprocal at most
     `2**-floor`, under the program's reach) and bounded (`log2_bound`: its reciprocal at least `2**-bound`,
     above the narrowest float's least normal power, so no flushing lane reads it as zero), and either the
     divisor is at least 1 (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend `a`) or
-    the dividend's bound with the reciprocal's stays under the reach. A reciprocal of an unguarded divisor
-    overflows where the quotient is finite (a subnormal one) and makes a NaN of a zero dividend, so it is
-    never shared (the reuse probe, 2026-11-05)."""
+    the dividend's bound with the reciprocal's stays under the reach."""
     a, u, w, v, one, t, r = vars_("a u w v one t r", Term)
     axes, extent = vars_("axes extent", Vec[i64])
-    divided, inverted, rooted, reciprocal, multiplied, made, laid = vars_(
-        "divided inverted rooted reciprocal multiplied made laid", i64)
+    divided, inverted, rooted, reciprocal, multiplied, made, laid, inv = vars_(
+        "divided inverted rooted reciprocal multiplied made laid inv", i64)
     floor, bound, held, reached, lowest = vars_("floor bound held reached lowest", i64)
     common = (eq(reached).to(reach()), eq(lowest).to(least()), eq(multiplied).to(stock("mul")),
               plain(divided), eq(shape(a)).to(shape(t)))
     # A divisor's reciprocal is a normal finite float (above least normal and under reach).
     normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
     reciprocals = []
-    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made))
+    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made),
+              u.clamp(w, v))
     r_laid = r.shaped("broadcast_in_dim", laid)
     for y in makers:
-        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
-            reciprocals += [
-                rule(
-                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)),
-                    unit(one), plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-                    eq(bound).to(log2_bound(y)), *common, *normal,
-                    *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
-                rule(
-                    eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
-                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted),
-                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
-                    eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)), *common, *normal,
-                    *dividend_guard).then(
-                    union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
-            ]
+        held_forms = ((eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted)),
+                      (eq(inv).to(stock("reciprocal")), eq(r).to(y.unary("integer_pow", inv))))
+        for observed in held_forms:
+            for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
+                divisor = (eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)))
+                reciprocals += [
+                    rule(eq(t).to(a.binary("div", y, divided)), *observed, eq(shape(r)).to(shape(t)),
+                         *divisor, *common, *normal, *dividend_guard).then(
+                        union(t).with_(a.binary("mul", r, multiplied))),
+                    rule(eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
+                         *observed, eq(shape(r)).to(shape(y)),
+                         eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
+                         *divisor, *common, *normal, *dividend_guard).then(
+                        union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                ]
+    inv_v = v.unary("integer_pow", inv)
+    inv_laid = inv_v.shaped("broadcast_in_dim", laid)
+    hoisted_reciprocals = [
+        rule(
+            eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid), divided)),
+            eq(inv).to(stock("reciprocal")), eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
+            eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
+            *dividend_guard).then(
+            union(t).with_(a.binary("mul", inv_laid, multiplied)),
+            set_(shape(inv_laid)).to(extent))
+        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,))
+    ]
+    rsq = v.unary("rsqrt", reciprocal)
+    rsq_laid = rsq.shaped("broadcast_in_dim", laid)
     roots = []
     for dividend_guard in ((eq(held).to(log2_bound(a)), held + (i64(0) - floor).max(i64(0)) <= reached),
                            (i64(0) <= floor,)):
         roots += [
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(t)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
-                *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
+                *dividend_guard).then(union(t).with_(a.binary("mul", rsq, multiplied))),
             rule(
                 eq(t).to(a.binary("div", v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(extent).to(shape(v.unary("sqrt", rooted).shaped("broadcast_in_dim", laid))),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
                 *dividend_guard).then(
-                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                union(t).with_(a.binary("mul", rsq_laid, multiplied)), set_(shape(rsq_laid)).to(extent)),
             rule(
                 eq(t).to(a.binary("div", v.shaped("broadcast_in_dim", laid).unary("sqrt", rooted), divided)),
-                eq(r).to(v.unary("rsqrt", reciprocal)), positive(v), eq(shape(r)).to(shape(v)),
+                eq(reciprocal).to(stock("rsqrt")), positive(v),
                 eq(extent).to(shape(v.shaped("broadcast_in_dim", laid))),
                 eq(floor).to(log2_floor(v)), eq(bound).to(log2_bound(v)), *common, *normal,
                 *dividend_guard).then(
-                union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                union(t).with_(a.binary("mul", rsq_laid, multiplied)), set_(shape(rsq_laid)).to(extent)),
         ]
     return (
         RuleFamily("a quotient by a value whose reciprocal the program holds", tuple(reciprocals),
                    (lambda a, y: a / jnp.maximum(y, 1e-3), lambda a, y: a * (1 / jnp.maximum(y, 1e-3)),
                     _FLOORED)),
-        RuleFamily("a quotient by a root whose reciprocal the program holds", tuple(roots),
+        RuleFamily("a quotient by a broadcast divisor hoisted to a reciprocal product",
+                   tuple(hoisted_reciprocals),
+                   (lambda a, y: a / y, lambda a, y: a * jax.lax.integer_pow(y, -1), _BROADCAST_FLOORED)),
+        RuleFamily("a quotient by a root as a reciprocal root product", tuple(roots),
                    (lambda a, v: a / jnp.sqrt(v), lambda a, v: a * jax.lax.rsqrt(v), _FLOORED)))
 
 
 def _linear() -> tuple[RuleFamily, ...]:
-    """Distributivity over operands of one shape (the sums' linearity is `_joined`'s), a positive scalar's
-    scale taken out of a maximum or a minimum it keeps the order of (`positive_scale`: `max(c x) = c max(x)`,
-    each element's one rounding of `c x` kept as the reduced one's, so it reorders no rounding and makes no
-    new magnitude), a product's bilinearity
-    (two products sharing an operand, one product of the summed others, and a power of two's scale of the
-    product on either operand instead), each over arithmetic in its operands' dtype (`plain`), and a value a
+    """Distributivity over operands of one shape, a positive scalar's scale out of a maximum or minimum
+    (the same element wins, with its original rounding), and two matrix products sharing an operand as
+    one product with the others summed. A scalar stays on its original side of a contraction: a power
+    of two can flush an operand or product even when the final written result is normal (row 13162).
+    A value a
     broadcast lays along every axis but a sum's taken out of the sum where the other factor has the product's
     shape (the broadcast's extent along the axis the product's or 1, as an elementwise product broadcasts a
     unit axis), and a matrix product of an operand scaled along its kept axis (a dequant's row or column
@@ -651,25 +733,7 @@ def _linear() -> tuple[RuleFamily, ...]:
     reaches (`dominated`, §6.3), each stating its own (`made`)."""
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
-    params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
-    scalar = Vec[i64].empty()
-    families = []
-    # A contraction scaled by a power of two: the scale on either operand, the product linear in each. The
-    # new operand and the new contraction over it each under the program's reach: a scale moved into a
-    # contraction's operand scales each of its products before its sum (2**120 x times 2 summed past 2**128).
-    for side, scaled, other, made_of, moved in (
-            ("left", x, y, lambda s: s.dot(y, params), lambda x, y, a: jnp.dot(x * 0.5, y.T)),
-            ("right", y, x, lambda s: x.dot(s, params), lambda x, y, a: jnp.dot(x, (y * 0.5).T))):
-        facts, power = product_magnitude(magnitude(scaled, "s"), magnitude(a, "a"), 0)
-        new = scaled.binary("mul", a, multiplied)
-        bounds, contracted = product_magnitude(([], power), magnitude(other, "other"),
-                                               var("replaced_length", i64))
-        families.append(RuleFamily(f"a power of two's scale into a contraction's {side} operand", (rule(
-            eq(t).to(x.dot(y, params).binary("mul", a, multiplied)), eq(shape(a)).to(scalar), exact_scale(a),
-            plain(params), plain(multiplied), *facts, *dominated(power, "new"),
-            eq(var("replaced_length", i64)).to(contracted_length(x.dot(y, params))), *bounds,
-            *dominated(contracted, "replaced")).then(union(t).with_(made_of(new)), *made(new, power)),),
-            (lambda x, y, a: jnp.dot(x, y.T) * 0.5, moved, _ROWS)))
+    laid, axis, added, multiplied, summed = vars_("laid axis added multiplied summed", i64)
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
     # The factored product too: `a (x + y)` rounds `x + y` before the product, so it may pass the float's
@@ -677,7 +741,7 @@ def _linear() -> tuple[RuleFamily, ...]:
     # `x + y` rounds to `1 + 2**-22`, and `a (1 + 2**-22)` overflows where the written sum rounds to the
     # largest). Under the reach it is finite for every `a` its bound holds: `|a| 2**(max(x, y) + 1)`.
     more, factored = product_magnitude(magnitude(a, "a"), ([], power), 0)
-    families += [
+    families = [
         RuleFamily("distributivity", (rule(
             eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
             eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
@@ -760,53 +824,54 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     product = x.dot(y, params)
     # The scaled product too, which rounds the product before its scale (distributivity's).
     more, scaled_power = product_magnitude(magnitude(s, "s"), ([], power), 0)
-    lifted_by: dict[str, list] = {"row": [], "column": []}
-    for scaled, laid_axis, lift_axis, lift in (
-            (lambda: x.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied).dot(y, params), 1, 0,
-             row_lift),
-            (lambda: s.shaped("broadcast_in_dim", laid).binary("mul", x, multiplied).dot(y, params), 1, 0,
-             row_lift),
-            (lambda: x.dot(y.binary("mul", s.shaped("broadcast_in_dim", laid), multiplied), params), 0, 1,
-             column_lift),
-            (lambda: x.dot(s.shaped("broadcast_in_dim", laid).binary("mul", y, multiplied), params), 0, 1,
-             column_lift)):
-        lifted_by["row" if lift is row_lift else "column"].append(rule(
-            eq(t).to(scaled()), matrix_product(params), plain(multiplied), matrix(x), matrix(y),
-            along(laid, i64(laid_axis)), eq(product_extent).to(shape(t)),
-            eq(lift).to(lifted(product_extent, i64(lift_axis))),
-            *contracted, *facts, *dominated(power, "new"), *more, *dominated(scaled_power, "scaled")).then(
-            union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
-            # The lifted broadcast lays the scale over the product's extent: its shape, so it is priced.
-            set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
-            *made(product, power)))
+    lifted_by: tuple[list, list] = ([], [])
+    for kept_axis in (1, 0):
+        proof = () if kept_axis == 1 else (
+            exact_int8_product(t), int8_values(x), int8_values(y), dyadic_scale(s))
+        for lift_axis, laid_axis, lift in ((0, 1, row_lift), (1, 1 - kept_axis, column_lift)):
+            side = s.shaped("broadcast_in_dim", laid)
+            operand = x if lift_axis == 0 else y
+            for scaled_operand in (operand.binary("mul", side, multiplied),
+                                   side.binary("mul", operand, multiplied)):
+                written = scaled_operand.dot(y, params) if lift_axis == 0 else x.dot(scaled_operand, params)
+                lifted_by[lift_axis].append(rule(
+                    eq(t).to(written), eq(matrix_product(params)).to(i64(kept_axis)), *proof,
+                    plain(multiplied), matrix(x), matrix(y), along(laid, i64(laid_axis)),
+                    eq(shape(scaled_operand)).to(shape(operand)),
+                    eq(product_extent).to(shape(t)), eq(lift).to(lifted(product_extent, i64(lift_axis))),
+                    *contracted, *facts, *dominated(power, "new"), *more,
+                    *dominated(scaled_power, "scaled")).then(
+                    union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
+                    set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
+                    *made(product, power)))
     return (
-        RuleFamily("a row scale out of a product", tuple(lifted_by["row"]),
+        RuleFamily("a row scale out of a product", tuple(lifted_by[0]),
                (lambda x, s, y: jnp.dot(x * s[:, None], y.T), lambda x, s, y: jnp.dot(x, y.T) * s[:, None],
                 _ROW_SCALED)),
-        RuleFamily("a column scale out of a product", tuple(lifted_by["column"]),
+        RuleFamily("a column scale out of a product", tuple(lifted_by[1]),
                (lambda x, s, y: jnp.dot(x, (y * s[:, None]).T), lambda x, s, y: jnp.dot(x, y.T) * s[None, :],
                 _ROW_SCALED)))
 
 
 def _joined() -> tuple[RuleFamily, ...]:
-    """Two sums along one axis of operands of one shape as one sum of their terms (linearity), in their
-    operands' dtype (`plain`), where the new sum of terms and the new reduction of it, its length's power
-    (`sum_length`) above them, are each under the program's reach (`dominated`): `sum(x) + sum(y)` may be
-    finite where `sum(x + y)` is not (float32's `x = [2**126, 2**126]` and
-    `y = [2**126 - 2**102, 2**126 - 2**103]`)."""
+    """Join two counts of the same shape and axes when every partial sum in both orders is exact.
+
+    An upper magnitude alone does not make ordinary floating-point sums safe to join. Adding their
+    entries first can erase a contribution which would survive cancellation (row 13161)."""
     x, y, t = vars_("x y t", Term)
     axes = var("axes", Vec[i64])
     params, added = vars_("params added", i64)
     length = var("length", i64)
-    facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    power = i64(1)
     new = x.binary("add", y, added)
     reduced = new.reduce("sum", axes, params)
-    summed_x = x.reduce("sum", axes, params)
-    return (RuleFamily("two sums along an axis", (rule(
-        eq(t).to(summed_x.binary("add", y.reduce("sum", axes, params), added)), eq(shape(x)).to(shape(y)),
-        plain(added), eq(length).to(sum_length(summed_x)), *facts, *dominated(power + length, "new")).then(
+    left, right = x.reduce("sum", axes, params), y.reduce("sum", axes, params)
+    return (RuleFamily("two counts along an axis", (rule(
+        eq(t).to(left.binary("add", right, added)), eq(shape(x)).to(shape(y)), plain(added),
+        counting_sum(left), counting_sum(right), eq(length).to(sum_length(left))).then(
         union(t).with_(reduced), *made(new, power), *made(reduced, power + length)),),
-        (lambda x, y, a: jnp.sum(x, -1) + jnp.sum(y, -1), lambda x, y, a: jnp.sum(x + y, -1), _ROWS)),)
+        (lambda x, y, a: jnp.sum((x > a).astype(x.dtype), -1) + jnp.sum((y > a).astype(y.dtype), -1),
+         lambda x, y, a: jnp.sum((x > a).astype(x.dtype) + (y > a).astype(y.dtype), -1), _ROWS)),)
 
 
 CONTRACTED = {"mul": "fmul", "add": "fadd", "sub": "fsub"}
@@ -840,13 +905,20 @@ def _contracted() -> tuple[RuleFamily, ...]:
 
 
 def _identities() -> tuple[RuleFamily, ...]:
-    """Commutativity of addition and multiplication: each rounds as the form it replaces."""
+    """Exact identities within a window, not heads that open windows on their own."""
     x, y = vars_("x y", Term)
-    params = var("params", i64)
+    params, wide, narrow = vars_("params wide narrow", i64)
     return (RuleFamily("addition's commutativity", (birewrite(x.binary("add", y, params)).to(
         y.binary("add", x, params)),), (lambda x, y, a: x + y, lambda x, y, a: y + x, _ROWS)),
             RuleFamily("multiplication's commutativity", (birewrite(x.binary("mul", y, params)).to(
-                y.binary("mul", x, params)),), (lambda x, y, a: x * y, lambda x, y, a: y * x, _ROWS)))
+                y.binary("mul", x, params)),), (lambda x, y, a: x * y, lambda x, y, a: y * x, _ROWS)),
+            RuleFamily("two float32 negations", (rule(
+                eq(y).to(x.unary("neg", params).unary("neg", params)),
+                eq(dtype(x)).to(String("float32"))).then(union(y).with_(x)),),
+                (lambda x, y, a: jax.lax.neg(jax.lax.neg(x)), lambda x, y, a: x, _ROWS)),
+            RuleFamily("an exact widening round trip", (rule(
+                eq(y).to(x.convert(wide).convert(narrow)), exact_roundtrip(y, x)).then(union(y).with_(x)),),
+                (lambda x, y, a: x.astype(jnp.float32).astype(x.dtype), lambda x, y, a: x, _HALF_ROWS)))
 
 
 FACTS = _facts()

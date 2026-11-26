@@ -671,9 +671,12 @@ class PagedKV:
     """The prefix pages a host tier holds beside the device's, split over the groups
     (`dew.inference.pages`)."""
     shared: bool = False
-    """Pages only where they pay: where a server over them keeps a prefix cache, its caller's requests
-    repeating prompts (a group's samples of one, a session's turns), and the model's max_seq_len holds a
-    row in whole pages (`_holds`); the model's own layout elsewhere (rows 5374, 5375, `PAGE_SIZE`)."""
+    """Pages only where they pay (`_pages_pay`): where a server over them keeps a prefix cache, its caller's
+    requests repeating prompts (a group's samples of one, a session's turns), the model's max_seq_len holds a
+    row in whole pages (`_holds`), and, where the server chooses pages over whole rows, its rows are at least
+    the measured crossover's capacity (`SHARED_PAGES_FROM`): a stated `prefix_cache` or `host_pages`, or
+    pages a layout declares, hold at any capacity (`_measured`, row 13278); the model's own layout elsewhere
+    (rows 5374, 5375, 7420, `PAGE_SIZE`)."""
 
     def __post_init__(self) -> None:
         if self.layout is not None and (self.page_size is not None or self.pages is not None):
@@ -710,14 +713,15 @@ def named_cache(page_size: PageSize) -> ServedCache:
 def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None = None) -> KVCache | None:
     """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `cache`
     (`_laid`), None for a model of no layout, whose rows are whole; and for pages where they pay
-    (`PagedKV.shared`), that layout only where a server over it keeps a prefix cache (`_reuses_prefixes`)
-    and the model's max_seq_len holds a row of `capacity` in its whole pages (`_holds`), None where not:
+    (`PagedKV.shared`), that layout only where they pay (`_pages_pay`), None where not:
     what a caller serving the task only where its server shares prompts' pages reads, as an episode cohort
     does (`dew.objectives.rl.RolloutScheduler.episodes`)."""
     *_, strategy = task.controls().components()
     layout = _laid(task.model, cache, capacity, strategy, None)
-    shares = (layout is not None and _reuses_prefixes(task.model, layout, strategy, None)
-              and _holds(task.model, capacity, layout.page_size))
+    own = task.model.kv_cache if isinstance(task.model, Layered) else None
+    base = cache.layout if isinstance(cache, PagedKV) and cache.layout is not None else own
+    shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None,
+                                               measured=_measured(cache, base))
     return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
@@ -1902,11 +1906,11 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     layout, whose rows are whole: for None the model's own; for `DenseKV` the model's own unpaged, each
     row's cache whole; for `PagedKV` the model's own in pages of its `page_size` (the model's own, else
     `PAGE_SIZE`), its pool of `pages` (the model's own where its pages are the model's); and for
-    `PagedKV.shared` over a model that pages none, those pages only where they pay: where a server over them
-    keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of `capacity` in whole
-    pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375), the model's own unpaged
-    elsewhere. A layout either names (`layout`) is laid in place of the model's, exactly: its format, its
-    offload, a paged one's page size (`PAGE_SIZE` where it names none) and pool."""
+    `PagedKV.shared` over a model that pages none, those pages only where they pay (`_pages_pay`: a prefix
+    cache kept, rows held in whole pages, at least the measured crossover's capacity), so requests over one
+    prompt prefill it once (rows 5374, 5375, 7420), the model's own unpaged elsewhere. A layout either names
+    (`layout`) is laid in place of the model's, exactly: its format, its offload, a paged one's page size
+    (`PAGE_SIZE` where it names none) and pool."""
     own = model.kv_cache if isinstance(model, Layered) else None
     if cache is None:
         return own
@@ -1928,8 +1932,38 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     paged = dataclasses.replace(base, page_size=size, pages=pages, groups=1)
     if not cache.shared or base.page_size is not None:
         return paged
-    pays = _holds(model, capacity, size) and _reuses_prefixes(model, paged, strategy, prefill_mesh)
+    measured = _measured(cache, base)
+    pays = _pages_pay(model, paged, capacity, strategy, prefill_mesh, measured=measured)
     return paged if pays else unpaged(base)
+
+
+def _measured(cache: ServedCache | None, base: KVCache | None) -> bool:
+    """Whether shared pages over `base` (`PagedKV.shared`) are chosen over whole rows by the measured
+    crossover (`SHARED_PAGES_FROM`): where pages are the server's own choice, not a layout's (`base`'s own
+    pages, the model's or the cache's) nor a requirement the cache states, a prefix cache it names
+    (`prefix_cache`) or pages it offloads (`host_pages`), which hold at any capacity as before the crossover
+    (row 13278). One policy `_laid` and `served_layout` read."""
+    stated = isinstance(cache, PagedKV) and (cache.prefix_cache is not None or cache.host_pages > 0)
+    return not stated and (base is None or base.page_size is None)
+
+
+SHARED_PAGES_FROM = 2048
+"""The row capacity from which shared pages (`PagedKV.shared`) pay over whole rows, measured: a GH200 serving
+Qwen3-0.6B's groups of 8 samples a prompt took 0.453 s paged against 0.439 s whole at 512-token prompts and
+0.615 s against 1.154 s at 2048 (M-IG-11, row 7420); prompts no two of which share ran paged 13-25% slower
+at 256-512 and 1-8% faster at 2048 on a GH200 and an H100 (M-IG-12). Below it a row's cache stays whole,
+the owner allowing no penalty where pages do not pay."""
+
+
+def _pages_pay(model: nn.Module, paged: KVCache, capacity: int, strategy: Strategy,
+               prefill_mesh: Mesh | None, *, measured: bool = True) -> bool:
+    """Whether shared pages (`PagedKV.shared`) pay over whole rows of `capacity` slots: a server over
+    `paged` keeps a prefix cache (`_reuses_prefixes`), the model's max_seq_len holds a row in whole pages
+    (`_holds`), and, where `measured` (pages chosen over whole rows, not a model's own), the row is at
+    least the measured crossover's (`SHARED_PAGES_FROM`)."""
+    return ((not measured or (type(capacity) is int and capacity >= SHARED_PAGES_FROM))
+            and _holds(model, capacity, paged.page_size)
+            and _reuses_prefixes(model, paged, strategy, prefill_mesh))
 
 
 def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:

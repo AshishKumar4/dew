@@ -48,6 +48,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -1044,11 +1045,11 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     query, key, value, sinks, _ = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
     assert sinks is not None
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    hooks = template.Hooks(score_mod=template.Capped(SOFTCAP),
+    hooks = template.Hooks(score=Hook(template.Capped(SOFTCAP)),
                            initial=template.sinks(sinks, ROWS, QUERIES, WIDTH))
     assert attention_route.attend(query, key, value, spans, hooks).shape == (ROWS, QUERIES, HEADS, WIDTH)
     with pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans, template.Hooks(output_mod=jnp.tanh))
+        attention_route.attend(query, key, value, spans, template.Hooks(output=Hook(jnp.tanh)))
 
 
 @pytest.mark.parametrize("generation_name", ["sm86", "sm120"])
@@ -1204,18 +1205,50 @@ def test_a_b200s_packed_documents_take_cudnn_only_where_its_receipt_timed_them(t
      {"sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712",
       "sys/fs/cgroup/memory/outer/inner/memory.limit_in_bytes": "1073741824"}, 1073741824),
     ("0::/system.slice/run.service\n", {"sys/fs/cgroup/memory.max": "3221225472"}, 3221225472),
-], ids=["v2-limiting-parent", "v1-nested", "v2-container"])
+    ("0::/workers/batch \n", {"sys/fs/cgroup/memory.max": "max",
+                               "sys/fs/cgroup/workers/batch /memory.max": "1073741824",
+                               "sys/fs/cgroup/workers/batch/memory.max": "4294967296"}, 1073741824),
+], ids=["v2-limiting-parent", "v1-nested", "v2-container", "v2-name-ending-in-a-space"])
 def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, groups, limits, least):
     """A CPU call's memory share reads the limits on this process's control groups (`/proc/self/cgroup`),
-    its own group's and every ancestor's (`generation.cgroup_memory_limits`): a parent's tighter limit
-    under cgroup v2, a nested group's under v1's memory controller, and a container's own group, its mount's
-    root, where the group its process names is not mounted."""
+    its own group's and every ancestor's (`_cgroups.memory_limits`): a parent's tighter limit
+    under cgroup v2, a nested group's under v1's memory controller, a container's own group, its mount's
+    root, where the group its process names is not mounted, and a group whose name ends in a space, read as
+    named (the review of toolkit/audit-1800 1ecba10d3)."""
     (tmp_path / "proc/self").mkdir(parents=True)
     (tmp_path / "proc/self/cgroup").write_text(groups)
     for path, limit in limits.items():
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_text(limit + "\n")
-    assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
+    from dew import _cgroups
+
+    stated = _cgroups.memory_limits(tmp_path / "sys/fs/cgroup", tmp_path / "proc/self/cgroup")
+    assert min(limit for _, limit in stated) == least
+
+
+def test_a_cgroup_limit_unreadable_as_it_is_read_leaves_the_others(tmp_path):
+    """A process's group's limit that cannot be read (a group removed or made unreadable as the process
+    moves out of it; a file no one may read here) leaves its ancestors' limits read, as the membership file
+    unreadable leaves none, where a CPU call's memory share failed outright (the review of
+    toolkit/audit-1800 1ecba10d3)."""
+    import os
+
+    from dew import _cgroups
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads a file no one may read")
+    membership = tmp_path / "proc/self/cgroup"
+    membership.parent.mkdir(parents=True)
+    membership.write_text("0::/outer/inner\n")
+    (tmp_path / "sys/fs/cgroup/outer/inner").mkdir(parents=True)
+    (tmp_path / "sys/fs/cgroup/outer/memory.max").write_text("2147483648\n")
+    hidden = tmp_path / "sys/fs/cgroup/outer/inner/memory.max"
+    hidden.write_text("1073741824\n")
+    hidden.chmod(0)
+    root = tmp_path / "sys/fs/cgroup"
+    assert list(_cgroups.memory_limits(root, membership)) == [(root / "outer", 2147483648)]
+    membership.chmod(0)
+    assert list(_cgroups.memory_limits(root, membership)) == []
 
 
 @pytest.mark.parametrize("filled", [False, True], ids=["blocks", "filled"])
@@ -1373,13 +1406,10 @@ def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
 
     def make_hooks(b_p, s_v, qs):
         return template.Hooks(
-            score_mod=score_mod,
-            score_params=(template.Param(b_p, template.Kind.TILE),
-                          template.Param(pos_i, template.Kind.QUERY)),
+            score=Hook(score_mod, (Side(b_p, template.Kind.TILE), Side(pos_i, template.Kind.QUERY))),
             initial=template.sinks(s_v, b, q_len, d),
             drop=drop,
-            query_mod=q_mod,
-            query_params=(template.Param(qs, template.Kind.HEAD),),
+            query=Hook(q_mod, (Side(qs, template.Kind.HEAD),)),
         )
 
     def route_fn(qi, ki, vi, b_p, s_v, qs):
@@ -1425,13 +1455,12 @@ def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
         return s + b_p if b_p.dtype == jnp.float32 else s
 
     def bf_route(b_in):
-        hk = template.Hooks(score_mod=dtype_checked_score,
-                            score_params=(template.Param(b_in, template.Kind.TILE),))
+        hk = template.Hooks(score=Hook(dtype_checked_score, (Side(b_in, template.Kind.TILE),)))
         return attention_route.attend(q, k, v, spans, hk)
 
     def bf_ref(b_in):
-        hk = template.Hooks(score_mod=dtype_checked_score,
-                            score_params=(template.Param(b_in.astype(jnp.float32), template.Kind.TILE),))
+        hk = template.Hooks(score=Hook(dtype_checked_score,
+                                       (Side(b_in.astype(jnp.float32), template.Kind.TILE),)))
         return template.reference(q, k, v, spans, hk)
 
     _, jvp_bf = jax.jvp(bf_route, (bf_bias,), (db_bf,))

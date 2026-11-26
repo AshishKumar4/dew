@@ -593,6 +593,16 @@ class Scorer(Protocol):
     def shares_prefixes(self, train: bool = False) -> bool: ...
 
 
+def _trained_by(objective: Scorer) -> tuple[bool, bool]:
+    """What a collection's rows owe the objective they train, one policy every factory reads: rescored at
+    the step's weights where a GRPO objective's ratio reads its policy at another `sampling_temperature`
+    than the proximal likelihoods' 1 (`Synchronous.rescores`), so unchanged weights give a ratio of 1; and
+    a reward that pays its reward-side reference penalty where it states one (`GRPOObjective.reward_kl`,
+    `penalized`)."""
+    grpo = isinstance(objective, GRPOObjective)
+    return grpo and objective.sampling_temperature != 1.0, grpo and objective.reward_kl > 0
+
+
 class RolloutScheduler:
     """Admits complete groups of rollouts from `acquisition` and packs them into the trainer's batches.
 
@@ -708,10 +718,10 @@ class RolloutScheduler:
         collection's are, so its unchanged weights give a ratio of 1."""
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
-        grpo = isinstance(objective, GRPOObjective)
-        return cls(Synchronous(collector, rescores=grpo and objective.sampling_temperature != 1.0),
+        rescores, penalized = _trained_by(objective)
+        return cls(Synchronous(collector, rescores=rescores),
                    tasks=prompt_tasks, groups=groups, estimator=estimator, truncation=truncation, log=log,
-                   varied=varied, overlong=overlong, admit=admit, penalized=grpo and objective.reward_kl > 0,
+                   varied=varied, overlong=overlong, admit=admit, penalized=penalized,
                    generation_batches=generation_batches, scorer=objective)
 
     @classmethod
@@ -757,7 +767,7 @@ class RolloutScheduler:
                                    max_lag=max_lag, sync_every=sync_every)
         scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
                         truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
-                        penalized=objective.reward_kl > 0, generation_batches=generation_batches,
+                        penalized=_trained_by(objective)[1], generation_batches=generation_batches,
                         scorer=objective)
         # The source and the server it built end with it: the reward pool, then the engine.
         scheduler._owned = (source.close, server.close)
@@ -798,7 +808,9 @@ class RolloutScheduler:
         cache = PagedKV(layout=layout) if layout is not None and layout.page_size is not None else None
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
                                      max_turns, sampling, record, journal, cache=cache)
-        return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)
+        rescores, penalized = _trained_by(objective)
+        return cls(Synchronous(collector, rescores=rescores), groups=groups, credit=credit, log=log,
+                   penalized=penalized, scorer=objective)
 
     @property
     def share(self) -> bool:

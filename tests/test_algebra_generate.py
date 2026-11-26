@@ -16,7 +16,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, error, generate, printed
+from dew.algebra import acceptance, component_cases, error, generate, printed
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 
@@ -57,10 +57,109 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
     """Each generated form at each of its declaration's cases is on par with the declaration as written
     against its float64 truth (check 1), on the declaration's own draws."""
     form = generate.DECLARATIONS[name]
+    truth = form.truth if isinstance(form, generate.ComponentForm) else form.function
     for operands in form.cases.operands:
         assert_as_exact(jax.jit(functools.partial(_derived(name), policy=policy)), jax.jit(form.function),
                         lambda seed, operands=operands: form.cases.draw(seed, operands), f"{name} ({policy})",
-                        seeds=form.cases.seeds, truth_fn=form.function)
+                        seeds=form.cases.seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize("kind", ["placed", "duplicate"])
+def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
+    (example,) = component_cases.ROUNDED.cases.operands[0]
+    if kind == "placed":
+        mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        operands = ((jax.ShapeDtypeStruct(example.shape, example.dtype, sharding=sharding),),)
+    else:
+        operands = ((example,), (example,))
+    form = component_cases.ROUNDED
+    cases = generate.Cases(operands, form.cases.draw, seeds=form.cases.seeds)
+    form = generate.ComponentForm(form.function, form.truth, cases)
+    with pytest.raises(ValueError):
+        generate._chosen("bad.components", form)
+
+
+def test_a_component_preserves_one_result_convention_across_cases():
+    def changed(x):
+        return x if x.shape == (1,) else (x, x + 1)
+
+    def draw(seed, operands):
+        return (np.full(operands[0].shape, seed, np.float32),)
+
+    shapes = tuple((jax.ShapeDtypeStruct((n,), jnp.float32),) for n in (1, 2))
+    cases = generate.Cases(shapes, draw, seeds=2)
+    with pytest.raises(ValueError):
+        generate._chosen("bad.component", generate.ComponentForm(changed, changed, cases))
+
+
+def test_generated_query_cotangents_default_to_the_accurate_small_weight_order():
+    from dew.algebra.component_cases_derived import queries_cotangent
+
+    cases = component_cases.QUERIES_COTANGENT.cases
+    inputs = cases.draw(1, cases.operands[0])
+    _, weights, cotangents = jax.jit(queries_cotangent)(*inputs)
+    assert weights[0, 1] == 0
+    # The shared Check 1 draw also checks this value against independent float64 arithmetic.
+    assert cotangents[0, 1] > jnp.finfo(cotangents.dtype).tiny
+
+
+def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
+    from dew.algebra.component_cases_derived import online_softmax_step, split_kv_merge
+
+    def empty(logits, values):
+        rows = logits.shape[0]
+        return (jnp.zeros((rows, values.shape[1]), logits.dtype),
+                jnp.full((rows,), jnp.finfo(jnp.float32).min, logits.dtype), jnp.zeros((rows,), logits.dtype))
+
+    def generated(left, left_values, right, right_values):
+        start = empty(left, left_values)
+        first = online_softmax_step(*start, left, left_values)
+        second = online_softmax_step(*start, right, right_values)
+        return split_kv_merge(*first, *second)
+
+    def split(left, left_values, right, right_values):
+        start = empty(left, left_values)
+        first = component_cases._online_truth(*start, left, left_values)
+        second = component_cases._online_truth(*start, right, right_values)
+        return component_cases._split_kv_truth(*first, *second)
+
+    def whole(left, left_values, right, right_values):
+        logits = jnp.concatenate((left, right), axis=1)
+        values = jnp.concatenate((left_values, right_values), axis=0)
+        return component_cases._online_truth(*empty(logits, values), logits, values)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        left, right = rng.normal(size=(2, 32, 64)).astype(np.float32)
+        left[0], right[0], right[1] = -np.inf, -np.inf, -np.inf
+        right[2] += 12
+        first, second = rng.normal(size=(2, 64, 64)).astype(np.float32)
+        return left, first, right, second
+
+    with jax.default_matmul_precision("highest"):
+        assert_as_exact(jax.jit(generated), jax.jit(split), draw, "generated split-KV tile composition",
+                        seeds=8, truth_fn=whole)
+
+
+def test_generated_rounded_bodies_keep_the_written_surrogate_law():
+    from dew.algebra import component_cases_derived as emitted
+    from dew.nn import derivatives, precision
+
+    def tangent(primals, tangents, value):
+        return emitted.rounded_tangent(primals[0], tangents[0], value)
+
+    rounded = derivatives.surrogate(emitted.rounded, tangent)
+    x = np.full((16, 32), 1.003, np.float32)
+    dx = np.full_like(x, 1.007)
+    primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
+    np.testing.assert_array_equal(primal, precision.rounded_operand(x, jnp.bfloat16))
+    np.testing.assert_array_equal(direction, dx)
+    _, pullback = jax.vjp(rounded, jnp.asarray(x))
+    np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
+    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+    _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
+    np.testing.assert_array_equal(higher, 2 * dx)
 
 
 def nested(x, y):

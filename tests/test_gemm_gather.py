@@ -19,6 +19,7 @@ from reference_error import assert_as_exact, equations
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates import product, rings
 from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 SEEDS = 8
 """The gathered product's check-1 seeds, the template's grouped products' count."""
@@ -675,7 +676,7 @@ def test_a_gathered_product_with_a_prologue_holds_check_1_with_its_gradients(gen
         return x * scale[:, None]
 
     def templated(tokens, table, scale, matrices):
-        return gemm.gemm(tokens, matrices, sizes, prologue=scaled, prologue_operands=((scale, ("rows",)),),
+        return gemm.gemm(tokens, matrices, sizes, prologue=Hook(scaled, (Side(scale, ("rows",)),)),
                          gather=table, out_dtype=jnp.float32, interpret_on_cpu=True)
 
     def plain(tokens, table, scale, matrices, wide=jnp.float32):
@@ -715,8 +716,9 @@ def _swiglu(gate, up):
 def _gathered_layer(tokens, sizes, table, inv_rms, weight, gate_w, up_w, **options):
     """The second stacked layer's gate|up over `tokens`' rows at `table`, normed by their inverse RMS and the
     norm's weight in the prologue and SwiGLU in the epilogue (`gemm.gemm`, row 5391)."""
-    return gemm.gemm(tokens, gate_w, sizes, paired=up_w, layer=jnp.int32(1), gather=table, prologue=_normed,
-                     prologue_operands=((inv_rms, ("rows",)), (weight, ("depth",))), epilogue=_swiglu,
+    return gemm.gemm(tokens, gate_w, sizes, paired=up_w, layer=jnp.int32(1), gather=table,
+                     prologue=Hook(_normed, (Side(inv_rms, ("rows",)), Side(weight, ("depth",)))),
+                     epilogue=Hook(_swiglu),
                      out_dtype=jnp.bfloat16, **options)
 
 
@@ -832,7 +834,7 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
     def mosaic_run(gpu: str, t, s, m):
         with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
             out, pull = jax.vjp(
-                lambda a, b, c: gemm.gemm(a, c, sizes, prologue=scaled, prologue_operands=((b, ("rows",)),),
+                lambda a, b, c: gemm.gemm(a, c, sizes, prologue=Hook(scaled, (Side(b, ("rows",)),)),
                                           gather=table, out_dtype=jnp.float32, interpret_on_cpu=True),
                 t, s, m)
             grads = pull(cotangent)
@@ -862,8 +864,8 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
         def dew_vjp(t, s, m, dy, gpu=gpu):
             with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
                 out, pull = jax.vjp(
-                    lambda a, b, c: gemm.gemm(a, c, sizes, prologue=scaled,
-                                              prologue_operands=((b, ("rows",)),), gather=table,
+                    lambda a, b, c: gemm.gemm(a, c, sizes, prologue=Hook(scaled, (Side(b, ("rows",)),)),
+                                              gather=table,
                                               out_dtype=jnp.float32, interpret_on_cpu=True),
                     t, s, m)
                 return (out, *pull(dy))
@@ -952,6 +954,49 @@ def test_producers_rungs_keeps_top_after_stated_cap_start():
         assert start_cap not in ladder, (start_cap, ladder)
 
 
+@pytest.mark.parametrize("depth", [512, 511], ids=["whole", "padded"])
+def test_a_refused_gathered_tile_leaves_its_launch_a_config_it_takes(depth):
+    """A gathered paired product on an H100 (an MoE gate/up, 512 tokens gathered to 1024 rows over two
+    experts, its gated epilogue's three outputs) whose tile a compile refused spilling, and the first rungs of
+    its producer's ladder too (`producers.rungs`), each modelled past its consumers' budget: the launch still
+    offers a config no compile refused and its launch takes, the tile refused where its ladder settles on a
+    rung it does not take, at a depth its tiles divide and at one they pad (train 1286, row 12972: the
+    refused tile offered again, its offer refused, the call Exhausted)."""
+    from dew.nn.activations import gated_hook, rounded_gated
+    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates.gemm import producers
+
+    bf16 = jnp.bfloat16
+    sizes = jnp.asarray([512, 512], jnp.int32)
+    table = jnp.arange(1024, dtype=jnp.int32) % 512
+
+    epilogue = Hook(rounded_gated(gated_hook("swiglu"), bf16))
+
+    def paired(tokens, first, second):
+        return gemm.gemm(tokens, first, sizes, compute=bf16, out_dtype=bf16, out_dtypes=(bf16,) * 3,
+                         paired=second, gather=table, epilogue=epilogue)
+
+    shapes = (jax.ShapeDtypeStruct((512, depth), bf16), jax.ShapeDtypeStruct((2, depth, 512), bf16),
+              jax.ShapeDtypeStruct((2, depth, 512), bf16))
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as launches:
+        jax.make_jaxpr(paired)(*shapes)
+    [ba] = [bound for _, bound in launches.taken if bound.arguments.get("paired") is not None
+            and not bound.arguments.get("trans_rhs")]
+    op = ba.op
+    assert isinstance(op, grouped_matmul.MosaicGmm), op
+    with generation.assumed("sm90"), report.refusals():
+        target = generation.gpu_target()
+        tile = op.derived(ba, target)
+        identity = report._identity(op, ba, target)
+        report.refuse([(identity, tile, frozenset({op.KERNEL}))])
+        rungs = list(producers.rungs(op, ba, tile, target))[:3]
+        assert rungs, "a gathered tile's producer steps"
+        report.refuse([(identity, rung, frozenset({op.KERNEL})) for rung in rungs])
+        refused = [tile, *rungs]
+        offered = op.remaining(ba)
+        assert offered is not None and offered not in refused and op.legal(ba, offered, target), offered
+
+
 @pytest.mark.parametrize("in_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
 def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compiles(in_dtype):
     """MoE call shape (`compute=bf16` + `prologue` + `gather` + `paired` + `layer`, rows 5391, 12306):
@@ -1001,8 +1046,7 @@ def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compil
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
             outs, pull = jax.vjp(
                 lambda a, b, c, d, e: gemm.gemm(
-                    a, d, sizes, prologue=scaled,
-                    prologue_operands=((b, ("rows",)), (c, ("depth",))),
+                    a, d, sizes, prologue=Hook(scaled, (Side(b, ("rows",)), Side(c, ("depth",)))),
                     compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
                     out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=e, layer=layer_idx,
                     gather=table, interpret_on_cpu=True),
@@ -1024,8 +1068,8 @@ def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compil
 
         def compiled(t, rs, dw, s1, s2, sz, tbl, lyr):
             with generation.chosen(grouped_matmul="mosaic"):
-                return gemm.gemm(t, s1, sz, prologue=scaled,
-                                 prologue_operands=((rs, ("rows",)), (dw, ("depth",))),
+                return gemm.gemm(t, s1, sz,
+                                 prologue=Hook(scaled, (Side(rs, ("rows",)), Side(dw, ("depth",)))),
                                  compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
                                  out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=s2, layer=lyr,
                                  gather=tbl)

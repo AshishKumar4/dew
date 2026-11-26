@@ -1348,49 +1348,60 @@ def _tile_of(rows: int, width: int, block: int, at: int = 0):
     return pl.ds(first_row, count), pl.ds(at + first_column, columns), mask
 
 
-def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
+def _apart(gate_ref, block: int):
+    """An apart program's tile of `[rows, width]` gate and up (`_tile_of`): its rows, its columns, their mask,
+    and the up's columns, the same."""
     rows, columns, mask = _tile_of(gate_ref.shape[0], gate_ref.shape[1], block)
-    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    y = _product(gate, up, gate_ref.dtype, interpret)
-    plgpu.store(y_ref.at[rows, columns], y.astype(y_ref.dtype), mask=mask)
-
-
-def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
-    rows, columns, mask = _tile_of(gate_ref.shape[0], gate_ref.shape[1], block)
-    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    dy = plgpu.load(dy_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    dg, du = _gradients(gate, up, dy)
-    plgpu.store(dg_ref.at[rows, columns], dg.astype(dg_ref.dtype), mask=mask)
-    plgpu.store(du_ref.at[rows, columns], du.astype(du_ref.dtype), mask=mask)
+    return rows, columns, mask, columns
 
 
 def _halves(gate_up_ref, block: int):
-    """A packed program's tile of `[rows, 2 * width]` (`_tile_of`): its rows, the gate's and the up's
-    columns, contiguous runs which the loads vectorize, and their mask."""
+    """A packed program's tile of `[rows, 2 * width]` (`_tile_of`): its rows, the gate's columns, their mask,
+    and the up's columns, contiguous runs which the loads vectorize."""
     rows, width = gate_up_ref.shape[0], gate_up_ref.shape[1] // 2
     tile_rows, columns, mask = _tile_of(rows, width, block)
     _, up_columns, _ = _tile_of(rows, width, block, at=width)
     return tile_rows, columns, mask, up_columns
 
 
-def _packed_forward(gate_up_ref, y_ref, *, block: int, interpret: bool):
-    rows, columns, mask, up_columns = _halves(gate_up_ref, block)
-    gate = plgpu.load(gate_up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(gate_up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
-    y = _product(gate, up, gate_up_ref.dtype, interpret)
+def _forward_tile(gate_ref, up_ref, y_ref, tile, *, interpret: bool) -> None:
+    """SwiGLU's forward of one program's `tile` (`_apart`'s or `_halves`'), its gate and up read where they
+    lie, the product stored at the gate's columns."""
+    rows, columns, mask, up_columns = tile
+    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
+    y = _product(gate, up, gate_ref.dtype, interpret)
     plgpu.store(y_ref.at[rows, columns], y.astype(y_ref.dtype), mask=mask)
 
 
-def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool):
-    rows, columns, mask, up_columns = _halves(gate_up_ref, block)
-    gate = plgpu.load(gate_up_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(gate_up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
+def _backward_tile(gate_ref, up_ref, dy_ref, dg_ref, du_ref, tile) -> None:
+    """SwiGLU's reverse of one program's `tile`: the gate's and up's gradients stored where each operand
+    lies."""
+    rows, columns, mask, up_columns = tile
+    gate = plgpu.load(gate_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[rows, up_columns], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[rows, columns], mask=mask, other=0).astype(jnp.float32)
     dg, du = _gradients(gate, up, dy)
-    plgpu.store(d_ref.at[rows, columns], dg.astype(d_ref.dtype), mask=mask)
-    plgpu.store(d_ref.at[rows, up_columns], du.astype(d_ref.dtype), mask=mask)
+    plgpu.store(dg_ref.at[rows, columns], dg.astype(dg_ref.dtype), mask=mask)
+    plgpu.store(du_ref.at[rows, up_columns], du.astype(du_ref.dtype), mask=mask)
+
+
+def _swiglu_forward(gate_ref, up_ref, y_ref, *, block: int, interpret: bool):
+    _forward_tile(gate_ref, up_ref, y_ref, _apart(gate_ref, block), interpret=interpret)
+
+
+def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, block: int, interpret: bool):
+    del interpret
+    _backward_tile(gate_ref, up_ref, dy_ref, dg_ref, du_ref, _apart(gate_ref, block))
+
+
+def _packed_forward(gate_up_ref, y_ref, *, block: int, interpret: bool):
+    _forward_tile(gate_up_ref, gate_up_ref, y_ref, _halves(gate_up_ref, block), interpret=interpret)
+
+
+def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool):
+    del interpret
+    _backward_tile(gate_up_ref, gate_up_ref, dy_ref, d_ref, d_ref, _halves(gate_up_ref, block))
 
 
 @dataclasses.dataclass(frozen=True)

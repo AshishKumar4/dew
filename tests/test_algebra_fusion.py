@@ -38,6 +38,109 @@ def ran(fn, label: str, *operands):
     return ahead_arm(jax.jit(fn), label)(*operands)
 
 
+@pytest.mark.parametrize("boundary", ["none", "escaped_gate", "extra_hidden_read", "separate_rows"])
+def test_decode_region_keeps_shared_projections_and_their_actual_outputs(boundary):
+    from dew.algebra.fusion import decode_regions
+    from dew.nn.activations import gated_product
+
+    def layer(x, other, w_gate, w_up, w_down):
+        gate, up = x @ w_gate, (other if boundary == "separate_rows" else x) @ w_up
+        hidden = gated_product("swiglu", implementation="xla")(gate, up)
+        down = hidden @ w_down
+        if boundary == "escaped_gate":
+            return down, gate
+        if boundary == "extra_hidden_read":
+            return down + hidden.sum()
+        return down
+
+    shapes = ((1, 8), (1, 8), (8, 16), (8, 16), (16, 8))
+    traced = jax.make_jaxpr(layer)(*(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in shapes)).jaxpr
+    found = decode_regions(traced, rows=1)
+    if boundary != "none":
+        assert not found
+        return
+    region, = found
+    assert region.inputs == (traced.invars[0], *traced.invars[2:])
+    assert region.outputs == tuple(traced.outvars)
+    assert not decode_regions(traced, rows=8)
+
+
+def _decode_layer(x, gate, up, down):
+    from dew.nn.activations import gated_product
+
+    def product(left, right):
+        return jax.lax.dot_general(left, right, (((1,), (0,)), ((), ())),
+                                   precision=jax.lax.Precision.HIGHEST)
+
+    hidden = gated_product("swiglu", implementation="xla")(product(x, gate), product(x, up))
+    return product(hidden, down)
+
+
+def _wide_decode(x, gate, up, down):
+    x, gate, up, down = (a.astype(jnp.float64) for a in (x, gate, up, down))
+    g = x @ gate
+    return ((g / (1 + jnp.exp(-g))) * (x @ up)) @ down
+
+
+def _decode_draw(rows, seed):
+    rng = np.random.default_rng(seed)
+    return tuple(rng.normal(size=shape).astype(jnp.bfloat16)
+                 for shape in ((rows, 8), (8, 16), (8, 16), (16, 8), (rows, 8)))
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+def test_the_opt_in_decode_region_lowers_as_one_call_with_the_written_math(rows):
+    from jax.extend import core
+    from reference_error import assert_as_exact, with_gradients
+
+    from dew.algebra.fusion import lower_decode
+
+    args = _decode_draw(rows, 6107)[:-1]
+    traced = jax.jit(_decode_layer).trace(*args)
+    original = traced.jaxpr.jaxpr
+    assert lower_decode(original, rows=rows) is original
+    with jax.disable_jit():
+        assert lower_decode(original, rows=rows, enabled=True) is original
+    selected = lower_decode(original, rows=rows, enabled=True)
+    (call,) = selected.eqns
+    body = call.params["jaxpr"].jaxpr
+    lhs = [(eq.primitive, eq.params) for eq in body.eqns if eq.primitive is jax.lax.dot_general_p]
+    rhs = [(eq.primitive, eq.params) for eq in original.eqns if eq.primitive is jax.lax.dot_general_p]
+    assert len(lhs) == 3 and lhs == rhs
+    chosen = traced.jaxpr.replace(jaxpr=selected)
+
+    mesh = jax.sharding.AbstractMesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
+    with jax.sharding.use_abstract_mesh(mesh):
+        placed = jax.make_jaxpr(_decode_layer)(*args).jaxpr
+    assert lower_decode(placed, rows=rows, enabled=True) is placed
+
+    def decoded(*operands):
+        (out,) = core.jaxpr_as_fun(chosen)(*operands)
+        return out
+
+    assert_as_exact(
+        with_gradients(decoded), with_gradients(_decode_layer), lambda seed: _decode_draw(rows, seed),
+        "one-call decode SwiGLU and all four gradients", seeds=8, truth_fn=with_gradients(_wide_decode))
+
+
+def test_decode_lowering_does_not_move_across_a_named_residual():
+    from jax.ad_checkpoint import checkpoint_name
+
+    from dew.algebra.fusion import decode_regions, lower_decode
+    from dew.nn.activations import gated_product
+
+    def layer(x, gate, up, down):
+        a = x @ gate
+        held = checkpoint_name(x, "residual")
+        hidden = gated_product("swiglu", implementation="xla")(a, x @ up)
+        return hidden @ down, held
+
+    shapes = ((1, 8), (8, 16), (8, 16), (16, 8))
+    traced = jax.make_jaxpr(layer)(*(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in shapes)).jaxpr
+    assert decode_regions(traced, rows=1)
+    assert lower_decode(traced, rows=1, enabled=True) is traced
+
+
 def _passed(fn, *operands, kernels: bool = True):
     """`fn` under the algebra pass (`algebra.rewritten`, its kernels too where `kernels`), made where it is
     traced: a program of it is stated by `fn` (`truths_ahead.arm_role`), where the pass's own closure holds
@@ -515,6 +618,50 @@ def test_a_models_gated_product_is_its_gate_projections_epilogue():
                         jax.jit(with_gradients(gated_mlp_product)),
                         lambda seed: (*operands(seed), *cotangent(seed)),
                         "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
+
+
+def gated_projection(gate, up, down):
+    from dew.nn import activations
+
+    return activations.gated_product("swiglu")(gate, up) @ down
+
+
+@lowers("sm90")
+def test_a_gated_activation_can_feed_the_next_products_prologue():
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    dims = ((256, 512), (256, 512), (512, 256))
+    operands = normal_drawn(3422, *dims, (256, 256), dtype=jnp.bfloat16)
+    shapes = tuple(jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in dims)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused"),
+          generation.routes() as routes):
+        jax.jit(algebra.rewritten(gated_projection, kernels=True)).trace(*shapes)
+    assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in routes)
+
+    def truth(gate, up, down):
+        gate, up, down = (part.astype(jnp.float64) for part in (gate, up, down))
+        return (jax.nn.silu(gate) * up) @ down
+
+    def directional(call):
+        def run(*values):
+            return jax.jvp(call, values[:3], values[3:])
+        return jax.jit(run)
+
+    with (generation.assumed("sm90", interpreted=True),
+          generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused")):
+        fused = functools.partial(_passed, gated_projection)
+        assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(gated_projection)), operands,
+                        "gated product before a projection", seeds=8, truth_fn=with_gradients(truth))
+        assert_as_exact(directional(fused), directional(gated_projection),
+                        normal_drawn(3423, *dims, *dims, dtype=jnp.bfloat16), "gated projection tile JVP",
+                        seeds=8, truth_fn=directional(truth))
+        gate, up, down = (jnp.ones(shape, jnp.bfloat16) for shape in dims)
+
+        def loss(value):
+            return fused(gate.at[0, 0].set(value), up, down)[0, 0].astype(jnp.float32)
+
+        assert jnp.isfinite(jax.jit(jax.grad(jax.grad(loss)))(jnp.bfloat16(-100)))
 
 
 def test_a_gated_product_of_no_product_stays_its_region():

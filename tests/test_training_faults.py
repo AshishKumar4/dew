@@ -65,14 +65,19 @@ if mode == "replaced":
 """
 
 
-def _fit(tmp_path: Path, mode: str, ucx: str | None = None) -> tuple[subprocess.CompletedProcess, str]:
+def _fit(tmp_path: Path, mode: str, ucx: str | None = None, *,
+         held: str | None = None) -> tuple[subprocess.CompletedProcess, str]:
     """A fit of `CRASHING_FIT` in a process of its own (no fault handler enabled before it,
     `UCX_ERROR_SIGNALS` `ucx` where given, else unset), in `mode`: 'none' crashing nowhere, 'plain' faulting
     in its data reader past its first step, 'replaced' faulting past the fit's end, a native handler
-    installed over the record's during it; its outcome and its record."""
+    installed over the record's during it; its run directory holding a regular file named `held` before it
+    where given; its outcome and its record."""
     script = tmp_path / "crashing_fit.py"
     script.write_text(textwrap.dedent(CRASHING_FIT))
     run = tmp_path / "run"
+    if held is not None:
+        run.mkdir()
+        (run / held).write_text("an unrelated file beside the checkpoints\n")
     inherited = {name: value for name, value in os.environ.items()
                  if name not in ("PYTHONFAULTHANDLER", "UCX_ERROR_SIGNALS")}
     environment = {**inherited, "JAX_PLATFORMS": "cpu",
@@ -80,7 +85,7 @@ def _fit(tmp_path: Path, mode: str, ucx: str | None = None) -> tuple[subprocess.
                    **({} if ucx is None else {"UCX_ERROR_SIGNALS": ucx})}
     done = subprocess.run([sys.executable, str(script), str(run), mode], capture_output=True, text=True,
                           env=environment, timeout=600, check=False)
-    records = sorted((run / "faults").glob("*.txt"))
+    records = sorted((run / "faults").glob("*.txt")) if (run / "faults").is_dir() else []
     return done, "".join(record.read_text() for record in records)
 
 
@@ -107,6 +112,17 @@ def test_a_process_owns_its_fatal_signals_from_its_start_asking_ucx_for_none_it_
     assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
     assert _seen(done) == {"ucx during the fit": "" if ucx is None else ucx, "enabled after the fit": True}
     assert list((tmp_path / "run" / "faults").glob("*.txt"))
+
+
+def test_a_run_directory_holding_a_file_named_faults_fits_its_faults_on_standard_error(tmp_path):
+    """A run directory may hold a regular file named `faults` beside its checkpoints (a valid checkpoint
+    root's unrelated file): the fit runs, no record kept, the handler writing to standard error as before
+    (Train 1290's review, row 13017: the record's directory raised FileExistsError before the fit read its
+    checkpoints)."""
+    done, record = _fit(tmp_path, "none", held="faults")
+    assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
+    assert _seen(done)["enabled after the fit"] and not record, (record, done.stderr[-2000:])
+    assert (tmp_path / "run" / "faults").is_file()
 
 
 def test_a_handler_installed_over_the_record_during_a_fit_outlives_it(tmp_path):

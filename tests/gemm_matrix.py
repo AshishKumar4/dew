@@ -38,6 +38,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.mesh import DEFAULT_RULES
 from dew.nn.kernels import gemm, generation, grouped_cutlass, grouped_matmul, selection
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.sharding import placing
 
 ROWS, DEPTH, WIDTH = 256, 256, 384
@@ -90,12 +91,12 @@ def _operands(case: dict[str, str], extras: tuple) -> dict:
     grouped = case["form"] == "grouped"
     match case["hook"]:
         case "bias":
-            return {"epilogue": _biased,
-                    "epilogue_operands": ((extras[0], ("groups", "columns") if grouped else ("columns",)),)}
+            axes = ("groups", "columns") if grouped else ("columns",)
+            return {"epilogue": Hook(_biased, (Side(extras[0], axes),))}
         case "row-scale":
-            return {"epilogue": _scaled, "epilogue_operands": ((extras[0], ("rows",)),)}
+            return {"epilogue": Hook(_scaled, (Side(extras[0], ("rows",)),))}
         case "paired":
-            return {"epilogue": _gated, "paired": extras[0]}
+            return {"epilogue": Hook(_gated), "paired": extras[0]}
     return {}
 
 

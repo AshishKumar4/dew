@@ -232,6 +232,24 @@ def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path
     assert raised.value.labels == ["computes"]
 
 
+def test_two_cells_preparing_one_site_label_fail_the_prepare(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare, a second site of a label another cell's prepare began
+    (`truths_ahead.SiteCollision`) fails its flow there, never deferred to the run, which would read the
+    first site's programs as its own (row 13030: two attention-stability cells of one label, the second's
+    run a MissingTruth); the first cell's prepare passes."""
+    import store_wire
+    import tier_wire
+    from truths_ahead import compiled_truths
+
+    def site():
+        store_wire.COMPILED.get().compile_site("one label", {}, {})
+
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with compiled_truths(tmp_path, prepare=True, stamp="a"), pytest.raises(CellsFailed) as raised:
+        run_cells([Cell("first", site), Cell("second", site)])
+    assert raised.value.labels == ["second"]
+
+
 def test_a_cell_past_its_prepares_cap_is_deferred_to_its_run_and_not_run(tmp_path, monkeypatch):
     """In a part's prepare past its cap (`tier_wire.PREPARE_BY`), a flow runs the cells before it and defers
     each after, unrun, to its run (`tier_wire.DEFERRED`, where `tier_wire.CAPPED`), its flow passing its
@@ -525,6 +543,41 @@ def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, m
     with prepared(tmp_path / "store", stamp="a", target=node_target()) as store:
         store.compile_site("a site calling the host", {"doubled": (doubled, [shape])}, {})
         assert store.at_run("a site calling the host") is not None
+
+
+def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others_ahead(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), a site whose Dew arm calls cuDNN's attention, which a
+    prepare's compile for any GPU of the generation refuses (`selection.Unlowerable`: a cuDNN plan holds to
+    its GPU's model), writes that arm alone to compile at its run and compiles the site's XLA reference
+    ahead: the refusal aborted the site's every arm, and an A100 tier named its cuDNN cells'
+    dew, reference and written arms unprepared, "compiled none of its arms" (MAINGPU-2b1b88c39)."""
+    import jax
+    import jax.numpy as jnp
+    import model_flows
+    import tier_wire
+    from arm_store import _unlowered_arm, armed
+    from contract_support import normal_drawn
+    from generation_support import node_target
+    from reference_error import assert_as_exact
+    from truths_ahead import CompiledTruths, arm_role, prepared
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def attend(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation))
+
+    draw = normal_drawn(0xC0D, *((1, 128, 2, 64),) * 3, dtype=jnp.bfloat16)
+    cudnn, xla = attend("cudnn"), attend("xla")
+    label = "cuDNN beside XLA"
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        assert_as_exact(cudnn, xla, draw, label, seeds=8)
+    store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
+    arms = armed(label)
+    assert store.at_run(_unlowered_arm(arms, arm_role("dew", cudnn, label))) is not None
+    assert store.at_run(_unlowered_arm(arms, arm_role("reference", xla, label))) is None
+    assert store.holds(arms) and store.at_run(arms) is None
 
 
 def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):

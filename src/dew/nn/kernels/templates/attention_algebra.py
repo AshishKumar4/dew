@@ -588,27 +588,26 @@ def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arra
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
     rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
-    merged half and half). Its maximum as given where finite, the walk's start (`LEAST`) where not, and its
-    mass as given, 0 where not a number: a slice of zero total keeps the maximum its keys had and its total
-    itself, so the merge's derivative along that total is its weight's, where the walk's start in its place
-    weighed it at the floor and a select of 0 at a zero total held that derivative at 0 (row 7124). A slice
-    of no key holds the walk's start already. A row or a launch's block of rows alike."""
-    return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
+    merged half and half). Keep a nonfinite maximum as the merge's empty sentinel. A finite maximum with
+    zero total still holds its own weight derivative (row 7124); negative or NaN totals weigh zero.
+    A row or a launch's block of rows alike."""
+    return Partial(out, maximum, jnp.where(total >= 0, total, 0.0))
 
 
 def initial_state(spec: Forward | windows.Units, initial: Partial, *,
-                  raw_scale: float | None = None) -> Partial:
+                  raw_scale: float | None = None, normalized: bool = False) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
     fold's passes fp32's largest (`raw_maximum`, as `resumed` takes it: a finite maximum of 1e38 at a scale
     of 1/8 was infinite, and its merge's mass NaN). Where it holds mass the law's reading says
     (`means.holding`: a subnormal total's too, which a comparison on a lane that flushes it read as none
-    while the law's merge weighed it, an output of 1 merged to 2/3, the merge P0's head review 3)."""
+    while the law's merge weighed it, an output of 1 merged to 2/3, the merge P0's head review 3). A
+    `normalized` state's output is its `acc` as it is (`Initial.normalized`)."""
     held = means.holding(initial.total)
     # The law's finish (`means.finished`): a division by a broadcast total flushed past 2^126 (a total of
     # 1.5 x 2^126 left its output 0, train 931's review).
     laid_held = held if initial.acc.ndim == held.ndim else held[..., None]
-    out = jnp.where(laid_held, means.finished(initial.acc, initial.total), 0.0)
+    out = jnp.where(laid_held, initial.acc if normalized else means.finished(initial.acc, initial.total), 0.0)
     raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
     maximum = raw_maximum(initial.m, raw) if raw is not None else initial.m
     return slice_state(spec, out, maximum, initial.total)
@@ -626,20 +625,12 @@ def merged_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arr
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
-                                          jnp.swapaxes(initial.total, 1, 2)), raw_scale=raw_scale)
+                                          jnp.swapaxes(initial.total, 1, 2)), raw_scale=raw_scale,
+                            normalized=initial.normalized)
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
     return finished_merged(spec, state, axis=1)
-
-
-def resumable(spec: Forward, state: Partial) -> Partial:
-    """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
-    call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
-    a state of no mass the walk's start, which adds nothing to a merge."""
-    held = means.holding(state.total)
-    return Partial(means.resumed(state.acc, state.total), jnp.where(held, spec.naturalized(state.m), LEAST),
-                   state.total)
 
 
 def units_of(spec: Forward | windows.Units) -> windows.Units:

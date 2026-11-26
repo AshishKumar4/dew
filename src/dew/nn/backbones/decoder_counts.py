@@ -77,7 +77,8 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
 def final_norm_runs(decoder: CausalTransformer) -> int:
     """How many times a call runs the decoder's final norm (`norm`): after its last layer where it ends in
     one, and in a loop (`dew.nn.backbones.looping`) before each later pass where every pass exits through
-    it (`Loop.exiting`, `normed_output`) or its step reads the normed state, and, under `reinject`, on
+    it (`Loop.exiting`, `normed_output`) or its step reads the normed state, after the last where an exit
+    gate weighs it, and, under `reinject`, on
     each pass's input and after the passes. Under nGPT none, its norm being the unit sphere's, which
     learns nothing."""
     if decoder.ngpt is not None:
@@ -90,6 +91,9 @@ def final_norm_runs(decoder: CausalTransformer) -> int:
         # The exit's norm of a pass's output serves its step norm too, where no coda runs between them.
         exited = loop.exiting and decoder.normed_output
         runs += later * (int(exited) + int(loop.step_norm and (coda or not exited)))
+        # The last pass's exit gate reads its own normed exit (`looping._final_gate`), beside the norm the
+        # head reads.
+        runs += int(loop.exit_gate and decoder.normed_output)
         if loop.reinject:
             runs += 1 + later + 1
     return runs

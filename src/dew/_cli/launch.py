@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import ipaddress
 import os
 import re
@@ -43,14 +44,17 @@ from dew._cli.gcloud import emit
 from dew._cli.tpu import reach
 from dew._pool import (
     PREEMPTED_EXIT,
+    GpuListing,
+    answered,
     listed_gpus,
     local_gpu_count,
     refuse_idle_gpus,
     runs_on_gpu,
     slurm_tasks_here,
-    visible_gpus,
+    verified_visible,
+    visible_list,
 )
-from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
+from dew.clusters import SCHEDULERS, Launched, Scheduler, detected_environment
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -91,7 +95,7 @@ class Process:
     argv: tuple[str, ...]
     env: dict[str, str]
     devices: str = ""
-    """The local devices it takes, as JAX_LOCAL_DEVICE_IDS lists them."""
+    """The GPUs it takes, as its CUDA_VISIBLE_DEVICES lists them; empty where it takes every local device."""
 
     @property
     def local(self) -> bool:
@@ -301,9 +305,7 @@ class Launch:
         processes, devices = self.processes_per_host, self.devices_per_process
         if processes == 1 and devices is None:
             return processes, devices
-        # What the pool's processes will see: the --env values, and on this
-        # machine the launcher's own environment, which ssh does not carry.
-        env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
+        env = self.host_env(first_host)
         on_gpu = runs_on_gpu(env)
         # None where the GPUs could not be counted, which is not zero of them.
         gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
@@ -348,11 +350,50 @@ class Launch:
         for rank in range(count):
             host = hosts[rank // per_host]
             first = (rank % per_host) * (devices or 0)
-            env = {**shared, **Launched.environ_of(address, count, rank, None if devices is None
-                                                   else range(first, first + devices))}
+            # A process on GPUs sees its own alone, so it opens none of its neighbours' whatever pool it joins
+            # and, holding one, keeps XLA's CUDA graphs (row 12761), JAX numbering them from 0; one off them
+            # (JAX_PLATFORMS=cpu, its GPUs hidden) takes its devices by their places, its GPUs as they were.
+            mine = None if devices is None else self.pinned(host, first, devices)
+            taken = None if devices is None else range(devices) if mine else range(first, first + devices)
+            env = {**shared, **Launched.environ_of(address, count, rank, taken)}
+            if mine:
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(mine)
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
-                                     env.get(LOCAL_DEVICES, "")))
+                                     env.get("CUDA_VISIBLE_DEVICES", "")))
         return processes
+
+    def host_env(self, host: str) -> dict[str, str]:
+        """What a pool process on `host` sees of its environment: the --env values, and on this machine the
+        launcher's own environment, which ssh does not carry."""
+        return {**(os.environ if host in LOCAL_HOSTS else {}), **self.extra_env()}
+
+    def pinned(self, host: str, first: int, devices: int) -> list[str] | None:
+        """The CUDA ordinals a pool process on `host` taking `devices` GPUs from its host's `first` sees alone
+        (`CUDA_VISIBLE_DEVICES`), so it opens none of its neighbours' whether or not it joins them; None for
+        a pool kept off its GPUs, which takes its devices by their places. With none stated, the host's own
+        ordinals from `first`, as JAX_LOCAL_DEVICE_IDS named them; else its places among the GPUs the pool's
+        list (--env, or this machine's own here) shows as CUDA enumerates it on the host (`verified_visible`,
+        `listed_on`), refused before any process starts where that enumeration is not known (the host lists
+        none of its GPUs, a MIG device, one GPU named twice, indices and UUIDs mixed), as no process could be
+        shown its own alone, or where the list shows too few (rows 13104, 13118)."""
+        environment = self.host_env(host)
+        if not runs_on_gpu(environment):
+            return None
+        visible = environment.get("CUDA_VISIBLE_DEVICES")
+        if visible is None:
+            return [str(device) for device in range(first, first + devices)]
+        listed = verified_visible(visible, listed_on(host))
+        if listed is None:
+            raise ValueError(f"CUDA_VISIBLE_DEVICES={visible} cannot be split among {host}'s processes, each "
+                             f"shown its own alone: the host did not list its GPUs (nvidia-smi -L), or the "
+                             f"list names a MIG device, one GPU twice or mixes indices and UUIDs, whose "
+                             f"enumeration CUDA decides; name whole GPUs once each, all by index or all by "
+                             f"UUID, or launch one process a host")
+        if first + devices > len(listed):
+            raise ValueError(f"{host}'s CUDA_VISIBLE_DEVICES={visible} shows {len(listed)} of its GPUs, too "
+                             f"few for a process taking {devices} from its {first}th; ask for fewer with "
+                             f"--processes-per-host or --devices-per-process")
+        return listed[first:first + devices]
 
     def remote_argv(self, host: str, env: dict[str, str]) -> tuple[str, ...]:
         """The argv that starts the command on `host`: the command itself
@@ -439,13 +480,23 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
         "kill -KILL -$rank 2>/dev/null", "exit $code"])
 
 
+@functools.cache
+def listed_on(host: str) -> GpuListing | None:
+    """`host`'s GPUs as `nvidia-smi -L` lists them whatever any process's CUDA_VISIBLE_DEVICES (asked over
+    ssh of another machine), asked once for the launch; None where it does not answer."""
+    argv = ("nvidia-smi", "-L")
+    listed = answered(argv if host in LOCAL_HOSTS else ("ssh", "-o", "BatchMode=yes", host, " ".join(argv)))
+    return None if listed is None else GpuListing.of(listed)
+
+
 def gpu_count(host: str, visible: str | None) -> int | None:
     """GPUs a pool process on `host` may use: those `visible` lists when
     the pool sets CUDA_VISIBLE_DEVICES itself, else what `host` shows,
     asked over ssh when it is another machine; None when they could not be
     counted there."""
     if visible is not None:
-        return visible_gpus(visible)
+        # As CUDA enumerates them: up to an entry naming none of the host's own, where it lists them.
+        return len(visible_list(visible, listed_on(host)))
     if host in LOCAL_HOSTS:
         return local_gpu_count()
     return listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))

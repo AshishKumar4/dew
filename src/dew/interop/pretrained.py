@@ -153,8 +153,8 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     Each layout keeps the source's own tensor name and points at the leaf path
     the loader built, so an export writes the names the source shipped. The
     language model's tensors bind through the readings its load placed
-    (`language`, by its local names), an alias of a local name through the
-    same one; the media components' through the layouts their readers placed
+    (`language`, by its local names; one its family's `prepare` rewrote into others none), an alias of a
+    local name through the same one; the media components' through the layouts their readers placed
     them by (`media`). A media tensor no component computes with (SigLIP's
     pooling head, auxiliary tensors the reference ignores) keeps its source
     bytes for export.
@@ -168,14 +168,14 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     retained = {}
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
-        if group == "language_model":
+        if group == "language_model" and local in readings:
             layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
                                     record["text_model_type"], language_tree, _in_language_model)
             if layout is None:
                 retained[name] = tensor
             else:
                 bindings.append(layout)
-        elif name not in placed:
+        elif group != "language_model" and name not in placed:
             retained[name] = tensor
     return tuple(bindings), retained
 
@@ -1223,6 +1223,19 @@ class PretrainedFallback(Pretrained):
 
     def pipeline(self):
         return self.text_generation()
+
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model`, which runs its torch forward (`torchax_fallback.replaced`), in place."""
+        from dew.interop.torchax_fallback import replaced
+
+        return replace(self, model=replaced(self.model, model))
+
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """`Pretrained.export`, refused for a model whose release would lose its loop (`unlooped`)."""
+        from dew.interop.torchax_fallback import unlooped
+
+        unlooped(self.model)
+        return super().export(variables)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's

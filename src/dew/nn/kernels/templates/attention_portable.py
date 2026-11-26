@@ -36,12 +36,14 @@ from dew.nn.kernels.templates.attention import (
     interpreted_dot,
     interpreted_rows,
     key_tiles,
+    kinds_of,
     padded_call,
     prescaled,
     prologues_taken,
     ranges_walk,
     shared_place,
     sums_units,
+    walked_initial,
     within,
 )
 from dew.nn.precision import power2
@@ -49,24 +51,24 @@ from dew.nn.precision import power2
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
     """A score hook parameter's values for a tile of query rows `rows` and keys `keys` (index arrays) of
-    batch row `row` and query head `head`, as `kind` lays them out (`Kind.axes`): a head's scalar, else the
+    batch row `row` and query head `head`, as `kind` lays them out (its `Kind`): a head's scalar, else the
     tile's `[block_q, block_k]` entries, a singleton along an axis it does not vary on."""
     if kind is Kind.OUTPUT:
         raise ValueError("an output hook's parameter has no score tile")
     if kind is not Kind.HEAD:
         row, head = shared_place(value.shape, row, head)
     places = {"batch": row, "heads": head, "queries": rows[:, None], "keys": keys[None, :]}
-    return value[axes.named(kind.axes, places)]
+    return value[axes.named(kind, places)]
 
 
 def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
     """An output hook parameter's values for query rows `rows` of batch row `row` and query head `head`, as
-    `kind` lays them out (`Kind.axes`): a head's scalar, else the output tile's `[block_q, Dv]` entries, a
+    `kind` lays them out (its `Kind`): a head's scalar, else the output tile's `[block_q, Dv]` entries, a
     query's a singleton along the width."""
-    if "keys" in kind.axes:
+    if "keys" in kind:
         raise ValueError("an output hook's parameter has no key axis")
-    queries = rows if "width" in kind.axes else rows[:, None]
-    return value[axes.placed(kind.axes, {"batch": row, "heads": head, "queries": queries})]
+    queries = rows if "width" in kind else rows[:, None]
+    return value[axes.placed(kind, {"batch": row, "heads": head, "queries": queries})]
 
 
 def _identity(step: jax.Array) -> jax.Array:
@@ -224,7 +226,7 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     # (`algebra.Forward.headroom`, `algebra.SCALED_WALK`), and the fold guards its logits' reach
     # (`algebra.walked`).
     headroom = hooks.rounds is None and algebra.headroom(value.dtype)
-    spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
+    spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score.fn,
                            natural, headroom, hooks.initial is not None,
                            compensated=algebra.compensates(value.dtype), prescale=power, rounds=hooks.rounds,
                            dropped=1.0 if hooks.drop is None else hooks.drop.bound,
@@ -265,16 +267,15 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
     and, with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
     None)."""
     initial = None
-    if hooks.initial is not None:
-        state = hooks.initial
+    if (state := walked_initial(hooks.initial)) is not None:
         widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
         initial = (call.rows(state.m, algebra.LEAST), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), widened))
     return forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
-        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
-        output_mod=hooks.output_mod, residuals=residuals, drop=hooks.drop)
+        call.score_params, kinds_of(hooks.score.sides), call.output_params,
+        kinds_of(hooks.output.sides), initial, block_q=block_q, block_k=block_k,
+        output_mod=hooks.output.fn, residuals=residuals, drop=hooks.drop)
 
 
 def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None], row, rows: jax.Array,
@@ -637,8 +638,7 @@ def backward(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Array, 
     # Its gradients the query's and key's under their prologues (`attention_route._pulled` takes them back).
     query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
-        plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial,
-                                                    drop=hooks.drop)
+        plain = Hooks() if hooks is None else Hooks(score=hooks.score, initial=hooks.initial, drop=hooks.drop)
         _, maxima, totals, anchors, sums = xla_mainloop(config, query, key, value, spans, plain, scale=scale,
                                                         residuals=True, natural=natural)
         residuals = maxima, totals, anchors, sums

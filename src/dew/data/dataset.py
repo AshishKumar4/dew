@@ -375,22 +375,20 @@ class Host:
         return worker_start_seconds() if self.worker_start is None else self.worker_start
 
     @classmethod
-    def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
-        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
-        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
-        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
-        the memory its limit leaves bound the host's. Under a memory limit the page cache the
-        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
-        working set: a run that has read its corpus once holds it in cache, charged to its
-        cgroup, and counting that as taken left room for no worker beside it."""
+    def current(cls, root: Path = cgroups.ROOT, membership: Path = cgroups.MEMBERSHIP) -> Host:
+        """This process's host, read through the cgroups `membership` (/proc/self/cgroup) names it in under
+        `root`, its own and every ancestor of it: a container's limit on a parent binds an unlimited child,
+        so each level's CPU quota and the memory its limit leaves (`cgroups.memory_limits`, v2's and v1's)
+        bound the host's. Under a memory limit the page cache the kernel reclaims first (`inactive_file`) is
+        room, as the kubelet counts a container's working set: a run that has read its corpus once holds it
+        in cache, charged to its cgroup, and counting that as taken left room for no worker beside it. A
+        level whose charge cannot be read (`cgroups.memory_held`) is bounded by its limit alone."""
         import psutil
 
-        group = cgroups.own(root) if cgroup is None else cgroup
+        group = cgroups.own(root, membership)
         cpus, memory = cgroups.usable_cpus(group, root), psutil.virtual_memory().available
-        for level in cgroups.levels(group, root):
-            limit, held = cgroups.memory(level), cgroups.memory_held(level)
-            if limit is not None and held is not None:
-                memory = min(memory, max(0, limit - held))
+        for level, limit in cgroups.memory_limits(root, membership):
+            memory = min(memory, max(0, limit - (cgroups.memory_held(level) or 0)))
         return cls(cpus, memory)
 
 
@@ -475,14 +473,14 @@ class Loading:
     host: Host | None = None
     """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
     or another's, its CPUs, memory and a worker's start as it states them."""
-    sized: Sized | None = dataclasses.field(default=None, compare=False)
-    """What automatic loading measured as it sized these settings (`resolved`), which `Loader.explain`
-    names; None where nothing sized them."""
     warn_over: float = 0.01
     """The share of a corpus's attempted records it may reject before the read warns, once (data.md, the
     counts): a streamed read's counter (`dew.data.mixing.Accepted`) and a memory read's preparation
     (`dew.data.mixing.warn_rejections`) alike. A filter that drops more than one record in a hundred is
     worth a look; a read that expects to drop more states its own."""
+    sized: Sized | None = dataclasses.field(default=None, compare=False, kw_only=True)
+    """What automatic loading measured as it sized these settings (`resolved`), which `Loader.explain`
+    names; None where nothing sized them. Keyword-only and last: no setting a caller passes in order."""
 
     def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
@@ -916,12 +914,13 @@ class Loader:
     """How its training read reads, as its compile chose and sized it (`explain`); None for data handed as it
     is read."""
 
-    def explain(self) -> str:
+    def explain(self, partition: DataPartition | None = None) -> str:
         """The training read as its compile lowered and sized it, a line a fact: its batch, its read and who
-        chose it, the workers and buffers it reads in and what automatic loading measured to size them, a
-        faster read its sources could take, and its plan's order, steps, derived facts and caches. It
-        renders what the compile recorded and reads nothing."""
-        return explained(self)
+        chose it, the workers and buffers it reads in, each corpus's as a reader of `partition`'s share builds
+        them (one share's where None, said so), and what automatic loading measured to size them, a faster
+        read its sources could take, and its plan's order, steps, derived facts and caches. It renders what
+        the compile recorded and reads nothing."""
+        return explained(self, partition)
 
     @property
     def each_token_batch(self) -> tuple[int | None, ...]:

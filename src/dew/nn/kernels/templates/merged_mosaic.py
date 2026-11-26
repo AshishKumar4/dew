@@ -348,7 +348,7 @@ def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, 
 def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: int, block: int,
                    raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-                   family: str = "mma.sync"):
+                   family: str = "mma.sync", normalized: bool = False):
     """`_value` as one Mosaic GPU launch on NVIDIA sm80+ GPUs (row 9795): zero SMEM, zero warp shuffles,
     predicated coalesced GMEM loads/stores over arbitrary `width`/`slices`, executing the exact same
     `algebra.finished_merged_chunked` body as `_launch`, with optional fused `output_mod` epilogue
@@ -379,7 +379,7 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
                 init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, block=block, tile_block=tile_block,
                 width=width, tile_1d=tile_1d)
             init_state: algebra.Partial | None = algebra.initial_state(
-                units, algebra.Partial(raw_acc, raw_m, raw_t), raw_scale=raw_scale)
+                units, algebra.Partial(raw_acc, raw_m, raw_t), raw_scale=raw_scale, normalized=normalized)
         else:
             init_state = None
 

@@ -19,7 +19,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
-from dew.algebra.rules import CONTRACTED, shape
+from dew.algebra.rules import CONTRACTED, dtype as dtype_fact, param_dtype, shape
 from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -55,6 +55,19 @@ def shape_of(graph: EGraph, term, held: dict | None = None) -> tuple[int, ...] |
     return found
 
 
+def dtype_of(graph: EGraph, term, held: dict | None = None) -> np.dtype | None:
+    """The scalar dtype of `term`, an e-class the extractor supplied (`rules.dtype`), kept in `held` where
+    given (row 12974)."""
+    named = ("dtype", key(term))
+    if held is not None and named in held:
+        return held[named]
+    known = graph.lookup_function_value(dtype_fact(term))
+    found = None if known is None else jnp.dtype(text(known))
+    if held is not None:
+        held[named] = found
+    return found
+
+
 VALUE = jnp.dtype(jnp.float32)
 """The dtype a term's value is priced at where the e-graph holds none (a leaf's and a product's are their
 own): a vector lane's fp32, as `LANE_BYTES` keeps it."""
@@ -68,37 +81,47 @@ def _shapes(graph: EGraph, operands, held: dict | None) -> list[tuple[int, ...]]
     return known if len(known) == len(shapes) else None
 
 
-def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget | None = None) -> Work:
+def _operation_work(primitive, inputs, outputs, params, on: generation.GpuTarget | None = None,
+                    fp32: bool | None = None) -> Work:
     """`emission.operation_work`, the kernels' counter's one rule, imported where a price first asks: the
     emission's module loads the templates' resources, which no process reading the algebra alone imports (the
     test cache keys a row on each module it loads)."""
     from dew.nn.kernels.templates import emission
 
-    return emission.operation_work(primitive, inputs, outputs, params, on)
+    return emission.operation_work(primitive, inputs, outputs, params, on, fp32=fp32)
 
 
 def _priced(primitive, params, shapes: list[tuple[int, ...]], made: tuple[int, ...],
-            on: generation.GpuTarget | None = None, dtype=None) -> Work:
-    """An equation's arithmetic as the kernels' counter prices its primitive (`_operation_work`) on `on`, its
-    operands of `shapes` and the value it makes of `made` at `VALUE`; a division at `dtype`, its price its
-    dtype's (an fp32 one's its own, `emission.IEEE_DIVISION`), one of no `dtype` (an int32's, a bfloat16
-    program's, `rules._ranged`'s quotient of one) an operation an element, as unproven fp32."""
-    if primitive is jax.lax.div_p:
-        if dtype is None:
-            return Work(operations=float(math.prod(made)))
-        return _operation_work(primitive, [jax.ShapeDtypeStruct(known, dtype) for known in shapes],
-                               [jax.ShapeDtypeStruct(made, dtype)], params, on)
-    return _operation_work(primitive, [jax.ShapeDtypeStruct(known, VALUE) for known in shapes],
-                           [jax.ShapeDtypeStruct(made, VALUE)], params, on)
+            on: generation.GpuTarget | None = None, dtype=None, *,
+            in_dtypes: list[np.dtype | None] | None = None) -> Work:
+    """Price the traced widths, without borrowing the synthetic vector dtype as evidence of fp32 work."""
+    out_dt = VALUE if dtype is None else dtype
+    known = (None,) * len(shapes) if in_dtypes is None else in_dtypes
+    inputs = [jax.ShapeDtypeStruct(s, out_dt if dt is None else dt)
+              for s, dt in zip(shapes, known, strict=True)]
+    return _operation_work(primitive, inputs, [jax.ShapeDtypeStruct(made, out_dt)], params, on,
+                           fp32=dtype == VALUE)
 
 
 def _elementwise(graph: EGraph, primitive, params, operands, held: dict | None,
-                 on: generation.GpuTarget | None = None, dtype=None) -> Work:
-    """An elementwise node's arithmetic (`_priced` on `on`, a division at `dtype`), its result its operands'
-    shapes broadcast; nothing where one is unknown."""
+                 on: generation.GpuTarget | None = None, *, parameter=None, predicate: bool = False) -> Work:
+    """Price the operands' dtype facts and the equation's stated result dtype. A borrowed e-graph cannot
+    evaluate the output term in a cost callback, only its supplied operands and parameter index."""
     shapes = _shapes(graph, operands, held)
-    return (Work() if shapes is None
-            else _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, dtype))
+    if shapes is None:
+        return Work()
+    in_dtypes = [dtype_of(graph, operand, held) for operand in operands]
+    stated = None if parameter is None else graph.lookup_function_value(param_dtype(parameter))
+    if stated is not None:
+        out_dt = jnp.dtype(text(stated))
+    elif predicate:
+        out_dt = jnp.dtype(jnp.bool_)
+    else:
+        values = (in_dtypes[1:] if primitive is jax.lax.select_n_p else in_dtypes[1:2]
+                  if primitive is jax.lax.clamp_p else in_dtypes)
+        first = values[0]
+        out_dt = first if all(value == first for value in values[1:]) else None
+    return _priced(primitive, params, shapes, np.broadcast_shapes(*shapes), on, out_dt, in_dtypes=in_dtypes)
 
 
 def _product(left: tuple[int, ...], right: tuple[int, ...], params, product,
@@ -125,19 +148,19 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
     for its primitive (`_operation_work`, the one rule: a product's FLOPs in its mode and passes, a
     reduction's operations an operand element, a special function's exponentials and a conversion's
     conversions, any other elementwise operation's operations, a clamp's two, a layout change none, a
-    primitive no rule prices its elements unpriced, `Work.unpriced_operations`), an equation outside the
-    language a leaf of the region reads (a derivative's `add_any`, `terms.OPERATIONS`) priced so where it is
-    entrywise, where it was work no comparison read (the audit of 2026-11-19pm, 8964); and XLA's fusion's
-    accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read from device memory
-    once however many values read it (extraction prices a shared node once), and nothing else of device
-    memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too) and keeps its fused
-    intermediates on chip; the bytes a product's operands are staged in (the tile walk's, at their dtypes'
+    primitive no rule prices its elements unpriced, `Work.unpriced_operations`); an equation outside the
+    language that a region reads as a leaf is still priced for the arithmetic it computes (row 8964).
+    XLA fusion's accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read
+    from device memory once however many values read it (extraction prices a shared node once), and
+    nothing else of device memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too)
+    and keeps its fused intermediates on chip; the bytes a product's operands are staged in (the tile walk's,
+    at their dtypes'
     sizes); a reduction and a product each a kernel of XLA's fusion, its root (elementwise work fuses into
     it); a contracted multiply nothing, its reader's fused multiply-add computing it (`rules._contracted`);
     a declaration's own rescale an exponential an element. What XLA's fusion keeps on chip
     (`Work.kept_bytes`, a TPU's VMEM traffic, row 7283): a leaf's bytes read once into the vector registers,
     a reduction's and a product's result written once and read once by its reader (a product's at its
-    result's dtype, a reduction's at a vector lane's four bytes an element, as the e-graph holds no dtype),
+    result's dtype, a reduction's at a vector lane's four bytes an element, `LANE_BYTES`),
     and elementwise work fused into a kernel none, its values in the registers. Priced on `on` (the
     schedule's target), else the process's."""
     if (args := get_callable_args(node, Term.leaf)) is not None:
@@ -161,7 +184,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
         primitive, params = region.params[integer(args[3])]
         # Its value: its operand's unreduced extents (an empty reduction's too).
         unreduced = tuple(size for axis, size in enumerate(operand) if axis not in params["axes"])
-        return (_priced(primitive, params, [operand], unreduced, on)
+        in_dt = dtype_of(graph, args[0], held)
+        return (_priced(primitive, params, [operand], unreduced, on, in_dt, in_dtypes=[in_dt])
                 + Work(kernels=1.0, kept_bytes=kept(math.prod(unreduced))))
     if (args := get_callable_args(node, Term.dot)) is not None:
         left, right = (shape_of(graph, operand, held) for operand in args[:2])
@@ -184,16 +208,17 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
     # Each other elementwise operation by its primitive, its parameters' entry (`Region.params`); a
     # selection's and a clamp's their own. A layout change computes nothing.
     if (args := get_callable_args(node, Term.unary)) is not None:
-        return _elementwise(graph, *region.params[integer(args[2])], args[:1], held, on)
+        param = args[2]
+        return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
     if (args := get_callable_args(node, Term.convert)) is not None:
-        return _elementwise(graph, *region.params[integer(args[1])], args[:1], held, on)
+        param = args[1]
+        return _elementwise(graph, *region.params[integer(param)], args[:1], held, on, parameter=param)
     for constructor in (Term.binary, Term.compare):
         if (args := get_callable_args(node, constructor)) is not None:
-            primitive, params = region.params[integer(args[3])]
-            # A division's dtype: fp32 where its program holds fp32 values alone, unproven otherwise (an
-            # e-graph's node names no dtype; `Region.dtypes` its traced terms').
-            typed = VALUE if primitive is jax.lax.div_p and region.single_float32 else None
-            return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, typed)
+            param = args[3]
+            primitive, params = region.params[integer(param)]
+            return _elementwise(graph, primitive, params, (args[0], args[2]), held, on, parameter=param,
+                                predicate=constructor is Term.compare)
     for constructor, primitive in ((Term.select, jax.lax.select_n_p), (Term.clamp, jax.lax.clamp_p)):
         if (args := get_callable_args(node, constructor)) is not None:
             return _elementwise(graph, primitive, {}, args[:3], held, on)

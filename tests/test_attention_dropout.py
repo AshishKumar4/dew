@@ -44,6 +44,7 @@ from dew.nn.kernels.templates import (
     mosaic_sm90,
 )
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
+from dew.nn.kernels.templates.hooks import Hook
 
 
 @pytest.fixture(autouse=True)
@@ -869,7 +870,7 @@ def _assert_resumed_dropout_on_par(drop, draw, label: str, *, training: bool, ou
 
     def hooks_of(state_m, state_total, state_acc):
         return template.Hooks(initial=template.Initial(state_m, state_total, state_acc),
-                              output_mod=output_mod, drop=drop)
+                              output=Hook(output_mod), drop=drop)
 
     def walked(query, key, value, state_m, state_total, state_acc):
         out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,

@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax._src import core as jax_core
+from jax._src import config as jax_config, core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -304,6 +304,94 @@ def _activation(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
             and all(_shape(var) == shape for var in (*equation.invars, *equation.outvars)))
 
 
+def decode_regions(jaxpr: jcore.Jaxpr, *, rows: int) -> tuple[Region, ...]:
+    """Report two projections, their gated activation, and the down projection at decode rows.
+
+    These regions are evidence for a launch-control experiment, not splices. The writer keeps the
+    original dots, their rounding, and the cache and routing boundaries.
+    """
+    index = Index(jaxpr)
+    return tuple(region for place, equation in enumerate(jaxpr.eqns)
+                 if len(equation.outvars) == 1 and _activation(equation, _shape(equation.outvars[0]))
+                 if (region := _decode_gated(index, place, rows)) is not None)
+
+
+def _decode_gated(index: Index, joined: int, rows: int) -> Region | None:
+    equations = index.jaxpr.eqns
+    gate, up = equations[joined].invars
+    hidden, = equations[joined].outvars
+    if len(shape := _shape(hidden)) != 2 or shape[0] != rows:
+        return None
+    if not isinstance(gate, jcore.Var) or not isinstance(up, jcore.Var) or gate is up:
+        return None
+    first, second = index.producer.get(gate), index.producer.get(up)
+    if first is None or second is None or first == second:
+        return None
+    if index.readers[gate] != {joined} or index.readers[up] != {joined} or len(index.readers[hidden]) != 1:
+        return None
+    if any(var in index.escaping for var in (gate, up, hidden)):
+        return None
+    down, = index.readers[hidden]
+    if any(not _decode_product(equations[place]) for place in (first, second, down)):
+        return None
+    if (equations[first].invars[0] is not equations[second].invars[0]
+            or equations[down].invars[0] is not hidden):
+        return None
+    places = (*sorted((first, second)), joined, down)
+    ctx = equations[down].ctx
+    if any(equations[place].ctx != ctx for place in places):
+        return None
+    if any(equations[place].effects for place in range(places[0], down + 1)):
+        return None
+    outputs = tuple(equations[down].outvars)
+    at = min((reader for out in outputs for reader in index.readers[out]), default=len(equations))
+    return Region(places, region_inputs(index.jaxpr, places), outputs, at)
+
+
+def lower_decode(jaxpr: jcore.Jaxpr, *, rows: int, enabled: bool = False) -> jcore.Jaxpr:
+    """Experimental A/B arm: lower a contiguous gated region as one nested program.
+
+    This is not a GPU kernel. XLA owns all three written dots, their rounding, the original
+    activation, and any fusion it can do. Placed or interleaved regions stay as written.
+    """
+    from dew.algebra.terms import body_key, provenance_key
+
+    if not enabled or jax_config.disable_jit.value or not jax.sharding.get_abstract_mesh().empty:
+        return jaxpr
+    written = []
+    for region in decode_regions(jaxpr, rows=rows):
+        first, down = region.places[0], region.places[-1]
+        if down - first + 1 != len(region.places):
+            continue
+        equations = list(jaxpr.eqns[first:down + 1])
+        atoms = (atom for eqn in equations for atom in (*eqn.invars, *eqn.outvars))
+        if any(not isinstance(aval := atom.aval, ShapedArray) or aval.weak_type
+               or not aval.sharding.mesh.empty for atom in atoms):
+            continue
+        if any(eqn.ctx.cur_abstract_mesh is not None and not eqn.ctx.cur_abstract_mesh.empty
+               for eqn in equations):
+            continue
+        debug = jcore.DebugInfo("algebra_decode", "gated decode region", None, None)
+        body = jcore.Jaxpr([], list(region.inputs), list(region.outputs), equations, debug_info=debug)
+        closed = jcore.Jaxpr(body, [])
+        if (key := body_key(closed)) is not None:
+            written.append(Written(region.places, region.inputs, region.outputs, down, _decode_call(body),
+                                   ("decode", key, provenance_key(closed))))
+    return _spliced(jaxpr, written) if written else jaxpr
+
+
+def _decode_call(body: jcore.Jaxpr) -> Callable:
+    def gated_decode(*operands):
+        return tuple(jax_core.eval_jaxpr(body, (), *operands))
+
+    return gated_decode
+
+
+def _decode_product(equation: jcore.JaxprEqn) -> bool:
+    form = _form(equation)
+    return form is not None and not (form.grouped or form.transpose_lhs)
+
+
 def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: set[int]) -> set[int]:
     """The layout equations of the captured operands of the equations at `scanned` that only `members` read
     (`CAPTURED`: a bias's broadcast, a row statistic's over the depth), no other region holds (`claimed`)
@@ -326,11 +414,10 @@ def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: 
 
 
 def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
-    """The places of the product at `start`'s prologue (`_regions`): the elementwise equations of its left
-    operand's shape (`_elementwise`) that make it, walked back from it to a value of another shape or kind or
-    an equation another region holds (`claimed`), with the layout equations of their captured operands only
-    they read (`CAPTURED`: a row statistic broadcast over the depth, a scale over the rows); none for a
-    product whose left operand is not its rows (a kernel gradient's xᵀ @ dy)."""
+    """The product's entrywise producers, including a marked gated activation, before the first
+    equation of another shape or kind or one another region holds (claimed); include their captured
+    layout equations when nothing else reads them (a row statistic broadcast over the depth, a scale over
+    the rows). A product whose left operand is not its rows (Xᵀ @ dY) has no prologue."""
     jaxpr, producer = index.jaxpr, index.producer
     equation = jaxpr.eqns[start]
     form, lhs = _form(equation), equation.invars[0]
@@ -339,11 +426,13 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     shape, members, frontier = _shape(lhs), set(), [lhs]
     while frontier:
         place = producer.get(frontier.pop())
-        if place is None or place in members or place in claimed or not _elementwise(jaxpr.eqns[place],
-                                                                                      shape):
+        if place is None or place in members or place in claimed:
+            continue
+        producer_eqn = jaxpr.eqns[place]
+        if not (_elementwise(producer_eqn, shape) or _activation(producer_eqn, shape)):
             continue
         members.add(place)
-        frontier.extend(var for var in jaxpr.eqns[place].invars if isinstance(var, jcore.Var))
+        frontier.extend(var for var in producer_eqn.invars if isinstance(var, jcore.Var))
     return tuple(sorted(members | _captured(index, sorted(members), members, claimed)))
 
 
@@ -539,8 +628,8 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
     of it (`_replayed` takes its constants as inputs, and its literals by their values)."""
     from dew.algebra import program
 
-    return program.structure(jcore.Jaxpr([], list(region.inputs), list(region.outputs),
-                                         [jaxpr.eqns[place] for place in region.replayed]))
+    return program.structure_of(region.inputs, [jaxpr.eqns[place] for place in region.replayed],
+                                region.outputs)
 
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,

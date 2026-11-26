@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from kernel_compile import TPU_TOPOLOGIES
 from reference_error import assert_as_exact
 
 from dew import algebra
@@ -240,11 +241,6 @@ def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
         owned_program(split).compiled(operand, operand)
 
 
-TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
-"""Each TPU generation's compile-only topology (`dew.training.ahead.compile_only_tpus`), of which a product
-takes one chip."""
-
-
 def _compiles_on_a_tpu(generation_name: str, preset: jax.lax.DotAlgorithmPreset) -> bool:
     """Whether libtpu compiles a `[256, 256] @ [256, 256]` float32 product in `preset` for a compile-only TPU
     of `generation_name`, as XLA:TPU lowers it: an algorithm it does not run is refused at its compile
@@ -313,6 +309,41 @@ def test_the_accurate_policy_takes_a_compensated_sum_where_every_form_rounds_its
     choice = choose(three_terms, OPERANDS * 3, accurate=True, saturation=algebra.SATURATION, admits=admits)
     assert choice.chosen.compensated
     assert not admits(three_terms, choice.chosen.function)
+
+
+def test_the_compensated_derivation_retains_both_products_rounding_residuals():
+    from dew.algebra.error import Candidate, compensated
+
+    def difference(a, b, c, d):
+        first = a * b
+        return first - c * d, first
+
+    p, q = np.float32(2 ** -13), np.float32(2 ** -14)
+    values = tuple(np.asarray(v, np.float32) for v in (1 + p, 1 - p, 1 + q, 1 - q))
+    parms = (jax.ShapeDtypeStruct((), jnp.float32),) * 4
+    tree = jax.tree.structure(jax.eval_shape(difference, *parms))
+    derived = compensated(Candidate("written", 0.0, difference), parms, tree)
+    assert derived is not None
+    evaluate = jax.jit(derived.function)
+    residual, first = evaluate(*values)
+    np.testing.assert_equal(np.asarray(residual), np.float32(q * q - p * p))
+    np.testing.assert_equal(np.asarray(first), np.float32(1))
+    gradient = jax.jit(jax.grad(lambda *x: evaluate(*x)[0], argnums=(0, 1, 2, 3)))(*values)
+    a, b, c, d = values
+    np.testing.assert_array_equal(gradient, (b, a, -d, -c))
+
+
+def test_a_compensated_float64_product_preserves_the_low_bits_of_a_literal():
+    from dew.algebra.error import Candidate, compensated
+
+    def difference(x):
+        return jnp.float64(1 + 2 ** -40) * x - x
+
+    with jax.enable_x64():
+        operand = jax.ShapeDtypeStruct((), jnp.float64)
+        derived = compensated(Candidate("written", 0.0, difference), (operand,), jax.tree.structure(operand))
+        assert derived is not None
+        np.testing.assert_equal(float(jax.jit(derived.function)(np.float64(1))), 2 ** -40)
 
 
 def ranged(seed):

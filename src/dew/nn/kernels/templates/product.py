@@ -375,6 +375,46 @@ class Scaled:
         return self.value.shape
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class Support:
+    """Where a product's terms may be nonzero, as its caller states them statically: `left[r, k]` where its
+    left operand's entries may be, `right[k, c]` its right's, `kept[r, c]` the outputs it reads (numpy bool,
+    each its operand's shape). Its other terms are zero, so a product issued of its support alone
+    (`mosaic.Issuer.products`' `support`) skips each instruction none of whose terms it holds: its kept
+    outputs the whole product's bit for bit where every operand an instruction reads is finite as it reads
+    it (staged and converted: a skipped zero times an infinity or a NaN was a NaN in the whole, and an
+    earlier product's overflow is such an operand), up to the sign of a zero (an accumulator at -0 a skipped
+    +0 left -0), its other outputs anything."""
+
+    left: np.ndarray
+    right: np.ndarray
+    kept: np.ndarray
+    _tiles: dict = dataclasses.field(default_factory=dict, init=False, repr=False)
+    """`tiles`' masks by their geometry, each formed once however many parts' products read it."""
+
+    def divides(self, rows: int, columns: int, depth: int) -> bool:
+        """Whether tiles of `rows` by `columns` of its outputs and `depth` of its terms tile its product."""
+        (m, k), n = self.left.shape, self.right.shape[1]
+        return not (m % rows or n % columns or k % depth)
+
+    def tiles(self, rows: int, columns: int, depth: int) -> np.ndarray:
+        """`[M / rows, N / columns, K / depth]` bool: whether the instruction a product issues on a tile of
+        `rows` by `columns` of its outputs and `depth` of its terms holds one of its support's; refused where
+        those tiles do not tile it (`divides`)."""
+        if not self.divides(rows, columns, depth):
+            raise ValueError(f"tiles of {rows} x {columns} by {depth} do not tile a {self.left.shape[0]} x "
+                             f"{self.right.shape[1]} product of depth {self.left.shape[1]}")
+        geometry = (rows, columns, depth)
+        if geometry not in self._tiles:
+            terms = self.left[:, None, :] & self.right.T[None, :, :] & self.kept[:, :, None]
+            m, n, k = terms.shape
+            tiles = terms.reshape(m // rows, rows, n // columns, columns, k // depth, depth).any(
+                axis=(1, 3, 5))
+            tiles.setflags(write=False)
+            self._tiles[geometry] = tiles
+        return self._tiles[geometry]
+
+
 class Blocks:
     """`count` products named `name` to sum, `left(j) @ right(j)` a block `j` (tiles in memory): one a
     block, which a mainloop may issue as a loop over `j`, its operands' fragments loaded a block at a time

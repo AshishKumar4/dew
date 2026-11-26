@@ -345,7 +345,7 @@ interpreted, and their gradients everywhere, which the GPU tier runs whole (test
 SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 'the decay bound'),
                     ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'),
                     ('scalar delta', 'resets on chunk edges'), ('gated', 'saturated gates'),
-                    ('gated', 'spread gates'))
+                    ('gated', 'spread gates'), ('vector delta', 'saturated gates'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
 tasks: Kimi delta attention's 32 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw
 (16 before its unit queries' recording, M-JS-233), and its 64 seeds under the decay bound at 2.2 s (179 and
@@ -354,8 +354,9 @@ edges, each of its forms (121 s whole under the accurate ones, train 861's CI); 
 there (130 to 143 s whole, tests/test_durations.json at dc7ebf822, row 10861); the gated delta net with a
 decay a head, its 32 draws there (125 s whole, train 1196's CI, row 11974); the gated delta net's 128
 under saturated gates and under spread gates, the accurate forms' (186 and 141 s whole, main's
-tests/test_durations.json at fc1a40b63, row 12442). Their marks are literal parameters (`pytest.param`), as
-the plan reads a site's from the source."""
+tests/test_durations.json at fc1a40b63, row 12442); and Kimi delta attention's 32 recorded seeds under
+saturated gates (its fla recording's, `the_template_is_as_exact_as_fla`; 131 s whole, train 1286's CI, row
+12969). Their marks are literal parameters (`pytest.param`), as the plan reads a site's from the source."""
 
 
 @pytest.mark.parametrize(('name', 'regime', 'forms'), [
@@ -376,7 +377,9 @@ the plan reads a site's from the source."""
     pytest.param('gated', 'saturated gates', 'accurate', id='gated-saturated_gates-accurate',
                  marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
     pytest.param('gated', 'spread gates', 'accurate', id='gated-spread_gates-accurate',
-                 marks=pytest.mark.check1_shards(seeds=128, per_task=32))])
+                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
+    pytest.param('vector delta', 'saturated gates', None, id='vector_delta-saturated_gates',
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=8))])
 def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
     """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
     own tokens (`ORDINARY`): the CPU twin of each form's forward cell of the GPU tier's, each case a test of

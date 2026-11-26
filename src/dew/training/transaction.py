@@ -36,7 +36,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
-from dew.nn.dense import NVFP4_HISTORY, rolled
+from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, rolled, rolled_waiting
 from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
@@ -1440,10 +1440,16 @@ class Transaction:
                                   for name, value in written.items()}}
             if amax is not None:
                 # Each history the window recorded a largest for rolls it in, newest, where the update
-                # applies (`done`): a gated step's rejection, or an update an optimizer holds back, keeps
-                # them as they were.
-                params = {**params, NVFP4_HISTORY: _chosen(done, rolled(params[NVFP4_HISTORY], amax),
-                                                           params[NVFP4_HISTORY])}
+                # applies (`done`): a gated step's rejection keeps them as they were. An optimizer that holds
+                # updates back keeps what its held calls recorded waiting (`NVFP4_PENDING`), and the call
+                # that applies one rolls the largest of them and its own.
+                if NVFP4_PENDING in params:
+                    histories, waiting = rolled_waiting(params[NVFP4_HISTORY], params[NVFP4_PENDING], amax,
+                                                        done, input_taken(current.opt_state, opt_state))
+                    params = {**params, NVFP4_HISTORY: histories, NVFP4_PENDING: waiting}
+                else:
+                    params = {**params, NVFP4_HISTORY: _chosen(done, rolled(params[NVFP4_HISTORY], amax),
+                                                               params[NVFP4_HISTORY])}
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
@@ -1452,6 +1458,9 @@ class Transaction:
                 at = self.progress(current) if self.objective.ema.progressed else current.updates
                 averaged = _chosen(self.objective.averages(current.updates) & done,
                                    ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
+                if NVFP4_HISTORY in averaged:
+                    # A reference's histories are its start's, never averaged (`Trainer._fresh_state`).
+                    averaged = {**averaged, NVFP4_HISTORY: current.ema[NVFP4_HISTORY]}
             inspected = {} if self.inspection is None else summaries(
                 self.inspection, stored, native, update, params["params"])
             updates = current.updates + done.astype(current.updates.dtype)

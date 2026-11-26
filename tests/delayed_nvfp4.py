@@ -20,21 +20,31 @@ DELAYED = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recip
 """A run's numerics in the delayed-scaling NVFP4 recipe, which takes the feed-forward's projections."""
 
 
-def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: float | None = None) -> Trainer:
+class Referenced(LMObjective):
+    """An LM whose average is a frozen reference, as a preference or GRPO objective's is
+    (`Objective.ema_is_reference`)."""
+
+    ema_is_reference = True
+
+
+def delayed_lm(split: int, checkpoints: Checkpoints | None = None, ema_decay: float | None = None, *,
+               optimizer: optax.GradientTransformation | None = None,
+               objective: type[LMObjective] = LMObjective) -> Trainer:
     """A two-layer LM whose feed-forward projections the delayed recipe takes, initialized under it (so its
     variables hold their histories), its batch of sixteen rows read in `split` microbatches, keeping an
-    average of its weights at `ema_decay` where given."""
+    average of its weights at `ema_decay` where given, by `optimizer` (AdamW where none is given) and as
+    `objective` (an `LMObjective` class)."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ)
-    return Trainer(LMObjective(model, seq_len=SEQ, ema_decay=ema_decay), optax.adamw(1e-3), key=0,
-                   split=split, checkpoints=checkpoints)
+    return Trainer(objective(model, seq_len=SEQ, ema_decay=ema_decay), optimizer or optax.adamw(1e-3),
+                   key=0, split=split, checkpoints=checkpoints)
 
 
-def data() -> Pipeline:
-    """Rows of sixteen, each step's its own: every microbatch of a split in two whole rows on each of a
-    CPU mesh's eight data shards."""
+def data(rows: int = 16) -> Pipeline:
+    """Batches of `rows`, sixteen by default, each step's its own: every microbatch of a split in two whole
+    rows on each of a CPU mesh's eight data shards."""
     text = (np.arange(128 * (SEQ + 1)).reshape(128, SEQ + 1) * 7 % 64).astype(np.int32)
-    return Pipeline(Memory({"text": text})).batch(16)
+    return Pipeline(Memory({"text": text})).batch(rows)
 
 
 def histories(state) -> list[np.ndarray]:

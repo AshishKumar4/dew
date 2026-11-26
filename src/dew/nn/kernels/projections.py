@@ -17,7 +17,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew import _cache
 from dew._facts import Held
-from dew.mesh import mesh_axes
+from dew.mesh import mesh_axes, spec_axes
 from dew.nn.derivatives import (
     Protected,
     Surrogate,
@@ -39,8 +39,9 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_finished,
     nvfp4_block_product,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import biased, biased_value
+from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -335,8 +336,9 @@ def _chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_
                   for matrix in gate)
     product, codes, scales = blockwise_fp8_finished(
         rows, up, sizes, rows_scales.T, up_scales,
-        epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
-        out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), epilogue_operands=gated,
+        epilogue=Hook(quantized.blockwise_fp8_epilogue(activation, out_dtype),
+                      tuple(Side(gate, ('rows', 'columns')) for gate in gated)),
+        out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32),
         out_forms=(None, None, (SCALE_DEPTH, True)), dense=True, interpret_on_cpu=interpret)
     products = (*gated, product)
     return _quantized_rows_product(codes, scales, w_down, sizes, out_dtype, interpret), tuple(products)
@@ -582,9 +584,10 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
     rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
+    # An FP4 backward's exact fp32 products: the decoded codes times their scales, held whole.
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
-                 precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
+                 precision=EXACT_FLOAT32, interpret_on_cpu=interpret)
     return (*with_gradients_formed(d_x, d_w), None, None)
 
 # The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`); its tensor
@@ -608,8 +611,10 @@ def _nvfp4_chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation
     gated = tuple(nvfp4_block_product(rows, matrix, group_blocks, out_dtype=out_dtype,
                                       interpret_on_cpu=interpret) for matrix in gate)
     product, codes, scales = nvfp4_block_finished(
-        rows, up, group_blocks, epilogue=quantized.nvfp4_epilogue(activation, out_dtype),
-        out_dtypes=(out_dtype, jnp.uint8, jnp.float8_e4m3fn), epilogue_operands=gated,
+        rows, up, group_blocks,
+        epilogue=Hook(quantized.nvfp4_epilogue(activation, out_dtype),
+                      tuple(Side(gate, ('rows', 'columns')) for gate in gated)),
+        out_dtypes=(out_dtype, jnp.uint8, jnp.float8_e4m3fn),
         epilogue_scalars=(hidden_scale,),
         out_forms=(None, quantized.Form(2, packed=True), quantized.Form(NVFP4_BLOCKS.depth, transposed=True)),
         dense=True, interpret_on_cpu=interpret)
@@ -734,7 +739,7 @@ def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
         return None
     lead = min(lhs.ndim - 1, 2)
     rows = logical_spec(RESIDUAL[:lead], lhs.shape[:lead])
-    named = {axis for entry in rows for axis in ((entry,) if isinstance(entry, str) else entry or ())}
+    named = spec_axes(rows)
     return jax.sharding.PartitionSpec(*rows) if named == automatic else None
 
 

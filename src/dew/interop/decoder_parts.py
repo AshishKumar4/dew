@@ -1380,6 +1380,8 @@ LAYER_ROUTES = Table(
              {'projection': one_of(*MOE_SHARED)}),
     in_layer('mlp.shared_experts.{projection}.weight', 'mlp/shared_experts/{projection}/kernel',
              {'projection': one_of(*MOE_SHARED)}),
+    # The shared expert's scalar gate (`Mixture.shared_gate`).
+    in_layer('mlp.shared_expert_gate.weight', 'mlp/shared_expert_gate/kernel'),
     # Qwen3.5's delta net, the block's mixer, lands where self_attn does.
     *DELTA_NET_ROUTES,
     *(in_layer(f'{module}.weight', f'{module}/{leaf}') for module, leaf in _PER_LAYER_INPUTS.items()),

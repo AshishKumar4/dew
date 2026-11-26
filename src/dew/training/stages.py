@@ -320,17 +320,51 @@ class StageLocal:
         (`supplied`): what a run checks against its first batch before it places the state."""
         return jax.eval_shape(functools.partial(self.state, convert=self.staged), state)
 
-    def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState]
-                 ) -> tuple[TrainState, TrainState]:
+    def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState], *,
+                 consumed: bool = False, sources: TrainState | None = None) -> tuple[TrainState, TrainState]:
         """A state given whole, wherever its arrays are (one device's, another mesh's), its runs stacked by
         stage onto the placement `validated` gives the stacked state's shapes, and that placement: placed
-        whole on this mesh first, as `validated` places it, and stacked there."""
+        whole on this mesh first, as `validated` places it, and stacked there. A state the caller hands on
+        (`consumed`, a fit's `state=`, which its first step donates on a plain layout alike) gives its
+        moving arrays to the stacking (`apart`), so its leaves the stacking keeps alias theirs and its
+        layers' are freed as their stacks are made: borrowed, the devices held the state twice through
+        the run's plan search (row 12463: a second fit of a 4B run held 69 GiB, 34.6 GiB its state, and
+        fit no rung). Its frozen trees, which the objective's tree shares, are never given. `sources`, the
+        state as its caller handed it where `state` was made of it (`received`'s banks cut to another stage
+        count, `afresh`'s schedules), gives its moving arrays over the same way."""
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(self.stacked_shapes(state))
+        from dew.state import apart, together  # read where called, as this module reads dew.state's types
+        from dew.training.planning import released
+
+        given = () if not consumed or sources is None else apart(sources)[0]
         if not self.sites:
-            return jax.device_put(state, placement), placement
-        whole = jax.device_put(state, validated(jax.eval_shape(lambda given: given, state)))
-        return owned_program(stack, out_shardings=placement)(whole), placement
+            # Placed as a plain layout places a state its step takes over; of what the caller handed, the
+            # arrays `state` was cut from and holds none of are freed (row 13238: a two-stage run's banks cut
+            # onto the layers of a run that keeps every layer whole stayed beside them).
+            placed = jax.device_put(state, placement)
+            kept = {id(leaf) for leaf in jax.tree.leaves((state, placed))}
+            released([leaf for leaf in jax.tree.leaves(given)
+                      if isinstance(leaf, jax.Array) and id(leaf) not in kept])
+            return placed, placement
+        laid = validated(jax.eval_shape(lambda given: given, state))
+        if not consumed:
+            return owned_program(stack, out_shardings=placement)(jax.device_put(state, laid)), placement
+
+        # Placed whole giving the handed arrays over (`donate`, where a placement other than theirs copies
+        # them), then stacked giving the placed ones over; the handed arrays no placement or stacking
+        # aliased are freed after (`planning.released`), as nothing reads the handed state again: a
+        # placement JAX reshards by slicing gives nothing over, and a layer stacked anew aliases nothing.
+        (handed, frozen), (moving_laid, frozen_laid) = apart(state), apart(laid)
+        moving = jax.device_put(handed, moving_laid, donate=True)
+        stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
+                                 out_shardings=placement, donate_argnums=0)
+        stacked = stacking(moving, jax.device_put(frozen, frozen_laid))
+        # Never one the stacked state holds itself (an input a program hands back as its output).
+        kept = {id(leaf) for leaf in jax.tree.leaves(stacked)}
+        released([leaf for leaf in jax.tree.leaves((moving, handed, given))
+                  if isinstance(leaf, jax.Array) and id(leaf) not in kept])
+        return stacked, placement
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,

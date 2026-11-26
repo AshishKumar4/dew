@@ -19,9 +19,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
-    attention_mosaic_tail as tail,
     mosaic,
-    mosaic_sm90,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import DQ_GRADS, Draw, Kind, by_power
@@ -187,7 +185,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
     dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
     one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
     both fp32: the normalized weights, dropped, and the scaled cotangents. `lean` (the fused launch's): its
-    bf16 cotangents narrowed saturating in one conversion on wgmma (`attention_mosaic_tail.saturated_bf16`);
+    bf16 cotangents narrowed saturating by its family (`Family.formed`, a pair an instruction natively);
     a launch at its registers' edge takes none (the shared-keys dK/dV at width 256 spilled 24 bytes at 255
     with it)."""
     family = walk.program.family
@@ -212,11 +210,11 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         if walk.scaled:
             # Retire prescaled Q registers before scoping dP and free S before allocating dP so peak
             # registers hold even at the deepest ring (0 spills at 231.6 KB SMEM), while overlapping dV
-            # with dP and `_score_cotangents` via `product_with(..., pending=1)` (rows 5272, 11998).
+            # with dP and `_score_cotangents` via `product_with`, dV's group in flight (rows 5272, 11998).
             s = family.registers_product(by_power(family.left_of(q_slot), walk.spec.prescale), held)
             weights, slopes, seen = prepare_weights(s)
             if after_weights is not None and not whole_operands:
-                _, dp = family.product_with(do_slot, values_t, shape, after_weights, pending=1)
+                _, dp = family.product_with(do_slot, values_t, shape, after_weights)
             else:
                 dp = family.product(do_slot, values_t, shape)
         elif stages_weights:
@@ -249,15 +247,21 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                 exps, w = exps * multiplier, w * multiplier
             return exps, w, gradient.pulled(cot, sl, sn, ())[0]
         if masked is None:
+            # The rows read ahead of the branches: a ring's slot a row reads is held by the step's slots
+            # (`rings.Slots`, its first read's), so one read within a branch leaves the next read the branch's
+            # value, a tracer of a trace that has ended (row 13106: a G4's non-causal training step, its
+            # streamed statistics read in the first branch, failed to lower).
+            rows = tuple(_read(row) for row in rows)
             exponentials, weights, cotangents = lax.cond(whole, functools.partial(scores, is_masked=False),
                                                          functools.partial(scores, is_masked=True))
         else:
             exponentials, weights, cotangents = scores(is_masked=masked)
     if whole_operands:
         return weights, cotangents * walk.grad_scale
-    if (lean and q_slot.dtype == jnp.bfloat16 and not walk.interpret
-            and isinstance(family, mosaic_sm90.WgmmaIssuer)):
-        part = tail.saturated_bf16(cotangents * walk.grad_scale)
+    if lean and q_slot.dtype == jnp.bfloat16:
+        # The fast form's one saturating part (`cotangent_parts`'), formed by the family (`Family.formed`:
+        # natively a pair a `cvt.rn.satfinite`, the same bits).
+        (part,) = family.formed(cotangents * walk.grad_scale, 1, walk.interpret)
     else:
         part = mosaic.unscaled_part(*algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype,
                                                              accurate=False))

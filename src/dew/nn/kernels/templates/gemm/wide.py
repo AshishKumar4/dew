@@ -21,6 +21,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates.gemm import quantized
+from dew.nn.kernels.templates.hooks import Hook
 
 GROUP = 32
 """The columns of each run of gate or up columns in a wide matrix (the module's docstring)."""
@@ -68,8 +69,9 @@ class Gated:
     """The epilogue of a wide product (`gated_product`): its accumulator rounded to `dtype`, as the paired
     form rounds the gate's and up's products (`gated_mlp.fused_products`), and their gated product
     `hook(gate, up)` (`activations.gated_hook`) its one output, half its tile's width; `saved`, the rounded
-    product first, whole, a reverse pass's residual. It states its outputs' forms (`out_forms`), which a
-    launch stores them in."""
+    product first, whole, a reverse pass's residual alone (`hooks.Residualized`: written where a derivative
+    is taken, `unsaved` elsewhere). It states its outputs' forms (`out_forms`), which a launch stores them
+    in."""
 
     hook: Callable
     dtype: jnp.dtype
@@ -81,6 +83,15 @@ class Gated:
         return (rounded, hidden) if self.saved else (hidden,)
 
     @property
+    def residuals(self) -> int:
+        """Its outputs a reverse pass alone reads (`hooks.Residualized`): the rounded product, where saved."""
+        return int(self.saved)
+
+    def unsaved(self) -> "Gated":
+        """The epilogue where no derivative is taken: its gated product alone."""
+        return dataclasses.replace(self, saved=False)
+
+    @property
     def out_forms(self) -> tuple:
         """Each output's form (`Hooks.out_forms`): the rounded product a tile of its own, the gated product
         narrowed to half its tile (`quantized.Form.narrowed`)."""
@@ -88,24 +99,27 @@ class Gated:
 
 
 def gated_product(rows: jax.Array, wide: jax.Array, hook: Callable, *, out_dtype, saved: bool = False,
-                  name: str = "gate_up", precision=None,
-                  interpret_on_cpu: bool = False) -> jax.Array | tuple[jax.Array, jax.Array]:
+                  name: str | tuple[str, ...] | None = "gate_up", precision=None,
+                  interpret_on_cpu: bool = False) -> jax.Array:
     """`rows` (`[tokens, in]`) through a gated MLP's gate and up projections held as one wide matrix (`[in, 2
     * hidden]`, their columns interleaved a `GROUP` at a time, `interleaved`): one product, one accumulator,
     whose epilogue writes their gated product `hook(gate, up)` alone (`[tokens, hidden]` in `out_dtype`, each
     projection rounded to it first, as the paired form rounds them, `gated_mlp.fused_products`;
     `activations.gated_hook`), half its tile's width (`Gated`; formulation (C),
-    docs/design/kernel-templates.md §3). `saved`: the rounded wide product too, first (`[tokens, 2 * hidden]`,
-    gate and up interleaved), the reverse pass's residual under `name` (`gemm.gemm`'s `named`, a remat
-    policy's label), from which it forms the gate's and up's cotangents (the hook's VJP) for one input
-    gradient and one kernel gradient of the wide matrix; unsaved, the reverse pass forms the product again.
+    docs/design/kernel-templates.md §3). `saved`: the rounded wide product (`[tokens, 2 * hidden]`, gate and
+    up interleaved) stored too where a derivative is taken, never returned (`Gated.residuals`), the reverse
+    pass's residual under `name` (`gemm.gemm`'s `named`, a remat policy's label; None, unlabelled), from which
+    it forms the
+    gate's and up's cotangents (the hook's VJP) for one input gradient and one kernel gradient of the wide
+    matrix; an inference's launch stores the gated product alone. Unsaved, the reverse pass forms the
+    product again.
     Its route is the dense product's (`grouped_matmul.GROUPED`): the template's launch where it stores the
     narrowed output (`quantized.forms_refusal`), XLA's otherwise, the same function of the product."""
     from dew.nn.kernels import gemm
 
     dtype = jnp.dtype(out_dtype)
     named = (name, None) if saved else ()
-    outs = gemm.gemm(rows, wide, None, epilogue=Gated(hook, dtype, saved), out_dtype=dtype,
+    outs = gemm.gemm(rows, wide, None, epilogue=Hook(Gated(hook, dtype, saved)), out_dtype=dtype,
                      out_dtypes=(dtype,) * (1 + saved), precision=precision,
                      interpret_on_cpu=interpret_on_cpu, named=named)
-    return (outs[0], outs[1]) if saved else outs[0]
+    return outs[0]

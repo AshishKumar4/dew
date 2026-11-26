@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
     emission,
     report,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 KEYS = 256
 SEEDS = 8
@@ -54,7 +55,7 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     if hook == "sinks":
         return template.Hooks(initial=template.sinks(sinks, len(LENGTHS), positions, 64))
     if hook == "softcap":
-        return template.Hooks(template.Capped(2.0))
+        return template.Hooks(score=Hook(template.Capped(2.0)))
     return None
 
 
@@ -419,6 +420,121 @@ def test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_sof
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"template decode resumed over {keys} keys {hook}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_decode_steps_state_near_fp32s_largest_resumes_each_rows_own_output_interpreted():
+    """A decode step's state (`attend`'s `finished=False`) of two rows over four keys of eight that weigh
+    alike at a logit of 2^27, each row's values of one magnitude near fp32's largest (2^127 and 1.5 x 2^127,
+    bf16), resumed over the other four, whose values are zeros: each row's output is half its values', its
+    first four keys' mass against its last four's. The state's numerator, the output times a total of four,
+    passes fp32's largest: held so, both rows resumed as +inf and their outputs were NaN; held a power of
+    two down with its maximum as far up, the maximum rounded the power away at 2^27 and the first keys
+    weighed an eighth of the rest (`attention_decode.resumable`)."""
+    magnitudes = jnp.asarray([2.0**127, 1.5 * 2.0**127], jnp.float32)
+    query = jnp.zeros((2, 1, 8, 64), jnp.bfloat16).at[..., 0].set(1.0)
+    key = jnp.zeros((2, KEYS, 2, 64), jnp.bfloat16).at[..., 0].set(2.0**30)
+    first_values = jnp.broadcast_to(magnitudes[:, None, None, None], (2, KEYS, 2, 64))
+    value = jnp.where(jnp.arange(KEYS)[None, :, None, None] < 4, first_values, 0.0).astype(jnp.bfloat16)
+    lengths, cut = jnp.asarray([8, 8], jnp.int32), jnp.asarray([4, 4], jnp.int32)
+    first = template.spans(1, KEYS, 2, lengths=cut)
+    rest = template.spans(1, KEYS, 2, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(initial=state), interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32),
+                                  np.broadcast_to(np.asarray(magnitudes / 2)[:, None, None, None], out.shape))
+
+
+@INTERPRETS
+def test_a_resumed_decode_state_takes_its_steps_output_hook_at_one_slice_interpreted():
+    """A decode step of 256 rows (one slice: its programs fill the device) resumed from a state over the
+    first four of eight keys that weigh alike, values of one, under an output hook doubling its output:
+    the step's output is two, the hook applied past the merge of the resumed state (`Initial.normalized`),
+    where a hook of no parameters was dropped there and the output was one."""
+    rows = 256
+    query = jnp.zeros((rows, 1, 4, 64), jnp.bfloat16)
+    key = jnp.zeros((rows, KEYS, 4, 64), jnp.bfloat16)
+    value = jnp.ones((rows, KEYS, 4, 64), jnp.bfloat16)
+    lengths, cut = jnp.full((rows,), 8, jnp.int32), jnp.full((rows,), 4, jnp.int32)
+    first = template.spans(1, KEYS, rows, lengths=cut)
+    rest = template.spans(1, KEYS, rows, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(
+            initial=state, output=Hook(lambda o: o * 2.0)), interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), 2.0)
+
+
+def test_a_resumed_decode_state_is_no_walks_initial_state():
+    """A resumed decode state holds its output (`Initial.normalized`), which no walk resumes from (each
+    reads its numerator): the template's route, its reference, the Mosaic forward's certify form and the
+    Triton forward's fitting refuse it, as the decode step alone merges it past its own walk; a numerator
+    held read four keys of value two as one quarter of their output."""
+    import functools
+
+    from dew.nn.kernels.templates import attention_mosaic, attention_route, attention_triton
+
+    query = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    key = value = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    spans = template.spans(4, 4, 1)
+    state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 4.0), jnp.full((1, 2, 4, 64), 2.0),
+                             normalized=True)
+    walks = (attention_route.attend, template.reference, attention_mosaic.certified,
+             functools.partial(attention_triton.unfitted, certified=True))
+    with generation.assumed("sm90"):
+        for walk in walks:
+            with pytest.raises(ValueError):
+                walk(query, key, value, spans, template.Hooks(initial=state))
+
+
+def test_a_resumed_decode_state_is_no_backwards_initial_state():
+    """A resumed decode state (`Initial.normalized`) is refused by every standalone backward given the
+    forward's residuals, as by every walk: the route's, the Triton mainloop's and its certified fitting, the
+    portable one's and Mosaic GPU's binding. Taken, the state's gradient divided its output by its total a
+    second time (an output of 6 over a total of 3 weighed as 2, train 1318's review)."""
+    from dew.nn.kernels.templates import (
+        attention_mosaic,
+        attention_portable,
+        attention_route,
+        attention_triton,
+    )
+
+    query = key = value = dout = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    spans = template.spans(4, 4, 1)
+    state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 3.0), jnp.full((1, 2, 4, 64), 6.0),
+                             normalized=True)
+    residuals = (jnp.zeros((1, 2, 4)), jnp.ones((1, 2, 4)), None, None)
+    hooks = template.Hooks(initial=state)
+    tiles = attention_portable.Tiles(16, 16, 16)
+    backwards = (
+        lambda: attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals),
+        lambda: attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals),
+        lambda: attention_portable.backward(tiles, query, key, value, spans, hooks, dout,
+                                            residuals=residuals),
+        lambda: attention_triton.backward_unfitted(query, key, value, spans, hooks, dout, residuals=residuals,
+                                                   certified=True),
+        lambda: attention_mosaic._backward_call(query, key, value, spans, hooks, dout, residuals, scale=None,
+                                                natural=False, accurate=False))
+    with generation.assumed("sm90"):
+        for backward in backwards:
+            with pytest.raises(ValueError):
+                backward()
+
+
+def test_a_resumed_states_output_spans_fp32s_range_as_its_finish_held_it():
+    """A finished state whose output holds fp32's largest and least magnitudes in one row (2^127 and
+    2^-149) over a total of four, resumed (`attention_decode.resumable`) and taken back as a merge takes an
+    initial state (`algebra.initial_state`), gives its output back bit for bit: its numerator would pass
+    fp32 at the large channel (2^129) and a power of two taken off it flushed the small one (2^-150)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=8, scale=1.0))
+    output = jnp.asarray([[[2.0**127, 2.0**-149]]], jnp.float32)
+    state = algebra.Partial(output, jnp.zeros((1, 1), jnp.float32), jnp.full((1, 1), 4.0, jnp.float32))
+    resumed = attention_decode.resumable(spec, state)
+    back = algebra.initial_state(spec, resumed, normalized=True)
+    np.testing.assert_array_equal(np.asarray(back.acc), np.asarray(output))
 
 
 @INTERPRETS
@@ -1067,6 +1183,26 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
+def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
+    """A one-row decode walk over 32768 keys, 32 heads over 8 key heads 64 wide in bf16, on an RTX PRO 6000,
+    whose multiprocessor states no issue interval: its issued price (`MosaicForward.price_config`'s
+    `issued`, the decode planner's) is unknown, where priced at its bytes alone it was level over every slice
+    count and the planner took two of them, 16 programs on 188 multiprocessors (M-NA-35-decodec-g4: 281 of
+    a step's 288 us); its unissued price still its own."""
+    target = generation.gpu_target("NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    query = jax.ShapeDtypeStruct((1, 1, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 32768, 8, 64), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, 32768, 1)
+    op, ba = attention_decode._bound(query, key, key, spans, None, scale=None, table=None, sources=None,
+                                     scales=None, splits=4, chosen=attention_decode.WALKS["plain"],
+                                     in_key=False)
+    with generation.assumed(target):
+        tiles = op.derived(ba, target)
+        assert tiles is not None
+        assert op.price_config(ba, tiles, target, issued=True) is None
+        assert op.price_config(ba, tiles, target) is not None
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
@@ -1186,6 +1322,17 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
 
 
+def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
+    """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
+    (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at
+    width 64 on 4 slices walked 30.9 us at K128 and 37.2 at K64 (M-NA-27c-gh200), which its walk prices
+    alike."""
+    small, large = (attention_mosaic.Tiles(16, block_k, 3, 1, family="mma.sync.fed") for block_k in (64, 128))
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0, (8, large): 1.0}) == (4, large)
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0 + 2.0**-20}) == (4, small)
+    assert attention_decode.least_plan({(2, small): 1.0, (4, large): 1.0}) == (2, small)
+
+
 def _query_gated(o, q_p):
     """An output hook of a `Kind.QUERY` parameter, its tile's `[rows, 1]` query values (row 5385's shape)."""
     assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
@@ -1196,7 +1343,7 @@ def _query_gated(o, q_p):
 @pytest.mark.parametrize("kind", ["stateless", "head", "query", "output"])
 @pytest.mark.parametrize("mode", ["single", "split"])
 def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kind, mode):
-    """Row 5385: `attention_decode.attend` admits and fuses `output_mod` (`stateless`, `Kind.HEAD`,
+    """Row 5385: `attention_decode.attend` admits and fuses an output hook (`stateless`, `Kind.HEAD`,
     `Kind.QUERY`, and `Kind.OUTPUT` bf16 gate) on both single-slice (`at.slices == 1`, fused in
     `MosaicForward`) and split-KV (`at.slices > 1`, fused in `merged.merged_finished`) GQA decode steps,
     matching `template.reference` under check 1, and rejects `finished=False` or unsupported kinds."""
@@ -1223,15 +1370,15 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
 
     def hooks_of(*extra):
         if kind == "stateless":
-            return template.Hooks(initial=initial, output_mod=lambda o: jnp.tanh(o * 0.5))
+            return template.Hooks(initial=initial, output=Hook(lambda o: jnp.tanh(o * 0.5)))
         if kind == "head":
-            return template.Hooks(initial=initial, output_mod=lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
-                                  output_params=(template.Param(extra[0], template.Kind.HEAD),))
+            return template.Hooks(initial=initial, output=Hook(lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
+                                                               (Side(extra[0], template.Kind.HEAD),)))
         if kind == "query":
-            return template.Hooks(initial=initial, output_mod=_query_gated,
-                                  output_params=(template.Param(extra[0], template.Kind.QUERY),))
-        return template.Hooks(initial=initial, output_mod=lambda o, g: o * jax.nn.sigmoid(g),
-                              output_params=(template.Param(extra[0], template.Kind.OUTPUT),))
+            return template.Hooks(initial=initial,
+                                  output=Hook(_query_gated, (Side(extra[0], template.Kind.QUERY),)))
+        return template.Hooks(initial=initial, output=Hook(lambda o, g: o * jax.nn.sigmoid(g),
+                                                           (Side(extra[0], template.Kind.OUTPUT),)))
 
     def ours(q, k, v, *extra):
         with generation.assumed("sm90"):
@@ -1241,10 +1388,11 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
         hooks = hooks_of(*extra)
         wide = jnp.promote_types(q.dtype, jnp.float32)
         wide_params = tuple(
-            template.Param(p.value.astype(jnp.promote_types(p.value.dtype, wide))
-                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.kind)
-            for p in hooks.output_params)
-        return template.reference(q, k, v, spans, dataclasses.replace(hooks, output_params=wide_params))
+            Side(p.value.astype(jnp.promote_types(p.value.dtype, wide))
+                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.axes)
+            for p in hooks.output.sides)
+        return template.reference(q, k, v, spans, dataclasses.replace(
+            hooks, output=dataclasses.replace(hooks.output, sides=wide_params)))
 
     sample = draw(0)
     assert attention_decode.packable(hooks_of(*sample[3:]))
@@ -1257,11 +1405,8 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
 
     if kind == "output" and mode == "single":
         assert not attention_decode.packable(
-            template.Hooks(output_params=(template.Param(sample[3], template.Kind.OUTPUT),)))
-        assert not attention_decode.packable(
-            template.Hooks(output_mod=lambda o, x: o + x,
-                           output_params=(template.Param(jnp.zeros((batch, heads, keys)),
-                                                         template.Kind.KEY),)))
+            template.Hooks(output=Hook(lambda o, x: o + x, (Side(jnp.zeros((batch, heads, keys)),
+                                                                 template.Kind.KEY),))))
         with generation.assumed("sm90"), pytest.raises(ValueError):
             attention_decode.attend(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]),
                                     interpret=True, finished=False)
@@ -1294,8 +1439,8 @@ def _hooked_step(step: str) -> tuple:
         sinks = jnp.zeros((8,), jnp.float32)
 
         def gated(q_in, k_in, v_in, g_in):
-            hooks = template.Hooks(initial=template.sinks(sinks, batch, 1, 128), output_mod=_gated,
-                                   output_params=(template.Param(g_in, template.Kind.OUTPUT),))
+            hooks = template.Hooks(initial=template.sinks(sinks, batch, 1, 128),
+                                   output=Hook(_gated, (Side(g_in, template.Kind.OUTPUT),)))
             return attention_decode.attend(q_in, k_in, v_in, spans, hooks, interpret=False)
 
         return gated, (q, k, k, q), _gated if step == "split" else None
@@ -1308,7 +1453,7 @@ def _hooked_step(step: str) -> tuple:
     spans = template.spans(1, 256, 32, causal=False)
 
     def deferred(q_in, k_in, v_in, p_in):
-        hooks = template.Hooks(output_mod=mod, output_params=(template.Param(p_in, kind),))
+        hooks = template.Hooks(output=Hook(mod, (Side(p_in, kind),)))
         return attention_decode.attend(q_in, k_in, v_in, spans, hooks, interpret=False)
 
     return deferred, (q, k, k, param), mod
@@ -1382,7 +1527,7 @@ def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
     k_s = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.bfloat16)
     sp_s = template.spans(1, 4096, 1, lengths=jnp.array([4096], jnp.int32))
     op_cap, _ = attention_mosaic._forward_call(
-        q_s, k_s, k_s, sp_s, template.Hooks(cap), scale=64 ** -0.5, natural=False)
+        q_s, k_s, k_s, sp_s, template.Hooks(score=Hook(cap)), scale=64 ** -0.5, natural=False)
     prepared_spec = algebra.Forward("spans", 4096, ids=False, scale=64 ** -0.5,
                                     score_mod=op_cap.score_mod, natural=False)
     assert prepared_spec.base2 and not prepared_spec.reaches and not prepared_spec.raw
@@ -1420,7 +1565,7 @@ def test_a_folded_cap_and_a_state_resumed_at_it_hold_one_logit():
 
 def _softcap_or_windowed(case: str) -> tuple:
     """`test_softcap_and_windowed_decode_compile_spill_free`'s call `case` and its operands."""
-    capped = template.Hooks(template.Capped(30.0))
+    capped = template.Hooks(score=Hook(template.Capped(30.0)))
     if case == "softcap-d64-decode":
         spans = template.spans(1, 32768, 32, lengths=jnp.full((32,), 32768, jnp.int32))
         operands = (jax.ShapeDtypeStruct((32, 1, 32, 64), jnp.bfloat16),

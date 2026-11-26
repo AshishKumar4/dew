@@ -6,7 +6,7 @@ from types import MappingProxyType
 
 from dew import _records
 from dew.interop.config_records import NativeFields
-from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table, mapped
+from dew.interop.layouts import ConfigField, ConfigLayout, Route, Table, mapped
 from dew.nn.activations import HIDDEN_ACT
 from dew.nn.vision.lfm3 import Lfm3VlProjector, Lfm3VlVision
 from dew.registry import Record, towers
@@ -16,8 +16,8 @@ from .common import (
     TowerLayout,
     _vision_section,
     activation_name,
+    axial_rope_part,
     block_routes,
-    rope_base,
     tensor_routes,
 )
 
@@ -64,26 +64,11 @@ def _stated(key: str, parse) -> ConfigField:
                        parse=lambda value, key: default if value is None else parse(value, key))
 
 
-def _read_rope(vision: Mapping[str, object], used: set[str],
-               record: NativeFields[Lfm3VlVision]) -> NativeFields[Lfm3VlVision]:
-    """The axial rotary's base: LFM3-VL's trunk turns no other."""
-    used.update(("rope_parameters", "rope_theta"))
-    rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
-    if rope.get("rope_type", "axial") != "axial":
-        raise ValueError(f"LFM3-VL's trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
-    record["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, Lfm3VlVision.rope_theta, axial=True)
-    return record
-
-
-def _write_rope(tower: Lfm3VlVision) -> Mapping[str, object]:
-    return {"rope_parameters": {"rope_type": "axial", "rope_theta": tower.rope_theta}}
-
-
 _LFM3_CONFIG = ConfigLayout(
     *(_stated(name, _records.integer) for name in _INTEGERS), _stated("norm_eps", _records.number),
     ConfigField("layer_types", "layer_types", None,
                 parse=lambda value, key: _records.strings(value, key) if value else None),
-    ConfigPart(_read_rope, _write_rope))
+    axial_rope_part(Lfm3VlVision.rope_theta, "LFM3-VL"))
 """An Lfm3VlVisionConfig's fields, both ways: those it states, the value's own defaults for the rest
 (its cadence over the depth among them, `Lfm3VlVision.kinds`)."""
 

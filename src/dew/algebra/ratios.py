@@ -17,7 +17,7 @@ import numpy as np
 from jax.interpreters import ad, batching
 from jax.sharding import PartitionSpec
 
-from dew.algebra import scaled
+from dew.algebra import bands, scaled, windows
 from dew.algebra.windows import (
     Units,
     _arrays,
@@ -32,6 +32,8 @@ from dew.algebra.windows import (
     _without_axis,
     chunk_width,
 )
+from dew.nn.float_bits import raw_fields
+from dew.nn.precision import at_least_fp32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,7 +41,8 @@ class Ratio:
     """A ratio of sums of products of float operands (`ratio_p`): `sum numerator / sum denominator`, each a
     tuple of terms `(coefficient, factors)`, a factor `("v", i)` operand `i`, `("e", i, j)` the factor
     `exp(s (operand_i - operand_j))` of `units` (`_factors_value`) or `("s",)` the units' scale `s` in the
-    operands' format. The numerator is summed over the operands' `axis` where `reduced` (the result without
+    operands' format, or `("m", i)` a held zero/one term mask. The numerator is summed over the operands'
+    `axis` where `reduced` (the result without
     it), else taken a state at a time; the denominator is always summed over it (none: one). The numerator
     is summed too over `over`, further axes of the operands' domain, each term over its own extent there (a
     term of none counted once), the result one along them: a transpose's cotangent summed over the axes its
@@ -53,6 +56,10 @@ class Ratio:
     `Summed`), its `numerator` then none: a derivative's whose denominator moves, `(dP D - q P dD) / D^(q+1)`
     (`_ratio_jvp`), each sum formed once, unlanded, so no quotient is landed apart from the terms it cancels
     against (the merge P0's base review 9, F2: a landed quotient of 2^-156 lost the derivative's -2^-66).
+    With track_directions, a single affine direction is streamed with its coefficients. Independent
+    directional sums keep their dyadic bands until all products have met the final reduction.
+    A plain product sum can retain IEEE nonfinite terms rather than annihilate them with zero
+    (ieee_products, a portable recurrence pairing). This choice follows the term through AD.
     A zero lands as +0. A value (`scaled._valued`)."""
 
     numerator: tuple
@@ -64,6 +71,9 @@ class Ratio:
     across: tuple[int, ...] = ()
     power: int = 1
     products: tuple = ()
+    track_directions: bool = False
+    directions: tuple[int, ...] = ()
+    ieee_products: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,6 +146,162 @@ def _ratio_sums(operands, form: Ratio):
     return numerator, (made[0] if form.denominator else None)
 
 
+def _product_of(coefficient, sums, values, dtype):
+    fraction, power = math.frexp(coefficient)
+    if sums and abs(fraction) == 0.5:
+        hi, lo, exponent = values[sums[0]]
+        sums = sums[1:]
+        if fraction < 0:
+            hi, lo = -hi, -lo
+        product = hi, lo, exponent if power == 1 else exponent + (power - 1)
+    else:
+        product = (jnp.asarray(2 * fraction, dtype), jnp.zeros((), dtype), jnp.asarray(power - 1, jnp.int32))
+    for each in sums:
+        product = _times(product, values[each])
+    return product
+
+
+def _carries_direction(each: Summed, active: frozenset[int]) -> bool:
+    return each.reduced and not each.over and any(
+        active.intersection(factor[1:]) for _, factors in each.terms for factor in factors)
+
+
+def _directional_sums(form: Ratio) -> tuple[Summed, ...]:
+    """Keep independent direction sums, and sums that a pullback subtracts from entrywise values."""
+    active = frozenset(form.directions)
+    sums = [tuple(each for each in term if _carries_direction(each, active)) for _, term in form.products]
+    if form.reduced and not any(len(term) > 1 for term in sums):
+        return ()
+    return tuple(dict.fromkeys(each for term in sums for each in term))
+
+
+def _directional_products(form: Ratio):
+    """Each product's one affine sum, separated from its coefficients."""
+    if not form.reduced or not any(form.directions):
+        return ()
+    active = frozenset(form.directions)
+    plans = []
+    for coefficient, sums in form.products:
+        chosen = tuple(at for at, each in enumerate(sums) if _carries_direction(each, active))
+        if len(chosen) != 1:
+            return ()
+        (at,) = chosen
+        plans.append((coefficient, sums[at], sums[:at] + sums[at + 1:]))
+    return plans
+
+
+def _directions_summed(plans, values, arrays, count: int, rank: int, form: Ratio, dtype):
+    """Cancel a linear direction's coefficients before reducing across samples."""
+    load, chunks = arrays
+    summed = [(_Sum(direction.terms, form.axis, (), count), tuple(jnp.expand_dims(part, form.axis)
+               for part in _product_of(coefficient, sums, values, dtype)))
+              for coefficient, direction, sums in plans]
+
+    def summands_of(chunk):
+        inputs, valid = load(chunk)
+        factors = windows._factor_values(inputs, form.units, rank)
+        terms = []
+        for each, multiplier in summed:
+            for parts in each._placed_summands(inputs, factors, valid, dtype, empty_exponent=0):
+                hi, lo, exponent = _times(parts, multiplier)
+                terms.append((hi, lo, jnp.where(hi != 0, exponent, windows._NONE)))
+        return [jax.lax.optimization_barrier(tuple(terms))]
+
+    bits = (count * sum(len(each.terms) for each, _ in summed)).bit_length()
+    (value,) = windows._windows(summands_of, chunks, [(form.axis,)], [bits], dtype)
+    return tuple(jnp.squeeze(part, form.axis) for part in value)
+
+
+def _banded_sums(expanded: tuple[Summed, ...], arrays, count: int, rank: int, form: Ratio, dtype):
+    """Keep each directional sum's bins separate, sharing factors and digit extraction across sums
+    that have the same number of terms. The common grid encloses every sum in a group."""
+    load, chunks = arrays
+    number = scaled.format_of(dtype)
+    capacity = min(jnp.iinfo(jnp.int32).bits - 1, number.mantissa + 1)
+    groups: dict[int, list[Summed]] = {}
+    for each in expanded:
+        groups.setdefault(len(each.terms), []).append(each)
+    made = {}
+    for size, group in groups.items():
+        terms_per_bin = 2 * count * size
+        width = max(1, min(16, capacity - terms_per_bin.bit_length()))
+        powers = [(math.frexp(coefficient)[1], len(factors))
+                  for each in group for coefficient, factors in each.terms]
+        lower = min(exponent - (degree + 2) * number.reach - number.mantissa for exponent, degree in powers)
+        upper = max(exponent + (degree + 1) * (number.largest + 2) for exponent, degree in powers)
+        may_round = terms_per_bin * ((1 << width) - 1) > 1 << (number.mantissa + 1)
+        summations = tuple(_Sum(each.terms, form.axis, (), count) for each in group)
+
+        def terms(chunk, summations=summations):
+            inputs, valid = load(chunk)
+            factors = windows._factor_values(inputs, form.units, rank)
+            terms_by_sum = [each._placed_summands(inputs, factors, valid, dtype, empty_exponent=0)
+                            for each in summations]
+            if len(terms_by_sum) == 1:
+                return terms_by_sum[0]
+            return tuple(tuple(jnp.stack(jnp.broadcast_arrays(*part), axis=-1)
+                               for part in zip(*pieces, strict=True))
+                         for pieces in zip(*terms_by_sum, strict=True))
+
+        placed, live = bands.summed(terms, chunks, axis=form.axis, width=width, lower=lower,
+                                    bins=(upper - lower) // width + 1, dtype=dtype, may_round=may_round)
+        if len(group) == 1:
+            made[group[0]] = placed, live
+        else:
+            for at, each in enumerate(group):
+                made[each] = tuple(part[..., at, :] for part in placed), live[..., at]
+    return made
+
+
+def _band_products(products, values, expanded, dtype):
+    """Multiply independent sums over their bin combinations, without materializing a sample grid."""
+    plans = [(coefficient, sums, math.prod(expanded[each][1] for each in sums if each in expanded),
+              math.prod(expanded[each][0][0].shape[-1] for each in sums if each in expanded))
+             for coefficient, sums in products]
+    length = max(bound for _, _, _, bound in plans)
+    width = chunk_width(length)
+    live_length = functools.reduce(jnp.maximum,
+                                   [jnp.max(jnp.asarray(steps), initial=0) for _, _, steps, _ in plans])
+
+    def stacked(arrays):
+        return jnp.stack(jnp.broadcast_arrays(*arrays), axis=-2)
+
+    def block(chunk):
+        term = chunk * width + jnp.arange(width, dtype=jnp.int32)
+        by_arity: dict[int, list] = {}
+        for coefficient, sums, steps, _ in plans:
+            taken = []
+            index = term
+            for each in sums:
+                if each in expanded:
+                    parts, count = expanded[each]
+                    index, pos = jnp.divmod(index, jnp.maximum(count[..., None], 1))
+                    taken.append(tuple(jnp.take_along_axis(part, pos, axis=-1) for part in parts))
+                else:
+                    taken.append(tuple(part[..., None] for part in values[each]))
+            first = _product_of(coefficient, (0,) if taken else (), taken, dtype)
+            by_arity.setdefault(len(taken), []).append((term < jnp.asarray(steps)[..., None],
+                                                        (first, *taken[1:])))
+        found = []
+        # One multiplier per factor position and arity. A separate multiplier graph per product
+        # duplicates compensated arithmetic in both passes of every window and for every derivative.
+        for group in by_arity.values():
+            masks, factors = zip(*group, strict=True)
+            operands = [tuple(stacked(arrays) for arrays in zip(*factor, strict=True))
+                        for factor in zip(*factors, strict=True)]
+            hi, lo, exponent = functools.reduce(_times, operands)
+            live = stacked(masks) & (hi != 0)
+            found.append((jnp.where(live, hi, 0), jnp.where(live, lo, 0),
+                          jnp.where(live, exponent, windows._NONE)))
+        return [jax.lax.optimization_barrier(tuple(found))]
+
+    rank = next(iter(expanded.values()))[0][0].ndim - 1
+    axes = (rank, rank + 1)
+    bits = sum(bound for _, _, _, bound in plans).bit_length()
+    (value,) = windows._windows(block, (live_length + width - 1) // width, [axes], [bits], dtype)
+    return tuple(jnp.squeeze(part, axes) for part in value)
+
+
 def _products_summed(operands, form: Ratio):
     """A numerator of products of sums (`Ratio.products`) and its denominator's sum, each `(high, low,
     exponent)` (`_ratio_sums`'s): each distinct sum formed once (`_streamed`: those over the states in one
@@ -148,13 +314,17 @@ def _products_summed(operands, form: Ratio):
     count = -(-states // chunk_width(states)) * chunk_width(states)
     # The denominator's own sum where a product takes it (the quotient rule's `D`), formed once for both.
     own = Summed(form.denominator, reduced=True) if form.denominator else None
-    distinct = list(dict.fromkeys(each for _, sums in form.products for each in sums))
+    expanded = _directional_sums(form)
+    directional = () if expanded else _directional_products(form)
+    products = (sums for _, _, sums in directional) if directional else (sums for _, sums in form.products)
+    distinct = list(dict.fromkeys(each for sums in products for each in sums if each not in expanded))
     reduced = [each for each in distinct if each.reduced and each != own]
     entrywise = [each for each in distinct if not each.reduced]
     over_states = [_Sum(each.terms, form.axis, each.over, count) for each in reduced]
     if form.denominator:
         over_states.append(_Sum(form.denominator, form.axis, (), count))
-    made = _streamed(*_arrays(laid, form.axis), over_states, form.units) if over_states else []
+    arrays = _arrays(laid, form.axis)
+    made = _streamed(*arrays, over_states, form.units) if over_states else []
     values = dict(zip(reduced, made[:len(reduced)], strict=True))
     denominator = None
     if own is not None:
@@ -166,14 +336,16 @@ def _products_summed(operands, form: Ratio):
     if not form.reduced:
         values = {each: tuple(jnp.expand_dims(part, form.axis) for part in value) if each.reduced else value
                   for each, value in values.items()}
-    dtype = laid[0].dtype
-    products = []
-    for coefficient, sums in form.products:
-        fraction, power = math.frexp(coefficient)
-        product = (jnp.asarray(2 * fraction, dtype), jnp.zeros((), dtype), jnp.asarray(power - 1, jnp.int32))
-        for each in sums:
-            product = _times(product, values[each])
-        products.append(product)
+    dtype = at_least_fp32(laid[0].dtype)
+    if expanded:
+        values_by_band = _banded_sums(expanded, arrays, count, rank, form, dtype)
+        if not form.reduced:
+            values_by_band = {each: jax.tree.map(lambda part: jnp.expand_dims(part, form.axis), band)
+                              for each, band in values_by_band.items()}
+        return _band_products(form.products, values, values_by_band, dtype), denominator
+    if directional:
+        return _directions_summed(directional, values, arrays, count, rank, form, dtype), denominator
+    products = [_product_of(coefficient, sums, values, dtype) for coefficient, sums in form.products]
     if len(products) == 1:
         return products[0], denominator
     # The products summed as a sum's terms are (`_quotients_summed`, banded and compensated), each unlanded:
@@ -208,11 +380,41 @@ def _ratio_sum(operands, form: Ratio):
 
 
 
+def _exceptional_products(operands, form: Ratio, rank: int):
+    """IEEE nonfinite products, summed on the same axes as the plain product sum."""
+    held = []
+    for operand in operands:
+        laid = _laid_to(operand, rank)
+        finite = jnp.isfinite(laid)
+        _, _, exponent, mantissa = raw_fields(laid)
+        sign = jnp.copysign(jnp.where((exponent == 0) & (mantissa == 0), 0.0, 1.0), laid)
+        held.append((finite, jnp.where(finite, sign, laid)))
+    axes = (*form.over, form.axis) if form.reduced else form.over
+    terms = []
+    for coefficient, factors in form.numerator:
+        values = [held[index] for kind, index in factors if kind != "m"]
+        exceptional = ~functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        for kind, index in factors:
+            if kind == "m":
+                exceptional = exceptional & (_laid_to(operands[index], rank) != 0)
+        sign = functools.reduce(jnp.multiply, (value for _, value in values), coefficient)
+        terms.append(jnp.sum(jnp.where(exceptional, sign, 0.0), axis=axes, keepdims=True))
+    total = functools.reduce(jnp.add, terms)
+    total = jnp.sum(total, axis=form.across, keepdims=True)
+    return jnp.squeeze(total, form.axis) if form.reduced else total
+
+
 def _ratio_value(*operands, form: Ratio):
     """A ratio's value (`Ratio`): its sum (`_ratio_sum`) landed once (`_landed`), over its operands' whole
     extent (`_ratio_abstract`'s), each of its sums broadcast to it."""
-    landed = _landed(_ratio_sum(operands, form), operands[0].dtype)
     rank = max(operand.ndim for operand in operands)
+    if form.ieee_products:
+        finite = tuple(jnp.where(jnp.isfinite(operand), operand, 0.0) for operand in operands)
+        total = _landed(_ratio_sum(finite, form), operands[0].dtype)
+        special = _exceptional_products(operands, form, rank)
+        landed = jnp.where(jnp.isfinite(special), total, special)
+    else:
+        landed = _landed(_ratio_sum(operands, form), operands[0].dtype)
     shape = np.broadcast_shapes(*(_laid_to(operand, rank).shape for operand in operands))
     whole = tuple(1 if place in (*form.over, *form.across) else size for place, size in enumerate(shape)
                   if not (form.reduced and place == form.axis))
@@ -266,7 +468,7 @@ def _derived(term, tangent_of: dict[int, int]) -> list:
     coefficient, factors = term
     made = []
     for place, factor in enumerate(factors):
-        if factor[0] == "s":
+        if factor[0] in ("s", "m"):
             continue
         if factor[0] == "v":
             if factor[1] in tangent_of:
@@ -311,6 +513,7 @@ def _compacted(operands: list, form: Ratio):
     return ([operands[index] for index in sorted(read)],
             dataclasses.replace(form, numerator=_remapped(form.numerator, to),
                                 denominator=_remapped(form.denominator, to),
+                                directions=tuple(to(i) for i in form.directions if i in read),
                                 products=tuple((coefficient, tuple(dataclasses.replace(
                                     each, terms=_remapped(each.terms, to)) for each in sums))
                                     for coefficient, sums in form.products)))
@@ -362,8 +565,9 @@ def _ratio_jvp(primals, tangents, *, form: Ratio):
     products = _canonical(products)
     if not products:
         return value, ad.Zero(jax.typeof(value).to_tangent_aval())
+    directions = (*form.directions, *tangent_of.values()) if form.track_directions else ()
     derived_form = _classic(dataclasses.replace(form, numerator=(), products=products,
-                                                power=form.power + bool(moved)))
+                                                power=form.power + bool(moved), directions=directions))
     return value, ratio(operands, derived_form)
 
 
@@ -450,7 +654,8 @@ def _cotangent_of(index: int, aval, form: Ratio, full: list, held: int, rank: in
         raise TypeError("a ratio's operand is summed over other axes in one product than in another")
     (own_axes,) = reduced
     fresh = {axis: rank + place for place, axis in enumerate(own_axes)}
-    outside = functools.partial(_taken_apart, full, fresh, {})
+    moved: dict[int, int] = {}
+    outside = functools.partial(_taken_apart, full, fresh, moved)
     denominator_terms = outside(form.denominator)
     cotangent_at = _moved_apart(full, held, fresh) if fresh else held
     # Each product's terms holding the operand, it replaced: by the cotangent where the product's value at a
@@ -494,7 +699,9 @@ def _cotangent_of(index: int, aval, form: Ratio, full: list, held: int, rank: in
         return None
     transposed = _classic(dataclasses.replace(
         form, numerator=(), denominator=denominator_terms, products=products, reduced=False, over=within,
-        across=(*(axis for axis in broadcast if axis not in within), *fresh.values())))
+        across=(*(axis for axis in broadcast if axis not in within), *fresh.values()),
+        directions=tuple(direction for i in form.directions if i != index
+                         for direction in ((i, moved[i]) if i in moved else (i,)))))
     made = ratio(full, transposed)
     # Laid to the ratio's rank: along a fresh axis (a sum's channels', `_apart_axes`, or the operand's sum's,
     # summed across) the value one or broadcast, so its first place is the whole.

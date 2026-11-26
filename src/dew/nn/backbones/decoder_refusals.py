@@ -27,7 +27,19 @@ def mixed_admission(decoder: CausalTransformer) -> str | None:
     if decoder.engram is not None:
         return ("an n-gram reads the tokens before each in its row, which the mixed call's row of every "
                 "slot's tokens holds apart")
-    return _layer(decoder, lambda mixer, context: mixer.mixed_refusal(context))
+    return _convolved(decoder, "a short convolution's history is its row's, which the mixed call's row "
+                               "of every slot's tokens holds apart") or _layer(
+        decoder, lambda mixer, context: mixer.mixed_refusal(context))
+
+
+def _convolved(decoder: CausalTransformer, why: str) -> str | None:
+    """"layer i: `why`" for the first layer whose kind convolves its mixer's or its feed-forward's output
+    (`LayerKind.mixer_conv`, `LayerKind.feedforward_conv`), or None."""
+    for index, kind in enumerate(decoder.per_layer_types):
+        held = decoder.kind_of(kind)
+        if held.mixer_conv is not None or held.feedforward_conv is not None:
+            return f"layer {index}: {why}"
+    return None
 
 
 def generation(decoder: CausalTransformer) -> str | None:
@@ -91,7 +103,8 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
         return "dropout draws each row's masks apart, which a shared prefix draws once"
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
         return refusal
-    return _layer(decoder, lambda mixer, _: mixer.fork_refusal())
+    return _convolved(decoder, "a short convolution reads each document's own inputs, none of a fork's "
+                               "parent's") or _layer(decoder, lambda mixer, _: mixer.fork_refusal())
 
 
 def prefix_sharing(decoder: CausalTransformer, train: bool = False) -> str | None:

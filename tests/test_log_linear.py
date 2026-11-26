@@ -46,7 +46,7 @@ def naive(query, key, value, g, level_scales, *, starts=None):
         return jnp.concatenate(pieces)
     length = query.shape[1]
     work = jnp.promote_types(value.dtype, jnp.float32)
-    q, k = (jnp.repeat(x.astype(work), HEADS // GROUPS, axis=2) for x in (query, key))
+    q, k = (jnp.repeat(x.astype(work), value.shape[2] // query.shape[2], axis=2) for x in (query, key))
     running = jnp.cumsum(g.astype(work), axis=1).transpose(0, 2, 1)
     causal = np.tril(np.ones((length, length), bool))
     decay = jnp.exp(jnp.where(causal, running[..., :, None] - running[..., None, :], -jnp.inf))
@@ -57,16 +57,16 @@ def naive(query, key, value, g, level_scales, *, starts=None):
     return (jnp.einsum('bhlc,bchp->blhp', scores, value.astype(work)) * WIDTH ** -0.5).astype(value.dtype)
 
 
-def draw(seed: int):
-    """fp32 operands from `seed`: unit queries and keys, a log decay `log sigmoid`, level weights about
-    one, and a cotangent of the output."""
+def draw(seed: int, groups: int = GROUPS, heads: int = HEADS):
+    """fp32 operands from `seed`, `groups` key heads serving `heads` value heads: unit queries and keys, a
+    log decay `log sigmoid`, level weights about one, and a cotangent of the output."""
     normal = np.random.default_rng([seed, 3]).standard_normal
-    q, k = (normal((ROWS, LENGTH, GROUPS, WIDTH)) for _ in range(2))
+    q, k = (normal((ROWS, LENGTH, groups, WIDTH)) for _ in range(2))
     q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
-    v = normal((ROWS, LENGTH, HEADS, VALUES))
-    g = np.log(sigmoid(normal((ROWS, LENGTH, HEADS)) + 2.0))
-    weights = 1.0 + 0.3 * normal((ROWS, LENGTH, HEADS, levels(LENGTH)))
-    return *(hosted(x) for x in (q, k, v, g, weights)), hosted(normal((ROWS, LENGTH, HEADS, VALUES)))
+    v = normal((ROWS, LENGTH, heads, VALUES))
+    g = np.log(sigmoid(normal((ROWS, LENGTH, heads)) + 2.0))
+    weights = 1.0 + 0.3 * normal((ROWS, LENGTH, heads, levels(LENGTH)))
+    return *(hosted(x) for x in (q, k, v, g, weights)), hosted(normal((ROWS, LENGTH, heads, VALUES)))
 
 
 @pytest.mark.parametrize('packed', (False, True))
@@ -80,6 +80,38 @@ def test_the_masked_form_is_as_exact_as_flas_level_by_level(packed):
         log_linear_attention
     assert_packed_on_par(dew, naive, draw, 'log-linear attention', packed=packed, documents=DOCUMENTS,
                          length=LENGTH, seeds=SEEDS[packed])
+
+
+def test_key_heads_serve_their_own_value_heads_packed():
+    """Two key heads, each serving two value heads, over packed documents: the output and every operand's
+    gradient on par with fla's reference (check 1), so each value head reads its own key head's scores
+    (the within-block scores formed once a key head, its value heads mapped inside it: head `g H/G + p`)."""
+    dew = functools.partial(log_linear_attention, max_segments=max(map(len, DOCUMENTS)))
+    assert_packed_on_par(dew, naive, functools.partial(draw, groups=2, heads=4),
+                         'log-linear attention, two key heads', packed=True, documents=DOCUMENTS,
+                         length=LENGTH, seeds=SEEDS[True])
+
+
+def _two_tokens(weights, values=(1.0, 1.0)):
+    """Two tokens' log-linear attention, one level apart: unit queries and keys, no decay, a unit scale,
+    each token's level weights `weights` `[2, 2]` and its value `values`."""
+    ones = jnp.ones((1, 2, 1, 1), jnp.float32)
+    value = jnp.asarray(values, jnp.float32).reshape(1, 2, 1, 1)
+    return functools.partial(log_linear_attention, ones, ones, value, jnp.zeros((1, 2, 1), jnp.float32),
+                             scale=1.0), jnp.asarray(weights, jnp.float32).reshape(1, 2, 1, 2)
+
+
+def test_a_pairs_weight_is_its_own_levels_alone_both_ways():
+    """A token's weight at one level reaches that level's pairs alone, forward and back (head review of
+    fd3af8c41): an infinite weight at the token's own level leaves its pair with the other token finite,
+    its output infinite where a masked product's zero times it read NaN; and an infinite cotangent of its
+    own pair leaves the other level's weight's gradient finite, 2 where a product's transpose read NaN."""
+    attend, weights = _two_tokens([[1.0, 1.0], [np.inf, 1.0]])
+    np.testing.assert_array_equal(np.asarray(attend(weights)).ravel(), [1.0, np.inf])
+    attend, weights = _two_tokens([[0.5, 0.5], [0.5, 0.5]], values=(1.0, 2.0 ** 127))
+    cotangent = jnp.asarray([0.0, 2.0], jnp.float32).reshape(1, 2, 1, 1)
+    grads = jax.grad(lambda w: jnp.sum(attend(w) * cotangent))(weights)
+    np.testing.assert_array_equal(np.asarray(grads).reshape(2, 2), [[0.0, 0.0], [np.inf, 2.0]])
 
 
 @pytest.mark.parametrize("read", ["overflowing", "overflowing at a level of zero weight", "a NaN"])

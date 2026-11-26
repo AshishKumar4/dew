@@ -448,8 +448,10 @@ class SharedCrossAttention:
                              "DeepSeek V4 attention implement); name layers of those, or read the context "
                              "with CrossAttention's block")
         if not mixer.reads_context:
-            raise ValueError(f"layer {index} shares its keys and values with an earlier layer, so it "
-                             "projects none of its own to read a context with")
+            raise ValueError(f"layer {index}'s attention reads no context (its `reads_context`): it shares "
+                             "its keys and values with an earlier layer, so it projects none of its own, or "
+                             "each of its queries projects its own sinks, which a context's softmax takes "
+                             "none of")
         return mixer
 
 

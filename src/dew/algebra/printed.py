@@ -2,10 +2,10 @@
 each equation its primitive bound at its own parameters (`lax.<name>_p.bind`), so the function computes
 exactly what the jaxpr does, bit for bit, but for a choice by the platform it lowers for, printed as its
 default branch (a GPU's and a TPU's: Dew's products under a CPU's wide arithmetic choose the CPU's own,
-`dew.nn.precision`); and the same function with its float sums compensated
-(`compensated`: the error-free derivation, §6.9), each addition's rounding carried beside it as a double word
-(`dew.nn.precision.compensated_add`) and each sum's reduction compensated (`compensated_sum`), both protected
-from the pass. What the generator writes and what dev time measures are one text (`source`, `loaded`)."""
+`dew.nn.precision`); and a compensated candidate (`compensated`, §6.9) whose elementwise sums carry
+their own and their direct products' rounding residuals, and whose reductions compensate their sums.
+The transforms are protected from the pass. Generation and dev-time admission measure the same text.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ own (a custom derivative's call is refused, its rule not a value's)."""
 
 IMPORTS = ({"Callable": "from collections.abc import Callable"},
            {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": "from jax import lax"},
-           {"precision": "from dew.nn import precision"})
+           {"_generated": "from dew.algebra import _generated", "precision": "from dew.nn import precision"})
 """The imports a printed function or a generated module may read, by the name it reads, in the tree's
 sections (the standard library's, the third parties', Dew's) and order (`imports`)."""
 
@@ -63,6 +63,7 @@ class _Printer:
     platforms: dict[jcore.Var, tuple] = dataclasses.field(default_factory=dict)
     pairs: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
     read: set[jcore.Var] = dataclasses.field(default_factory=set)
+    dimensions: dict[int, str] = dataclasses.field(default_factory=dict)
     count: int = 0
     used: bool = False
 
@@ -91,13 +92,19 @@ class _Printer:
         return f"({'-' if negated else ''}{value}, jnp.zeros_like({value}))"
 
 
-def source(closed: core.Jaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
+def source(closed: core.Jaxpr, name: str, *, compensated: bool = False,
+           borrow_shapes: bool = False) -> tuple[str, bool]:
     """`closed` printed as a function `name` over its inputs returning its outputs as a tuple, and whether a
     sum was compensated (`compensated`: always False where it is not asked). Raises `Unprintable` for an
     equation no plain call writes."""
     printer = _Printer(compensated)
     inputs = [printer.fresh("x") for _ in closed.jaxpr.invars]
     printer.names.update(zip(closed.jaxpr.invars, inputs, strict=True))
+    if borrow_shapes:
+        for var, arg in zip(closed.jaxpr.invars, inputs, strict=True):
+            for axis, extent in enumerate(_shaped(var).shape):
+                if isinstance(extent, int) and extent > 1:
+                    printer.dimensions.setdefault(extent, f"{arg}.shape[{axis}]")
     for var, value in zip(closed.jaxpr.constvars, closed.consts, strict=True):
         printer.names[var] = printer.fresh("c")
         printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -135,6 +142,8 @@ def _held(text: str, name: str, closed: core.Jaxpr) -> None:
 
 def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
     """Each equation of `jaxpr` printed in order, a call's body in its place (`INLINED`)."""
+    summands = ({atom for eq in jaxpr.eqns if _sum_pair(eq) for atom in eq.invars
+                 if isinstance(atom, jcore.Var)} if printer.compensated else set())
     for equation in jaxpr.eqns:
         primitive = equation.primitive
         if primitive is jcore.primitives.platform_index_p:
@@ -155,8 +164,8 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             for var, atom in zip(equation.outvars, body.outvars, strict=True):
                 _alias(printer, var, atom)
             continue
-        if printer.compensated and _compensates(equation):
-            _compensated(printer, equation)
+        if printer.compensated and (transform := _eft(equation, summands)) is not None:
+            _compensated(printer, equation, transform)
             continue
         if getattr(lax, f"{primitive.name}_p", None) is not primitive:
             raise Unprintable(f"no plain call writes a {primitive.name} equation")
@@ -164,11 +173,20 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
         for var, named in zip(equation.outvars, outputs, strict=True):
             printer.names[var] = named
         arguments = [printer.atom(atom) for atom in equation.invars]
-        arguments += [f"{key}={_param(value)}" for key, value in equation.params.items()]
+        arguments += [f"{key}={_layout(printer, value) if key == 'shape' else _param(value)}"
+                      for key, value in equation.params.items()]
         # A primitive of several results binds a sequence, unpacked even where it holds one.
         target = (", ".join(outputs) + ("," if len(outputs) == 1 else "") if primitive.multiple_results
                   else outputs[0])
         printer.emit(target, f"lax.{primitive.name}_p.bind", arguments)
+
+
+def _layout(printer: _Printer, value) -> str:
+    """Identical emitted bodies may share extents read from their declared input shapes."""
+    if not printer.dimensions or not isinstance(value, tuple) or not all(isinstance(n, int) for n in value):
+        return _param(value)
+    sizes = [printer.dimensions.get(n, repr(n)) for n in value]
+    return f"({', '.join(sizes)}{',' if len(sizes) == 1 else ''})"
 
 
 def _inlined(printer: _Printer, equation: jcore.JaxprEqn) -> tuple:
@@ -217,21 +235,35 @@ def _floating(var) -> bool:
     return isinstance(var.aval, ShapedArray) and jnp.issubdtype(var.aval.dtype, jnp.floating)
 
 
-def _compensates(equation: jcore.JaxprEqn) -> bool:
-    """Whether a compensated program carries `equation` as a double word: a float addition or subtraction,
-    or a float sum's reduction."""
-    if equation.primitive in (lax.add_p, lax.sub_p):
-        return all(_floating(var) for var in (*equation.invars, *equation.outvars))
-    return equation.primitive is lax.reduce_sum_p and _floating(equation.invars[0])
+def _sum_pair(equation: jcore.JaxprEqn) -> bool:
+    return (equation.primitive in (lax.add_p, lax.sub_p)
+            and all(_floating(var) for var in (*equation.invars, *equation.outvars)))
 
 
-def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
-    """`equation` printed compensated (`_compensates`): an addition's double word, its operands' own, or a
-    reduction's compensated sum, rounded once."""
+def _eft(equation: jcore.JaxprEqn, summands: set[jcore.Var]) -> str | None:
+    """The dev-time transform rules, keeping a residual as a separate word, not in a real e-class."""
+    primitive = equation.primitive
+    if _sum_pair(equation):
+        return "sum"
+    if primitive is lax.reduce_sum_p and _floating(equation.invars[0]):
+        return "reduction"
+    if (primitive is lax.mul_p and equation.outvars[0] in summands
+            and equation.params.get("out_dtype") is None):
+        left, right = equation.invars
+        out = equation.outvars[0].aval
+        if (isinstance(out, ShapedArray) and not out.weak_type and out.dtype in (jnp.float32, jnp.float64)
+                and all(isinstance(atom.aval, ShapedArray) and not atom.aval.weak_type
+                        and atom.aval.dtype == out.dtype for atom in (left, right))):
+            return "product"
+    return None
+
+
+def _compensated(printer: _Printer, equation: jcore.JaxprEqn, transform: str) -> None:
+    """Emit protected TwoSum, TwoProduct, pair addition or compensated reduction."""
     printer.used = True
     (out,) = equation.outvars
     printer.names[out] = printer.fresh()
-    if equation.primitive is lax.reduce_sum_p:
+    if transform == "reduction":
         axes = tuple(equation.params["axes"])
         printer.emit(printer.names[out], "precision.compensated_sum",
                      [printer.atom(equation.invars[0]), _param(axes)])
@@ -239,8 +271,19 @@ def _compensated(printer: _Printer, equation: jcore.JaxprEqn) -> None:
     left, right = equation.invars
     pair = printer.fresh("p")
     printer.pairs[out] = pair
-    printer.emit(pair, "precision.compensated_add",
-                 [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
+    if transform == "product":
+        hi, lo = printer.fresh(), printer.fresh()
+        printer.emit(f"{hi}, {lo}", "precision.two_product",
+                     [printer.atom(left), printer.atom(right), "bit_split=True"])
+        # The residual restores the rounded product's real value, not another product's tangent.
+        printer.lines.append(f"    {pair} = ({hi}, lax.stop_gradient({lo}))")
+    elif any(isinstance(atom, jcore.Var) and atom in printer.pairs for atom in (left, right)):
+        printer.emit(pair, "precision.compensated_add",
+                     [printer.pair(left), printer.pair(right, negated=equation.primitive is lax.sub_p)])
+    else:
+        left, right = printer.atom(left), printer.atom(right)
+        signed_right = f"-({right})" if equation.primitive is lax.sub_p else right
+        printer.emit(pair, "precision.two_sum", [left, signed_right])
 
 
 def refused(closed: core.Jaxpr, *, compensated: bool = False) -> str | None:

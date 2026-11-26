@@ -17,6 +17,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
+from dew.nn.division import _rounded_significand
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.float_bits import (
     TWO_FACTOR_REACH,
@@ -36,7 +37,6 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import (
     ACCURATE,
     Numerics,
-    _rounded_significand,
     compensated_add,
     compensated_difference,
     exact_products,
@@ -426,6 +426,35 @@ def test_a_constant_factor_splits_on_the_host_outside_its_protected_span():
     np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
 
 
+def test_a_bfloat16_host_factor_leaves_a_bfloat16_product_residual():
+    factor = np.asarray(1 + 2 ** -7, jnp.bfloat16)
+    left = jnp.asarray(1 - 2 ** -7, jnp.bfloat16)
+    high, low = jax.jit(lambda x: two_product(x, factor, bit_split=True))(left)
+    assert high.dtype == low.dtype == left.dtype
+    np.testing.assert_array_equal(np.asarray([high, low], np.float32), [1, -(2 ** -14)])
+
+
+@pytest.mark.parametrize("literal", [False, True], ids=["traced", "host"])
+def test_two_product_splits_a_mixed_operand_in_its_promoted_format(literal):
+    scale, factor = np.float32(2.0 ** -8), np.float16(65504)
+
+    def product(a, b):
+        value = factor if literal else b
+        return two_product(a, value, bit_split=True), two_product(value, a, bit_split=True)
+
+    for high, low in jax.jit(product)(scale, factor):
+        assert high.dtype == low.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray([high, low]), [float(scale) * float(factor), 0.0])
+
+
+def test_two_product_promotes_a_python_literal_without_double_rounding():
+    # The final bit is below the fp32 precision at this fp16 midpoint.
+    factor = 1 + 2.0 ** -11 + 2.0 ** -30
+    x = np.ones((2,), np.float16)
+    high, _ = jax.jit(lambda a: two_product(a, factor))(x)
+    np.testing.assert_array_equal(np.asarray(high), np.full_like(x, 1 + 2.0 ** -10))
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
@@ -659,21 +688,20 @@ def divides_as_ieee_division_at_its_edges(divider: str = ""):
     """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
     operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
     once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
-    over divisors given as arrays and as constants (which the backend's division approximates); and each
-    quotient of a zero, subnormal, infinite or NaN operand the backend's own division. Its arms' labels end in
+    over divisors given as arrays and as constants (which the backend's division approximates), a subnormal
+    operand's quotient its value's (row 13163); and each quotient of a zero, infinite or NaN operand IEEE
+    division's, beside a subnormal one too. Its arms' labels end in
     `divider`, a process's divider of its own (`APPROXIMATELY`), so one test's store holds both processes'."""
     from reference_error import ahead_arm
 
     from dew.nn.precision import correctly_rounded_divide
 
     numerator, denominator = division_edges()
-    normal = (np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator) & (
-        np.abs(denominator) >= np.finfo(np.float32).tiny) & np.isfinite(denominator)
+    # A finite nonzero operand, a subnormal one too: its quotient its value's (row 13163).
+    valued = (numerator != 0) & np.isfinite(numerator) & (denominator != 0) & np.isfinite(denominator)
     # Programs with no check-1 site, each prepared as an arm is in a GPU tier part (`ahead_arm`), every one
     # run before any is judged: a prepare's arm gives zeros.
     actual = np.asarray(ahead_arm(jax.jit(correctly_rounded_divide), EDGES + divider)(numerator, denominator))
-    past = f"the plain division of the edges past the normals{divider}"
-    plain = np.asarray(ahead_arm(jax.jit(jnp.divide), past)(numerator[~normal], denominator[~normal]))
     # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
     # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
     # over divisors just below a power of two, odd ones and the ones the callers divide by.
@@ -685,8 +713,11 @@ def divides_as_ieee_division_at_its_edges(divider: str = ""):
         for divisor in divisors]
     with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
         expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
-    np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
-    np.testing.assert_array_equal(actual[~normal], plain)
+    np.testing.assert_array_equal(actual[valued].view(np.uint32), expected[valued].view(np.uint32))
+    # A zero, infinite or NaN operand's is IEEE division's, beside a subnormal one too, its sign included.
+    special = ~valued & ~np.isnan(expected)
+    np.testing.assert_array_equal(actual[~valued], expected[~valued])
+    np.testing.assert_array_equal(np.signbit(actual[special]), np.signbit(expected[special]))
     for divisor, quotient in zip(divisors, quotients, strict=True):
         with np.errstate(over="ignore", under="ignore"):
             wanted = (held.astype(np.float64) / np.float64(divisor)).astype(np.float32)
@@ -794,6 +825,130 @@ def test_a_correctly_rounded_divisions_derivatives_divide_as_ieee_division():
     first, second = denominator[:2]
     over_both = jax.jit(jax.grad(lambda x: jnp.sum(jax.vmap(lambda d: divided(x, d))(denominator[:2]))))(six)
     np.testing.assert_array_equal(np.asarray(over_both), np.float32(1) / first + np.float32(1) / second)
+
+
+def test_a_correctly_rounded_division_of_subnormal_operands_is_their_values_quotient():
+    """A subnormal operand divides as its value, which XLA's division on a flushing CPU reads as zero:
+    `2^-149 / 2^-126` is `2^-23` and `2^-126 / 2^-149` is `2^23`, `3 * 2^-149 / 2^-148` is `1.5`, bit for bit,
+    where the division gave 0, an infinity and 0 (row 13163)."""
+    from dew.nn.precision import correctly_rounded_divide
+
+    numerator = np.float32([2.0 ** -149, 2.0 ** -126, 3 * 2.0 ** -149])
+    denominator = np.float32([2.0 ** -126, 2.0 ** -149, 2.0 ** -148])
+    np.testing.assert_array_equal(np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator)),
+                                  np.float32([2.0 ** -23, 2.0 ** 23, 1.5]))
+
+
+@pytest.mark.parametrize(("numerator", "denominator", "tangent", "cotangent", "moved", "pulled"), [
+    (2.0 ** 20, 2.0 ** -60, 2.0 ** -60, 2.0 ** -60, -(2.0 ** 80), -(2.0 ** 80)),
+    (2.0 ** -149, 2.0 ** -140, 2.0 ** -12, 2.0 ** -145, -(2.0 ** 119), -(2.0 ** -14)),
+    (4.0, 2.0 ** -128, 2.0 ** -149, 2.0 ** -149, -(2.0 ** 109), -(2.0 ** 109)),
+    (2.0 ** -100, 2.0 ** 30, 2.0 ** 100, 2.0 ** 100, -(2.0 ** -60), -(2.0 ** -60)),
+], ids=["its-twice-quotient-overflows", "a-subnormal-numerator-either-order-overflows",
+        "its-quotient-overflows-under-a-subnormal-seed", "its-quotient-underflows-under-a-large-seed"])
+def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_its_value_is(
+        numerator, denominator, tangent, cotangent, moved, pulled):
+    """The derivative of `n / d` in `d`, `-t n / d^2`, where `(n / d) / d` overflows: a tangent and a
+    cotangent are moved and pulled back to their exact values, `-2^80` (`2^20 / 2^-60` under `2^-60`) and,
+    for `2^-149 / 2^-140`, `-2^119` under `2^-12` and `-2^-14` under `2^-145`, where `t / d` overflowed one
+    way and `t q` flushed the other (row 13163)."""
+    from dew.nn.precision import divided
+
+    numerator, denominator = np.float32(numerator), np.float32(denominator)
+    _, forward = jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(tangent),))
+    assert float(forward) == moved
+    _, pull = jax.vjp(lambda d: divided(numerator, d), denominator)
+    assert float(pull(np.float32(cotangent))[0]) == pulled
+
+
+def test_a_balanced_denominator_derivative_keeps_its_mixed_derivatives():
+    """`2^-100 / d` at `d = 2^30` under a denominator seed `2^100`, whose tangent `-2^-60` the balanced order
+    computes (PyTorch's coefficient `2^-160` flushes): its derivative in the numerator is `-2^40`, bit for
+    bit, forward over forward and reverse over forward, jitted, as PyTorch's order differentiates it through
+    its normal `2^-30` and `2^-60`, where the balanced order held its operands constant and gave 0 (row
+    13261)."""
+    from dew.nn.precision import divided
+
+    fixed, denominator = np.float32(2.0 ** 100), np.float32(2.0 ** 30)
+
+    def tangent(n):
+        return jax.jvp(lambda d: divided(n, d), (denominator,), (fixed,))[1]
+
+    numerator = np.float32(2.0 ** -100)
+    assert float(jax.jit(tangent)(numerator)) == -(2.0 ** -60)
+    assert float(jax.jit(lambda n: jax.jvp(tangent, (n,), (np.float32(1),))[1])(numerator)) == -(2.0 ** 40)
+    assert float(jax.jit(jax.grad(tangent))(numerator)) == -(2.0 ** 40)
+
+
+def test_a_correctly_rounded_divisions_denominator_derivative_of_a_special_is_ieees():
+    """`0 / 0`'s tangent in its denominator is IEEE's NaN, both ways, not a finite value of the operands' bits
+    (row 13163's review)."""
+    from dew.nn.precision import divided
+
+    zero = np.float32(0)
+    assert np.isnan(float(jax.jvp(lambda d: divided(zero, d), (zero,), (np.float32(1),))[1]))
+    assert np.isnan(float(jax.vjp(lambda d: divided(zero, d), zero)[1](np.float32(1))[0]))
+
+
+def test_a_correctly_rounded_divisions_zero_seed_is_zero_beside_an_overflowing_coefficient():
+    """Differentiating only the second of `[2^20, 1] / [2^-60, 1]` leaves the first denominator's gradient
+    zero, not the NaN of `0` times an infinite `(n / d) / d` (row 13163's review)."""
+    from dew.nn.precision import divided
+
+    gradient = jax.grad(lambda d: divided(np.float32([2.0 ** 20, 1]), d)[1])(np.float32([2.0 ** -60, 1]))
+    np.testing.assert_array_equal(np.asarray(gradient), np.float32([0, -1]))
+
+
+def test_a_correctly_rounded_divisions_denominator_derivative_keeps_its_derivative_in_the_numerator():
+    """`n / 16` at `n = 2^-126`, its quotient subnormal and its tangent in the denominator under `2^40`
+    normal (`2^-94`): that tangent's derivative in the numerator is `-2^40 / 16^2 = -2^32`, bit for bit,
+    forward over forward and reverse over forward, as PyTorch's order differentiates it, where the
+    balanced order, holding its operands constant, gave 0 (row 13247)."""
+    from dew.nn.precision import divided
+
+    fixed, denominator = np.float32(2.0 ** 40), np.float32(16)
+
+    def tangent(n):
+        return jax.jvp(lambda d: divided(n, d), (denominator,), (fixed,))[1]
+
+    # Jitted, as a CPU that flushes subnormal operands lowers them; a numerator seed of 2^90 and a
+    # cotangent of 2^-110 too, whose derivatives PyTorch's order keeps normal (row 13247's review).
+    numerator = np.float32(2.0 ** -126)
+    assert float(jax.jit(tangent)(numerator)) == -(2.0 ** -94)
+    for moving, expected in ((1.0, -(2.0 ** 32)), (2.0 ** 90, -(2.0 ** 122))):
+        moved = jax.jit(lambda n, m=moving: jax.jvp(tangent, (n,), (np.float32(m),))[1])(numerator)
+        assert float(moved) == expected, moving
+    # An infinite numerator's lane, PyTorch's own: its tangent's derivative in the numerator is `-1 / d^2`
+    # under a fixed seed, its constant seed adding no `0 * inf` term.
+    def unit(n):
+        return jax.jvp(lambda d: divided(n, d), (np.float32(1),), (np.float32(1),))[1]
+
+    assert float(jax.jit(lambda n: jax.jvp(unit, (n,), (np.float32(1),))[1])(np.float32(np.inf))) == -1.0
+    # A zero seed's tangent keeps its sign: `-0` in, the negated `+0` out, as the plain product gives.
+    zero = jax.jit(lambda: jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(-0.0),))[1])()
+    assert float(zero) == 0.0 and not np.signbit(np.asarray(zero))
+    for cotangent, expected in ((1.0, -(2.0 ** 32)), (2.0 ** -110, -(2.0 ** -78))):
+        pulled = jax.jit(lambda n, c=cotangent: jax.vjp(tangent, n)[1](np.float32(c))[0])(numerator)
+        assert float(pulled) == expected, cotangent
+
+
+@pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])
+def test_a_subnormal_beside_a_special_divides_as_ieee_division(lowered):
+    """A subnormal operand beside a zero, an infinity or a NaN gives IEEE division's result, either order
+    and sign, lowered or not: `-0 / 2^-149` is -0, `2^-149 / -0` is -inf, `-2^-149 / inf` is -0, `inf /
+    -2^-149` is -inf, a NaN's is NaN, where a flushing division read the subnormal as zero, 0 / 0 (row
+    13163's review)."""
+    from dew.nn.precision import lowered_divide
+
+    tiny = np.float32(2.0 ** -149)
+    numerator = np.float32([-0.0, tiny, -tiny, np.inf, np.nan, tiny])
+    denominator = np.float32([tiny, -0.0, np.inf, -tiny, tiny, np.nan])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected = numerator / denominator
+    got = np.asarray(jax.jit(lowered_divide)(numerator, denominator, np.int32(lowered)))
+    np.testing.assert_array_equal(got, expected)
+    signed = ~np.isnan(expected)
+    np.testing.assert_array_equal(np.signbit(got[signed]), np.signbit(expected[signed]))
 
 
 @pytest.mark.mesh(devices=2)

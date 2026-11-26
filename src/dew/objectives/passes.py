@@ -92,12 +92,17 @@ class PassWeights:
 
     def of_model(self, model: object) -> tuple[float, ...] | None:
         """Each pass's weight over the passes `model`'s loop runs (`over`), refused for a model that runs
-        no loop: it has one pass, whose exit is its output."""
+        no loop (it has one pass, whose exit is its output), or for weights on an earlier pass of a loop that
+        exits no pass but its last (a tier-3 source's, `exiting`)."""
         loop = model.loop if isinstance(model, Looped) else None
         if loop is None or not isinstance(model, Looping):
             raise ValueError(f"pass_weights weighs a looped model's passes, and a {type(model).__name__} "
                              "runs no loop (dew.nn.protocols.Looped)")
-        return self.over(loop.steps)
+        weights = self.over(loop.steps)
+        if weights is not None and not loop.exiting and model.with_passes(exits=True) is None:
+            raise ValueError(f"pass_weights scores each earlier pass's exit, and a {type(model).__name__}'s "
+                             "loop gives its passes none (`Looping.with_passes(exits=True)`)")
+        return weights
 
 
 def exiting[M](model: M) -> M:
@@ -108,7 +113,7 @@ def exiting[M](model: M) -> M:
     if model.loop.exiting:
         return model
     passing = model.with_passes(exits=True)
-    assert passing is not None, "a looped model keeps its loop"
+    assert passing is not None, "a model whose loop exits no pass is refused first (`PassWeights.of_model`)"
     return passing
 
 

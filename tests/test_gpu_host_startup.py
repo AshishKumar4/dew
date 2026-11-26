@@ -75,6 +75,8 @@ def reported(script: Path, arguments: list[str], environment: dict[str, str]) ->
     return json.loads(done.stdout.splitlines()[-1])
 
 
+@pytest.mark.compiles_at_run(reason="a host step prepared by a process of its own, started here reading its "
+                                    "programs from the cache: no check-1 site")
 def test_a_host_step_prepared_without_a_gpu_starts_here_reading_every_program_from_the_cache(tmp_path):
     """A host step's programs compiled where no GPU is visible for this GPU (its serialized topology,
     `host_gpus`), the CPU companion's on this host's CPUs, key JAX's persistent cache as this GPU's run

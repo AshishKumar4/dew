@@ -236,40 +236,41 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
-         value_heads: int = VALUE_HEADS, value_width: int | None = None) -> tuple[Chunk]:
+         value_heads: int = VALUE_HEADS, value_width: int | None = None, key_heads: int = KEY_HEADS,
+         key_width: int = KEY_WIDTH) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries (of unit
     norm where the hooks declare them), keys and values (`NORMED_WIDTH` wide under the norm), a log decay a
     head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory entering, `length` tokens over
-    `value_heads` value heads, the values `value_width` wide where given, and with `packed` documents
-    starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
-    chunk's first token."""
+    `value_heads` value heads and `key_heads` key heads `key_width` wide, the values `value_width` wide where
+    given, and with `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the
+    second, 48 a chunk's first token."""
     rng = np.random.default_rng(seed)
     normal = np.random.default_rng([seed, 1]).standard_normal
     width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
-    key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(width)
+    key_order, value_order = rng.permutation(key_width), rng.permutation(width)
     turned = {}
     if hooks.turns:
         # A turned state's symmetry: its turned pairs permuted among themselves, each pair's keys adjacent
         # and its turn moved with it, the unturned keys among themselves; a turn of up to 3 radians a token.
         pairs = rng.permutation(hooks.turns)
         key_order = np.concatenate([np.stack([2 * pairs, 2 * pairs + 1], axis=-1).reshape(-1),
-                                    2 * hooks.turns + rng.permutation(KEY_WIDTH - 2 * hooks.turns)])
+                                    2 * hooks.turns + rng.permutation(key_width - 2 * hooks.turns)])
         turn = rng.uniform(-3.0, 3.0, (ROWS, length, value_heads, hooks.turns))
         turned = {'turn': hosted(turn[..., pairs])}
-    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))
+    query = normal((ROWS, length, key_heads, key_width))
     # Unit queries where the hooks declare them (`recurrence.Hooks.unit_queries`, Kimi Linear's l2-normed).
     query = (unit(query) if hooks.unit_queries else query)[..., key_order]
-    key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
+    key = unit(normal((ROWS, length, key_heads, key_width)))[..., key_order]
     value = normal((ROWS, length, value_heads, width))[..., value_order]
     vector = hooks.decay == 'vector'
-    log_decay = -softplus(normal((ROWS, length, value_heads) + ((KEY_WIDTH,) if vector else ())) - 1.0)
+    log_decay = -softplus(normal((ROWS, length, value_heads) + ((key_width,) if vector else ())) - 1.0)
     if vector:
         log_decay = log_decay[..., key_order]
     written = normal((ROWS, length, value_heads))
     beta = sigmoid(written)
     skip = normal((value_heads,))
-    state = (0.3 * normal((ROWS, value_heads, KEY_WIDTH, width)))[:, :, key_order][..., value_order]
+    state = (0.3 * normal((ROWS, value_heads, key_width, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
@@ -285,7 +286,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
     starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
-    own = {'own': hosted(0.5 * normal((value_heads, KEY_WIDTH))[..., key_order])} if hooks.own_weight else {}
+    own = {'own': hosted(0.5 * normal((value_heads, key_width))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,
@@ -857,15 +858,16 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+@pytest.mark.parametrize('along', ['pulled back', 'pushed forward'])
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[4], ADDITIVE],
                          ids=['no decay', 'the delta rule', 'an additive erase'])
-def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
+def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
     """A forked call (`Chunk.loads`: documents taking their memories up from its table, entry writes) on the
     portable math, its operands' rows split over an Explicit mesh axis before it is differentiated: its
-    output, last memory, every operand's gradient and their tangent along its values on par from float64
-    with the same call whole (check 1), each placed as its rows are (row 9690: its walk's carries, seeded
-    within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a no-decay call's
-    gates, formed whole, its map's)."""
+    output, last memory and every operand's gradient (`pulled back`), or its tangent along its values, on
+    par from float64 with the same call whole (check 1), each placed as its rows are (row 9690: its walk's
+    carries, seeded within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a
+    no-decay call's gates, formed whole, its map's). Both directions in one case took 151 to 186 s (12802)."""
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     rows = jax.sharding.NamedSharding(mesh, P('data'))
     run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
@@ -876,28 +878,25 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
         return transitioned(hooks, operands, seed), seeded, tangent
 
     def arm(place):
-        # The draw's operands, cotangents and tangent placed as `place` places them before the call is
-        # differentiated, its documents laid within it (as `assert_forked_on_par`'s) and placed alike.
+        # The draw placed by `place` before the call is differentiated, its documents laid within it alike.
         def ran(operands):
             return run(place(entering_documents(operands)))
 
-        def both(operands, cotangents, tangent):
+        def differentiated(operands, cotangents, tangent):
             operands, cotangents, tangent = place((operands, cotangents, tangent))
+            if along == 'pulled back':
+                return with_gradients(ran)(operands, cotangents)
+            return jax.jvp(lambda value: ran(dataclasses.replace(operands, value=value)), (operands.value,),
+                           (tangent,))[1]
 
-            def along(value):
-                return ran(dataclasses.replace(operands, value=value))
+        return differentiated
 
-            pulled = with_gradients(ran)(operands, cotangents)
-            return pulled, jax.jvp(along, (operands.value,), (tangent,))[1]
-
-        return both
-
-    split = arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree))
+    split = jax.jit(arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree)))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
-                        f'forked {hooks} on an explicit row axis', seeds=FEWEST_SEEDS)
-        ((out, last), grads), tangents = jax.jit(split)(*drawn(0))
-    for placed in (out, last, grads.value, *tangents):
+        assert_as_exact(split, jax.jit(arm(lambda tree: tree)), drawn,
+                        f'forked {hooks} on an explicit row axis, {along}', seeds=FEWEST_SEEDS)
+        found = split(*drawn(0))
+    for placed in found if along != 'pulled back' else (*found[0], found[1].value):
         assert jax.typeof(placed).sharding.spec[0] == 'data'
 
 

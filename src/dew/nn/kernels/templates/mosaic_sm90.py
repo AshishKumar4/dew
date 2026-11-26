@@ -15,6 +15,10 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import fed, mosaic, resources, ring_family
 
+WAIT_MOST = 7
+"""The most product groups a warpgroup's wait leaves in flight: `wgmma.wait_group`'s immediate, 0 to 7 (PTX
+ISA, wgmma.wait_group; CUTLASS's `warpgroup_wait` asserts the same range)."""
+
 
 class WgmmaLayout:
     """A home whose 64-row tiles sit in registers in the WGMMA layout (`plgpu.Layout.WGMMA`), a thread two
@@ -85,13 +89,17 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
-            value = between()
+            with mosaic.committed_here() as committed:
+                value = between()
+            # The groups `between` committed run on past the product's read (`committed_here`), no more than
+            # a wait's immediate holds (`WAIT_MOST`): one leaving fewer in flight waits on the product still.
+            pending = min(committed(), WAIT_MOST)
             return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
@@ -127,7 +135,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
-    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True, support=None):
+        mosaic.whole_products(self, support)
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
         if interpret and isinstance(acc, jax.Array):

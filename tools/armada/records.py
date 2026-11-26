@@ -199,28 +199,30 @@ def epochs_of(python: str, names: list[str], common: str, held: str, until: floa
 
 
 def begun(python: str, row_name: str, held: str, common: str, token: str, after: str | None = None,
-          fresh_only: bool = False) -> str:
+          fresh_only: bool = False, until: float | None = None) -> str:
     """A new epoch of row `row_name` on class `held` on these shared inputs, its fresh name written over the
     epoch of ETag `after` (`epoch`; none: only where the row has none), and its name; `UNREAD` where the
     Worker did not take it. Written only on that condition (If-Match, If-None-Match), so a write sent again
     later, by a retry or by a connection that replays its request, never puts back an epoch a later one
     replaced (review, 2026-11-12). A red run (`fresh_only` false) whose condition another write beat reads the
     epoch again and begins the next after it, as it must revoke whatever stands; a green one gives up
-    (`UNREAD`): an epoch it did not read may be a red's."""
+    (`UNREAD`): an epoch it did not read may be a red's. All within `until` where one is given."""
     for attempt in range(RECORD_TRIES * 2):
         if attempt:
+            if until is not None and time.monotonic() + min(2 ** attempt, 8) / 4 >= until:
+                return UNREAD
             time.sleep(min(2 ** attempt, 8) / 4)
         name = uuid.uuid4().hex
         condition = {"If-Match": after} if after is not None else {"If-None-Match": "*"}
         try:
             with store(token).request("PUT", epoch_key(python, row_name, held, common), headers=condition,
-                                      body=json.dumps({"epoch": name}).encode()):
+                                      body=json.dumps({"epoch": name}).encode(), until=until):
                 return name
         except r2.Conflict:
             if fresh_only:
                 return UNREAD
             try:
-                after = epoch(python, row_name, held, common, token)[1]
+                after = epoch(python, row_name, held, common, token, until)[1]
             except Unread:
                 return UNREAD
         except (r2.R2Error, ValueError) as error:
@@ -264,14 +266,17 @@ RECORD_TRIES = 4
 """How many times a record's write is tried, two, four and eight seconds apart."""
 
 
-def written(key: str, token: str, body: bytes, tries: int = RECORD_TRIES) -> bool:
-    """Whether `body` was PUT at `key`, tried `tries` times while the Worker is unavailable: a record not
-    written leaves the one before it, such as an older green row a red run should have replaced."""
+def written(key: str, token: str, body: bytes, tries: int = RECORD_TRIES, until: float | None = None) -> bool:
+    """Whether `body` was PUT at `key`, tried `tries` times while the Worker is unavailable, all within
+    `until` (a `time.monotonic` instant) where one is given, no try begun past it: a record not written
+    leaves the one before it, such as an older green row a red run should have replaced."""
     for attempt in range(tries):
         if attempt:
+            if until is not None and time.monotonic() + 2 ** attempt >= until:
+                return False
             time.sleep(2 ** attempt)
         try:
-            store(token).put(key, body)
+            store(token).put(key, body, until=until)
             return True
         except r2.Unavailable as error:
             print(f"the test cache did not take {key}: {error}", file=sys.stderr)

@@ -126,6 +126,11 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "kimi-k3": {"torch": "2.8.0", "triton": "3.4.0", "fla-core": "0.5.2", "transformers": "4.56.2",
                 "compressed-tensors": "0.17.1"},
     "kimi-linear": {"torch": "2.8.0", "triton": "3.4.0", "fla-core": "0.4.0", "transformers": "4.57.1"},
+    # Inkling 2 (`inkling2_loop`), which no transformers release holds yet: its commit until one ships it,
+    # then that release (tools/inkling2_fixture.py).
+    "inkling2": {
+        "transformers": "git+https://github.com/huggingface/transformers@3a96649547593bacad4b65d43442ccdf15d0ae0f",
+        "torch": "2.14.1"},
     "vllm-dory": {"vllm": "git+https://github.com/shan18/vllm@55076950b6c155f384d6766d63563c3bc20a0e3f",
                   "torch": "2.14.0"},
     "diffusers-qwen-image": {
