@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.core import ShapedArray
 from model_support import attending
 from reference_error import assert_as_exact
 
@@ -367,31 +368,49 @@ def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_c
     np.testing.assert_array_equal(run(places), run(None))
 
 
+BANDED = 1536
+"""A call's length past its relative band's width (`band.band_width(5)`, 1280 columns), where a layer scored
+at its indices biases its attention through the band."""
+
+
 def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_out():
-    """A layer scored with no places given (its places its indices) biases its attention by the band about
-    each query (`relative_band`, row 13138), which holds `Q band_width` entries a head: its output and its
-    gradients are, bit for bit, the same call's with its places stated (`positions`, which takes the
-    written-out bias, `relative_logits`), its QK-Clip maxima too."""
+    """A layer scored over more keys than its band holds, with no places given (its places its indices) and
+    no QK-Clip maxima sown, biases its attention by the band about each query (`relative_band`, row 13138):
+    on the attention template, which reads the band a tile at a time, its program stages no `[B, H, Q, K]`
+    bias or score, where the same call with its places stated (`positions`, which takes the bias written
+    out, `relative_logits`) stages it; and its output and gradients are, bit for bit, that call's."""
     from dew.batch import coordinates
     from dew.nn.inputs import AttentionMetadata, MixerCall
-    from dew.nn.inspection import QK
+    from dew.nn.kernels import generation
+    from dew.nn.programs import equations
 
-    layer = _layer()
+    layer = CausalSelfAttention(MixerContext(
+        emb_features=FEATURES, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=WIDTH, max_seq_len=BANDED,
+        qk_norm=False, dtype=jnp.float32), nope=True, **TERMS)
     rng = np.random.default_rng(0xBA4D)
-    x = jnp.asarray(rng.normal(size=(ROWS, LENGTH, FEATURES)), jnp.float32)
+    x = jnp.asarray(rng.normal(size=(1, BANDED, FEATURES)), jnp.float32)
     params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(scale=0.5, size=leaf.shape), leaf.dtype),
                           nn.unbox(layer.init(jax.random.key(0), x)))
     stated = MixerCall(AttentionMetadata(coordinates=coordinates(
-        (ROWS, LENGTH), positions=jnp.broadcast_to(jnp.arange(LENGTH), (ROWS, LENGTH)))))
+        (1, BANDED), positions=jnp.arange(BANDED)[None])))
 
-    def run(call):
-        def loss(params, x):
-            out, sown = layer.apply(params, x, call, mutable=[QK])
-            return jnp.sum(out ** 2), (out, sown)
-        (_, (out, sown)), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(params, x)
-        return jax.tree.leaves((out, sown, grads))
+    def loss(call):
+        def summed(params, x):
+            out = layer.apply(params, x, call)
+            return jnp.sum(out ** 2), out
+        return summed
 
-    for banded, written in zip(run(MixerCall()), run(stated), strict=True):
+    def staged(call) -> set:
+        program = jax.make_jaxpr(lambda params, x: layer.apply(params, x, call))(params, x)
+        return {var.aval.shape for eqn in equations(program.jaxpr) for var in eqn.outvars
+                if isinstance(var.aval, ShapedArray) and jnp.issubdtype(var.aval.dtype, jnp.floating)}
+
+    quadratic = (1, HEADS, BANDED, BANDED)
+    with generation.chosen(attention="template"):
+        assert quadratic not in staged(MixerCall()) and quadratic in staged(stated)
+        runs = [jax.jit(jax.value_and_grad(loss(call), argnums=(0, 1), has_aux=True))(params, x)
+                for call in (MixerCall(), stated)]
+    for banded, written in zip(*(jax.tree.leaves(run) for run in runs), strict=True):
         np.testing.assert_array_equal(np.asarray(banded), np.asarray(written))
 
 

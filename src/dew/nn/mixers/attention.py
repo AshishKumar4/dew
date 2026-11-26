@@ -69,7 +69,7 @@ from dew.nn.inputs import (
 from dew.nn.inspection import QK
 from dew.nn.joined import side_by_side
 from dew.nn.kernels.selection import select
-from dew.nn.kernels.templates import attention as template
+from dew.nn.kernels.templates import attention as template, band
 from dew.nn.kv_cache import (
     CURSOR,
     DOCUMENTS,
@@ -1122,9 +1122,12 @@ class CausalSelfAttention(nn.Module):
             key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs, call)
 
         kv_len = key.shape[-3]
-        # A whole call whose places are its indices (none given, none counted): its relative bias a band
-        # (`relative_band`), its places its keys' indices.
-        indexed = not decode and positions is None and logical_positions is None and not self.ctx.kv_shared
+        # A whole call whose places are its indices (none given, none counted), its keys more than a band
+        # holds and no QK-Clip maxima sown (whose probe writes every logit out): its relative bias a band
+        # (`relative_band`, row 13138), its places its keys' indices.
+        indexed = (not decode and positions is None and logical_positions is None and not self.ctx.kv_shared
+                   and self.relative_bias is not None and not self._sows
+                   and band.band_width(self.relative_bias.extent) < key.shape[-3])
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
                                                          decode, S)
         # The tokens' logical places (`Coordinates.positions`): the caller's, else the slots a cache
