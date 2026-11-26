@@ -1225,26 +1225,16 @@ class PretrainedFallback(Pretrained):
         return self.text_generation()
 
     def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
-        """This source with `model` in its model's place where `model` runs this source's own torch forward
-        (its `graph`: a loop or recompute of its layers, `TorchCausalLM.with_loop`), its parameters this
-        source's, none drawn; any other model as `Pretrained.with_model` places it."""
-        from dew.interop.torchax_fallback import TorchCausalLM
+        """This source with `model`, which runs its torch forward (`torchax_fallback.replaced`), in place."""
+        from dew.interop.torchax_fallback import replaced
 
-        if isinstance(model, TorchCausalLM) and isinstance(self.model, TorchCausalLM):
-            if model.graph is not self.model.graph:
-                raise ValueError("a tier-3 source's model in its place runs the source's own torch forward "
-                                 "(`graph`), whose parameters it holds")
-            return replace(self, model=model)
-        return super().with_model(model, key=key)
+        return replace(self, model=replaced(self.model, model))
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        """The source's tensors under its own names (`Pretrained.export`), refused for a looped model: its
-        release would reload the source's one pass, no field of its config recording the loop."""
-        from dew.interop.torchax_fallback import TorchCausalLM
+        """`Pretrained.export`, refused for a model whose release would lose its loop (`unlooped`)."""
+        from dew.interop.torchax_fallback import unlooped
 
-        if isinstance(self.model, TorchCausalLM) and self.model.loop is not None:
-            raise ValueError("a tier-3 source's release is its source's config and tensors, which hold no "
-                             "loop: export it unlooped, or keep the run's checkpoint")
+        unlooped(self.model)
         return super().export(variables)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:

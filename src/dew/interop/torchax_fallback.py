@@ -1349,6 +1349,23 @@ _PASS: contextvars.ContextVar[int] = contextvars.ContextVar("dew_tier3_pass", de
 dropout's key past the first (`_dew_attention`), so each pass drops its own."""
 
 
+def replaced(held, model):
+    """`model` in place of the tier-3 model `held` (`PretrainedFallback.with_model`): a model running the same
+    torch forward (`TorchCausalLM.graph`), whose parameters are `held`'s (a loop or recompute of its
+    layers), refused otherwise."""
+    same = isinstance(held, TorchCausalLM) and isinstance(model, TorchCausalLM) and model.graph is held.graph
+    if not same:
+        raise ValueError("a tier-3 source's model in its place runs the source's own torch forward")
+    return model
+
+
+def unlooped(model) -> None:
+    """Refuse a tier-3 model running a loop (`TorchCausalLM.loop`) a release (`PretrainedFallback.export`):
+    no field of its source's config records the loop, so it would reload one pass."""
+    if isinstance(model, TorchCausalLM) and model.loop is not None:
+        raise ValueError("a tier-3 source's release holds no loop: export it unlooped")
+
+
 def runnable_loop(loop: Loop) -> Loop:
     """`loop` where a tier-3 source can run it: its steps, block and step norm alone (`TorchCausalLM.loop`);
     a gate, a gradient cut, messages, θ rows, exits or a shared cache refused."""
@@ -1447,17 +1464,19 @@ def _layer_seam(model, env, draws, *, layers: list | None, loop: Loop | None) ->
             return output
         return call
 
+    # Each layer's forward as its instance holds it (a module's own dict, which torch's call reads before its
+    # class's), restored as it was.
     own = {index: vars(layer).get('forward') for index, layer in enumerate(stack)}
     for index, layer in enumerate(stack):
-        layer.forward = seam(index, layer.forward)
+        vars(layer)['forward'] = seam(index, layer.forward)
     try:
         yield
     finally:
         for index, layer in enumerate(stack):
             if own[index] is None:
-                del layer.forward
+                vars(layer).pop('forward')
             else:
-                layer.forward = own[index]
+                vars(layer)['forward'] = own[index]
 
 
 _BROADCASTING = frozenset((primitives.add_p, primitives.sub_p, primitives.mul_p, primitives.div_p,

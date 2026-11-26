@@ -87,6 +87,13 @@ def attested[**P, R](function: Callable[P, R], rule: str) -> Callable[P, R]:
 
     return nested(function, traced=record)
 
+def attestation(eqn: core.JaxprEqn) -> str | None:
+    """The rule `eqn` computes as Dew attested it (`attested`): a call of a program of its own bound under
+    one, else None."""
+    program = called(eqn)
+    return _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
+
+
 CONCRETE = 1 << 20
 """The most entries of an integer value the walk evaluates while it walks (a gather's indices, a
 slice's start), and of a reshaped axis it sizes anew (`_moved`), beyond which it reads none and keeps
@@ -420,7 +427,7 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     """A call of a program of its own: a jit of a program Dew's code bound under a rule (`attested`) by
     that rule, any other walked inside."""
     program = called(eqn)
-    rule = _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
+    rule = attestation(eqn)
     if rule is not None or program is None:
         given = [_reads(value) for value in given]
     if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):

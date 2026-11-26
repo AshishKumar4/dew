@@ -230,12 +230,10 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
-def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(source, loaded, tokens):
+def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(loaded, tokens):
     """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs
-    (one `jax.checkpoint` a layer in the step's program), and its gradients are torch autograd's of
-    transformers' own loss as the step without it are; its record names its rung, and the ladder climbs no
-    further."""
-    _, model = source
+    (one `jax.checkpoint` a layer in the step's program), and its gradients are, bit for bit, the step's
+    without it; its record names its rung, and the ladder climbs no further."""
     recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
     assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
     assert loaded.model.recompute_record() is None
@@ -249,13 +247,16 @@ def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transform
     (checkpoint,) = (eqn.primitive for eqn in jax.make_jaxpr(jax.checkpoint(lambda x: x))(1.0).eqns)
     checkpoints = [eqn for eqn in equations(program) if eqn.primitive is checkpoint]
     assert len(checkpoints) == TINY["num_hidden_layers"], len(checkpoints)
-    ids = torch.from_numpy(tokens.astype(np.int64))
-    model.zero_grad()
-    model(ids, labels=ids).loss.backward()
-    grads = jax.grad(loss)(params)
-    for name, parameter in model.named_parameters():
-        expected = parameter.grad.numpy()
-        assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
+    # Recomputing a layer evaluates its program again: the same gradients, bit for bit, as the step that
+    # keeps its residuals, whose gradients are transformers' (`test_the_gradients_are_transformers`).
+    plain = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+
+    def kept(params):
+        return objective_loss(plain, {**loaded.variables, "params": params}, tokens, scalar=True)
+    recomputed_gradients, kept_gradients = jax.jit(jax.grad(loss))(params), jax.jit(jax.grad(kept))(params)
+    for name, gradient in kept_gradients.items():
+        np.testing.assert_array_equal(np.asarray(recomputed_gradients[name]), np.asarray(gradient),
+                                      err_msg=name)
 
 
 @pytest.mark.mesh
@@ -1556,6 +1557,15 @@ LONGCAT_SEEDS = 8
 """Longcat's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
+def torch_arm(source, precision=contextlib.nullcontext):
+    """`source`'s float64 logits over drawn ids (`as_given`, `torch_logits`) run under `precision`: a
+    check-1 reference or truth arm of a torch model."""
+    def run(ids):
+        with precision():
+            return torch_logits(source, ids)
+    return as_given(run)
+
+
 def _longcat(tmp_path, config: dict, **load):
     """A tiny Longcat Flash of `config` loaded in tier 3 with `load`, its eager copy and its float64 twin,
     and its logits' arms: `ours(tokens)` from the loaded model, `theirs(source, precision)` from a source."""
@@ -1577,13 +1587,8 @@ def _longcat(tmp_path, config: dict, **load):
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(tokens):
-            with precision(), torch.no_grad():
-                return source(torch.from_numpy(tokens).long()).logits.double().numpy()
-        return as_given(run)
 
-    return model, reference, wide, ours, theirs
+    return model, reference, wide, ours, torch_arm
 
 
 def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_computes_them(tmp_path):
@@ -1600,7 +1605,7 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
     identity = routes[0] >= LONGCAT["n_routed_experts"]
     assert identity.any() and not identity.all()
     assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
-                    truth_fn=theirs(wide, float64))
+                    truth_fn=torch_arm(wide, float64))
 
 
 def a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path):
@@ -1682,7 +1687,8 @@ def test_identity_experts_alone_run_as_transformers_runs_them(tmp_path):
     _, reference, wide, ours, theirs = _longcat(
         tmp_path, {**LONGCAT, "n_routed_experts": 0, "zero_expert_num": 3}, fallback="torchax")
     assert_as_exact(ours, theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
-                    "identity-only longcat logits", seeds=IDENTITY_SEEDS, truth_fn=theirs(wide, float64))
+                    "identity-only longcat logits", seeds=IDENTITY_SEEDS,
+                    truth_fn=torch_arm(wide, float64))
 
 
 ERNIE = {**TINY, "num_key_value_heads": 2, "moe_num_experts": 4, "moe_k": 2, "moe_intermediate_size": 32,
@@ -1719,27 +1725,23 @@ MIXTRAL = {**TINY, "num_key_value_heads": 2, "num_local_experts": 4, "num_expert
 
 
 @attending("reference")
-def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_path, monkeypatch):
+def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_path):
     """A Mixtral taken to tier 3, its routed experts asked of transformers' experts interface (`EXPERTS`):
-    Dew's grouped dispatch computes every layer's (`_routed_slots`, through `_dew_experts`), and its logits
-    over drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
-    from dew.interop import torchax_fallback
+    Dew's grouped dispatch computes every layer's (`_dew_experts`, a program attested token by token), and
+    its logits over drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
+    from dew.interop.sequence_causality import TOKENWISE, attestation
 
     torch.manual_seed(0)
     model = transformers.MixtralForCausalLM(transformers.MixtralConfig(**MIXTRAL)).eval()
     model.save_pretrained(tmp_path)
-    dispatched = []
-    routed = torchax_fallback._routed_slots
-    def counted(*args, **kwargs):
-        dispatched.append(kwargs["routed"])
-        return routed(*args, **kwargs)
-    monkeypatch.setattr(torchax_fallback, "_routed_slots", counted)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert isinstance(loaded, PretrainedFallback)
     forward = jax.jit(loaded.model.apply)
     tokens = token_draw(0x13044, MIXTRAL["vocab_size"], (2, 12))
-    forward.lower(loaded.variables, *tokens(0))
-    assert dispatched == [MIXTRAL["num_local_experts"]] * MIXTRAL["num_hidden_layers"], dispatched
+    # Each layer's experts a program Dew's dispatch attests token by token (`_dew_experts`).
+    program = jax.make_jaxpr(loaded.model.apply)(loaded.variables, *tokens(0))
+    dispatched = [eqn for eqn in equations(program) if attestation(eqn) == TOKENWISE]
+    assert len(dispatched) == MIXTRAL["num_hidden_layers"], len(dispatched)
 
     def built(dtype):
         built = transformers.AutoModelForCausalLM.from_config(
@@ -1747,16 +1749,11 @@ def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_
         built.load_state_dict(model.state_dict())
         return built
 
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(ids):
-            with precision(), torch.no_grad():
-                return source(torch.from_numpy(ids).long()).logits.double().numpy()
-        return as_given(run)
     with float64():
         wide = built(torch.float64)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                    theirs(built(torch.float32)), tokens, "interface experts logits", seeds=8,
-                    truth_fn=theirs(wide, float64))
+                    torch_arm(built(torch.float32)), tokens, "interface experts logits", seeds=8,
+                    truth_fn=torch_arm(wide, float64))
 
 
 GEMMA3 = {**TINY, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 4,
@@ -1819,16 +1816,11 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
         built.set_attn_implementation("eager")
         return built
 
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(ids):
-            with precision(), torch.no_grad():
-                return source(torch.from_numpy(ids).long()).logits.double().numpy()
-        return as_given(run)
     with float64():
         wide = repeated(torch.float64)
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                    theirs(repeated(torch.float32)), draw, f"looped tier 3 {family} logits", seeds=8,
-                    truth_fn=theirs(wide, float64))
+                    torch_arm(repeated(torch.float32)), draw, f"looped tier 3 {family} logits", seeds=8,
+                    truth_fn=torch_arm(wide, float64))
 
 
 def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(tmp_path):
