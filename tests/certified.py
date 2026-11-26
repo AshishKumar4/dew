@@ -2194,8 +2194,12 @@ def observing():
         del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
 
 
-_RAW_BITCAST_PAIRS = frozenset({(np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
-                               (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8))})
+_RAW_BITCAST_PAIRS = frozenset({
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
+    (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8)),
+    (np.dtype(np.uint8), np.dtype(jax.numpy.float8_e8m0fnu)),
+    (np.dtype(jax.numpy.float8_e8m0fnu), np.dtype(np.uint8)),
+})
 """Explicit integer/FP8 storage views the exact bitcast contract can check without a float format."""
 
 

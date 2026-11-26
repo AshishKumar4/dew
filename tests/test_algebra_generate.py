@@ -69,7 +69,9 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "softcap_tile", "sink_state", "sliding_visibility", "selective_adjoint",
                                   "kda_strict_band", "gdn_value_pullback", "ssd_chunk_forward",
                                   "ssd_chunk_pullback",
-                                  "gemm_partial_scale", "fp8_epilogue"])
+                                  "gemm_partial_scale", "fp8_epilogue", "mxfp8_scale", "mxfp8_epilogue",
+                                  "nvfp4_epilogue", "nvfp4_payload", "rounded", "rounded_tangent",
+                                  "rounded_fp16", "rounded_fp16_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
@@ -153,14 +155,14 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    (example,) = component_cases.ROUNDED.cases.operands[0]
+    form = component_cases.ROUNDED.cases[jnp.bfloat16,].forward
+    (example,) = form.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
         operands = ((jax.ShapeDtypeStruct(example.shape, example.dtype, sharding=sharding),),)
     else:
         operands = ((example,), (example,))
-    form = component_cases.ROUNDED
     cases = generate.Cases(operands, form.cases.draw, seeds=form.cases.seeds)
     form = generate.ComponentForm(form.function, form.truth, cases)
     with pytest.raises(ValueError):
@@ -328,24 +330,77 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
     assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
 
 
-def test_generated_rounded_bodies_keep_the_written_surrogate_law():
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
     from dew.algebra import component_cases_derived as emitted
-    from dew.nn import derivatives, precision
+    from dew.nn import precision
 
-    def tangent(primals, tangents, value):
-        return emitted.rounded_tangent(primals[0], tangents[0], value)
+    composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
 
-    rounded = derivatives.surrogate(emitted.rounded, tangent)
-    x = np.full((16, 32), 1.003, np.float32)
-    dx = np.full_like(x, 1.007)
-    primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
-    np.testing.assert_array_equal(primal, precision.rounded_operand(x, jnp.bfloat16))
-    np.testing.assert_array_equal(direction, dx)
-    _, pullback = jax.vjp(rounded, jnp.asarray(x))
-    np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
-    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
-    _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
-    np.testing.assert_array_equal(higher, 2 * dx)
+    def rounded(value):
+        return composed(value, dtype)
+
+    for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
+        x = np.full(shape, 1.003, np.float32)
+        dx = np.full_like(x, 1.007)
+        primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(primal, precision.rounded_operand(x, dtype))
+        np.testing.assert_array_equal(direction, dx)
+        _, pullback = jax.vjp(rounded, jnp.asarray(x))
+        np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
+        gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+        _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
+        np.testing.assert_array_equal(higher, 2 * dx)
+
+def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_value():
+    from jax.custom_derivatives import SymbolicZero
+
+    def value(x, y):
+        return x + y
+
+    def tangent(primals, directions, written):
+        dx, dy = (jnp.zeros_like(p) if isinstance(d, SymbolicZero) else d
+                  for p, d in zip(primals, directions, strict=True))
+        return written * (dx + dy)
+
+    def active_tangent(x, y, dx, written):
+        return written * dx
+
+    def draw(seed, operands):
+        return tuple(np.random.default_rng(seed + i).standard_normal(part.shape).astype(np.float32)
+                     for i, part in enumerate(operands))
+
+    tile = jax.ShapeDtypeStruct((8,), jnp.float32)
+    forward = generate.ComponentForm(value, value, generate.Cases(((tile, tile),), draw, 8))
+    active = generate.ComponentForm(active_tangent, active_tangent, generate.Cases(((tile,) * 4,), draw, 8))
+    case = generate.SurrogateCase("partial", forward, {(1,): active})
+    declared = generate.SurrogateBodies(value, tangent, (), True, {(): case})
+    reachable = {}
+    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
+        _, text = generate._component(component, component.cases.operands[0], "default", "sm90", name)
+        reachable[name] = printed.loaded(text, "form")
+
+    called = set()
+
+    def emitted(name):
+        fn = reachable[name]
+        called.add(fn)
+
+        def array(*operands, policy, target):
+            (result,) = fn(*operands)
+            return result
+
+        return array
+
+    composed = declared.assembled(emitted)
+    x = np.arange(8, dtype=np.float32)
+    y = np.full_like(x, 3.5)
+    dx = np.full_like(x, 2.25)
+    primal, moved = jax.jit(lambda x, y, dx: jax.jvp(lambda z: composed(z, y), (x,), (dx,)))(x, y, dx)
+    np.testing.assert_array_equal(primal, x + y)
+    np.testing.assert_array_equal(moved, (x + y) * dx)
+    assert called == set(reachable.values())
+
 
 
 def nested(x, y):

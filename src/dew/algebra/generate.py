@@ -21,7 +21,7 @@ import importlib.metadata
 import importlib.util
 import itertools
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -79,6 +79,81 @@ class ComponentForm:
     function: Callable
     truth: Callable
     cases: Cases
+
+
+@dataclasses.dataclass(frozen=True)
+class SurrogateCase:
+    """One static argument tuple's flat value and tangent bodies, the latter keyed by inactive slots."""
+
+    name: str
+    forward: ComponentForm
+    tangents: Mapping[tuple[int, ...], ComponentForm]
+
+    def tangent_name(self, inactive: tuple[int, ...]) -> str:
+        suffix = "_zero_" + "_".join(map(str, inactive)) if inactive else ""
+        return self.name + "_tangent" + suffix
+
+
+@dataclasses.dataclass(frozen=True)
+class SurrogateBodies:
+    """A written surrogate and its opt-in checked body cases. Production keeps using the written rule."""
+
+    forward: Callable
+    tangent: Callable
+    nondiff_argnums: tuple[int, ...]
+    symbolic_zeros: bool
+    cases: Mapping[tuple, SurrogateCase]
+
+    def declared(self, module: str) -> SurrogateBodies:
+        """Register both bodies under the same static-argument and tangent-activity declaration."""
+        for case in self.cases.values():
+            declare(module, case.name, case.forward)
+            for inactive, form in case.tangents.items():
+                declare(module, case.tangent_name(inactive), form)
+        return self
+
+    def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
+        """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
+        from jax.custom_derivatives import SymbolicZero
+
+        from dew.nn.derivatives import surrogate
+
+        fixed_at = sorted(self.nondiff_argnums)
+
+        def forward(*values):
+            fixed = tuple(values[index] for index in fixed_at)
+            case = self.cases.get(fixed)
+            dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
+            if case is not None and _case_admitted(case.forward.cases, dynamic, policy, target):
+                return emitted(case.name)(*dynamic, policy=policy, target=target)
+            return self.forward(*values)
+
+        def tangent(*values):
+            *fixed, primals, directions, value = values
+            case = self.cases.get(tuple(fixed))
+            inactive = tuple(i for i, direction in enumerate(directions) if isinstance(direction, SymbolicZero))
+            component = None if case is None else case.tangents.get(inactive)
+            if case is not None and component is not None:
+                active = tuple(direction for direction in directions if not isinstance(direction, SymbolicZero))
+                operands = (*primals, *active, *jax.tree.leaves(value))
+                if _case_admitted(component.cases, operands, policy, target):
+                    return emitted(case.tangent_name(inactive))(*operands, policy=policy, target=target)
+            return self.tangent(*values)
+
+        return surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums, symbolic_zeros=self.symbolic_zeros)
+
+
+def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:
+    if policy not in cases.policies or target not in cases.targets:
+        return False
+    for value in operands:
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            return False
+        aval = jax.typeof(value)
+        if not isinstance(aval, ShapedArray) or aval.weak_type or not aval.sharding.mesh.empty:
+            return False
+    key = case_of(operands)
+    return any(case_of(shapes) == key for shapes in cases.operands)
 
 
 @dataclasses.dataclass(frozen=True)

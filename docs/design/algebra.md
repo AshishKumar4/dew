@@ -1373,11 +1373,13 @@ merge, the backward's overlapped weight and dropped anchored cotangent phases in
 the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
 pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
 solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
-the selective scan's packed and unpacked decay. The same writer checks rounded-operand forward and
-tangent bodies. Additional cases cover the masked softcap hook and its slope, projected sink state,
+the selective scan's packed and unpacked decay. A paired surrogate declaration checks both BF16 and
+FP16 rounded-operand bodies and preserves their written higher-order rule. Other cases cover the masked
+softcap hook and its slope, projected sink state,
 document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
-Mamba-SSD chunk forward and pullback, and GEMM partial scaling and blockwise FP8 epilogue. Each case
-has an independent reference. The template component suites check their primitives on the CPU.
+Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8, MXFP8 and NVFP4 epilogues. Exact
+byte witnesses also cover the MX scale exponent and the NVFP4 packed payload. Each case has an independent
+reference. The template component suites check their primitives on the CPU.
 Production still uses the written bodies (row 3272).
 
 ```python
