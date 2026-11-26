@@ -334,12 +334,16 @@ class StageLocal:
         placement = validated(self.stacked_shapes(state))
         if not self.sites:
             return jax.device_put(state, placement), placement
-        whole = jax.device_put(state, validated(jax.eval_shape(lambda given: given, state)))
+        laid = validated(jax.eval_shape(lambda given: given, state))
         if not consumed:
-            return owned_program(stack, out_shardings=placement)(whole), placement
+            return owned_program(stack, out_shardings=placement)(jax.device_put(state, laid)), placement
         from dew.state import apart, together  # read where called, as this module reads dew.state's types
 
-        moving, frozen = apart(whole)
+        # Placed whole giving the handed arrays over (`donate`), where a placement other than theirs copies
+        # them, so no handed array outlives its copy; then stacked giving the copies over.
+        (moving, frozen), (moving_laid, frozen_laid) = apart(state), apart(laid)
+        moving = jax.device_put(moving, moving_laid, donate=True)
+        frozen = jax.device_put(frozen, frozen_laid)
         stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
                                  out_shardings=placement, donate_argnums=0)
         return stacking(moving, frozen), placement
