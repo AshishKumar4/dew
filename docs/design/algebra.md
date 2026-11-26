@@ -373,8 +373,9 @@ fitted to them, and a rule set ships only with measured receipts.
   a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
   product, a narrow float's correctly rounded arithmetic its float32 arithmetic rounded once, axes of one
-  element erased, equal equations once). Where a candidate's results are then its declaration's very values,
-  the region is that call's by identity and no e-graph is built. Otherwise the program enters one term
+  element erased, equal equations once). An explicit reduce-precision keeps its own operation; narrowing
+  and widening can change observable NaN payload bits. Identical canonical results match without an
+  e-graph. Otherwise the program enters one term
   region and saturates under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact
   sets alone under the accurate forms), and the region is the call's where each of its results shares its
   declaration's e-class. Either way the call's selector must give it a kernel of Dew's. A different constant, cast,

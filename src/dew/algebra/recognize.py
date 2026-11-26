@@ -847,8 +847,15 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
     is made from and each value it makes of the gate's shape, the up projection the one other operand of
     that shape; or one packed projection `[..., 2, H]` both are read from, its two halves its operands'
     sources (`packed_gated_product`)."""
-    from dew.nn.activations import gated_product, packed_gated_product
+    from dew.nn.activations import gated_hook, gated_product, packed_gated_product
     from dew.nn.kernels import norm_swiglu
+
+    # The selected Pallas kernel rounds by narrowing casts, not XLA's reduce_precision.
+    def cast_pair(g, u, dtype):
+        return gated_hook("swiglu")(g, u).astype(dtype)
+
+    def cast_packed(gate_up, dtype):
+        return cast_pair(gate_up[..., 0, :], gate_up[..., 1, :], dtype)
 
     if place not in _entrywise_places(index):
         return
@@ -886,14 +893,14 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
                     made = packed_gated_product("swiglu", implementation=implementation)(gate_up)
                     return made.astype(dtype)
 
-                yield Candidate((packed,), (output,), halves, functools.partial(halves, implementation='xla'),
+                yield Candidate((packed,), (output,), halves, functools.partial(cast_packed, dtype=dtype),
                                 lambda packed=packed: norm_swiglu.packed_swiglu_kernel(
                                     "auto", _shape(packed)) == "pallas")
 
             def product(g, u, implementation='auto', dtype=dtype):
                 return gated_product("swiglu", implementation=implementation)(g, u).astype(dtype)
 
-            yield Candidate((gate, up), (output,), product, functools.partial(product, implementation='xla'),
+            yield Candidate((gate, up), (output,), product, functools.partial(cast_pair, dtype=dtype),
                             lambda gate=gate, up=up: norm_swiglu.swiglu_kernel(
                                 "auto", _shape(gate), _shape(up)) == "pallas")
 
