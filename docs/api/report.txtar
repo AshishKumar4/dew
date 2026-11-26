@@ -352,8 +352,6 @@ class Trainer(objective: Objective[Loss, Effects], optimizer: OptimizerSpec | Op
   .optimizer: property -> optax.GradientTransformation
   .place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]
   .plan: property -> JSON
-  .reading(self, loader: Loader, prefetch: int = 2, *, examples=None, steps=None) -> None
-  .scheduled(self, updates: int | None) -> None
   .shardings(self, state: TrainState) -> Placement[TrainState]
   .staged(self, state: TrainState) -> TrainState
   .state_mesh: cached property -> Mesh
