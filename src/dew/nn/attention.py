@@ -947,9 +947,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
-    if isinstance(bias, BandBias):
-        # Every route reads it written out over the call's keys (`BandBias.dense`).
-        bias = bias.dense(key.shape[-3])
+    bias = bias.dense(key.shape[-3]) if isinstance(bias, BandBias) else bias  # every route's, written out
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
