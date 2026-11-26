@@ -309,6 +309,24 @@ def rope_part(default: float, *, axial: bool = False) -> ConfigPart:
     return ConfigPart(read, write)
 
 
+def axial_rope_part(default: float, family: str) -> ConfigPart:
+    """A trunk that turns an axial rotary alone (`rope_type` 'axial', the type its config class defaults to
+    where it states none), its base `rope_base`'s, written as its `rope_parameters`; any other type
+    refused in `family`'s name."""
+    def read(vision: Mapping[str, object], used: set[str],
+             record: NativeFields[Rotary]) -> NativeFields[Rotary]:
+        used.update(("rope_parameters", "rope_theta"))
+        rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
+        if rope.get("rope_type", "axial") != "axial":
+            raise ValueError(f"{family}'s trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
+        record["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, default, axial=True)
+        return record
+
+    def write(tower: Rotary) -> Mapping[str, object]:
+        return {"rope_parameters": {"rope_type": "axial", "rope_theta": tower.rope_theta}}
+    return ConfigPart(read, write)
+
+
 TRUNK_FIELDS = (integer_field("hidden_size", required=True),
                 integer_field("intermediate_size", required=True),
                 integer_field("num_hidden_layers", "num_layers", required=True),

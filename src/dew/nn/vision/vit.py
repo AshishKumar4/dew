@@ -282,6 +282,30 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                       precision=precision, name=f"blocks_{index}")
 
 
+def _segments(layout: ViTLayout, valid, frame, windows, *, images: bool) -> dict:
+    """Each attention kind's segment ids `[B, tokens]` (`ViTLayout.attention`), None where it attends
+    unmasked: an NCHW image is one frame with no padding, its full layers unmasked. A packed row's special
+    tokens (a class token, registers) join its first frame in its full layers: a row one image, as a tower
+    holding them packs it."""
+    segments = {
+        "full": None if images else jnp.where(valid, frame + 1, 0),
+        "band": jnp.where(valid, frame + 1, 0),
+        "conv": jnp.where(valid, frame + 1, 0),
+        "item": jnp.where(valid, 1, 0),
+        "window": None if windows is None else jnp.where(valid, windows + 1, 0),
+    }
+    tokens = layout.special_tokens
+    if tokens.count and not images:
+        if set(layout.attention) != {"full"} or set(layout.order) != {"patches"} or any(layout.sinks):
+            raise ValueError("a packed image's special tokens join its patches in full layers alone, in "
+                             "their own order and with no sinks")
+        full = segments["full"]
+        joined = jnp.ones((full.shape[0], tokens.count), full.dtype)
+        segments["full"] = jnp.concatenate([joined, full] if tokens.cls == "first" else [full, joined],
+                                           axis=1)
+    return segments
+
+
 def _gather(x, index):
     """`x`'s rows `[B, L, ...]` taken in `index` `[B, L]` order; None takes them as they are."""
     if x is None or index is None:
@@ -405,14 +429,7 @@ class VisionTransformer(nn.Module):
                   else jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True)
                   for name, key in keys.items() if key is not None}
 
-        segments = {
-            # An NCHW image is one frame with no padding: its full layers attend unmasked.
-            "full": None if images else jnp.where(valid, frame + 1, 0),
-            "band": jnp.where(valid, frame + 1, 0),
-            "conv": jnp.where(valid, frame + 1, 0),
-            "item": jnp.where(valid, 1, 0),
-            "window": None if windows is None else jnp.where(valid, windows + 1, 0),
-        }
+        segments = _segments(lay, valid, frame, windows, images=images)
         current = "patches"
         for index in range(lay.depth):
             wanted = lay.order[index]
