@@ -583,21 +583,26 @@ def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
         np.testing.assert_array_equal(np.asarray(mapped(rows, scales, dy)), want)
 
 
-def test_a_ternary_matrix_at_a_subnormal_scale_is_refused_where_packed_and_where_restored():
-    """A BitNet b1.58 matrix's fp32 scale is zero or normal (row 13340): a subnormal one given to
-    `TernaryWeights.of` is refused by name, as is one a restored matrix holds (`checked`, which its product
-    calls), where a process that flushes a subnormal operand (XLA's CPU) read its products as zeros; zero and
-    the least normal scale pack, and a traced scale is checked where it is restored."""
+def test_a_ternary_matrix_at_a_scale_neither_zero_nor_finite_normal_is_refused_where_packed_and_restored():
+    """A BitNet b1.58 matrix's fp32 scale is zero or a finite normal (row 13340): a subnormal one given to
+    `TernaryWeights.of` is refused, as are an infinity and a NaN; so is a negative subnormal among a
+    per-column scale's normal entries, packed under `jit` (its scale traced there) and checked concrete after
+    (`checked`, its restore's), and one a traced form's product meets concrete; zero and the least normal
+    scale pack, where a process that flushes a subnormal operand (XLA's CPU) read its products as zeros."""
     weights = np.zeros((256, 2), np.float32)
     weights[0] = [1.0, -1.0]
+    for scale in (2.0 ** -127, np.inf, np.nan):
+        with pytest.raises(ValueError):
+            formats.TernaryWeights.of(weights, scale=np.float32(scale))
+    mixed = np.asarray([0.5, -(2.0 ** -130)], np.float32)
+    packed = jax.jit(lambda s: formats.TernaryWeights.of(weights, scale=s))(jnp.asarray(mixed))
     with pytest.raises(ValueError):
-        formats.TernaryWeights.of(weights, scale=np.float32(2.0 ** -127))
-    packed = formats.TernaryWeights.of(weights, scale=np.float32(1.0))
-    stored = dataclasses.replace(packed, scale=np.float32(2.0 ** -127))
+        packed.checked()
+    normal = formats.TernaryWeights.of(weights, scale=np.float32(1.0))
+    stored = dataclasses.replace(normal, scale=np.float32(2.0 ** -127))
     with pytest.raises(ValueError):
-        stored.checked()
-    with pytest.raises(ValueError):
-        gemm.ternary_weight_product(jnp.ones((1, 256), jnp.float32), stored, quantize_activations=False)
+        jax.jit(lambda form: gemm.ternary_weight_product(
+            jnp.ones((1, 256), jnp.float32), dataclasses.replace(stored, form=form),
+            quantize_activations=False))(jnp.asarray(stored.form))
     for scale in (0.0, float(np.finfo(np.float32).tiny)):
         formats.TernaryWeights.of(weights, scale=np.float32(scale)).checked()
-    jax.jit(lambda s: formats.TernaryWeights.of(weights, scale=s).words)(jnp.float32(2.0 ** -127))

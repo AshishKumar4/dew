@@ -78,7 +78,9 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     if not isinstance(weights.form, Tracer):
         weights.checked()
     else:
+        # Its form checked where concrete; its scale wherever it is (`TernaryWeights.checked`'s rule).
         scale_checked(jnp.shape(weights.scale), weights.shape)
+        weights.scale_admitted(weights.scale)
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
