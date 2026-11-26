@@ -423,9 +423,9 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
             for j in range(later):
                 first = (j + 1) * algebra.SUB
                 # A sub-chunk's keys staged and published in one batch (`operands.staged_all`), the row sets'
-                # gated rows with the first's, its products issued then: the batch's opening barrier (each
-                # store's own where Mosaic GPU brackets it) keeps this sub-chunk's keys from overwriting one
-                # buffer the last's products still read (`_sub_chunk_staged`).
+                # gated rows with the first's, its products issued then: its first store's barrier keeps this
+                # sub-chunk's keys from overwriting one buffer the last's products still read
+                # (`_sub_chunk_staged`).
                 batch = [(gated_up(j + 1), raised[j % len(raised)]),
                          *([] if held else [(value, lefts[r]) for r, value in enumerate(gated)])]
                 staged = operands.staged_all(call, batch)

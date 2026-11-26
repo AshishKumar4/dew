@@ -3,6 +3,7 @@ operand across persistent tiles of their own trip counts, one consumer or two sh
 interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
 here, and runs on one in the GPU gate."""
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -1675,20 +1676,17 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     assert order[first + 3:first + 5] == ["tcgen05_commit_arrive", "barrier_wait"], order
 
 
-def _staged_three(x, *, interpret: bool, batched: bool, aliased: bool = False):
+def _staged_three(x, *, interpret: bool, batched: bool):
     """`x` (16 x 64), twice and thrice it, staged in bf16 by an mma.sync issuer whose warps split a tile's
-    columns (its stores bracketed by its own barriers), in one batch (`Family.staged_all`) or a store apiece
-    (`Family.staged`), and each read back; `aliased`, its first buffer given twice."""
+    columns (its stores bracketed by its own barriers), published together (`Family.staged_together`) or a
+    store apiece (`Family.staged`), and each read back."""
     family = bundles.named("mma.sync", jnp.bfloat16, None).specialized(16, 64)
 
     def body(x_gmem, *outs):
         def scoped(*buffers):
             value = x_gmem[...] if interpret else family.zeros((16, 64))
-            targets = (buffers[0], buffers[0], buffers[2]) if aliased else buffers
-            pairs = [(value * times, buffer) for times, buffer in zip((1, 2, 3), targets, strict=True)]
-            if batched:
-                family.staged_all(pairs)
-            else:
+            pairs = [(value * times, buffer) for times, buffer in zip((1, 2, 3), buffers, strict=True)]
+            with family.staged_together() if batched else contextlib.nullcontext():
                 for each, buffer in pairs:
                     family.staged(each, buffer)
             if interpret:
@@ -1704,7 +1702,7 @@ def _staged_three(x, *, interpret: bool, batched: bool, aliased: bool = False):
 
 @INTERPRETS
 def test_a_staged_batch_holds_each_value_in_its_buffer():
-    """Interpreted: three values staged in one batch (`Family.staged_all`) read back exactly from their own
+    """Interpreted: three values staged together (`Family.staged_together`) read back exactly from their own
     buffers."""
     x = jax.random.randint(jax.random.key(7), (16, 64), -4, 4).astype(jnp.float32)
     got = _staged_three(x, interpret=INTERPRETED, batched=True)
@@ -1734,22 +1732,15 @@ def _barriers(call) -> int:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("batched", [False, True], ids=["apiece", "batch"])
+@pytest.mark.parametrize("batched", [False, True], ids=["apiece", "together"])
 def test_three_mma_sync_staged_stores_take_a_barrier_at_each_end_and_one_between_each_two(batched):
-    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns, a
-    store apiece (`staged`) or in one batch (`Family.staged_all`), take four warpgroup barriers, one before
-    the first store, one after the last and one between each two: the fork drops a collective barrier that
-    repeats one before it (`core._drop_repeated_barriers`), where each store's own pair and the staging's
-    beside it took 12 apiece and 8 in a batch (a Kimi intra step's 20 a trip, FS-INTRA-BAR1; row 13053)."""
+    """Lowered for an A100: three tiles staged by an mma.sync issuer whose warps split a tile's columns, each
+    store bracketed by its own barriers, published apiece (`staged`) or together (`staged_together`), take
+    four warpgroup barriers, one before the first store, one after the last and one between each two: the
+    fork drops a collective barrier that repeats one before it (`core._drop_repeated_barriers`), where each
+    store's own pair and the staging's beside it took 12 apiece and a batch's own pair 8 (a Kimi intra
+    step's 20 a trip, FS-INTRA-BAR1; row 13053)."""
     assert _barriers(functools.partial(_staged_three, interpret=False, batched=batched)) == 4
-
-
-def test_a_staged_batch_refuses_a_buffer_twice():
-    """A batch given one shared-memory buffer twice is refused as it traces, before any store: its stores go
-    unbracketed against each other."""
-    with generation.assumed("sm80"), pytest.raises(ValueError):
-        jax.make_jaxpr(functools.partial(_staged_three, interpret=False, batched=True, aliased=True))(
-            jax.ShapeDtypeStruct((16, 64), jnp.float32))
 
 
 def _staged_together(x, w, *, interpret, shared: bool):

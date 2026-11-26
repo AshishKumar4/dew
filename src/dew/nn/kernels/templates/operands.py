@@ -47,11 +47,13 @@ def staged(call: Issuing, value: jax.Array, buffers: Sequence[mosaic.Ref], *,
 
 def staged_all(call: Issuing, operands: Sequence[tuple[jax.Array, Sequence[mosaic.Ref]]]) -> list["Parts"]:
     """Each value of `operands` staged in shared memory as the parts its products take, one a buffer of its
-    `buffers` (`staged`'s), every part written in one batch (`Family.staged_all`: an mma.sync issuer's one
-    pair of barriers for all)."""
+    `buffers` (`staged`'s), every part stored before any is published, all of them once
+    (`Family.staged_together`)."""
     parts = [(formed(call, value, len(buffers)), buffers, value.dtype) for value, buffers in operands]
-    call.family.staged_all([(part, buffer) for values, buffers, _ in parts
-                            for part, buffer in zip(values, buffers, strict=True)])
+    with call.family.staged_together():
+        for values, buffers, _ in parts:
+            for part, buffer in zip(values, buffers, strict=True):
+                call.family.staged(part, buffer)
     return [Parts(buffers, dtype) for _, buffers, dtype in parts]
 
 
