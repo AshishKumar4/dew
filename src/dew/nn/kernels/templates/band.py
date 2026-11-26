@@ -51,6 +51,9 @@ def band_column(origin: jax.Array, k_first, keys: int | jax.Array, width: int) -
     `origin` (`band_origins`), clamped within the band, and whether the tile lies within it: origins and
     widths whole `BAND_ALIGN`s, and every key tile's keys dividing one, a tile lies wholly within the band or
     wholly past it."""
+    if isinstance(keys, int) and BAND_ALIGN % keys:
+        raise ValueError(f"a key tile of {keys} keys straddles a band's origins, whole {BAND_ALIGN}s: a tile "
+                         "of a band divides them")
     column = jnp.asarray(k_first, jnp.int32) - origin
     inside = (column >= 0) & (column <= width - keys)
     return jnp.clip(column, 0, width - keys), inside

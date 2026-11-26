@@ -59,11 +59,12 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
     key's column from its query's origin (`origins`, its QUERY side after it), zeros past its band."""
     if kind is Kind.OUTPUT:
         raise ValueError("an output hook's parameter has no score tile")
+    # A band's origins' row the program's own (its values' and its origins' rows each shared apart).
+    origin_row = None if origins is None else shared_place(origins.shape, row, 0)[0]
     if kind is not Kind.HEAD:
         row, head = shared_place(value.shape, row, head)
     if kind is Kind.BAND:
-        assert origins is not None, "a band is read by its origins, the side after it"
-        origin_row, _ = shared_place(origins.shape, row, 0)
+        assert origins is not None and origin_row is not None, "a band is read by its origins, after it"
         column = keys[None, :] - origins[origin_row, 0, rows][:, None].astype(jnp.int32)
         inside = (column >= 0) & (column < value.shape[-1])
         read = jnp.take_along_axis(value[row, head, rows], jnp.clip(column, 0, value.shape[-1] - 1), axis=-1)
@@ -526,12 +527,43 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
                              for kind in score_kinds if kind in DKV_GRADS)
 
-    dk, dv, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    graded = [index for index, kind in enumerate(score_kinds) if kind in DKV_GRADS]
     pairs = band_origins_of(score_kinds)
-    bands = [(score_params[pairs[index]], score_params[index].shape[-1]) if kind is Kind.BAND else None
-             for index, kind in enumerate(score_kinds) if kind in DKV_GRADS]
+    banded = {index: score_params[pairs[index]] for index in graded if score_kinds[index] is Kind.BAND}
+
+    def step(bands, index):
+        # A band's gradient added into its compact `[B, H, Qp, Kb]` as each program writes its piece: its
+        # rows' columns of the program's keys (`_band_added`), no `[B, H, Qp, Kp]` held (head review).
+        dk, dv, written = program(index)
+        j, rest = index // (batch * heads), index % (batch * heads)
+        held, kept = iter(bands), []
+        added = []
+        for place, grad in zip(graded, written, strict=True):
+            if place in banded:
+                added.append(_band_added(next(held), grad, banded[place], rest // heads, rest % heads,
+                                         j * block_k))
+            else:
+                kept.append(grad)
+        return tuple(added), (dk, dv, tuple(kept))
+
+    start = tuple(jnp.zeros((batch, heads, queries, score_params[index].shape[-1]), jnp.float32)
+                  for index in banded)
+    bands, (dk, dv, written) = jax.lax.scan(step, start, jnp.arange(blocks * batch * heads))
     return _dkv_laid_out(dk, dv, written, [kind for kind in score_kinds if kind in DKV_GRADS], bands,
                          batch=batch, heads=heads, queries=queries, keys=keys, block_k=block_k)
+
+
+def _band_added(band: jax.Array, piece: jax.Array, origins: jax.Array, row, head, k_first) -> jax.Array:
+    """`band` `[B, H, Qp, Kb]` with a dK/dV program's piece of its gradient added, `piece` `[Qp, bk]` for
+    the keys from `k_first` of row `row` and head `head`: each query's entries at its keys' columns from its
+    origin (`origins`, its QUERY side's), none past its band."""
+    origin_row, _ = shared_place(origins.shape, row, 0)
+    origin = origins[origin_row, 0].astype(jnp.int32)
+    column = k_first - origin[:, None] + jnp.arange(piece.shape[1], dtype=jnp.int32)[None, :]
+    width = band.shape[-1]
+    inside = (column >= 0) & (column < width)
+    rows = jnp.arange(piece.shape[0])[:, None]
+    return band.at[row, head, rows, jnp.clip(column, 0, width - 1)].add(jnp.where(inside, piece, 0.0))
 
 
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, *, score_mod,
@@ -588,22 +620,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 def _dkv_laid_out(dk, dv, written, kinds, bands, *, batch: int, heads: int, queries: int, keys: int,
                   block_k: int):
     """`_dkv_launch`'s programs' results laid out: dK, dV and the key parameters' gradients (`kinds`, each of
-    `written`'s) from `[blocks * batch * heads, bk, ...]` to `[B, Kp, H, ...]`, the tile parameters' from
-    `[blocks * batch * heads, Qp, bk]` to `[B, H, Qp, Kp]`, a band's (`bands`' origins and width where its
-    kind is `Kind.BAND`) read from its keys' blocks at each query's columns, `[B, H, Qp, Kb]`."""
+    `written`'s but a band's) from `[blocks * batch * heads, bk, ...]` to `[B, Kp, H, ...]`, the tile
+    parameters' from `[blocks * batch * heads, Qp, bk]` to `[B, H, Qp, Kp]`, a band's its own (`bands`, in
+    turn, `[B, H, Qp, Kb]` as `_band_added` wrote it)."""
     blocks = keys // block_k
-
-    def banded(x, origins, width):
-        # Each query's band column c is key origin + c: its block's piece at it, zero past the call's keys.
-        pieces = x.reshape(blocks, batch, heads, queries, block_k)
-        shared = jnp.broadcast_to(origins[:, 0], (batch, queries))
-        at = shared[:, :, None] + jnp.arange(width, dtype=jnp.int32)
-        inside = (at >= 0) & (at < keys)
-        at = jnp.clip(at, 0, keys - 1)
-        rows, query = jnp.arange(batch)[:, None, None, None], jnp.arange(queries)[None, None, :, None]
-        read = pieces[at[:, None] // block_k, rows, jnp.arange(heads)[None, :, None, None], query,
-                      at[:, None] % block_k]
-        return jnp.where(inside[:, None], read, 0.0)
 
     def keyed(x):
         return jnp.moveaxis(x.reshape(blocks, batch, heads, *x.shape[1:]), 0, 2).reshape(
@@ -613,10 +633,11 @@ def _dkv_laid_out(dk, dv, written, kinds, bands, *, batch: int, heads: int, quer
         return jnp.moveaxis(x.reshape(blocks, batch, heads, queries, block_k), 0, 3).reshape(
             batch, heads, queries, keys)
 
+    held, banded = iter(written), iter(bands)
     return keyed(dk), keyed(dv), tuple(
-        keyed(grad[..., None])[..., 0].swapaxes(1, 2) if kind == Kind.KEY
-        else banded(grad, *band) if kind is Kind.BAND else tiles(grad)
-        for grad, kind, band in zip(written, kinds, bands, strict=True))
+        next(banded) if kind is Kind.BAND
+        else keyed(next(held)[..., None])[..., 0].swapaxes(1, 2) if kind == Kind.KEY else tiles(next(held))
+        for kind in kinds)
 
 
 def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,

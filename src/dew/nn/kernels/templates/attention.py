@@ -1205,11 +1205,12 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = N
     """`param` as the reference reads it for one batch row and query head, over every query and `keys`
     keys: a band's written out over them from its `origins` (`band_dense`)."""
     value = param.value
+    # A band's origins' row the call's own (its values' and its origins' rows each shared apart).
+    origin_row = None if origins is None else shared_place(origins.value.shape, row, 0)[0]
     if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE, Kind.BAND):
         row, head = shared_place(value.shape, row, head)
     if kind_of(param) is Kind.BAND:
-        assert origins is not None, "a band is read by its origins, the side after it"
-        origin_row, _ = shared_place(origins.value.shape, row, 0)
+        assert origins is not None and origin_row is not None, "a band is read by its origins, after it"
         bands = value[row, head]
         # Its origins whole keys whatever dtype a truth's draw widened them to.
         origin = origins.value[origin_row, 0][:, None].astype(jnp.int32)

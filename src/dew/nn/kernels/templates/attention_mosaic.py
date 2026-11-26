@@ -346,15 +346,18 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         return max(1, resources.register_model(family, config.consumers, regs,
                                                shared=staged, target=target, tmem=tmem, joined=joined).most)
 
-def _band_held(kinds: tuple[Kind, ...], config: "Tiles | BackwardTiles") -> bool:
-    """Whether every query tile `config`'s launches read a band side of (`Kind.BAND`) lies within one of its
-    origins' groups (`band.BAND_GROUP`), a tile's origin one scalar (`attention_mosaic_program._param`): a
-    forward's consumers' rows, a backward's dQ tile's and its dK/dV walk's."""
+def _band_held(kinds: tuple[Kind, ...], config: Tiles | BackwardTiles) -> bool:
+    """Whether every tile `config`'s launches read a band side of (`Kind.BAND`) lies within one of its
+    origins' groups and wholly within its band or wholly past it: a program's query rows (its consumers')
+    dividing `band.BAND_GROUP`, a tile's origin one scalar (`attention_mosaic_program._param`), and each key
+    tile dividing `band.BAND_ALIGN` (`band.band_column`: a 192-key tile from key 192 straddles an origin of
+    256, and read as past the band dropped keys 256 to 383's biases, head review), the forward's, the dQ
+    launch's and the dK/dV launch's own (`BackwardTiles.dkv`)."""
     if Kind.BAND not in kinds:
         return True
-    # A forward's and a dQ launch's consumers' rows together, a dK/dV walk's query tile alone.
-    rows = (config.consumers * config.block_q, config.block_q)
-    return all(band.BAND_GROUP % each == 0 for each in rows)
+    tiles = (config, config.dkv) if isinstance(config, BackwardTiles) else (config,)
+    return all(band.BAND_GROUP % (tile.consumers * tile.block_q) == 0 and band.BAND_GROUP % tile.block_q == 0
+               and band.BAND_ALIGN % tile.block_k == 0 for tile in tiles)
 
 
 @dataclasses.dataclass(frozen=True)
