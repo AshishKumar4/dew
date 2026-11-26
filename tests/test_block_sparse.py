@@ -304,12 +304,14 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
         assert selected.shape == (rows, groups, length, top_k + 2), forcing
         for row, group, at in np.ndindex(rows, groups, length):
             own = at // block
-            forced = set(range(initial)) | {b for b in range(own - local + 1, own + 1) if b >= 0}
+            # The forced blocks it reaches, each once, ranked ahead of the rest within its one top.
+            forced = {b for b in set(range(initial)) | set(range(own - local + 1, own + 1)) if 0 <= b <= own}
             maxima = np.array([scores[row, group, at, b * block:min((b + 1) * block, at + 1)].max()
                                if b * block <= at else -np.inf for b in range(length // block)])
             maxima[list(forced)] = -np.inf
-            picked = {int(b) for b in selected[row, group, at] if b >= 0}
-            assert picked == _top(maxima, top_k + 2 - initial - local, forced), (forcing, row, group, at)
+            slots = [int(b) for b in selected[row, group, at] if b >= 0]
+            assert len(slots) == len(set(slots)), (forcing, row, group, at)
+            assert set(slots) == _top(maxima, top_k + 2 - len(forced), forced), (forcing, row, group, at)
     selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k))
 
     logits = jnp.asarray(rng.standard_normal((rows, heads * groups, length, length)), jnp.float32)
@@ -340,20 +342,24 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     np.testing.assert_array_equal(np.asarray(by_hidden), 0.0)
 
 
-def test_msas_selection_keeps_its_slots_and_forces_no_block_past_the_query():
-    """MSA's selection (`msa_selection`) holds its `top_k` slots whatever its blocks: over one block of keys,
-    the query's own and 15 empty (-1); and forces no block a query does not reach: with the first two blocks
-    forced, a query of the first block takes the first alone, the second not yet past it; and none past the
-    keys' last block, a query past every key (16 queries over 8 keys) forcing no block the keys hold not."""
+def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach():
+    """MSA's selection (`msa_selection`), its raw slots: over one block of keys, the query's own once and
+    the rest empty (-1) whatever its `top_k`; M3's forcing (the first block and the two ending at its own)
+    for a query of the first block, its own once, not the first and its own as two (row 13501); a top of
+    one with its own forced alone, its own; with two first blocks forced, a query of the first block its
+    first alone, the second not yet past it; and no block past the keys' last (16 queries over 8 keys)."""
     scores = jnp.where(jnp.tril(jnp.ones((16, 16), bool)), 0.0, -jnp.inf)[None, None]
     one = np.asarray(block_sparse.msa_selection(scores, block=16, top_k=16))
-    assert one.shape == (1, 1, 16, 16)
-    assert all({int(b) for b in one[0, 0, at] if b >= 0} == {0} for at in range(16))
+    np.testing.assert_array_equal(one[0, 0], np.array([[0] + [-1] * 15] * 16))
+    m3 = np.asarray(block_sparse.msa_selection(scores, block=8, top_k=4, initial=1, local=2))
+    np.testing.assert_array_equal(m3[0, 0, 0], [0, -1, -1, -1])
+    np.testing.assert_array_equal(m3[0, 0, 8], [0, 1, -1, -1])
+    alone = np.asarray(block_sparse.msa_selection(scores, block=8, top_k=1, initial=0, local=1))
+    np.testing.assert_array_equal(alone[0, 0, :, 0], [0] * 8 + [1] * 8)
     two = np.asarray(block_sparse.msa_selection(scores, block=8, top_k=4, initial=2, local=1))
-    assert {int(b) for b in two[0, 0, 0] if b >= 0} == {0}
-    assert {int(b) for b in two[0, 0, 8] if b >= 0} == {0, 1}
+    np.testing.assert_array_equal(two[0, 0, 0], [0, -1, -1, -1])
     rectangular = np.asarray(block_sparse.msa_selection(scores[..., :8], block=8, top_k=4, local=1))
-    assert {int(b) for b in rectangular[0, 0, 8] if b >= 0} == {0}
+    np.testing.assert_array_equal(rectangular[0, 0, 8], [0, -1, -1, -1])
 
 
 def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense_call():
