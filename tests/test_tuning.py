@@ -725,3 +725,23 @@ def test_a_prepared_hook_pickles_as_its_source_and_is_rebuilt_by_the_constructor
     assert loaded_rewritten.run is not loaded_rewritten.source and loaded_taken.run is loaded_taken.source
     for loaded, made in ((loaded_rewritten, rewritten), (loaded_taken, taken)):
         assert jnp.array_equal(loaded(scores), made(scores))
+
+
+def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_compiler():
+    """A TPU step none of whose kernel launches is Dew's, another library's Pallas TPU kernel alone (JAX's
+    Splash attention's kind), lowered for a TPU here: a measuring tuning run of it would measure nothing it
+    asked for, so its kernels are named by their compiler (`tuning._foreign_kernels`, which `tune` refuses
+    with as `Untunable`), never passed by as a GPU's Triton kernels alone were (row 13534)."""
+    from jax.experimental import pallas as pl
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    def step(x):
+        return pl.pallas_call(doubled, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+    rows = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    lowered = jax.jit(step).trace(rows).lower(lowering_platforms=("tpu",))
+    foreign = tuning._foreign_kernels(lowered)
+    assert foreign and all(name.startswith("mosaic_tpu: ") for name in foreign), foreign
+    assert "mosaic_tpu: " in str(tuning.Untunable(foreign))
