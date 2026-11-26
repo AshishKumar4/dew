@@ -354,11 +354,14 @@ def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
         holding[1]
 
 
-def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named(monkeypatch, tmp_path):
-    """An export on a Hub repository read by its branch is read at the commit the branch named as its
-    manifest was read, each file it lists at that commit (a Hub file at a commit is one version by its
-    URL): the branch moved on since, to a commit whose files hold other records, the source reads the
-    records its manifest listed, from the files it listed."""
+@pytest.mark.parametrize("transport", ["", "simplecache::"], ids=["direct", "through a transport cache"])
+def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named(monkeypatch, tmp_path,
+                                                                              transport):
+    """An export on a Hub repository read by its branch, directly or through a transport cache over the Hub
+    (`simplecache::hf://`), is read at the commit the branch named as its manifest was read, each file it
+    lists at that commit (a Hub file at a commit is one version by its URL): the branch moved on since, to a
+    commit whose files hold other records, the source reads the records its manifest listed, from the files
+    it listed (row 13554: through a cache, its files were read at the moved branch)."""
     from types import SimpleNamespace
 
     from huggingface_hub import HfApi, HfFileSystem, parse_hf_uri
@@ -399,7 +402,9 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
                         SimpleNamespace(sha=branch.get(revision or "main", revision)))
     # The real Hub's filesystem again once the test ends.
     monkeypatch.setitem(importlib.import_module("fsspec.registry")._registry, "hf", LocalHub)
-    source = Files("hf://datasets/owner/data@main/export", format="parquet")
+    source = Files(f"{transport}hf://datasets/owner/data@main/export", format="parquet",
+                   storage_options={"simplecache": {"cache_storage": str(tmp_path / "cache")}} if transport
+                   else None)
     # Its manifest read, none of its files yet, as a run's identity is taken before its reads.
     assert source.committed is not None
     branch["main"] = "1" * 40
