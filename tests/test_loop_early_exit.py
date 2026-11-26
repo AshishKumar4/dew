@@ -17,6 +17,7 @@ from model_support import (
     TINY_DECODER,
     attending,
     decode_steps,
+    decode_with,
     method_run,
     model_draw,
     stacked,
@@ -206,18 +207,10 @@ def test_a_pass_runs_over_the_rows_still_looping_alone(opened, shared):
 
 def _decoded(model, prompt: int):
     """`model`'s logits over `ids`, its first `prompt` tokens prefilled into an allocated cache and each
-    later one decoded alone."""
-    made, step = decode_steps(model)
-
-    def run(variables, ids):
-        cache = made(variables, ids.shape[0])
-        logits, cache = step(variables, cache, ids[:, :prompt])
-        each = [logits]
-        for index in range(prompt, ids.shape[1]):
-            logits, cache = step(variables, cache, ids[:, index:index + 1])
-            each.append(logits)
-        return jnp.concatenate(each, axis=1)
-    return run
+    later one decoded alone (`model_support.decode_with`)."""
+    steps = decode_steps(model)
+    return lambda variables, ids: decode_with(steps, variables, ids[:, :prompt], ids[:, prompt:],
+                                              prefilled=True)
 
 
 def _tokens_exiting(**loop) -> CausalTransformer:
@@ -241,6 +234,41 @@ def test_a_shared_cache_decodes_each_token_at_its_exiting_pass(bias, site):
     draw = _gated(model_draw(looped, (2, 10), looped.vocab_size), looped.emb_features, 0xE93, bias=bias)
     assert_as_exact(_decoded(looped, 1), _decoded(reference, 1), draw, f"decoding exiting at the {site}",
                     seeds=SEEDS[site], truth_fn=_decoded(reference.clone(dtype=jnp.float64), 1))
+
+
+@attending("reference")
+def test_a_shared_cache_keeps_each_rows_exiting_pass_when_its_rows_exit_apart():
+    """A token decoded under a cache its passes share, five rows exiting at each of its three passes
+    (row 12928): each row's cache after the step is, bit for bit, the one the loop leaves running the
+    passes its token's gate exits at (the first whose cumulative exit probability, read off the step's
+    own exit logits, reaches the threshold), threshold or none, from the same cache. The passes' caches
+    held by reference followed each later pass's writes, so a row exiting at the first kept the second's."""
+    looped = _tokens_exiting(shared_cache=True, layers=(2, 4))
+    variables, ids = _gated(model_draw(looped, (5, 4), looped.vocab_size), looped.emb_features, 0xE98)(0)
+    made, step = decode_steps(looped)
+    _, cache = step(variables, made(variables, ids.shape[0]), ids[:, :3])
+    _, kept = step(variables, cache, ids[:, 3:4])
+    # Every pass's exit logit, read off a call that opens them (which runs every pass, the threshold's
+    # choice made by none: `EXITS`).
+    opened = jax.jit(lambda v, c, token: looped.apply({**v, "cache": c}, token, decode=True,
+                                                      mutable=["cache", "exits"]))
+    _, sown = opened(variables, cache, ids[:, 3:4])
+    hazards = jax.nn.sigmoid(np.asarray(sown["exits"]["logits"], np.float64).reshape(looped.loop.steps, -1))
+    reached = 1 - np.cumprod(1 - hazards, axis=0) >= looped.loop.exit_threshold
+    exits = np.where(reached.any(axis=0), reached.argmax(axis=0), looped.loop.steps - 1)
+    assert set(exits.tolist()) == set(range(looped.loop.steps)), exits
+
+    def ran(count: int):
+        every = looped.clone(loop=dataclasses.replace(looped.loop, steps=count, exit_threshold=None))
+        return decode_steps(every)[1](variables, cache, ids[:, 3:4])[1]
+    passes = [ran(count) for count in range(1, looped.loop.steps + 1)]
+
+    def row(tree, index):
+        return [np.take(np.asarray(leaf), index, axis=list(leaf.shape).index(ids.shape[0]))
+                for leaf in jax.tree.leaves(tree) if ids.shape[0] in leaf.shape]
+    for index, exited in enumerate(exits.tolist()):
+        for held, every in zip(row(kept, index), row(passes[exited], index), strict=True):
+            np.testing.assert_array_equal(held, every)
 
 
 @attending("reference")

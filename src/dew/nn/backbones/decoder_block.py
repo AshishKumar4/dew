@@ -72,6 +72,7 @@ from ..protocols import (
 )
 from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual, recomputing
 from ..sharding import RESIDUAL, constrain, declared
+from ..short_conv_site import ShortConvSite
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -770,6 +771,9 @@ class DecoderBlock(nn.Module):
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
+    depth_sites: bool = False  # each mixer input site its own depth query and norm (`LayerKind`)
+    mixer_conv: int | None = None  # taps of a short convolution over its mixer's output
+    feedforward_conv: int | None = None  # taps of a short convolution over its feed-forward output
     cross_pass: CrossPass | None = None
     """The messages a looped pass merges into the block's sublayer inputs (`Loop.messages`): a merge for
     each of its mixer's input sites and its feed-forward's (`CrossPassMerge`), which a call reads given the
@@ -1000,20 +1004,7 @@ class DecoderBlock(nn.Module):
         if self.hyper_connections is not None:
             self._stream_sites(self.hyper_connections)
         if self.residual_site is not None:
-            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
-                    or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim
-                    or self.hyper_connections is not None or self.residual_multiplier != 1.0):
-                raise ValueError(
-                    "attention residuals run Kimi K3's block, a plain pre-norm block whose "
-                    "residual is the depth mixture: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
-            site = functools.partial(DepthAttention, emb_features=self.emb_features,
-                                     norm_eps=self._stated_eps('attention residuals'),
-                                     normalize_values=self.residual_site.normalize_values)
-            self.attention_res = site(name='attention_res')
-            if self.feedforward is not None:
-                self.mlp_res = site(name='mlp_res')
+            self._depth_reads(self.residual_site, norm)
         if self.engram is not None:
             if self.hyper_connections is None or self.engram_index is None:
                 raise ValueError("an engram lookup gates into mHC's residual streams and reads "
@@ -1024,6 +1015,43 @@ class DecoderBlock(nn.Module):
         self.dropout = Dropout(rate=self.dropout_rate)
         if self.cross_pass is not None:
             self.cross_pass_merges = self._cross_pass_merges(self.cross_pass)
+        self._output_convs()
+
+    def _output_convs(self):
+        """Its short convolutions over its mixer's and feed-forward's outputs on the residual's width
+        (`LayerKind.mixer_conv`, `feedforward_conv`), each its own decode history."""
+        if self.mixer_conv is not None:
+            self.attn_conv = ShortConvSite(self.emb_features, self.mixer_conv, dtype=self.dtype,
+                                           name='attn_conv')
+        if self.feedforward_conv is not None:
+            if self.feedforward is None:
+                raise ValueError("a feed-forward's convolution convolves its output: the layer has none")
+            self.mlp_conv = ShortConvSite(self.emb_features, self.feedforward_conv, dtype=self.dtype,
+                                          name='mlp_conv')
+
+    def _depth_reads(self, residual_site: ResidualSite, norm: Callable[..., nn.Module]):
+        """The layer's depth mixtures over Kimi K3's blocks (`residual_site`): its attention's, each of its
+        mixer's input sites' under `depth_sites` with its own norm, and its feed-forward's."""
+        if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
+                or self.parallel is not None or self.altup is not None
+                or self.laurel_rank is not None or self.per_layer_input_dim
+                or self.hyper_connections is not None or self.residual_multiplier != 1.0):
+            raise ValueError(
+                "attention residuals run Kimi K3's block, a plain pre-norm block whose "
+                "residual is the depth mixture: no output norms, layer scalar, parallel "
+                "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
+        site = functools.partial(DepthAttention, emb_features=self.emb_features,
+                                 norm_eps=self._stated_eps('attention residuals'),
+                                 normalize_values=residual_site.normalize_values,
+                                 scaled=residual_site.scaled, gained=residual_site.gained)
+        self.attention_res = site(name='attention_res')
+        if self.depth_sites:
+            # The first site's query and norm the layer's own (`attention_res`, `input_layernorm`).
+            later = self._mixer_sites()[1:]
+            self.site_reads = {name: site(name=f'attention_res_{name}') for name in later}
+            self.site_norms = {name: norm(name=f'{NormSite.INPUT}_{name}') for name in later}
+        if self.feedforward is not None:
+            self.mlp_res = site(name='mlp_res')
 
     @nn.nowrap
     def _cross_pass_merges(self, spec: CrossPass) -> dict[str, CrossPassMerge]:
@@ -1056,7 +1084,9 @@ class DecoderBlock(nn.Module):
         out."""
         holders = {'self_attn': self.self_attn,
                    **({'engram': self.engram_layer} if self.engram is not None else {}),
-                   **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {})}
+                   **({CROSS_ATTENTION: self.cross_attention} if self.cross is not None else {}),
+                   **({'attn_conv': self.attn_conv} if self.mixer_conv is not None else {}),
+                   **({'mlp_conv': self.mlp_conv} if self.feedforward_conv is not None else {})}
         held = {name: cache_of(holder, rows) for name, holder in holders.items()}
         return {name: spec for name, spec in held.items() if spec}
 
@@ -1140,7 +1170,11 @@ class DecoderBlock(nn.Module):
             held = AttentionMetadata() if attention_metadata is None else attention_metadata
             state = self._crossed(state, held.context, decode, train, held.progress,
                                   CrossContext.queries_of(held.coordinates))
-        state, read, site = self._read(state, "attention")
+        state, taken, site = self._read(state, "attention")
+        # Each mixer site's own depth read under `depth_sites`, the first site's the layer's read.
+        sites = self._mixer_sites()
+        site_reads = taken if isinstance(taken, dict) else None
+        read = taken[sites[0]] if isinstance(taken, dict) else taken
         bank = prior_bank if self.cross_pass is not None else None
         if self.cross_pass is not None and bank is None and self.is_initializing():
             # A first pass reads no bank; its merges' parameters are declared all the same, so a decoder
@@ -1152,9 +1186,13 @@ class DecoderBlock(nn.Module):
             # Each site's input its own merge of the bank, normed as the block norms its attention's input;
             # a seam norm's fused stream would norm the stream, which no merge reads.
             # The sites' merges read the bank once together (`merged_sites`).
-            sites = self._mixer_sites()
-            merged = merged_sites(tuple(self.cross_pass_merges[name] for name in sites), read, bank)
-            normed, *rest = (self._attention_input(each) for each in merged)
+            merged = merged_sites(tuple(self.cross_pass_merges[name] for name in sites),
+                                  read if site_reads is None else tuple(site_reads[name] for name in sites),
+                                  bank)
+            normed, *rest = (self._site_input(name, each) for name, each in zip(sites, merged, strict=True))
+            site_inputs = dict(zip(sites[1:], rest, strict=True)) or None
+        elif site_reads is not None:
+            normed, *rest = (self._site_input(name, site_reads[name]) for name in sites)
             site_inputs = dict(zip(sites[1:], rest, strict=True)) or None
         elif not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -1168,6 +1206,9 @@ class DecoderBlock(nn.Module):
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
             mixer_routes, None if per_layer_input is None else per_layer_input.depth, site_inputs)
+        if self.mixer_conv is not None:
+            # On the residual's width past its projection, behind its own history (Inkling 2's `attn_sconv`).
+            mixed = self.attn_conv(mixed, MixerCall(attention_metadata, decode))
         if self.wiring.output_norms:
             mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")
@@ -1187,6 +1228,8 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
             else:
                 state, read, site = self._read(state, "mlp")
+                # Only a mixer's sites read their own depth (`depth_sites`); the feed-forward reads one.
+                assert not isinstance(read, dict), "a feed-forward reads one input"
                 if bank is not None:
                     # The feed-forward's site (and a parallel branch's, which reads it unnormed).
                     read = self.cross_pass_merges['mlp'](read, bank)
@@ -1205,6 +1248,9 @@ class DecoderBlock(nn.Module):
                                      and self.mlp.reads_train else {}))
                 if self.parallel is not None:
                     hidden = self.moe(read, hidden, **routes)
+            if self.feedforward_conv is not None:
+                # Convolved over the call's tokens behind its own history, before it joins the residual.
+                hidden = self.mlp_conv(hidden, MixerCall(attention_metadata, decode))
             if self.wiring.output_norms:
                 hidden = residual_normed(self.mlp_output_norm, hidden)
             mlp_branch = self._branch(hidden, train, "mlp")
@@ -1248,6 +1294,13 @@ class DecoderBlock(nn.Module):
                 return partial
             return self.attention_res(sources(state.blocks, state.finished, partial))
         return state._replace(partial=cross(state.partial, context, read=mixture))
+
+    def _site_input(self, name: str, read: jax.Array) -> jax.Array:
+        """Mixer input site `name`'s states from its `read`: through its own input norm where its depth
+        read is its own (`depth_sites`, a site past the first), else as the layer's attention reads them."""
+        if self.depth_sites and name in self.site_norms and self.wiring.pre_norms and self.attention_norm:
+            return self.site_norms[name](read)
+        return self._attention_input(read)
 
     def _attention_input(self, read: jax.Array) -> jax.Array:
         """The states a sublayer reads, `read`, as the layer's attention reads them: through its
@@ -1352,15 +1405,21 @@ class DecoderBlock(nn.Module):
         # layer with the partial it received, or that partial alone before any
         # block is finished (KimiDecoderLayer._forward_attn_residual,
         # modeling_kimi_linear.py:973-1046).
+        readers = {self._mixer_sites()[0]: self.attention_res,
+                   **(self.site_reads if self.depth_sites else {})}
         if not state.finished:
             if self.is_initializing():
                 # Layer 0 carries the site like every layer and never reads it
                 # (the reference skips it on an empty block list, :987-993); the
                 # tree holds it so the checkpoint's tensors have a leaf.
-                self.attention_res(state.partial[:, :, None])
-            read = state.partial
+                for reader in readers.values():
+                    reader(state.partial[:, :, None])
+            reads = dict.fromkeys(readers, state.partial)
         else:
-            read = self.attention_res(sources(state.blocks, state.finished, state.partial))
+            held = sources(state.blocks, state.finished, state.partial)
+            reads = {name: reader(held) for name, reader in readers.items()}
+        # Each site's read under `depth_sites` (Inkling 2's full layers), else the one every site takes.
+        read = reads if self.depth_sites else next(iter(reads.values()))
         if site_spec.opens:
             # A layer that opens a block closes the partial it received into
             # the next slot, and its attention output starts the new partial.

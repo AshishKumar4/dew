@@ -134,12 +134,13 @@ def merged_by_hand(params, read, bank, spec: CrossPass, eps: float, dtype=jnp.fl
         keys = bank * jax.lax.rsqrt(jnp.mean(bank * bank, axis=-1, keepdims=True) + eps)
         depth = {name: jnp.asarray(value, dtype) for name, value in params["depth"].items()}
         query = depth["scale"] * depth["kernel"][:, 0]
-        weights = jax.nn.softmax(keys @ query, axis=-1)
+        scores = keys @ query
+        weights = jax.nn.softmax(scores / np.sqrt(keys.shape[-1]) if spec.scaled else scores, axis=-1)
         mixed = jnp.einsum("bsn,bsnd->bsd", weights, keys if spec.normalize_values else bank)
         message = mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=-1, keepdims=True) + eps)
         sigma = jnp.sqrt(jnp.mean(read * read, axis=-1, keepdims=True) + eps)
         state = (read / sigma) @ wide["input_down"] + message @ wide["message_down"]
-        sent = jnp.tanh(state @ wide["gain"]) * message
+        sent = jnp.tanh(state @ wide["gain"]) * (message if spec.normalize_message else mixed)
         if spec.additive:
             sent = sent + jnp.tanh(state @ wide["added"])
         kept = (1 - jnp.tanh(state @ wide["forget"])) * read
@@ -148,13 +149,19 @@ def merged_by_hand(params, read, bank, spec: CrossPass, eps: float, dtype=jnp.fl
 
 @pytest.mark.parametrize("spec", [MESSAGES, dataclasses.replace(MESSAGES, additive=False),
                                   dataclasses.replace(MESSAGES, scale_by_input_rms=False,
-                                                      normalize_values=False)],
-                         ids=["additive", "gained alone", "unit scale, raw values"])
+                                                      normalize_values=False),
+                                  dataclasses.replace(MESSAGES, additive=False, scale_by_input_rms=False,
+                                                      normalize_message=False),
+                                  dataclasses.replace(MESSAGES, additive=False, scale_by_input_rms=False,
+                                                      normalize_message=False, scaled=True)],
+                         ids=["additive", "gained alone", "unit scale, raw values", "raw message",
+                              "raw message, scaled scores"])
 def test_a_merge_is_its_formula(spec):
     """A merge of a bank of three summaries into a sublayer input, every parameter drawn off its init,
     computes its formula (`merged_by_hand`) on par with the formula written in float32 (check 1 against
-    it in float64), whether its message adds a term of its own, joins at the input's RMS and mixes the
-    summaries normed or raw."""
+    it in float64), whether its message adds a term of its own, joins at the input's RMS, mixes the
+    summaries normed or raw and joins at unit RMS or as the mixture left it, its scores over the root of the
+    width or not (Inkling 2's, row 12939)."""
     merge = CrossPassMerge(spec, 16, 1e-6)
 
     def draw(seed):

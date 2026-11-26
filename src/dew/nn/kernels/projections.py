@@ -17,7 +17,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew import _cache
 from dew._facts import Held
-from dew.mesh import mesh_axes
+from dew.mesh import mesh_axes, spec_axes
 from dew.nn.derivatives import (
     Protected,
     Surrogate,
@@ -735,7 +735,7 @@ def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
         return None
     lead = min(lhs.ndim - 1, 2)
     rows = logical_spec(RESIDUAL[:lead], lhs.shape[:lead])
-    named = {axis for entry in rows for axis in ((entry,) if isinstance(entry, str) else entry or ())}
+    named = spec_axes(rows)
     return jax.sharding.PartitionSpec(*rows) if named == automatic else None
 
 

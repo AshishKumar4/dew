@@ -386,7 +386,10 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             rows = _entry(queries, 0) if x.shape[0] == query.shape[0] else None
             extras[name] = (x, P(rows, exchanged_heads if x.shape[1] == heads else None))
     if sinks is not None:
-        extras['sinks'] = (sinks, P(exchanged_heads))
+        # A head's sinks with the heads; each query's own `[B, Q, H]` (projected sinks) with its row and heads
+        # too, its queries whole as the exchange leaves them.
+        extras['sinks'] = (sinks, P(exchanged_heads) if sinks.ndim == 1
+                           else P(_entry(queries, 0), None, exchanged_heads))
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
@@ -457,6 +460,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
         query = stripe(query, shards)
         positions = stripe(positions, shards, axis=0)
         mask, bias = rows_in_order(mask), rows_in_order(bias)
+        if sinks is not None and sinks.ndim == 3:
+            # Each query's own sinks `[B, Q, H]` in the striped queries' order.
+            sinks = stripe(sinks, shards)
         structural = structural_mask(
             stripe(jnp.arange(q_len), shards, axis=0), kv_len, causal, sliding_window)
         if structural is not None:
@@ -467,6 +473,8 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
         positions = jnp.pad(positions, (0, padding))
         if bias is not None and bias.ndim >= 2 and bias.shape[-2] == q_len:
             bias = jnp.pad(bias, ((0, 0),) * (bias.ndim - 2) + ((0, padding), (0, 0)))
+        if sinks is not None and sinks.ndim == 3:
+            sinks = jnp.pad(sinks, ((0, 0), (0, padding), (0, 0)))
 
     # A key length the shards do not divide takes no sequence axis, and
     # arrives whole instead of gathered; so do no keys, whose all-gather
@@ -481,7 +489,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
             x = four_dimensional(x)
             extras[name] = (x, query_split(SCORES, x, queries, query.shape))
     if sinks is not None:
-        extras['sinks'] = (sinks, query_split(("activation_heads",), sinks, queries, query.shape))
+        axes = ("activation_heads",) if sinks.ndim == 1 else ("activation_batch", "activation_length",
+                                                               "activation_heads")
+        extras['sinks'] = (sinks, query_split(axes, sinks, queries, query.shape))
     if key_value_seq_lengths is not None:
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))

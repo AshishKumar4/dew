@@ -319,6 +319,10 @@ class CausalTransformer(LinearProducts):
     """A vocabulary bias added in fp32 after a tied or untied head's product, as
     Phi's, GPT-J's and ModernBERT's decoders add one (`output_table`'s `bias`)."""
     tie_embeddings: bool = True
+    output_vocab: int | None = None
+    """The head's logits' width where it is narrower than the table's rows (`vocab_size`): the head
+    keeps every row as stored and scores the first `output_vocab` alone (`logits_width`). Inkling 2's
+    head scores 200058 of its 201024 released rows, the rest padding no tokenizer id reaches."""
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
@@ -426,9 +430,17 @@ class CausalTransformer(LinearProducts):
 
     def __post_init__(self):
         settle_fields(self)
+        if self.output_vocab is not None and not 0 < self.output_vocab <= self.vocab_size:
+            raise ValueError(f"a head scores at most its table's {self.vocab_size} rows, got "
+                             f"output_vocab={self.output_vocab}")
         # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
         _ = self.wiring
         super().__post_init__()
+
+    @property
+    def logits_width(self) -> int:
+        """`LogitsWidth`: the head's logits' width, its first `output_vocab` rows or every row."""
+        return self.vocab_size if self.output_vocab is None else self.output_vocab
 
     @property
     def wiring(self) -> BlockWiring:
@@ -518,7 +530,10 @@ class CausalTransformer(LinearProducts):
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
             qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
-            mixer=kind.mixer)
+            mixer=kind.mixer,
+            mixer_conv=kind.mixer_conv,
+            feedforward_conv=kind.feedforward_conv,
+            depth_sites=kind.depth_sites)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
         """The fraction of a kind's head its rotary turns, None for all of
@@ -823,6 +838,8 @@ class CausalTransformer(LinearProducts):
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              normalize_values=self.attention_residuals.normalize_values,
+                                             scaled=self.attention_residuals.scaled,
+                                             gained=self.attention_residuals.gained,
                                              name='output_res')
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
@@ -947,6 +964,9 @@ class CausalTransformer(LinearProducts):
             hyper_connections=None if spec.streams is None else self.hyper_connections,
             streams_at_ends=(False, False) if spec.streams is None else spec.streams,
             residual_site=spec.residual_site,
+            depth_sites=spec.kind.depth_sites,
+            mixer_conv=spec.kind.mixer_conv,
+            feedforward_conv=spec.kind.feedforward_conv,
             cross_pass=self.loop.messages if spec.messaged and self.loop is not None else None,
             dropout_rate=self.dropout_rate,
             remat=self.remat,
