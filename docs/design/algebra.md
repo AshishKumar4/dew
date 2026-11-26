@@ -166,10 +166,10 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     is zero where the magnitude keeps its bits), nor for a complex value; an exponential's logarithm is the
     stable set's (log space, below), and a logarithm's exponential holds only over a sign and a range. None of
     these is built;
-  - **reuse** (`reuse`, `reorders`, row 9035; dev time until its receipt is measured, row 9777: of the nine
-    perf-gate steps compiled ahead for an H100 it changes finetune-4b's program alone, whose timing with and
-    without it is M-DC-14's; compile time once measured): a value the forward already
-    computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
+  - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
+    dev-only until a changed default-route executable has a native receipt (row 9777). M-DC-14's
+    compile-only survey forcing XLA attention found a changed 4B step; the subsequent default-route
+    survey fired no match and did not time it. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
     read once without a rule. The rules relate a new value to another the program holds or hoist a division
     past a broadcast or square root: a quotient by a value whose reciprocal the program holds, `a / y` as
     `a (1/y)`, a quotient by a broadcast divisor hoisted to a per-row reciprocal, `a / broadcast(y)` as
@@ -186,9 +186,10 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     reciprocal-root reuse) or the dividend is bounded with the product under the reach (§6.3). Window
     formation (`program._windows`) pulls sibling `rsqrt` and unit reciprocal equations sharing a division
     head's radicand or divisor into the window;
-  - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
-    running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
-    merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);
+  - **decoupled reductions** (declared forms and dev-time rules): dependent nonlinear reductions broken
+    with correction terms. Stateful softmax and log-sum-exp merges use their own rescale; weighted or
+    masked variance and bilinear covariance use the declared Chan–Golub–LeVeque merge in `moments.py`
+    (row 9036), with independently ranged directional sums carried as described in §6.12;
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of
