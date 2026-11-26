@@ -1150,7 +1150,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         spent = "in " + " ".join(left_tests) + (f" ({group})" if group else "")
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, left_tests, group, part, left, "off", grace, common, environ,
-                                coverage, written=written))
+                                coverage, written=written,
+                                recycle_at=None if coverage is not None else PLAIN_RECYCLE_AT))
         rows += json.loads(part.read_text())["rows"]
         # The next process sees the commit's checkout, not what this one left in it (row 3932's review).
         if later:
@@ -1413,6 +1414,16 @@ class Processes:
 RECORDS = "DEW_RECORDS"
 """Where a task's run is told to keep no record ("off"): a suspect's (ops queue/suspect.sh), whose cache-off
 and repeated runs wrote each row's records again on keys a train's run holds."""
+
+
+PLAIN_RECYCLE_AT = 4 << 30
+"""The resident bytes past which a task's pytest ends between two tests and runs the rest in a fresh process
+(recycle.py, `ran_in_processes`), a dry prepare's aside (prepares.py's `RECYCLE_AT`): a 10 GiB container
+holds 4 GiB a process kept beside its next test's 5.2 GiB at most (row 13063's cold cases: 3.5 to 5.2 GiB
+each; train 1299's test_contracts_algebra.py#1/5 killed for memory beside its own earlier tests, green
+alone). A test that needs more is marked `fresh_process` (recycle.py's `FRESH`). A row run past a recycle is
+recorded as a blind watch's (`run_keys.record`), so a train runs it again; one that never passes the bound
+is one process's, as before. Coverage's runs are one process each, its data file whole."""
 
 
 def ran_in_processes(base: list[str], resumes: bool,

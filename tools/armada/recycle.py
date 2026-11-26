@@ -1,9 +1,10 @@
-"""A dry prepare's pytest that ends between two tests once it holds more than its task lets it
-(`RECYCLE_AT`, bytes resident), so its task runs the tests left in a fresh process (ci.py's `tested`): a
-process keeps much of what each test compiled (JAX's traces, XLA's and MLIR's native memory, which neither
-its caches' release nor a collection frees: a recurrence family held 1-3.6 GB past its release, scratch
-pk-rsstrace), and only its end returns it. It writes the test it ended after to `RECYCLED`, which its task
-reads as its word to run again. This module imports no pytest: ci.py reads its names."""
+"""A task's pytest that ends between two tests once it holds more than its task lets it (`RECYCLE_AT`, bytes
+resident), or before or after a test marked `fresh_process`, so its task runs the tests left in a fresh
+process (ci.py's `tested`): a process keeps much of what each test compiled (JAX's traces, XLA's and MLIR's
+native memory, which neither its caches' release nor a collection frees: a recurrence family held 1-3.6 GB
+past its release, scratch pk-rsstrace; eight higher-order algebra compiles 5.3 to 10 GB, row 13063), and
+only its end returns it. It writes the test it ended after to `RECYCLED`, which its task reads as its word to
+run again. This module imports no pytest: ci.py reads its names."""
 
 import json
 import os
@@ -11,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 RECYCLE_AT = "DEW_RECYCLE_AT"
-"""What names the resident bytes past which a dry prepare's pytest ends after the test running."""
+"""What names the resident bytes past which a task's pytest ends after the test running."""
+FRESH = "fresh_process"
+"""The mark of a test that runs in a process of its own: one that needs more than any process but a fresh
+one leaves its container (row 13063: a gradient of a gradient's compile peaks at 9.06 GiB of 10 GiB)."""
 RECYCLED = "DEW_RECYCLED"
 """What names the file a pytest that ended so writes the node id of its last test to."""
 SELECTED = "DEW_RECYCLE_SELECTED"
@@ -44,10 +48,16 @@ def pytest_collection_finish(session) -> None:
 
 
 def pytest_runtest_logfinish(nodeid: str, location) -> None:
-    """After a test, end the session where this process holds more than `RECYCLE_AT` and a test is left."""
+    """After a test, end the session where a test is left and this process holds more than `RECYCLE_AT`, the
+    test was marked `FRESH`, or the next one is."""
     at, recycled, session = os.environ.get(RECYCLE_AT), os.environ.get(RECYCLED), _session.get("it")
     if not at or not recycled or session is None or not session.items or session.items[-1].nodeid == nodeid:
         return
-    if resident() > int(at):
+    at_item = next((index for index, item in enumerate(session.items) if item.nodeid == nodeid), None)
+    fresh = at_item is not None and any(item.get_closest_marker(FRESH) is not None
+                                        for item in session.items[at_item:at_item + 2])
+    if fresh or resident() > int(at):
         Path(recycled).write_text(nodeid)
-        session.shouldstop = f"recycled after {nodeid}: this process holds more than {at} bytes"
+        why = ("a test beside it runs in a fresh process" if fresh
+               else f"this process holds more than {at} bytes")
+        session.shouldstop = f"recycled after {nodeid}: {why}"
