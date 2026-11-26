@@ -1350,15 +1350,17 @@ def _read_past(a, b, *, between: str):
             plgpu.store(out_smem, value, optimized=False)
             plgpu.commit_smem()
             mosaic.synced(interpret=False)
-            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
-                              copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
+            # Each program its own rows of the output.
+            stores.store_rows(out_smem, out_gmem, jax.lax.axis_index("programs") * LANDED, 0,
+                              jnp.int32(LANDED), 0, LANDED, copy=swizzling.coalesced,
+                              widest=resources.copied_rows(LANDED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
         accumulators = (plgpu.WGMMAAccumulatorRef(shape, jnp.float32),) * 2
         pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
                       swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
 
-    out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
+    out = jax.ShapeDtypeStruct((2 * LANDED, LANDED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(2,), grid_names=("programs",), consumers=1,
                          interpret=False, name="read_past")(a, b)
 
