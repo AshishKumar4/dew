@@ -212,7 +212,8 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
 def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path):
     """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule), and a JPEG
     turned by its EXIF orientation reads upright, whether the image is given through the public processor
-    as a PIL image, its encoded bytes, its file's path or a data URI: transformers' `load_image` converts a
+    as a PIL image, its encoded bytes, its file's path, a data URI (one past a path's length too) or
+    line-wrapped base64: transformers' `load_image` converts a
     path's image to RGB first, its transparent pixels black (row 13341). A tokenizer padding a side that is
     neither is refused (row 13342)."""
     import base64
@@ -241,11 +242,19 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
         with Image.open(stored) as image:
             image.load()
             forms = {'PIL': read(image), 'bytes': read(encoded), 'path': read(stored),
-                     'data URI': read(f'data:image/{kind};base64,{base64.b64encode(encoded).decode()}')}
-        for name in ('bytes', 'path', 'data URI'):
+                     'data URI': read(f'data:image/{kind};base64,{base64.b64encode(encoded).decode()}'),
+                     'wrapped base64': read(base64.encodebytes(encoded).decode())}
+        for name in ('bytes', 'path', 'data URI', 'wrapped base64'):
             for field, value in forms[name].items():
                 np.testing.assert_array_equal(value, forms['PIL'][field],
                                               err_msg=f'{stored.name} {name} {field}')
+    # A data URI longer than a path may be (an image of 64x64 noise, its PNG past 4 KiB).
+    large = tmp_path / 'large.png'
+    Image.fromarray(np.random.default_rng(13342).integers(0, 256, (64, 64, 4), np.uint8), 'RGBA').save(large)
+    inline = f'data:image/png;base64,{base64.b64encode(large.read_bytes()).decode()}'
+    assert len(inline) > 4096
+    for field, value in read(inline).items():
+        np.testing.assert_array_equal(value, read(large)[field], err_msg=f'large data URI {field}')
     blacked = read(rgba[..., :3])
     assert any(not np.array_equal(blacked[field], value) for field, value in read(transparent).items())
     upright = read(np.asarray(Image.open(turned).transpose(Image.Transpose.ROTATE_270)))

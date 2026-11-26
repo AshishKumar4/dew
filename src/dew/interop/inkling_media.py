@@ -68,6 +68,7 @@ def opened(image: str | Path | bytes | bytearray):
     import base64
     import binascii
     import io
+    import os
 
     from PIL import Image
 
@@ -77,10 +78,13 @@ def opened(image: str | Path | bytes | bytearray):
         response = requests.get(image, timeout=60)
         response.raise_for_status()
         image = response.content
-    elif isinstance(image, str) and not Path(image).is_file():
+    elif isinstance(image, str) and (image.startswith("data:image/") or not os.path.isfile(image)):
+        # Inline before any path probe (a long data URI is no path, `os.path.isfile` False where
+        # `Path.is_file` raises), decoded as transformers' `base64.decodebytes` decodes one: line-wrapped
+        # base64 too, any other character refused.
+        encoded = "".join((image.split(",", 1)[1] if image.startswith("data:image/") else image).split())
         try:
-            image = base64.b64decode(image.split(",", 1)[1] if image.startswith("data:image/") else image,
-                                     validate=True)
+            image = base64.b64decode(encoded, validate=True)
         except (binascii.Error, ValueError) as error:
             raise ValueError(f"an image string is a URL, a file's path, base64 or a data URI: {image[:64]!r}"
                              ) from error
