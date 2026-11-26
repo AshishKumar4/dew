@@ -1022,11 +1022,10 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
                                                              template.Kind.KEY),))
 
 
-def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype():
     """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
-    batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
-    and `launch_work` keys hook pricing on the active JAX trace context, its plan held by what its hook
-    computes."""
+    batch extent, and `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed
+    in-kernel."""
     spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
     queries, out_heads = tokens * group, kv_heads * group
@@ -1085,6 +1084,13 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     op_b = dataclasses.replace(op_a, output_mod=branch_b)
     assert op_a.traced("output_mod", op_a.output_mod) != op_b.traced("output_mod", op_b.output_mod)
 
+
+def test_a_merges_price_is_held_by_its_hook_as_its_epilogue_calls_it_for_its_target():
+    """Row 12420: a merge's priced work (`launch_work`) is held by its output hook as its epilogue calls it on
+    the launch's target (`merged._epilogue_programs`): its 16-bit gate widened to fp32, at each candidate
+    block, traced for the B200 it is priced for whatever the ambient GPU, under the trace context a hook
+    reads; a hook closing over an array held once for its program."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     def ctx_hook(o, g):
         return o * jax.nn.sigmoid(g) if _CTX_HOOK_MODE.get() == "sigmoid" else o + g
 
