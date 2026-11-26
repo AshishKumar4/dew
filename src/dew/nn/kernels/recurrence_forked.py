@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from dew.algebra import scan
 from dew.nn.sharding import varying_like
 
-from .chunked_launch import entry_write
+from .chunked_launch import Forked, entry_write
 
 
 def table_read(given, table, slot):
@@ -104,12 +104,8 @@ def forked_steps(forms, operands, given, forked, held: int, documents: int, deca
     chunks, count = loads.shape
     place = jnp.arange(count)
     starts = loads >= 0
-    # Each segment's first token, in token order: each document's first, and a chunk's first where its
-    # document continues; past the row's segments, a sentinel past its tokens.
-    marks = (starts | (place == 0)).reshape(-1)
-    # One place past the segments' most: the walk stops at its first sentinel, each segment's end the next
-    # origin (the row's end at its last).
-    origins = jnp.nonzero(marks, size=chunks + documents + 1, fill_value=chunks * count)[0]
+    # The walk stops at its first sentinel, each segment's end the next origin (`Forked.segment_origins`).
+    origins = Forked.segment_origins(loads, documents)
     # Every carry typed as each operand that reaches it varies (a checked `shard_map`'s manual axes): the
     # table's given memories, the chunks' operands (a laid erase's corrections among them) and the fork's.
     reaching = (given, *jax.tree.leaves(operands), *jax.tree.leaves(forked))
@@ -121,8 +117,7 @@ def forked_steps(forms, operands, given, forked, held: int, documents: int, deca
         the row's end), a real one: the loop stops at the first sentinel."""
         (chunk_in, held_chunk, leaving), table, outputs, entering = carried
         # A row's sentinel past its own segments walks its last chunk's first window, its result dropped.
-        chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
-        through = jnp.where(after // count == chunk, after % count - 1, count - 1)
+        chunk, origin, through = Forked.segment_span(first, after, chunks, count)
         # Entering a new chunk, its memory is the one the chunk before left.
         new = chunk != held_chunk
         memory_in = jax.tree.map(lambda a, b: jnp.where(new, a, b), leaving, chunk_in)
@@ -168,11 +163,7 @@ def most_segments(h, added: bool, turned: bool):
     vmap over differing layouts it is batched there, and the walk's conditional runs both branches, as the
     scan before it did (correct, its saving gone)."""
     _, forked = taken_up(h, added, turned)
-    if forked is None:
-        return None
-    loads = forked[0]
-    marks = (loads >= 0) | (jnp.arange(loads.shape[-1]) == 0)
-    return jnp.max(jnp.sum(marks, axis=(-2, -1)))
+    return None if forked is None else Forked.most_segments(forked[0])
 
 
 def forked_replay(replay, operands, given, forked, held: int):
