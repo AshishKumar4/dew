@@ -817,60 +817,40 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
 
 
-def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[str, ...] | None:
-    """The compute dtypes the Flax modules `objective` trains state, theirs or, a wrapper's stating none, the
-    submodules' its fields hold (their `dtype` fields), each once, in order: a model computes in the dtype it
-    was built with, a field of its own no trainer sets. None where one takes a compute dtype and states none
-    (Flax's None), its compute inferred from its inputs and its parameters together (`jnp.result_type`),
-    which no reading of the module establishes."""
-    stated: list[DTypeLike] = []
-    for module in _trained_modules(objective):
-        dtypes, takes = _stated(module, "dtype")
-        if takes and not dtypes:
-            return None
-        stated += dtypes
-    return tuple(dict.fromkeys(jnp.dtype(dtype).name for dtype in stated))
+def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> str | None:
+    """The one compute dtype every module `objective` trains states as its own (a Flax module's `dtype`
+    field): a model computes in the dtype it was built with, a field of its own no trainer sets. None where
+    one states none (Flax's None, its compute inferred from its inputs and parameters together, or a
+    module that takes no dtype, computing as it is written), or they state several: no reading of a
+    module's own fields establishes what its submodules compute in."""
+    stated = {jnp.dtype(dtype).name if (dtype := _own(entry.module, "dtype")) is not None else None
+              for entry in objective.program_key() if entry.trained}
+    return next(iter(stated)) if len(stated) == 1 else None
 
 
-def _trained_modules[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[linen.Module]:
-    return [entry.module for entry in objective.program_key()
-            if entry.trained and isinstance(entry.module, linen.Module)]
-
-
-def _stated(module: linen.Module, name: str) -> tuple[list[DTypeLike], bool]:
-    """The dtype `module` states in its field `name` (`dtype`, `param_dtype`), else those the submodules its
-    fields hold state, in order (a wrapper's, stating none of its own); and whether any of them has that
-    field at all (stating None, Flax's own)."""
-    fields = {field.name: getattr(module, field.name) for field in dataclasses.fields(module)
-              if field.name != "parent"}
-    if fields.get(name) is not None:
-        return [fields[name]], True
-    stated: list[DTypeLike] = []
-    has = name in fields
-    for value in fields.values():
-        for held in (value if isinstance(value, (tuple, list)) else (value,)):
-            if isinstance(held, linen.Module):
-                inner, inner_has = _stated(held, name)
-                stated, has = stated + inner, has or inner_has
-    return stated, has
+def _own(module: object, name: str) -> DTypeLike | None:
+    """The dtype `module` states in its own field `name` (`dtype`, `param_dtype`), a Flax module's; None
+    where it states none or is no Flax module."""
+    if not isinstance(module, linen.Module):
+        return None
+    return next((getattr(module, field.name) for field in dataclasses.fields(module) if field.name == name),
+                None)
 
 
 def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                    numerics: Numerics) -> tuple[bool, str | None]:
     """Whether a trainer under `numerics` scales its loss dynamically and the dtype it stores the parameters
     it draws fresh in (`TrainerAdvanced.numerics`): the one resolution of both, a run config's among them
-    (`dew.config.RunConfig.trained_numerics`). A module `objective` trains is refused where it states another
-    compute dtype than `numerics`', or states none, inferring it (`stated_compute`): the trainer cannot set
-    it, and the loss would be scaled for a compute the model may not run."""
-    stated = stated_compute(objective)
-    compute = jnp.dtype(numerics.dtypes.compute).name
-    other = [] if stated is None else [dtype for dtype in stated if dtype != compute]
-    if stated is None or other:
-        computes = "infers its compute dtype" if stated is None else f"computes in {' and '.join(other)}"
-        raise ValueError(f"the model {computes} and the run's numerics name {compute}: build it with "
-                         f"dtype={compute}, or name its dtype in the numerics (Dtypes.compute)")
-    drawn = numerics.drawn_dtype([dtype for module in _trained_modules(objective)
-                                  for dtype in _stated(module, "param_dtype")[0]])
+    (`dew.config.RunConfig.trained_numerics`). Refused unless every module `objective` trains states the
+    numerics' compute dtype as its own (`stated_compute`): the trainer cannot set it, and the loss would be
+    scaled for a compute the model may not run."""
+    stated, compute = stated_compute(objective), jnp.dtype(numerics.dtypes.compute).name
+    if stated != compute:
+        raise ValueError(f"the run's numerics compute in {compute}, which every module it trains states as "
+                         f"its own dtype (dtype={compute}); "
+                         + ("they state none, or several" if stated is None else f"they compute in {stated}"))
+    drawn = numerics.drawn_dtype([dtype for entry in objective.program_key() if entry.trained
+                                  and (dtype := _own(entry.module, "param_dtype")) is not None])
     return numerics.scales_loss(), drawn
 
 

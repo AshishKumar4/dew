@@ -461,6 +461,27 @@ def test_a_trainer_refuses_numerics_its_model_computes_outside_or_beside_their_o
     for dtype, stated in ((jnp.float32, numerics), (None, numerics), (None, full)):
         with pytest.raises(ValueError):
             Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=stated))
+
+    class Branches(nn.Module):
+        """A wrapper of two branches, one stating float16 and one inferring its compute."""
+
+        first: nn.Module
+        second: nn.Module
+
+        def __call__(self, x):
+            return self.first(x) + self.second(x)
+
+    class Compact(nn.Module):
+        """A wrapper stating no dtype whose float16 layer its body alone builds."""
+
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(1, dtype=jnp.float16)(x)
+
+    # A wrapper states no compute of its own, whatever its branches state.
+    for wrapper in (Branches(nn.Dense(1, dtype=jnp.float16), nn.Dense(1)), Compact()):
+        with pytest.raises(ValueError):
+            Trainer(Fitted(wrapper), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
     for knobs in ({"param_dtype": "bfloat16"}, {"dynamic_scale": True}):
         with pytest.raises(ValueError):
             Trainer(Fitted(read(jnp.float16)), optax.sgd(.1),

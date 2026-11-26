@@ -1698,12 +1698,13 @@ class RunConfig:
 
     def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics | None:
         """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
-        precision, with the compute dtype its model computes in in place of its own, the one the model it is
-        handed states (`stated_compute`, a model built in Python), else its record's (`compute_dtype`), and
-        the parameters' dtype its model's record states, which the model then draws them in itself. None
-        where a module it trains infers its compute (Flax's None), which no trainer establishes: the run
-        then hands its trainer the loss scale and drawn dtype its record names (`trained_knobs`), as before
-        numerics reached the trainer, its programs traced under its numerics all the same (`traced`)."""
+        precision, with the compute dtype its modules state as their own in place of its own
+        (`stated_compute`: the record's where the run built them, `numerics_fields`, a handed model's own),
+        and the parameters' dtype its model's record states, which the model then draws them in itself. None
+        where its modules state no one compute dtype (Flax's None, a wrapper's, several among a multipart
+        objective's), which no trainer establishes: the run then hands its trainer the loss scale and drawn
+        dtype its record names (`trained_knobs`), as before numerics reached the trainer, its programs traced
+        under its numerics all the same (`traced`)."""
         from dew.training.transaction import stated_compute
 
         computes = stated_compute(objective)
@@ -1713,7 +1714,7 @@ class RunConfig:
         stated = self.model.fields.get("param_dtype")
         params = precision.dtypes.params if stated is None else str(stated)
         return dataclasses.replace(precision, dtypes=dataclasses.replace(
-            precision.dtypes, compute=computes[0] if computes else self.compute_dtype(), params=params))
+            precision.dtypes, compute=computes, params=params))
 
     def trained_knobs(self) -> tuple[bool, str | None]:
         """The loss scale and drawn dtype a trainer takes for a run whose numerics it cannot hold
