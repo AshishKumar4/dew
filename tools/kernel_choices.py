@@ -59,11 +59,18 @@ def served() -> dict[str, frozenset[str]]:
     the names a site decides by (`generation.SITE_KERNELS`)."""
     from dew.nn.kernels import generation
 
-    named: dict[str, set[str]] = {str(choice): set() for choice in generation.CHOICES}
+    choices = {str(choice) for choice in generation.CHOICES}
+    named: dict[str, set[str]] = {}
     for choice, found in ops().items():
         named.setdefault(str(choice), set()).update(kernel.name for op in found for kernel in op.kernels)
     for choice, kernels in generation.SITE_KERNELS.items():
         named.setdefault(str(choice), set()).update(kernels)
+    # A choice no op or site serves would write an empty Literal, and one no choice names a field a block
+    # cannot set: either refuses, naming them, before anything is written.
+    if unserved := sorted(choice for choice in choices if not named.get(choice)):
+        raise ValueError(f"choices no op or site serves a kernel of: {unserved}")
+    if unknown := sorted(set(named) - choices):
+        raise ValueError(f"ops or sites serve choices `generation.CHOICES` names not: {unknown}")
     return {choice: frozenset(kernels) for choice, kernels in named.items()}
 
 
