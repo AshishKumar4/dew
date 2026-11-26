@@ -88,10 +88,13 @@ with report.certifying(compile_only_gpus("sm90")[0]):
             lowered = step.trace(*shapes).lower()
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
-    # The lowered program run here on nonzero operands, its hook's held value 2 either way (`t` sums to 2).
+    # The lowered program run here on nonzero operands, its hook's held value 2 either way (`t` sums to 2);
+    # and again on a `t` summing to 3, which the closed hook alone reads.
     operands = (np.arange(1, 129, dtype=np.float32).reshape(8, 16) / 64,
                 np.linspace(-1, 1, 128, dtype=np.float32).reshape(8, 16), np.float32([1.5, 0.5]))
-    ran = lowered.compile()(*operands)
+    other = (*operands[:2], np.float32([2.0, 1.0]))
+    executable = lowered.compile()
+    ran, reran = executable(*operands), executable(*other)
 
 
 def listed(values):
@@ -99,7 +102,7 @@ def listed(values):
 
 
 print(json.dumps({"program": program_of(lowered), "certified": found, "ran": listed(ran),
-                  "plain": listed(step(*operands)),
+                  "plain": listed(step(*operands)), "reran": listed(reran), "replain": listed(step(*other)),
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """A launch of a custom derivative in a step's gradient traced and lowered with each launch certified on a
@@ -125,7 +128,8 @@ def test_a_launch_certified_aside_lowers_the_program_it_lowers_unpending_and_is_
     inside a shard_map, and its loss and both gradients run as the step's own uncertified call's, the
     multiplier its derivative takes and the hook's held value in them; and it is certified either way. A
     hook closing over an operand of the step's own trace, which no launch traced alone could read, is
-    certified aside, its operand replayed as an argument, and runs as with a constant of its value."""
+    certified aside, its operand replayed as an argument, and runs as with a constant of its value, another
+    value of it read as it is given."""
     for placed in ("whole", "sharded"):
         captured, certified, closed = (stepped(tmp_path, placed, mode)
                                        for mode in ("captured", "certified", "closed"))
@@ -133,11 +137,14 @@ def test_a_launch_certified_aside_lowers_the_program_it_lowers_unpending_and_is_
         loss, *gradients = captured["ran"]
         assert loss != 0 and all(np.any(np.asarray(gradient)) for gradient in gradients), placed
         for found in (captured, certified, closed):
-            np.testing.assert_allclose(np.concatenate([np.ravel(value) for value in found["ran"]]),
-                                       np.concatenate([np.ravel(value) for value in found["plain"]]),
-                                       rtol=0, atol=0, err_msg=placed)
+            for ran, plain in (("ran", "plain"), ("reran", "replain")):
+                np.testing.assert_allclose(np.concatenate([np.ravel(value) for value in found[ran]]),
+                                           np.concatenate([np.ravel(value) for value in found[plain]]),
+                                           rtol=0, atol=0, err_msg=placed)
         for found in (certified, closed):
             assert found["ran"] == captured["ran"], placed
+        # The closed hook reads the operand it was replayed with: another `t`, another result.
+        assert closed["reran"] != closed["ran"] and captured["reran"] == captured["ran"], placed
         for found in (captured, certified, closed):
             assert found["certified"] == [["Scaled", False]] and not found["uncertified"], (placed, found)
 
