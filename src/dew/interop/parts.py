@@ -108,13 +108,21 @@ def _biased(*linears: torch.nn.Module) -> bool:
     return biased.pop()
 
 
-def _rope(config, *, partial: bool = False) -> Mapping[str, object]:
+_GRIDS = ('mrope_section', 'mrope_interleaved')
+"""A rope record's layout of an image's three position grids over the rotated pairs (Qwen3.5's): one
+position a token gives every grid the same angles, which the layout then reads alike
+(modeling_qwen3_5.py:143-216, `recomposition_frequencies`), so a text decoder's rotary is the plain one."""
+
+
+def _rope(config, *, partial: bool = False, grids: bool = False) -> Mapping[str, object]:
     """The rotary a `LlamaRotaryEmbedding`-shaped class builds from its config's standardized record
     (its rope_type through ROPE_INIT_FUNCTIONS, `decoder_parts.read_rope`), over the whole head; where
     `partial`, a class whose code turns the record's `partial_rotary_factor` of each head (GLM-4's and
     StableLM's), over that fraction, its frequencies over the dimensions it turns (`partial_rotary_type`
-    'default', GPT-NeoX's)."""
-    parameters = dict(config.rope_parameters or {})
+    'default', GPT-NeoX's); where `grids`, a text decoder's rotary whose record lays out an image's
+    position grids (`_GRIDS`), which its text reads as one."""
+    parameters = {key: value for key, value in (config.rope_parameters or {}).items()
+                  if not (grids and key in _GRIDS)}
     factor = parameters.get('partial_rotary_factor', 1.0)
     if factor != 1.0 and not partial:
         raise Ambiguous("the rotary turns part of each head, which this rotation applies whole")
@@ -259,7 +267,12 @@ def _head_geometry(view: PartView) -> dict[str, int]:
 
 
 def _read_attention(view: PartView) -> Mapping[str, object]:
-    geometry = _head_geometry(view)
+    return _attention_fields(view, _head_geometry(view))
+
+
+def _attention_fields(view: PartView, geometry: Mapping[str, int]) -> Mapping[str, object]:
+    """A causal attention's fields over its `geometry` (`_head_geometry`): its biases, dropout and
+    scale."""
     width = geometry['head_dim']
     biased = _biased(view.q_proj, view.k_proj, view.v_proj)
     fields: dict[str, object] = {
@@ -277,6 +290,134 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     """Qwen3's attention: Llama's with an RMSNorm over each head's queries and keys (`q_norm`, `k_norm`,
     read as norms like the block's)."""
     return {**_read_attention(view), 'qk_norm': True}
+
+
+def _read_query_gated_attention(view: PartView) -> Mapping[str, object]:
+    """Qwen3.5's and Qwen3-Next's attention: Qwen3's (`q_norm`, `k_norm`), its query projection twice as
+    wide, each head's queries beside their gate (`torch.chunk` of the head's two widths), the output
+    times the sigmoid of its gate before `o_proj` (modeling_qwen3_5.py:787-821), as Dew's `output_gate`
+    computes from its query projection."""
+    width = view.head_dim
+    if not view.is_causal:
+        raise Ambiguous("the attention is not causal")
+    heads, kv_heads = view.q_proj.out_features // (2 * width), view.k_proj.out_features // width
+    if 2 * heads * width != view.q_proj.out_features or kv_heads * width != view.k_proj.out_features:
+        raise Ambiguous("the projections hold no whole number of heads beside their gates")
+    geometry = {'num_heads': heads, 'num_kv_heads': kv_heads, 'head_dim': width}
+    return {**_attention_fields(view, geometry), 'qk_norm': True, 'output_gate': True}
+
+
+def _delta_net_geometry(view: PartView) -> dict[str, int]:
+    """A gated delta net's heads and widths, and its causal depthwise convolution's taps over its queries,
+    keys and values, activated by silu (`causal_conv1d_fn`, `activation=self.activation`), checked
+    against what its code builds them as."""
+    taps, heads = int(view.conv_kernel_size), (int(view.num_k_heads), int(view.num_v_heads))
+    widths = (int(view.head_k_dim), int(view.head_v_dim))
+    conv, channels = view.conv1d, 2 * heads[0] * widths[0] + heads[1] * widths[1]
+    if (view.activation != 'silu' or conv.groups != channels or conv.in_channels != channels
+            or conv.kernel_size != (taps,) or conv.padding != (taps - 1,) or conv.bias is not None):
+        raise Ambiguous("the convolution is not one unbiased causal depthwise filter per channel activated "
+                        "by silu")
+    if heads[1] % heads[0]:
+        raise Ambiguous(f"its {heads[1]} value heads share no whole number of its {heads[0]} key heads")
+    return {'linear_num_key_heads': heads[0], 'linear_num_value_heads': heads[1],
+            'linear_key_head_dim': widths[0], 'linear_value_head_dim': widths[1],
+            'linear_conv_kernel_dim': taps}
+
+
+def _delta_net_fact(view: PartView, geometry: Mapping[str, int], *, fused: bool) -> Mapping[str, object]:
+    """A gated delta net's per-layer mixer fact (`dew.nn.mixers.gated_delta_net.GatedDeltaNetMixer`): its
+    `geometry`, its gated norm's activation (`output_gate_type`), its norms' epsilon the block's own
+    (`norm_eps`, which Dew's mixer reads), and its out projection, unbiased, back to the width."""
+    values = geometry['linear_num_value_heads'] * geometry['linear_value_head_dim']
+    if view.out_proj.in_features != values or view.out_proj.bias is not None:
+        raise Ambiguous("the out projection is not one unbiased map of the value heads")
+    return {'norm_eps': float(view.layer_norm_epsilon), _LAYER: {'mixer': {
+        'kind': 'linear_attention', 'class': 'gated_delta_net',
+        'fields': {**geometry, 'output_gate_type': str(view.norm.activation), 'fused_in_proj': fused}}}}
+
+
+def _read_gated_delta_net(view: PartView) -> Mapping[str, object]:
+    """Qwen3.5's gated delta net: `in_proj_qkv` through the convolution to the queries, keys and values,
+    `in_proj_z` to the gated norm's gate, `in_proj_b` and `in_proj_a` to each value head's write strength
+    and decay (with `A_log` and `dt_bias`), the chunked delta rule over l2-normed queries and keys, its
+    gated norm and `out_proj` (modeling_qwen3_5.py:504-668); a per-layer fact (`_with_mixers`)."""
+    geometry = _delta_net_geometry(view)
+    keys, values = (geometry['linear_num_key_heads'] * geometry['linear_key_head_dim'],
+                    geometry['linear_num_value_heads'] * geometry['linear_value_head_dim'])
+    heads = geometry['linear_num_value_heads']
+    expected = {'in_proj_qkv': 2 * keys + values, 'in_proj_z': values, 'in_proj_b': heads, 'in_proj_a': heads}
+    for name, width in expected.items():
+        projection = getattr(view, name)
+        if projection.out_features != width or projection.bias is not None:
+            raise Ambiguous(f"{name} is not one unbiased map to its {width} channels")
+    return _delta_net_fact(view, geometry, fused=False)
+
+
+def _read_fused_delta_net(view: PartView) -> Mapping[str, object]:
+    """Qwen3-Next's gated delta net: Qwen3.5's, its four input projections fused as two, each key head's
+    query, key, values and gates together (`in_proj_qkvz`) and its value heads' write strengths and decays
+    together (`in_proj_ba`, `fix_query_key_value_ordering`, modeling_qwen3_next.py:580-640), as Dew's
+    `fused_in_proj` reads them."""
+    geometry = _delta_net_geometry(view)
+    keys, values = (geometry['linear_num_key_heads'] * geometry['linear_key_head_dim'],
+                    geometry['linear_num_value_heads'] * geometry['linear_value_head_dim'])
+    for name, width in {'in_proj_qkvz': 2 * keys + 2 * values,
+                        'in_proj_ba': 2 * geometry['linear_num_value_heads']}.items():
+        projection = getattr(view, name)
+        if projection.out_features != width or projection.bias is not None:
+            raise Ambiguous(f"{name} is not one unbiased map to its {width} channels")
+    return _delta_net_fact(view, geometry, fused=True)
+
+
+def _read_gated_norm(view: PartView) -> Mapping[str, object]:
+    """A delta net's gated norm: RMS-normed in float32 with the net's epsilon, times its weight in the
+    input's dtype, times the activation of its gate (`Qwen3_5RMSNormGated`), as Dew's delta net norms its
+    output with the block's epsilon."""
+    return {'norm_eps': float(view.variance_epsilon)}
+
+
+def _read_kimi_delta_attention(view: PartView) -> Mapping[str, object]:
+    """Kimi Linear's delta attention (`dew.nn.kda.KimiDeltaAttentionMixer`): its query, key and value
+    projections through one causal depthwise convolution activated by silu (`conv1d`, read as Dew's three,
+    `split`), its forget gate's low-rank projection and `-exp(A_log) * softplus(g + dt_bias)` decay
+    (`forget_gate`, whose leaves Dew holds under the layer), each head's write strength (`b_proj`), the
+    chunked delta rule over l2-normed queries and keys, the sigmoid-gated norm of its low-rank output gate
+    (`g_a_proj`, `g_b_proj`, `o_norm`) and `o_proj` (modeling_kimi_linear.py:316-716 at transformers 5.17);
+    a per-layer fact (`_with_mixers`)."""
+    heads, width, taps = int(view.num_heads), int(view.head_dim), int(view.conv_kernel_size)
+    channels, conv = heads * width, view.conv1d
+    if (view.activation != 'silu' or conv.groups != 3 * channels or conv.in_channels != 3 * channels
+            or conv.kernel_size != (taps,) or conv.padding != (taps - 1,) or conv.bias is not None):
+        raise Ambiguous("the convolution is not one unbiased causal depthwise filter per channel activated "
+                        "by silu")
+    forget = view.forget_gate
+    shapes = {'q_proj': channels, 'k_proj': channels, 'v_proj': channels, 'b_proj': heads,
+              'g_a_proj': width, 'g_b_proj': channels}
+    projections = [getattr(view, name) for name in shapes] + [forget.f_a_proj, forget.f_b_proj, view.o_proj]
+    if (any(getattr(view, name).out_features != size for name, size in shapes.items())
+            or forget.f_a_proj.out_features != width or forget.f_b_proj.out_features != channels
+            or view.o_proj.in_features != channels or _biased(*projections)):
+        raise Ambiguous("the projections are not the unbiased maps of its heads its code reads")
+    if view.o_norm.activation != 'sigmoid':
+        raise Ambiguous(f"the output norm gates by {view.o_norm.activation}, not the sigmoid Dew's does")
+    return {'norm_eps': float(view.layer_norm_epsilon), _LAYER: {'mixer': {
+        'kind': 'linear_attention', 'class': 'kimi_delta_attention',
+        'fields': {'linear_num_heads': heads, 'linear_head_dim': width, 'linear_conv_kernel_dim': taps,
+                   'linear_lower_bound': None, 'use_full_rank_gate': False}}}}
+
+
+def _read_unrotated_latent_attention(view: PartView) -> Mapping[str, object]:
+    """Kimi Linear's latent attention: DeepSeek V3's (`_latent_attention`), its shared key's slice and
+    each head's rope slice left unrotated (`mla_use_nope`; its model holds no rotary), as Kimi K3's MLA."""
+    # Its layer places no positions: no rotary base is read for it (`assemble`).
+    return {**_latent_attention(view, interleave=False, rotary=False), _LAYER: {'rotates': False}}
+
+
+def _read_grid_rotary(view: PartView) -> Mapping[str, object]:
+    """Qwen3.5's text rotary: the partial rope its record states, the grids' layout read as one
+    (`_GRIDS`)."""
+    return _rope(view.config, partial=True, grids=True)
 
 
 def _read_laguna_attention(view: PartView) -> Mapping[str, object]:
@@ -693,9 +834,9 @@ def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
                      'scaling': float(view.routed_scaling_factor), 'bias': True}}
 
 
-def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, object]:
+def _latent_attention(view: PartView, *, interleave: bool, rotary: bool = True) -> Mapping[str, object]:
     """A DeepSeek V3 latent attention's fields (`_read_latent_attention`), its rope heads rotated in
-    interleaved pairs or halves."""
+    interleaved pairs or halves, or left unrotated (`rotary=False`, its model holding no rotary)."""
     if not view.is_causal:
         raise Ambiguous("the attention is not causal")
     nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
@@ -705,14 +846,15 @@ def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, objec
     if any(float(norm.variance_epsilon) != epsilon for norm in norms):
         raise Ambiguous(f"the latents are normed at an epsilon other than {epsilon}")
     heads = int(view.num_heads)
-    return {**_rope(view.config), 'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
+    return {**(_rope(view.config) if rotary else {}), 'num_heads': heads,
+            'num_kv_heads': heads // int(view.num_key_value_groups),
             'head_dim': nope + rope, 'qk_norm': False,
             'attention_bias': view.kv_a_proj_with_mqa.bias is not None,
             'attention_dropout_rate': float(view.attention_dropout),
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': interleave,
+                'rope_interleave': interleave, 'mla_use_nope': not rotary,
                 # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
                 'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
@@ -820,8 +962,8 @@ class KnownPart:
     the empty name reads the child's parameters as the part's own (ERNIE 4.5's `moe_statics` holds its
     router's correction bias)."""
     flat: tuple[str, ...] = ()
-    """The parameters the source stores with leading unit axes that its leaf holds flat (ERNIE 4.5's
-    `[1, experts]` correction bias), by the known class's names (`Assembly.flat`)."""
+    """The parameters the source stores with unit axes that its leaf holds flat (ERNIE 4.5's `[1, experts]`
+    correction bias, Kimi Linear's `[1, 1, heads, 1]` decay), by the known class's names (`Assembly.flat`)."""
     constants: tuple[str, ...] = ()
     """The buffers its checkpoint stores that its code reads and no step trains (xIELU's `beta` and
     `eps`), by the known class's names: each a constant of Dew's (`constants` collection,
@@ -866,6 +1008,9 @@ _LAGUNA = 'transformers.models.laguna.modeling_laguna'
 _JAMBA = 'transformers.models.jamba.modeling_jamba'
 _FALCON_H1 = 'transformers.models.falcon_h1.modeling_falcon_h1'
 _AXK2 = 'transformers.models.axk2.modeling_axk2'
+_QWEN35 = 'transformers.models.qwen3_5.modeling_qwen3_5'
+_KIMI_LINEAR = 'transformers.models.kimi_linear.modeling_kimi_linear'
+_QWEN3_NEXT = 'transformers.models.qwen3_next.modeling_qwen3_next'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -1039,6 +1184,48 @@ KNOWN: tuple[KnownPart, ...] = (
               _read_step_normed_mamba, ('A_log', 'D')),
     KnownPart('moe', f'{_JAMBA}:JambaSparseMoeBlock', {'router': ('linear',), 'experts': ('experts',)},
               _read_unnormalized_moe, canonical={'router': 'gate'}),
+    KnownPart('causal_lm', f'{_KIMI_LINEAR}:KimiLinearForCausalLM',
+              {'model': ('model',), 'lm_head': ('linear',)}, _read_causal_lm),
+    KnownPart('model', f'{_KIMI_LINEAR}:KimiLinearModel',
+              {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',)}, _read_llama_model),
+    KnownPart('layer', f'{_KIMI_LINEAR}:KimiLinearDecoderLayer',
+              {'self_attn': ('attention', 'kimi_delta_attention'), 'mlp': ('mlp', 'moe'),
+               'input_layernorm': ('norm',), 'post_attention_layernorm': ('norm',)}, _read_nothing),
+    KnownPart('attention', f'{_KIMI_LINEAR}:KimiLinearAttention', _LATENT_CHILDREN,
+              _read_unrotated_latent_attention),
+    KnownPart('kimi_delta_attention', f'{_KIMI_LINEAR}:KimiLinearDeltaAttention',
+              {**dict.fromkeys(('q_proj', 'k_proj', 'v_proj', 'b_proj', 'g_a_proj', 'g_b_proj', 'o_proj'),
+                               ('linear',)),
+               'conv1d': ('conv1d',), 'forget_gate': ('forget_gate',), 'o_norm': ('delta_norm',)},
+              _read_kimi_delta_attention, canonical={'conv1d': '', 'forget_gate': ''},
+              split={'conv1d': ('q_conv1d', 'k_conv1d', 'v_conv1d')}),
+    KnownPart('forget_gate', f'{_KIMI_LINEAR}:KimiLinearForgetGate',
+              {'f_a_proj': ('linear',), 'f_b_proj': ('linear',)}, _read_nothing, ('dt_bias', 'A_log'),
+              flat=('A_log',)),
+    KnownPart('delta_norm', f'{_KIMI_LINEAR}:KimiLinearRMSNormGated', {}, _read_gated_norm, ('weight',)),
+    # Their block norms and feed-forwards compute Gemma's (1 + w) norm and Llama's SwiGLU by code, which
+    # those classes' parts read.
+    *(part for module, prefix, delta_net, reader in (
+        (_QWEN35, 'Qwen3_5', 'Qwen3_5GatedDeltaNet', _read_gated_delta_net),
+        (_QWEN3_NEXT, 'Qwen3Next', 'Qwen3NextGatedDeltaNet', _read_fused_delta_net))
+      for part in (
+          KnownPart('causal_lm', f'{module}:{prefix}ForCausalLM',
+                    {'model': ('model',), 'lm_head': ('linear',)}, _read_causal_lm),
+          KnownPart('model', f'{module}:{prefix}{"TextModel" if prefix == "Qwen3_5" else "Model"}',
+                    _MODEL_CHILDREN, _read_llama_model),
+          KnownPart('layer', f'{module}:{prefix}DecoderLayer',
+                    {'linear_attn': ('gated_delta_net',), 'self_attn': ('attention',), 'mlp': ('mlp',),
+                     'input_layernorm': ('norm',), 'post_attention_layernorm': ('norm',)}, _read_nothing),
+          KnownPart('attention', f'{module}:{prefix}Attention',
+                    {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
+                    _read_query_gated_attention),
+          KnownPart('gated_delta_net', f'{module}:{delta_net}',
+                    {**dict.fromkeys(('in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'in_proj_qkvz',
+                                      'in_proj_ba', 'out_proj'), ('linear',)),
+                     'conv1d': ('conv1d',), 'norm': ('delta_norm',)}, reader, ('dt_bias', 'A_log')),
+          KnownPart('delta_norm', f'{module}:{prefix}RMSNormGated', {}, _read_gated_norm, ('weight',)),
+          KnownPart('rotary', f'{module}:{prefix}{"Text" if prefix == "Qwen3_5" else ""}RotaryEmbedding', {},
+                    _read_grid_rotary, whole=True))),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
@@ -1411,7 +1598,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     # mixer an attention or beside one.
     count = _records.integer(fields['num_layers'], 'num_layers')
     rotating = [held for held in (assembler.layers.get(layer, {}) for layer in range(count))
-                if not held.get('nope') and ('parallel' in held or 'mixer' not in held)]
+                if not held.get('nope') and held.get('rotates', True)
+                and ('parallel' in held or 'mixer' not in held)]
     if rotating and 'rope_theta' not in fields:
         raise Ambiguous("no part states rope_theta")
     branches = assembler.parallel()
@@ -1591,7 +1779,7 @@ _STACKED_EXPERTS: decoder_parts.Leaves = {
 
 _CANONICAL = decoder_parts.spelled((), layer_leaves={
     **_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES, **decoder_parts.XIELU_LEAVES,
-    **decoder_parts.MAMBA_LEAVES, **decoder_parts.GATED_NORM_LEAVES})
+    **decoder_parts.MAMBA_LEAVES, **decoder_parts.GATED_NORM_LEAVES, **decoder_parts.KDA_LEAVES})
 """The canonical names' routes, the shared decoder's and the parts' own leaves beside them."""
 
 _DEPTH_COPIES = Table(*decoder_parts.prediction_copies('model.layers.{depth}.',
@@ -1650,7 +1838,7 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         for name, value in tensors.items():
             if assembly.canonical(name) in assembly.flat:
                 stored = held(value)
-                if any(size != 1 for size in stored.shape[:-1]):
+                if sum(size != 1 for size in stored.shape) > 1:
                     raise ValueError(f"the checkpoint's {name!r} holds {stored.shape}, not one row")
                 prepared[name] = stored.reshape(-1)
         return prepared

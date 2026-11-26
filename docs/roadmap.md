@@ -24,7 +24,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12780, 12873]
-- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
@@ -53,7 +52,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1458, 1459, 1460, 1646]
 - The suite's wall. [5478, 12431, 12433, 12644]
-- Src/dew/interop/parts.py KNOWN covers Mamba, Mamba-2 and LFM2 ShortConv, but omits GatedDeltaNet (Qwen3.5), KDA (Kimi) and newer registered mixers, so…. [13043]
 - The image tower: 23-layer ViT with axial RoPE, a class token, learned 32x32 position embeddings interpolated bilinearly, 20-pixel patches in 40x40 cells, a 2x2…. [12943]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
@@ -84,8 +82,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- Src/dew/interop/torchax_fallback.py traces the whole PyTorch model.forward as one opaque TorchGraph with no per-layer jax.checkpoint / remat boundaries, so Dew…. [13045]
-- TorchCausalLM (src/dew/interop/torchax_fallback.py) exposes DecisionModel hidden_states/logits_from_hidden seams but does not implement Dew's Looped protocol…. [13046]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
