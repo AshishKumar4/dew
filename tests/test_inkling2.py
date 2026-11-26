@@ -107,6 +107,7 @@ def test_a_cached_decode_at_given_places_scores_as_its_whole_call():
 
     wide = model.clone(dtype=jnp.float64)
     whole = jax.jit(lambda variables, ids: model.apply(variables, ids, positions=places))
-    truth = jax.jit(lambda variables, ids: wide.apply(widened(variables), ids, positions=places))
+    held = widened(variables)
+    truth = jax.jit(lambda _, ids: wide.apply(held, ids, positions=places))
     assert_as_exact(jax.jit(stepped), whole, lambda seed: (variables, draw(seed)),
                     'Inkling 2 at given places', seeds=8, truth_fn=truth)
