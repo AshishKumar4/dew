@@ -199,14 +199,18 @@ def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
         identity = jnp.eye(size, dtype=system.dtype)
 
         def solve(a):
-            return jax.lax.linalg.triangular_solve(a, identity, left_side=True, lower=True, unit_diagonal=True)
+            return jax.lax.linalg.triangular_solve(
+                a, identity, left_side=True, lower=True, unit_diagonal=True)
 
         _, pull = jax.vjp(solve, system)
         return pull(jnp.tril(cotangent, -1))[0]
 
     def draw(seed):
-        system = component_cases._chunk_system(seed, size)
-        cotangent = np.random.default_rng(seed + 23).standard_normal(system.shape).astype(system.dtype)
+        rng = np.random.default_rng(seed)
+        # Same-shape adversarial draws can also use the system as the cotangent. Keep the closed
+        # solve and its transpose representable together; the component gate covers the isolated edge.
+        system = np.tril(rng.uniform(-0.125 / size, 0.125 / size, (size, size)).astype(np.float32), -1)
+        cotangent = rng.normal(size=system.shape).astype(np.float32)
         return system, cotangent
 
     assert_as_exact(generated, written, draw, "generated inverse VJP of a triangular solve",
