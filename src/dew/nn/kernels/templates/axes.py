@@ -30,6 +30,16 @@ def whole(count: int, block: int) -> int:
     return -(-count // block) * block
 
 
+def laid(array: jax.Array, subscript: Sequence[str], letters: Sequence[str]) -> jax.Array:
+    """`array`, whose axes `subscript` names letter by letter (an einsum operand's), laid over `letters`: its
+    axes in their order, an axis of extent one at a letter it lacks, so it broadcasts against any other
+    operand laid over them (`scaled_contraction`'s factors, the algebra's subnormal contraction's)."""
+    ordered = [letter for letter in letters if letter in subscript]
+    moved = jnp.transpose(array, [subscript.index(letter) for letter in ordered])
+    return moved.reshape([array.shape[subscript.index(letter)] if letter in subscript else 1
+                          for letter in letters])
+
+
 def blocked(ref, block: Sequence[int], indices: Sequence):
     """`ref`'s block of extents `block` at block indices `indices`, axis by axis (`pl.ds(index * extent,
     extent)`): a step's tile of a stream's view, as a `BlockSpec`'s index map reads it (a GPU ring's

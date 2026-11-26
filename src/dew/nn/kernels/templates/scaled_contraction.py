@@ -44,6 +44,7 @@ from jax.interpreters import ad, batching, mlir
 
 from dew.algebra import windows
 from dew.nn.float_bits import binade_of, float_bits
+from dew.nn.kernels.templates.axes import laid
 from dew.nn.precision import at_least_fp32, exact_float32, power2, two_sum
 from dew.nn.sharding import varied_alike
 
@@ -92,14 +93,6 @@ class Form:
         return "".join(dict.fromkeys("".join(self.subscripts[index] for index, _ in group)))
 
 
-def _laid(array: jax.Array, subscript: str, letters: str) -> jax.Array:
-    """`array` over `subscript` laid over `letters`, a letter it lacks of extent one."""
-    ordered = [letter for letter in letters if letter in subscript]
-    moved = jnp.transpose(array, [subscript.index(letter) for letter in ordered])
-    return moved.reshape([array.shape[subscript.index(letter)] if letter in subscript else 1
-                          for letter in letters])
-
-
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` as its significand in `[1, 2)` (signed; zero a zero's, a non-finite `x` itself) and its exponent
     `floor(log2 |x|)` (int32; zero's and a non-finite's 0), read from its bits (`float_bits`): a subnormal's
@@ -122,9 +115,9 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
     significand, exponent = jnp.ones((), dtype), jnp.int32(0)
     for index, power in group:
         if power == 0:
-            exponent = exponent + _laid(arrays[index].astype(jnp.int32), form.subscripts[index], letters)
+            exponent = exponent + laid(arrays[index].astype(jnp.int32), form.subscripts[index], letters)
             continue
-        part, binade = _split(_laid(arrays[index].astype(dtype), form.subscripts[index], letters))
+        part, binade = _split(laid(arrays[index].astype(dtype), form.subscripts[index], letters))
         significand = significand * part if power > 0 else significand / part
         exponent = exponent + binade if power > 0 else exponent - binade
     significand = jnp.broadcast_to(significand, jnp.broadcast_shapes(significand.shape, jnp.shape(exponent)))
@@ -182,7 +175,7 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     shaped = Form(form.subscripts, terms, out, units=form.units)
     held = [[part for group in groups for part in _parts(shaped, group, arrays, dtype)]
             for _, groups in terms]
-    scales = [sum((_laid(largest, "".join(letter for letter in letters if letter in out), out)
+    scales = [sum((laid(largest, "".join(letter for letter in letters if letter in out), out)
                    for letters, _, _, largest in groups), jnp.zeros((1,) * len(out), jnp.int32))
               for groups in held]
 
@@ -356,8 +349,8 @@ def _value(*arrays: jax.Array, form: Form) -> jax.Array:
     if form.divisor:
         below, exponent = _sum(arrays, form, form.divisor, form.divided, dtype)
         none = below == 0
-        total = total / _laid(jnp.where(none, 1, below), form.divided, form.out)
-        joined = joined - _laid(jnp.where(none, 0, exponent), form.divided, form.out)
+        total = total / laid(jnp.where(none, 1, below), form.divided, form.out)
+        joined = joined - laid(jnp.where(none, 0, exponent), form.divided, form.out)
     return power2(total, joined)
 
 
@@ -445,7 +438,7 @@ def _jvp(primals, tangents, *, form: Form):
         if below:
             # A zero divisor read as one is a constant: its moved terms none there.
             total, _ = _sum(_held_out(primals), form, form.divisor, form.divided, _dtype(primals))
-            none = _laid(total == 0, form.divided, form.out)
+            none = laid(total == 0, form.divided, form.out)
             operands.append(jnp.where(none, jnp.zeros((), out.dtype), out))
             subscripts.append(form.out)
             terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for (sign, groups), _, _ in below]
