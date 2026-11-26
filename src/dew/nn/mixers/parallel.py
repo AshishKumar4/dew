@@ -176,8 +176,16 @@ class ParallelMixer(MixerBase):
     def drops_attention(self) -> bool:
         return all(branch.mixer.drops_attention for branch in self.branches)
 
-    def publishes(self, kv_shared: bool) -> bool:
-        return any(branch.mixer.publishes(kv_shared) for branch in self.branches)
+    def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
+        """`MixerBase.publications` of its branches in the order they run, each reading the store after the
+        branches before it: a key one reads is the layer's own read where no branch before it wrote it."""
+        reads: set[str] = set()
+        writes: set[str] = set()
+        for branch in self.branches:
+            read, written = branch.mixer.publications(kv_shared)
+            reads |= read - writes
+            writes |= written
+        return frozenset(reads), frozenset(writes)
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:

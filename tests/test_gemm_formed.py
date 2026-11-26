@@ -14,6 +14,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 ROWS, FEATURES, HIDDEN = 136, 128, 256
 """Rows no tile divides, the features a gated MLP reads and writes, its hidden width."""
@@ -108,7 +109,7 @@ def test_a_higher_order_through_an_output_no_reverse_pass_reaches_holds_check_1(
                      for shape in ((16, 32), (32, 24), (32, 24), (16, 32)))
 
     def fused(x, gate, up):
-        return gemm.gemm(x, gate, paired=up, epilogue=lambda g, u: (g * u, u), out_dtype=x.dtype,
+        return gemm.gemm(x, gate, paired=up, epilogue=Hook(lambda g, u: (g * u, u)), out_dtype=x.dtype,
                          out_dtypes=(x.dtype, x.dtype))
 
     def portable(x, gate, up):
@@ -149,11 +150,11 @@ def test_a_formed_operand_is_its_prologues_value_and_derivative(generation_name)
     matrix = jnp.asarray(rng.normal(size=(FEATURES, FEATURES)) / 8, jnp.bfloat16)
 
     def through(x, side, matrix):
-        return gemm.gemm(x, matrix, prologue=_formed, prologue_operands=((side, ("rows", "depth")),),
+        return gemm.gemm(x, matrix, prologue=Hook(_formed, (Side(side, ("rows", "depth")),)),
                          out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def applied(x, side, matrix, formed):
-        return gemm.gemm(x, matrix, prologue=_formed, prologue_operands=((side, ("rows", "depth")),),
+        return gemm.gemm(x, matrix, prologue=Hook(_formed, (Side(side, ("rows", "depth")),)),
                          applied=formed, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def plain(formed, matrix):
@@ -193,7 +194,7 @@ def test_an_output_no_reverse_pass_reaches_costs_its_reverse_mode_nothing(genera
 
     def loss(outputs, x, gate, up):
         formed = outputs != "projections"
-        found = gemm.gemm(x, gate, paired=up, epilogue=functools.partial(projected, formed=formed),
+        found = gemm.gemm(x, gate, paired=up, epilogue=Hook(functools.partial(projected, formed=formed)),
                           out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * (3 if formed else 2),
                           interpret_on_cpu=True)
         total = jnp.sum(found[0].astype(jnp.float32) * found[1].astype(jnp.float32))

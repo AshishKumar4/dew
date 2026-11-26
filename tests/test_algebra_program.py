@@ -860,334 +860,6 @@ def test_moving_a_scale_keeps_finite_contraction_products(scaled, compiled, over
         np.testing.assert_array_equal(rewritten(y), expected)
 
 
-
-@pytest.mark.parametrize(("generation_name", "speedup"), [("sm90", 2), ("sm80", 1)])
-def test_an_fp8_product_is_priced_in_the_tensor_mode_its_gpu_runs_it_in(generation_name, speedup):
-    """An FP8 product's seconds on a GPU: a bf16 product's halved where its tensor cores multiply FP8
-    (Hopper's warpgroup MMA), a bf16 product's where its codes are unpacked into 16-bit products (an A100's
-    mma.sync), and on no GPU the CUDA cores' (row 3612)."""
-    target = generation.TARGETS[generation_name]
-
-    def seconds(dtype):
-        priced, unpriced = kernel_cost.units(cost.product_work(4096, 4096, 4096, dtype=dtype),
-                                             kernel_cost.rates(target, device=True))
-        assert not any(unpriced)
-        return max(priced)
-
-    # Exact: each mode's price is the same FLOPs over the same facts, its rate a power of two apart.
-    assert seconds(jnp.float8_e4m3fn) == seconds(jnp.bfloat16) / speedup
-
-
-@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
-def test_an_fp32_product_on_a_tpu_is_its_matrix_units_bf16_passes(target_name):
-    """An fp32 product priced for a TPU is its matrix units' bfloat16 passes (`jax.lax.Precision`'s: one at
-    the default precision, three at HIGH, six at HIGHEST), a bf16 product's work that many times, all of it
-    work the TPU's rates price (row 7201: counted as CUDA-core operations, which a TPU states no rate of,
-    every product of a scan's chunk forms priced at nothing)."""
-    tpu = generation.TARGETS[target_name]
-
-    def work(dtype, precision):
-        with program.passes(target=target_name):
-            made = cost.product_work(1024, 1024, 1024, dtype=dtype, precision=precision)
-        assert not any(kernel_cost.units(made, kernel_cost.rates(tpu, device=True))[1])
-        return made.flops
-
-    bf16 = work(jnp.bfloat16, None)
-    assert [work(jnp.float32, precision) for precision in ("default", "high", "highest")] == [
-        bf16, 3 * bf16, 6 * bf16]
-
-
-def test_xlas_schedule_prices_each_kernel_its_parts_fixed_latency():
-    """XLA's schedule (`cost.fused`) prices each kernel of a form, a product's or a reduction's (a root of
-    XLA's fusion), at its part's measured fixed latency (`GpuTarget.fixed_seconds`, its launch and first
-    byte) beside its work: a traced product and a chunk form's products (`cost.product_work`, one a product)
-    alike, row 4081's receipts finding a small fusion's time that latency. On a part no one measured, the
-    kernels are work no rate prices (`Schedule.unpriced`)."""
-    hopper = generation.gpu_target("NVIDIA H100 80GB HBM3")
-    schedule = cost.fused(hopper)
-
-    def priced(fn, *shapes):
-        region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.bfloat16) for shape in shapes)))
-        graph, bundle, _ = program.graphed(region)
-        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                             cost_model=cost.model(region, schedule))[1].work
-
-    traced = priced(lambda a, b: jnp.sum(jnp.dot(a, b), axis=-1), (64, 64), (64, 64))
-    assert traced.kernels == 2
-    one, two = cost.product_work(64, 64, 64), cost.product_work(64, 64, 64, count=2)
-    throughput = sum(kernel_cost.units(one, kernel_cost.rates(hopper, device=True))[0])
-    # Exact: two products' work and kernels are one's doubled, each unit's seconds a power of two apart.
-    assert schedule(one) == throughput + hopper.fixed_seconds
-    assert schedule(two) == 2 * (throughput + hopper.fixed_seconds)
-    assert cost.fused(generation.gpu_target("sm86")).unpriced(two)[-1] == 2
-
-
-@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
-def test_xlas_schedule_on_a_tpu_prices_what_its_kernels_keep_in_vmem(target_name):
-    """XLA's schedule on a TPU (`cost.fused`) prices the bytes its kernels move between the vector registers
-    and VMEM (`Work.kept_bytes`) at the TPU's VMEM rate (`GpuTarget.vmem_rate`, row 7283): a leaf read once,
-    a product's result and a reduction's written once and read once (a reduction's at a lane's four bytes),
-    a chunk form's product's too (`cost.product_work`). A GPU's XLA keeps them on chip at no price, and a TPU
-    no one measured leaves them work no rate prices."""
-    tpu = generation.TARGETS[target_name]
-
-    def kept(fn, *shapes):
-        with program.passes(target=target_name):
-            region = terms.region(jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes)))
-            graph, bundle, _ = program.graphed(region)
-            return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(tpu)))[1].work
-
-    product, summed = kept(jnp.dot, (64, 128), (128, 256)), kept(lambda x: jnp.sum(x, axis=-1), (64, 128))
-    assert product.kept_bytes == 4 * (64 * 128 + 128 * 256 + 2 * 64 * 256)
-    assert summed.kept_bytes == 4 * (64 * 128 + 2 * 64)
-    assert kept(lambda x: jnp.sum(x, axis=-1), (4, 0)).kept_bytes == 2 * 4 * 4
-    assert cost.product_work(64, 128, 256, count=3).kept_bytes == 3 * 2 * 64 * 256 * 4
-    # On-chip memory's unit (`templates.cost.units`' fourth): exact, one quotient beside a zero.
-    on_chip = 3
-    assert (kernel_cost.units(product, kernel_cost.rates(tpu, device=True))[0][on_chip]
-            == product.kept_bytes / tpu.vmem_rate)
-    hopper, unmeasured = (kernel_cost.rates(generation.TARGETS[name], device=True) for name in ("sm90", "v4"))
-    assert kernel_cost.units(product, hopper)[0][on_chip] == 0
-    assert product.kept_bytes in kernel_cost.units(product, unmeasured)[1]
-
-
-@pytest.mark.parametrize("target_name", ["v5e", "v6e"])
-def test_a_tpu_tile_walks_staged_bytes_are_priced_at_its_vmem_rate(target_name):
-    """A Pallas TPU template's staged bytes (`Work.shared_bytes`, its tiles copied into VMEM) are priced on
-    on-chip memory's unit at the chip's VMEM rate in a tile walk (`templates.cost.rates`, `device=False`: the
-    chip its one multiprocessor), where they were work no rate priced and a TPU template's forms were
-    compared without them (row 8729); a TPU no one measured leaves them unpriced."""
-    tpu, unmeasured = generation.TARGETS[target_name], generation.TARGETS["v4"]
-    staged = kernel_cost.Work(shared_bytes=4.0 * 512 * 1024)
-    on_chip = 3
-    priced, unpriced = kernel_cost.units(staged, kernel_cost.rates(tpu, device=False))
-    assert priced[on_chip] == staged.shared_bytes / tpu.vmem_rate
-    assert not any(unpriced)
-    assert staged.shared_bytes in kernel_cost.units(staged, kernel_cost.rates(unmeasured, device=False))[1]
-
-
-def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
-    """A scan's chunk form on a v5e (`linear_scan.derive` under XLA's schedule, as `scan` derives it) keeps
-    its products' results and a token step's state on chip (`Work.kept_bytes`), which the TPU's VMEM rate
-    prices (row 7283): derived where the v5e states no rate, those bytes are work no rate prices, and the
-    cheapest form's seconds are fewer by them."""
-    from dew.algebra import linear_scan
-
-    v5e = generation.TARGETS["v5e"]
-
-    def derived(target):
-        # Derived as scan derives on a v5e (`program.passes`' target): its products priced in the v5e's modes.
-        with program.passes(target="v5e"):
-            return linear_scan.derive(linear_scan.Extents(64, 128, 128, 1), corrects=False,
-                                      schedule=cost.fused(target), precision=None,
-                                      saturation=algebra.SATURATION)
-
-    priced, unmeasured = derived(v5e), derived(dataclasses.replace(v5e, vmem_rate=None))
-    assert priced.price.work.kept_bytes > 0
-    assert unmeasured.price.work.kept_bytes in unmeasured.price.schedule.unpriced(unmeasured.price.work)
-    assert priced.price.value > unmeasured.price.value
-
-
-def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes():
-    """A sum JAX's derivatives accumulate with (`add_any`, a leaf of the region, outside the language) is
-    priced as the add it computes, one CUDA-core operation an element, as the template's emission prices it:
-    a product and an `add_any` of it cost what a product and an add do. Its work was dropped, its leaf's
-    bytes alone charged, so a prologue holding one compared cheaper than it computes (the audit of
-    2026-11-19pm, 8964)."""
-    from jax._src.ad_util import add_jaxvals_p
-
-    def priced(fn):
-        x, y = jnp.ones((64, 128), jnp.float32), jnp.ones((64, 128), jnp.float32)
-        region = terms.region(jax.make_jaxpr(fn)(x, y))
-        graph, bundle, _ = program.graphed(region)
-        return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                             cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
-
-    accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
-    added = priced(lambda x, y: x * y + x)
-    assert accumulated.operations == added.operations
-
-
-def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
-    """A `lax.dot_general` of a bfloat16 and a float16 matrix, no preferred type stated, priced at the dtype
-    JAX makes it (`terms.Product.made`, its traced result's, which the region records as its stated type),
-    its result kept on chip at two bytes an element beside its leaves' (`Work.kept_bytes`); NumPy's
-    promotion of the pair, which it refuses, raised there (base review 0b8b7ed98 F1). A bare product heads no
-    rewrite window, so `dew.jit` alone never prices it (`test_algebra_fusion`'s witness holds its value)."""
-    def product(a, b):
-        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
-
-    a, b = jnp.ones((2, 3), jnp.bfloat16), jnp.ones((3, 4), jnp.float16)
-    region = terms.region(jax.make_jaxpr(product)(a, b))
-    graph, bundle, _ = program.graphed(region)
-    work = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                         cost_model=cost.model(region, cost.fused(generation.TARGETS["v5e"])))[1].work
-    made = jax.eval_shape(product, a, b).dtype.itemsize
-    assert work.kept_bytes == 2 * (2 * 3 + 3 * 4) + 2 * made * (2 * 4)
-
-
-def test_a_product_of_two_16_bit_formats_replays_as_traced():
-    """A product of a bfloat16 and a float16 matrix, no preferred type stated, its region's term replayed as
-    the engine binds a term's equation (`terms.value_of`): its product bound with its parameters as traced,
-    its preferred type unset, and its value the traced program's bit for bit, one program. The region wrote
-    the dtype it makes into that preferred type, which the replay then bound (base review 3232beb7c); it
-    keeps it apart (`terms.Product.made`)."""
-    def product(a, b):
-        return jax.lax.dot_general(a, b, (((1,), (0,)), ((), ())))
-
-    a, b = jnp.full((2, 3), 0.75, jnp.bfloat16), jnp.full((3, 4), 2.5, jnp.float16)
-    traced = jax.make_jaxpr(product)(a, b)
-    region = terms.region(traced)
-
-    def replayed(a, b):
-        def value(term):
-            return terms.value_of(term, value, region, (a, b))
-        return value(region.outputs[0])
-
-    def dots(jaxpr) -> list[dict]:
-        # Each product's parameters, within the programs an equation calls too (a jit's).
-        return [dict(equation.params) for equation in programs.equations(jaxpr)
-                if equation.primitive is jax.lax.dot_general_p]
-
-    assert dots(jax.make_jaxpr(replayed)(a, b).jaxpr) == dots(traced.jaxpr)
-    assert np.asarray(jax.jit(replayed)(a, b)).tolist() == np.asarray(jax.jit(product)(a, b)).tolist()
-
-
-def test_device_memory_is_priced_at_the_parts_measured_stream():
-    """A GPU's device-memory bytes are priced at its part's measured stream (`GpuTarget.part`,
-    tools/device_facts.py's plateau), whatever bandwidth its memory clock and bus state, which no transfer
-    reaches; a part no one measured, at its clocks' (row 3612)."""
-    hopper = generation.TARGETS["sm90"]
-
-    def memory_rate(device_kind, clocked):
-        target = dataclasses.replace(hopper, device_kind=device_kind, memory_bandwidth=clocked)
-        return kernel_cost.rates(target, device=True).device
-
-    (measured,) = {memory_rate("NVIDIA GH200 480GB", clocked) for clocked in (4.0e12, 4.9e12)}
-    assert measured is not None and measured < 4.0e12
-    # A part no device reports (its kind the test's own), which no row's streams can name: its clocks'.
-    assert memory_rate("a Hopper part no one measured", 2.0e12) == 2.0e12
-
-
-@pytest.mark.parametrize("tpu", ["v5e", "v6e"])
-def test_a_tpus_program_is_rewritten_by_the_rates_it_states(tpu):
-    """A TPU's target states its MXU's rate and not its vector or transcendental units' (`cost.cheaper`): a
-    program of a product reduced (`sum(a * b)` and two joinable sums of products) traces and runs rewritten
-    for it, on par with the program (check 1), a form taken only where it does no more work at a rate the
-    TPU states none of."""
-    with algebra.passes(target=tpu):
-        assert_as_exact(jax.jit(algebra.rewritten(two_products_summed)), jax.jit(two_products_summed),
-                        lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)), f"a {tpu} program", seeds=16)
-
-
-def test_a_products_mode_prices_it():
-    """A product of fp32 operands at the default precision (`Precision.DEFAULT`, stated: the suite configures
-    the highest) takes the tensor cores' TF32 mode, one of 16-bit operands their 16-bit mode, and one at
-    `Precision.HIGHEST` the CUDA cores (`cost.work`): an H100's TF32 rate is half its 16-bit one and its
-    CUDA cores' far below both, so the three price apart."""
-    def product(precision, dtype, result=jnp.float32):
-        def contracted(a, b):
-            return jnp.dot(a, b, precision=precision, preferred_element_type=result)
-
-        a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
-        region = terms.region(jax.make_jaxpr(contracted)(a, b))
-        graph, bundle, _ = program.graphed(region)
-        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
-        return price.work
-
-    half, tf32, highest = (product(None, jnp.bfloat16), product(jax.lax.Precision.DEFAULT, jnp.float32),
-                           product(jax.lax.Precision.HIGHEST, jnp.float32))
-    flops = 2.0 * 64 ** 3
-    # The CUDA cores' FFMAs, a multiply an instruction and its add fused into it (`Work.fused_multiply_adds`).
-    assert (half.flops, tf32.tf32_flops, highest.operations, highest.fused_multiply_adds) == (
-        flops, flops, flops / 2, flops / 2)
-    # A dot algorithm by its fields is its preset's: three 16-bit products.
-    spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
-    assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)
-    assert product(spelled, jnp.float32).flops == 3 * flops
-    # A preset is priced by what JAX lowers it to, whatever its operands' storage: bf16 products of fp32
-    # storage accumulated in bf16 are the 16-bit mode's, where a preset not named `..._F32` was the CUDA
-    # cores'.
-    narrow = product(jax.lax.DotAlgorithmPreset.BF16_BF16_BF16, jnp.float32, jnp.bfloat16)
-    assert (narrow.flops, narrow.operations) == (flops, 0.0)
-    # An FP8 dot algorithm's products are the 8-bit mode's, as FP8 operands' are.
-    eight = jax.lax.DotAlgorithm(jnp.float8_e4m3fn, jnp.float8_e4m3fn, jnp.float32)
-    assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
-
-
-def _priced(fn, *shapes, schedule=None):
-    """`fn`'s program over fp32 ones of `shapes`, its price (`cost.model`, under XLA's schedule on an H100
-    where none is given) and its traced program."""
-    traced = jax.make_jaxpr(fn)(*(jnp.ones(shape, jnp.float32) for shape in shapes))
-    region = terms.region(traced)
-    graph, bundle, _ = program.graphed(region)
-    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag", cost_model=cost.model(
-        region, schedule or cost.fused(generation.TARGETS["sm90"])))
-    return price, traced
-
-
-@pytest.mark.parametrize("name", ["power", "clamp", "exponential", "selection", "conversion", "reduction"])
-def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(name):
-    """A term's arithmetic (`cost.work`) is what the kernels' counter prices its equation at in a kernel's
-    body (`emission.operation_work`, the one rule): a power an exponential an element, a clamp a maximum and
-    a minimum, an exponential, a comparison and a selection, a conversion and a reduction theirs, where the
-    algebra's own table priced a power as an operation and the counter a clamp as one (row 5901)."""
-    from dew.nn.kernels.templates import emission
-
-    fn = {"power": jax.lax.pow,
-          "clamp": lambda x, y: jax.lax.clamp(np.float32(-0.5), x, np.float32(0.5)) + y,
-          "exponential": lambda x, y: jax.lax.exp(x) * y,
-          "selection": lambda x, y: jax.lax.select(x < y, x, y),
-          "conversion": lambda x, y: jax.lax.convert_element_type(x, jnp.bfloat16) * y.astype(jnp.bfloat16),
-          "reduction": lambda x, y: jnp.sum(x * y, axis=-1)}[name]
-    price, traced = _priced(fn, (64, 128), (64, 128))
-    counted = emission.emitted(traced.jaxpr, 1, None).fixed
-    fields = ("operations", "exponentials", "conversions")
-    assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
-
-
-def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
-    """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
-    (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
-    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
-    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
-    process's own target, every division at fp32)."""
-    hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
-    elements = 64 * 128
-
-    def priced(dtype, target):
-        rows = jax.ShapeDtypeStruct((64, 128), dtype)
-        closed = jax.make_jaxpr(lambda x, y: jax.lax.div(x, y))(rows, rows).jaxpr
-        return program.priced(closed, target).work
-
-    assert (priced(jnp.float32, hopper).exponentials, priced(jnp.float32, hopper).operations) == (
-        elements, 6 * elements)
-    for dtype, target in ((jnp.float32, tpu), (jnp.int32, hopper), (jnp.bfloat16, hopper)):
-        assert priced(dtype, target).exponentials == 0, (dtype, target)
-    # A masked fp32 division (its mask's bools beside its fp32 values) is fp32's.
-    rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
-    masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
-    assert program.priced(masked, hopper).work.exponentials == elements
-    # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
-    # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
-    assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
-
-
-def test_an_operation_no_rule_prices_makes_no_form_cheaper_for_taking_more_of_it():
-    """An operation no rule prices (an atan2: no kernel's body holds one and no probe has measured it) is
-    work at no rate (`Work.unpriced_operations`), so a form taking more of it is never cheaper
-    (`cost.cheaper`), whatever its priced work's seconds: priced as one operation an element, two atan2s
-    compared cheaper than one beside a product."""
-    one, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jnp.sum(jnp.dot(w, w)), (64, 128), (64, 128),
-                     (512, 512))
-    two, _ = _priced(lambda x, y, w: jax.lax.atan2(x, y) + jax.lax.atan2(y, x) + jnp.sum(w), (64, 128),
-                     (64, 128), (512, 512))
-    assert two.value < one.value and not cost.cheaper(two, one)
-    assert (one.work.unpriced_operations, two.work.unpriced_operations) == (64 * 128, 2 * 64 * 128)
-
-
 def test_a_rewrites_persisted_record_names_the_limits_its_saturation_had():
     """A rewrite's record as a fit search persists it (`planning.rewrite_record`, `FitSearch.kernels`): the
     node and iteration limits its saturation had beside whether one stopped it (docs/design/algebra.md
@@ -1349,20 +1021,32 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
     assert kernel_cost.walked(kernel_cost.Work(flops=1.0, span=10_000), target) == 10_000 * step > 0
 
 
-def test_a_template_walks_chain_is_priced_at_its_parts_latencies():
-    """A tile walk's dependent path (`Chain`) waits on its products and its warpgroups' barriers, each at the
-    part's measured latency (a GH200's: a waited 64 x N product's fixed seconds and seconds a column, a
-    barrier round trip, M-FS-19): a recurrence chunk step waiting on four products of 128 columns and two
-    round trips costs their sum, where its span alone priced one reduction (row 4123: a states launch's chunk
-    step measured 13 times one)."""
+GH200_LATENCIES = {"product": (20.6e-9, 1.156e-9), "barrier": 85.0e-9, "copy": (464.5e-9, 5.17e-12)}
+"""A GH200's step latencies as M-FS-19 measured them (FS-4123-LATENCIES2-gh200, clock locked at 1.98 GHz,
+two rounds within 0.5%): a waited 64 x N product's fixed seconds and seconds a column, a two-warpgroup
+barrier's round trip, a tile copy's from device memory past an L2 eviction, fixed and a byte."""
+
+
+def test_a_template_walks_chain_is_priced_at_its_parts_measured_latencies():
+    """A tile walk's dependent path (`Chain`) waits on its products, its warpgroups' barriers and its cold
+    tile copies, each at the part's measured latency (M-FS-19's receipt, `GH200_LATENCIES`, independent of
+    the part's own record): a recurrence chunk step waiting on four products of 128 columns and two round
+    trips costs their sum, where its span alone priced one reduction (row 4123: a states launch's chunk step
+    measured 13 times one), and one waiting on a 32 KiB tile copied cold through a ring of one stage the
+    copy's fixed seconds and its slope's (the review of pricing-5 146aadb571f, row 12371)."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
+    (fixed, per_column), barrier = GH200_LATENCIES["product"], GH200_LATENCIES["barrier"]
     chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
     chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
     spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
-    (fixed, per_column), barrier = target.product_latency, target.barrier_seconds
     expected = target.kernel_step_seconds + 4 * fixed + 512 * per_column + 2 * barrier
     assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
     assert chained > 4 * spanned
+    copied, per_byte = GH200_LATENCIES["copy"]
+    cold = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2, copies=1, copy_bytes=32768)
+    waited = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(cold,)), target)
+    assert_computes_the_oracle(np.float64(waited), np.float64(expected + copied + 32768 * per_byte),
+                               "the cold copy's seconds", roundings=8)
 
 
 def test_a_rings_stages_hide_a_tile_copy_its_steps_outlast():
@@ -2155,3 +1839,346 @@ def test_shared_divisor_fanout_stays_bounded_and_proven_matches_region_on_chaine
     p_held, p_apart = terms.proven(closed_b.jaxpr)
     assert p_held == reg.held
     assert p_apart == reg.apart
+
+
+def test_jaxpr_parameter_key_hashes_structure_and_isolates_opaques_and_consts():
+    """`terms.parameter_key` hashes `jcore.Jaxpr` structurally (`terms.jaxpr_digest`), keeping pure jaxprs
+    JSON-safe (`_stated._plain`) and cross-process stable (`terms.opaque`) while distinguishing different
+    arithmetic, constants, and opaque `custom_vjp` `WrappedFun` closures."""
+    from dew import _stated
+
+    shape = jax.ShapeDtypeStruct((4, 8), jnp.float32)
+    c1 = jax.make_jaxpr(lambda x: jnp.sin(x) + 1.0)(shape)
+    c2 = jax.make_jaxpr(lambda x: jnp.sin(x) + 1.0)(shape)
+    c3 = jax.make_jaxpr(lambda x: jnp.cos(x) + 1.0)(shape)
+    k1, k2, k3 = terms.parameter_key(c1), terms.parameter_key(c2), terms.parameter_key(c3)
+    assert k1 == k2 and k1 != k3
+    assert terms.jaxpr_digest(c1) == terms.jaxpr_digest(c2)
+    assert terms.opaque(k1) == k1
+    assert isinstance(_stated._plain(k1, "pure_jaxpr"), list)
+
+    # Closed-over constants differentiate `parameter_key` even when the jaxpr body matches structurally.
+    arr_a, arr_b = np.ones((4, 8), np.float32), np.full((4, 8), 2.0, np.float32)
+    ca = jax.make_jaxpr(lambda x: x + arr_a)(shape)
+    cb = jax.make_jaxpr(lambda x: x + arr_b)(shape)
+    assert terms.jaxpr_digest(ca) == terms.jaxpr_digest(cb)
+    assert terms.parameter_key(ca) != terms.parameter_key(cb)
+
+    # Distinct `custom_vjp` rules embed distinct opaque `WrappedFun`s that never collide and refuse `_plain`.
+    def make_vjp(scale: float):
+        @jax.custom_vjp
+        def f(x):
+            return x * 2.0
+
+        f.defvjp(lambda x: (x * 2.0, None), lambda _, g: (g * scale,))
+        return jax.make_jaxpr(f)(shape)
+
+    v1, v2 = make_vjp(2.0), make_vjp(3.0)
+    kv1, kv2 = terms.parameter_key(v1), terms.parameter_key(v2)
+    assert kv1 != kv2
+    assert terms.opaque(kv1) == terms.opaque(kv2)
+    with pytest.raises(_stated.Unestablished):
+        _stated._plain(kv1, "custom_vjp_jaxpr")
+
+
+def _bf16_rms(x, w):
+    """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
+    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+    return (x.astype(jnp.float32) * jax.lax.rsqrt(mean_sq + 1e-6)).astype(x.dtype) * w
+
+
+def _named_bf16_rms(name: str):
+    """Freshly named RMSNorm function so each `make_jaxpr` carries distinct `debug_info`."""
+    def norm(x, w):
+        return _bf16_rms(x, w)
+
+    norm.__name__ = name
+    return norm
+
+
+def test_structural_closed_reuses_const_free_body_preserving_debug_info_and_reports():
+    """Fresh structurally identical const-free bodies hit `program._STRUCTURAL_CLOSED`, replaying routes and
+    rewrite reports while keeping each body's own `debug_info` and computing identical values."""
+    from jax._src import core as jax_core
+
+    from dew.nn.kernels.templates import report as kernel_report
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    ca = jax.make_jaxpr(_named_bf16_rms("norm_a"))(*shapes)
+    cb = jax.make_jaxpr(_named_bf16_rms("norm_b"))(*shapes)
+    assert ca is not cb and ca.debug_info != cb.debug_info
+    with generation.assumed("sm90"):
+        with generation.routes() as routes_a, kernel_report.recording():
+            out_a = program._closed(ca, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.routes() as routes_b, kernel_report.recording():
+            out_b = program._closed(cb, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert out_a is not ca and out_b is not cb
+    assert out_a.debug_info == ca.debug_info
+    assert out_b.debug_info == cb.debug_info
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in routes_a)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in routes_b)
+    jax_core.check_jaxpr(out_b.jaxpr)
+
+    # `rules.head_primitives()` and `rules.heads()` stay aligned with and without dev rule sets enabled.
+    base_prims = algebra.rules.head_primitives()
+    assert "add" in base_prims and "div" not in base_prims
+    with algebra.rules.enabling_dev("reuse"):
+        reuse_prims = algebra.rules.head_primitives()
+        assert "div" in reuse_prims
+        assert algebra.rules.heads("div", [None, "sqrt"])
+        assert not algebra.rules.heads("div", [None, None])
+
+
+def test_structural_closed_isolates_callbacks_device_consts_and_prng_impls():
+    """`program._STRUCTURAL_CLOSED` and `terms.body_key` distinguish `pure_callback` closures from the same
+    factory, same-tag `define_prng_impl` specs with distinct implementations, and decline structural sharing
+    without touching device memory when a nested `pjit` holds a concrete `jax.Array`."""
+    from jax.core import ShapedArray, eval_jaxpr
+    from jax.extend import random as jrandom
+
+    def make_cb_body(offset: float):
+        def bump(x):
+            return x + np.asarray(offset, dtype=x.dtype)
+
+        def body(x, w):
+            normed = _bf16_rms(x, w)
+            return jax.pure_callback(bump, jax.ShapeDtypeStruct(normed.shape, normed.dtype), normed)
+
+        return body
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    cb1, cb5 = jax.make_jaxpr(make_cb_body(1.0))(*shapes), jax.make_jaxpr(make_cb_body(5.0))(*shapes)
+    assert terms.body_key(cb1) != terms.body_key(cb5)
+    with generation.assumed("sm90"):
+        r1 = program._closed(cb1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        r5 = program._closed(cb5, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert r1 is not cb1 and r5 is not cb5 and r1.jaxpr is not r5.jaxpr
+    eq1 = next(eq for eq in r1.jaxpr.eqns if eq.primitive.name == "pure_callback")
+    eq5 = next(eq for eq in r5.jaxpr.eqns if eq.primitive.name == "pure_callback")
+    assert eq1.params["callback"] is not eq5.params["callback"]
+    x_in, w_in = jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16)
+    cpu1 = program._closed(cb1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    cpu5 = program._closed(cb5, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert float(eval_jaxpr(cpu1.jaxpr, cpu1.consts, x_in, w_in)[0][0, 0]) == 2.0
+    assert float(eval_jaxpr(cpu5.jaxpr, cpu5.consts, x_in, w_in)[0][0, 0]) == 6.0
+
+    # Nested `jit` holding a concrete device `jax.Array` declines structural sharing without host copy.
+    captured = jnp.ones((256,), jnp.bfloat16)
+
+    @jax.jit
+    def inner_with_const(x):
+        return x + captured
+
+    def outer_const_free(x, w):
+        return inner_with_const(_bf16_rms(x, w))
+
+    nested_closed = jax.make_jaxpr(outer_const_free)(*shapes)
+    assert not nested_closed.consts
+    assert terms.body_key(nested_closed) is None
+
+    # Same-tag `define_prng_impl` specs with distinct `random_bits` implementations get distinct keys.
+    def make_prng(fill: int):
+        return jrandom.define_prng_impl(
+            key_shape=(2,),
+            seed=lambda seed: jnp.zeros((2,), jnp.uint32),
+            split=lambda key, shape: jnp.broadcast_to(key, (*shape, 2)),
+            random_bits=lambda key, bit_width, shape: jnp.full(shape, fill, jnp.uint32),
+            fold_in=lambda key, word: key,
+            name="shared_test_name",
+            tag="shared_test_tag",
+        )
+    impl_a, impl_b = make_prng(11), make_prng(29)
+    key_a, key_b = jax.random.key(0, impl=impl_a), jax.random.key(0, impl=impl_b)
+
+    def draw_and_norm(k, x, w):
+        return jax.random.bits(k, (4,), jnp.uint32), _bf16_rms(x, w)
+
+    p_a = jax.make_jaxpr(draw_and_norm)(jax.typeof(key_a), *shapes)
+    p_b = jax.make_jaxpr(draw_and_norm)(jax.typeof(key_b), *shapes)
+    assert terms.body_key(p_a) != terms.body_key(p_b)
+    with generation.assumed("sm90"):
+        rp_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        rp_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert rp_a is not p_a and rp_b is not p_b and rp_a.jaxpr is not rp_b.jaxpr
+    a0, b0 = rp_a.in_avals[0], rp_b.in_avals[0]
+    assert isinstance(a0, ShapedArray) and isinstance(b0, ShapedArray) and a0.dtype != b0.dtype
+    cpu_a = program._closed(p_a, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    cpu_b = program._closed(p_b, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert int(eval_jaxpr(cpu_a.jaxpr, cpu_a.consts, key_a, x_in, w_in)[0][0]) == 11
+    assert int(eval_jaxpr(cpu_b.jaxpr, cpu_b.consts, key_b, x_in, w_in)[0][0]) == 29
+
+
+def test_structural_closed_keys_on_drawing_context_in_both_orders():
+    """Fresh structurally identical bodies traced under `generation.drawing()` and live `assumed('sm90')`
+    never share a `_STRUCTURAL_CLOSED` entry in either cache order."""
+    from dew.nn.kernels.templates import report as kernel_report
+
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    d1, n1 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("draw_first", "real_after"))
+    n2, d2 = (jax.make_jaxpr(_named_bf16_rms(name))(*shapes) for name in ("real_first", "draw_after"))
+    with generation.assumed("sm90"):
+        with generation.drawing(), generation.routes() as draw_r1, kernel_report.recording():
+            out_d1 = program._closed(d1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.routes() as real_r1, kernel_report.recording():
+            out_n1 = program._closed(n1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.routes() as real_r2, kernel_report.recording():
+            out_n2 = program._closed(n2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        with generation.drawing(), generation.routes() as draw_r2, kernel_report.recording():
+            out_d2 = program._closed(d2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+    assert not any(r.choice == "rms_norm" and r.kernel != "xla" for r in draw_r1)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in real_r1)
+    assert any(r.choice == "rms_norm" and r.kernel != "xla" for r in real_r2)
+    assert not any(r.choice == "rms_norm" and r.kernel != "xla" for r in draw_r2)
+    assert out_d1 is d1 and out_n1 is not n1 and out_n2 is not n2 and out_d2 is d2
+
+
+def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_gc():
+    """`terms.body_key` and `_STRUCTURAL_CLOSED` handle `float0` tangent dtypes from integer gradients, stay
+    linear on depth-30 shared nested-jit DAGs, preserve equation-local `cur_abstract_mesh` contexts in both
+    cache orders, and never pin a `jax.Array` held only in a scoped `ContextVar`."""
+    import contextvars
+    import gc
+
+    from jax.sharding import AbstractMesh, AxisType
+
+    import dew
+
+    grad_int = jax.grad(lambda x, i: (x * i).sum(), allow_int=True)
+    f0_closed = jax.make_jaxpr(grad_int)(
+        jax.ShapeDtypeStruct((4,), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32))
+    assert terms.body_key(f0_closed) is not None and terms.jaxpr_digest(f0_closed, in_process=True)[0]
+    assert program._closed(f0_closed, accurate=False, saturation=algebra.SATURATION, kernels=True) is not None
+    got_g = dew.jit(grad_int)(jnp.ones((4,), jnp.float32), jnp.arange(4, dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(got_g), np.arange(4, dtype=jnp.float32))
+
+    def build_dag(offset: float):
+        fn = jax.jit(lambda x: x + offset)
+        for _ in range(30):
+            prev = fn
+            fn = jax.jit(lambda x, f=prev: f(x) + f(x + 1.0))
+        return jax.make_jaxpr(fn)(jax.ShapeDtypeStruct((4,), jnp.float32))
+
+    dag_a, dag_b, dag_diff = build_dag(1.0), build_dag(1.0), build_dag(2.0)
+    ka, kb, kd = terms.body_key(dag_a), terms.body_key(dag_b), terms.body_key(dag_diff)
+    assert ka is not None and ka == kb and ka != kd
+    assert terms.jaxpr_digest(dag_a, in_process=True) == terms.jaxpr_digest(dag_b, in_process=True)
+    assert terms.jaxpr_digest(dag_a, in_process=True) != terms.jaxpr_digest(dag_diff, in_process=True)
+
+    mesh_a = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
+    mesh_b = AbstractMesh((4,), ("data",), axis_types=(AxisType.Explicit,))
+    shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+
+    def make_scoped_body(mesh: AbstractMesh, name: str):
+        def body(x, w):
+            normed = _bf16_rms(x, w)
+            with jax.sharding.use_abstract_mesh(mesh):
+                return normed + jnp.asarray(1.0, normed.dtype)
+        body.__name__ = name
+        return jax.make_jaxpr(body)(*shapes)
+
+    for first_mesh, second_mesh, tag in ((mesh_a, mesh_b, "ab"), (mesh_b, mesh_a, "ba")):
+        c1, c2 = make_scoped_body(first_mesh, f"ctx_{tag}_1"), make_scoped_body(second_mesh, f"ctx_{tag}_2")
+        assert terms.body_key(c1) != terms.body_key(c2) and terms.jaxpr_digest(c1) != terms.jaxpr_digest(c2)
+        with generation.assumed("sm90"):
+            r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r1.jaxpr.eqns[-1].ctx.cur_abstract_mesh == first_mesh
+        assert r2.jaxpr.eqns[-1].ctx.cur_abstract_mesh == second_mesh
+
+    scoped_var: contextvars.ContextVar = contextvars.ContextVar("test_scoped_device_array", default=None)
+
+    def run_in_scope() -> weakref.ref:
+        buf = jnp.ones((16, 16), jnp.float32)
+        ref, token = weakref.ref(buf), scoped_var.set(buf)
+        try:
+            traced = jax.make_jaxpr(lambda x: x + 1.0)(jax.ShapeDtypeStruct((4,), jnp.float32))
+            program._closed(traced, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        finally:
+            scoped_var.reset(token)
+        return ref
+
+    arr_ref = run_in_scope()
+    gc.collect()
+    assert arr_ref() is None
+
+
+def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layouts():
+    """Executable callable dataclasses (factory-made, `eq=False`, cyclic `eq=False`, and frozen cyclic
+    `compare=False` in bare nested `jax.jit`) never hit `RecursionError` or cross-hit `_STRUCTURAL_CLOSED`;
+    `_NormTrack` rejects permuting reshapes, singleton expansion, and lossy `bf16->fp16` casts."""
+    import dew
+
+    def make_factory_callback(offset: float):
+        @dataclasses.dataclass(frozen=True)
+        class OffsetCallback:
+            def __call__(self, arr):
+                return arr + np.float32(offset)
+        return OffsetCallback()
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class IdentityCallback:
+        def __call__(self, arr):
+            return arr + np.float32(1.0 if self is id_first else 2.0)
+
+    @dataclasses.dataclass(eq=False)
+    class CyclicCallback:
+        offset: float
+        parent: object = None
+        def __call__(self, arr):
+            return arr + np.float32(self.offset)
+
+    @dataclasses.dataclass(frozen=True)
+    class FrozenCyclic:
+        offset: float
+        parent: list = dataclasses.field(default_factory=list, compare=False, repr=False)
+        def __call__(self, arr):
+            return arr + np.float32(self.offset)
+
+    id_first, id_second = IdentityCallback(), IdentityCallback()
+    cyc1, cyc2 = CyclicCallback(1.0), CyclicCallback(2.0)
+    cyc1.parent, cyc2.parent = cyc1, cyc2
+    fc1, fc2 = FrozenCyclic(1.0), FrozenCyclic(2.0)
+    fc1.parent.append(fc1)
+    fc2.parent.append(fc2)
+    rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    x_in, w_in = jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16)
+    exp2, exp3 = np.full((256, 256), 2.0, np.float32), np.full((256, 256), 3.0, np.float32)
+    def make_body(cb, *, nested: bool = False, bare: bool = False):
+        inner = jax.jit(lambda y: jax.pure_callback(cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))
+        return lambda x, w: (lambda y: inner(y) if nested else jax.pure_callback(
+            cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))(
+            x.astype(jnp.float32) if bare else _bf16_rms(x, w).astype(jnp.float32))
+    cases = ((make_factory_callback(1.0), make_factory_callback(2.0), True, False, False),
+             (id_first, id_second, False, False, False), (cyc1, cyc2, False, True, False),
+             (fc1, fc2, False, True, True))
+    for cb1, cb2, shareable, is_nested, is_bare in cases:
+        f1, f2 = (make_body(cb, nested=is_nested, bare=is_bare) for cb in (cb1, cb2))
+        c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
+        k1, k2 = terms.body_key(c1), terms.body_key(c2)
+        assert (k1 is not None and k2 is not None and k1 != k2) if shareable else (k1 is None and k2 is None)
+        assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
+        assert shareable or terms.jaxpr_digest(c1) != terms.jaxpr_digest(c2)
+        with generation.assumed("sm90"):
+            r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r1.jaxpr != r2.jaxpr
+        np.testing.assert_array_equal(np.asarray(dew.jit(f1)(x_in, w_in)), exp2)
+        np.testing.assert_array_equal(np.asarray(dew.jit(f2)(x_in, w_in)), exp3)
+    bad_norms = (
+        (lambda x: x * jax.lax.rsqrt(jax.lax.reshape(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6),
+            (4, 2, 2, 1), dimensions=(0, 2, 1, 3))), (4, 2, 2, 8), jnp.float32),
+        (lambda x: x * jax.lax.broadcast_in_dim(jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)),
+            (4, 2, 2, 64), (0, 1, 2, 3)), (4, 2, 2, 1), jnp.float32),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x.astype(jnp.float16).astype(jnp.float32)), axis=-1, keepdims=True)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.bfloat16),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True).astype(jnp.float32)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.float16),
+    )
+    for bad_fn, shape, dt in bad_norms:
+        closed = jax.make_jaxpr(bad_fn)(jax.ShapeDtypeStruct(shape, dt))
+        held, apart = terms.proven(closed.jaxpr, targets=(closed.jaxpr.outvars[0],), deep=True)
+        assert held[closed.jaxpr.outvars[0]] is None and not apart[closed.jaxpr.outvars[0]].unit_norm

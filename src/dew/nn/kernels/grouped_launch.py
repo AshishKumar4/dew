@@ -19,6 +19,7 @@ from . import tuning
 from .templates import base
 from .templates.axes import held as held_axes
 from .templates.gemm.hooks import NO_HOOKS, Hooks
+from .templates.hooks import TRACED_TILE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,11 +66,6 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     sizes = np.floor(shares / shares.sum() * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
     return jnp.asarray(sizes)
-
-
-TRACED_TILE = 16
-"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`), widened for an
-epilogue that narrows whole runs of columns to the least tile holding one (`quantized.Form.unit`)."""
 
 
 class _GroupedLaunch[Config: Hashable](base.Template[Config]):
@@ -138,6 +134,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
             return value if isinstance(value, str) else None
 
         from .templates.gemm import quantized
+        from .templates.gemm.hooks import column_local
 
         traced = math.lcm(TRACED_TILE, *(form.unit for form in quantized.forms_of(
             value.out_forms, value.out_dtypes or ()) if form is not None and form.narrowed))
@@ -151,12 +148,15 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
                                   *(jax.ShapeDtypeStruct((extent,) * len(axes), dtype)
                                     for axes, dtype in zip(axes_of, sides, strict=True)))
 
+        # A column-local epilogue (`hooks.ColumnLocal`) is read out a chunk at a time, another kernel than
+        # the same hook read out whole: keyed apart, every other hook's key as it was.
+        local = ('column-local',) if column_local(value.epilogue) else ()
         return "hooks:" + repr((program(value.before(), value.prologue_axes, value.prologue_dtypes),
                                 program(value.after(), value.epilogue_axes, value.epilogue_dtypes,
                                         value.accumulators, traced),
                                 value.prologue_axes, value.epilogue_axes, value.out_dtypes,
                                 value.prologue_broadcast, value.epilogue_broadcast, value.accumulators,
-                                value.out_forms))
+                                value.out_forms, *local))
 
     def keyed(self, ba):
         """`tuning.KernelOp.keyed`, a call's tables (`gather`, `scatter`) bucketed as the tokens' rows are,

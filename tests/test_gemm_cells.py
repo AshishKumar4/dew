@@ -69,13 +69,17 @@ def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alo
 
 @pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
 def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
-    """A dense kind runs the template whole only where every product its receipt timed is at parity in time
-    and temporaries (kernel-templates.md §1; bible §6, 2026-11-24); a kind with a product lagging keeps XLA's
-    dot, its products at parity the template's over their timed rows, its lagging ones and every product it
-    did not time XLA's (`grouped_cells.Scoreboard`)."""
+    """A dense kind runs the template whole only where every product any receipt timed of it is at parity in
+    time and temporaries and its step holds no more (kernel-templates.md §1; bible §6, 2026-11-24;
+    `grouped_cells.STEP_HELD`); a kind with a product lagging keeps XLA's dot, its products at parity the
+    template's over their timed rows, its lagging ones and every product it did not time XLA's
+    (`grouped_cells.Scoreboard`)."""
     untimed = (3 * 1024 + 64, 8 * 1024 + 64)
     for made, projections in board.times.items():
-        kind = board.winner(made)
+        lags = (board.generation, made) in grouped_cells.STEP_HELD or any(
+            timing.winner == "xla" for timing in grouped_cells.timings()
+            if (timing.generation, timing.made) == (board.generation, made))
+        kind = "xla" if lags else board.winner(made)
         assert _route(_dense_case(board.generation, made, untimed, board.rows)) == kind, made
         for name in projections:
             route = _route(_dense_case(board.generation, made, grouped_cells.PROJECTIONS[name], board.rows))
@@ -120,3 +124,19 @@ def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
                             if isinstance(op, grouped_matmul.MosaicGmm)}
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
                 jax.jit(run).trace(*shapes(264))
+
+
+@pytest.mark.parametrize(("operands", "rate"), [("float8_e4m3fn", "eight"), ("bfloat16", "tensor")])
+def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
+    """A step's products are priced at the tensor rate of the dtype its MMA issues (`pricing.step_seconds`'s
+    `issued`): an 8-bit float's on an H100, which doubles the 16-bit rate, so a cooperative 128 x 256 FP8 step
+    within its products' time takes half a bf16 step's; a bf16 one, the 16-bit rate (row 13008)."""
+    from dew.nn.kernels.templates import cost
+    from dew.nn.kernels.templates.gemm import pricing, tiling
+
+    h100 = generation.gpu_target("sm90")
+    tiles = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
+    size = jnp.dtype(operands).itemsize
+    step = pricing.step_seconds(tiles, h100, (size, size), issued=jnp.dtype(operands))
+    rates = cost.rates(h100, device=False)
+    assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]

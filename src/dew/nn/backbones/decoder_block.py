@@ -26,7 +26,7 @@ from dew.nn.dropout import Dropout
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
-from ..cross_pass import MERGE_PREFIX, CrossPass, CrossPassMerge
+from ..cross_pass import MERGE_PREFIX, CrossPass, CrossPassMerge, merged_sites
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -1151,9 +1151,10 @@ class DecoderBlock(nn.Module):
         if bank is not None:
             # Each site's input its own merge of the bank, normed as the block norms its attention's input;
             # a seam norm's fused stream would norm the stream, which no merge reads.
+            # The sites' merges read the bank once together (`merged_sites`).
             sites = self._mixer_sites()
-            merges = self.cross_pass_merges
-            normed, *rest = (self._attention_input(merges[name](read, bank)) for name in sites)
+            merged = merged_sites(tuple(self.cross_pass_merges[name] for name in sites), read, bank)
+            normed, *rest = (self._attention_input(each) for each in merged)
             site_inputs = dict(zip(sites[1:], rest, strict=True)) or None
         elif not (self.wiring.pre_norms and self.attention_norm):
             normed = read

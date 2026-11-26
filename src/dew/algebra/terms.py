@@ -52,6 +52,34 @@ from jax.experimental.layout import Layout
 from jax.extend import core as jcore
 from jax.typing import DTypeLike
 
+from dew.algebra._proofs import (
+    NOTHING,
+    NOWHERE,
+    UNIT,
+    WHOLE,
+    Apart,
+    Magnitude,
+    Proven,
+    _apart_of,
+    _constant_apart,
+    _declared,
+    _declared_apart,
+    _deep_nonlang,
+    _deep_refine,
+    _held_apart,
+    _host_array,
+    _log2,
+    _magnitude,
+    _NormTrack,
+    _reduced,
+    _shape,
+    _shared_sign,
+    _side_matches,
+    _SoftmaxTrack,
+    _within,
+    dtype_lossless_in as dtype_lossless_in,
+    typed_key,
+)
 from dew.nn import programs
 
 
@@ -383,14 +411,6 @@ class Region[Node: (Term, Skeleton)]:
         return _interned(self.params, self.products, self.indexed, primitive, values, product)
 
     @functools.cached_property
-    def single_float32(self) -> bool:
-        """Whether every value the region's program traced is fp32 (`dtypes`; an extended dtype and a mask's
-        bool aside, `where(y > 0, a / y, 0)`'s): a division of it, traced or a rewrite's, fp32 too
-        (`cost.work`); an integer's or another float's program none."""
-        return all(np.dtype(dtype) == np.float32 for dtype in self.dtypes.values()
-                   if not jnp.issubdtype(dtype, jax.dtypes.extended) and np.dtype(dtype) != np.bool_)
-
-    @functools.cached_property
     def made_by(self) -> dict[int, Opaque[Node]]:
         """Each leaf an equation outside the language makes (`opaque`), by its index, that equation."""
         return {leaf: opaque for opaque in self.opaque for leaf in opaque.outputs}
@@ -456,6 +476,11 @@ def _interned(params: list, products: dict[int, Product], indexed: dict[Hashable
 def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
     """An equation's primitive and parameters as a region holds them: two equations of one primitive whose
     parameters are one (`parameter_key`) share one entry of its table (`Region.params`), the first's."""
+    if not values:
+        return primitive, ()
+    if len(values) == 1:
+        name, value = next(iter(values.items()))
+        return primitive, ((name, parameter_key(value)),)
     return primitive, tuple((name, parameter_key(value)) for name, value in sorted(values.items()))
 
 
@@ -478,25 +503,80 @@ def _abstract_key(value: ShapedArray) -> Hashable:
             parameter_key((manual.varying, manual.unreduced, manual.reduced, manual.unreduced_kind)))
 
 
+def _cycle_guard(value, kind: type, seen: set[int], *, reject_device: bool,
+                 build: Callable[[], Hashable]) -> Hashable:
+    """Run `build()` with `id(value)` on active ancestor stack `seen`; on a cycle raise `_Unshareable` when
+    `reject_device` else key `value` by identity."""
+    obj_id = id(value)
+    if obj_id in seen:
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    seen.add(obj_id)
+    try:
+        return build()
+    finally:
+        seen.discard(obj_id)
+
+
+def _container_param_key(value, kind: type, recurse: Callable, seen: set[int], *,
+                         reject_device: bool) -> Hashable | None:
+    """Cycle-safe structural key for Python containers and `functools.partial`, or None for other types."""
+    if isinstance(value, functools.partial):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "partial", recurse(value.func), recurse(value.args), recurse(value.keywords)))
+    if isinstance(value, (tuple, list)) and not isinstance(value, jax.sharding.PartitionSpec):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "sequence", _named(kind), tuple(recurse(part) for part in value)))
+    if isinstance(value, (set, frozenset)):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "set", tuple(sorted((recurse(part) for part in value), key=repr))))
+    if isinstance(value, Mapping):
+        return _cycle_guard(value, kind, seen, reject_device=reject_device, build=lambda: (
+            "mapping", tuple(sorted(((recurse(k), recurse(v)) for k, v in value.items()), key=repr))))
+    return None
+
+
 def parameter_key(value) -> Hashable:
-    """An equation's parameter as what it is, the one structural key the algebra pass (`parameters_key`,
-    `program.structure`) and the kernel tuner (`dew.nn.kernels.tuning.program`) read: plain data, the same in
-    every process, tagged with its kind. A number by its value whatever its Python or NumPy type (a float by
-    its bits, so a NaN is one key and -0.0 another than 0.0); a sequence's parts, a named tuple's with its
-    type; a set's and a mapping's parts, ordered by their keys' printed forms (an order, never an identity); a
-    dtype by its name; an enumeration by its type and member; a dataclass by its type and fields; a mesh by
-    its devices, axes and axis types, an abstract one by its sizes, axes, axis types and device; a sharding by
-    its mesh, partitions, memory and logical device order; an abstract value by its shape, dtype, weak type,
-    placement (partitions, mesh axes, memory), memory space, layout and the manual axes it varies over,
-    reduces or leaves unreduced; a layout by its dimension order, tiling and sub-byte element size; an array
-    by its dtype, shape and bytes' digest; a function by its module and name, a partial one with its bound
-    arguments. Any other object is its type's name and the object itself, compared by its own equality, never
-    by its printed form, which a key kept in another process cannot read (`opaque`); an object that cannot be
-    hashed (JAX's `WrappedFun` of a derivative rule, hashing an `Unhashable` tree) by its identity, held alive
-    by the key (`_Identity`), so it is equal to itself alone. `value` is any parameter JAX's primitives take,
-    which share no type."""
-    if value is None or isinstance(value, (bool, str)):
-        return type(value).__name__, value
+    """Structural parameter key (`parameters_key`, `program.structure`, `tuning.program`): plain data across
+    processes; unhashable, cyclic, or identity-equality objects by identity."""
+    return _parameter_key(value, None)
+
+
+def _parameter_key(value, seen: set[int] | None) -> Hashable:
+    kind = type(value)
+    if value is None or kind in (bool, str, int):
+        return kind.__name__, value
+    if kind is float:
+        return "float", value.hex()
+    if kind is ShapedArray:
+        return _abstract_key(value)
+    if kind in (tuple, list):
+        active = set() if seen is None else seen
+        return _cycle_guard(value, kind, active, reject_device=False, build=lambda: (
+            "sequence", _named(kind), tuple(_parameter_key(part, active) for part in value)))
+    if isinstance(value, jcore.Jaxpr):
+        digest, opaques = jaxpr_digest(value)
+        held = ("object", "subkey", _SubKey(digest, opaques)) if opaques else ()
+        consts = tuple(_nested_const_key(const) for const in value.consts) if value.consts else ()
+        return "jaxpr", digest, held, consts
+    return _parameter_key_other(value, kind, set() if seen is None else seen)
+
+
+def _array_key(value, kind: type) -> Hashable:
+    """Cross-process array digest (`parameter_key`), never transferring non-addressable global shards."""
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+        return "object", _named(kind), _Identity(value)
+    _, array = held_bits(value)
+    return ("array", str(value.dtype), array.shape, str(array.dtype),
+            hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+
+
+def _parameter_key_other(value, kind: type, seen: set[int]) -> Hashable:
+    """`parameter_key` fallback for NumPy scalars/arrays, enums, layouts, shardings, dataclasses, mappings,
+    and opaque objects."""
+    if isinstance(value, (bool, str)):
+        return kind.__name__, value
     if isinstance(value, (int, np.integer)):
         return "int", int(value)
     if isinstance(value, (float, np.floating)):
@@ -506,58 +586,391 @@ def parameter_key(value) -> Hashable:
     if isinstance(value, np.dtype):
         return "dtype", value.name
     if isinstance(value, enum.Enum):
-        return "enum", _named(type(value)), value.name
+        return "enum", _named(kind), value.name
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
-        # The key type's printed form, which a key kept in another process can read.
-        _, array = held_bits(value)
-        return ("array", str(value.dtype), array.shape, str(array.dtype),
-                hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
+        return _array_key(value, kind)
     if isinstance(value, ShapedArray):
         return _abstract_key(value)
     if value is Layout.AUTO:
-        # The layout XLA chooses, one singleton.
         return "layout", "auto"
     if isinstance(value, Layout):
-        return ("layout", parameter_key(value.major_to_minor), parameter_key(value.tiling),
+        return ("layout", _parameter_key(value.major_to_minor, seen), _parameter_key(value.tiling, seen),
                 value.sub_byte_element_size_in_bits)
     if isinstance(value, jax.sharding.Mesh):
-        # An empty mesh (a jit's context outside any) holds no devices.
         devices = () if value.empty else value.device_ids
-        return ("mesh", parameter_key(devices), parameter_key(value.axis_names),
-                parameter_key(value.axis_types))
+        return ("mesh", _parameter_key(devices, seen), _parameter_key(value.axis_names, seen),
+                _parameter_key(value.axis_types, seen))
     if isinstance(value, jax.sharding.AbstractMesh):
-        return ("abstract mesh", parameter_key(value.axis_sizes), parameter_key(value.axis_names),
-                parameter_key(value.axis_types), parameter_key(value.abstract_device))
+        return ("abstract mesh", _parameter_key(value.axis_sizes, seen),
+                _parameter_key(value.axis_names, seen), _parameter_key(value.axis_types, seen),
+                _parameter_key(value.abstract_device, seen))
     if isinstance(value, jax.sharding.NamedSharding):
-        # Its mesh, partitions, memory and logical device order, as JAX pickles it, which its equality reads.
         _, arguments = value.__reduce__()
-        return "named sharding", parameter_key(arguments)
-    if isinstance(value, functools.partial):
-        return "partial", parameter_key(value.func), parameter_key(value.args), parameter_key(value.keywords)
+        return "named sharding", _parameter_key(arguments, seen)
     if isinstance(value, jax.sharding.PartitionSpec):
-        return ("partitions", parameter_key(tuple(value)), parameter_key(value.unreduced),
-                parameter_key(value.reduced), parameter_key(value.unreduced_kind))
+        return ("partitions", _parameter_key(tuple(value), seen), _parameter_key(value.unreduced, seen),
+                _parameter_key(value.reduced, seen), _parameter_key(value.unreduced_kind, seen))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = dataclasses.fields(value)
-        return "record", _named(type(value)), tuple((field.name, parameter_key(getattr(value, field.name)))
-                                                    for field in fields)
-    if isinstance(value, (tuple, list)):
-        # A named tuple's type names its fields, which its parts take in order.
-        return "sequence", _named(type(value)), tuple(parameter_key(part) for part in value)
-    if isinstance(value, (set, frozenset)):
-        return "set", tuple(sorted((parameter_key(part) for part in value), key=repr))
-    if isinstance(value, Mapping):
-        return "mapping", tuple(sorted(((parameter_key(name), parameter_key(part))
-                                        for name, part in value.items()), key=repr))
+        if kind.__eq__ is object.__eq__:
+            return "object", _named(kind), _Identity(value)
+        return _cycle_guard(value, kind, seen, reject_device=False, build=lambda: (
+            "record", _named(kind), tuple((f.name, _parameter_key(getattr(value, f.name), seen))
+                                          for f in dataclasses.fields(value))))
+    if (boxed := _container_param_key(value, kind, lambda part: _parameter_key(part, seen), seen,
+                                      reject_device=False)) is not None:
+        return boxed
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
     try:
         hash(value)
     except TypeError:
-        # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
-        # them: keyed by its identity.
-        return "object", _named(type(value)), _Identity(value)
-    return "object", _named(type(value)), value
+        return "object", _named(kind), _Identity(value)
+    return "object", _named(kind), value
+
+
+class _SubKey:
+    """DAG-memoized structural key for a `jcore.Jaxpr` with O(1) hash and O(V) equality."""
+
+    __slots__ = ("_hash", "digest", "opaques")
+
+    def __init__(self, digest: str, opaques: tuple[Hashable, ...]) -> None:
+        self.digest, self.opaques, self._hash = digest, opaques, hash((digest, opaques))
+
+    def __repr__(self) -> str:
+        return f"_SubKey({self.digest!r})"
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __eq__(self, other) -> bool:
+        return (self is other or (isinstance(other, _SubKey) and self._hash == other._hash
+                                  and self.digest == other.digest and _subkeys_equal(self, other)))
+
+
+def _subkey_child(entry) -> _SubKey | None:
+    if (isinstance(entry, tuple) and len(entry) == 3 and entry[0] == "object"
+            and entry[1] == "subkey" and isinstance(entry[2], _SubKey)):
+        return entry[2]
+    return None
+
+
+def _subkeys_equal(left: _SubKey, right: _SubKey) -> bool:
+    """Iterative pair-memoized equality of two `_SubKey` DAGs, O(V) even across distinct copies."""
+    seen: set[tuple[int, int]] = set()
+    stack: list[tuple[_SubKey, _SubKey]] = [(left, right)]
+    while stack:
+        first, second = stack.pop()
+        if first is second:
+            continue
+        pair = (id(first), id(second))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        if (first._hash != second._hash or first.digest != second.digest
+                or len(first.opaques) != len(second.opaques)):
+            return False
+        for lhs, rhs in zip(first.opaques, second.opaques, strict=True):
+            if lhs is rhs:
+                continue
+            lhs_child, rhs_child = _subkey_child(lhs), _subkey_child(rhs)
+            if lhs_child is not None and rhs_child is not None:
+                stack.append((lhs_child, rhs_child))
+            elif lhs != rhs:
+                return False
+    return True
+
+
+_JAXPR_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]]] = (
+    weakref.WeakKeyDictionary())
+_IN_PROCESS_DIGESTS: weakref.WeakKeyDictionary[jcore.Jaxpr, _SubKey] = weakref.WeakKeyDictionary()
+_BODY_KEYS: weakref.WeakKeyDictionary[jcore.Jaxpr, _SubKey | None] = weakref.WeakKeyDictionary()
+_PROVENANCE_KEYS: weakref.WeakKeyDictionary[jcore.Jaxpr, str] = weakref.WeakKeyDictionary()
+
+
+class _Unshareable(Exception):
+    """Raised internally by `body_key` when a body holds nested consts, cycles, or device arrays."""
+
+
+def _nested_const_key(const) -> Hashable:
+    if isinstance(const, jax.Array) and not isinstance(const, jax_core.Tracer):
+        return "object", _named(type(const)), _Identity(const)
+    return parameter_key(const)
+
+
+def _extended_dtype(dtype) -> Hashable | None:
+    if isinstance(dtype, (str, np.dtype)):
+        return None
+    return ("object", "extended_dtype", dtype) if jnp.issubdtype(dtype, jax.dtypes.extended) else None
+
+
+def _in_process_digest(jaxpr: jcore.Jaxpr) -> _SubKey:
+    inner = jaxpr.jaxpr
+    if (cached := _IN_PROCESS_DIGESTS.get(inner)) is not None:
+        return cached
+    sub = _SubKey(*_body_digest(inner, in_process=True, reject_device=False))
+    _IN_PROCESS_DIGESTS[inner] = sub
+    return sub
+
+
+def _body_key_of(jaxpr: jcore.Jaxpr) -> _SubKey | None:
+    if jaxpr.consts or jaxpr.constvars:
+        return None
+    inner = jaxpr.jaxpr
+    if inner in _BODY_KEYS:
+        return _BODY_KEYS[inner]
+    try:
+        made: _SubKey | None = _SubKey(*_body_digest(inner, in_process=True, reject_device=True))
+    except _Unshareable:
+        made = None
+    _BODY_KEYS[inner] = made
+    return made
+
+
+def _dataclass_param_key(value, kind: type, *, reject_device: bool, seen: set[int]) -> Hashable:
+    """In-process structural key for a dataclass preserving class, identity-eq, extra attrs, and cycles."""
+    fields = dataclasses.fields(value)
+    names = {field.name for field in fields}
+    inst = value.__dict__ if any("__dict__" in cls.__dict__ for cls in kind.__mro__) else None
+    extra_slots = any(
+        not set((s,) if isinstance(s, str) else s).issubset(names | {"__dict__", "__weakref__"})
+        for cls in kind.__mro__ if (s := cls.__dict__.get("__slots__")) is not None)
+    if kind.__eq__ is object.__eq__ or (inst is not None and not set(inst).issubset(names)) or extra_slots:
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    return _cycle_guard(
+        value, kind, seen, reject_device=reject_device,
+        build=lambda: ("record", ("object", "class", kind), tuple(
+            (f.name, _in_process_param_key(getattr(value, f.name), reject_device=reject_device, seen=seen))
+            for f in fields)))
+
+
+def _in_process_param_key(value, *, reject_device: bool, seen: set[int] | None = None) -> Hashable:
+    """In-process structural key for an equation parameter preserving executable callable, primitive, and
+    extended-dtype identities while never copying `jax.Array` device buffers to host."""
+    kind = type(value)
+    if value is None or kind in (bool, str, int):
+        return kind.__name__, value
+    if kind is float:
+        return "float", value.hex()
+    if isinstance(value, ShapedArray):
+        return _abstract_key(value), _extended_dtype(value.dtype)
+    if isinstance(value, jcore.Jaxpr):
+        if reject_device:
+            if (child := _body_key_of(value)) is None:
+                raise _Unshareable
+            return "jaxpr", child.digest, ("object", "subkey", child), ()
+        child = _in_process_digest(value)
+        consts = tuple(_nested_const_key(c) for c in value.consts) if value.consts else ()
+        return "jaxpr", child.digest, ("object", "subkey", child), consts
+    if isinstance(value, jax.Array) and not isinstance(value, jax_core.Tracer):
+        if reject_device:
+            raise _Unshareable
+        return "object", _named(kind), _Identity(value)
+    if isinstance(value, (types.FunctionType, types.BuiltinFunctionType)):
+        return "object", _named(kind), value
+    active = set() if seen is None else seen
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _dataclass_param_key(value, kind, reject_device=reject_device, seen=active)
+    if (boxed := _container_param_key(
+            value, kind, lambda part: _in_process_param_key(part, reject_device=reject_device, seen=active),
+            active, reject_device=reject_device)) is not None:
+        return boxed
+    if callable(value) and not isinstance(value, (type, np.dtype, jax.sharding.Mesh)):
+        if reject_device:
+            raise _Unshareable
+        if kind.__eq__ is object.__eq__:
+            return "object", _named(kind), _Identity(value)
+        try:
+            hash(value)
+        except TypeError:
+            return "object", _named(kind), _Identity(value)
+        return "object", _named(kind), value
+    return _parameter_key_other(value, kind, active)
+
+
+def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
+    """Hoist any `("object", cls, held)` entries out of `key` into `opaques`, replacing each with a
+    deterministic positional reference so the remaining key hashes cross-process without object addresses."""
+    if not isinstance(key, tuple):
+        return key
+    if len(key) == 3 and key[0] == "object":
+        slot = len(opaques)
+        opaques.append(key)
+        return "object_ref", key[1], slot
+    return tuple(_collect_opaque(part, opaques) for part in key)
+
+
+def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
+                 reject_device: bool = False) -> tuple[str, tuple[Hashable, ...]]:
+    """Compute `(blake2b_hex, opaques)` for `jaxpr`. With `in_process=True`, executable callables,
+    primitive objects, and extended dtypes stay by exact identity in `opaques`; with `reject_device=True`,
+    any `jax.Array` literal/parameter or nested `consts` raises `_Unshareable` without touching device
+    buffers."""
+    hasher = hashlib.blake2b(digest_size=20)
+    opaques: list[Hashable] = []
+    ctx_keys: dict[int, Hashable] = {}
+    position: dict[jcore.Var, int] = {}
+
+    def feed(part: Hashable) -> None:
+        hasher.update(repr(part).encode())
+        hasher.update(b"\0")
+
+    def aval_key(given) -> Hashable:
+        if in_process and isinstance(given, ShapedArray):
+            return _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
+        return _collect_opaque(parameter_key(given), opaques)
+
+    def feed_atom(atom) -> None:
+        if isinstance(atom, jcore.Literal):
+            if isinstance(atom.val, jax.Array) and not isinstance(atom.val, jax_core.Tracer):
+                if reject_device:
+                    raise _Unshareable
+                feed(("lit_device", _collect_opaque(("object", "jax.Array", _Identity(atom.val)), opaques),
+                      aval_key(atom.aval)))
+                return
+            dtype, value = held_bits(atom.val)
+            raw = np.ascontiguousarray(value).tobytes()
+            ext = _collect_opaque(_extended_dtype(dtype), opaques) if in_process else None
+            feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
+            hasher.update(raw)
+            hasher.update(b"\0")
+        else:
+            feed(("var", position[atom]))
+
+    def var_key(var: jcore.Var) -> Hashable:
+        return isinstance(var, jcore.DropVar), aval_key(var.aval)
+
+    feed(("constvars", tuple(var_key(var) for var in jaxpr.constvars)))
+    feed(("invars", tuple(var_key(var) for var in jaxpr.invars)))
+    for var in (*jaxpr.constvars, *jaxpr.invars):
+        position[var] = len(position)
+    feed(("eqns", len(jaxpr.eqns)))
+    for equation in jaxpr.eqns:
+        ctx = equation.ctx
+        if (ctx_key := ctx_keys.get(id(ctx))) is None:
+            if in_process:
+                # JAX interns `JaxprEqnContext` by all fields (`no_collectives` and `cur_abstract_mesh`
+                # included), so keying the interned object preserves every equation-local policy in O(1).
+                ctx_key = _collect_opaque(("object", "eqn_ctx", ctx), opaques)
+            else:
+                ctx_key = _collect_opaque(parameter_key((
+                    ctx.compute_type, ctx.threefry_partitionable, ctx.xla_metadata,
+                    str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis,
+                    ctx.no_collectives, ctx.cur_abstract_mesh)), opaques)
+            ctx_keys[id(ctx)] = ctx_key
+        if equation.params:
+            raw_params = (
+                tuple((name, _in_process_param_key(part, reject_device=reject_device))
+                      for name, part in sorted(equation.params.items()))
+                if in_process else parameters_key(equation.primitive, equation.params)[1]
+            )
+            params_key = _collect_opaque(raw_params, opaques)
+        else:
+            params_key = ()
+        effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
+        prim_key = (_collect_opaque(("object", "primitive", equation.primitive), opaques) if in_process
+                    else (_named(type(equation.primitive)), equation.primitive.name))
+        feed((prim_key, params_key, ctx_key, effects_key, len(equation.invars),
+              tuple(var_key(var) for var in equation.outvars)))
+        for atom in equation.invars:
+            feed_atom(atom)
+        for var in equation.outvars:
+            position[var] = len(position)
+    feed(("outvars", len(jaxpr.outvars)))
+    for atom in jaxpr.outvars:
+        feed_atom(atom)
+    feed(("effects", _collect_opaque(parameter_key(jaxpr.effects), opaques) if jaxpr.effects else ()))
+    return hasher.hexdigest(), tuple(opaques)
+
+
+def jaxpr_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = False) -> tuple[str, tuple[Hashable, ...]]:
+    """Structural `(hex_digest, opaques)` of `jaxpr` (constvars/invars avals, equations, parameters,
+    contexts, literals, outvars, and effects; excluding `jaxpr.consts` values). Plain data when `in_process`
+    is False and `opaques` is empty; with `in_process=True` returns a DAG-memoized `_SubKey` preserving exact
+    primitive, callable, equation-context, and extended-dtype identities without touching device buffers."""
+    if in_process:
+        sub = _in_process_digest(jaxpr)
+        return sub.digest, (sub,)
+    inner = jaxpr.jaxpr
+    if (cached := _JAXPR_DIGESTS.get(inner)) is not None:
+        return cached
+    digest = _body_digest(inner, in_process=False, reject_device=False)
+    _JAXPR_DIGESTS[inner] = digest
+    return digest
+
+
+def body_key(closed: jcore.Jaxpr) -> Hashable | None:
+    """Exact DAG-memoized in-process structural key for whole-body rewrite reuse
+    (`program._STRUCTURAL_CLOSED`), or None when `closed` (or any nested body) holds constants or concrete
+    `jax.Array` buffers: preserves primitive, callback-closure, equation-context, and extended PRNG dtype
+    identities while never copying device buffers to host."""
+    return _body_key_of(closed)
+
+
+def _walk_sub_provenance(value, out: list[str], seen: set[int]) -> None:
+    """Collect recursive provenance digests for any nested `jcore.Jaxpr` inside equation parameters."""
+    if isinstance(value, jcore.Jaxpr):
+        out.append(provenance_key(value))
+        return
+    if isinstance(value, (tuple, list)):
+        for part in value:
+            _walk_sub_provenance(part, out, seen)
+        return
+    if isinstance(value, Mapping):
+        for _, part in sorted(value.items(), key=lambda entry: repr(entry[0])):
+            _walk_sub_provenance(part, out, seen)
+        return
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        ident = id(value)
+        if ident in seen:
+            return
+        seen.add(ident)
+        try:
+            for field in dataclasses.fields(value):
+                _walk_sub_provenance(getattr(value, field.name), out, seen)
+        finally:
+            seen.discard(ident)
+
+
+def provenance_key(closed: jcore.Jaxpr) -> str:
+    """DAG-memoized digest of `closed`'s root/nested `debug_info` and every equation's `source_info`
+    (`name_stack` and raw traceback frames), used by `program._STRUCTURAL_CLOSED` so a modified body is never
+    substituted across differing equation or nested-body provenance (row 13020)."""
+    inner = closed.jaxpr
+    if (cached := _PROVENANCE_KEYS.get(inner)) is not None:
+        return cached
+    hasher = hashlib.blake2b(digest_size=20)
+
+    def feed(part) -> None:
+        hasher.update(repr(part).encode())
+        hasher.update(b"\0")
+
+    di = inner.debug_info
+    if di is None:
+        feed(("debug_info", None))
+    else:
+        result_paths = (di.result_paths if isinstance(di.result_paths, (type(None), tuple))
+                        else repr(di.result_paths))
+        feed(("debug_info", di.traced_for, di.func_src_info, di.arg_names, result_paths))
+    for equation in inner.eqns:
+        si = equation.source_info
+        tb = si.traceback
+        if tb is None:
+            frames = None
+        else:
+            codes, lastis = tb.raw_frames()
+            frames = tuple((code.co_filename, code.co_qualname, code.co_firstlineno, lasti)
+                           for code, lasti in zip(codes, lastis, strict=True))
+        feed(("eqn", si.name_stack.stack, frames))
+        if equation.params:
+            nested: list[str] = []
+            _walk_sub_provenance(equation.params, nested, set())
+            if nested:
+                feed(("nested", tuple(nested)))
+    digest = hasher.hexdigest()
+    _PROVENANCE_KEYS[inner] = digest
+    return digest
 
 
 class _Identity:
@@ -599,20 +1012,6 @@ def declarations(language: object) -> Declarations:
     return language.__egg_decls__
 
 
-Magnitude = int
-"""A bound on a value's magnitude (docs/design/algebra.md §6.3): its power of two, `|x| <= 2**log2`, a number
-its constants', its declared ranges' and its equations' prove of a value proven finite (`Apart.finite`); a
-value no number bounds, or that may be a NaN or an infinity, has none (None). A
-sum's is twice the larger of its terms', a product's their product, a contraction's their product times its
-length. Proved under its arithmetic's contract (`_real_bound`): IEEE rounding to nearest, a native
-transcendental given one power past its real range, a contraction's mode one it states the rounding of
-(`contraction_slack`); an equation outside the contract is unbounded, so overflow admission
-(`rules.dominated`) never reads a bound no argument holds."""
-
-NOTHING = -(2 ** 20)
-"""A zero's magnitude: under every other."""
-
-
 type Ranges = Mapping[int, float | tuple[float, float] | Proven] | None
 """Declared ranges by input index (`region`'s): a bound on an input's magnitude, an interval, or what a
 program around the input proves of it (`Proven`)."""
@@ -641,6 +1040,26 @@ def region(closed: jcore.Jaxpr, ranges: Ranges = None, *,
     if forms is Skeleton:
         return _region(closed, ranges, Skeleton)
     return _region(closed, ranges, Term)
+
+
+def _merge_proven(out_var: jcore.Var, bound: Magnitude | None, proved: Apart,
+                  ext: float | tuple[float, float] | Proven | None) -> tuple[Magnitude | None, Apart]:
+    """Join an equation's locally proven `(bound, apart)` with an enclosing program's proven entry `ext`."""
+    if ext is None or not isinstance(out_var.aval, ShapedArray):
+        return bound, proved
+    ext_bound = _declared(ext)
+    ext_apart = _held_apart(_declared_apart(ext), out_var.aval.dtype)
+    floors = [f for f in (proved.floor, ext_apart.floor) if f is not None]
+    floor = max(floors) if floors else None
+    sign = proved.sign if proved.sign != 0 else ext_apart.sign
+    merged = _held_apart(Apart(
+        floor, sign, proved.number or ext_apart.number,
+        proved.finite or ext_apart.finite, proved.unit_norm or ext_apart.unit_norm,
+    ), out_var.aval.dtype)
+    bounds = [b for b in (bound if proved.finite else None,
+                          ext_bound if ext_apart.finite else None) if b is not None]
+    best = min(bounds) if bounds else None
+    return (best if merged.finite else None), merged
 
 
 def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
@@ -693,15 +1112,19 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
+    softmax = _SoftmaxTrack()
     opaque: list[Opaque] = []
-    for equation in jaxpr.eqns:
+    n_invars = len(jaxpr.invars)
+
+    for eq_idx, equation in enumerate(jaxpr.eqns):
         composed, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
         if composed is not None and facts is not None:
             origin, params_ = composed
             out = equation.outvars[0]
             env[out] = read(origin).shaped("broadcast_in_dim", param(equation.primitive, params_))
             shapes.append((env[out], _shape(out)))
-            bound, apart[out] = facts
+            bound, proved = softmax.step(equation, *facts, apart_of)
+            bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, env[out], out, bound)
             depths[out] = depths.get(origin, 0) + 1
             continue
@@ -710,17 +1133,26 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
-            bound, apart[out] = facts
+            bound, proved = softmax.step(equation, *facts, apart_of)
+            bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, term, out, bound)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
+        is_stop = equation.primitive is jax.lax.stop_gradient_p and len(equation.outvars) == 1
         outputs = []
         for var in equation.outvars:
             env[var] = forms.leaf(leaves)
             shapes.append((env[var], _shape(var)))
-            # An equation outside the language bounds nothing.
-            _typed(dtypes, magnitudes, env[var], var, None)
+            if is_stop:
+                src = equation.invars[0]
+                apart[var] = apart_of(src)
+                if isinstance(src, jcore.Var):
+                    softmax.passthrough(src, var)
+                _typed(dtypes, magnitudes, env[var], var, magnitude_of(src))
+            else:
+                # An equation outside the language bounds nothing.
+                _typed(dtypes, magnitudes, env[var], var, None)
             outputs.append(leaves)
             leaves += 1
         opaque.append(Opaque(equation, [None if isinstance(atom, jcore.Literal) else env[atom]
@@ -810,24 +1242,30 @@ def _propagate_facts(
     return None, None
 
 
-def _apart_of(atom, apart: Mapping[jcore.Var, Apart]) -> Apart:
-    """`atom`'s proven `Apart` from `apart`, or its constant `Apart` for a literal."""
-    if isinstance(atom, jcore.Literal):
-        return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
-                           else np.asarray(atom.val).dtype)
-    return apart.get(atom, NOWHERE)
-
-
-def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
-    """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), its constants taken as inputs,
-    without building terms or interning parameters (`dew.algebra.program._held`), sharing `_propagate_facts`
-    with `_region` so both produce identical facts."""
+def _proven_walk(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | None,
+                 targets: Sequence[jcore.Var] | None, deep: bool,
+                 init: Mapping[jcore.Var, tuple[Magnitude | None, Apart]] | None = None,
+                 track: _NormTrack | None = None,
+                 softmax: _SoftmaxTrack | None = None,
+                 depth: int = 0) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
+    """Core walker for `proven`, shared between plain in-language proofs (`deep=False`) and deep slice
+    proofs (`deep=True`, peeling calls, `concatenate`/`slice`/`stop_gradient`, NaN guards, and L2 norms)."""
+    needed = programs.read_by(jaxpr, targets) if targets is not None else None
     held: dict[jcore.Var, Magnitude | None] = {}
     apart: dict[jcore.Var, Apart] = {}
     for var in (*jaxpr.constvars, *jaxpr.invars):
-        held[var] = None
-        if isinstance(var.aval, ShapedArray):
-            apart[var] = _held_apart(WHOLE, var.aval.dtype)
+        if needed is not None and var not in needed:
+            continue
+        if init is not None and var in init:
+            held[var], apart[var] = init[var]
+        elif consts is not None and var in consts and _host_array(consts[var]) is not None:
+            held[var] = _magnitude(consts[var])
+            apart[var] = (_held_apart(_constant_apart(consts[var]), var.aval.dtype)
+                          if isinstance(var.aval, ShapedArray) else NOWHERE)
+        else:
+            held[var] = None
+            if isinstance(var.aval, ShapedArray):
+                apart[var] = _held_apart(WHOLE, var.aval.dtype)
 
     def magnitude_of(atom) -> Magnitude | None:
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else held.get(atom)
@@ -836,15 +1274,47 @@ def proven(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, Magnitude | None], dict[
         return _apart_of(atom, apart)
 
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
+    made_eq: dict[jcore.Var, jcore.JaxprEqn] = {}
+    norm_track = _NormTrack() if (deep and track is None) else track
+    softmax_track = _SoftmaxTrack() if softmax is None else softmax
     for equation in jaxpr.eqns:
+        if needed is not None and not any(var in needed for var in equation.outvars):
+            continue
+        if deep and len(equation.outvars) == 1:
+            made_eq[equation.outvars[0]] = equation
         _, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
         if facts is not None:
             out = equation.outvars[0]
-            held[out], apart[out] = facts
+            bound, proved = softmax_track.step(equation, *facts, apart_of)
+            if deep and norm_track is not None:
+                bound, proved = _deep_refine(equation, bound, proved, made_eq, magnitude_of, apart_of,
+                                             norm_track)
+            held[out], apart[out] = bound, proved
+            continue
+        if equation.primitive is jax.lax.stop_gradient_p and len(equation.outvars) == 1:
+            out = equation.outvars[0]
+            held[out], apart[out] = magnitude_of(equation.invars[0]), apart_of(equation.invars[0])
+            if isinstance(equation.invars[0], jcore.Var):
+                softmax_track.passthrough(equation.invars[0], out)
+            continue
+        if deep and norm_track is not None and _deep_nonlang(
+                equation, held, apart, magnitude_of, apart_of, norm_track, softmax_track, depth,
+                _proven_walk):
             continue
         for var in equation.outvars:
             held[var] = None
     return held, apart
+
+
+def proven(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | None = None,
+           targets: Sequence[jcore.Var] | None = None,
+           deep: bool = False) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
+    """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), without building terms or
+    interning parameters (`dew.algebra.program._held`), sharing `_propagate_facts` with `_region` so both
+    produce identical facts when `deep=False`. With `deep=True` and optional `consts`/`targets`, walks only
+    the dependency slice of `targets` without touching tracers or device arrays, peeling called bodies and
+    tracking `concatenate`, slicing, NaN guards, and unit-norm denominators."""
+    return _proven_walk(jaxpr, consts=consts, targets=targets, deep=deep)
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -853,7 +1323,6 @@ INTEGRAL = _symbols(lambda operation: operation.integral)
 BITWISE = _symbols(lambda operation: operation.bitwise)
 KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
 """The symbols whose operations' values prove each fact of their operand's (`Operation`)."""
-UNIT = 0
 
 
 def _keeps_sign(source, out) -> bool:
@@ -876,129 +1345,6 @@ def _integer_range(dtype) -> Magnitude:
     `2**(bits - 1)`, an unsigned one `2**bits`."""
     integers = jnp.iinfo(dtype)
     return integers.bits - (integers.min < 0)
-
-
-class Apart(NamedTuple):
-    """What a value is known to hold beside its magnitude, as its dtype holds it: `floor`, a power with
-    `2**floor <= |x|` (None where nothing holds it away from zero; a float's alone); `sign`, 1 where
-    `x >= 0`, -1 where `x <= 0`, 0 where either may be; `number`, that it is no NaN; and `finite`, that it
-    is a finite value its magnitude bound holds of as computed; each proven of it from the program's inputs
-    taken as finite reals within their declared ranges.
-
-    A zero of either sign is on both sides: only a floor says a value is none, so a reciprocal's sign is
-    read where its operand has one. A sign and a floor are a number's alone, and the bounds read from a
-    floor (`_apart_bound`) read an operand's magnitude of a finite one alone. A value that may have
-    overflowed is not finite, nor is one an equation makes by keeping or scaling it, a conversion to a
-    wider float or to an integer among them, whatever its bound reads there; a value is finite again where
-    its operation bounds it whatever its operand is (a boolean, a logistic, a zeroth power) or makes a
-    zero of an infinity (a quotient by one, its reciprocal root, its negative power). The bounds that read
-    no floor keep their own convention, every value a finite real (`_real_bound`)."""
-
-    floor: int | None = None
-    sign: int = 0
-    number: bool = False
-    finite: bool = False
-
-    @property
-    def above(self) -> int | None:
-        """Its floor where `x >= 2**floor`, above zero; None where it is not known so."""
-        return self.floor if self.sign > 0 else None
-
-    @property
-    def positive(self) -> bool:
-        """Whether `x >= 2**floor`: above zero."""
-        return self.above is not None
-
-
-NOWHERE = Apart()
-"""A value nothing is proven of: one an equation outside the language made, or one with no rule here."""
-WHOLE = Apart(number=True, finite=True)
-"""A finite number of no known side: an input of no declared interval, an integer or a boolean before its
-sign."""
-
-
-class Proven(NamedTuple):
-    """An input's declaration as a program around it proves it (`dew.algebra.program._declared`): its
-    magnitude's bound where one holds (a power of two, 0 for nothing; None for none) and what else it holds
-    (`Apart`). A window cut from a program takes each value it reads from the program so, not as every
-    input is taken, a finite real: a value the program proves no number (a NaN's tanh made outside the
-    window) bounds nothing within it (spec alignment, 8993)."""
-
-    bound: float | None
-    apart: Apart
-
-
-def _floor_log2(value: float) -> int:
-    """`floor(log2(value))` of a positive float, exactly, by its exponent."""
-    return math.frexp(value)[1] - 1
-
-
-def _held_apart(apart: Apart, dtype) -> Apart:
-    """`apart` as `dtype` holds it: a sign and a floor of a number alone; a floor only of a float, and only
-    a normal power of it, which a result at or above it rounds to nothing under (rounding to nearest is
-    monotone; a subnormal one, or one past the dtype's largest, is dropped); an integer a number whatever
-    made it, and a boolean a finite one; a complex value nothing."""
-    if jnp.issubdtype(dtype, jnp.integer) or dtype == np.bool_:
-        return Apart(None, apart.sign if apart.number else 0, number=True,
-                     finite=apart.finite or dtype == np.bool_)
-    if not jnp.issubdtype(dtype, jnp.floating):
-        return NOWHERE
-    if not apart.number:
-        return NOWHERE
-    floats = jnp.finfo(dtype)
-    if apart.floor is not None and not int(floats.minexp) <= apart.floor < int(floats.maxexp):
-        return apart._replace(floor=None)
-    return apart
-
-
-def _constant_apart(value) -> Apart:
-    """A real constant's `Apart`: whether it holds no NaN and no infinity, its sign where its elements share
-    one, and a float's least magnitude's power where no element is zero; none of a key's."""
-    if typed_key(value):
-        return NOWHERE
-    array = np.asarray(value)
-    real = jnp.issubdtype(array.dtype, jnp.floating) or jnp.issubdtype(array.dtype, jnp.integer)
-    if not real or not array.size:
-        return NOWHERE
-    if not jnp.issubdtype(array.dtype, jnp.floating):
-        return WHOLE._replace(sign=1 if (array >= 0).all() else -1 if (array <= 0).all() else 0)
-    # A float's value is a float64 exactly.
-    values = array.astype(np.float64)
-    if np.isnan(values).any():
-        return NOWHERE
-    sign = 1 if (values >= 0).all() else -1 if (values <= 0).all() else 0
-    least = float(np.min(np.abs(values)))
-    return Apart(_floor_log2(least) if 0 < least < math.inf else None, sign, number=True,
-                 finite=bool(np.isfinite(values).all()))
-
-
-def _declared_apart(declared: float | tuple[float, float] | Proven | None) -> Apart:
-    """An input's `Apart`: a finite number, as every input is taken to be (a real, within its declared range
-    where it has one); and, of an interval, its end nearer zero where the interval holds none and the side
-    of zero it lies on."""
-    if declared is None:
-        return WHOLE
-    if isinstance(declared, Proven):
-        return declared.apart
-    if not isinstance(declared, tuple):
-        return Apart(number=True, finite=math.isfinite(declared))
-    low, high = declared
-    nearest = low if low > 0 else -high if high < 0 else 0.0
-    return Apart(_floor_log2(nearest) if 0 < nearest < math.inf else None,
-                 1 if low >= 0 else -1 if high <= 0 else 0, number=True,
-                 finite=math.isfinite(low) and math.isfinite(high))
-
-
-def _within(bound: Magnitude | None, dtype) -> bool:
-    """Whether a float of `dtype` bounded by `2**bound` in the reals is finite as computed: its bound is
-    known and under the dtype's largest power, which a value under it cannot round past."""
-    return bound is not None and (bound == NOTHING or bound < int(jnp.finfo(dtype).maxexp))
-
-
-def _reduced(equation: jcore.JaxprEqn) -> int:
-    """The elements a reduction along axes reads for each it makes."""
-    shape = _shape(equation.invars[0])
-    return math.prod(shape[axis] for axis in equation.params["axes"])
 
 
 def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
@@ -1067,24 +1413,33 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
     return _held_apart(made._replace(number=made.number or finite, finite=finite), aval.dtype)
 
 
-def _extremes(name: str, operands: list[Apart]) -> Apart:
+def _extremes(name: str, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
     """`_apart` of a maximum, a minimum or a clamp, XLA's: the minimum of its upper bound and the maximum of
     its operand and its lower bound (`_extreme`), finite between finite bounds whatever its operand."""
     if name == "clamp":
         lower, operand, upper = operands
-        clamped = _extreme(-1, [_extreme(1, [operand, lower]), upper])
+        lb, ob, ub = bounds
+        clamped = _extreme(-1, [_extreme(1, [operand, lower], [ob, lb]), upper], [None, ub])
         # Finite where it is a number between finite bounds, whatever its operand: an infinity clamps to one.
         return clamped._replace(finite=clamped.number and lower.finite and upper.finite)
-    return _extreme(1 if name == "max" else -1, operands)
+    return _extreme(1 if name == "max" else -1, operands, bounds)
 
 
-def _extreme(side: int, operands: list[Apart]) -> Apart:
+def _extreme(side: int, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
     """`_apart` of a maximum (`side` 1) or a minimum (-1) of `operands`: on the side of an operand on that
-    side, else of theirs where they share one; at least the largest floor of an operand on that side, else
-    the least of all their floors (it is one of them); a number, and finite, where they all are."""
-    floors, signs = [held.floor for held in operands], [held.sign for held in operands]
+    side (including exact zero `NOTHING`), else of theirs where they share one; at least the largest floor of
+    an operand on that side, else the least of all their floors (it is one of them); a number, and finite,
+    where they all are."""
+    floors = [held.floor for held in operands]
     known = [floor for floor in floors if floor is not None]
-    sign = side if side in signs else signs[0] if len(set(signs)) == 1 else 0
+    if any(_side_matches(h, b, side) for h, b in zip(operands, bounds, strict=True)):
+        sign = side
+    elif all(_side_matches(h, b, 1) for h, b in zip(operands, bounds, strict=True)):
+        sign = 1
+    elif all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True)):
+        sign = -1
+    else:
+        sign = 0
     beyond = [held.floor for held in operands if held.sign == side and held.floor is not None]
     least = min(known) if len(known) == len(floors) else None
     return Apart(max(beyond) if beyond else least, sign, all(held.number for held in operands),
@@ -1101,8 +1456,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     known = [floor for floor in floors if floor is not None]
     every = known if len(known) == len(floors) else None
     if name in ("add", "sub"):
-        sides = signs if name == "add" else [signs[0], -signs[1]]
-        sign = sides[0] if len(set(sides)) == 1 else 0
+        shifted = operands if name == "add" else [operands[0], operands[1]._replace(sign=-operands[1].sign)]
+        sign = _shared_sign(shifted, bounds)
         floor = max((found for found in floors if found is not None), default=None) if sign else None
         return Apart(floor, sign, numbers and (finite or sign != 0), finite)
     if name == "mul":
@@ -1123,12 +1478,11 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         held = base.positive and base.finite and exponent.finite
         return Apart(None, 1 if base.positive else 0, held, held)
     if name in ("max", "min", "clamp"):
-        return _extremes(name, operands)
+        return _extremes(name, operands, bounds)
     if name == "select_n":
-        cases = operands[1:]
+        cases, case_bounds = operands[1:], bounds[1:]
         kept = [held.floor for held in cases if held.floor is not None]
-        return Apart(min(kept) if len(kept) == len(cases) else None,
-                     cases[0].sign if len({held.sign for held in cases}) == 1 else 0,
+        return Apart(min(kept) if len(kept) == len(cases) else None, _shared_sign(cases, case_bounds),
                      all(held.number for held in cases), all(held.finite for held in cases))
     if name == "neg":
         return first._replace(sign=-first.sign)
@@ -1138,22 +1492,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         return first._replace(sign=1)
     if name in ("square", "integer_pow"):
         return _power_apart(equation, first, bounds[0], dtype)
-    if name in ("exp", "exp2"):
-        floor = None
-        if first.finite and bounds[0] is not None and bounds[0] <= 6:
-            floor = -(math.floor(2 ** bounds[0] * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
-        return Apart(floor, 1, first.number, first.finite)
-    if name == "sqrt":
-        real, above = first.number and first.sign > 0, first.above
-        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
-    if name == "rsqrt":
-        real = first.number and first.sign > 0
-        floor = (-bounds[0]) // 2 - 1 if real and first.finite and bounds[0] not in (None, NOTHING) else None
-        return Apart(floor, 1 if first.positive else 0, real, first.positive)
-    if name == "logistic":
-        return Apart(None, 1, first.number, first.number)
-    if name in ("log", "log2"):
-        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
+    if name in ("exp", "exp2", "sqrt", "rsqrt", "logistic", "log", "log2", "log1p"):
+        return _transcendental_apart(name, first, bounds[0])
     if name == "dot_general":
         return Apart(None, 0, number=False, finite=finite)
     if name in BOUNDED:
@@ -1170,15 +1510,37 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         if name.startswith("reduce_") and _reduced(equation) < 1:
             return NOWHERE
         if name == "convert_element_type" and not _keeps_sign(source, equation.outvars[0]):
-            return first._replace(floor=None, sign=0)
+            return first._replace(floor=None, sign=0, unit_norm=False)
         floating = isinstance(source.aval, ShapedArray) and jnp.issubdtype(source.aval.dtype, jnp.floating)
-        return first if floating else first._replace(floor=None)
+        return first._replace(unit_norm=False) if floating else first._replace(floor=None, unit_norm=False)
     if name == "reduce_sum":
         if _reduced(equation) < 1:
             return WHOLE
         return Apart(first.floor if first.sign else None, first.sign, first.number and first.sign != 0,
                      first.finite)
     return NOWHERE
+
+
+def _transcendental_apart(name: str, first: Apart, bound: Magnitude | None) -> Apart:
+    """`Apart` for elementary unary transcendentals and roots (`_float_apart`)."""
+    if name in ("exp", "exp2"):
+        floor = None
+        if first.finite and bound is not None and bound <= 6:
+            floor = -(math.floor(2 ** bound * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
+        return Apart(floor, 1, first.number, first.finite or (first.number and first.sign < 0))
+    if name == "sqrt":
+        real, above = first.number and first.sign > 0, first.above
+        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
+    if name == "rsqrt":
+        real = first.number and first.sign > 0
+        floor = (-bound) // 2 - 1 if real and first.finite and bound not in (None, NOTHING) else None
+        return Apart(floor, 1 if first.positive else 0, real, first.positive)
+    if name == "logistic":
+        return Apart(None, 1, first.number, first.number)
+    if name in ("log", "log2"):
+        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
+    nonneg = _side_matches(first, bound, 1)
+    return Apart(None, 1 if nonneg else 0, first.number and nonneg, first.finite and nonneg)
 
 
 def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
@@ -1270,8 +1632,9 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     and for a bitwise operation (int32's `not(-2**31)` is `2**31 - 1`); a float as the real arithmetic
     bounds it (`_real_bound`)."""
     aval = equation.outvars[0].aval
-    # An extended dtype's value (a typed key a selection or a layout moves) is no number.
-    if not isinstance(aval, ShapedArray) or jnp.issubdtype(aval.dtype, jax.dtypes.extended):
+    # An extended dtype's value (a typed key) or symbolic `float0` tangent is no number.
+    if (not isinstance(aval, ShapedArray) or _extended_dtype(aval.dtype) is not None
+            or aval.dtype == jax.dtypes.float0):
         return None
     dtype = np.dtype(aval.dtype)
     if dtype == np.bool_:
@@ -1369,6 +1732,8 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
         # An exponential of a value under 64: under 2**(64 log2(e)), a power above the exact one's floor, as
         # XLA's rounds (float16's exp2(4) is 16.02).
         return math.floor(2 ** given[0] * (math.log2(math.e) if name == "exp" else 1.0)) + 1
+    if name == "log1p" and _side_matches(apart[0], given[0], 1):
+        return given[0] if given[0] == NOTHING else given[0] + 1
     if name == "reduce_sum":
         shape = _shape(equation.invars[0])
         return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))
@@ -1419,46 +1784,13 @@ def contraction_slack(precision, left, right) -> int | None:
     return None
 
 
-def _log2(value: float) -> int:
-    """`ceil(log2(value))`, `NOTHING` for 0: a magnitude's exponent bounding `value` from above, exactly, by
-    the float's own exponent (a logarithm rounds, and `log2` of the float under 8 is 3)."""
-    if value == 0:
-        return NOTHING
-    mantissa, exponent = math.frexp(value)
-    return exponent - 1 if mantissa == 0.5 else exponent
-
-
-def _magnitude(value) -> Magnitude | None:
-    """A constant's magnitude, its elements' largest (a complex one's modulus); None for one of no number (a
-    key's). A number of any dtype, ml_dtypes' (bfloat16, float8) among them, which numpy's type tree omits."""
-    if typed_key(value):
-        return None
-    array = np.asarray(value)
-    if not (jnp.issubdtype(array.dtype, jnp.number) or array.dtype == bool):
-        return None
-    # In complex128, which holds every integer's absolute value (int32's least's too) and a complex modulus.
-    largest = float(np.max(np.abs(array.astype(np.complex128)))) if array.size else 0.0
-    return _log2(largest) if math.isfinite(largest) else None
-
-
-def _declared(declared: float | tuple[float, float] | Proven | None) -> Magnitude | None:
-    """An input's magnitude from its declared range (an interval's larger end's), None where it declares
-    none."""
-    if isinstance(declared, Proven):
-        declared = declared.bound
-    if declared is None:
-        return None
-    largest = max(abs(declared[0]), abs(declared[1])) if isinstance(declared, tuple) else declared
-    return _log2(largest) if math.isfinite(largest) else None
-
-
 def _typed(dtypes: dict, magnitudes: dict, term: Term | Skeleton, atom, magnitude: Magnitude | None) -> None:
     """`term`'s dtype (`atom`'s) and its magnitude, the first where one term names two values."""
     named = key(term)
     if isinstance(atom.aval, ShapedArray):
         # An extended dtype (a typed key's) is JAX's own, which NumPy holds no type of.
         dtype = atom.aval.dtype
-        dtypes.setdefault(named, dtype if jnp.issubdtype(dtype, jax.dtypes.extended) else np.dtype(dtype))
+        dtypes.setdefault(named, dtype if _extended_dtype(dtype) is not None else np.dtype(dtype))
     magnitudes.setdefault(named, magnitude)
 
 
@@ -1476,13 +1808,16 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     # device it does not hold (a compile-only GPU) places no array.
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
-                                       jnp.log1p(a), jnp.expm1(a),
+                                       jnp.log1p(a), jnp.expm1(a), jax.lax.rsqrt(a),
+                                       jax.lax.integer_pow(a, -1),
                                        *(a.astype(narrow).astype(jnp.float32) for narrow in WIDENED)))(scalar)
     found = {}
     for equation in traced.jaxpr.eqns:
         symbol = OPERATIONS[equation.primitive].symbol
         if equation.primitive is jax.lax.convert_element_type_p:
             symbol = f"convert_{np.dtype(equation.params['new_dtype']).name}"
+        elif equation.primitive is jax.lax.integer_pow_p and equation.params.get("y") == -1:
+            symbol = "reciprocal"
         found.setdefault(symbol, (equation.primitive, dict(equation.params)))
     return found
 
@@ -1593,12 +1928,6 @@ def compact(value: np.ndarray) -> np.ndarray:
     return value
 
 
-def typed_key(value) -> bool:
-    """Whether `value` holds typed PRNG keys (`jax.random.key`), whose bits NumPy cannot read."""
-    dtype = getattr(value, "dtype", None)
-    return dtype is not None and jnp.issubdtype(dtype, jax.dtypes.prng_key)
-
-
 def held_bits(value) -> tuple[Hashable, np.ndarray]:
     """A constant's dtype and the array of the bits it holds: a typed PRNG key's are its key data
     (`jax.random.key_data`), its dtype the key type itself, which is its implementation (two implementations
@@ -1607,11 +1936,6 @@ def held_bits(value) -> tuple[Hashable, np.ndarray]:
         return value.dtype, np.asarray(jax.random.key_data(value))
     array = np.asarray(value)
     return str(array.dtype), array
-
-
-def _shape(atom) -> tuple[int, ...]:
-    """An array value's shape; a value of no shape (a token, a key's) has none the rules read."""
-    return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
 
 
 def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., Node],

@@ -40,6 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew import _cgroups as cgroups, _position
 from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
+from dew.data.explained import Sized, TrainingRead, explained
 from dew.mesh import LayoutRefused, batch_axes
 from dew.registry import from_record, to_record
 
@@ -374,28 +375,34 @@ class Host:
         return worker_start_seconds() if self.worker_start is None else self.worker_start
 
     @classmethod
-    def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
-        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
-        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
-        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
-        the memory its limit leaves bound the host's. Under a memory limit the page cache the
-        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
-        working set: a run that has read its corpus once holds it in cache, charged to its
-        cgroup, and counting that as taken left room for no worker beside it."""
+    def current(cls, root: Path = cgroups.ROOT, membership: Path = cgroups.MEMBERSHIP) -> Host:
+        """This process's host, read through the cgroups `membership` (/proc/self/cgroup) names it in under
+        `root`, its own and every ancestor of it: a container's limit on a parent binds an unlimited child,
+        so each level's CPU quota and the memory its limit leaves (`cgroups.memory_limits`, v2's and v1's)
+        bound the host's. Under a memory limit the page cache the kernel reclaims first (`inactive_file`) is
+        room, as the kubelet counts a container's working set: a run that has read its corpus once holds it
+        in cache, charged to its cgroup, and counting that as taken left room for no worker beside it. A
+        level whose charge cannot be read (`cgroups.memory_held`) is bounded by its limit alone."""
         import psutil
 
-        group = cgroups.own(root) if cgroup is None else cgroup
+        group = cgroups.own(root, membership)
         cpus, memory = cgroups.usable_cpus(group, root), psutil.virtual_memory().available
-        for level in cgroups.levels(group, root):
-            limit, held = cgroups.memory(level), cgroups.memory_held(level)
-            if limit is not None and held is not None:
-                memory = min(memory, max(0, limit - held))
+        for level, limit in cgroups.memory_limits(root, membership):
+            memory = min(memory, max(0, limit - (cgroups.memory_held(level) or 0)))
         return cls(cpus, memory)
 
 
 def batch_bytes(batch: Batch) -> int:
     """The bytes of a batch's leaves, as arrays hold them."""
     return sum(np.asarray(leaf).nbytes for leaf in jax.tree_util.tree_leaves(batch))
+
+
+def _ahead(python: float, slowest: float, room: int) -> int:
+    """The batches a loading worker holds ready (`Loading.resolved`): as many as its slowest batch takes
+    mean ones (`python` seconds) to make, to the nearest, at least Grain's one (`WORKER_BUFFER`) and at
+    most the `room` its memory leaves."""
+    wanted = round(slowest / python) if python > 0 else WORKER_BUFFER
+    return max(WORKER_BUFFER, min(wanted, room))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -413,7 +420,8 @@ class Loading:
     - `threads`: reads one worker keeps in flight;
     - `read_buffer`: reads one worker holds ahead;
     - `worker_buffer`: whole batches one worker holds ready for the training
-      process.
+      process, Grain's one (`WORKER_BUFFER`) where None, or as many as automatic
+      loading sizes (`resolved`).
 
     `threads` and `read_buffer` count the elements a read produces: a whole
     batch where the order is indexed, which is cut into batches by index
@@ -456,7 +464,7 @@ class Loading:
     workers: int | Literal["auto"] = 0
     threads: int = 16
     read_buffer: int = 16
-    worker_buffer: int = WORKER_BUFFER
+    worker_buffer: int | None = None
     ram_budget_mb: int | None = None
     max_workers: int | None = None
     cache: bool = True
@@ -465,6 +473,9 @@ class Loading:
     host: Host | None = None
     """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
     or another's, its CPUs, memory and a worker's start as it states them."""
+    sized: Sized | None = dataclasses.field(default=None, compare=False)
+    """What automatic loading measured as it sized these settings (`resolved`), which `Loader.explain`
+    names; None where nothing sized them."""
     warn_over: float = 0.01
     """The share of a corpus's attempted records it may reject before the read warns, once (data.md, the
     counts): a streamed read's counter (`dew.data.mixing.Accepted`) and a memory read's preparation
@@ -505,7 +516,17 @@ class Loading:
         1,500 steps, 15 ms of Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the
         CPUs', 168 s at 12.4 ms; 13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short
         run, one whose batches take no Python to speak of, or one whose length nothing states (None),
-        which no measure shows they pay for, reads in the process."""
+        which no measure shows they pay for, reads in the process.
+
+        Each worker holds as many batches ahead (`worker_buffer`, where none is asked) as its slowest
+        sampled batch takes mean ones to make (`_ahead`), within the memory its share of the budget
+        leaves. Grain's workers hand on their batches in turn, so a worker the training process takes
+        from every T seconds stalls it on a batch that takes longer than its buffer's T each, and
+        where the workers keep up with the step, which is where a buffer is ever full, T is at least
+        that mean batch: a read of even batches holds one, Grain's own, and one whose slowest batch
+        takes four mean ones holds four. The step's own time is not known as the read opens,
+        before any step runs, and no read resizes as it runs (Grain fixes its buffers as its workers
+        start), so the read is sized for the step it can least wait on."""
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []
@@ -520,6 +541,7 @@ class Loading:
             return dataclasses.replace(self, workers=0)
         # Their mean, which a step making several batches at once is paid in, as the run pays it.
         python = statistics.fmean(seconds[1:] or seconds)
+        slowest = max(seconds[1:] or seconds)
         host = Host.current() if self.host is None else self.host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
@@ -528,7 +550,8 @@ class Loading:
         if self.max_workers is not None:
             cpus = min(cpus, self.max_workers)
         read_buffer = min(self.read_buffer, budget // read)
-        held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
+        ahead = WORKER_BUFFER if self.worker_buffer is None else self.worker_buffer
+        held = WORKER_PROCESS_BYTES + ahead * batch + read_buffer * read
         workers = 0 if batches is None else max(0, min(cpus, budget // held))
         if workers and batches is not None and (started := host.started) > 0:
             # W workers started one after another, then reading P seconds of Python a batch over B batches,
@@ -537,18 +560,29 @@ class Loading:
             paid = python * batches / started
             least = math.isqrt(int(paid))
             workers = 0 if paid < 1 else min(workers, least + 1 if paid > least * (least + 1) else least)
+        if workers and self.worker_buffer is None:
+            room = budget // workers - WORKER_PROCESS_BYTES - read_buffer * read
+            ahead = _ahead(python, slowest, room // batch)
         if not workers:
             _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each, on %d "
                       "CPUs", batches, python * 1e3, host.cpus)
-        _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
-                  "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
-        return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)
+        _log.info("automatic loading reads in %d workers holding %d reads and %d batches ahead, sized for %d "
+                  "CPUs and %.2f GiB", workers, read_buffer, ahead, host.cpus, budget / 2**30)
+        sized = Sized(sampled=len(sampled), python=python, slowest=slowest, batch_bytes=batch, cpus=host.cpus,
+                      budget=budget, batches=batches)
+        return dataclasses.replace(self, workers=workers, read_buffer=read_buffer, worker_buffer=ahead,
+                                   sized=sized)
 
     def unsized(self) -> Loading:
         """This loading for a read automatic loading sizes nothing for, a pass that is no run's training
         read (a record pass, a snapshot, `iterate`): automatic workers read in the process, every other
         setting as it is (a chain that sets its threads alone, `Pipeline.threads`)."""
         return dataclasses.replace(self, workers=0) if self.workers == "auto" else self
+
+    @property
+    def ahead(self) -> int:
+        """The batches each worker holds ready (`worker_buffer`), Grain's one where none is set."""
+        return WORKER_BUFFER if self.worker_buffer is None else self.worker_buffer
 
     @property
     def worker_count(self) -> int:
@@ -876,6 +910,16 @@ class Loader:
     """A read of phases' batches on the step clock, each from the record it starts at (`PhasedStream.stages`),
     which its steps a count of records takes are counted through (`steps_through`); none for one of one
     batch, or on the token clock, whose phases begin where the run's commits reach them."""
+    reading: TrainingRead | None = None
+    """How its training read reads, as its compile chose and sized it (`explain`); None for data handed as it
+    is read."""
+
+    def explain(self) -> str:
+        """The training read as its compile lowered and sized it, a line a fact: its batch, its read and who
+        chose it, the workers and buffers it reads in and what automatic loading measured to size them, a
+        faster read its sources could take, and its plan's order, steps, derived facts and caches. It
+        renders what the compile recorded and reads nothing."""
+        return explained(self)
 
     @property
     def each_token_batch(self) -> tuple[int | None, ...]:

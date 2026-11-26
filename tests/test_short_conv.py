@@ -26,7 +26,8 @@ from reference_error import (
 from test_recurrence_chunk import ROUTES, on_route
 
 from dew.nn.kernels import generation, short_conv
-from dew.nn.linear import causal_conv1d, xla_conv1d
+from dew.nn.kernels.short_conv import xla_conv1d
+from dew.nn.linear import causal_conv1d
 
 pytestmark = pytest.mark.kernel
 

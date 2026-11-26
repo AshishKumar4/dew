@@ -35,6 +35,8 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -307,8 +309,8 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=Fa
 
     def scaled(x, w, weights, dtype=jnp.bfloat16):
         return gemm.gemm(x.astype(dtype), w.astype(dtype), jnp.asarray(group_sizes, jnp.int32),
-                         prologue=lambda rows, s: rows * s.astype(rows.dtype),
-                         prologue_operands=((weights.astype(dtype), ("rows", None)),), out_dtype=dtype)
+                         prologue=Hook(lambda rows, s: rows * s.astype(rows.dtype),
+                                       (Side(weights.astype(dtype), ("rows", None)),)), out_dtype=dtype)
 
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
@@ -816,7 +818,7 @@ def test_a_mixed_kernel_gradients_prologue_reads_and_rounds_the_rows_in_their_dt
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
               jax.default_matmul_precision("highest")):
             return np.asarray(jax.jit(lambda x, dy: gemm.gemm_t(
-                x, dy, None, prologue=lambda r: r + 2.0 ** -8, out_dtype=jnp.float32,
+                x, dy, None, prologue=Hook(lambda r: r + 2.0 ** -8), out_dtype=jnp.float32,
                 interpret_on_cpu=True))(rows, cotangent))
 
     np.testing.assert_array_equal(gradient("mosaic"), np.full((1, 128, 128), 128.0, np.float32))
@@ -841,9 +843,9 @@ def test_a_row_scales_gradient_reads_the_accumulator_summed_at_its_own_width(ker
 
     def scale_gradient(out_dtype):
         def product(scale):
-            return gemm.gemm(x, w, group_sizes, epilogue=lambda acc, s: acc * s[:, None],
-                             epilogue_operands=((scale, ("rows",)),), out_dtype=out_dtype,
-                             interpret_on_cpu=True)
+            return gemm.gemm(x, w, group_sizes, epilogue=Hook(lambda acc, s: acc * s[:, None],
+                                                              (Side(scale, ("rows",)),)),
+                             out_dtype=out_dtype, interpret_on_cpu=True)
 
         with generation.assumed("sm80"), generation.chosen(grouped_matmul=kernel):
             _, pull = jax.vjp(product, scale)
@@ -1182,7 +1184,7 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         rounded = acc.astype(tokens.dtype)
         return rounded * rounded, rounded
 
-    named = {**options, "epilogue": squared, "named": (None, "rounded")}
+    named = {**options, "epilogue": Hook(squared), "named": (None, "rounded")}
 
     def named_fused(tokens, first):
         return gemm.gemm(tokens, first, sizes, gather=table, scatter=slots, layer=layer, **named)
@@ -1338,8 +1340,9 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
 @lowers("sm90")
 def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
     """The GEMM register model holds legal multi-output epilogues and `dew_tgmm` spill-free under sm90 ptxas
-    while refusing wide multi-output tiles past the single-warpgroup budget, and scopes wgmma `tgmm` scalar
-    addressing away from tcgen05 (rows 8723, 11946, 11947)."""
+    while refusing wide multi-output tiles past the single-warpgroup budget, but where their hook is declared
+    column-local (read out 64 columns at a time), and scopes wgmma `tgmm` scalar addressing away from
+    tcgen05 (rows 8723, 11946, 11947, 1958)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1355,21 +1358,29 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
             out_dtypes=("bfloat16", "bfloat16"))
         ba_two = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                           hooks=two_out_hooks)
-        wide_last = grouped_matmul.Hooks(
-            epilogue=lambda acc: (acc.astype(jnp.bfloat16), acc + 1.0),
-            out_dtypes=("bfloat16", "float32"))
+        def mixed(acc):
+            return acc.astype(jnp.bfloat16), acc + 1.0
+
+        wide_last = grouped_matmul.Hooks(epilogue=mixed, out_dtypes=("bfloat16", "float32"))
         ba_wide_last = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                                 hooks=wide_last)
+        # Declared column-local (`hooks.ColumnLocal`), its tile read out 64 columns at a time.
+        ba_local = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                            hooks=dataclasses.replace(wide_last, epilogue=ColumnLocal(mixed)))
         ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=False)
         t256 = tiling.Tiles(64, 256, 64, 3, 56, warpgroups=1, family="wgmma")
         # 128-col mixed (bf16, fp32) exercises per-output staging widths: 64-col bf16 and 32-col fp32.
         t128 = tiling.Tiles(64, 128, 64, 3, 56, warpgroups=1, family="wgmma")
         assert gmm.legal(ba_two, t256, sm90)
+        # Read out whole, the wide mixed tile is past one warpgroup's registers; a column-local hook's, 64
+        # columns at a time, is within them and compiles spill-free (row 1958).
         assert not gmm.legal(ba_wide_last, t256, sm90)
+        assert gmm.legal(ba_local, t256, sm90)
         assert gmm.legal(ba_wide_last, t128, sm90)
         assert tgmm.legal(ba_dw, t256, sm90)
         cases = [
             KernelCase("two_out_64x256", lambda: gmm.lowering(ba_two, t256)),
+            KernelCase("mixed_local_64x256", lambda: gmm.lowering(ba_local, t256)),
             KernelCase("mixed_64x128", lambda: gmm.lowering(ba_wide_last, t128)),
             KernelCase("tgmm_64x256", lambda: tgmm.lowering(ba_dw, t256)),
         ]
@@ -1480,7 +1491,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
     with generation.assumed(small_sm80):
         from dew.nn.kernels.templates import tail as tail_mod
 
-        step_s = pricing.step_seconds(tile_mw, small_sm80, (2, 2))
+        step_s = pricing.step_seconds(tile_mw, small_sm80, (2, 2), issued=jnp.bfloat16)
         assert step_s is not None
         traffic = tail_mod.Traffic((5, 2), 2, 64 * 32 * 2, 64 * 32 * 2, step_s, 4, 120e9, 64 * 1024)
         # Unscoped, tail.balanced accepts the 2-tile tail; scoped (mma.sync's walk launched persistent), the
@@ -1584,21 +1595,12 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
-def _traced_on(target, fn, args):
-    """`fn` of `args` traced on `target` assumed, whatever generation its compile names."""
-    def traced(*arrays):
-        with generation.assumed(target):
-            return fn(*arrays)
-
-    return traced, args
-
-
 @lowers("sm90")
 def test_hopper_cluster2_balanced_tail_lowers_spill_free():
     """Hopper `128x256x64 cluster=2` dense `gmm` and `tgmm` with balanced tail compile under sm90 ptxas
-    with zero spills (row 10151), on an H100 PCIe's 114 multiprocessors, whose 57 pairs' partials (30 MiB)
-    are within cuBLAS's 32 MiB workspace; a GH200's 66 pairs' (33 MiB) are not, so it takes none (row
-    12850)."""
+    with zero spills (row 10151), its workspace a slot a program and one a tail tile (`tail_workspace`):
+    a GH200's 66 pairs and 14 tail tiles 21 MiB, within cuBLAS's 32 MiB workspace (two slots a program,
+    33 MiB, were past it: NG29, row 12850)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1614,11 +1616,9 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is None
-        sm90 = dataclasses.replace(sm90, multiprocessors=114)
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 114) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 114) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 114) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)
@@ -1637,10 +1637,9 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         assert gmm._stated(ba_half, tile_c2_split, sm90)["balanced"] is False
         assert tgmm.legal(ba_dw, tile_c2, sm90) and tgmm.balanced(ba_dw, tile_c2, sm90)
         cases = [
-            KernelCase("sm90_cluster2_tail_fwd", lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2))),
-            KernelCase("sm90_cluster2_split2_fwd",
-                       lambda: _traced_on(sm90, *gmm.lowering(ba_half, tile_c2_split))),
-            KernelCase("sm90_cluster2_tail_dw", lambda: _traced_on(sm90, *tgmm.lowering(ba_dw, tile_c2))),
+            KernelCase("sm90_cluster2_tail_fwd", lambda: gmm.lowering(ba_fwd, tile_c2)),
+            KernelCase("sm90_cluster2_split2_fwd", lambda: gmm.lowering(ba_half, tile_c2_split)),
+            KernelCase("sm90_cluster2_tail_dw", lambda: tgmm.lowering(ba_dw, tile_c2)),
         ]
         records = compile_mosaic_kernels(cases, "sm90")
     for rec in records:
@@ -1816,7 +1815,7 @@ def test_gemm_named_compute_beside_prologue_and_applied_holds_check_1():
     def dew_fn(gate, up, down, cot):
         def fwd(g, u, w):
             hidden = hook(g, u).astype(jnp.bfloat16)
-            return gemm.gemm(g, w, group_sizes, prologue=hook, prologue_operands=((u, ("rows", "depth")),),
+            return gemm.gemm(g, w, group_sizes, prologue=Hook(hook, (Side(u, ("rows", "depth")),)),
                              applied=hidden, scatter=scatter, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
 
         out, pull = jax.vjp(fwd, gate, up, down)
@@ -1855,7 +1854,7 @@ def test_gemm_named_compute_prologue_preserves_compute_precision_in_vjp():
         return x * s[None, :]
 
     def scaled_gemm(a, s, b, *, compute_dtype):
-        return gemm.gemm(a, b, prologue=scale_pro, prologue_operands=((s, ("depth",)),),
+        return gemm.gemm(a, b, prologue=Hook(scale_pro, (Side(s, ("depth",)),)),
                          compute=compute_dtype, out_dtype=compute_dtype)
 
     # Exact wider-compute witness: bf16 lhs, fp32 rhs = 1 + 2^-9, compute=out_dtype=fp32.
@@ -2005,43 +2004,40 @@ def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
 
     # Unmapped (1, N) and mapped (B, 1, N) ('groups', 'columns') epilogue under batched rhs.
     y_shared = jax.vmap(
-        lambda x, w: gemm.gemm(x, w, epilogue=add_bias,
-                               epilogue_operands=((shared_bias, ("groups", "columns")),),
+        lambda x, w: gemm.gemm(x, w, epilogue=Hook(add_bias, (Side(shared_bias, ("groups", "columns")),)),
                                out_dtype=jnp.bfloat16),
         in_axes=(0, 0))(xs, ws)
     y_mapped = jax.vmap(
-        lambda x, w, bias: gemm.gemm(x, w, epilogue=add_bias,
-                                     epilogue_operands=((bias, ("groups", "columns")),),
+        lambda x, w, bias: gemm.gemm(x, w, epilogue=Hook(add_bias, (Side(bias, ("groups", "columns")),)),
                                      out_dtype=jnp.bfloat16),
         in_axes=(0, 0, 0))(xs, ws, mapped_bias)
     ref_shared = jnp.stack([
-        gemm.gemm(xs[i], ws[i], epilogue=add_bias, epilogue_operands=((shared_bias, ("groups", "columns")),),
+        gemm.gemm(xs[i], ws[i], epilogue=Hook(add_bias, (Side(shared_bias, ("groups", "columns")),)),
                   out_dtype=jnp.bfloat16) for i in range(b)])
     ref_mapped = jnp.stack([
-        gemm.gemm(xs[i], ws[i], epilogue=add_bias,
-                  epilogue_operands=((mapped_bias[i], ("groups", "columns")),),
+        gemm.gemm(xs[i], ws[i], epilogue=Hook(add_bias, (Side(mapped_bias[i], ("groups", "columns")),)),
                   out_dtype=jnp.bfloat16) for i in range(b)])
     np.testing.assert_array_equal(np.asarray(y_shared), np.asarray(ref_shared))
     np.testing.assert_array_equal(np.asarray(y_mapped), np.asarray(ref_mapped))
 
     # Unmapped (1, K) and mapped (B, 1, K) ('groups', 'depth') prologue in vmapped dense gemm_t.
     dw_shared = jax.vmap(
-        lambda x, dy: gemm.gemm_t(x, dy, None, prologue=mul_scale,
-                                  prologue_operands=((shared_scale, ("groups", "depth")),),
+        lambda x, dy: gemm.gemm_t(x, dy, None,
+                                  prologue=Hook(mul_scale, (Side(shared_scale, ("groups", "depth")),)),
                                   out_dtype=jnp.float32),
         in_axes=(0, 0))(xs, dys)
     dw_mapped = jax.vmap(
-        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=mul_scale,
-                                      prologue_operands=((sc, ("groups", "depth")),),
+        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=Hook(mul_scale, (Side(sc, ("groups", "depth")),)),
                                       out_dtype=jnp.float32),
         in_axes=(0, 0, 0))(xs, dys, mapped_scale)
     ref_dw_shared = jnp.stack([
-        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
-                    prologue_operands=((shared_scale, ("groups", "depth")),), out_dtype=jnp.float32)
+        gemm.gemm_t(xs[i], dys[i], None, prologue=Hook(mul_scale, (Side(shared_scale, ("groups", "depth")),)),
+                    out_dtype=jnp.float32)
         for i in range(b)])
     ref_dw_mapped = jnp.stack([
-        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
-                    prologue_operands=((mapped_scale[i], ("groups", "depth")),), out_dtype=jnp.float32)
+        gemm.gemm_t(xs[i], dys[i], None,
+                    prologue=Hook(mul_scale, (Side(mapped_scale[i], ("groups", "depth")),)),
+                    out_dtype=jnp.float32)
         for i in range(b)])
     np.testing.assert_array_equal(np.asarray(dw_shared), np.asarray(ref_dw_shared))
     np.testing.assert_array_equal(np.asarray(dw_mapped), np.asarray(ref_dw_mapped))
@@ -2207,7 +2203,8 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
         unsplit = dataclasses.replace(tile, splits=1)
         work = pricing.decode_contraction(
             unsplit, target, rows=8192, groups=1, depth=depth_k, width=width_n, columns=None, held=8192,
-            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors)
+            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors,
+            issued=jnp.bfloat16)
         return pricing.split_walk(unsplit, **work)
 
     with generation.assumed("sm80"):

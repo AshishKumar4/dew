@@ -14,6 +14,7 @@ from reference_error import assert_as_exact
 from test_gemm_template import DEPTH, ROUTED, ROWS, SEEDS, SIZES, WIDTH, _draw, biased_row, normed
 
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -32,8 +33,8 @@ def test_a_per_group_side_operand_and_its_gradient_hold_check_1(generation_name)
     def dew(x, w, b):
         def loss(b):
             # The groups axis reaches the hook as rows: each row's tile of its group's bias.
-            out = gemm.gemm(x, w, sizes, epilogue=biased_row,
-                                epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.float32,
+            out = gemm.gemm(x, w, sizes, epilogue=Hook(biased_row, (Side(b, ("groups", "columns")),)),
+                            out_dtype=jnp.float32,
                                 interpret_on_cpu=True)
             return jnp.sum(out[:ROUTED] ** 2), out
         (_, out), grad = jax.value_and_grad(loss, has_aux=True)(b)
@@ -76,7 +77,7 @@ def test_a_per_group_prologue_side_operand_and_its_gradients_hold_check_1(genera
     # A bf16 output, so every product of the reverse pass multiplies 16-bit operands, as the launch takes.
     def dew(x, w, s):
         def loss(x, w, s):
-            out = gemm.gemm(x, w, sizes, prologue=scaled, prologue_operands=((s, ("groups", "depth")),),
+            out = gemm.gemm(x, w, sizes, prologue=Hook(scaled, (Side(s, ("groups", "depth")),)),
                             out_dtype=jnp.bfloat16, interpret_on_cpu=True)
             return jnp.sum(out[:ROUTED].astype(jnp.float32) ** 2), out
         (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(x, w, s)
@@ -120,8 +121,8 @@ def test_a_side_operand_of_a_dimension_of_one_runs_on_the_template(generation_na
 
     def dew(x, w, ms, b):
         def loss(x, w, ms, b):
-            out = gemm.gemm(x, w, sizes, prologue=normed, prologue_operands=((ms[:, None], ("rows", None)),),
-                            epilogue=biased, epilogue_operands=((b, (None, "columns")),),
+            out = gemm.gemm(x, w, sizes, prologue=Hook(normed, (Side(ms[:, None], ("rows", None)),)),
+                            epilogue=Hook(biased, (Side(b, (None, "columns")),)),
                             out_dtype=jnp.bfloat16, interpret_on_cpu=True)
             return jnp.sum(out[:ROUTED].astype(jnp.float32) ** 2), out
         (_, out), grads = jax.value_and_grad(loss, argnums=(0, 1, 2, 3), has_aux=True)(x, w, ms, b)
@@ -153,11 +154,11 @@ def _biased_scaled(acc, bias, row_scale):
 
 
 HOOKED_NO_ROWS = {
-    "depth prologue": {"prologue": _scaled_depth, "prologue_operands": (("scale", ("depth",)),)},
-    "norm prologue": {"prologue": normed,
-                      "prologue_operands": (("mean_square", ("rows",)), ("weight", ("depth",)))},
-    "row and column epilogue": {"epilogue": _biased_scaled,
-                                "epilogue_operands": (("bias", ("columns",)), ("row_scale", ("rows",)))},
+    "depth prologue": lambda v: {"prologue": Hook(_scaled_depth, (Side(v["scale"], ("depth",)),))},
+    "norm prologue": lambda v: {"prologue": Hook(normed, (Side(v["mean_square"], ("rows",)),
+                                                          Side(v["weight"], ("depth",))))},
+    "row and column epilogue": lambda v: {"epilogue": Hook(_biased_scaled, (
+        Side(v["bias"], ("columns",)), Side(v["row_scale"], ("rows",))))},
 }
 """Hooks whose side operands lie along the depth, the rows or the columns, as a product of no rows takes
 them (`test_a_hooked_product_of_no_rows_is_empty_with_zero_side_gradients`)."""
@@ -173,28 +174,21 @@ def test_a_hooked_product_of_no_rows_is_empty_with_zero_side_gradients(hooked, d
     gradients zeros of their own shapes and dtypes."""
     values = {"scale": jnp.full((DEPTH,), 2.0), "mean_square": jnp.zeros((0,)),
               "weight": jnp.ones((DEPTH,)), "bias": jnp.ones((WIDTH,)), "row_scale": jnp.zeros((0,))}
-    spec = HOOKED_NO_ROWS[hooked]
-    hooks = {name: value for name, value in spec.items() if not name.endswith("_operands")}
-    named = {name: tuple(entry[0] for entry in value) for name, value in spec.items()
-             if name.endswith("_operands")}
-    axes = {name: tuple(entry[1] for entry in value) for name, value in spec.items()
-            if name.endswith("_operands")}
-    sides = {name: tuple(values[each] for each in names) for name, names in named.items()}
+    hooks = HOOKED_NO_ROWS[hooked](values)
     x = jnp.zeros((0, DEPTH), jnp.bfloat16)
     w = jnp.ones((DEPTH, WIDTH) if dense else (2, DEPTH, WIDTH), jnp.bfloat16)
     sizes = None if dense else jnp.zeros((2,), jnp.int32)
 
-    def loss(x, w, sides):
-        operands = {name: tuple(zip(sides[name], axes[name], strict=True)) for name in sides}
-        out = gemm.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True, **hooks, **operands)
+    def loss(x, w, hooks):
+        out = gemm.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True, **hooks)
         return jnp.sum(out), out.shape
 
     chosen = {} if kernel is None else {"grouped_matmul": kernel}
     with generation.assumed("sm90"), generation.chosen(**chosen):
-        (_, shape), (d_x, d_w, d_sides) = jax.value_and_grad(loss, (0, 1, 2), has_aux=True)(x, w, sides)
+        (_, shape), (d_x, d_w, d_hooks) = jax.value_and_grad(loss, (0, 1, 2), has_aux=True)(x, w, hooks)
     assert shape == (0, WIDTH) and d_x.shape == (0, DEPTH) and d_x.dtype == x.dtype
     np.testing.assert_array_equal(np.asarray(d_w, np.float32), np.zeros(w.shape, np.float32))
-    for name, given in sides.items():
-        for got, side in zip(d_sides[name], given, strict=True):
-            assert got.shape == side.shape and got.dtype == side.dtype
-            np.testing.assert_array_equal(np.asarray(got), np.zeros(side.shape, np.float32))
+    for name, hook in hooks.items():
+        for got, side in zip(d_hooks[name].sides, hook.sides, strict=True):
+            assert got.value.shape == side.value.shape and got.value.dtype == side.value.dtype
+            np.testing.assert_array_equal(np.asarray(got.value), np.zeros(side.value.shape, np.float32))

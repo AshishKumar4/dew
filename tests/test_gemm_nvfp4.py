@@ -20,6 +20,7 @@ from dew.algebra import bits
 from dew.nn import fake_quant
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
@@ -343,11 +344,11 @@ def test_gemm_takes_an_nvfp4_bank_as_its_matrix(kernel):
 
     with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
         got = gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32, gather=table,
-                        scatter=slots, epilogue=plus, epilogue_operands=((bias, ("groups", "columns")),),
+                        scatter=slots, epilogue=Hook(plus, (Side(bias, ("groups", "columns")),)),
                         interpret_on_cpu=True)
         with pytest.raises(ValueError):
             gemm.gemm(tokens, bank, jnp.asarray(sizes, jnp.int32), out_dtype=jnp.float32,
-                      prologue=lambda x: x)
+                      prologue=Hook(lambda x: x))
     faulthandler.cancel_dump_traceback_later()
     rows = np.asarray(tokens, np.float64)[np.asarray(table)]
     starts = np.cumsum([0, *sizes])

@@ -170,20 +170,22 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     perf-gate steps compiled ahead for an H100 it changes finetune-4b's program alone, whose timing with and
     without it is M-DC-14's; compile time once measured): a value the forward already
     computed. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
-    read once without a rule. The rules relate a new value to another the program holds: a quotient by a value
-    whose reciprocal it holds, `a / y` as `a (1/y)`, and by a root whose reciprocal root it holds, `a /
-    sqrt(v)` as `a rsqrt(v)` (a normalization's `x / max(|y|, eps)` beside its reciprocal, a norm's
-    `rsqrt(mean(x²) + eps)`). Over benchmark_step's and the parallelism matrix's step programs (2026-11-05,
-    every program the pass saw, bodies included) the only pattern of note was a divisor shared by several
-    quotients (42 to 452 of 423 to 794 divisions a suite). A shared reciprocal unguarded overflows where `a /
-    y` is finite (a subnormal `y`), makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient
-    keeps its value, so each rule reads a divisor an epsilon floors (a maximum's, a sum's, or a `reduce_sum`'s,
-    directly or broadcast along trailing axes) and fires only where its divisor is held away from zero (its
-    floor, `rules.log2_floor`) and bounded (`log2_bound`: the reciprocal a normal float above the narrowest
-    float's least normal power, `rules.least`) and either `|y| >= 1` (`floor >= 0`, so `0 < |1/y| <= 1` can
-    never overflow any finite dividend, with positivity required for reciprocal-root reuse) or the dividend
-    is bounded with the product under the reach (§6.3). Window formation (`program._windows`) pulls sibling
-    `rsqrt` and unit reciprocal equations sharing a division head's radicand or divisor into the window;
+    read once without a rule. The rules relate a new value to another the program holds or hoist a division
+    past a broadcast or square root: a quotient by a value whose reciprocal the program holds, `a / y` as
+    `a (1/y)`, a quotient by a broadcast divisor hoisted to a per-row reciprocal, `a / broadcast(y)` as
+    `a * broadcast(y^-1)` (`lax.integer_pow(..., -1)`), and a quotient by a root (directly or broadcast),
+    `a / sqrt(v)` as `a rsqrt(v)` (merging into any sibling `rsqrt(v)` when present). Over benchmark_step's
+    and the parallelism matrix's step programs (2026-11-05, every program the pass saw, bodies included) the
+    only pattern of note was a divisor shared by several quotients (42 to 452 of 423 to 794 divisions a
+    suite). A shared or hoisted reciprocal unguarded overflows where `a / y` is finite (a subnormal `y`),
+    makes a NaN of a zero `a`, and flushes to zero where a large `y`'s quotient keeps its value, so each rule
+    fires only where its divisor is held away from zero (its floor, `rules.log2_floor`: an epsilon's, or
+    `_SoftmaxTrack`'s `sum(exp(x - max(x))) >= 1` for finite `x`) and bounded (`log2_bound`: the reciprocal a
+    normal float above the narrowest float's least normal power, `rules.least`) and either `|y| >= 1`
+    (`floor >= 0`, so `0 < |1/y| <= 1` can never overflow any finite dividend, with positivity required for
+    reciprocal-root reuse) or the dividend is bounded with the product under the reach (§6.3). Window
+    formation (`program._windows`) pulls sibling `rsqrt` and unit reciprocal equations sharing a division
+    head's radicand or divisor into the window;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the
     running-max rescale of online softmax, log-sum-exp merges and folds, and Chan-Golub-LeVeque central-moment
     merges for weighted and masked variance and bilinear covariance in `derive.py` / `moments.py`, row 9036);
@@ -334,14 +336,20 @@ fitted to them, and a rule set ships only with measured receipts.
   out costs a trace, never a stale program; and the compiles' refused launches), and written into each later lowering holding the region, reporting the
   kernels' routes and launches its trace reported: a step's relowerings and its planner's candidates traced
   every region again, 1,724 traces and 144 seconds of a Qwen3.5-4B decision step's start on a GH200.
-- **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
-  attention, RMSNorm, stream and gated norms, SwiGLU) only where the region is proven to compute that call, by
-  its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
-  (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account
-  of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
-  (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
-  its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
-  kernels take as the program holds it), each choice the call takes tried, within the search's bounds
+  The dense gated MLP also offers a named wide form: the gate and up weights are interleaved, the product's
+  epilogue splits the accumulator and applies the gate, then one down product consumes the narrowed result.
+  The paired form and the products apart are its comparisons. At model width, check the output and the
+  input and three weight cotangents against float64 truth; a target uses a fused form by default only on
+  native parity or better and with timing separated from the session's A/A noise where a gain is claimed.
+- **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
+  attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is
+  proven to compute that call, by its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each
+  call's math is declared once, as the call itself on its portable path (`implementation='xla'`, attention's
+  `'reference'`, a recurrence's `step_reference`), the arithmetic its kernels are held to; no account of a
+  spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
+  (`exp`, `scan`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and
+  make, its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill,
+  which the kernels take as the program holds it), each choice the call takes tried, within the search's bounds
   (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first region one of whose
   candidates is proven equal taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
   answered at once, before any key of it is built (row 5556). The region's equations and each
@@ -575,6 +583,7 @@ rules read facts of an equation's parameters and layout, functions of a paramete
 | Fact | Sort | Join | Read by |
 |---|---|---|---|
 | `shape(t)` | `Vec[i64]` | the first stated (every member's is one shape) | every rule that names an axis |
+| `dtype(t)` | `String`, the scalar dtype | the first stated (equivalent terms keep their dtype) | elementwise and conversion prices |
 | `log2_bound(t)` | `i64`, a power of two over the value's magnitude | the first stated (each a true bound of every member) | the dominance rule: a reordering's new intermediates |
 | `reach()` | `i64`, the narrowest float's largest power of two | — | the dominance rule |
 | `log2_floor(t)` | `i64`, a power of two under a number's magnitude, `2**floor <= |x|` (`terms.Apart.floor`, the region's `floors`) | the first stated | a guarded reuse's divisor (§1.4) |
@@ -582,8 +591,10 @@ rules read facts of an equation's parameters and layout, functions of a paramete
 | `least()` | `i64`, the narrowest float's least normal power | — | a guarded reuse: no reciprocal a flushing lane reads as zero |
 | `narrowed(t)` | `i64`, the conversion back to a value's own narrow float (`stock`'s `convert_<dtype>`) | the first stated | a widened sum's result |
 
-A value's dtype and its equation's parameters are the region's tables (`terms.Region`), read by the rules
-that need them. Not built, and read by nothing: constant axes (a hoisting rule reads a broadcast's laid axes),
+The region states the traced dtypes and the parameters that fix a result's dtype (a cast or a product).
+The fact rules propagate them through equivalent forms, including new elementwise terms. Pricing uses
+the operands and parameter type facts; missing evidence does not select a measured fp32 form.
+Not built, and read by nothing: constant axes (a hoisting rule reads a broadcast's laid axes),
 sharded axes (no price reads a link, §1.6), a walked axis (the derivation's own `walked` fact, `derive.py`),
 per-token, decay and structure facts (`linear_scan`'s affine forms hold them), and a rounding class per value
 (each rule set states its own, §6.4).

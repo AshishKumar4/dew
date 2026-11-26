@@ -336,6 +336,12 @@ def taken(active, step: Callable, *state):
     return rebuilt(lax.cond(active, stepped, lambda *values: list(values), *carried))
 
 
+HOOK_COLUMNS = 64
+"""The columns of a register accumulator an epilogue's hook takes at a time (`Issuer.hook_columns`): whole
+tiles of every family's accumulator layout (WGMMA's 8 columns, mma.sync's 8 a warp along them) and a wide
+gated product's gate and up runs a pair (`templates.gemm.wide.UNIT`)."""
+
+
 def loaded(copies, issued: jax.Array | bool = True) -> None:
     """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
     awaited: issued where `issued` (a role loading `ref` for every role that shares it), awaited by every
@@ -1184,13 +1190,25 @@ class Issuer[Accumulator](abc.ABC):
         where the issuer accumulates in registers or in a ref its walk reads out whole."""
         return columns
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def hook_columns(self, columns: int) -> int:
+        """The columns of a tile's accumulator an epilogue's hook takes at once (`chunks`' `columns`, the
+        hook's temporaries one chunk's, as `pricing.epilogue_registers` counts them): its read-out chunk
+        (`chunk_columns`) where the issuer reads out no fewer."""
+        return self.chunk_columns(columns)
+
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
         """A tile's accumulators (its walk's) as its consumer reads them out: `(first_column, values)` a
         chunk of `chunk_columns` columns each, `values` each accumulator's, each chunk's load issued as it
         is taken, after the consumer is done with the chunk before (the live set one chunk's, as the
         register model counts it): the accumulators themselves, one chunk, where the walk returns their
-        values."""
-        yield 0, accumulators
+        values; `columns` of them a chunk where given (`hook_columns`), each a selection of the registers
+        holding them in their own layout (Mosaic GPU's tiled slices), the accumulators live whole."""
+        width = accumulators[0].shape[1]
+        if columns is None or columns >= width:
+            yield 0, accumulators
+            return
+        for first in range(0, width, columns):
+            yield first, tuple(acc[:, first:first + columns] for acc in accumulators)
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple[jax.Array, ...]:
         """Register accumulators of `shapes` as a walk starts: their `initial` values, zero where None."""
@@ -1569,6 +1587,11 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether a program copies its stored output tiles out through its registers (no TMA store before
     Hopper: `mosaic_sm80.Mma.persist`), so its epilogue holds its share of the stored tile beside the
     accumulator (`resources.tile_registers`)."""
+
+    stores_chunks: bool = False
+    """Whether its stores take a tile's output a chunk of its columns at a time, each at its own column
+    (`stores.staged_chunks`: a ring family's), so an epilogue may compute it so (`pricing.hook_chunk`); a
+    family staging each output tile whole as one value takes it whole."""
 
     stores_narrowed: bool = False
     """Whether its stores take an output its epilogue computes narrower than the tile (`stores.Output`'s
@@ -2180,7 +2203,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
         """fp32 `value`'s `count` bf16 parts (`product.formed`), natively each saturating one in the family's
-        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits."""
+        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits; a family of no
+        register layout (a TPU core's, `mosaic_tpu.MxuIssuer`) forms them portably."""
         if interpret:
             return product.formed(value, count)
         narrowed = functools.partial(inline_forms.satfinite_bf16, layout=self.layout)
@@ -2267,7 +2291,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         return resources.register_programs(self, consumers, registers, producer, joined)
 
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
-                 combine=operator.add, firsts=None) -> None:
+                 combine=operator.add, firsts=None, slot=None) -> None:
         """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
         (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
         `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
@@ -2286,13 +2310,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         `firsts` are a workspace, a slot written only where programs share a tile (none where one program
         walks it, nor the combining program's own interpreted): refs the launch takes in place (a
         `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
-        partly unwritten (NSNAN-2)."""
+        partly unwritten (NSNAN-2). `slot`, where given, is the tile's own slot of `firsts` (a balanced
+        tail's, `tail.Tail.segment`: a slot a tail tile, not a program), which its first program writes and
+        its combiner reads; the first program's index elsewhere."""
         opening = partials if firsts is None else firsts
+        opened = first if slot is None else slot
 
-        def left(refs) -> None:
+        def left(refs, at=program) -> None:
             # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
             # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[at], leaf, optimized=False), summed, refs)
 
         def read(refs, other, column=0, width=None):
             # The partials' structure read off the running value's: a ref may itself be a tree; the widest
@@ -2348,11 +2375,11 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         @pl.when(gathered - first > 1)
         def _():
             pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: left(opening))
+            pl.when(program == first)(lambda: left(opening, opened))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
             # The first program's partial read back from its slot by any last arriver: selected against its
             # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
-            pl.when(last == 1)(lambda: combined(read(opening, first)))
+            pl.when(last == 1)(lambda: combined(read(opening, opened)))
 
     def scoped(self, body, *allocations, streams, products: tuple | None = None, **after):
         """`Transport.scoped` (`after`), and with `products`, `(consumers, widths, lefts)`, the issuer's

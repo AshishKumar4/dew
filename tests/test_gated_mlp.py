@@ -39,22 +39,31 @@ def _apart(activation, limit, *, truth: bool = False):
     return run
 
 
-@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
-@pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
-def test_the_fused_mlp_holds_check_1_with_its_gradients(generation_name, activation, limit):
-    """The fused gated MLP (`fused_products`) on the template's launches, interpreted as `generation_name`:
-    its output, and the gradients of its rows and its three kernels through the template's own reverse
-    modes (the paired product's, and the down projection's with the gated product's VJP in its input
-    gradient's epilogue), each as exact as the three products apart from float64 truth (check 1). The routes
-    it records run every product on the template."""
-    def fused(x, gate, up, down):
-        return fused_products(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
 
-    label = f"fused {activation} MLP, limit {limit}, on {generation_name}"
+@pytest.mark.parametrize(("form", "generation_name"), [
+    pytest.param("fused", g.values[0], marks=g.marks, id=f"fused-{g.values[0]}")
+    for g in generations("sm90", "sm100")
+] + [
+    pytest.param("wide", g.values[0], marks=g.marks, id=f"wide-{g.values[0]}")
+    for g in generations("sm80", "sm90", "sm100")
+])
+@pytest.mark.parametrize(("activation", "limit"), ACTIVATIONS, ids=lambda value: str(value))
+def test_the_fused_mlp_holds_check_1_with_its_gradients(form, generation_name, activation, limit):
+    """Both fused gated MLP forms (`fused_products` paired and Formulation (C) `wide_products`) on the
+    template's launches, interpreted as `generation_name`: output and all four gradients (rows, gate, up,
+    down) hold check 1 against the three products apart from float64 truth, recording mosaic routes."""
+    from dew.nn.gated_mlp import wide_products
+
+    runner = wide_products if form == "wide" else fused_products
+
+    def run_form(x, gate, up, down):
+        return runner(x, (gate, up, down), activation, limit=limit, interpret_on_cpu=True)
+
+    label = f"{form} {activation} MLP, limit {limit}, on {generation_name}"
     apart, truth = (with_gradients(_apart(activation, limit, truth=truth)) for truth in (False, True))
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as routes):
-        assert_as_exact(with_gradients(fused), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
+        assert_as_exact(with_gradients(run_form), jax.jit(apart), _draw, label, seeds=SEEDS, truth_fn=truth)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
 
 
@@ -108,9 +117,10 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
             assert kernels(plain, gated_mlp="fused") == []
 
 
+@pytest.mark.parametrize("form", ["fused", "wide"])
 @pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
-def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shard(generation_name):
-    """A `GatedMLP` named fused on a run's mesh of two compile-only GPUs whose data axis splits its rows,
+def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(generation_name, form):
+    """A named MLP in a two-device row split runs its products on each device's own rows,
     lowered as a training step traces it (the trainer's layout, `placing`, under the default rules), runs
     its three products fused on each device's own rows (`gated_mlp._placement`: a map per shard, its kernels
     gathered whole there), as a projection's product maps its rows (`projections.mapped_shards`), where the
@@ -131,13 +141,14 @@ def test_a_gated_mlp_named_fused_on_a_data_split_mesh_runs_its_products_per_shar
     # A run's mesh (`MeshSpec`'s axes): the data axis two devices, every other one.
     mesh = Expected(tuple((axis, 2 if axis == DATA_AXIS else 1) for axis in MESH_AXES),
                     (None, PartitionSpec(DATA_AXIS)), frozenset())
-    with layer_scope(grouped_matmul="mosaic", gated_mlp="fused"), generation.routes() as routes:
+    with layer_scope(grouped_matmul="mosaic", gated_mlp=form), generation.routes() as routes:
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
-    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
+    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == [form]
     assert lowered.out_info.shape == (2, 64, FEATURES)
     read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
     # A device's 64 rows of the 128 and its hidden rows; each kernel whole, the template's one group of it.
-    assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, HIDDEN), (1, HIDDEN, FEATURES)} <= read, read
+    gate_width = 2 * HIDDEN if form == "wide" else HIDDEN
+    assert {(64, FEATURES), (64, HIDDEN), (1, FEATURES, gate_width), (1, HIDDEN, FEATURES)} <= read, read
     assert not {(128, FEATURES), (128, HIDDEN)} & read, read
 
 
@@ -165,6 +176,42 @@ def test_a_gated_mlps_case_runs_at_the_dtype_its_products_run_and_asks_nothing_a
 
     plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
     assert routes_of(plain) == routes_of(plain.clone(gate_multiplier=0.5))
+
+
+def test_a_mixed_gate_up_mlp_keeps_its_projection_dtypes_when_wide_is_named():
+    from dew.nn.mlp import GatedMLP
+
+    layer = GatedMLP(HIDDEN, FEATURES)
+    x = jax.ShapeDtypeStruct((64, FEATURES), jnp.bfloat16)
+    params = {"params": {"gate_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.bfloat16)},
+                         "up_proj": {"kernel": jax.ShapeDtypeStruct((FEATURES, HIDDEN), jnp.float32)},
+                         "down_proj": {"kernel": jax.ShapeDtypeStruct((HIDDEN, FEATURES), jnp.bfloat16)}}}
+    with generation.assumed("sm90"), generation.chosen(gated_mlp="wide"), generation.routes() as routes:
+        value = jax.eval_shape(layer.apply, params, x)
+    assert value.dtype == jnp.float32
+    assert [route.kernel for route in routes if route.choice == "gated_mlp"] == ["apart"]
+
+
+def test_saving_only_the_up_projection_keeps_the_wide_residual():
+    from jax._src.ad_checkpoint import saved_residuals
+    from jax.core import ShapedArray
+
+    from dew.nn.gated_mlp import wide_products
+    from dew.nn.residuals import Residual
+
+    rows, gate, up, down, _ = _draw(0)
+
+    def block(x, gate, up, down):
+        return wide_products(x, (gate, up, down), "swiglu")
+
+    shape = (rows.shape[0], 2 * gate.shape[-1])
+    with generation.chosen(grouped_matmul="xla"):
+        keep_up = jax.checkpoint_policies.save_only_these_names(Residual.UP_PROJ)
+        drop_all = jax.checkpoint_policies.nothing_saveable
+        kept = saved_residuals(jax.checkpoint(block, policy=keep_up), rows, gate, up, down)
+        dropped = saved_residuals(jax.checkpoint(block, policy=drop_all), rows, gate, up, down)
+    assert shape in {aval.shape for aval, _ in kept if isinstance(aval, ShapedArray)}
+    assert shape not in {aval.shape for aval, _ in dropped if isinstance(aval, ShapedArray)}
 
 
 @pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
@@ -398,3 +445,118 @@ def test_a_product_of_a_split_activation_and_a_weight_holding_a_sum_takes_jaxs_r
         assert jax.typeof(got).sharding.spec == jax.typeof(theirs).sharding.spec
     for got, alone in zip(jax.tree.leaves(values), jax.tree.leaves(whole), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(alone))
+
+
+@pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
+def test_grouped_gated_experts_selector_defaults_apart_and_honors_named_and_handoff_gates(generation_name):
+    """Grouped expert MLPs (`gated_mlp.fuses_grouped`, row 12847) key their own `(dtype, 'grouped')` cell on
+    `GATED_MLP`, default to `'apart'` without a receipt, run `'fused'` when named on supported 3D expert
+    kernels (both under the default grouped selector and under `grouped_matmul='mosaic'`), and hand off
+    cleanly to `'apart'` when `paired`, `down_prologue`, `hook`, `whole`, or `launched` fails."""
+    from dew.nn import gated_mlp
+
+    rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    hook = activations.gated_hook("swiglu")
+    with generation.assumed(generation_name):
+        case = gated_mlp.grouped_case(rows, (gate, down), None, hook)
+        assert case.cell == (generation_name, (jnp.dtype(jnp.bfloat16), "grouped"))
+        with generation.routes() as default_routes:
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        assert [route.kernel for route in default_routes if route.choice == "gated_mlp"] == ["apart"]
+        with generation.chosen(gated_mlp="fused"):
+            with generation.routes() as named_routes:
+                assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert [route.kernel for route in named_routes if route.choice == "gated_mlp"] == ["fused"]
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, paired=False)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, down_prologue=False)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, None)
+            assert not gated_mlp.fuses_grouped(rows, None, None, hook)
+            assert not gated_mlp.fuses_grouped(
+                rows, (gate, down), None, activations.gated_hook("geglu_exact"))
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+        # Named CUTLASS refuses paired epilogue / down prologue hooks and must hand off to `apart`.
+        with generation.chosen(grouped_matmul="cutlass", gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
+            assert gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            # Explicit group_sizes, gather/scatter tables, and stacked 4D layer banks pass through cleanly.
+            sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+            table = jax.ShapeDtypeStruct((256,), jnp.int32)
+            gate_4d = jax.ShapeDtypeStruct((2, 4, 128, 256), jnp.bfloat16)
+            down_4d = jax.ShapeDtypeStruct((2, 4, 256, 128), jnp.bfloat16)
+            assert gated_mlp.fuses_grouped(rows, (gate_4d, down_4d), None, hook,
+                                           group_sizes=sizes, gather=table, scatter=table, layer=0)
+            # Forced grouped Mosaic never escapes `KernelRefused` before GATED_MLP's handoff.
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, whole=False)
+            with jax.enable_x64():
+                wide_rows = jax.ShapeDtypeStruct((256, 128), jnp.float64)
+                assert not gated_mlp.fuses_grouped(wide_rows, (gate, down), None, hook)
+
+
+def test_grouped_gated_experts_hands_off_default_a100_cutlass_down():
+    """On A100 (`sm80`), the ordinary grouped down cell chooses CUTLASS which forms the prologue in XLA, and
+    `mma.sync` takes no side-tile prologue (`takes_prologue_tiles = False`), so `fuses_grouped` hands off to
+    `'apart'` under both the default selector and forced Mosaic without escaping `KernelRefused`."""
+    from dew.nn import gated_mlp
+
+    rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((256,), jnp.int32)
+    hook = activations.gated_hook("swiglu")
+    with generation.assumed("sm80"):
+        with generation.chosen(gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+        with generation.chosen(grouped_matmul="mosaic", gated_mlp="fused"):
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, gather=table)
+            assert not gated_mlp.fuses_grouped(rows, (gate, down), None, hook, scatter=table)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "sm100"))
+def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
+    """`GATED_MLP` selects `'wide'` when named via `dew.kernels.use(Kernels(gated_mlp='wide'))`, hands off
+    biased, unaligned-hidden, and grouped cases to `'apart'`, and drops the saved wide residual when an
+    enclosing `recomputing((Residual.GATE_PROJ,))` rung is active."""
+    import dew
+    from dew.nn import gated_mlp, residuals
+    from dew.nn.mlp import GatedMLP
+
+    x = jax.ShapeDtypeStruct((2, 64, FEATURES), jnp.bfloat16)
+
+    def kernels(layer, **choose):
+        params = jax.eval_shape(layer.init, jax.random.key(0), x)
+        with (generation.assumed(generation_name),
+              dew.kernels.use(dew.kernels.Kernels(grouped_matmul="mosaic", **choose)),
+              generation.routes() as routes):
+            jax.eval_shape(layer.apply, params, x)
+        return [route.kernel for route in routes if route.choice == "gated_mlp"]
+
+    plain = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, dtype=jnp.bfloat16)
+    biased = GatedMLP(hidden_features=HIDDEN, out_features=FEATURES, use_bias=True, dtype=jnp.bfloat16)
+    unaligned = GatedMLP(hidden_features=48, out_features=FEATURES, dtype=jnp.bfloat16)
+    assert kernels(plain, gated_mlp="wide") == ["wide"]
+    assert kernels(biased, gated_mlp="wide") == ["apart"]
+    assert kernels(unaligned, gated_mlp="wide") == ["apart"]
+
+    # Grouped experts hand off `'wide'` cleanly to `'apart'`.
+    g_rows = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    g_gate = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+    g_down = jax.ShapeDtypeStruct((4, 256, 128), jnp.bfloat16)
+    with generation.assumed(generation_name), generation.chosen(gated_mlp="wide"):
+        assert not gated_mlp.fuses_grouped(g_rows, (g_gate, g_down), None, activations.gated_hook("swiglu"))
+
+    # Remat `recomputing((Residual.GATE_PROJ,))` runs `wide_products` with `saved=False` and holds check 1.
+    def wide_recomputed(rows, gate, up, down):
+        with residuals.recomputing((residuals.Residual.GATE_PROJ,)):
+            return gated_mlp.wide_products(rows, (gate, up, down), "swiglu", interpret_on_cpu=True)
+
+    apart, truth = (with_gradients(_apart("swiglu", None, truth=t)) for t in (False, True))
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+        assert_as_exact(with_gradients(wide_recomputed), jax.jit(apart), _draw,
+                        f"wide swiglu recomputed on {generation_name}", seeds=SEEDS, truth_fn=truth)

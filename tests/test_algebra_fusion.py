@@ -517,6 +517,50 @@ def test_a_models_gated_product_is_its_gate_projections_epilogue():
                         "a model's gated product under the pass", seeds=8, truth_fn=with_gradients(wide))
 
 
+def gated_projection(gate, up, down):
+    from dew.nn import activations
+
+    return activations.gated_product("swiglu")(gate, up) @ down
+
+
+@lowers("sm90")
+def test_a_gated_activation_can_feed_the_next_products_prologue():
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    dims = ((256, 512), (256, 512), (512, 256))
+    operands = normal_drawn(3422, *dims, (256, 256), dtype=jnp.bfloat16)
+    shapes = tuple(jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in dims)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused"),
+          generation.routes() as routes):
+        jax.jit(algebra.rewritten(gated_projection, kernels=True)).trace(*shapes)
+    assert any(route.choice == "gemm_prologue" and route.kernel == "fused" for route in routes)
+
+    def truth(gate, up, down):
+        gate, up, down = (part.astype(jnp.float64) for part in (gate, up, down))
+        return (jax.nn.silu(gate) * up) @ down
+
+    def directional(call):
+        def run(*values):
+            return jax.jvp(call, values[:3], values[3:])
+        return jax.jit(run)
+
+    with (generation.assumed("sm90", interpreted=True),
+          generation.chosen(grouped_matmul="mosaic", gemm_prologue="fused")):
+        fused = functools.partial(_passed, gated_projection)
+        assert_as_exact(jax.jit(with_gradients(fused)), jax.jit(with_gradients(gated_projection)), operands,
+                        "gated product before a projection", seeds=8, truth_fn=with_gradients(truth))
+        assert_as_exact(directional(fused), directional(gated_projection),
+                        normal_drawn(3423, *dims, *dims, dtype=jnp.bfloat16), "gated projection tile JVP",
+                        seeds=8, truth_fn=directional(truth))
+        gate, up, down = (jnp.ones(shape, jnp.bfloat16) for shape in dims)
+
+        def loss(value):
+            return fused(gate.at[0, 0].set(value), up, down)[0, 0].astype(jnp.float32)
+
+        assert jnp.isfinite(jax.jit(jax.grad(jax.grad(loss)))(jnp.bfloat16(-100)))
+
+
 def test_a_gated_product_of_no_product_stays_its_region():
     """A model's SwiGLU (`gated_product`) over projections the program takes as inputs, no product before it:
     the pass leaves its region whole (`derivatives.Activation`, its body the route its dispatcher chose on an

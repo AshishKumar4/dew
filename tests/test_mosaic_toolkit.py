@@ -1407,16 +1407,21 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
     full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
     starts, on_gpu = np.arange(64)[:, None] // 16 * 16, here() != "cpu"
     run = jax.jit(_bounded, static_argnames=("family", "interpret"))
-    for bounds, constant in (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47)):
+    cases = (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47))
+    # Every bound's arm called before any is judged, so a GPU tier's prepare, whose arms give zeros, reaches
+    # each (row 10697: it stopped at the first one's check).
+    got = []
+    for bounds, constant in cases:
         operands, bounded = (a, b, c, np.asarray(bounds, np.int32)), family.bounded(constant)
         if on_gpu:
-            got = ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
-                            f"bounded products: {m_warps} warps at {constant}")(*operands)
+            got.append(ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
+                                 f"bounded products: {m_warps} warps at {constant}")(*operands))
         else:
             with generation.assumed("sm80"):
-                got = run(*operands, family=bounded, interpret=INTERPRETED)
+                got.append(run(*operands, family=bounded, interpret=INTERPRETED))
+    for (bounds, constant), found in zip(cases, got, strict=True):
         expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
-        np.testing.assert_array_equal(np.asarray(got), np.stack(expected))
+        np.testing.assert_array_equal(np.asarray(found), np.stack(expected))
     if on_gpu:
         return
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c, np.zeros(2, np.int32))]
@@ -1903,6 +1908,9 @@ def test_a_product_issued_within_a_staged_block_is_refused():
 
 @pytest.mark.gpu(reason="compiles a launch under each lowering semantics and runs it on this GPU")
 @pytest.mark.generations("sm90", "sm100")
+@pytest.mark.skipif(not here().startswith("sm") or not generation.architecture(here()).tma,
+                    reason="copies its tiles out by TMA, which a GPU before Hopper has none of (row 10697: "
+                           "an A100's compile of it aborted its file's process)")
 @pytest.mark.parametrize("semantics", [plgpu.LoweringSemantics.Lane, plgpu.LoweringSemantics.Warpgroup],
                          ids=["lane", "warpgroup"])
 def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semantics):
@@ -2291,3 +2299,29 @@ def test_a_staged_outputs_launch_states_its_cost():
     [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
                   if "cost_estimate" in equation.params]
     assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)
+
+
+@pytest.mark.parametrize("family", [bundles.MmaFed(jnp.bfloat16), bundles.MmaProduced(jnp.bfloat16),
+                                    mosaic_sm80.Mma(jnp.bfloat16), "wgmma"],
+                         ids=["mma.sync fed", "mma.sync produced", "mma.sync on cp.async", "wgmma"])
+def test_a_staged_batch_is_fenced_for_asynchronous_product_readers_alone(family):
+    """A consumer's staged batch for products to read (`Family.staged_all`) takes the async proxy's fence
+    (`plgpu.commit_smem`) where its products read shared memory asynchronously (wgmma's), and none where
+    they read it through the warpgroup's own ldmatrix, mma.sync's on any movement: TMA rings its consumer
+    or a producer fills as on cp.async (a Kimi intra walk's three fences a step on a GH200, M-JS-272)."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu
+
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.WGMMA if family == "wgmma" else family
+
+    def body(out_ref, source, staging):
+        value = plgpu.load(source, layout=family.layout, optimized=False)
+        family.staged_all([(value, staging)])
+
+    tile = plgpu.SMEM((64, 64), jnp.bfloat16)
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[tile, tile])
+    fences = [equation for equation in equations(jax.make_jaxpr(launch)().jaxpr)
+              if equation.primitive is gpu.commit_smem_p]
+    assert bool(fences) == (family is mosaic_sm90.WGMMA), fences

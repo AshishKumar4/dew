@@ -16,19 +16,16 @@ the algebra pass's fusion on ("pass") or off ("nopass").
     {"builder": "tools/timing_cases.py:fused", "cells": [{"shape": "qwen3.5-4b up"}],
      "arms": [{"name": "pass", "implementation": "pass"}, {"name": "nopass", "implementation": "nopass"}]}
 
-`gated`: a gated MLP's three products at a model's MLP shape (`cell["model"]`, its `DENSE` down projection's
-widths), SwiGLU, fused on the GEMM template's hooks (`dew.nn.gated_mlp.fused_products`: the gated product
-the paired product's epilogue, the down product's prologue; `implementation` "fused") or apart, each product
-the template's launch with a gated MLP's gated product between (`activations.gated_product`, "apart"), its
-forward (`cell["kind"]` "forward") or its forward and the gradients of its input and three kernels
-("train"): the fused MLP's receipt a `gated_mlp.FUSED_CELLS` cell is declared from (row 1958).
+`gated`: a model-width dense SwiGLU MLP with `GatedMLP` named `wide`, `fused` or `apart`. The arm
+must take that route (a handoff is not a comparison). Its forward (cell kind `forward`) or its output
+and gradients of the input and all three kernels (`train`) use one seeded draw per arm (row 1958).
 
     {"builder": "tools/timing_cases.py:gated", "cells": [{"model": "qwen3.5-4b", "kind": "train"}],
      "arms": [{"name": "fused", "implementation": "fused"}, {"name": "apart", "implementation": "apart"}]}
 
-`stepped`: a perf gate step case's training step (tools/perf_gate.py's `STEP_CASES`), compiled and run as a
-run's step is, under the algebra pass with every registered rule set ("every") or without one ("without
-<set>"): a rule set's measured receipt (docs/design/algebra.md §1.6).
+`stepped`: a perf gate step case's training step, compiled and run as a run's step is, with the
+default rule sets (`every`), one excluded (`without <set>`), or one dev-time set enabled
+(`with <set>`). A receipt compares an actual executable change against the same-session A/A.
 
     {"builder": "tools/timing_cases.py:stepped", "cells": [{"case": "step lm-dense 4x1024"}],
      "arms": [{"name": "every", "implementation": "every"},
@@ -56,6 +53,7 @@ lane's Triton GEMMs as upstream XLA keeps them under deterministic ops); a user'
 """
 import atexit
 import contextlib
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -146,39 +144,35 @@ def fused(cell: dict, implementation: str) -> tuple:
 
 
 def gated(cell: dict, implementation: str) -> tuple:
-    """A gated MLP of `cell["model"]`'s MLP widths (`DENSE`'s "<model> down"), SwiGLU, its products fused
-    (`implementation` "fused") or apart ("apart"), its forward or its training products (`cell["kind"]`),
-    compiled under the GEMM template's launch (grouped_matmul "mosaic"), and its one draw of inputs (seed
-    0)."""
-    from dew.nn import activations
-    from dew.nn.gated_mlp import fused_products
-    from dew.nn.kernels import gemm, generation
+    """The model's dense SwiGLU layer with a named MLP route, compiled at a production width."""
+    from dew.nn.kernels import generation
+    from dew.nn.mlp import GatedMLP
 
     hidden, width = DENSE[f"{cell['model']} down"]
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.normal(size=(TOKENS, width)), jnp.bfloat16)
     kernels = tuple(jnp.asarray(rng.normal(size=shape) / np.sqrt(shape[0]), jnp.bfloat16)
                     for shape in ((width, hidden), (width, hidden), (hidden, width)))
-    dy = jnp.asarray(rng.normal(size=(TOKENS, width)), jnp.bfloat16)
-    # The gated product apart as a gated MLP takes it (`dew.nn.mlp`): the generation's measured kernel, a
-    # Pallas SwiGLU where one is (row 12030: XLA's hook timed an arm no model runs).
-    product = activations.gated_product("swiglu")
+    params = {f"{name}_proj": {"kernel": kernel}
+              for name, kernel in zip(("gate", "up", "down"), kernels, strict=True)}
+    layer = GatedMLP(hidden_features=hidden, out_features=width, activation="swiglu", dtype=jnp.bfloat16)
 
-    def mlp(x, gate, up, down):
-        if implementation == "fused":
-            return fused_products(x, (gate, up, down), "swiglu")
-        projected = [gemm.gemm(x, kernel, None, out_dtype=jnp.bfloat16) for kernel in (gate, up)]
-        return gemm.gemm(product(*projected), down, None, out_dtype=jnp.bfloat16)
-
-    def trained(x, gate, up, down, dy):
-        out, pulled = jax.vjp(mlp, x, gate, up, down)
+    def trained(params, x, dy):
+        out, pulled = jax.vjp(layer.apply, params, x)
         return out, pulled(dy)
 
-    function = (lambda x, gate, up, down, dy: mlp(x, gate, up, down)) if cell["kind"] == "forward" else (
-        trained)
-    with generation.chosen(grouped_matmul="mosaic"):
-        compiled = jax.jit(function).lower(x, *kernels, dy).compile()
-    return compiled, lambda index: (x, *kernels, dy)
+    arguments: tuple = ({"params": params}, x)
+    if cell["kind"] == "train":
+        arguments = (*arguments, jnp.asarray(rng.normal(size=x.shape), x.dtype))
+    function = trained if cell["kind"] == "train" else layer.apply
+    choices = {} if implementation == "apart" else {"grouped_matmul": "mosaic"}
+    with generation.chosen(gated_mlp=implementation, **choices), generation.routes() as routes:
+        lowered = jax.jit(function).lower(*arguments)
+    taken = {route.kernel for route in routes if route.choice == "gated_mlp"}
+    if taken != {implementation}:
+        raise ValueError(f"MLP arm {implementation!r} cannot be timed as {taken}")
+    print(f"gated {cell}: {implementation} routes: {[(r.choice, r.kernel) for r in routes]}", file=sys.stderr)
+    return lowered.compile(), lambda index: arguments
 
 
 def stepped(cell: dict, implementation: str) -> tuple:
@@ -192,18 +186,15 @@ def stepped(cell: dict, implementation: str) -> tuple:
     from benchmark_models import build_trainer, compiled_step
     from perf_gate import STEP_CASES
 
-    from dew.algebra.program import passes
-
-    without = _left_out(implementation)
     objective = {"decoder_objective": cell["objective"]} if "objective" in cell else {}
     case = Case(**STEP_CASES[cell["case"]], **objective)
     placed = contextlib.ExitStack()
-    with passes(without=without):
+    with _algebra_arm(implementation):
         step = placed.enter_context(compiled_step(case, build_trainer(case), fixed_batch=True))
     state = [step.state]
 
     def call():
-        with passes(without=without):
+        with _algebra_arm(implementation):
             state[0], loss, _ = step.step(state[0])
         return loss
 
@@ -214,9 +205,19 @@ def stepped(cell: dict, implementation: str) -> tuple:
     return call, lambda index: ()
 
 
-def _left_out(implementation: str) -> tuple[str, ...]:
-    """An arm's sets left out: none for "every", else the one "without <set>" names."""
-    return () if implementation == "every" else (implementation.removeprefix("without "),)
+@contextlib.contextmanager
+def _algebra_arm(implementation: str):
+    """Keep the normal rule sets, leave one out, or add only the named development set."""
+    from dew.algebra.program import passes
+    from dew.algebra.rules import enabling_dev
+
+    if implementation.startswith("with "):
+        with enabling_dev(implementation.removeprefix("with ")):
+            yield
+        return
+    without = () if implementation == "every" else (implementation.removeprefix("without "),)
+    with passes(without=without):
+        yield
 
 
 def flowed(cell: dict, implementation: str) -> tuple:
@@ -233,10 +234,9 @@ def flowed(cell: dict, implementation: str) -> tuple:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     import model_flows
 
-    from dew.algebra.program import passes
     from dew.nn.kernels.options import program
 
-    flow, without = model_flows.flow_named(cell["flow"]), _left_out(implementation)
+    flow = model_flows.flow_named(cell["flow"])
     model_flows.held_process(flow)
     flat, _ = model_flows.programs_of(flow)[f"{cell['kind']} dew"]
     # The program's arguments: the parameters' leaves and the draw's inputs (`programs_of`'s order), a token
@@ -245,7 +245,7 @@ def flowed(cell: dict, implementation: str) -> tuple:
     compiled = program(flat)
 
     def call(*arguments):
-        with passes(without=without):
+        with _algebra_arm(implementation):
             return compiled(*arguments)
 
     jax.block_until_ready(call(*inputs))

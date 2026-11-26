@@ -37,6 +37,7 @@ from dew.nn.kernels.generation import (
 )
 from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.telemetry import instrumentation
 from dew.training import TrainerAdvanced
 from dew.training._lowering import KernelReport, kernel_report
@@ -735,8 +736,9 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     rows, depth, width, groups = 384, 128, 256, 4
 
     def biased(x, w, sizes, b):
-        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
-                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+        return gemm.gemm(x, w, sizes,
+                         epilogue=Hook(lambda acc, bias: acc + bias, (Side(b, ("groups", "columns")),)),
+                         out_dtype=jnp.bfloat16)
 
     args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
@@ -866,24 +868,12 @@ def test_two_mamba_layers_lower_the_template_scans_launches_once():
     (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
     launches were each traced and lowered again (row 2969). The selective template's alone: the second
     layer's input projection takes its input's gradient, which the first's has none of, its own launch."""
-    from jax.extend.mlir import ir
-
-    from dew.nn.kernels.lowered import kernel_call
+    from dew.nn.kernels.lowered import kernel_calls
 
     def launches(layers: int) -> int:
-        found = []
-
-        def visit(operation: ir.Operation) -> ir.WalkResult:
-            if "call_target_name" in operation.attributes:
-                call = kernel_call(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
-                if call is not None and call.kind == "mosaic_gpu" and call.name.startswith("selective_scan"):
-                    found.append(call.name)
-            return ir.WalkResult.ADVANCE
-
-        module = _mamba1_lowered("sm90", layers).compiler_ir(dialect="stablehlo")
-        with module.context:
-            module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
-        return len(found)
+        # Every lowered call, a function no run reaches too (`unrun`): the code lowered, each once.
+        return len([call for call in kernel_calls(_mamba1_lowered("sm90", layers), unrun=True)
+                    if call.kind == "mosaic_gpu" and call.name.startswith("selective_scan")])
 
     one = launches(1)
     assert one > 0 and launches(2) == one
