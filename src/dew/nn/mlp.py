@@ -30,6 +30,7 @@ from .activations import (
     Xielu,
     gated_product,
     packed_gated_product,
+    placed_gate_up,
     swiglu_clamped,
     ungated_activation,
 )
@@ -42,7 +43,7 @@ from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup, fixed_remat, internal_remat
-from .sharding import MLP_HIDDEN, LogicalAxes, constrain, whole_along
+from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
@@ -276,9 +277,9 @@ class GatedMLP(nn.Module):
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
                 gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
-                # The pair placed whole before the checkpoint (`whole_along`, the product's own placement),
-                # so its reverse mode recomputes the product from the placed pair, moving none again.
-                placed = whole_along(gate_up, -2, onto=-1)
+                # The pair placed before the checkpoint (`placed_gate_up`, the product's own placement), so
+                # its reverse mode recomputes the product from the placed pair, moving none again.
+                placed = placed_gate_up(gate_up)
                 return self._gated_down(packed_gated_product(activation, axes=axes), (placed,), train)
         if self._packed():
             group = self._group()
