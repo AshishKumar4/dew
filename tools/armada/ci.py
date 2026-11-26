@@ -1361,10 +1361,11 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
 def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None, cache: str, common: str,
           network: bool, kept: Mapping[str, tuple[str, str]] | None,
           judged: Callable[[list[dict]], list[dict]] | None, deadline: float,
-          reading: "Reading | None" = None, afford: bool = True) -> tuple[list[dict], list[str]]:
+          reading: "Reading | None" = None, afford: bool = True,
+          publish_by: float | None = None) -> tuple[list[dict], list[str]]:
     """`tested`'s rows it need not run (reused, no site's map task; kept, `afforded` where `afford`),
     graded by `judged`, and the tests it must, from `reading`; a reused row named the commit's only as its
-    grade leaves it green."""
+    grade leaves it green, its writes within `publish_by` where one is given (`tested`)."""
     began = time.monotonic()
     named: dict[str, tuple[str, str]] = {}
     rows = ([] if cache == "off" or (site is not None and site["start"] is not None)
@@ -1377,10 +1378,11 @@ def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None,
     # A reused row named main's commit's only where the run keeps records (`RECORDS`).
     if (token := os.environ.get("DEW_XLA_CACHE_TOKEN")) and os.environ.get(RECORDS) != "off":
         unnamed = {found["name"] for found in rows if found["name"] in named and found["exitCode"] == 0
-                   and not run_keys.baselined(python, found["name"], named[found["name"]][0], token, found)}
+                   and not run_keys.baselined(python, found["name"], named[found["name"]][0], token, found,
+                                              publish_by)}
         for found in rows:
             if found["name"] in named and found["exitCode"] == 0 and found["name"] not in unnamed:
-                run_keys.named_at_commit(python, found["name"], *named[found["name"]], token)
+                run_keys.named_at_commit(python, found["name"], *named[found["name"]], token, publish_by)
         rows = unbaselined(python, rows, unnamed)
     return rows, tests
 
@@ -1521,21 +1523,22 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
            variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None,
-           written: list[set[str]] | None = None, recycle_at: int | None = None) -> int:
+           written: list[set[str]] | None = None, recycle_at: int | None = None,
+           publish_by: float | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`). A check-1
-    site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
-    reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
-    process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
-    same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first.
-    `written`: each earlier process's checkout writes, read by none of its records; it adds its own."""
+    Hub open, recorded on the network lane's class (`device_class`). A check-1 site's map task
+    (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge reads. A run that is
+    no test of its files (a GPU lane's prepare, `recorded` false) records no row. A process of the files under
+    other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the same cut of them, its rows and
+    their records named apart (`varied`); `judged` grades its rows first. `written`: each earlier process's
+    checkout writes; `publish_by`: when its records' writes end by (a dry prepare's budget, row 13014)."""
     began = time.monotonic()
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
-    group = varied(split, variant)
-    site = session.SITE.fullmatch(group)
+    site = session.SITE.fullmatch(group := varied(split, variant))
     recycle_at = None if site is not None else recycle_at  # A site's task: one test, its draws its artifacts.
-    rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline)
+    rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline,
+                        publish_by=publish_by)
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -1634,19 +1637,21 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if resumes:  # Sealed once graded: a recall sets a whole file's passes aside where it graded green alone.
         progress.ended(read_text(pid), int(any(found["exitCode"] for found in ran)))
     kept_records(python, rows, ran, out, (log, unrecorded), common, network, began_in, recording,
-                 (opened if processes.segments == 1 else None, set(wrote), written))
+                 (opened if processes.segments == 1 else None, set(wrote), written), publish_by)
     return 0
 
 
 def kept_records(python: str, rows: list[dict], ran: list[dict], out: Path, files: tuple[Path, Path],
                  common: str, network: bool, began_in: Mapping[str, str | None] | None, recording: bool,
-                 reads: tuple[set[str] | None, set[str], list[set[str]] | None]) -> None:
+                 reads: tuple[set[str] | None, set[str], list[set[str]] | None],
+                 until: float | None = None) -> None:
     """A task's graded rows `ran`, where it is `recording`, recorded (`run_keys.record`) with what its pytest
     read (`files`: its executed log and its unrecorded files' list; `reads`: what it opened, what it wrote,
     and each earlier process's checkout writes, `written`, which it adds its own to whether it records or
     not), `out` written again where a green row's baseline was not taken (`unbaselined`). A row run in more
     than one process (what it opened None, as a blind watch's) keeps no key, what each read being no one
-    record's; its red still begins its next epoch and its green still writes its baseline."""
+    record's; its red still begins its next epoch and its green still writes its baseline. Its records'
+    reads and writes within `until` where one is given."""
     opened, wrote, written = reads
     carried = wrote.union(*(written or []))
     if written is not None:
@@ -1655,7 +1660,8 @@ def kept_records(python: str, rows: list[dict], ran: list[dict], out: Path, file
         return
     log, unrecorded = files
     unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
-    if unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in):
+    if unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in,
+                                  until):
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
 
 
