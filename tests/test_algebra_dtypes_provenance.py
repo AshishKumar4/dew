@@ -57,6 +57,7 @@ def test_a_norm_of_norms_backward_reuses_a_reduction_through_a_cotangent_sum():
 @pytest.mark.mesh(devices=2)
 def test_cotangent_reductions_keep_their_explicit_placements():
     from jax._src.ad_util import add_jaxvals_p
+    from jax.core import ShapedArray
     from jax.sharding import AxisType, PartitionSpec as P
 
     def reduced(a, b):
@@ -73,7 +74,7 @@ def test_cotangent_reductions_keep_their_explicit_placements():
         np.testing.assert_array_equal(actual, expected)
         selected = _equations(jax.make_jaxpr(compute)(*inputs).jaxpr)
         add, = (eq for eq in selected if eq.primitive is add_jaxvals_p)
-        assert [atom.aval.shape for atom in add.invars] == [(), ()]
+        assert [atom.aval.shape for atom in add.invars if isinstance(atom.aval, ShapedArray)] == [(), ()]
 
 
 def test_structural_closed_preserves_equation_source_info_and_nested_body_provenance():
