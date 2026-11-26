@@ -281,8 +281,8 @@ class GatedMLP(nn.Module):
                 # The halves read apart where the product reads them (`placed_gate_up`), for the down
                 # projection's reverse mode to hold in place of the product.
                 placed = placed_gate_up(gate_up)
-                return self._down(packed_gated_product(activation, axes=axes)(gate_up), train,
-                                  (placed[..., 0, :], placed[..., 1, :], activation))
+                return self._down(packed_gated_product(activation, axes=axes)(placed), train,
+                                  lambda: (placed[..., 0, :], placed[..., 1, :], activation))
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -296,7 +296,7 @@ class GatedMLP(nn.Module):
         gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        halves = (gate, up, activation) if isinstance(activation, str) else None
+        halves = (lambda: (gate, up, activation)) if isinstance(activation, str) else None
         return self._down(gated_product(activation, axes=axes)(gate, up), train, halves)
 
     def _fusable(self) -> bool:
@@ -376,9 +376,10 @@ class GatedMLP(nn.Module):
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
 
-    def _down(self, hidden, train: bool, halves: tuple | None = None):
-        """The down projection of `hidden`, its units dropped while training. `halves`, where given, the
-        gate's and the up projection's values `hidden` is the gated product of, and its activation's name:
+    def _down(self, hidden, train: bool, halves: Callable[[], tuple] | None = None):
+        """The down projection of `hidden`, its units dropped while training. `halves`, where given, gives
+        the gate's and the up projection's values `hidden` is the gated product of, and its activation's
+        name, read only where the projection takes them:
         undropped, the projection reads `hidden` as formed from them (`projections.FormedInput`, the product's
         hook `gated_hook`'s), so its reverse mode holds them, which the projections' own hold already, and
         never `hidden`, a `[tokens, hidden]` value a layer less."""
@@ -387,7 +388,7 @@ class GatedMLP(nn.Module):
         if halves is None or not (isinstance(self.down_proj, ReadsFormed) and self.down_proj.reads_formed):
             out = self.down_proj(hidden)
         else:
-            gate, up, activation = halves
+            gate, up, activation = halves()
             out = self.down_proj(hidden, formed=FormedInput(hidden, gate, (up,), gated_hook(activation)))
         return scaled(checkpoint_name(out, Residual.DOWN_PROJ), self.down_multiplier)
 

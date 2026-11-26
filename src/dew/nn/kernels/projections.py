@@ -705,8 +705,10 @@ def dot_general(xla, path: tuple | None = None):
         plain = (nonempty and not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
-        # A formed input's hook reads its rows and sides as `lhs` is read: of its shape, its dtype.
+        # A formed input's hook reads its rows and sides as `lhs` is read: of its shape, its dtype; a dot
+        # algorithm the call or the run states is the layer's own product's (`xla`'s) to run.
         formed = (formed if formed is not None and formed.operand is lhs and plain
+                  and not _algorithm(precision)
                   and all((each.shape, each.dtype) == (lhs.shape, lhs.dtype)
                           for each in (formed.rows, *formed.sides)) else None)
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
@@ -745,6 +747,17 @@ def dot_general(xla, path: tuple | None = None):
         return taken(lhs, (rhs,) if bias is None else (rhs, bias))
 
     return product
+
+
+def _algorithm(precision: PrecisionLike) -> bool:
+    """Whether a product's precision, the call's or else the run's (`jax_default_matmul_precision`), names a
+    dot algorithm (`jax.lax.DotAlgorithm`, `DotAlgorithmPreset`, or a preset's name), which the layer's own
+    product runs as stated (`float32_dot_general`'s BF16_BF16_F32) and no formed product takes."""
+    stated = precision if precision is not None else jax.config.jax_default_matmul_precision
+    if isinstance(stated, (tuple, list)):
+        return any(_algorithm(each) for each in stated)
+    return (isinstance(stated, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))
+            or (isinstance(stated, str) and stated in jax.lax.DotAlgorithmPreset.__members__))
 
 
 def _whole(*operands: jax.Array) -> bool:

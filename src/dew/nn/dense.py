@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.linen.dtypes import promote_dtype
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
@@ -482,14 +483,16 @@ class Dense(_LinearEnvelope, nn.Dense):
         """The layer of `inputs`. `formed`, where given, states `inputs` formed entrywise from other values
         (`projections.FormedInput`: a gated MLP's hidden activation), which the layer's plain product
         multiplies as the template's formed operand, holding the values it was formed from in place of
-        `inputs` for reverse mode (`_product`), under the class's identity rule."""
-        held = formed if formed is not None and formed.operand is inputs else None
-        return self._envelope(functools.partial(self._linear, formed=held), inputs)
+        `inputs` for reverse mode (`_product`), under the class's identity rule: the rows its arithmetic
+        multiplies (`_linear`'s, past an envelope) the operand itself."""
+        linear = self._linear if formed is None else functools.partial(self._linear, formed=formed)
+        return self._envelope(linear, inputs)
 
     @property
     def reads_formed(self) -> bool:
-        """Whether its call takes `formed` (`protocols.ReadsFormed`): a plain Dense's does."""
-        return True
+        """Whether its call takes `formed` (`protocols.ReadsFormed`): a Dense whose arithmetic is this
+        class's own (`_linear`), not one a subclass computes otherwise."""
+        return type(self)._linear is Dense._linear
 
     def product_owned(self) -> bool:
         """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
@@ -497,6 +500,8 @@ class Dense(_LinearEnvelope, nn.Dense):
         return intercepted()
 
     def _linear(self, inputs: Array, formed: projections.FormedInput | None = None) -> jax.Array:
+        # Read only as the rows it states (an envelope or an interceptor handing other rows leaves it).
+        formed = formed if formed is not None and formed.operand is inputs else None
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
@@ -506,14 +511,17 @@ class Dense(_LinearEnvelope, nn.Dense):
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
         stored = bias
+        given = inputs.dtype
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
         # Under a delayed-scaling NVFP4 recipe that takes the product, its rows' scale its amax history's.
         scale = history_scale(self, 'amax_history', kernel.shape)
         if scale is not None:
             recorded(self, 'amax_history', inputs)
-        # The formed input as promoted: the product reads its hook's values in the dtype it multiplies.
-        formed = None if formed is None else dataclasses.replace(formed, operand=inputs)
+        # The formed input as promoted where flax's promotion keeps its dtype (its values as they are); a
+        # promotion of the layer's own, or to another dtype, leaves it.
+        kept = self.promote_dtype is promote_dtype and inputs.dtype == given
+        formed = dataclasses.replace(formed, operand=inputs) if formed is not None and kept else None
         return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored, tensor_scale=scale,
                        formed=formed)
 

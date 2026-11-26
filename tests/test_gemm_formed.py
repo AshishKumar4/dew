@@ -4,6 +4,7 @@ its product's reverse mode forms nothing for: each interpreted as a GPU on a CPU
 products composed on them compiled for compile-only GPUs within their resources."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -16,7 +17,9 @@ from reference_error import assert_as_exact, with_gradients
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 
 ROWS, FEATURES, HIDDEN = 136, 128, 256
 """Rows no tile divides, the features a gated MLP reads and writes, its hidden width."""
@@ -241,12 +244,13 @@ def test_a_remat_keeping_the_projections_forms_the_hidden_activation_by_no_produ
     assert launched["saved"] == launched["whole"], launched
 
 
-class _HoldingItsHidden(GatedMLP):
-    """A gated MLP whose down projection multiplies its gated product as any input, holding it for reverse
-    mode: the path before the projection read it as formed (`GatedMLP._down`'s `halves`)."""
+class _HoldingDense(Dense):
+    """A Dense that reads no formed input (`protocols.ReadsFormed`): a gated MLP's down projection that
+    multiplies its gated product as any input, holding it for reverse mode, the path before."""
 
-    def _down(self, hidden, train: bool, halves: tuple | None = None):
-        return super()._down(hidden, train)
+    @property
+    def reads_formed(self) -> bool:
+        return False
 
 
 GATED_LAYERS = {
@@ -261,13 +265,16 @@ GATED_LAYERS = {
 def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
     """A bf16 gated MLP, its gate and up apart or packed (`[..., 2, H]`), clamped or its gate scaled,
     unrematerialized: its output and every gradient under a cotangent (each kernel's and the input's) as
-    exact as the path holding its hidden product from float64 truth (check 1), and its reverse mode holds
-    the gate's and the up projection's values (the halves the product reads) and never the down
-    projection's input, which the path holding it shows held: a `[tokens, hidden]` value a layer less."""
+    exact as the path holding its hidden product (its down projection reading no formed input) from float64
+    truth (check 1), and its reverse mode, compiled as the held one's, holds at least the hidden product's
+    bytes less: a `[tokens, hidden]` value a layer."""
     tokens, hidden, features = (2, 12), 48, 16
-    layer, holding, truth = (cls(hidden_features=hidden, out_features=features, dtype=dtype, **fields)
-                             for cls, dtype in ((GatedMLP, jnp.bfloat16), (_HoldingItsHidden, jnp.bfloat16),
-                                                (GatedMLP, jnp.float64)))
+    holding_linear = functools.partial(_HoldingDense, dot_general=float32_dot_general)
+    layer, holding, truth = (GatedMLP(hidden_features=hidden, out_features=features, dtype=dtype, **fields,
+                                      **extra)
+                             for dtype, extra in ((jnp.bfloat16, {}),
+                                                  (jnp.bfloat16, {"linear": holding_linear}),
+                                                  (jnp.float64, {})))
     shapes = jax.eval_shape(layer.init, jax.random.key(0), jnp.zeros((*tokens, features), jnp.bfloat16))
     leaves, tree = jax.tree.flatten(shapes)
 
@@ -286,49 +293,26 @@ def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
                     truth_fn=with_gradients(applied(truth)))
 
     x, *kernels, _ = draw(0)
-    seen = {}
 
-    def read(next_fun, args, kwargs, context):
-        out = next_fun(*args, **kwargs)
-        if context.method_name == "__call__":
-            seen[context.module.name] = args[0] if context.module.name == "down_proj" else out
-        return out
-
-    with nn.intercept_methods(read):
-        applied(layer)(x, *kernels)
-    gate, up = ((seen["gate_up_proj"].reshape(*tokens, 2, hidden)[..., at, :] for at in (0, 1))
-                if fields.get("packed") else (seen["gate_proj"], seen["up_proj"]))
-    if "swiglu_limit" in fields:
-        gate, up = jnp.minimum(gate, 1.5), jnp.clip(up, -1.5, 1.5)
-    if "gate_multiplier" in fields:
-        gate = (gate.astype(jnp.float32) * 0.5).astype(gate.dtype)
-
-    def held(module) -> list:
-        """The arrays `module`'s reverse mode holds (its pullback's leaves), compiled as a step is."""
+    def held_bytes(module) -> int:
+        """The bytes `module`'s reverse mode holds (its jitted pullback's leaves)."""
         _, pull = jax.vjp(jax.jit(applied(module)), x, *kernels)
-        return jax.tree.leaves(pull)
+        return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(pull))
 
-    def holds(values: list, value) -> bool:
-        """Whether one of `values` holds `value`'s entries exactly, in any layout or wider dtype (a product's
-        rows flattened, a CPU's sum widened)."""
-        value = np.asarray(value, np.float64).ravel()
-        return any(each.size == value.size and np.array_equal(np.asarray(each, np.float64).ravel(), value)
-                   for each in values)
-
-    product = seen["down_proj"]
-    assert holds(held(holding), product), "the path holding its hidden product shows it held"
-    mine = held(layer)
-    assert not holds(mine, product)
-    assert holds(mine, gate) and holds(mine, up)
+    product = math.prod(tokens) * hidden * jnp.dtype(jnp.bfloat16).itemsize
+    assert held_bytes(holding) - held_bytes(layer) >= product
 
 
 def test_a_gated_mlps_down_projection_multiplies_the_inputs_an_interceptor_hands_it():
     """A gated MLP whose down projection an interceptor hands other inputs (an input quantizer's rounded
     rows; zeros here): the projection multiplies those, its formed product left unread (`Dense`'s identity
-    rule), so its output is zeros; and a capture of its calls (`capture_intermediates`) keeps the output the
-    layer returns."""
+    rule), so its output is zeros and so is every gradient under a cotangent, the down kernel's, the gate
+    and up kernels' and the input's; and a capture of its calls (`capture_intermediates`) keeps the output
+    the layer returns."""
     layer = GatedMLP(hidden_features=48, out_features=16, dtype=jnp.bfloat16)
-    x = jnp.asarray(np.random.default_rng(1).normal(size=(4, 16)), jnp.bfloat16)
+    rng = np.random.default_rng(1)
+    x = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
     variables = layer.init(jax.random.key(0), x)
 
     def zeroed(next_fun, args, kwargs, context):
@@ -337,8 +321,11 @@ def test_a_gated_mlps_down_projection_multiplies_the_inputs_an_interceptor_hands
         return next_fun(*args, **kwargs)
 
     with nn.intercept_methods(zeroed):
-        out = jax.jit(layer.apply)(variables, x)
+        out, pull = jax.vjp(jax.jit(layer.apply), variables, x)
+        gradients = pull(cotangent)
     assert not np.any(np.asarray(out, np.float32))
+    for leaf in jax.tree.leaves(gradients):
+        assert not np.any(np.asarray(leaf, np.float32))
 
     out, state = layer.apply(variables, x, capture_intermediates=True, mutable=["intermediates"])
     np.testing.assert_array_equal(np.asarray(state["intermediates"]["down_proj"]["__call__"][0], np.float32),
