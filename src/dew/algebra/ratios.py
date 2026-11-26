@@ -238,29 +238,43 @@ def _band_products(products, values, expanded, dtype):
     live_length = functools.reduce(jnp.maximum,
                                    [jnp.max(jnp.asarray(steps), initial=0) for _, _, steps, _ in plans])
 
+    def stacked(arrays):
+        return jnp.stack(jnp.broadcast_arrays(*arrays), axis=-2)
+
     def block(chunk):
         term = chunk * width + jnp.arange(width, dtype=jnp.int32)
-        found = []
+        by_arity: dict[int, list] = {}
         for coefficient, sums, steps, _ in plans:
-            taken = {}
+            taken = []
             index = term
-            for place, each in enumerate(sums):
+            for each in sums:
                 if each in expanded:
                     parts, count = expanded[each]
                     index, pos = jnp.divmod(index, jnp.maximum(count[..., None], 1))
-                    taken[place] = tuple(jnp.take_along_axis(part, pos, axis=-1) for part in parts)
+                    taken.append(tuple(jnp.take_along_axis(part, pos, axis=-1) for part in parts))
                 else:
-                    taken[place] = tuple(part[..., None] for part in values[each])
-            hi, lo, exponent = _product_of(coefficient, tuple(taken), taken, dtype)
-            live = (term < jnp.asarray(steps)[..., None]) & (hi != 0)
+                    taken.append(tuple(part[..., None] for part in values[each]))
+            first = _product_of(coefficient, (0,) if taken else (), taken, dtype)
+            by_arity.setdefault(len(taken), []).append((term < jnp.asarray(steps)[..., None],
+                                                        (first, *taken[1:])))
+        found = []
+        # One multiplier per factor position and arity. A separate multiplier graph per product
+        # duplicates compensated arithmetic in both passes of every window and for every derivative.
+        for group in by_arity.values():
+            masks, factors = zip(*group, strict=True)
+            operands = [tuple(stacked(arrays) for arrays in zip(*factor, strict=True))
+                        for factor in zip(*factors, strict=True)]
+            hi, lo, exponent = functools.reduce(_times, operands)
+            live = stacked(masks) & (hi != 0)
             found.append((jnp.where(live, hi, 0), jnp.where(live, lo, 0),
                           jnp.where(live, exponent, windows._NONE)))
         return [jax.lax.optimization_barrier(tuple(found))]
 
     rank = next(iter(expanded.values()))[0][0].ndim - 1
+    axes = (rank, rank + 1)
     bits = sum(bound for _, _, _, bound in plans).bit_length()
-    (value,) = windows._windows(block, (live_length + width - 1) // width, [(rank,)], [bits], dtype)
-    return tuple(jnp.squeeze(part, rank) for part in value)
+    (value,) = windows._windows(block, (live_length + width - 1) // width, [axes], [bits], dtype)
+    return tuple(jnp.squeeze(part, axes) for part in value)
 
 
 def _products_summed(operands, form: Ratio):
