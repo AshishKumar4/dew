@@ -1794,53 +1794,54 @@ def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_ta
     np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))
 
 
-CERTIFIED_FORMS = {"full": {}, "causal": {"causal": True}, "window": {"causal": True, "sliding_window": 8},
-                   "documents": {"causal": True, "segment_ids": np.asarray([[0] * 10 + [1] * 14])}}
-"""The forms attention's plain-JAX mainloop is certified under: a 24-token call's keys whole, causal, in a
-causal window of 8 and in two packed documents."""
+
+PLAIN_JAX_CERTIFIED = """
+import json, sys
+import jax.numpy as jnp
+import numpy as np
+from certified import certified
+
+from dew.nn.kernels.templates import attention as template, attention_portable
+from dew.nn.kernels.templates.hooks import Hook
+
+dtype, form = getattr(jnp, sys.argv[1]), sys.argv[2]
+forms = {"full": {}, "causal": {"causal": True}, "window": {"causal": True, "sliding_window": 8},
+         "documents": {"causal": True, "segment_ids": np.asarray([[0] * 10 + [1] * 14])}}
+tiles = attention_portable.Tiles(8, 8, 8)
+spans = template.spans(24, 24, 1, **forms[form])
+findings = {}
+capped = template.Hooks(score=Hook(template.Capped(5.0)))
+for hooks, hook in ((template.Hooks(), "plain"), (capped, "capped")):
+    parts = {"forward": lambda q, k, v, do: attention_portable.xla_mainloop(tiles, q, k, v, spans, hooks,
+                                                                            residuals=True),
+             "backward": lambda q, k, v, do: attention_portable.backward(tiles, q, k, v, spans, hooks, do)}
+    for part, fn in parts.items():
+        for seed in range(2):
+            rng = np.random.default_rng([6130, seed])
+            drawn = [jnp.asarray(rng.standard_normal((1, 24, 2, 16)), dtype) for _ in range(4)]
+            if found := certified(fn, *drawn)[1]:
+                findings[f"{part}, {hook}, seed {seed}"] = found[:8]
+print(json.dumps(findings))
+"""
+"""Attention's plain-JAX mainloop certified in a process of its own (argv: its dtype and form), its forward
+with residuals and its backward, plain and under Gemma 2's cap, over two draws: each finding by its case."""
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("form", list(CERTIFIED_FORMS))
-@pytest.mark.parametrize("capped", [False, True], ids=["plain", "capped"])
-def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form, capped, monkeypatch):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("form", ["full", "causal", "window", "documents"])
+def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form):
     """Attention's plain-JAX mainloop, the path every CPU and TPU call runs (`attention_portable`): its
-    forward with residuals (`xla_mainloop`) and its backward from them (`backward`), under each form and
-    plain or under Gemma 2's cap (`template.Capped`), run one primitive at a time, every element of every
-    operation within its own operation's certified contract (check 2, tests/certified.py), over drawn
-    queries, keys, values and output cotangents, its tiles cutting the call into three of each: the
-    library's own program, without the test lane's wide CPU arithmetic."""
-    from certified import assert_certified
+    forward with residuals (`xla_mainloop`) and its backward from them (`backward`), a 24-token call under
+    `form` (its keys whole, causal, in a causal window of 8, in two packed documents), plain and under Gemma
+    2's cap (`template.Capped`), run one primitive at a time, every element of every operation within its
+    own operation's certified contract (check 2, tests/certified.py), over drawn queries, keys, values and
+    output cotangents, its tiles cutting the call into three of each. The library's own program: in a
+    process of its own without the test lane's wide CPU arithmetic, so no program the suite traced under it
+    is taken in its place."""
+    import process_support
 
     from dew.nn import precision
-    from dew.nn.kernels import options
 
-    def released():
-        # The programs earlier tests traced under the suite's wide arithmetic (a jitted helper's trace,
-        # one Dew keeps past jit's caches) traced again without it, and this test's not left to later ones.
-        options.release()
-        jax.clear_caches()
-
-    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
-    released()
-    tiles = attention_portable.Tiles(8, 8, 8)
-    spans = template.spans(24, 24, 1, **CERTIFIED_FORMS[form])
-    hooks = template.Hooks(score=Hook(template.Capped(5.0))) if capped else template.Hooks()
-
-    def forward(q, k, v, do):
-        return attention_portable.xla_mainloop(tiles, q, k, v, spans, hooks, residuals=True)
-
-    def backward(q, k, v, do):
-        return attention_portable.backward(tiles, q, k, v, spans, hooks, do)
-
-    def draw(seed):
-        rng = np.random.default_rng([6130, seed])
-        return tuple(jnp.asarray(rng.standard_normal((1, 24, 2, 16)), dtype) for _ in range(4))
-
-    label = f"{jnp.dtype(dtype).name} {form} {'capped' if capped else 'plain'}"
-    try:
-        assert_certified(forward, draw, f"the plain-JAX forward, {label}", seeds=2)
-        assert_certified(backward, draw, f"the plain-JAX backward, {label}", seeds=2)
-    finally:
-        monkeypatch.undo()
-        released()
+    findings = process_support.fresh(PLAIN_JAX_CERTIFIED, dtype, form, platforms="cpu",
+                                     variables={precision.WIDE_CPU_ARITHMETIC: "0"})
+    assert findings == {}, findings
