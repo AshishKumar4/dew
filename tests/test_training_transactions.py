@@ -745,7 +745,7 @@ def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
     trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0),
                       advanced=TrainerAdvanced(skip_nonfinite=True))
-    trainer._scheduled(1)
+    trainer._horizon(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())
     advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)

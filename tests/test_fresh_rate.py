@@ -171,7 +171,7 @@ def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_gr
         CrossAttention((0,), 8), key=0, frozen=False)
     decision = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     trainer = Trainer(decision, OptimConfig(optimizer=Adam(), lr=RATE, param_groups=named), key=0)
-    trainer._scheduled(4)
+    trainer._horizon(4)
     params = jax.eval_shape(lambda: decision.init(jax.random.key(0)))["params"]
     labels = labelled(OptimConfig(param_groups=(FRESH, BASE)).with_fresh(
         decision.fresh_modules()).param_groups, params)

@@ -269,7 +269,7 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
         readied, loader, _, _, _ = prepared.run.readied(prepared.objective, prepared.dataset, None, (), name)
         trainer = readied.built(prepared.objective, readied.trainer.mesh, None)
         # Its optimizer built over the run's length, as `fit` builds it.
-        trainer._scheduled(settings.horizon.steps)
+        trainer._horizon(settings.horizon.steps)
         return trainer, loader
 
     stepping, loader = built(STEPS, phased(tmp_path), "phased")
