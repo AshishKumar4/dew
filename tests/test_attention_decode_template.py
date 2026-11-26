@@ -1021,10 +1021,10 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     """A decode step's walk whose launch a compile refused (its kernel spilled, `report.refuse_launch`) plans
     that walk again at a config its own launch pins: each walk's plan is its launched op's (`WALKS`), so the
     refusal of the scaled walk's launch steps it down, never pinning it to the config refused (row 5420)."""
-    # 16 rows of 16 heads, 256 programs, past an H100's 132: one slice whatever its dtype.
-    query = jnp.zeros((16, 1, 16, 64), dtype)
-    key = value = jnp.zeros((16, KEYS, 8, 64), dtype)
-    spans = template.spans(1, KEYS, 16, lengths=jnp.full((16,), KEYS, jnp.int32))
+    # 8 rows of 32 heads, 256 programs, past an H100's 132: one slice whatever its dtype.
+    query = jnp.zeros((8, 1, 32, 64), dtype)
+    key = value = jnp.zeros((8, KEYS, 8, 64), dtype)
+    spans = template.spans(1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32))
     with generation.assumed("sm90"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
