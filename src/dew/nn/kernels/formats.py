@@ -671,7 +671,8 @@ class Bf16Window:
         *lead, depth, width = source.shape
         held = np.swapaxes(source.view(np.uint16).astype(np.uint32), -1, -2)
         grouped = held.reshape(*lead, width, depth // group, group)
-        sign, exponent, mantissa = grouped >> 15, (grouped >> 7) & 0xFF, grouped & 0x7F
+        # Its exponents signed: a group whose largest is below the window's binades floors its base at 1.
+        sign, exponent, mantissa = grouped >> 15, ((grouped >> 7) & 0xFF).astype(np.int32), grouped & 0x7F
         zero = (grouped & 0x7FFF) == 0
         normal = exponent > 0
         base = np.maximum(np.where(normal, exponent, 0).max(-1, keepdims=True) - (WINDOW_BINADES - 1), 1)
@@ -699,10 +700,11 @@ class Bf16Window:
         offsets = (nibbles.reshape(*lead, width, depth // 8, 8) << (4 * np.arange(8, dtype=np.uint32))).sum(
             -1, dtype=np.uint32)
         groups = depth // group
-        words = np.concatenate([low.reshape(*lead, width, groups, 2 * 16),
-                                offsets.reshape(*lead, width, groups, 16)], axis=-1)
+        words = np.concatenate([low.reshape(*lead, width, groups, 16 * packed.WINDOW_BYTE_BLOCKS),
+                                offsets.reshape(*lead, width, groups, 16 * packed.WINDOW_NIBBLE_BLOCKS)],
+                               axis=-1)
         return cls(words.reshape(*lead, width, groups * WINDOW_WORDS),
-                   meta.reshape(*lead, width, depth // 32), window_form_version())
+                   meta.reshape(*lead, width, groups * packed.WINDOW_META_WORDS), window_form_version())
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -737,8 +739,8 @@ class Bf16Window:
         groups = count // WINDOW_WORDS
         depth = groups * group
         grouped = words.reshape(*lead, width, groups, WINDOW_WORDS)
-        low = grouped[..., :2 * 16].reshape(*lead, width, depth // 4)
-        offsets = grouped[..., 2 * 16:].reshape(*lead, width, depth // 8)
+        low = grouped[..., :16 * packed.WINDOW_BYTE_BLOCKS].reshape(*lead, width, depth // 4)
+        offsets = grouped[..., 16 * packed.WINDOW_BYTE_BLOCKS:].reshape(*lead, width, depth // 8)
         bytes_ = ((low[..., None] >> (8 * jnp.arange(4, dtype=jnp.uint32))) & 0xFF).reshape(
             *lead, width, depth)
         nibbles = ((offsets[..., None] >> (4 * jnp.arange(8, dtype=jnp.uint32))) & 0xF).reshape(
@@ -746,7 +748,7 @@ class Bf16Window:
         shape = (*lead, width, depth // group, group)
         byte = bytes_[..., np.argsort(window_byte_rows(depth))].reshape(shape)
         offset = nibbles[..., np.argsort(window_nibble_rows(depth))].reshape(shape)
-        words4 = meta.reshape(*lead, width, depth // group, 4)
+        words4 = meta.reshape(*lead, width, depth // group, packed.WINDOW_META_WORDS)
         escapes = tuple(words4[..., 1 + pair // 2, None] >> (16 * (pair % 2)) & 0xFFFF for pair in range(4))
         held = window_bits(byte, offset, words4[..., :1], escapes)
         values = jax.lax.bitcast_convert_type(held.astype(jnp.uint16).reshape(*lead, width, depth),
@@ -754,7 +756,7 @@ class Bf16Window:
         return jnp.swapaxes(values, -1, -2).astype(dtype)
 
 
-WINDOW_WORDS = 48
+WINDOW_WORDS = 16 * (packed.WINDOW_BYTE_BLOCKS + packed.WINDOW_NIBBLE_BLOCKS)
 """The uint32 words a `Bf16Window` group of `packed.WINDOW_GROUP` depths holds a column: its 128 bytes and its
 128 nibbles, three blocks of 16 words its stage streams apart (`packed.weight_format`'s `blocks`)."""
 

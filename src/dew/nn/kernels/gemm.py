@@ -115,7 +115,7 @@ def unbuilt():
         _UNBUILT.reset(token)
 
 
-def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
+def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
          group_sizes: jax.Array | None = None, *,
          transpose_rhs: bool = False, prologue: Hook = NO_HOOK, epilogue: Hook = NO_HOOK, out_dtype,
          out_dtypes: tuple | None = None,
@@ -826,11 +826,13 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
 
 
 def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_bank,
-                         interpret: bool, *, dense: bool):
+                         interpret: bool, *, dense: bool, finite: bool = True):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
     (`ternary_weight_product`, `window_product`) of operands `(rows, words, sizes, *rest)`, its bank
     `make_bank(words, *rest)` (a window's meta among `rest`); callers wrap `linear_tangent` with
-    `contracted(...)`."""
+    `contracted(...)`. Its rows' cotangent is the decoded matrix's products of the cotangent's bfloat16
+    parts where its weights are `finite` (a ternary code's), else the decoded product's own pullback (a
+    window's infinity times a part's zero would be NaN where the one transpose reads it whole)."""
     def decoded(*bank) -> jax.Array:
         [matrices, _] = decoded_operands(make_bank(*bank), None)
         return matrices[0] if dense else matrices
@@ -852,11 +854,15 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
         del saved
         r, w, s, *rest = operands
         matrices = decoded(w, *rest)
-        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
         with xla_products.interpreted_context(interpret):
-            d_rows = functools.reduce(jnp.add, [
-                gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
-                     precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+            if finite:
+                parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+                d_rows = functools.reduce(jnp.add, [
+                    gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
+                         precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+            else:
+                [d_rows] = jax.vjp(lambda rows: decoded_product(rows, matrices, None if dense else s,
+                                                                interpret_on_cpu=interpret), r)[1](cotangent)
         leaves = (d_rows.astype(r.dtype), *(zero_from_primal(each) for each in (w, s, *rest)))
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
@@ -898,7 +904,8 @@ def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | Non
     return ternary.ternary_weight_product(lhs, weights, group_sizes, **kw)
 
 
-def window_product(lhs: jax.Array, window, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
+def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | None = None,
+                   **kw) -> jax.Array:
     """`window.window_product`: a lossless bfloat16 window's product, decoded in the template's stages
     (row 5387)."""
     from .templates.gemm import window as window_module

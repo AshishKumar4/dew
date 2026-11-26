@@ -2,6 +2,8 @@
 again decoded, a group past its escapes refused by its site's name, and a Dense served its window as its
 kernel (`quantization.bf16_windows`), its variables' kernels back bitwise (`decoded_bf16_windows`)."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -45,11 +47,15 @@ def test_a_bf16_window_decodes_every_weight_to_its_bits():
     assert stored / weights.size == 13
 
 
-def test_a_group_past_its_escapes_is_refused_by_its_sites_name():
-    """A group holding more nonzeros below its window than it stores escapes (`WINDOW_ESCAPES`: one weight
-    near 2^0 beside five tiny ones, 2^-20 and less) is refused, naming its site, where no window holds it."""
+def test_a_group_past_its_escapes_is_refused():
+    """A group holding as many nonzeros below its window as it stores escapes (`WINDOW_ESCAPES`: tiny
+    weights, 2^-20, beside 0.25) is held, each weight its bits again; one more is refused, where no window
+    holds it."""
     weights = np.full((128, 4), 0.25, jnp.bfloat16)
-    weights[: WINDOW_ESCAPES + 1, 3] = np.asarray([2.0 ** -20] * (WINDOW_ESCAPES + 1), jnp.bfloat16)
+    weights[:WINDOW_ESCAPES, 3] = np.asarray(2.0 ** -20, jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(Bf16Window.of(weights).decoded()).view(np.uint16),
+                                  weights.view(np.uint16))
+    weights[WINDOW_ESCAPES, 3] = np.asarray(2.0 ** -20, jnp.bfloat16)
     with pytest.raises(ValueError):
         Bf16Window.of(weights, site="layers/q_proj")
 
@@ -65,7 +71,7 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
     x = jnp.asarray(rng.integers(-4, 4, (8, 256)), jnp.bfloat16)
     layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
     variables = {"params": {"kernel": jnp.asarray(kernel), "bias": jnp.asarray(bias, jnp.bfloat16)}}
-    windowed = quantization.bf16_windows(variables)
+    windowed = quantization.bf16_windows(variables, sites=[""])
     assert "kernel" not in windowed["params"]
     rounded = np.asarray(bias.astype(jnp.bfloat16), np.float64)
     want = np.asarray(x, np.float64) @ np.asarray(kernel, np.float64) + rounded
@@ -78,25 +84,40 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
                                   kernel.view(np.uint16))
 
 
+def _two_steps(seed: int = 5387) -> np.ndarray:
+    """`_drawn`'s edges in a first 256-deep step and, in a second, a draw 2**-20 smaller (other bases) with
+    three weights of one group below its window (its escapes): a launch reading step zero's words or meta
+    again decodes the second wrong."""
+    second = _drawn((256, 64), seed + 1)
+    finite = np.isfinite(second.astype(np.float32))
+    second = np.where(finite, (second.astype(np.float32) * np.float32(2.0 ** -20)), 0.0).astype(jnp.bfloat16)
+    second[0:3, 5] = np.asarray(2.0 ** -50, jnp.bfloat16)
+    return np.concatenate([_drawn((256, 64), seed), second])
+
+
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
 def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
-    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, a group near
-    the largest finite, infinities and NaNs) times the rows of the identity, each output entry one weight
-    times one: its product on the template's route, each stage decoded in place (interpreted), and on XLA's,
-    the decoded matrix's, each XLA's plain product of the weights themselves, bit for bit (a NaN where it
-    is NaN), dense and grouped (two groups of 128 rows of finite weights, the second's reversed in its
-    columns); the route each took reported."""
-    weights = _drawn((256, 64))
-    rows = np.eye(256, dtype=jnp.bfloat16)
-    sizes = np.asarray([128, 128], np.int32)
+    """A window over two 256-deep steps (`_two_steps`: signed zeros, subnormals, escapes, a group's floor, a
+    group near the largest finite, infinities and NaNs, and a second step of other bases and escapes) times
+    the rows of the identity, each output entry one weight times one: its product on the template's route,
+    each stage decoded in place (interpreted), and on XLA's, the decoded matrix's, each XLA's plain product
+    of the weights themselves, bit for bit (a NaN where it is NaN), dense and grouped (two groups of
+    finite weights, the second's reversed in its columns, each group's rows the even or the odd depths, so
+    each reads both steps); the route each took reported."""
+    weights = _two_steps()
+    depth = weights.shape[0]
+    rows = np.eye(depth, dtype=jnp.bfloat16)
+    sizes = np.asarray([depth // 2, depth // 2], np.int32)
     if grouped:
         # Finite: XLA's ragged dot reads every group's matrix for every row, so one group's infinity is NaN
         # in the others' rows (row 13562); the dense case holds the non-finite edges.
         weights = np.where(np.isfinite(weights.astype(np.float32)), weights, np.asarray(0.0, jnp.bfloat16))
         stacked = np.stack([weights, weights[:, ::-1]])
+        rows = np.concatenate([rows[0::2], rows[1::2]])
         window = Bf16Window.of(stacked)
+        half = depth // 2
         want = np.concatenate([
-            jax.lax.dot(jnp.asarray(rows[at * 128:(at + 1) * 128]), jnp.asarray(stacked[at]),
+            jax.lax.dot(jnp.asarray(rows[at * half:(at + 1) * half]), jnp.asarray(stacked[at]),
                         preferred_element_type=jnp.float32) for at in range(2)])
     else:
         window = Bf16Window.of(weights)
@@ -116,19 +137,56 @@ def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
                                       err_msg=kernel)
 
 
-def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
-    """A window's launch reads its columns' meta halves beside its words (`gmm`'s `scales`): a staged
-    matrix of a 256-deep step is taken, and a call swapping its matrix into the products' rows, which stream
-    no columns' meta, is refused by name."""
-    from dew.nn.kernels.templates.gemm import packed, tiling
+def test_a_window_products_rows_cotangent_keeps_an_infinite_weight():
+    """A window holding one infinite weight, its product's cotangent of ones pulled back on the template's
+    route (interpreted) and XLA's: the rows' cotangent is XLA's plain product's of the weights (the
+    infinity's depth infinite, no NaN a split cotangent's zero parts would make), bit for bit."""
+    weights = np.full((256, 64), 0.5, jnp.bfloat16)
+    weights[7, 3] = np.asarray(np.inf, jnp.bfloat16)
+    window = Bf16Window.of(weights)
+    rows = jnp.ones((8, 256), jnp.bfloat16)
+    cotangent = jnp.ones((8, 64), jnp.float32)
+    [want] = jax.vjp(lambda rows: jax.lax.dot(rows, jnp.asarray(weights), preferred_element_type=jnp.float32),
+                     rows)[1](cotangent)
+    for kernel in ("mosaic", "xla"):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+            [got] = jax.vjp(lambda rows: gemm.window_product(rows, window, out_dtype=jnp.float32,
+                                                             interpret_on_cpu=True), rows)[1](cotangent)
+        np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32),
+                                      err_msg=kernel)
 
-    tiles = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+
+def test_a_window_holds_a_group_of_the_least_normal_binades():
+    """A group of the least normal bfloat16 binades (`0x0080`, `0x0100`, `0x0180`), fewer than its window's
+    fifteen from the subnormals, takes its window from the least base, its weights decoded to their bits."""
+    bits = np.tile(np.asarray([0x0080, 0x0100, 0x0180, 0x8080], np.uint16), (32, 2))
+    weights = bits.view(jnp.bfloat16).reshape(128, 2)
+    window = Bf16Window.of(weights)
+    np.testing.assert_array_equal(np.asarray(window.decoded()).view(np.uint16), weights.view(np.uint16))
+
+
+def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
+    """A window's launch reads its columns' meta halves beside its words (`gmm`'s `scales`): its staged
+    matrix of a 256-deep step is taken, and a swapped call (its matrix the products' rows, which stream no
+    columns' meta) is refused where the same call of a ternary matrix is taken (an H100's warpgroup MMA)."""
+    from dew.nn.kernels.templates.gemm import packed, pricing, tiling
+
+    tiles = tiling.Tiles(128, 64, 256, 2, 2, family="wgmma")
+    with generation.assumed("sm90"):
+        family = pricing.family_of(tiles, jnp.bfloat16)
     words = jax.ShapeDtypeStruct((1, 64, 256 // 128 * 48), jnp.uint32)
     packed.word_taken(words, "window", tiles, transpose_rhs=True, prologue=None, paired=None,
                       transpose_lhs=False, depth=256, width=64)
-    with pytest.raises(ValueError):
-        packed.word_taken(words, "window", tiles, transpose_rhs=True, prologue=None, paired=None,
-                          transpose_lhs=False, depth=256, width=64, packed_rows=True)
+    for fmt, per_group, group in (("ternary", 16, 256), ("window", 48, 128)):
+        rows = jax.ShapeDtypeStruct((128, 256 // group * per_group), jnp.uint32)
+        swapped = functools.partial(packed.word_taken, words, fmt, tiles, transpose_rhs=True, prologue=None,
+                                    paired=None, transpose_lhs=False, depth=256, width=64, lhs=rows,
+                                    family=family, dense=True, packed_rows=True)
+        if fmt == "ternary":
+            swapped()
+        else:
+            with pytest.raises(ValueError):
+                swapped()
 
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
@@ -151,3 +209,18 @@ def test_a_window_product_compiles_spill_free(gpu: str):
             assert not record.get("error"), record
             assert record["kernels"], record
             assert all(kernel.get("spilled") == 0 for kernel in record["kernels"]), record
+
+
+def test_a_float32_dense_served_its_window_computes_as_its_kernel():
+    """A Dense computing in float32 over a bfloat16 kernel (its dtype float32, its inputs `1 + 2**-9` that
+    bfloat16 rounds away) served its window computes what it computes over its kernel, bit for bit: a
+    window multiplies bfloat16 rows alone (`gemm.window_product`), so the layer multiplies its weights as
+    its kernel there."""
+    rng = np.random.default_rng(5388)
+    kernel = (rng.integers(-64, 64, (128, 64)) / 16.0).astype(jnp.bfloat16)
+    x = jnp.full((4, 128), 1 + 2.0 ** -9, jnp.float32)
+    layer = Dense(64, dtype=jnp.float32, param_dtype=jnp.bfloat16, use_bias=False)
+    variables = {"params": {"kernel": jnp.asarray(kernel)}}
+    plain = jax.jit(layer.apply)(variables, x)
+    served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(plain).view(np.uint32))

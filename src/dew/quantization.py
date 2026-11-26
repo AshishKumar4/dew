@@ -605,9 +605,10 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
-def bf16_windows(variables: Variables, *, sites: Sequence[str] | None = None) -> Variables:
-    """`variables` with each frozen bfloat16 `[in, out]` kernel of `sites` (`/`-joined paths of the layers
-    under `params`; every two-axis bfloat16 kernel where None) stored as its lossless window
+def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
+    """`variables` with each frozen bfloat16 `[in, out]` kernel of `sites` (`/`-joined paths of `dew.nn.Dense`
+    layers under `params`, named, "" the root's: a kernel's rank and name do not say its layer reads a
+    window, a one-axis DenseGeneral's reads its parameter) stored as its lossless window
     (`formats.Bf16Window`, row 5387) in `QUANTIZATION` at its layer's path, its parameter gone, which its
     Dense serves as it is (`dense.packed_matrix`): 13 bits a weight where 16 were, each weight its bits
     again decoded. A kernel no window holds (a group of more escapes than it stores) is refused by its
@@ -618,7 +619,7 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str] | None = None) ->
     kernels = {path[:-1]: leaf for path, leaf in params.items()
                if path[-1] == "kernel" and isinstance(leaf, (jax.Array, np.ndarray)) and jnp.ndim(leaf) == 2
                and jnp.result_type(leaf) == jnp.bfloat16}
-    named = {tuple(site.split("/")) for site in sites} if sites is not None else set(kernels)
+    named = {tuple(part for part in site.split("/") if part) for site in sites}
     if missing := named - set(kernels):
         raise ValueError(f"no two-axis bfloat16 kernel at {sorted('/'.join(site) for site in missing)}")
     windows = {(*site, "kernel"): Bf16Window.of(kernels[site], site="/".join(site)) for site in sorted(named)}

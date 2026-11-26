@@ -481,6 +481,10 @@ class Dense(_LinearEnvelope, nn.Dense):
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
+        if isinstance(kernel, Bf16Window) and _compute_dtype(self, inputs) != jnp.bfloat16:
+            # A window's weights are its kernel's bits again: a layer computing in another dtype multiplies
+            # them as its kernel, promoted as any (`gemm.window_product` multiplies bfloat16 rows).
+            kernel = kernel.decoded()
         if isinstance(kernel, PACKED_FORMATS):
             return self._packed(inputs, kernel)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
@@ -534,6 +538,12 @@ class Dense(_LinearEnvelope, nn.Dense):
         if bias is not None:
             summed = summed + jnp.asarray(bias, jnp.float32)
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
+
+
+def _compute_dtype(layer: nn.Dense, inputs: Array) -> jnp.dtype:
+    """The dtype `layer`'s product multiplies in over a bfloat16 kernel: its own where it states one, else
+    its inputs' promoted with the kernel's (flax's `promote_dtype`)."""
+    return jnp.dtype(layer.dtype if layer.dtype is not None else jnp.result_type(inputs, jnp.bfloat16))
 
 
 def _members(init, batched: int, flat_shape):

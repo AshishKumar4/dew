@@ -45,6 +45,12 @@ WINDOW_GROUP = 128
 """Dew: the depths of a column a bfloat16 window matrix (`formats.Bf16Window`, row 5387) shares a base
 exponent and an escape table over: its nibbles' staged group (`window_nibble_depth`), two of its bytes'."""
 
+WINDOW_BYTE_BLOCKS, WINDOW_NIBBLE_BLOCKS, WINDOW_META_WORDS = 2, 1, 4
+"""Dew: a window group's sixteen-word blocks a column, its bytes' (64 depths a block) then its nibbles'
+(128), and the uint32 words of its meta (its base, its four escapes two a word, a zero word): the one
+geometry its encoder, its decoders, its stream and its price read (`formats.Bf16Window`,
+`weight_format('window')`)."""
+
 
 def window_byte_depth(group, word, code):
     """Dew: the depth `formats.Bf16Window`'s byte plane gives word `word`'s byte `code` (`0..3`) of its
@@ -93,7 +99,7 @@ def _decode_window_lanes(blocks: list[jax.Array], meta: jax.Array, group: int, a
     from dew.nn.kernels import formats
 
     del active
-    first, second, nibbles = blocks
+    *bytes_, nibbles = blocks
     which = jax.lax.broadcasted_iota(jnp.int32, meta.shape, 1)
     halves = meta.astype(jnp.int32)
 
@@ -104,7 +110,7 @@ def _decode_window_lanes(blocks: list[jax.Array], meta: jax.Array, group: int, a
     base, escapes = column(0), tuple(column(half) for half in range(2, 6))
     lanes = []
     for slice_ in range(packed_depth_slices(WINDOW_GROUP)):
-        word = (first, second)[slice_ // 4]
+        word = bytes_[slice_ // 4]
         byte = (word >> jnp.uint32(8 * (slice_ % 4))) & jnp.uint32(0xFF)
         offset = (nibbles >> jnp.uint32(4 * slice_)) & jnp.uint32(0xF)
         held = formats.window_bits(byte, offset, base, escapes)
@@ -148,9 +154,11 @@ def weight_format(name: str) -> PackedWeightFormat:
     if name == "window":
         # A weight's 13 bits; a slice's decode holds its byte and nibble words, its group's base and four
         # escapes a column, and a weight's bits in flight.
+        blocks = WINDOW_BYTE_BLOCKS + WINDOW_NIBBLE_BLOCKS
         return PackedWeightFormat(
-            name="window", group_depth=WINDOW_GROUP, weight_bytes=13 / 8, steps=(WINDOW_STEP,),
-            decode_live=10, decode_lanes=_decode_window_lanes, blocks=3, meta=True)
+            name="window", group_depth=WINDOW_GROUP, weight_bytes=4 * (16 * blocks + WINDOW_META_WORDS)
+            / WINDOW_GROUP, steps=(WINDOW_STEP,), decode_live=10, decode_lanes=_decode_window_lanes,
+            blocks=blocks, meta=True)
     raise ValueError(f"unsupported packed weight format {name!r}; expected 'ternary' or 'window'")
 
 
@@ -212,8 +220,11 @@ def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scal
     desc = weight_format(packed_format) if packed_format is not None else None
 
     def depth(words: int) -> int:
-        return (8 * words if desc is None
-                else words // desc.words_per_group * desc.group_depth)
+        if desc is None:
+            return 8 * words
+        if words % desc.words_per_group:
+            raise ValueError(f"packed({desc.name}) words come {desc.words_per_group} a group, not {words}")
+        return words // desc.words_per_group * desc.group_depth
 
     k, k2 = ((depth(k), k2) if packed_rows
              else (k, depth(k2) if scales is not None or desc is not None else k2))
@@ -221,6 +232,10 @@ def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scal
         if (scales is not None) != desc.meta:
             raise ValueError(f"packed({packed_format}) takes {'its meta halves as' if desc.meta else 'no'} "
                              "scales")
+        halves = (rhs.shape[0], n, k2 // 16)
+        if scales is not None and (scales.dtype != jnp.uint16 or tuple(scales.shape) != halves):
+            raise ValueError(f"packed({packed_format})'s meta halves are uint16 {halves}, not "
+                             f"{scales.dtype} {tuple(scales.shape)}")
         word_taken(rhs, desc.name, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
                    paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
                    lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
