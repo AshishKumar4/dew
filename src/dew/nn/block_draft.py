@@ -49,9 +49,9 @@ from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import rotary_freqs, rotate
 
-CARRIED = 'carried'
+CARRIED = 'taps'
 """The drafter's cache leaf holding each row's mix of its last context token's taps (the Markov head's
-context, vLLM's `f_rnn`)."""
+context, vLLM's `f_rnn`), under its holder (`Carried`)."""
 
 
 class Draft(NamedTuple):
@@ -137,6 +137,61 @@ class Context(NamedTuple):
     count: jax.Array
 
 
+class ContextStore(nn.Module):
+    """A draft layer's cached context: each row's keys and values in a store of its own (`KVSpec`), its
+    cursor each row's count of context tokens."""
+
+    kv_cache: KVCache
+    capacity: int
+    kv_heads: int
+    head_dim: int
+
+    @nn.nowrap
+    def spec(self, rows: int, dtype: Dtype) -> KVSpec:
+        return KVSpec(self.kv_cache, rows, self.capacity, self.kv_heads, self.head_dim, dtype)
+
+    @nn.nowrap
+    def cache_spec(self, rows: int, dtype: Dtype) -> CacheSpec:
+        """The store for `rows` rows of `dtype`, with its cursor."""
+        return {**self.spec(rows, dtype).leaves(), **cursor(rows)}
+
+    @nn.compact
+    def __call__(self, mixed, valid, rows: int, dtype: Dtype, project: Callable) -> Context:
+        """The context of `rows` rows (of `dtype`, the drafter's) after writing `mixed`'s real tokens
+        (`valid`, every one where None) after those the store holds, each projected at its count
+        (`project(mixed, places)`, its keys and values); `mixed` None writes none."""
+        store = KVStore.open(self, self.spec(rows, dtype))
+        if mixed is not None:
+            slots = cache_positions(self, rows, mixed.shape[1], valid)
+            store.write(*project(mixed, jnp.maximum(slots, 0)), slots)
+        else:
+            cache_variables(self, cursor(rows))
+        keys, values = store.read()
+        count = self.get_variable('cache', CURSOR)
+        places = jnp.broadcast_to(jnp.arange(keys.shape[1])[None], (rows, keys.shape[1]))
+        return Context(store.plain(keys), values, places, places < count[:, None], count)
+
+
+class Carried(nn.Module):
+    """The Markov head's carried taps `[rows, D]` a cache holds (`CARRIED`): each row's last real context
+    token's mix."""
+
+    features: int
+
+    @nn.nowrap
+    def cache_spec(self, rows: int, dtype: Dtype) -> CacheSpec:
+        return {CARRIED: Opened((rows, self.features), dtype)}
+
+    @nn.compact
+    def __call__(self, fresh, real, rows: int, dtype: Dtype) -> jax.Array:
+        """The carried taps (of `dtype`, the drafter's) after writing `fresh` `[B, D]` where `real` `[B]`
+        holds (a row with no real token keeps what it carried); `fresh` None writes none."""
+        held = cache_variables(self, self.cache_spec(rows, dtype))[CARRIED]
+        if fresh is not None:
+            kept(held, jnp.where(real[:, None], fresh.astype(dtype), held.value), CARRIED)
+        return held.value
+
+
 class DraftAttention(nn.Module):
     """A draft layer's attention (vLLM's `Inkling2DraftSelfAttention`): queries and keys normed per head
     and rotated at their places, reading the block both ways and the context's keys and values before it,
@@ -161,6 +216,7 @@ class DraftAttention(nn.Module):
         self.o_proj = dense(self.emb_features)
         norm = functools.partial(RMSNorm, epsilon=spec.norm_eps, dtype=self.dtype)
         self.q_norm, self.k_norm, self.k_norm_ctx = norm(), norm(), norm()
+        self.held_context = ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim)
 
     def _heads(self, x, count: int):
         return x.reshape(*x.shape[:-1], count, self.spec.head_dim)
@@ -170,17 +226,6 @@ class DraftAttention(nn.Module):
                                 dtype=at_least_fp32(x.dtype))
         return rotate(x, cos, sin)
 
-    @nn.nowrap
-    def _store(self, rows: int) -> KVSpec:
-        spec = self.spec
-        return KVSpec(self.kv_cache, rows, self.max_seq_len, spec.num_kv_heads, spec.head_dim,
-                      compute_dtype(self, self.dtype))
-
-    @nn.nowrap
-    def cache_spec(self, rows: int) -> CacheSpec:
-        """Its context's store for `rows` rows, with its cursor."""
-        return {**self._store(rows).leaves(), **cursor(rows)}
-
     def context(self, mixed, places):
         """The context's rotated keys and values `[B, M, kv_heads, head_dim]` from the layer's mix of the
         target's taps `mixed` `[B, M, D]` at `places` `[B, M]` (`store_context_kv`)."""
@@ -188,19 +233,11 @@ class DraftAttention(nn.Module):
         keys = self._rotated(self.k_norm_ctx(self._heads(self.k_proj_ctx(mixed), heads)), places)
         return keys, self._heads(self.v_proj_ctx(mixed), heads)
 
-    def held(self, mixed, valid, rows: int) -> Context:
-        """The cached context of `rows` rows after writing `mixed`'s real tokens (`valid`, every one where
-        None) after those the store holds, each at its count; `mixed` None writes none."""
-        store = KVStore.open(self, self._store(rows))
-        if mixed is not None:
-            slots = cache_positions(self, rows, mixed.shape[1], valid)
-            store.write(*self.context(mixed, jnp.maximum(slots, 0)), slots)
-        else:
-            cache_variables(self, cursor(rows))
-        keys, values = store.read()
-        count = self.get_variable('cache', CURSOR)
-        places = jnp.broadcast_to(jnp.arange(keys.shape[1])[None], (rows, keys.shape[1]))
-        return Context(store.plain(keys), values, places, places < count[:, None], count)
+    def held(self, mixed, valid, rows: int, dtype: Dtype) -> Context:
+        """The cached context of `rows` rows of `dtype` after writing `mixed`'s real tokens (`valid`, every
+        one where None) after those the store holds, each at its count (`ContextStore`); `mixed` None writes
+        none."""
+        return self.held_context(mixed, valid, rows, dtype, self.context)
 
     def given(self, mixed, valid) -> Context:
         """The context `mixed` uncached, each real token (`valid`) at its rank among its row's, as a cache
@@ -359,41 +396,40 @@ class BlockDrafter(nn.Module):
                                       jnp.float32)
         self.mask_embed = self.param('mask_embed', nn.initializers.normal(0.02), (self.emb_features,),
                                      jnp.float32)
+        self.carried = Carried(self.emb_features)
 
     @nn.nowrap
     def cache_spec(self, rows: int) -> CacheSpec:
-        """Each layer's context store for `rows` rows, and each row's carried taps (`CARRIED`)."""
-        spec = self.spec
-        store = KVSpec(self.kv_cache, rows, self.max_seq_len, spec.num_kv_heads, spec.head_dim,
-                       compute_dtype(self, self.dtype))
-        return {**{f'layers_{index}': {'self_attn': {**store.leaves(), **cursor(rows)}}
+        """Each layer's context store for `rows` rows (`ContextStore`), and each row's carried taps
+        (`Carried`), each under its holder's name."""
+        spec, dtype = self.spec, compute_dtype(self, self.dtype)
+        store = ContextStore(self.kv_cache, self.max_seq_len, spec.num_kv_heads, spec.head_dim, parent=None)
+        carried = Carried(self.emb_features, parent=None)
+        return {**{f'layers_{index}': {'self_attn': {'held_context': store.cache_spec(rows, dtype)}}
                    for index in range(spec.layers)},
-                CARRIED: Opened((rows, self.emb_features), compute_dtype(self, self.dtype))}
+                'carried': carried.cache_spec(rows, dtype)}
 
     def contexts(self, taps, valid, rows: int, decode: bool) -> tuple[list[Context], jax.Array]:
         """Each layer's context and the Markov head's carried taps `[B, D]`: cached, after writing the
         real tokens of `taps` `[B, M, T * D]` (`valid`, every one where None; None writes none) and carrying
         each row's last; uncached, of `taps` as given."""
         weights = jax.nn.softmax(self.fuse_weight.astype(at_least_fp32(self.fuse_weight.dtype)), axis=-1)
+        # The drafter's activations' dtype, which its cache keeps them in (`cache_spec`).
+        dtype = compute_dtype(self, self.dtype)
         if not decode and taps is None:
             raise ValueError("uncached, a block drafter reads its whole context, given")
         contexts = []
         for index, layer in enumerate(self.layers):
             mixed = None if taps is None else fused_taps(taps, weights[index], layer.dflare_norm)
-            contexts.append(layer.self_attn.held(mixed, valid, rows) if decode
+            contexts.append(layer.self_attn.held(mixed, valid, rows, dtype) if decode
                             else layer.self_attn.given(mixed, valid))
         carried = None if taps is None else self._carried(taps, valid, weights[-1])
         if not decode:
             assert carried is not None
             fresh, real = carried
             return contexts, jnp.where(real[:, None], fresh, jnp.zeros_like(fresh))
-        held = cache_variables(self, {CARRIED: Opened((rows, self.emb_features),
-                                                      compute_dtype(self, self.dtype))})[CARRIED]
-        if carried is not None:
-            # A row with no real token in the call keeps what it carried.
-            fresh, real = carried
-            kept(held, jnp.where(real[:, None], fresh.astype(held.value.dtype), held.value), CARRIED)
-        return contexts, held.value
+        fresh, real = (None, None) if carried is None else carried
+        return contexts, self.carried(fresh, real, rows, dtype)
 
     def _carried(self, taps, valid, weights) -> tuple[jax.Array, jax.Array]:
         """Each row's last real context token's taps mixed for the Markov head (`compute_f_rnn` over vLLM's
