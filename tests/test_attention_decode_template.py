@@ -1027,7 +1027,9 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     query = jnp.zeros((24, 1, 16, 64), dtype)
     key = value = jnp.zeros((24, KEYS, 8, 64), dtype)
     spans = template.spans(1, KEYS, 24, lengths=jnp.full((24,), KEYS, jnp.int32))
-    with generation.assumed("sm90"):
+    # An fp32 walk's parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at
+    # HIGHEST.
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
         assert work[walk].slices == 1

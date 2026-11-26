@@ -1788,7 +1788,7 @@ def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
     at the default precision is taken, and refused under HIGHEST (row 13498): its parts' products sum in
     the tensor cores' accumulator, 11.8 to 16.8 times the reference's error there (M-NA-48), which an fp32
     product above the default precision asks exact (`product.promoted`); another mainloop takes it."""
-    query = jax.ShapeDtypeStruct((1, 128, 2, 64), jnp.float32)
+    query = jnp.zeros((1, 128, 2, 64), jnp.float32)
     spans = template.spans(128, 128, 1, causal=True)
     with generation.assumed("sm90"):
         family = attention_mosaic_program.bundle("sm90", jnp.float32)
