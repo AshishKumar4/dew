@@ -131,16 +131,19 @@ class SurrogateBodies:
         def tangent(*values):
             *fixed, primals, directions, value = values
             case = self.cases.get(tuple(fixed))
-            inactive = tuple(i for i, direction in enumerate(directions) if isinstance(direction, SymbolicZero))
+            inactive = tuple(i for i, direction in enumerate(directions)
+                             if isinstance(direction, SymbolicZero))
             component = None if case is None else case.tangents.get(inactive)
             if case is not None and component is not None:
-                active = tuple(direction for direction in directions if not isinstance(direction, SymbolicZero))
+                active = tuple(direction for direction in directions
+                               if not isinstance(direction, SymbolicZero))
                 operands = (*primals, *active, *jax.tree.leaves(value))
                 if _case_admitted(component.cases, operands, policy, target):
                     return emitted(case.tangent_name(inactive))(*operands, policy=policy, target=target)
             return self.tangent(*values)
 
-        return surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums, symbolic_zeros=self.symbolic_zeros)
+        return surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
+                         symbolic_zeros=self.symbolic_zeros)
 
 
 def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:

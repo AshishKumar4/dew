@@ -8,9 +8,9 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, declare
 
 from dew.algebra import bits
+from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, declare
 from dew.nn import precision
 from dew.nn.kernels import formats, recurrence_algebra, ssd
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
@@ -784,7 +784,8 @@ def _mxfp8_epilogue_truth(acc):
     exponent, scale = _mx_scale_truth(jnp.max(jnp.abs(blocks), axis=-1, keepdims=True))
     narrowed = jnp.clip(jnp.ldexp(blocks, -exponent), -448, 448).astype(jnp.float8_e4m3fn)
     codes = jax.lax.bitcast_convert_type(narrowed, jnp.uint8)
-    return codes.reshape(acc.shape), jnp.broadcast_to(scale, blocks.shape).astype(jnp.uint8).reshape(acc.shape)
+    scale_codes = jnp.broadcast_to(scale, blocks.shape).astype(jnp.uint8)
+    return codes.reshape(acc.shape), scale_codes.reshape(acc.shape)
 
 
 def _mxfp8_draw(seed, operands):

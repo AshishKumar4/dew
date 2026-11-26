@@ -14,6 +14,7 @@ _MIN_SHARED = 6
 _MIN_WHOLE = 3
 _MAX_SHARED = 64
 """Long repeats can share several readable helpers rather than one oversized body."""
+_SHIFTS = ("lax.shift_left_p", "lax.shift_right_logical_p")
 
 
 class _Fragment(ast.NodeTransformer):
@@ -288,12 +289,13 @@ def _static_argument(expr: ast.expr, dimensions: dict[str, tuple[int, ...]]) -> 
         if any(part is None for part in parts):
             return None
         return f"({', '.join(part for part in parts if part is not None)}{',' if len(parts) == 1 else ''})"
-    if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Attribute) and expr.value.attr == "shape":
+    if (isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Attribute)
+            and expr.value.attr == "shape"):
         base = expr.value.value
         if (isinstance(base, ast.Name) and base.id in dimensions and isinstance(expr.slice, ast.Constant)
                 and type(expr.slice.value) is int):
             return repr(dimensions[base.id][expr.slice.value])
-    if isinstance(expr, ast.Attribute) and ast.unparse(expr) in ("lax.shift_left_p", "lax.shift_right_logical_p"):
+    if isinstance(expr, ast.Attribute) and ast.unparse(expr) in _SHIFTS:
         return ast.unparse(expr)
     if (isinstance(expr, ast.Call) and ast.unparse(expr.func) == "jnp.dtype"
             and len(expr.args) == 1 and isinstance(expr.args[0], ast.Constant)):
