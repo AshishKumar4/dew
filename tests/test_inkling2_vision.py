@@ -140,3 +140,60 @@ def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
     for given in ({**single, 'image_grid_thw': np.asarray([[1]])}, single):
         with pytest.raises(ValueError):
             processor.from_hf(given)
+
+
+def _bundle_with_tokenizer(directory):
+    """The vision bundle beside a word-level tokenizer whose image placeholder is the bundle's
+    (`IMAGE_TOKEN`), as the release's tokenizer holds `<|unused_200054|>`."""
+    import shutil
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    for path in BUNDLE.glob('*'):
+        shutil.copy(path, directory / path.name)
+    vocabulary = {'[PAD]': 0, **{f'w{index}': index + 1 for index in range(10)}, '<|image|>': IMAGE_TOKEN}
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token='[PAD]'))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token='[PAD]', unk_token='[PAD]',
+                                        additional_special_tokens=['<|image|>'])
+    tokenizer.save_pretrained(directory)
+    return directory
+
+
+def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_them(tmp_path):
+    """Inkling 2's release names `Inkling2Processor`, which no transformers Dew supports ships: Dew's own
+    (`dew.interop.inkling_media`, chosen by its model type whatever processor files the release ships)
+    pads, standardizes and cuts raw images (an RGB one of no whole merged tokens, an RGBA one over its
+    checkerboard, one of whole tokens) into the merged blocks and grids transformers' records, bit for bit;
+    and a public raw-image call (`Pretrained.processor`) lays a prompt around an image out as the model
+    reads the reference's fields (`Processor.from_hf`), each placeholder as many as the image's merged
+    tokens (row 13251)."""
+    from tool_support import run_from
+
+    from dew.interop.inkling_media import InklingProcessor
+
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    processor = loaded.processor._media_reference
+    assert isinstance(processor, InklingProcessor)
+    with np.load(BUNDLE / 'recorded_processor.npz') as recorded:
+        expected = {name: recorded[name] for name in recorded.files if not name.endswith('provenance')}
+    with run_from('inkling2_fixture', 'tools') as module:
+        images = module.processor_draws()
+    for name, image in images.items():
+        fields = processor(text='w1 <|image|>', images=[image])
+        for field in ('pixel_values', 'image_grid_thw'):
+            np.testing.assert_array_equal(fields[field], expected[f'{name}.{field}'],
+                                          err_msg=f'{name} {field}')
+    image = images['rgb']
+    rows, columns = expected['rgb.image_grid_thw'][0, 1:]
+    ids = np.asarray([[2, *[IMAGE_TOKEN] * int(rows * columns), 3]], np.int64)
+    read = loaded.processor('w1 <|image|> w2', images=[image])
+    reference = loaded.processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
+                                          'pixel_values': expected['rgb.pixel_values'],
+                                          'image_grid_thw': expected['rgb.image_grid_thw']})
+    np.testing.assert_array_equal(np.asarray(read.tokens), ids)
+    for name, value in reference.conditioning.items():
+        np.testing.assert_array_equal(np.asarray(read.conditioning[name]), np.asarray(value), err_msg=name)
