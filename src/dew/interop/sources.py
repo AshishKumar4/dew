@@ -191,6 +191,21 @@ class SourceReference:
                         weights=True if requested == ("",) else requested)
 
 
+def with_sidecars(tensors: Mapping[str, Stored], sidecars: Mapping[str, str], source: SourceReference,
+                  root: Path, *, weights: bool) -> Mapping[str, Stored]:
+    """`tensors` with those of each file of `sidecars` (a file beside the weights to the prefix its tensors
+    are read under, `DecoderFamily.sidecars`) that `source` holds, read whole or, without its weights, by
+    its header alone."""
+    held = None
+    for filename, prefix in sidecars.items():
+        stored = ((None if (path := source.optional_file(root, filename)) is None else tensor_file(path))
+                  if weights else source.stored_file(root, filename, optional=True))
+        if stored is not None:
+            held = dict(tensors) if held is None else held
+            held.update({prefix + name: tensor for name, tensor in stored.items()})
+    return tensors if held is None else held
+
+
 def missing_weights(source: str, files: Collection[str]) -> str:
     """Say what a source without safetensors weights or transformers'
     PyTorch pickles ships instead, and what loads."""

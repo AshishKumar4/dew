@@ -7,7 +7,7 @@ transformers predates: it runs in the suite's environment with that transformers
     uv pip install --target .inkling2 --no-deps \
         'transformers @ git+https://github.com/huggingface/transformers@3a96649547593bacad4b65d43442ccdf15d0ae0f'
     PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py \
-        [--quantized] [--recording]
+        [--quantized | --draft] [--recording]
 
 tests/fixtures/hf/inkling2-tiny/ is a random Inkling2LoopForCausalLM at `TEXT`, the release's text config
 (thinkingmachines/Inkling-2-Mini's config.json) at eight layers: two global, one inside the loop's core
@@ -19,7 +19,10 @@ reads back to the same weights, as the write checks. `--recording` records inste
 seeds, whole and at the shapes a cached decode computes them (`STEPPED`), against its float64 twin, as
 recorded_logits.npz there (`recorded_references.record_logits`). `--quantized` writes or records
 inkling2-tiny-nvfp4 instead: the same model with its experts stored as the release stores them
-(`quantized_experts`), which transformers dequantizes on read (`Inkling2LoopDequantizeExperts`).
+(`quantized_experts`), which transformers dequantizes on read (`Inkling2LoopDequantizeExperts`). `--draft`
+writes the tiny multi-token-prediction draft beside inkling2-tiny's decoder (`DRAFT`, the release's
+`mtp.safetensors` and `mtp_config`), and with `--recording` records the decoder's taps and the draft's
+logits through vLLM's draft ported (tools/inkling2_draft_reference.py) as recorded_draft.npz there.
 """
 
 import argparse
@@ -348,28 +351,206 @@ def write_vision_recording() -> None:
          reference=reference, license='Apache-2.0')
 
 
+def processor_draws() -> dict[str, np.ndarray]:
+    """The raw images the processor recording reads, `[height, width, channels]` uint8: an RGB image
+    whose sides are no whole merged tokens, an RGBA one laid over the checkerboard, and an RGB one of
+    whole merged tokens."""
+    rng = np.random.default_rng(0x13251)
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    return {'rgb': rng.integers(0, 256, (13, 21, 3), np.uint8),
+            'rgba': rng.integers(0, 256, (17, 9, 4), np.uint8),
+            'whole': rng.integers(0, 256, (2 * side, 3 * side, 3), np.uint8)}
+
+
+def write_processor_recording() -> None:
+    """transformers' Inkling2ImageProcessor at the tiny bundle's merged-token side, over each of
+    `processor_draws`' images: its `pixel_values` and `image_grid_thw`, as recorded_processor.npz in
+    inkling2-vision-tiny (row 13251)."""
+    import transformers
+    from recorded_references import provenance, save
+    from transformers.models.inkling2.image_processing_inkling2 import Inkling2ImageProcessor
+
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    processor = Inkling2ImageProcessor(size={'height': side, 'width': side})
+    fields = {}
+    for name, image in processor_draws().items():
+        out = processor(images=[image], return_tensors='np')
+        fields[f'{name}.pixel_values'] = np.asarray(out['pixel_values'])
+        fields[f'{name}.image_grid_thw'] = np.asarray(out['image_grid_thw'])
+    reference = 'Inkling2ImageProcessor (transformers)'
+    command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py '
+               '--vision --processor')
+    record = provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu', command,
+                        transformers=transformers.__version__)
+    save(VISION_TINY / 'recorded_processor.npz', {**fields, 'processor.provenance': record},
+         reference=reference, license='Apache-2.0')
+
+
+DRAFT = {
+    'hidden_size': TEXT['hidden_size'], 'num_hidden_layers': 3, 'num_attention_heads': 4,
+    'num_key_value_heads': 2, 'head_dim': 16, 'intermediate_size': 96,
+    'max_position_embeddings': TEXT['model_max_length'], 'torch_dtype': 'bfloat16', 'q_bias': False,
+    'o_bias': False, 'rms_norm_eps': 1e-06, 'rope_theta': 1000000.0,
+    'local_layer_ids': [0, 2], 'sliding_window_size': 16, 'block_size': 8, 'markov_rank': 16,
+    'markov_head_type': 'rnn_hidden', 'target_layer_ids': [1, 7, 13, 16]}
+"""The tiny draft's config, in the release's fields (its config.json's mtp_config): the release's three
+layers, the outer two local, at the decoder's width, over a window shorter than the drawn ids; its taps a
+prelude layer's visit, the core's second pass's (visit 7, layer 3) and its third's last (visit 13, layer 5),
+and the final states (visit 16, the decoder's count: 2 + 4 x 3 + 2)."""
+
+
+def draft_tensors() -> dict[str, torch.Tensor]:
+    """The tiny draft's weights in the release's names, shapes and dtype (`mtp.safetensors`, bf16): random,
+    its norms' weights about one, its taps' mixing weights apart."""
+    c, rows = DRAFT, TEXT['vocab_size']
+    width, rank, heads = c['hidden_size'], c['markov_rank'], c['head_dim']
+    generator = torch.Generator().manual_seed(12945)
+
+    def normal(*shape, scale=0.08):
+        return torch.randn(*shape, generator=generator) * scale
+
+    def norm(size):
+        return 1.0 + normal(size, scale=0.1)
+
+    tensors = {'fuse_weight': normal(c['num_hidden_layers'] + 1, len(c['target_layer_ids']), scale=1.0),
+               'mask_embed': normal(width, scale=1.0), 'norm.weight': norm(width),
+               'markov_head.dflare_norm.weight': norm(width),
+               'markov_head.hidden_out.weight': normal(width, rank, scale=0.3),
+               'markov_head.hidden_out.bias': normal(width),
+               'markov_head.markov_w1.weight': normal(rows, rank, scale=1.0),
+               'markov_head.rnn_proj.weight': normal(3 * rank, 2 * rank + 2 * width, scale=0.2),
+               'markov_head.rnn_proj.bias': normal(3 * rank)}
+    queries, keys = c['num_attention_heads'] * heads, c['num_key_value_heads'] * heads
+    for layer in range(c['num_hidden_layers']):
+        own = {'input_layernorm.weight': norm(width), 'post_attention_layernorm.weight': norm(width),
+               'dflare_norm.weight': norm(width), 'self_attn.q_norm.weight': norm(heads),
+               'self_attn.k_norm.weight': norm(heads), 'self_attn.k_norm_ctx.weight': norm(heads),
+               'self_attn.q_proj.weight': normal(queries, width),
+               'self_attn.k_proj.weight': normal(keys, width), 'self_attn.v_proj.weight': normal(keys, width),
+               'self_attn.o_proj.weight': normal(width, queries),
+               'self_attn.k_proj_ctx.weight': normal(keys, width),
+               'self_attn.v_proj_ctx.weight': normal(keys, width),
+               'mlp.gate_proj.weight': normal(c['intermediate_size'], width),
+               'mlp.up_proj.weight': normal(c['intermediate_size'], width),
+               'mlp.down_proj.weight': normal(width, c['intermediate_size'])}
+        tensors.update({f'layers.{layer}.{name}': tensor for name, tensor in own.items()})
+    return {name: tensor.to(torch.bfloat16).contiguous() for name, tensor in tensors.items()}
+
+
+def write_draft() -> None:
+    """The tiny draft beside inkling2-tiny's decoder (row 12945): its weights as the release's
+    `mtp.safetensors` and its config as the wrapper's `mtp_config`, the decoder's files as they are."""
+    from safetensors.torch import save_file
+
+    save_file(draft_tensors(), TINY / 'mtp.safetensors', metadata={'format': 'pt'})
+    wrapper = json.loads((TINY / 'config.json').read_text())
+    (TINY / 'config.json').write_text(json.dumps({**wrapper, 'mtp_config': DRAFT}, indent=2) + '\n')
+
+
+DRAFT_SHAPE = (2, 40)
+"""The ids' shape the draft's recording draws: the context, the anchor drawn after it."""
+
+
+def draft_draw(seed: int) -> dict[str, np.ndarray]:
+    """A draft recording's draw: ids over the head's rows, each row's anchor and the tokens fed back at
+    each drafted place (`forced`), uniform over the head's rows."""
+    rng = np.random.default_rng(seed)
+    rows, vocabulary = DRAFT_SHAPE[0], TEXT['unpadded_vocab_size']
+    return {'input_ids': rng.integers(0, vocabulary, DRAFT_SHAPE).astype(np.int32),
+            'anchor': rng.integers(0, vocabulary, (rows,)).astype(np.int32),
+            'forced': rng.integers(0, vocabulary, (rows, DRAFT['block_size'] - 1)).astype(np.int32)}
+
+
+def write_draft_recording() -> None:
+    """inkling2-tiny's decoder as transformers reads it (eager) and its draft as vLLM runs it, ported
+    (tools/inkling2_draft_reference.py), in fp32 (`draft`) and in bf16 (`draft_bf16`, the release's dtype,
+    the decoder's weights rounded to it), against their float64 twin, over check 1's seeds (`record_case`,
+    its summary): each seed's taps (`context`: the tapped visits' partial blocks and the final states) and
+    the draft's logits after them from its anchor, each place fed its `forced` token before it (`logits`),
+    as recorded_draft.npz there (row 12945)."""
+    import jax
+    import transformers
+    from inkling2_draft_reference import VLLM, Draft, visit_taps
+    from recorded_references import provenance, record_case, save
+    from safetensors.torch import load_file
+
+    from _dew_torch.precision import float64
+
+    model, wide = text_pair(TINY)
+    narrow = text_model(TINY, torch.bfloat16)
+    stored = load_file(TINY / 'mtp.safetensors')
+    visits = DRAFT['target_layer_ids'][:-1]
+
+    def outputs(network, drawn, dtype):
+        ids = torch.from_numpy(drawn['input_ids'].astype(np.int64))
+        taps = visit_taps(network, ids, visits)
+        drafter = Draft(stored, DRAFT, network.model.embed_tokens, network.lm_head.weight,
+                        TEXT['final_logit_softcapping'], dtype)
+        with torch.no_grad():
+            logits = drafter.draft(taps, torch.from_numpy(drawn['anchor'].astype(np.int64)),
+                                   torch.from_numpy(drawn['forced'].astype(np.int64)))
+        # A bf16 array as its fp32 value, which holds it exactly.
+        return {name: (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+                for name, value in (('context', taps), ('logits', logits))}
+
+    def evaluate_at(network, dtype):
+        def evaluate(drawn):
+            with float64():
+                truth = outputs(wide, drawn, torch.float64)
+            return outputs(network, drawn, dtype), truth
+        return evaluate
+
+    recording = {}
+    with jax.enable_x64(new_val=True):
+        for site, network, dtype in (('draft', model, torch.float32), ('draft_bf16', narrow, torch.bfloat16)):
+            recording.update(record_case(site, draft_draw, evaluate_at(network, dtype), store_inputs=False,
+                                         summary=True))
+    command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py '
+               '--draft --recording')
+    reference = f'Inkling2LoopForCausalLM (transformers) and vLLM {VLLM} Inkling2DSparkModel (ported)'
+    records = {f'{site}.provenance': provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu',
+                                                command, torch=torch.__version__, dtype=dtype,
+                                                attention='eager', transformers=transformers.__version__,
+                                                vllm=VLLM)
+               for site, dtype in (('draft', 'float32'), ('draft_bf16', 'bfloat16'))}
+    save(TINY / 'recorded_draft.npz', {**recording, **records}, reference=reference, license='Apache-2.0')
+
+
 def draw(seed: int) -> dict[str, np.ndarray]:
     """Check 1's ids, uniform over the embedding's rows."""
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
 
 
-def write_recording(directory: Path) -> None:
-    """The fixture at `directory` as transformers reads it, its experts dequantized where stored quantized,
-    fp32 on eager attention, and its float64 twin, recorded over check 1's seeds, whole and stepped."""
-    import transformers
-    from recorded_references import record_logits
-
-    from _dew_torch.precision import float64_twin
-
+def text_model(directory: Path, dtype: torch.dtype = torch.float32):
+    """The fixture at `directory` as transformers reads it at `dtype` (its router's weights fp32, as its
+    class keeps them), its experts dequantized where stored quantized, on eager attention."""
     configuration, modeling = _modeling()
     config = configuration.Inkling2LoopTextConfig(**TEXT)
     model = modeling.Inkling2LoopForCausalLM.from_pretrained(
-        directory, config=config, dtype=torch.float32, attn_implementation='eager').eval()
+        directory, config=config, dtype=dtype, attn_implementation='eager').eval()
     # The experts' own loop (`Inkling2LoopExperts.forward`), which runs in float64 as torch's grouped
     # products do not; its modules read the choice off the config at each call (integrations/moe.py:633).
     model.config._experts_implementation = 'eager'
+    return model
+
+
+def text_pair(directory: Path):
+    """The fixture at `directory` in fp32 (`text_model`) and its float64 twin."""
+    from _dew_torch.precision import float64_twin
+
+    _, modeling = _modeling()
+    model = text_model(directory)
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
     truth.config._experts_implementation = 'eager'
+    return model, truth
+
+
+def write_recording(directory: Path) -> None:
+    """The fixture at `directory` (`text_pair`) recorded over check 1's seeds, whole and stepped."""
+    import transformers
+    from recorded_references import record_logits
+
+    model, truth = text_pair(directory)
     flag = ' --quantized' if directory == QUANTIZED else ''
     command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py'
                f'{flag} --recording')
@@ -387,8 +568,16 @@ if __name__ == '__main__':
                         help="the bundle of the tiny decoder beside a tiny vision tower and merger")
     parser.add_argument('--recording', action='store_true',
                         help="record the tiny model's logits over the seeds")
+    parser.add_argument('--processor', action='store_true',
+                        help="record transformers' image processor's fields over drawn raw images")
+    parser.add_argument('--draft', action='store_true',
+                        help="the tiny multi-token-prediction draft beside the tiny decoder")
     arguments = parser.parse_args()
-    if arguments.vision:
+    if arguments.draft:
+        write_draft_recording() if arguments.recording else write_draft()
+    elif arguments.vision and arguments.processor:
+        write_processor_recording()
+    elif arguments.vision:
         write_vision_recording() if arguments.recording else write_vision()
     elif arguments.recording:
         write_recording(QUANTIZED if arguments.quantized else TINY)

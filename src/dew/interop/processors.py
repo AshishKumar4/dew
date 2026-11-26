@@ -75,11 +75,19 @@ def _mimo_processor(tokenizer: PreTrainedTokenizerBase, config: Mapping[str, obj
     return MiMoProcessor(tokenizer, config)
 
 
+def _inkling_processor(tokenizer: PreTrainedTokenizerBase, config: Mapping[str, object]) -> HostProcessor:
+    from dew.interop.inkling_media import InklingProcessor
+
+    return InklingProcessor(tokenizer, config)
+
+
 OWN_PROCESSORS: Mapping[str, Callable[[PreTrainedTokenizerBase, Mapping[str, object]], HostProcessor]] = {
-    "mimo_v2": _mimo_processor}
-"""The processor Dew runs, by a source's model type, for a release that ships none and states its
-processing in its config.json: MiMo-V2.6's (`processor_config`), as vLLM's MiMo processor runs it
-(`dew.interop.mimo_media`)."""
+    "mimo_v2": _mimo_processor, "inkling2_loop": _inkling_processor, "inkling2_loop_text": _inkling_processor}
+"""The processor Dew runs, by a source's model type, whatever processor files its release ships: one whose
+release ships none and states its processing in its config.json, MiMo-V2.6's (`processor_config`, as
+vLLM's MiMo processor runs it: `dew.interop.mimo_media`), and one whose release names a processor no
+transformers Dew supports ships, Inkling 2's (`Inkling2Processor`, absent from transformers 5.17, where
+AutoProcessor falls back to the tokenizer: `dew.interop.inkling_media`, row 13251)."""
 
 
 def chat_images(messages: Sequence[Mapping[str, object]], reader: str) -> list[Media | str | bytes]:
@@ -121,7 +129,27 @@ def _chat_image(image: object) -> Media | str | bytes:
 type MediaInput = Media | str | bytes | bytearray | Path | Sequence[MediaInput]
 
 
-def _is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
+def chat_call(processor: HostProcessor, tokenizer: PreTrainedTokenizerBase,
+              conversation: Sequence[Mapping[str, object]], name: str,
+              **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]:
+    """A Dew-owned processor's chat (`OWN_PROCESSORS`'): the tokenizer's template over `conversation`; asked
+    for its tokens as named fields (`tokenize`, `return_dict`), the template's text and its image parts'
+    images (`chat_images`) through `processor`'s own call, as a release's processor reads a chat. `name`
+    names the source in a refusal."""
+    if not hosts(tokenizer):
+        raise TypeError(f"{name}'s tokenizer lacks a host processor operation")
+    if not (kwargs.get("tokenize") and kwargs.get("return_dict")):
+        return tokenizer.apply_chat_template(conversation, **kwargs)
+    options = {key: value for key, value in kwargs.items()
+               if key not in ("tokenize", "return_dict", "return_tensors")}
+    text = tokenizer.apply_chat_template(conversation, tokenize=False, **options)
+    if not isinstance(text, str):
+        raise TypeError(f"{name}'s chat template must render text")
+    return processor(text=text, images=_as_host_media(chat_images(conversation, type(processor).__name__)),
+                     return_tensors=_records.text(kwargs.get("return_tensors", "np"), "return_tensors"))
+
+
+def is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
     """Whether `value` is a sequence of media items rather than one atomic path, byte buffer or array."""
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
@@ -306,6 +334,11 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
             "left" if side == "left" else "right")
 
 
+row_padding = _row_padding
+"""The padding policy a processor of Dew's own pads its text rows by (`InklingProcessor`), the host
+processors' own (`_row_padding`): one owner of it."""
+
+
 def _row_start(reference: HostProcessor) -> int | None:
     """Return the id the tokenizer starts a sequence with, or None, read at the
     boundary `_row_padding` reads its padding at: off the tokenizer a
@@ -347,13 +380,13 @@ class Processor:
     def _media_reference(self) -> HostProcessor:
         if self.directory is None:
             raise ValueError("this source ships no media processor")
+        from transformers import PreTrainedTokenizerBase
+
+        own = OWN_PROCESSORS.get(_records.text(self.config.get("model_type", ""), "model_type"))
+        if own is not None and isinstance(self.reference, PreTrainedTokenizerBase):
+            return own(self.reference, self.config)
         if not any((self.directory / name).exists() for name in ("processor_config.json",
                                                                  "preprocessor_config.json")):
-            from transformers import PreTrainedTokenizerBase
-
-            own = OWN_PROCESSORS.get(_records.text(self.config.get("model_type", ""), "model_type"))
-            if own is not None and isinstance(self.reference, PreTrainedTokenizerBase):
-                return own(self.reference, self.config)
             raise ValueError(f"{self.config.get('model_type')} ships no processor of its own: hand the model "
                              "its processed fields (`from_hf`)")
         from transformers import AutoProcessor
@@ -408,10 +441,10 @@ class Processor:
         rows = [text] if isinstance(text, str) else list(text)
         # One image (an array, a PIL image, a path or bytes) or a sequence of them.
         given: list[MediaInput] = (
-            [] if images is None else list(images) if _is_image_collection(images) else [images]
+            [] if images is None else list(images) if is_image_collection(images) else [images]
         )
         per_row = len(rows) > 1 and len(given) == len(rows) and all(
-            _is_image_collection(entry) for entry in given
+            is_image_collection(entry) for entry in given
         )
         image_id, _ = _media_token_ids(self.record)
         blocks = self._merge_size() ** 2
@@ -419,7 +452,7 @@ class Processor:
         for index, row in enumerate(rows):
             if per_row:
                 entry = given[index]
-                taken = list(entry) if _is_image_collection(entry) else [entry]
+                taken = list(entry) if is_image_collection(entry) else [entry]
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]
