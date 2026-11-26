@@ -176,7 +176,7 @@ def test_a_swapped_converting_tiles_stage_is_converted_once_between_its_consumer
                         converted.Codes(jax.ShapeDtypeStruct((1, 192, 256), jnp.float8_e4m3fn)),
                         jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
                         trans_rhs=True, interpret=True, dense=True, exact_sums=False)
-    tile = dataclasses.replace(ORIENTATIONS["swapped"], warpgroups=2)
+    tile = dataclasses.replace(ORIENTATIONS["swapped"], block_m=128, warpgroups=2)
     itemsizes, decoded = launch._operand_bytes(bound, tile)
     assert decoded == ((2, 1), None)
     with generation.assumed("sm80"):
