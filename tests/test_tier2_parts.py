@@ -239,12 +239,13 @@ FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
           "qwen3-5-hybrid": _DELTA_NETS,
           # Every layer's feed-forward dense (`mlp_only_layers`), which a hybrid's routed block is not read.
           "qwen3-next-hybrid": {**_DELTA_NETS, "mlp_only_layers": [0, 1]},
-          # A delta attention layer beside a latent one, both feed-forwards dense (`mlp_layer_types`).
+          # A delta attention layer beside a latent one, both feed-forwards dense (`mlp_layer_types`), the
+          # latent's keys a head each (its keys expand to every head, as DeepSeek's do).
           "kimi-linear-hybrid": {"linear_num_heads": 2, "linear_head_dim": 16, "linear_conv_kernel_dim": 4,
                                  "layer_types": ["linear_attention", "full_attention"],
                                  "mlp_layer_types": ["dense", "dense"], "q_lora_rank": None,
                                  "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
-                                 "v_head_dim": 16},
+                                 "v_head_dim": 16, "num_key_value_heads": 4},
           # The rotary turns DeepSeek's rotated slice of each head (`qk_rope_head_dim`).
           "latent": {"head_dim": 8, "num_key_value_heads": 4}}
 """Each source's config fields beside `TINY`."""
