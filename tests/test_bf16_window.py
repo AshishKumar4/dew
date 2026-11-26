@@ -80,28 +80,24 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
 def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
-    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, a group
-    anchored high) beside rows of small integers: its product on the template's route, each stage
-    decoded in place (interpreted), and on XLA's, the decoded matrix's, each the float64 product of its
-    weights rounded once to fp32 (each product exact, its sums exact in fp32), dense and grouped (two groups
-    of 3 and 5 rows); the route each took reported."""
+    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, a group near
+    the largest finite, infinities and NaNs) times the rows of the identity, each output entry one weight
+    times one: its product on the template's route, each stage decoded in place (interpreted), and on XLA's,
+    the decoded matrix's, each XLA's plain product of the weights themselves, bit for bit (a NaN where it
+    is NaN), dense and grouped
+    (two groups of 128 rows, the second's weights reversed in its columns); the route each took reported."""
     weights = _drawn((256, 64))
-    finite = np.isfinite(np.asarray(weights, np.float32))
-    # Its infinities and NaNs zeroed, and its group near the largest finite lowered by 2**-120 exactly (still
-    # a group anchored high in its window), as no finite sum holds them: the decode of each bit pattern is
-    # `test_a_bf16_window_decodes_every_weight_to_its_bits`' (one `window_bits` either way).
-    weights = np.where(finite, weights, np.asarray(0.0, jnp.bfloat16))
-    weights[128:256, 2] = (weights[128:256, 2].astype(np.float32) * np.float32(2.0 ** -120)).astype(
-        jnp.bfloat16)
-    window = Bf16Window.of(weights)
-    rows = np.random.default_rng(5387).integers(-3, 4, (8, 256)).astype(jnp.bfloat16)
-    sizes = np.asarray([3, 5], np.int32)
+    rows = np.eye(256, dtype=jnp.bfloat16)
+    sizes = np.asarray([128, 128], np.int32)
     if grouped:
-        window = Bf16Window.of(np.stack([weights, weights[:, ::-1]]))
-        held = np.stack([weights, weights[:, ::-1]]).astype(np.float64)
-        want = np.concatenate([rows[:3].astype(np.float64) @ held[0], rows[3:].astype(np.float64) @ held[1]])
+        stacked = np.stack([weights, weights[:, ::-1]])
+        window = Bf16Window.of(stacked)
+        want = np.concatenate([
+            jax.lax.dot(jnp.asarray(rows[at * 128:(at + 1) * 128]), jnp.asarray(stacked[at]),
+                        preferred_element_type=jnp.float32) for at in range(2)])
     else:
-        want = rows.astype(np.float64) @ weights.astype(np.float64)
+        window = Bf16Window.of(weights)
+        want = jax.lax.dot(jnp.asarray(rows), jnp.asarray(weights), preferred_element_type=jnp.float32)
     for kernel in ("mosaic", "xla"):
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
               generation.routes() as seen):
@@ -109,7 +105,12 @@ def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
                 rows, window, jnp.asarray(sizes) if grouped else None, out_dtype=jnp.float32,
                 interpret_on_cpu=True))(jnp.asarray(rows))
         assert any(route.kernel == kernel for route in seen), (kernel, seen)
-        np.testing.assert_array_equal(np.asarray(got), want.astype(np.float32), err_msg=kernel)
+        got, held = np.asarray(got), np.asarray(want)
+        # A column holding an infinity is NaN in every row (its zeros times it); every other entry its bits.
+        np.testing.assert_array_equal(np.isnan(got), np.isnan(held), err_msg=kernel)
+        finite = ~np.isnan(held)
+        np.testing.assert_array_equal(got[finite].view(np.uint32), held[finite].view(np.uint32),
+                                      err_msg=kernel)
 
 
 def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
