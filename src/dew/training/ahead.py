@@ -720,9 +720,10 @@ class AheadPrograms:
     convolution compiled without its GPU, as `compile_programs` reads one for its memory alone), which
     `loaded` refuses on any GPU (row 8688)."""
     kept: dict[str, KeptProgram] | None = None
-    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
-    `keeping`): a process of their target runs each for a call that lowers to that program under those
-    options (`kept`); None for a file of named programs alone."""
+    """The programs a process compiled at Dew's compile point, each by its fingerprint on its devices
+    (`options.placed`; `KeptProgram`, `keeping`): a process of their target runs each for a call that lowers
+    to that program under those options over those devices (`kept`); None for a file of named programs
+    alone."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -865,7 +866,9 @@ class Keeping:
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
                                   "outside the process's default backend"
             return
-        self.kept[fingerprint] = KeptProgram(program.called, serialized, tuple(device.id for device in ran))
+        devices = tuple(device.id for device in ran)
+        # By its devices too (`options.placed`): one program kept for two of a host's devices is two.
+        self.kept[options.placed(fingerprint, devices)] = KeptProgram(program.called, serialized, devices)
 
     def save(self, path: str | Path) -> AheadPrograms:
         """Write the programs kept so far to `path` with this process's target, for `kept` in a process of
@@ -935,7 +938,10 @@ def kept(path: str | Path) -> Iterator[AheadPrograms]:
                      "every call compiles: %s", path, "; ".join(differences))
         yield programs
         return
-    with options.taking({fingerprint: each.loaded for fingerprint, each in programs.kept.items()}):
+    # Each by its fingerprint on the devices it was compiled for (`options.placed`): loaded onto those, it
+    # runs a call lowered over them alone.
+    with options.taking({options.placed(key.partition("@")[0], each.devices): each.loaded
+                         for key, each in programs.kept.items()}):
         yield programs
 
 

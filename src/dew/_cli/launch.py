@@ -374,8 +374,8 @@ class Launch:
         ordinals from `first`, as JAX_LOCAL_DEVICE_IDS named them; else its places among the GPUs the pool's
         list (--env, or this machine's own here) shows as CUDA enumerates it on the host (`verified_visible`,
         `listed_on`), refused before any process starts where that enumeration is not known (the host lists
-        none of its GPUs, a MIG device, one GPU named twice), as no process could be shown its own alone, or
-        where the list shows too few (row 13104)."""
+        none of its GPUs, a MIG device, one GPU named twice, indices and UUIDs mixed), as no process could be
+        shown its own alone, or where the list shows too few (rows 13104, 13118)."""
         environment = self.host_env(host)
         if not runs_on_gpu(environment):
             return None
@@ -386,8 +386,9 @@ class Launch:
         if listed is None:
             raise ValueError(f"CUDA_VISIBLE_DEVICES={visible} cannot be split among {host}'s processes, each "
                              f"shown its own alone: the host did not list its GPUs (nvidia-smi -L), or the "
-                             f"list names a MIG device or one GPU twice, whose enumeration CUDA decides; "
-                             f"name whole GPUs once each, or launch one process a host")
+                             f"list names a MIG device, one GPU twice or mixes indices and UUIDs, whose "
+                             f"enumeration CUDA decides; name whole GPUs once each, all by index or all by "
+                             f"UUID, or launch one process a host")
         if first + devices > len(listed):
             raise ValueError(f"{host}'s CUDA_VISIBLE_DEVICES={visible} shows {len(listed)} of its GPUs, too "
                              f"few for a process taking {devices} from its {first}th; ask for fewer with "
