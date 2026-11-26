@@ -5,6 +5,7 @@ taps: tools/inkling2_fixture.py --draft writes the tiny draft beside tests/fixtu
 and records both there (recorded_draft.npz)."""
 
 import json
+import shutil
 from pathlib import Path
 
 import jax
@@ -14,6 +15,7 @@ import pytest
 from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
+from dew.batch import coordinates as laid_out
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.inputs import ModelInputs
@@ -26,6 +28,8 @@ SHAPE = (2, 40)
 """The ids' shape the recorder drew: the context, the anchor drawn after it."""
 SPLIT = 24
 """Where the cached draft's context is cut: written in two calls, the second appending to the first."""
+ACCEPTED = (5, 1)
+"""Each row's tokens of the second call a verification accepted, the rest padding (a block's replay)."""
 
 
 def draw(seed):
@@ -49,21 +53,34 @@ def forcing(forced):
     return lambda index, logits: forced[:, index]
 
 
-def drafted(model, variables, inputs):
-    """The taps over the drawn ids and the draft's logits after them, uncached."""
+def drafted(model, variables, inputs, valid=None):
+    """The taps over the drawn ids and the draft's logits after them, uncached, over the context's real
+    tokens (`valid`, every one where None)."""
     context = context_of(model, variables, inputs['input_ids'])
+    coordinates = None if valid is None else laid_out(valid.shape, valid=valid)
     draft = model.apply(variables, context, inputs['anchor'], decode=False, choose=forcing(inputs['forced']),
-                        method='draft')
+                        coordinates=coordinates, method='draft')
     return {'context': context, 'logits': draft.logits}
 
 
+def accepted():
+    """The real tokens of a context whose `SPLIT` first are a prefill's and whose next are a replayed
+    block's, each row's `ACCEPTED` of them, the rest padding."""
+    kept = SPLIT + jnp.asarray(ACCEPTED)[:, None]
+    return jnp.arange(SHAPE[1])[None, :] < kept
+
+
 def cached(model, variables, inputs):
-    """The draft's logits after its context written to its cache in two calls (`SPLIT`), drafted from it."""
+    """The draft's logits after its context written to its cache in two calls, the prefill's (`SPLIT`) then
+    a block's whose rows a verification accepted apart (`accepted`), drafted from it."""
     context = context_of(model, variables, inputs['input_ids'])
     _, opened = model.apply(variables, SHAPE[0], method='init_draft_cache', mutable=['cache'])
     cache = opened['cache']
-    for part in (context[:, :SPLIT], context[:, SPLIT:]):
-        _, written = model.apply({**variables, 'cache': cache}, part, None, method='draft', mutable=['cache'])
+    valid = accepted()
+    for part in (slice(0, SPLIT), slice(SPLIT, SHAPE[1])):
+        _, written = model.apply({**variables, 'cache': cache}, context[:, part], None,
+                                 coordinates=laid_out(valid[:, part].shape, valid=valid[:, part]),
+                                 method='draft', mutable=['cache'])
         cache = written['cache']
     draft, _ = model.apply({**variables, 'cache': cache}, None, inputs['anchor'],
                            choose=forcing(inputs['forced']), method='draft', mutable=['cache'])
@@ -78,33 +95,57 @@ def source():
 
 @attending('reference')
 @pytest.mark.parametrize('leaf', ['context', 'logits'])
-def test_its_taps_and_draft_are_on_par_with_the_releases(source, leaf):
-    """The release-layout load's fp32 taps (each tapped visit's partial block, a looped layer's at its
-    pass, and the final states: `context`) and its draft's logits after them, each place fed the drawn
-    token before it (`logits`), on par with transformers' taps and vLLM's draft over them from their
-    float64 run's (check 1, the recording's), Dew's own float64 run the truth."""
+@pytest.mark.parametrize(('site', 'dtype'), [('draft', 'float32'), ('draft_bf16', 'bfloat16')])
+def test_its_taps_and_draft_are_on_par_with_the_releases(source, site, dtype, leaf):
+    """The release-layout load's taps (each tapped visit's partial block, a looped layer's at its pass,
+    and the final states: `context`) and its draft's logits after them, each place fed the drawn token
+    before it (`logits`), in fp32 and in bf16 (the release's own dtype, where every rounding point of the
+    draft's arithmetic shows: its fused adds and norms, its attention's scores and weights, its taps'
+    weights, its logits' sum before their cap), on par with transformers' taps and vLLM's draft over them
+    at that dtype from their float64 run's (check 1, the recording's), Dew's own float64 run the truth."""
     model, variables = source.model, source.variables
+    narrow = source if dtype == 'float32' else Pretrained.load(TINY, dtype=dtype)
     wide, held = model.clone(dtype=jnp.float64), widened(variables)
     truth_of = jax.jit(lambda inputs: drafted(wide, held, inputs)[leaf])
-    seeds = declared_seeds(RECORDED)['draft']
+    seeds = declared_seeds(RECORDED)[site]
     recorded, reference, truth = indexed_recording(
-        recording(RECORDED), 'draft', seeds, truth_fn=lambda inputs: {leaf: truth_of(inputs)},
+        recording(RECORDED), site, seeds, truth_fn=lambda inputs: {leaf: truth_of(inputs)},
         inputs_of=draw, leaves=(leaf,))
-    run = jax.jit(lambda inputs: drafted(model, variables, inputs)[leaf])
-    assert_as_exact(lambda index, inputs: {leaf: run(inputs)}, reference, recorded, 'Inkling 2 draft',
-                    seeds=seeds, truth_fn=truth)
+    run = jax.jit(lambda inputs: drafted(narrow.model, narrow.variables, inputs)[leaf])
+    assert_as_exact(lambda index, inputs: {leaf: run(inputs)}, reference, recorded,
+                    f'Inkling 2 draft ({dtype})', seeds=seeds, truth_fn=truth)
 
 
 @attending('reference')
-def test_a_cached_draft_is_on_par_with_its_whole_context(source):
-    """The draft after its context written to its cache in two calls, each row's places counted on, on par
-    with the draft over the whole context uncached (check 1, the uncached in float64 the truth)."""
+def test_a_cached_draft_after_a_partly_accepted_block_is_on_par_with_its_whole_context(source):
+    """The draft after its context written to its cache in two calls, the second a replayed block each row
+    of which a verification accepted apart (five tokens and one, the rest padding), each row's places
+    counted on and its Markov head's taps its last accepted token's, on par with the draft over that whole
+    context uncached (check 1, the uncached in float64 the truth)."""
     model, variables = source.model, source.variables
     wide, held = model.clone(dtype=jnp.float64), widened(variables)
-    whole = jax.jit(lambda variables, inputs: drafted(model, variables, inputs)['logits'])
-    truth = jax.jit(lambda _, inputs: drafted(wide, held, inputs)['logits'])
+    whole = jax.jit(lambda variables, inputs: drafted(model, variables, inputs, accepted())['logits'])
+    truth = jax.jit(lambda _, inputs: drafted(wide, held, inputs, accepted())['logits'])
     assert_as_exact(jax.jit(lambda variables, inputs: cached(model, variables, inputs)), whole,
                     lambda seed: (variables, draw(seed)), 'Inkling 2 cached draft', seeds=8, truth_fn=truth)
+
+
+def test_a_count_of_passes_is_refused_where_the_taps_are_recorded(source):
+    """A forward recording the draft's taps over fewer passes than the loop's (`loop_passes`) is refused:
+    its taps name visits in the loop's order, which a skipped pass would leave zeros in place of."""
+    ids = jnp.asarray(draw(0)['input_ids'])
+    source.model.apply(source.variables, ids, loop_passes=jnp.int32(2))
+    with pytest.raises(ValueError):
+        source.model.apply(source.variables, ids, loop_passes=jnp.int32(2), mutable=['prediction_inputs'])
+
+
+def test_a_load_keeping_no_prediction_depths_reads_no_draft(tmp_path):
+    """`prediction_depths=0` loads the decoder alone: no draft is built nor its `mtp.safetensors` read, so
+    a copy of the release without that file loads, where the whole release builds the draft."""
+    for name in ('config.json', 'model.safetensors'):
+        shutil.copy(TINY / name, tmp_path / name)
+    assert Pretrained.load(TINY, dtype='float32', weights=False).model.block_draft is not None
+    assert Pretrained.load(tmp_path, dtype='float32', prediction_depths=0).model.block_draft is None
 
 
 @attending('reference')

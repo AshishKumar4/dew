@@ -31,7 +31,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import prefix_sum
 from dew.nn.activations import logistic, silu
-from dew.nn.attention import reference_attention
+from dew.nn.attention import Products, reference_attention
 from dew.nn.dense import Dense
 from dew.nn.kv_cache import (
     CURSOR,
@@ -47,7 +47,7 @@ from dew.nn.kv_cache import (
     kept,
 )
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.precision import at_least_fp32, capped_logits, float32_dot_general
 from dew.nn.rope import rotary_freqs, rotate
 
 CARRIED = 'taps'
@@ -125,6 +125,13 @@ def fused_taps(taps, weights, norm: nn.Module):
     wide = at_least_fp32(taps.dtype)
     split = taps.reshape(*taps.shape[:-1], weights.shape[0], -1).astype(wide)
     return norm(jnp.sum(split * weights.astype(wide)[:, None], axis=-2)).astype(taps.dtype)
+
+
+def added_norm(norm: nn.Module, x, residual) -> tuple[jax.Array, jax.Array]:
+    """The stream `residual + x`, summed in at least fp32 and rounded to the stream's dtype, and `norm` of
+    the unrounded sum in `x`'s: FlashInfer's `fused_add_rmsnorm`, as vLLM's draft adds and norms."""
+    summed = residual.astype(at_least_fp32(residual.dtype)) + x.astype(at_least_fp32(x.dtype))
+    return summed.astype(residual.dtype), norm(summed).astype(x.dtype)
 
 
 class Context(NamedTuple):
@@ -265,10 +272,15 @@ class DraftAttention(nn.Module):
             seen = seen & (context.places >= anchor - spec.window)
         allowed = jnp.concatenate([jnp.broadcast_to(seen[:, None], (rows, length, seen.shape[1])),
                                    jnp.ones((rows, length, length), bool)], axis=-1)
+        # The scores of the rounded queries and keys in at least fp32, scaled after their product, and their
+        # weights unrounded over the values widened, the output rounded once (the draft's attention, vLLM's
+        # `block_decode_attention`).
+        wide = at_least_fp32(x.dtype)
         attended = reference_attention(query, jnp.concatenate([context.keys, keys], axis=1),
                                        jnp.concatenate([context.values, values], axis=1),
-                                       mask=allowed[:, None], precision=self.precision)
-        return self.o_proj(attended.reshape(rows, length, spec.num_heads * spec.head_dim))
+                                       mask=allowed[:, None], wide_logits=True,
+                                       precision=Products(self.precision, self.precision, weighted=wide))
+        return self.o_proj(attended.astype(x.dtype).reshape(rows, length, spec.num_heads * spec.head_dim))
 
 
 class DraftMLP(nn.Module):
@@ -293,7 +305,7 @@ class DraftMLP(nn.Module):
 
 class DraftLayer(nn.Module):
     """A pre-norm draft layer (vLLM's `Inkling2DraftLayer`): its norm before the attention takes the
-    stream's sum with the layer before's output, as before its MLP (`RMSNorm.seam`); its taps' norm
+    stream's sum with the layer before's output, as before its MLP (`added_norm`); its taps' norm
     (`dflare_norm`) normalizes its mix of them."""
 
     spec: MarkovBlockDraft
@@ -318,8 +330,9 @@ class DraftLayer(nn.Module):
         """The layer's MLP output and the stream before it, from the layer before's output `x` and its
         stream `residual` (None into the first layer, whose stream `x` is)."""
         residual, normed = ((x, self.input_layernorm(x)) if residual is None
-                            else self.input_layernorm.seam(residual, x))
-        residual, normed = self.post_attention_layernorm.seam(residual, self.self_attn(normed, context))
+                            else added_norm(self.input_layernorm, x, residual))
+        attended = self.self_attn(normed, context)
+        residual, normed = added_norm(self.post_attention_layernorm, attended, residual)
         return self.mlp(normed), residual
 
 
@@ -414,9 +427,11 @@ class BlockDrafter(nn.Module):
         """Each layer's context and the Markov head's carried taps `[B, D]`: cached, after writing the
         real tokens of `taps` `[B, M, T * D]` (`valid`, every one where None; None writes none) and carrying
         each row's last; uncached, of `taps` as given."""
-        weights = jax.nn.softmax(self.fuse_weight.astype(at_least_fp32(self.fuse_weight.dtype)), axis=-1)
-        # The drafter's activations' dtype, which its cache keeps them in (`cache_spec`).
+        # The drafter's activations' dtype, which its cache keeps them in (`cache_spec`), the taps' weights
+        # rounded to it after their softmax (vLLM's `refresh_derived_weights`).
         dtype = compute_dtype(self, self.dtype)
+        weights = jax.nn.softmax(self.fuse_weight.astype(at_least_fp32(self.fuse_weight.dtype)),
+                                 axis=-1).astype(dtype)
         if not decode and taps is None:
             raise ValueError("uncached, a block drafter reads its whole context, given")
         contexts = []
@@ -451,7 +466,7 @@ class BlockDrafter(nn.Module):
         residual = None
         for layer, context in zip(self.layers, contexts, strict=True):
             x, residual = layer(x, residual, context)
-        return self.norm.seam(residual, x)[1]
+        return added_norm(self.norm, x, residual)[1]
 
     def markov_context(self, hidden, carried):
         """The Markov head's context part of every step (`MarkovHead.context`)."""
@@ -462,26 +477,33 @@ class BlockDrafter(nn.Module):
         return self.markov_head.step(state, previous, context)
 
 
-def draft(drafter: BlockDrafter, taps, valid, tokens, embed: Callable, logits_of: Callable, *, decode: bool,
-          choose: Callable | None = None) -> Draft | None:
+def draft(drafter: BlockDrafter, taps, valid, tokens, embed: Callable, scores_of: Callable,
+          softcap: float | None, *, decode: bool, choose: Callable | None = None) -> Draft | None:
     """One drafting pass of `drafter` (vLLM's `Inkling2DSparkSpeculator`): its context from `taps` `[B, M,
     T * D]`, the real tokens `valid` marks (every one where None), written to its cache where `decode` (None
     drafts after what the cache holds), and with `tokens` `[B]` drawn after it a block drafted, each token
-    chosen by `choose(index, logits)` or greedily where None, its logits the target's head (`logits_of`) over
-    the place's states and its correction; `tokens` None writes the context alone and returns None. `embed`
-    embeds the anchor as the target's first layer reads it."""
+    chosen by `choose(index, logits)` or greedily where None; `tokens` None writes the context alone and
+    returns None. `embed` embeds the anchor as the target's first layer reads it. A place's logits are the
+    target head's scores (`scores_of`, before its cap) of its states and of its correction, each rounded to
+    the states' dtype, summed and rounded again, then capped at `softcap` (vLLM's `markov_logits`,
+    `add_softcap`)."""
     rows = (tokens if tokens is not None else taps).shape[0]
     contexts, carried = drafter.contexts(taps, valid, rows, decode)
     if tokens is None:
         return None
     hidden = drafter.states(embed(tokens), contexts)[:, 1:]
+    narrow, wide = hidden.dtype, at_least_fp32(hidden.dtype)
+
+    def rounded(x):
+        return x.astype(narrow).astype(wide)
+
+    base = rounded(scores_of(hidden))
     context = drafter.markov_context(hidden, carried)
-    state = jnp.zeros((rows, drafter.spec.markov_rank), hidden.dtype)
-    wide = at_least_fp32(hidden.dtype)
+    state = jnp.zeros((rows, drafter.spec.markov_rank), narrow)
     drafted, scored = [tokens.astype(jnp.int32)], []
     for index in range(drafter.spec.block_size - 1):
         state, correction = drafter.markov_step(state, drafted[-1], context[:, index])
-        logits = logits_of(hidden[:, index].astype(wide) + correction.astype(wide))
+        logits = rounded(capped_logits(rounded(base[:, index] + rounded(scores_of(correction))), softcap))
         chosen = jnp.argmax(logits, axis=-1) if choose is None else choose(index, logits)
         drafted.append(chosen.astype(jnp.int32))
         scored.append(logits)

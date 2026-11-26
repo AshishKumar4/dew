@@ -363,6 +363,13 @@ _DRAFT_LAYER_LEAVES: Leaves = {
 """A draft layer's tensors, below `layers.{layer}.`."""
 
 
+def _draft_kept(config: Mapping[str, object], kept: int) -> dict:
+    """The release's config as a checkpoint of its first `kept` prediction depths
+    (`DecoderFamily.whole_drafter`): its draft, one drafter, kept at any count and none at 0, where neither
+    it nor its `mtp.safetensors` is read."""
+    return {'mtp_config': None} if kept == 0 and config.get('mtp_config') else {}
+
+
 def _drafting(config: Config, slots: Mapping[str, str]) -> bool:
     """Whether the record carries the block drafter the draft's tensors fill."""
     return isinstance(config.get('block_draft'), Mapping)
@@ -521,6 +528,7 @@ INKLING2 = DecoderFamily(
     routes=_ROUTES,
     prepare=_inkling2_prepare,
     sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
+    whole_drafter=_draft_kept,
     preserve_source_layout=True,
     wrapper=_inkling2_wrapper,
 )

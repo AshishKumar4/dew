@@ -26,6 +26,7 @@ logits through vLLM's draft ported (tools/inkling2_draft_reference.py) as record
 """
 
 import argparse
+import copy
 import json
 import re
 from pathlib import Path
@@ -462,11 +463,12 @@ def draft_draw(seed: int) -> dict[str, np.ndarray]:
 
 
 def write_draft_recording() -> None:
-    """inkling2-tiny's decoder as transformers reads it (fp32, eager) and its draft as vLLM runs it, ported
-    (tools/inkling2_draft_reference.py), each with its float64 twin, over check 1's seeds (`record_case`, its
-    summary): each seed's taps (`context`: the tapped visits' partial blocks and the final states) and the
-    draft's logits after them from its anchor, each place fed its `forced` token before it (`logits`), as
-    recorded_draft.npz there (row 12945)."""
+    """inkling2-tiny's decoder as transformers reads it (eager) and its draft as vLLM runs it, ported
+    (tools/inkling2_draft_reference.py), in fp32 (`draft`) and in bf16 (`draft_bf16`, the release's dtype,
+    the decoder's weights rounded to it), against their float64 twin, over check 1's seeds (`record_case`,
+    its summary): each seed's taps (`context`: the tapped visits' partial blocks and the final states) and
+    the draft's logits after them from its anchor, each place fed its `forced` token before it (`logits`),
+    as recorded_draft.npz there (row 12945)."""
     import jax
     import transformers
     from inkling2_draft_reference import VLLM, Draft, visit_taps
@@ -476,6 +478,7 @@ def write_draft_recording() -> None:
     from _dew_torch.precision import float64
 
     model, wide = text_pair(TINY)
+    narrow = copy.deepcopy(model).to(torch.bfloat16)
     stored = load_file(TINY / 'mtp.safetensors')
     visits = DRAFT['target_layer_ids'][:-1]
 
@@ -487,23 +490,31 @@ def write_draft_recording() -> None:
         with torch.no_grad():
             logits = drafter.draft(taps, torch.from_numpy(drawn['anchor'].astype(np.int64)),
                                    torch.from_numpy(drawn['forced'].astype(np.int64)))
-        return {'context': taps.numpy(), 'logits': logits.numpy()}
+        # A bf16 array as its fp32 value, which holds it exactly.
+        return {name: (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+                for name, value in (('context', taps), ('logits', logits))}
 
-    def evaluate(drawn):
-        with float64():
-            truth = outputs(wide, drawn, torch.float64)
-        return outputs(model, drawn, torch.float32), truth
+    def evaluate_at(network, dtype):
+        def evaluate(drawn):
+            with float64():
+                truth = outputs(wide, drawn, torch.float64)
+            return outputs(network, drawn, dtype), truth
+        return evaluate
 
+    recording = {}
     with jax.enable_x64(new_val=True):
-        recording = record_case('draft', draft_draw, evaluate, store_inputs=False, summary=True)
+        for site, network, dtype in (('draft', model, torch.float32), ('draft_bf16', narrow, torch.bfloat16)):
+            recording.update(record_case(site, draft_draw, evaluate_at(network, dtype), store_inputs=False,
+                                         summary=True))
     command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py '
                '--draft --recording')
     reference = f'Inkling2LoopForCausalLM (transformers) and vLLM {VLLM} Inkling2DSparkModel (ported)'
-    record = provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu', command,
-                        torch=torch.__version__, dtype='float32', attention='eager',
-                        transformers=transformers.__version__, vllm=VLLM)
-    save(TINY / 'recorded_draft.npz', {**recording, 'draft.provenance': record}, reference=reference,
-         license='Apache-2.0')
+    records = {f'{site}.provenance': provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu',
+                                                command, torch=torch.__version__, dtype=dtype,
+                                                attention='eager', transformers=transformers.__version__,
+                                                vllm=VLLM)
+               for site, dtype in (('draft', 'float32'), ('draft_bf16', 'bfloat16'))}
+    save(TINY / 'recorded_draft.npz', {**recording, **records}, reference=reference, license='Apache-2.0')
 
 
 def draw(seed: int) -> dict[str, np.ndarray]:

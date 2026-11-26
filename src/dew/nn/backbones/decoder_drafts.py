@@ -75,7 +75,7 @@ def draft(decoder: CausalTransformer, context, tokens, *, decode: bool = True,
     valid = context_validity(decoder, context, coordinates)
     if decoder.block_draft is not None:
         return markov_draft(decoder.block_drafter, context, valid, tokens, decoder.anchor_embeddings,
-                           decoder.logits_from_hidden, decode=decode, choose=choose)
+                            decoder.head_scores, decoder.final_logit_softcap, decode=decode, choose=choose)
     if decoder.dspark is None:
         raise ValueError("this model has no block drafter")
     hc = decoder.hyper_connections

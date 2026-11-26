@@ -1169,6 +1169,10 @@ class CausalTransformer(LinearProducts):
         return level_of(self.continuum_level, index).step_terms(
             hidden, parts, functools.partial(decoder_head.quantizer, self), passed)
 
+    def head_scores(self, x):
+        """The head's scores of `x` before the final logit cap (`decoder_head.head_scores`)."""
+        return decoder_head.head_scores(self, x)
+
     def head_logits(self, x):
         """The fp32 head over states past the continuum levels (`continuum_states`), or final states
         (`decoder_head.head_logits`)."""

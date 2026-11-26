@@ -1728,6 +1728,9 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
     parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
     the CPU's float32 witness reaches XLA's arithmetic alone."""
+    from unittest import mock
+
+    from dew.nn.kernels import recurrence_chunk
     from dew.nn.kernels.lowered import kernel_calls
 
     torch.manual_seed(0)
@@ -1742,23 +1745,29 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     def loss(params):
         return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
 
-    def launches(function) -> list:
-        # The kernels a lowered program calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's,
-        # the recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
-        return [call for call in kernel_calls(jax.jit(function).lower(params))
-                if call.kind in ("triton", "mosaic_gpu")]
+    # The queries', keys' and values' dtypes each call of the delta rule takes, as the tier-3 part hands
+    # them over (`torchax_kernels._dew_chunk_rule` reads the rule off its module at each call).
+    handed = []
+    rule = recurrence_chunk.chunk_gated_delta_rule
 
-    stepped = launches(jax.grad(loss))
+    def recorded(query, key, value, *args, **kwargs):
+        handed.append((query.dtype, key.dtype, value.dtype))
+        return rule(query, key, value, *args, **kwargs)
+
+    with mock.patch.object(recurrence_chunk, "chunk_gated_delta_rule", recorded):
+        # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's,
+        # the recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
+        stepped = [call for call in kernel_calls(jax.jit(jax.grad(loss)).lower(params))
+                   if call.kind in ("triton", "mosaic_gpu")]
     names = sorted({call.name for call in stepped})
     for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
         assert any(name.startswith(kernel) for name in names), (kernel, names)
-    # The delta rule's launches: the step's beyond its forward's are its backward's, each over the bf16
-    # queries, keys and values a native layer's port takes, where float32 ones took the portable math.
-    delta = [call for call in stepped if call.name.startswith(DELTA_LAUNCHES)]
-    forward = [call for call in launches(loss) if call.name.startswith(DELTA_LAUNCHES)]
-    assert forward and len(delta) > len(forward), (len(forward), len(delta), names)
-    assert any(kind == "bf16" for call in forward for _, kind in call.signature[0]), [
-        call.signature[0] for call in forward]
+    # The delta rule takes the projections' bf16 operands, as a native layer's port does, and its kernels
+    # run its step forward and backward (`DELTA_LAUNCHES`: fla's `*_bwd_*`, the template's `*_back*`).
+    assert handed and set(handed) == {(jnp.dtype(jnp.bfloat16),) * 3}, handed
+    delta = [name for name in names if name.startswith(DELTA_LAUNCHES)]
+    assert any("bwd" in name or "back" in name for name in delta), names
+    assert any(not ("bwd" in name or "back" in name) for name in delta), names
     reference = copy.deepcopy(model).to(torch.bfloat16)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
