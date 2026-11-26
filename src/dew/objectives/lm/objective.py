@@ -172,6 +172,12 @@ class IndexerTraining:
     `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`). The
     reference sets the indexer's pace with its learning rate: 1e-3 for the 1000
     warm-up steps and 7.3e-6 for the sparse stage.
+
+    MSA's index branch (block-selected attention, `selection="msa"`, arXiv
+    2606.13392) trains in the sparse phase alone, by the same KL over the
+    tokens it selected, its main branch the detached target
+    (`block_sparse.msa_query_kls`, the paper's auxiliary loss); `weight` is that
+    loss's coefficient. It has no dense warm-up.
     """
 
     phase: Literal["warmup", "sparse"]
@@ -248,8 +254,8 @@ def _check_indexer(model: nn.Module, indexer: IndexerTraining,
     mixers = model.indexed_mixers if isinstance(model, DecoderTraining) else ()
     if not mixers:
         raise ValueError(
-            "indexer training needs an mla mixer with the indexer's "
-            "index_n_heads and index_head_dim")
+            "indexer training needs a mixer that carries an indexer: an mla mixer with the indexer's "
+            "index_n_heads and index_head_dim, or block-selected attention by MSA's selection")
     sparse = {mixer.sparse for mixer in mixers}
     if indexer.phase == "warmup" and sparse != {False}:
         raise ValueError(
