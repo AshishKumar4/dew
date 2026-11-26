@@ -417,8 +417,9 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
     moving none (it flipped the lowering unseen), and a hooked one named Triton
     (`generation.chosen(merge=...)`). Mosaic serves there a hooked merge (a sigmoid output hook) and one
     named Mosaic, as its executable carries its kernel; Pallas Triton lowers no Mosaic GPU primitive rule's
-    `platform_index`. Each generation's Triton compiles, and the Hopper's hooked and named Mosaic ones, a
-    case of its own (`where`: together 189 s, the two Mosaic compiles 161 s, row 12698)."""
+    `platform_index`. A merge named Mosaic as it traces lowers on it past the block that names it (row
+    13170). Each generation's Triton compiles, and the Hopper's hooked and named Mosaic ones, a case of its
+    own (`where`: together 189 s, the two Mosaic compiles 161 s, row 12698)."""
     from fla_gdn_support import KernelCase
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
@@ -463,9 +464,13 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
         if where == "hooked":
             records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
         else:
-            with generation.chosen(merge="mosaic"):
-                records = compile_mosaic_kernels(
-                    [KernelCase("named", lambda: (plain, (padded, stacked)))], "sm90")
+            def named(p, s):
+                # Named as it traces, inside the jitted body: its lowering, past the block, takes it.
+                with generation.chosen(merge="mosaic"):
+                    return plain(p, s)
+
+            records = compile_mosaic_kernels(
+                [KernelCase("named", lambda: (named, (padded, stacked)))], "sm90")
     for record in records:
         assert not mosaic_failures([record]), record
         assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
