@@ -50,7 +50,7 @@ from dew._pool import (
     slurm_tasks_here,
     visible_gpus,
 )
-from dew.clusters import LOCAL_DEVICES, SCHEDULERS, Launched, Scheduler, detected_environment
+from dew.clusters import SCHEDULERS, Launched, Scheduler, detected_environment
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -91,7 +91,7 @@ class Process:
     argv: tuple[str, ...]
     env: dict[str, str]
     devices: str = ""
-    """The local devices it takes, as JAX_LOCAL_DEVICE_IDS lists them."""
+    """The GPUs it takes, as its CUDA_VISIBLE_DEVICES lists them; empty where it takes every local device."""
 
     @property
     def local(self) -> bool:
@@ -301,9 +301,7 @@ class Launch:
         processes, devices = self.processes_per_host, self.devices_per_process
         if processes == 1 and devices is None:
             return processes, devices
-        # What the pool's processes will see: the --env values, and on this
-        # machine the launcher's own environment, which ssh does not carry.
-        env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
+        env = self.host_env(first_host)
         on_gpu = runs_on_gpu(env)
         # None where the GPUs could not be counted, which is not zero of them.
         gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
@@ -348,11 +346,37 @@ class Launch:
         for rank in range(count):
             host = hosts[rank // per_host]
             first = (rank % per_host) * (devices or 0)
-            env = {**shared, **Launched.environ_of(address, count, rank, None if devices is None
-                                                   else range(first, first + devices))}
+            # A process on GPUs sees its own alone, so it opens none of its neighbours' whatever pool it joins
+            # and, holding one, keeps XLA's CUDA graphs (row 12761), JAX numbering them from 0; one off them
+            # (JAX_PLATFORMS=cpu, its GPUs hidden) takes its devices by their places, its GPUs as they were.
+            pinned = devices is not None and runs_on_gpu(self.host_env(host))
+            taken = None if devices is None else range(devices) if pinned else range(first, first + devices)
+            env = {**shared, **Launched.environ_of(address, count, rank, taken)}
+            if pinned and devices is not None:
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(self.ordinals(host, first, devices))
             processes.append(Process(rank, host, self.remote_argv(host, env), env,
-                                     env.get(LOCAL_DEVICES, "")))
+                                     env.get("CUDA_VISIBLE_DEVICES", "")))
         return processes
+
+    def host_env(self, host: str) -> dict[str, str]:
+        """What a pool process on `host` sees of its environment: the --env values, and on this machine the
+        launcher's own environment, which ssh does not carry."""
+        return {**(os.environ if host in LOCAL_HOSTS else {}), **self.extra_env()}
+
+    def ordinals(self, host: str, first: int, devices: int) -> list[str]:
+        """The CUDA ordinals of a pool process on `host` taking `devices` GPUs from its host's `first`: those
+        places of the pool's CUDA_VISIBLE_DEVICES (--env, or this machine's own here), refused where it lists
+        too few; else the host's own ordinals from `first`, as JAX_LOCAL_DEVICE_IDS named them, whether or
+        not the host's GPUs could be counted (`layout`)."""
+        visible = self.host_env(host).get("CUDA_VISIBLE_DEVICES")
+        if visible is None:
+            return [str(device) for device in range(first, first + devices)]
+        listed = [device.strip() for device in visible.split(",") if device.strip()]
+        if first + devices > len(listed):
+            raise ValueError(f"{host}'s CUDA_VISIBLE_DEVICES lists {len(listed)} GPUs, too few for a process "
+                             f"taking {devices} from its {first}th; ask for fewer with --processes-per-host "
+                             f"or --devices-per-process")
+        return listed[first:first + devices]
 
     def remote_argv(self, host: str, env: dict[str, str]) -> tuple[str, ...]:
         """The argv that starts the command on `host`: the command itself

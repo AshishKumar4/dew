@@ -447,7 +447,7 @@ def _every_record(row) -> bool:
 def test_a_skewed_mix_of_whole_compressed_files_reads_in_its_workers_and_resumes(tmp_path):
     """A mix drawn 97:3 from two corpora of two gzip JSON-lines files each, its steps dropping records so its
     four workers are pooled before the mix: the heavy corpus, dealt three by its weight, holds two whole
-    files, so it reads in two and the light corpus in two (`_Build.capacities`), where the cut refused three
+    files, so it reads in two and the light corpus in two (`_Build.whole_files`), where the cut refused three
     workers two files (row 12995); and a position saved resumes where it stopped."""
     import gzip
 
@@ -461,9 +461,19 @@ def test_a_skewed_mix_of_whole_compressed_files_reads_in_its_workers_and_resumes
             _every_record).repeat()
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)
-    data = compile(mix([corpus("heavy"), corpus("light")], [97.0, 3.0], seed=1).batch(1), read="streamed",
+    data = compile(mix([corpus("heavy"), corpus("light")], [97.0, 3.0], seed=1).batch(2), read="streamed",
                    loading=loading)
     assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), _batches, 4, 4)
+
+    # Each corpus's workers as a share's reader is built, from the shards the compile read once: of two
+    # shares, each corpus's two files give each share's reader one worker of it, which the loader's
+    # explanation names (row 13060: it named one share's two for every run).
+    def counts(partition: DataPartition) -> list[int]:
+        return sorted(stage.count for stage in data.reading.pools_of(partition).values())
+
+    halves = DataPartition(0, 2)
+    assert (counts(DataPartition()), counts(halves)) == ([2, 2], [1, 1])
+    assert "share 0 of 2" in data.explain(halves)
 
 
 def test_a_streamed_weighted_mixture_read_in_loading_workers_reads():

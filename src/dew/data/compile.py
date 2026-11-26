@@ -1245,10 +1245,10 @@ def _compiled(
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
-        # As the reader is built: one share's (`DataPartition()`), a whole-file corpus's share bounded by
-        # its shards over one reader (`_Build.capacities`).
+        # As a reader of each share is built (`_Build.pool_stages`): a whole-file corpus's pool bounded by its
+        # shards over the run's shares, which are read here, once (`_Build.whole_files_of`).
         reading=TrainingRead(read, chooser, build.loading, worker_stage(train, build.loading),
-                             build.pool_stages(train, DataPartition()),
+                             functools.partial(build.pool_stages, train, files=build.whole_files_of(train)),
                              faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 

@@ -887,6 +887,7 @@ class Trainer(Generic[Loss, Effects]):
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
         template = _waiting_restored(self._configured(placed_shapes(abstract, shardings)))
+        _refuse_lost_reference(template, checkpoints, resume)
         state, position = self._staging.restore(checkpoints, template, resume, share)
         _refuse_lost_waiting(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
@@ -1252,6 +1253,7 @@ class Trainer(Generic[Loss, Effects]):
             # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
             # owns the capture.
             tracer = profiler if profiler is not None else telemetry_profile.active_profile()
+            ahead = self._compiler.ahead
             try:
                 # A run handed a step compiled ahead runs every program compiled with it as compiled
                 # (`_taking`).
@@ -1283,7 +1285,8 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
-        return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
+        with contextlib.nullcontext() if ahead is None else ahead.taking():
+            return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
 
     def _fit_plan(
         self,
@@ -2370,6 +2373,21 @@ def _waiting_restored(template: TrainState) -> TrainState:
     nothing = jax.tree.map(lambda leaf: jax.device_put(jnp.full(leaf.shape, -1.0, leaf.dtype), leaf.sharding),
                            template.variables[NVFP4_PENDING])
     return dataclasses.replace(template, variables={**template.variables, NVFP4_PENDING: nothing})
+
+
+def _refuse_lost_reference(template: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
+    """Refuse a frozen reference's restore (`Objective.ema_is_reference`) from a checkpoint an earlier Dew
+    wrote, which kept no amax histories of the reference (`NVFP4_HISTORY` under `ema`, row 13057): its start's
+    histories are recorded nowhere, a trained start's among them, which set the reference's scales and so its
+    loss, and no live history stands for them."""
+    if template.ema is None or NVFP4_HISTORY not in template.ema:
+        return
+    if NVFP4_HISTORY not in (checkpoints.stored(step).get("ema") or {}):
+        raise ValueError(
+            f"the checkpoint at step {step} in {checkpoints.directory} holds no amax histories of its "
+            f"frozen reference: the Dew that wrote it kept the reference's delayed-scaling NVFP4 histories "
+            f"nowhere, so its reference cannot be restored as it scaled; resume it with the Dew that wrote "
+            f"it, or start the run again from its weights")
 
 
 def _refuse_lost_waiting(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:

@@ -134,6 +134,36 @@ def test_a_run_resumed_partway_through_a_held_update_rolls_what_its_taken_calls_
             legacy.place()
 
 
+def test_a_reference_an_earlier_dew_saved_is_refused_and_one_this_dew_saved_resumes(tmp_path):
+    """A frozen reference's checkpoint an earlier Dew wrote, which kept no histories of the reference (its
+    average held none, row 13057), is refused: the reference's start histories, a trained start's among them,
+    are recorded nowhere, and no live history stands for them; one this Dew wrote restores its own."""
+    from dew.checkpoints import Checkpoints
+
+    with generation.run_precision(DELAYED):
+        def run(name: str) -> Trainer:
+            return delayed_lm(1, Checkpoints(str(tmp_path / name)), ema_decay=1.0, objective=Referenced)
+
+        run("current").fit(data(), steps=2, checkpoint_every=2)
+        source = run("current")
+        state = source.stored(source.checkpoints.restore(source.place()[0], 2)[0])
+        # A current checkpoint whose reference histories hold values of their own, which a restore reads back.
+        seeded = dataclasses.replace(state, ema={**state.ema, NVFP4_HISTORY: jax.tree.map(
+            lambda leaf: leaf + 1.0, state.ema[NVFP4_HISTORY])})
+        unkept = {key: value for key, value in state.ema.items() if key != NVFP4_HISTORY}
+        for name, ema in (("legacy", unkept), ("seeded", seeded.ema)):
+            written = Checkpoints(str(tmp_path / name))
+            written.save(2, dataclasses.replace(state, ema=ema))
+            written.wait()
+        earlier = run("legacy")
+        with pytest.raises(ValueError):
+            earlier.place()
+        again = run("seeded")
+        kept = again.stored(again.place()[0]).ema[NVFP4_HISTORY]
+    for read, written in zip(jax.tree.leaves(kept), jax.tree.leaves(seeded.ema[NVFP4_HISTORY]), strict=True):
+        np.testing.assert_array_equal(np.asarray(read), np.asarray(written))
+
+
 def test_a_ppo_steps_records_are_its_own_passes_its_critics_among_them():
     """A PPO objective draws its critic apart from its actor (`PPOObjective.init`), and the critic's draw
     keeps nothing its initializing pass recorded: a step's records are each part's own call's alone, one

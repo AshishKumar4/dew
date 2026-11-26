@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Literal
 
 from dew._records import record
 
 if TYPE_CHECKING:
-    from dew.data.dataset import Loader, Loading
+    from dew.data.dataset import DataPartition, Loader, Loading
     from dew.data.pipeline import Workers
     from dew.data.sources.base import Read
 
@@ -54,7 +54,11 @@ class TrainingRead:
     chooser: Chooser
     loading: Loading
     workers: Workers
-    pools: Mapping[str, Workers] = dataclasses.field(default_factory=dict)
+    pools_of: Callable[[DataPartition], Mapping[str, Workers]] = dataclasses.field(
+        default=lambda partition: {}, compare=False)
+    """Each corpus's worker stage as a reader of a share (`DataPartition`) builds it: a corpus streamed from
+    whole files takes no more workers than its shards over the run's shares (`_Build.whole_files`), so a
+    read cut over more shares deals it fewer."""
     faster: Read | None = None
     """`memory`, where another read was taken and every source can be read into memory, its chain lowering
     there: a memory read takes each record from RAM after one load of the corpus, with no read of its store
@@ -69,7 +73,7 @@ _CHOSEN: Mapping[Chooser, str] = {
 }
 
 
-def explained(loader: Loader) -> str:
+def explained(loader: Loader, partition: DataPartition | None = None) -> str:
     """`loader`'s training read as its compile recorded it, a line a fact (`Loader.explain`)."""
     tokens = "" if loader.batch_tokens is None else f", {loader.batch_tokens} tokens"
     records = "" if loader.records is None else f", {loader.records} records an epoch"
@@ -79,7 +83,7 @@ def explained(loader: Loader) -> str:
                      "first's")
     if (reading := loader.reading) is not None:
         lines.append(f"read: {reading.read}, {_CHOSEN[reading.chooser]}")
-        lines.extend(_loading_lines(reading))
+        lines.extend(_loading_lines(reading, partition))
         if reading.faster is not None:
             lines.append(f"faster where the corpus fits in host memory: a {reading.faster} read, each record "
                          f"from RAM after one load of it; ask for it with .read({reading.faster!r}): a "
@@ -97,14 +101,22 @@ def explained(loader: Loader) -> str:
     return "\n".join(lines)
 
 
-def _loading_lines(reading: TrainingRead) -> list[str]:
-    """The workers and buffers `reading` reads in, and what automatic loading measured to size them."""
+def _loading_lines(reading: TrainingRead, partition: DataPartition | None) -> list[str]:
+    """The workers and buffers `reading` reads in, each corpus's as a reader of `partition`'s share builds
+    them (one of one where None, said so), and what automatic loading measured to size them."""
     loading, workers = reading.loading, reading.workers
     held = (f"each holding {workers.buffer} batches ready" if workers.count else "in the training process")
     lines = [f"workers: {workers.count}, {held}; {loading.threads} threads a reader, "
              f"{loading.read_buffer} reads ahead"]
+    from dew.data.dataset import DataPartition  # this module is read as dataset's own loads
+
+    share = DataPartition() if partition is None else partition
+    pools = reading.pools_of(share)
+    if pools:
+        lines.append(f"  each corpus's, a reader of share {share.index} of {share.count}"
+                     + (" (explain(partition) for the run's)" if partition is None else "") + ":")
     lines.extend(f"  {corpus}: {stage.count} workers, each holding {stage.buffer} batches ready"
-                 for corpus, stage in reading.pools.items())
+                 for corpus, stage in pools.items())
     if (sized := loading.sized) is not None:
         run = "an unstated count of" if sized.batches is None else str(sized.batches)
         lines.append(f"sized for {run} batches from {sized.sampled} sampled: {sized.python * 1e3:.2f} ms of "

@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import ahead_on_the_host
 from model_support import attending
 from one_draw import assert_as_exact_as_the_reference
 from recorded_runs import assert_as_exact_as_recorded
@@ -40,12 +41,13 @@ def rows(checkpoint: Decide, *, parallel: bool):
             yield f"{name}/{case}/{qid}", question, encoded
 
 
+@pytest.mark.compiles_at_run(reason="lays out tokens on the host, no check-1 site")
 @pytest.mark.parametrize("parallel", [False, True])
 def test_the_marker_layout_lays_out_what_laya_does(parallel):
     """Token for token, marker for marker: instructions cut to the option
     budget, options cut evenly past it, a conversation keeping its end, the
     marker text cut out of what the caller wrote, and the parallel positions."""
-    checkpoint = Decide.from_pretrained(TINY)
+    checkpoint = tiny()
     expected = json.loads((TINY / "layouts.json").read_text())
     for key, _, encoded in rows(checkpoint, parallel=parallel):
         assert list(encoded.tokens) == expected[key]["ids"], key
@@ -73,7 +75,10 @@ OUTPUTS = ("sequential", "parallel")
 
 @functools.cache
 def tiny() -> Decide:
-    return Decide.from_pretrained(TINY)
+    """The tiny checkpoint, loaded once on the host however its first caller runs: before any check-1 site, or
+    within a draw's traced program, where a load would read its arrays as tracers (row 8058)."""
+    with jax.ensure_compile_time_eval(), ahead_on_the_host(wherever=True):
+        return Decide.from_pretrained(TINY)
 
 
 @functools.cache
@@ -167,7 +172,10 @@ def test_padded_rows_score_as_they_do_alone():
     score -inf."""
     checkpoint = tiny()
     ordered = sorted(rows(checkpoint, parallel=False), key=lambda row: row[0])
-    batch = DecisionInputs.collate([encoded for _, _, encoded in ordered], checkpoint.specials.pad)
+    # Collated on the host before its site, as a GPU tier part's prepare runs it (row 8060).
+    with ahead_on_the_host(wherever=True):
+        batch = jax.tree.map(np.asarray, DecisionInputs.collate([encoded for _, _, encoded in ordered],
+                                                                checkpoint.specials.pad))
     widths = [len(markers(encoded)) for _, _, encoded in ordered]
 
     def in_one_batch(dtype, inputs):

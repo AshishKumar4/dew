@@ -269,3 +269,6 @@ def test_two_keys_of_one_data_and_two_implementations_are_told_apart():
     assert_same_leaf(rbg, jax.random.wrap_key_data(data, impl="rbg"))
     with pytest.raises(AssertionError):
         assert_same_leaf(rbg, unsafe)
+    # Equal values in other words are told apart: a zero's sign (row 13061: compared by value, they passed).
+    with pytest.raises(AssertionError):
+        assert_same_leaf(jnp.zeros((2,)), -jnp.zeros((2,)))

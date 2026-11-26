@@ -201,6 +201,14 @@ def provenance(values: Sequence[object]) -> frozenset[str] | None:
     return frozenset(module for module in modules if _path(module) is not None)
 
 
+def _slots(kind: type) -> tuple[str, ...]:
+    """The attribute slots `kind` and its bases declare (`__slots__`), their own `__dict__` and weak
+    reference slots left out."""
+    declared = (vars(klass).get("__slots__", ()) for klass in kind.__mro__)
+    return tuple(name for names in declared for name in ((names,) if isinstance(names, str) else names)
+                 if name not in ("__dict__", "__weakref__"))
+
+
 def stated_class(kind: type) -> bool:
     """Whether `kind`'s code is a module of Dew's, which defines it at its top level, so an instance's code is
     that module's and what it imports (`code_digest`)."""
@@ -257,8 +265,11 @@ def _held(value) -> Sequence[object]:
         elif isinstance(current, Mapping):
             pending.extend(current.values())
         elif not isinstance(current, type) and stated_class(type(current)):
-            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model).
-            pending.extend(vars(current).values())
+            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model): in
+            # its `__dict__`, and in the slots its classes declare where they do (a slotted class has none).
+            if type(current).__dictoffset__:
+                pending.extend(vars(current).values())
+            pending.extend(getattr(current, name) for name in _slots(type(current)) if hasattr(current, name))
     return found
 
 
