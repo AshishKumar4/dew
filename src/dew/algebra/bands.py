@@ -66,8 +66,9 @@ def summed(load, chunks: int, *, axis: int, width: int, lower: int, bins: int, d
         flat_rows = math.prod(rows)
         loaded = shape[axis] * 2 * len(terms) * parts
         slots, values = (jnp.moveaxis(part, axis, -3).reshape(flat_rows, loaded) for part in (places, signed))
-        placed = jax.vmap(lambda row, at, value: row.at[at].add(value, mode="drop", wrap_negative_indices=False))(
-            carry.reshape(flat_rows, bins), slots, values)
+        scatter = jax.vmap(lambda row, at, value: row.at[at].add(value, mode="drop",
+                                                                wrap_negative_indices=False))
+        placed = scatter(carry.reshape(flat_rows, bins), slots, values)
         return placed.reshape(*rows, bins)
     sums = of_chunk(0, initial) if chunks == 1 else jax.lax.fori_loop(0, chunks, of_chunk, initial)
     live = sums != 0
