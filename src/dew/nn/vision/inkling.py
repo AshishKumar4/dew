@@ -44,7 +44,7 @@ class InklingVision(TowerBase):
         return ViTLayout(
             depth=self.depth, hidden_size=self.hidden_size, num_heads=self.num_heads,
             num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
-            intermediate_size=self.intermediate_size, activation="gelu", in_channels=self.in_channels,
+            intermediate_size=self.intermediate_size, activation="gelu_exact", in_channels=self.in_channels,
             patch_size=self.patch_size, temporal_patch_size=self.temporal_patch_size,
             spatial_merge_size=self.spatial_merge_size, norm_type="layer", norm_eps=self.layer_norm_eps,
             norm_bias=True, mlp_bias=True, packed=False, patch_bias=False,
