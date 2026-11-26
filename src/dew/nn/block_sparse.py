@@ -249,8 +249,8 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     own = jnp.arange(queries)[:, None] // block
     forced = jnp.concatenate([jnp.broadcast_to(jnp.arange(initial)[None], (queries, initial)),
                               own - jnp.arange(local)[None, ::-1]], axis=-1)
-    # A forced block the query reaches alone: none before the first, none past its own.
-    forced = jnp.where((forced >= 0) & (forced <= own), forced, -1)
+    # A forced block the query reaches alone: none before the first, none past its own or the keys' last.
+    forced = jnp.where((forced >= 0) & (forced <= own) & (forced < pooled.shape[-1]), forced, -1)
     forced = jnp.broadcast_to(forced, (rows, groups, *forced.shape))
     ranked = top_k - initial - local
     chosen = top_k_selection(pooled, keep, ranked, forced=forced)
@@ -331,27 +331,28 @@ short calls' path, a selection of 64 blocks of 64 near every key of them anyway.
 def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, block: int = 64, top_k: int = 64,
                      kernel: int = 32, stride: int = 16, initial: int = 1, local: int = 1,
                      dense_below: int = INFLLM_DENSE_BELOW, implementation: AttentionImpl = "auto",
-                     **options) -> jax.Array:
+                     dtype=None, precision=None, force_fp32_for_softmax: bool = True,
+                     wide_logits: bool = False, softcap: float | None = None,
+                     scale_logits: bool = False) -> jax.Array:
     """InfLLM-V2's attention (kernel-templates.md §A row 60): a call over fewer than `dense_below` keys the
     plain causal call; a longer one each query's selected blocks (`infllm_selection`: the `top_k` of its
     earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the `local`
     ending at its own forced) through the template's indexed form (`selected_attention`), reading those
     blocks' keys alone. `query` `[B, Q, G * h, D]`, `key` and `value` `[B, K, G, D]`, a causal call whose
-    queries are its keys; `options` the call's other arguments, none laid by its heads or rows (a sink, a
-    bias, a mask: refused on both branches alike). The selection takes no gradient."""
+    queries are its keys, its rows and heads whole: the call's arguments past them its numerics alone
+    (`dtype`, `precision`, `force_fp32_for_softmax`, `wide_logits`, `softcap`, `scale_logits`), which both
+    branches take alike; an operand laid by its rows, heads or places it takes none of, the selected
+    branch folding each group into the batch. The selection takes no gradient."""
     keys = key.shape[1]
-    # Operands laid by the call's heads or rows (sinks, a bias, a mask) match the dense call's layout alone,
-    # not the selected branch's, which takes each group into the batch: neither branch takes them.
-    held = sorted(set(options) & {"sinks", "bias", "mask", "key_valid", "segment_ids"})
-    if held:
-        raise ValueError(f"InfLLM-V2's attention takes no per-head or per-row operand: {held}")
+    numerics = {"dtype": dtype, "precision": precision, "force_fp32_for_softmax": force_fp32_for_softmax,
+                "wide_logits": wide_logits, "softcap": softcap, "scale_logits": scale_logits}
     if keys < dense_below:
         return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
-                                            **options)
+                                            **numerics)
     selected = infllm_selection(query, key, block=block, top_k=top_k, kernel=kernel, stride=stride,
                                 initial=initial, local=local)
     return selected_attention(query, key, value, selected, block_runs(keys, block),
-                              implementation=implementation, **options)
+                              implementation=implementation, **numerics)
 
 
 def masked_selection(mask: jax.Array, block_q: int, *, queries: int, most: int) -> jax.Array:

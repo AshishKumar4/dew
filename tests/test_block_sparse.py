@@ -2,6 +2,8 @@
 numpy, the runs a selection gives against the keys it reads, and the attention over a selection on par with
 the reference over its dense mask (check 1)."""
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -341,7 +343,8 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
 def test_msas_selection_keeps_its_slots_and_forces_no_block_past_the_query():
     """MSA's selection (`msa_selection`) holds its `top_k` slots whatever its blocks: over one block of keys,
     the query's own and 15 empty (-1); and forces no block a query does not reach: with the first two blocks
-    forced, a query of the first block takes the first alone, the second not yet past it."""
+    forced, a query of the first block takes the first alone, the second not yet past it; and none past the
+    keys' last block, a query past every key (16 queries over 8 keys) forcing no block the keys hold not."""
     scores = jnp.where(jnp.tril(jnp.ones((16, 16), bool)), 0.0, -jnp.inf)[None, None]
     one = np.asarray(block_sparse.msa_selection(scores, block=16, top_k=16))
     assert one.shape == (1, 1, 16, 16)
@@ -349,13 +352,15 @@ def test_msas_selection_keeps_its_slots_and_forces_no_block_past_the_query():
     two = np.asarray(block_sparse.msa_selection(scores, block=8, top_k=4, initial=2, local=1))
     assert {int(b) for b in two[0, 0, 0] if b >= 0} == {0}
     assert {int(b) for b in two[0, 0, 8] if b >= 0} == {0, 1}
+    rectangular = np.asarray(block_sparse.msa_selection(scores[..., :8], block=8, top_k=4, local=1))
+    assert {int(b) for b in rectangular[0, 0, 8] if b >= 0} == {0}
 
 
 def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense_call():
     """InfLLM-V2's attention past its dense cut whose selection takes every block a query sees (its top as
     many as the blocks) reads every key the dense causal call reads: its output and gradients are on par
-    with that call's (check 1), the two branches one function at the cut. A sink or a bias, laid by the
-    call's heads, is refused on both branches alike."""
+    with that call's (check 1), the two branches one function at the cut. An operand laid by the call's
+    heads, rows or places (a sink, query slots, key runs) is no argument of either branch."""
     rows, queries, heads, groups, width = 1, 128, 8, 2, 32
     shape = {"block": 16, "top_k": queries // 16, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
@@ -369,10 +374,12 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     assert_as_exact(jax.jit(with_gradients(selected)), jax.jit(with_gradients(dense)), draw,
                     "InfLLM-V2's attention over every block", seeds=SEEDS)
     query, key, value, _ = draw(0)
-    for dense_below in (queries + 1, queries):
-        with pytest.raises(ValueError):
-            block_sparse.infllm_attention(query, key, value, dense_below=dense_below,
-                                          sinks=jnp.zeros((heads,)), **shape)
+    laid = {"sinks": jnp.zeros((heads,)), "query_slots": jnp.zeros((rows, queries), jnp.int32),
+            "key_runs": jnp.zeros((rows, queries, 1, 2), jnp.int32)}
+    for dense_below, (name, operand) in itertools.product((queries + 1, queries), laid.items()):
+        with pytest.raises(TypeError):
+            block_sparse.infllm_attention(query, key, value, dense_below=dense_below, **{name: operand},
+                                          **shape)
 
 
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
