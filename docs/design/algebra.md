@@ -144,11 +144,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
 
 ### 1.4 Facts and rules
 
-- **Facts about each value** (e-class analyses): its shape, and a bound on its magnitude where the program
-  proves one (§6.3). Its dtype and parameters are the region's tables (`terms.Region`). Constant and sharded
-  axes and a rounding class per value are not built: a hoisting rule reads a broadcast's laid axes, no price
-  reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
-  as a fact (§1.5).
+- **Facts about each value** (e-class analyses): shape, scalar dtype, and magnitude where the program
+  proves it (§6.3). The region's traced types and parameter table seed dtype propagation (§6.3).
+  Constant and sharded axes and a rounding class per value are not built: a hoisting rule reads a
+  broadcast's laid axes, no price reads a link, and a rule set states its rounding class (§6.4).
+  Error is measured per candidate, never held as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): join sums of floating counts when their partial
     counts fit the dtype exactly (`joined`); keep ordinary rounded reductions separate (row 13161).
