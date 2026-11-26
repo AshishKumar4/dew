@@ -279,11 +279,9 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
         pulled_lhs = tokens if (gather is None or prologue is None) else tokens[gather]
         d_lhs, d_prologue, operand = _input_cotangents(pulled_lhs, d_products, matrices, group_sizes,
                                                        prologue, prologue_arrays, prologue_axes, compute,
-                                                       {**held, 'gather': read}, wide_rows=gather is not None)
+                                                       {**held, 'gather': read})
         if gather is not None:
-            # Each row's routes summed wide, then rounded once to the rows' dtype, as the packed kernel's
-            # pullback sums them (row 12396: two routes' 1 and -1, each rounded, summed 0 where 2^-9 holds).
-            d_lhs = jnp.zeros(tokens.shape, d_lhs.dtype).at[gather].add(d_lhs).astype(tokens.dtype)
+            d_lhs = jnp.zeros(tokens.shape, d_lhs.dtype).at[gather].add(d_lhs)
     # The operand the forward multiplied, as the kernel gradient reads it: written beside the input
     # gradient where its epilogue formed the prologue's VJP (`_prologue_pulled`), else the rows through the
     # prologue. A formed operand (`applied`) is the forward's alone, no residual of the reverse mode, so a
@@ -1861,7 +1859,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
 
 
 def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prologue, prologue_arrays,
-                      prologue_axes, compute, plain: dict, *, wide_rows: bool = False) -> tuple:
+                      prologue_axes, compute, plain: dict) -> tuple:
     """`lhs`'s and the prologue side operands' cotangents from the cotangent of the operand the forward
     multiplied (`prologue(lhs)` rounded to `lhs`'s dtype): each matrix's product with its accumulator's
     cotangent (none where it has none), one matrix's rounded once to `lhs`'s dtype, a paired product's two
@@ -1871,9 +1869,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     rows landed). Where the prologue is entrywise (`_entrywise`), its VJP is the last product's epilogue
     (`_prologue_pulled`, kernel-templates Appendix C row 17), so the operand's cotangent is never written,
     and the operand itself is written beside the cotangents for the kernel gradient: returned third, None
-    where the prologue's VJP ran apart. With `wide_rows`, `lhs`'s cotangent is left wide (fp32 or wider),
-    unrounded: a gathered call's, whose rows' routes are summed before it rounds once (`_pulled`, row
-    12396)."""
+    where the prologue's VJP ran apart."""
     options = {'interpret_on_cpu': plain['interpret_on_cpu'], 'precision': plain['precision'],
                'transpose_rhs': not plain['transpose_rhs'], 'dense': plain['dense'], 'first': plain['first'],
                'gather': plain['gather']}
@@ -1882,7 +1878,6 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     operand_dtype = jnp.dtype(lhs.dtype if prologue is None else compute)
     wide, d_operand = at_least_fp32(jnp.promote_types(lhs.dtype, operand_dtype)), None
-    rounded = wide if wide_rows else operand_dtype
     whole = not automatic_axes()
     taken = (None if entrywise
              else _one_launch(reached, group_sizes, operand_dtype, prologue, options, whole=whole))
@@ -1893,7 +1888,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         # wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient), a chain's overflowing tiles summed
         # again bounded (`mosaic_gpu.guarded_walk`).
         d, matrix, form, route = taken
-        out = wide if prologue is not None else rounded
+        out = wide if prologue is not None else operand_dtype
         d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
                                       several=False, summed_as=(operand_dtype,), selected=route, **form,
                                       **options))
@@ -1912,7 +1907,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                                       compute, options)
             if pulled is not None:
                 return pulled
-        out = wide if (not last or prologue is not None) else rounded
+        out = wide if (not last or prologue is not None) else operand_dtype
         if d_operand is not None and _keeps_launch(d, matrix, group_sizes, _added, (d_operand,), (out,),
                                                    (operand_dtype,), options):
             d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), _added, (d_operand,),
@@ -1927,11 +1922,11 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         return jnp.zeros(lhs.shape, lhs.dtype), tuple(_as_cotangent(jnp.zeros(a.shape, wide), a)
                                                       for a in prologue_arrays), None
     if prologue is None:
-        return d_operand.astype(wide if wide_rows else lhs.dtype), (), None
+        return d_operand.astype(lhs.dtype), (), None
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes, group_sizes,
                                              d_operand, compute)
-    sides = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
-    return d_lhs.astype(wide if wide_rows else lhs.dtype), sides, None
+    return d_lhs.astype(lhs.dtype), tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays,
+                                                                                strict=True)), None
 
 
 def _entrywise(lhs, prologue, arrays: tuple, axes_of: tuple, plain: dict) -> bool:
