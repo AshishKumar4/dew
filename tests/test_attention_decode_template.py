@@ -230,11 +230,11 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 def test_an_absorbed_mla_window_over_a_paged_latent_cache_returns_its_partial_for_the_merge_interpreted():
     """MLA over a sliding window of a paged latent cache returning its partial accumulators
     (kernel-templates.md §A row 63, tokamax's `mla_swa`): an absorbed step (`in_key`, the values its
-    latents' leading 512 columns) over each row's last 64 keys read from 4-key pages through a shuffled
+    latents' leading 512 columns) over each row's last 64 keys read from 16-key pages through a shuffled
     table, `finished=False` (its state, an `Initial`), merged by the step over the rest of its keys (the
     sparse part's, here its earlier keys whole, a dense cache) as its initial state: on par with the
     reference path over every key (check 1), as an H100 runs it under the interpreter."""
-    page, window, latent, heads = 4, 64, 576, 16
+    page, window, latent, heads = 16, 64, 576, 4
     lengths = jnp.asarray([KEYS - 56, KEYS // 3 * 2], jnp.int32)
     starts = lengths - window
     windowed = template.spans(1, KEYS, 2, lengths=lengths, starts=starts)
