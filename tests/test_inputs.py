@@ -88,6 +88,32 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     assert keys.sharding == NamedSharding(mesh, P(request_axes(mesh)))
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("explicit", [False, True], ids=["auto", "explicit"])
+@pytest.mark.parametrize("impl", ["threefry2x32", "rbg"])
+def test_row_plan_folds_its_rows_keys_under_the_mesh_in_context(explicit, impl):
+    """Under the mesh its rows sit on in context (`jax.set_mesh`), its row axis Auto or Explicit, a plan's
+    row keys fold on the mesh from the request's key of either implementation (two key words or four) by
+    each row's global index, as on one device (row 13493), with no host read."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.nn.inputs import RowPlan, request_axes
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(data=4, explicit=("data",) if explicit else ()).build()
+    plan = RowPlan(mesh, 6, 8, 0, 1)
+    key = jax.random.key(11, impl=impl)
+    with jax.set_mesh(mesh), guarded(allow=("host_to_device",)):
+        keys = plan.keys(key)
+        jax.block_until_ready(keys)
+    expected = jax.vmap(lambda row: jax.random.fold_in(key, row))(jnp.arange(8))
+    np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected))
+    assert jax.random.key_impl(keys) == jax.random.key_impl(key)
+    assert keys.sharding == NamedSharding(mesh, P(request_axes(mesh)))
+
+
 def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax
     import jax.numpy as jnp

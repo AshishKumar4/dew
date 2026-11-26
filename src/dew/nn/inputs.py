@@ -1339,7 +1339,7 @@ class RowPlan:
 
         words = jax.random.key_data(key.addressable_data(0))
         shards = math.prod(sharding.mesh.shape[axis] for axis in request_axes(sharding.mesh))
-        laid = (shards * words.shape[0],)
+        laid = (shards * words.shape[0], *words.shape[1:])
         roots = jax.make_array_from_single_device_arrays(laid, sharding, [
             jax.device_put(words, device) for device in sharding.addressable_devices_indices_map(laid)])
         placed = jax.make_array_from_process_local_data(sharding, indices)
@@ -1352,9 +1352,14 @@ class RowPlan:
 
 
 def _row_keys(roots: jax.Array, rows: jax.Array, impl, shards: int) -> jax.Array:
-    """Each row's root key folded by its index in `rows` (`RowPlan.keys`): `roots` the key words of `impl`
-    for each of the `shards` row shards in turn, each shard's rows taking its root."""
-    words = jnp.repeat(roots.reshape(shards, -1), rows.shape[0] // shards, axis=0)
+    """Each row's root key folded by its index in `rows` (`RowPlan.keys`): `roots` the key data of `impl`
+    for each of the `shards` row shards in turn, stacked along its first axis, each shard's rows taking its
+    root. Each root broadcast over a new axis of its shard's rows, merged after the shard axis, so an
+    Explicit row axis keeps its sharding where a repeat of it would be refused."""
+    held = roots.reshape(shards, -1, *roots.shape[1:])
+    per = rows.shape[0] // shards
+    words = jnp.broadcast_to(held[:, None], (shards, per, *held.shape[1:])).reshape(shards * per,
+                                                                                     *held.shape[1:])
     return jax.vmap(jax.random.fold_in)(jax.random.wrap_key_data(words, impl=impl), rows)
 
 
