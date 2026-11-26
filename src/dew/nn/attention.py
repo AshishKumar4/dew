@@ -14,7 +14,7 @@ import functools
 import importlib
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple, get_args
+from typing import Literal, NamedTuple, Protocol, get_args, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -231,10 +231,23 @@ def _least_bias(bias) -> jax.Array:
     return jnp.min(jnp.asarray(dense_bias(bias), jnp.float32))
 
 
+@runtime_checkable
+class RouteBias(Protocol):
+    """A bias that states both forms a route may take: its band (`band`, a `BandBias` the template reads a
+    tile at a time) and its writing out over the call's keys (`dense`), the route taking the form it reads
+    (`scaled_dot_product_attention`: the band on the template outside forward mode, written out everywhere
+    else): a route that writes a bias out runs no band (row 13503), whose trace the resolution alone reads
+    and a compiled program drops."""
+
+    def band(self) -> BandBias: ...
+
+    def dense(self, keys: int) -> jax.Array: ...
+
+
 def dense_bias(bias, keys: int | None = None):
     """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
-    a `BandBias` over `keys` (`BandBias.dense`), any other as it is."""
-    if isinstance(bias, BandBias):
+    a `BandBias` or a `RouteBias` over `keys` (their `dense`), any other as it is."""
+    if isinstance(bias, BandBias | RouteBias):
         if keys is None:
             raise ValueError("a band bias is written out over the call's keys, which its caller states")
         return bias.dense(keys)
@@ -1281,7 +1294,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     masked = with_key_starts(masked, starts, key.shape[-3])
     facts = {"dtype": dtype, "precision": precision, "force_fp32_for_softmax": force_fp32_for_softmax,
              "softcap": softcap, "sinks": sinks, "causal": causal, "sliding_window": sliding_window,
-             "mask": mask, "bias": bias, "segment_ids": segment_ids, "max_segments": max_segments,
+             "mask": mask, "bias": bias.band() if isinstance(bias, RouteBias) else bias,
+             "segment_ids": segment_ids, "max_segments": max_segments,
              "key_value_seq_lengths": lengths, "key_value_seq_starts": starts, "block_groups": block_groups,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
@@ -1291,6 +1305,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # (`template_attention`); every other route, 'inference''s two among them, adds it written out, as
         # forward mode's reference and kernel do.
         bias = dense_bias(bias, key.shape[-3])
+    elif isinstance(bias, RouteBias):
+        # The band the resolution read, the template's.
+        bias = facts["bias"]
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,

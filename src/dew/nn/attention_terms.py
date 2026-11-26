@@ -212,6 +212,32 @@ def relative_logits(states: jax.Array, bank: jax.Array, query_places: jax.Array,
     return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, 0.0)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RelativeTerms:
+    """A relative bias in both the forms a route may take (`attention.RouteBias`): each query's relative
+    states `states` `[B, Q, H, rank]` against `bank` `[rank, extent]`, its queries and keys at their
+    indices from the first key (a whole call's own tokens, `query_slots` and `key_slots` their slots):
+    its band (`relative_band`) for the template, its writing out (`relative_logits`) for every other
+    route, each formed only where a route reads it (row 13503)."""
+
+    states: jax.Array
+    bank: jax.Array
+    query_slots: jax.Array
+    key_slots: jax.Array
+
+    def band(self):
+        """The band about each query (`relative_band`), the keys at their indices."""
+        return relative_band(self.states, self.bank, jnp.zeros((), jnp.int32))
+
+    def dense(self, keys: int) -> jax.Array:
+        """The bias written out over the call's `keys` (`relative_logits`), `[B, H, Q, K]`."""
+        if self.key_slots.shape[-1] != keys:
+            raise ValueError(f"a relative bias over {self.key_slots.shape[-1]} keys is written out over "
+                             f"its own keys, not {keys}")
+        return relative_logits(self.states, self.bank, self.query_slots, self.key_slots)
+
+
 def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
     """`relative_logits`' bias as a band (`attention.BandBias`): each query's relative states `states` `[B, Q,
     H, rank]` against `bank` `[rank, extent]`, read at the query's place less each key's within its band and

@@ -2,6 +2,7 @@
 max-L2 clip, a query's log-ratio temperature and an input-conditioned relative-position bias, each against
 its formula written here."""
 
+import contextlib
 import dataclasses
 
 import jax
@@ -378,8 +379,10 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     no QK-Clip maxima sown, biases its attention by the band about each query (`relative_band`, row 13138):
     on the attention template, which reads the band a tile at a time, its program stages no `[B, H, Q, K]`
     bias or score, where the same call with its places stated (`positions`, which takes the bias written
-    out, `relative_logits`) stages it; and its output and every gradient are on par with that call's on the
-    template (check 1, the written-out call in float64 the truth)."""
+    out, `relative_logits`) stages it; a route that writes the bias out (a forced reference, the CPU's own)
+    runs no band and computes the stated call's output bit for bit (row 13503); and its output and every
+    gradient are on par with that call's on the template (check 1, the written-out call in float64 the
+    truth)."""
     from dew.batch import coordinates
     from dew.nn.inputs import AttentionMetadata, MixerCall
     from dew.nn.kernels import generation
@@ -418,6 +421,21 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     quadratic = (1, HEADS, BANDED, BANDED)
     with generation.chosen(attention="template"):
         assert quadratic not in staged(MixerCall()) and quadratic in staged(stated)
+    # A route that writes the bias out (a forced reference, or what the CPU resolves alone) runs no band:
+    # its compiled program holds none, the bias written out as the stated call writes it (row 13503).
+    from dew.nn.kernels.templates import band
+
+    params, x = draw(0)
+    spec = TERMS["relative_bias"]
+    assert isinstance(spec, RelativeBias)
+    banded = f"f32[1,{HEADS},{BANDED},{band.band_width(spec.extent)}]"
+    for forced in (generation.chosen(attention="reference"), contextlib.nullcontext()):
+        with forced:
+            apply = jax.jit(lambda params, x: layer.apply(params, x, MixerCall()))
+            compiled = apply.lower(params, x).compile()
+            written = jax.jit(lambda params, x: layer.apply(params, x, stated))(params, x)
+            assert banded not in compiled.as_text()
+            np.testing.assert_array_equal(np.asarray(compiled(params, x)), np.asarray(written))
     # The truth over the draw the harness widens (`assert_as_exact`).
     wide = stepped(layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64)), stated)
     assert_as_exact(attending("template")(stepped(layer, MixerCall())),
