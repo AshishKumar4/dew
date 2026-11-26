@@ -2058,6 +2058,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     measures = lane_measures(python, units, held, token)
     prepared = gpu_measures.prepared_needs(python, tests, tier_wire())  # No less than its programs' need.
     unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
+    filed_needs(python, units, prepared, unheld, held, token)
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
@@ -2095,6 +2096,29 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
              for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
+
+
+def filed_needs(python: str, units: Mapping[str, tuple[str, str, str]], prepared: Mapping[str, float],
+                unheld: Container[str], held: str, token: str) -> None:
+    """Each GPU lane unit of `units` whose prepared need (`prepared`) the lane could not hold (`unheld`) filed
+    where a GPU tier sizes its next part by it (records.py's `need_key`, gpu_holds.py), and each filed one it
+    held now cleared: its run measures it from here (`gpu_needs`), so no need filed before its file shrank
+    sizes a part past it. Each write or deletion tried once: one not made sizes the next part as before."""
+    within = f"{CACHE_PREFIX}-need/{python}/{held}/"
+    try:
+        filed = set(listed(within, token))
+    except r2.R2Error:
+        filed = set()  # None read: none cleared.
+    for name, need in prepared.items():
+        file, group, variant = units[name]
+        key = records.need_key(python, row(python, file, varied(group, variant)), held)
+        if name in unheld:
+            written(key, token, json.dumps({"need": need, "at": time.time()}).encode(), tries=1)
+        elif key.removeprefix(within) in filed:
+            try:
+                store(token).delete(key)
+            except r2.R2Error as error:
+                print(f"the test cache kept {key}: {error}", file=sys.stderr)
 
 
 def verdict_rows(verdict: dict) -> dict[str, list[dict]]:

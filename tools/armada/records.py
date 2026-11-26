@@ -136,6 +136,19 @@ def baseline_key(commit: str, python: str, row_name: str, held: str) -> str:
     return f"{CACHE_PREFIX}-baseline/{commit}/{python}/{row_place(row_name, held)}"
 
 
+def need_key(python: str, row_name: str, held: str) -> str:
+    """Where a GPU lane files what its unit `row_name` on class `held` needs by its prepared programs while no
+    lane of its part could hold it (ci.py's `filed_needs`), which a GPU tier sizes the unit's next part by
+    (gpu_holds.py): a unit never admitted is never measured, so its need is read nowhere else (rows 12893,
+    13042, 13112, 13148, 13272, 13316: one part sized short again each run). Cleared once a lane holds it."""
+    return f"{CACHE_PREFIX}-need/{python}/{row_place(row_name, held)}"
+
+
+NEED_DAYS = 7
+"""How long a filed need (`need_key`) sizes a part: one older is of a unit no lane has run since, whose file
+may since have been cut otherwise or shrunk."""
+
+
 def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
     """Where row `row_name`'s epoch on class `held` on shared inputs `common` is named (`epoch`)."""
     return f"{CACHE_PREFIX}-epochs/{python}/{common[:16]}/{row_place(row_name, held)}"
