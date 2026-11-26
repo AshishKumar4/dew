@@ -54,8 +54,8 @@ def _chunked_cov(x, y, w):
                                   if order == "grad of grad" else order for order in ORDER_SETS])
 def test_chunked_moments_holds_every_order(taken):
     """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
-    (`moments.chunked_covariance`, merge) hold every derivative order finite against float64 truth and their
-    plain declarations across float32's exponent edges (`EDGES`)."""
+    (`moments.chunked_covariance`, merge) hold every derivative order across float32's exponent edges.
+    Use the plain mathematical declarations in float64 as independent truth, not the same chunked AD rule.
     x, y, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
     dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
     c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
@@ -63,10 +63,11 @@ def test_chunked_moments_holds_every_order(taken):
         w_pos = ((jnp.abs(w) + 0.25) * scale).at[:, 0].set(0.0)
         assert_contract(_chunked_weighted, (x * scale, w_pos), (dx * scale, dw * scale), (c_mean, c_cov),
                         f"chunked moments {edge}", plain_fn=moments.weighted_moments,
-                        taking=ORDER_SETS[taken])
+                        truth_fn=moments.weighted_moments, taking=ORDER_SETS[taken])
         assert_contract(_chunked_cov, (x * scale, y * scale, w_pos), (dx * scale, dy * scale, dw * scale),
                         (c_mean, c_my, c_cov), f"chunked covariance {edge}",
-                        plain_fn=moments.weighted_covariance, taking=ORDER_SETS[taken])
+                        plain_fn=moments.weighted_covariance, truth_fn=moments.weighted_covariance,
+                        taking=ORDER_SETS[taken])
 
 
 def test_a_decayed_pair_holds_its_derivatives():
