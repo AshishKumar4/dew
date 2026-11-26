@@ -139,8 +139,8 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *, handoff
                 + 2 * candidate.partials() * partial_bytes / traffic.bandwidth + drift)
 
     # The cheapest, the first of equal prices (stream-K's), each priced once.
-    price, partitions = min(((shared(Tail(waves, iterations, partitions, steps)), at, partitions)
-                             for at, partitions in enumerate(_partitions(tail, steps, programs))))[::2]
+    price, _, partitions = min((shared(Tail(waves, iterations, partitions, steps)), at, partitions)
+                               for at, partitions in enumerate(_partitions(tail, steps, programs)))
     return (Tail(waves, iterations, partitions, steps) if price < _walked(steps, rows, columns, traffic)
             else None)
 
