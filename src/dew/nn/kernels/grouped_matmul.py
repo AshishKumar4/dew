@@ -507,16 +507,20 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     def neighbours(self, ba, config: tiling.Tiles) -> tuple[tiling.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
         # band halved or doubled, the columns or the rows the next block either side (a column unit, a
-        # role of rows).
+        # role of rows). A TPU core's (the MXU's) its columns, rows and depth alone, each the next block
+        # either side, the depth's the next of the MXU's doublings (`Mxu.depths`): it stages a fixed ring
+        # (`mosaic_tpu.STAGES`) and walks no band.
         from .templates.gemm import pricing
 
-        family = pricing.family_of(config, ba.arguments['tokens'].dtype, self.launch_target())
+        target = self.launch_target()
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
         unit = family.column_unit(ba.arguments['tokens'].dtype)
         role = family.role_rows * config.sharing
         band = config.grid_block_n
-        moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
-                 {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
-                 {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
+        steps = ([{'block_k': config.block_k // 2}, {'block_k': config.block_k * 2}] if generation.tpu(target)
+                 else [{'stages': config.stages - 1}, {'stages': config.stages + 1},
+                       {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2}])
+        moves = [*steps, {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
                  {'block_m': config.block_m - role}, {'block_m': config.block_m + role}]
         found = []
         for move in moves:

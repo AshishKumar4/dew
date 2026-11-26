@@ -1323,8 +1323,9 @@ def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
-    device time CUPTI reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`), each run
-    behind an eviction, so every config starts with its operands out of cache."""
+    device time its device reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`: CUPTI's
+    on a GPU, a profiler capture's ops on a TPU), each run behind an eviction, so every config starts with its
+    operands out of a GPU's cache (`benchmark.eviction`, none on a TPU)."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1349,9 +1350,10 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
         # refused and lowered afresh (`OuterProgram.compiled`). The launch runs behind the flush, which reads
-        # the whole buffer through the cache.
-        # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
-        lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
+        # the whole buffer through the cache. A GPU's without command buffers, which CUPTI does not read whole
+        # (`benchmark.Ungraphed`); a TPU runs none.
+        ungraphed = UNGRAPHED_OPTIONS if jax.default_backend() == "gpu" else None
+        lowered = owned_program(behind(launched), step=ungraphed).lower(flush, (arrays,))
         # Through Dew's one call of XLA's compile (`report.xla_compiled`): in one of this process's compile
         # slots, a step's launch waiting on its measurement, under the options its target takes (`targeted`).
         middle = time.perf_counter()
@@ -1364,7 +1366,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     # As many as the process's compile slots, whose compiles they wait on (`report.compile_threads`).
     with concurrent.futures.ThreadPoolExecutor(report.compile_threads()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
-    # CUPTI reads every run, the flush's own first. It takes one subscriber, so
+    # The device reads every run, the flush's own first. CUPTI takes one subscriber, a TPU one capture, so
     # where a profile capture holds it, from the first run or any later one,
     # the launch keeps its heuristic until a later compile.
     try:
@@ -1379,7 +1381,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
                     timings[config] = error
                     continue
                 except NoKernels as error:
-                    # CUPTI read none of the config's own kernels: its time would read as zero, so no pick.
+                    # The device read none of the config's own kernels: its time would read as zero, so no
+                    # pick.
                     timings[config] = error
                     continue
                 read[config] = runs, lowering, compiling
@@ -1654,12 +1657,14 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     lowers with every launch's config settled across the pool. The
     lowering records its launches as it traces them (`seen`); process 0 takes
     its stored pick for each, with `measure` measuring and storing one for a
-    launch without where it has its GPU to itself, and every process takes
+    launch without where it has its device to itself, and every process takes
     exactly process 0's configs (`_settle`). Where that changes a config the
     lowering traced, it lowers again. A launch without a pick takes its heuristic. A measuring run of a step
     with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
-    refused (`Untunable`)."""
-    if not generation.triton_runs():
+    refused (`Untunable`). A GPU that runs Dew's Pallas kernels (`generation.triton_runs`) and a TPU core are
+    tuned alike, each timed as its device reads it (`dew.telemetry.benchmark.device_time`); anywhere else the
+    program is lowered as it is."""
+    if not (generation.triton_runs() or generation.backend() == "tpu"):
         return lower()
     with reading():
         tuned = _cache.KERNEL_TUNES.get_global()

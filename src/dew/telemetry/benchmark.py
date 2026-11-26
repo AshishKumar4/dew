@@ -205,7 +205,11 @@ H100's 50 MB, a B200's 126 MB), so a read of them leaves none of a timed call's 
 
 
 def eviction() -> jax.Array:
-    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device."""
+    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device; on a TPU none (an
+    empty buffer): an eviction empties a GPU's L2, and Dew states no TPU cache a call's operands stay warm in
+    between its runs, so a TPU's call runs as it is (`behind`)."""
+    if jax.default_backend() == "tpu":
+        return jnp.zeros(0, jnp.float32)
     return jnp.zeros(EVICTION_BYTES // 4, jnp.float32)
 
 
@@ -241,6 +245,8 @@ def behind(call: Callable) -> Callable:
     cache times this program and leaves the read's kernel out (`DeviceTime.behind`): CUPTI reads a call
     after an untimed run of it, which refills a cache an eviction run before the call emptied."""
     def run(evicting, args):
+        if not evicting.size:  # a TPU's (`eviction`)
+            return evicting, call(*args)
         evicted, args = jax.lax.optimization_barrier((evicting_read(evicting), args))
         return evicted, call(*args)
     return run
@@ -385,12 +391,56 @@ def _nothing() -> None:
     """A call that launches no kernel, which a session's finalizing read runs (`DeviceTime._detach`)."""
 
 
+class CaptureHeld(CuptiHeld):
+    """The profiler's one capture is another's (a run's `jax.profiler` trace), so a TPU's call is read
+    nowhere (`TpuTime`): a TPU's `CuptiHeld`, which the kernel tuner and a benchmark take alike."""
+
+
+class TpuTime:
+    """The device time of each TPU call `device_time`'s session reads: the ops its programs ran on the
+    TPU's `XLA Ops` line, as one profiler capture of the call holds them (`dew.telemetry.trace.device_events`,
+    Dew's one reading of a capture), each its duration on the device, which no host dispatch enters. The call
+    runs once untimed before it, warm as CUPTI reads a GPU's (`DeviceTime`); a capture starts and stops a
+    call, a second or so a read."""
+
+    def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
+        """The ops of one call of `program`, compiled by its caller to run behind `evicting` (`behind`, which
+        a TPU's empty eviction leaves out). A call whose capture holds no program's op is refused
+        (`NoKernels`)."""
+        import tempfile
+
+        from jax import profiler
+
+        from dew.telemetry import trace
+
+        # Called as `DeviceTime.behind` calls it, its arguments one tuple (`behind`'s program's).
+        jax.block_until_ready(program(evicting, args))
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                profiler.start_trace(directory)
+            except RuntimeError as error:
+                raise CaptureHeld(str(error)) from error
+            try:
+                jax.block_until_ready(program(evicting, args))
+            finally:
+                profiler.stop_trace()
+            planes, _ = trace.device_events(directory)
+        timed = tuple(KernelTime(op.name, op.duration_ns / 1e6) for name, ops in planes.items()
+                      if name.startswith("/device:TPU:") for op in ops if trace.program_of(op) is not None)
+        if not timed:
+            raise NoKernels(f"{program} ran no op a TPU capture timed")
+        return timed
+
+
 @contextlib.contextmanager
-def device_time() -> Iterator[DeviceTime]:
-    """A session of GPU device timing (`DeviceTime`): CUPTI subscribed for each call it reads and
+def device_time() -> Iterator[DeviceTime | TpuTime]:
+    """A session of device timing: on a GPU `DeviceTime`, CUPTI subscribed for each call it reads and
     detached from the process when it ends, however it ends, so a profile capture or Nsight can
-    subscribe after. CUPTI takes one subscriber; where another holds it, a read raises `CuptiHeld`.
-    Dew's one reader of CUPTI (Mosaic GPU's profiler's `Cupti`)."""
+    subscribe after (CUPTI takes one subscriber; where another holds it, a read raises `CuptiHeld`), Dew's
+    one reader of CUPTI (Mosaic GPU's profiler's `Cupti`); on a TPU `TpuTime`, a capture a call."""
+    if jax.default_backend() == "tpu":
+        yield TpuTime()
+        return
     from jax.experimental.mosaic.gpu import profiler
 
     session = DeviceTime(profiler.Cupti(finalize=False))
