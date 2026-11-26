@@ -581,3 +581,24 @@ def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
         want = np.zeros((16, 256), np.float32)
         want[0, 0] = expected
         np.testing.assert_array_equal(np.asarray(mapped(rows, scales, dy)), want)
+
+
+@pytest.mark.parametrize("use_bias", [False, True], ids=["no bias", "bias"])
+def test_a_dense_layer_serves_a_packed_ternary_kernel_as_its_ternary_product(use_bias):
+    """A Dense layer whose `quantization` collection holds a packed BitNet b1.58 kernel
+    (`formats.TernaryWeights`, a checkpoint's weight served as its codes, row 1464) holds no kernel parameter
+    and computes its ternary product (`gemm.ternary_weight_product`, the inputs quantized a token at a time)
+    plus its bias, rounded once to its dtype: bitwise the unpacked product's, on its rows reshaped back."""
+    from dew.nn.dense import QUANTIZATION, Dense
+
+    rng = np.random.default_rng(1464)
+    x = jnp.asarray(rng.standard_normal((2, 8, 256)), jnp.bfloat16)
+    weights = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32))
+    bias = jnp.asarray(rng.standard_normal((64,)), jnp.float32)
+    layer = Dense(64, dtype=jnp.bfloat16, use_bias=use_bias)
+    variables = {QUANTIZATION: {"kernel": weights}, **({"params": {"bias": bias}} if use_bias else {})}
+    out = jax.jit(layer.apply)(variables, x)
+    summed = gemm.ternary_weight_product(x.reshape(-1, 256), weights, out_dtype=jnp.float32)
+    if use_bias:
+        summed = summed + bias
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(summed.astype(jnp.bfloat16).reshape(2, 8, 64)))
