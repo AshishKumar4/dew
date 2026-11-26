@@ -296,6 +296,21 @@ def test_a_tiny_epsilons_radial_share_survives_a_giant_head():
         assert derivative[0] == 2.0 ** -5, derivative
 
 
+def test_a_giant_heads_epsilon_share_keeps_its_derivative_in_the_head():
+    """A one-channel head `2^64` with epsilon `2^64` clipped to 1: its tangent under a unit seed, differenti-
+    ated again along `2^64`, is `-2^-66`, bit for bit, jitted, as the share's plain quotient differentiates
+    through its normal intermediates, where the balanced share held the length constant and gave `-2^-67`
+    (row 13260)."""
+    from dew.nn.attention_terms import clipped
+
+    def tangent(x):
+        return jax.jvp(lambda x: clipped(x, 1.0, 2.0 ** 64), (x,), (jnp.ones_like(x),))[1]
+
+    head = jnp.full((1,), 2.0 ** 64, jnp.float32)
+    second = jax.jit(lambda x: jax.jvp(tangent, (x,), (jnp.full_like(x, 2.0 ** 64),))[1])(head)
+    np.testing.assert_array_equal(np.asarray(second), np.float32([-(2.0 ** -66)]))
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped
