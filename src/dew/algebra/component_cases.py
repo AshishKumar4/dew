@@ -8,7 +8,7 @@ import numpy as np
 
 from dew.algebra.generate import Cases, ComponentForm, declare
 from dew.nn import precision
-from dew.nn.kernels.recurrence_algebra import derived_tile
+from dew.nn.kernels.recurrence_algebra import apart, derived_tile
 from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents, derived_from_weights
 
 
@@ -30,17 +30,15 @@ def _scores_truth(products, decays, scales):
     return jnp.tril(products * (decays * scales))
 
 
-def _pairs(products, decays, scales):
-    return derived_tile("pairs").mapped({"products": products, "decays": decays, "scales": scales})
-
-
-def _pairs_truth(products, decays, scales):
-    return jnp.tril(products * decays * scales[:, None], k=-1)
+def _apart_truth(rows, rows_lo, columns, columns_lo):
+    left = rows + rows_lo
+    right = columns + columns_lo
+    return left[:, None] - right[None, :]
 
 
 def _keys_cotangent(weights, products, anchor, delta, seen):
     return derived_from_weights(keys_first=True, masked=True).mapped(
-        dict(weights=weights, products=products, anchor=anchor, delta=delta, seen=seen))
+        {"weights": weights, "products": products, "anchor": anchor, "delta": delta, "seen": seen})
 
 
 def _keys_truth(weights, products, anchor, delta, seen):
@@ -48,9 +46,9 @@ def _keys_truth(weights, products, anchor, delta, seen):
 
 
 def _queries_cotangent(logits, products, peak, total, anchor, delta, seen, at_anchor):
-    return derived_cotangents(False, False, True, accurate=True).mapped(
-        dict(logits=logits, products=products, peak=peak, total=total, anchor=anchor, delta=delta,
-             seen=seen, at_anchor=at_anchor))
+    return derived_cotangents(keys_first=False, dropped=False, masked=True, accurate=True).mapped(
+        {"logits": logits, "products": products, "peak": peak, "total": total,
+         "anchor": anchor, "delta": delta, "seen": seen, "at_anchor": at_anchor})
 
 
 def _queries_truth(logits, products, peak, total, anchor, delta, seen, at_anchor):
@@ -84,14 +82,6 @@ def _backward_cases(shapes, *, mask_count, total_at=None, accurate=False):
     return Cases((operands,), draw, seeds=8, policies=("accurate" if accurate else "default",))
 
 
-def _rounded_half(x):
-    return precision._rounded(x, jnp.float16)
-
-
-def _rounded_half_truth(x):
-    return x.astype(jnp.float16).astype(x.dtype)
-
-
 def _rounded(x):
     return precision._rounded(x, jnp.bfloat16)
 
@@ -110,14 +100,14 @@ def _tangent_truth(x, dx, value):
 
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
-ROUNDED = declare(__name__, "rounded", ComponentForm(_rounded, _rounded_truth, _cases(((16, 32),))))
+ROUNDED = declare(__name__, "rounded", ComponentForm(_rounded, _rounded_truth, _cases(((16, 32),), ((8, 64),))))
 TANGENT = declare(__name__, "rounded_tangent", ComponentForm(
-    _tangent, _tangent_truth, _cases(((16, 32), (16, 32), (16, 32)))))
-PAIRS = declare(__name__, "pairs", ComponentForm(_pairs, _pairs_truth, _cases(((32, 32), (32, 32), (32,)))))
-ROUNDED_HALF = declare(__name__, "rounded_half", ComponentForm(
-    _rounded_half, _rounded_half_truth, _cases(((16, 32),))))
+    _tangent, _tangent_truth, _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))])))
+PREFIX_DIFFERENCE = declare(__name__, "prefix_difference", ComponentForm(
+    apart, _apart_truth, _cases(((32,), (32,), (64,), (64,)))))
 KEYS_COTANGENT = declare(__name__, "keys_cotangent", ComponentForm(
-    _keys_cotangent, _keys_truth, _backward_cases(((64, 32), (64, 32), (32,), (32,), (64, 32)), mask_count=1)))
+    _keys_cotangent, _keys_truth,
+    _backward_cases(((64, 32), (64, 32), (32,), (32,), (64, 32)), mask_count=1)))
 QUERIES_COTANGENT = declare(__name__, "queries_cotangent", ComponentForm(
     _queries_cotangent, _queries_truth,
     _backward_cases(((32, 64), (32, 64), (32,), (32,), (32,), (32,), (32, 64), (32, 64)),
