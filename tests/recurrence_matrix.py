@@ -35,7 +35,14 @@ import tier_wire
 from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
-from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, recording, with_gradients
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    indexed_recording,
+    recorded_names,
+    recording,
+    with_gradients,
+)
 from ssd_support import MAMBA_SSM, mamba_side
 from test_recurrence_chunk import (
     FORMED,
@@ -141,13 +148,21 @@ FP32_HEADS = 16
 within 512 seeds (M-JS-75d); a 16-bit cell's rounding resolves at two."""
 
 
+MODEL_WIDTHS = {"Qwen3.5-27B": {"key_heads": 16, "value_heads": 48, "key_width": 128, "value_width": 128,
+                                "length": 1024}}
+"""A model's gated delta net widths a cell may draw at (`_drawn`'s `widths`): Qwen3.5-27B's 16 key heads
+and 48 value heads of 128 (tools/benchmark_recurrence.py's shape, its fixture's config.json) over 1,024
+tokens, sixteen of its template's chunks."""
+
+
 def _drawn(case: dict[str, str], seed: int):
     """`case`'s operands from `seed` (`draw`, its queries, keys and values and write gate in the case's
-    dtype; an fp32 cell's over `FP32_HEADS` value heads) and fp32 cotangents of its output and final
-    memory."""
+    dtype; an fp32 cell's over `FP32_HEADS` value heads; a case naming `widths` at a model's,
+    `MODEL_WIDTHS`) and fp32 cotangents of its output and final memory."""
     hooks = FORMS[case["form"]]
     heads = FP32_HEADS if case["dtype"] == "float32" else VALUE_HEADS
-    (operands,) = draw(hooks, packed=case["documents"] == "packed", seed=seed, value_heads=heads)
+    widths = MODEL_WIDTHS[case["widths"]] if "widths" in case else {"value_heads": heads}
+    (operands,) = draw(hooks, packed=case["documents"] == "packed", seed=seed, **widths)
     narrow = jnp.dtype(case["dtype"])
     operands = dataclasses.replace(operands, starts=None, **{
         name: getattr(operands, name).astype(narrow) for name in ("query", "key", "value", "beta")
@@ -331,12 +346,14 @@ def _upstream(named: dict[str, str], block: int, *, first: int = 0):
                         keyed=lambda operands, cotangents: operands)
 
 
-def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
+def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS, *, widths: str | None = None
+            ) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
     (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
-    output, the final memory and every operand's gradient. Its routes are its family's (`CHOICES`). A cell
-    reports its distance from Dew's own chunk math and the forms its call took."""
-    named = dict(zip(AXES[family], case, strict=True))
+    output, the final memory and every operand's gradient, drawn at a model's `widths` where named
+    (`MODEL_WIDTHS`). Its routes are its family's (`CHOICES`). A cell reports its distance from Dew's own
+    chunk math and the forms its call took."""
+    named = dict(zip(AXES[family], case, strict=True)) | ({} if widths is None else {"widths": widths})
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
@@ -356,7 +373,7 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
         assert any(route.kernel == named["kernel"] for route in found)
     reference = _reference(named)
     upstream = reference.removeprefix("upstream ") if reference.startswith("upstream ") else None
-    if _held_to_a_recording(upstream):
+    if _held_to_a_recording(upstream, "-".join(named.values())):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
@@ -369,15 +386,22 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
                     truth_fn=with_gradients(truth))
 
 
-def _held_to_a_recording(upstream: str | None, environ: Mapping[str, str] = os.environ) -> bool:
-    """Whether a cell of `upstream` (None: none) is held to its recording (`_on_par_recorded`): on a host of
-    `environ` without its GPU tier reference interpreter (`INTERPRETERS`), but in a GPU tier part's prepare
-    of an upstream with no recording (`RECORDED`), which prepares the site its run, where the interpreter
-    runs, holds it at (`_upstream`, an arm the gate runs as given): asserted against a recording there, a
-    mamba_ssm cell left its site unprepared and its run red (train 1282, `sm90-rated scan-pallas`)."""
+def _held_to_a_recording(upstream: str | None, site: str, environ: Mapping[str, str] = os.environ) -> bool:
+    """Whether a cell of `upstream` (None: none) at `site` is held to its recording (`_on_par_recorded`): on
+    a host of `environ` without its GPU tier reference interpreter (`INTERPRETERS`), but in a GPU tier part's
+    prepare of a site no recording holds (`RECORDED`, `_recorded`), which prepares the site its run, where
+    the interpreter runs, holds it at (`_upstream`, an arm the gate runs as given): asserted against a
+    recording there, a mamba_ssm cell left its site unprepared and its run red (train 1282, `sm90-rated
+    scan-pallas`)."""
     if upstream is None or environ.get(INTERPRETERS[upstream]):
         return False
-    return upstream in RECORDED or not tier_wire.preparing(environ)
+    return _recorded(upstream, site) or not tier_wire.preparing(environ)
+
+
+def _recorded(upstream: str, site: str) -> bool:
+    """Whether `upstream`'s recording (`RECORDED`) holds `site` (`indexed_recording`'s `<site>.` arrays)."""
+    return upstream in RECORDED and any(
+        name.startswith(f"{site}.") for name in recorded_names(RECORDED[upstream]))
 
 
 def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: int) -> None:
@@ -387,9 +411,9 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: i
     float64 truth held to the recorded truth's sketch; a recording of another release than the tier's pin
     is stale, refused."""
     site = "-".join(named.values())
-    # Only the recorded upstreams' cells are held here: another's is its GPU tier's alone.
-    assert upstream in RECORDED, (f"{site}: no recording of {upstream}; its cells run where "
-                                  f"{INTERPRETERS[upstream]} names its reference interpreter")
+    # Only the recorded sites are held here: another's is its GPU tier's alone.
+    assert _recorded(upstream, site), (f"{site}: no recording of it on {upstream}; its cell runs where "
+                                       f"{INTERPRETERS[upstream]} names its reference interpreter")
     stored = recording(RECORDED[upstream])
     recorded = json.loads(str(stored["provenance"]))["revision"]
     pinned = tier_release(upstream)
@@ -415,6 +439,15 @@ def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
 def a_recurrences_training_step_on_a_tpu_is_on_par(case: tuple[str, ...]) -> None:
     """`_on_par` of a TPU's case (the TPU tier's flow, tests/test_ssd_kernel.py)."""
     _on_par("recurrence_tpu", case)
+
+def a_gated_delta_nets_training_step_at_a_models_widths_is_on_par(generation_name: str) -> None:
+    """`_on_par` of the gated delta net's 16-bit training step on the template, on `generation_name`'s GPU,
+    at Qwen3.5-27B's widths (`MODEL_WIDTHS`): on mma.sync (an A100's, an RTX PRO 6000's) its solve's merges
+    issue their supports' instructions alone (`recurrence_algebra.doubled`), which an interpreter issues
+    whole (row 13234)."""
+    _on_par("recurrence", (generation_name, "gated delta net", "mosaic_gpu", "bfloat16", "one"),
+            widths="Qwen3.5-27B")
+
 
 SHARDED_SEEDS = 8
 """The per-shard cells' declared draws (check 1, `sharded.assert_runs_per_shard`)."""

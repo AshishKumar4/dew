@@ -389,6 +389,8 @@ class Support:
     left: np.ndarray
     right: np.ndarray
     kept: np.ndarray
+    _tiles: dict = dataclasses.field(default_factory=dict, init=False, repr=False)
+    """`tiles`' masks by their geometry, each formed once however many parts' products read it."""
 
     def divides(self, rows: int, columns: int, depth: int) -> bool:
         """Whether tiles of `rows` by `columns` of its outputs and `depth` of its terms tile its product."""
@@ -402,9 +404,15 @@ class Support:
         if not self.divides(rows, columns, depth):
             raise ValueError(f"tiles of {rows} x {columns} by {depth} do not tile a {self.left.shape[0]} x "
                              f"{self.right.shape[1]} product of depth {self.left.shape[1]}")
-        terms = self.left[:, None, :] & self.right.T[None, :, :] & self.kept[:, :, None]
-        m, n, k = terms.shape
-        return terms.reshape(m // rows, rows, n // columns, columns, k // depth, depth).any(axis=(1, 3, 5))
+        geometry = (rows, columns, depth)
+        if geometry not in self._tiles:
+            terms = self.left[:, None, :] & self.right.T[None, :, :] & self.kept[:, :, None]
+            m, n, k = terms.shape
+            tiles = terms.reshape(m // rows, rows, n // columns, columns, k // depth, depth).any(
+                axis=(1, 3, 5))
+            tiles.setflags(write=False)
+            self._tiles[geometry] = tiles
+        return self._tiles[geometry]
 
 
 class Blocks:

@@ -589,14 +589,21 @@ def doubled(a, issue: Issue, *, supported: Supported | None = None):
     return inverse
 
 
+@functools.cache
 def _merges_support(size: int, width: int) -> tuple[Support, Support]:
     """`doubled`'s two merges' supports at blocks of `width` (`Support`): the inverse `X_s` lower-triangular
     in its `width`-blocks, `A` strictly lower, the joins `M_s * (X_s A)` read in each odd block's rows over
-    the block before's columns; then those joins against the inverse, every output read (the sum's)."""
+    the block before's columns; then those joins against the inverse, every output read (the sum's). Formed
+    once a size and width, so every trace and part of a merge reads one support and its tiles
+    (`Support.tiles`)."""
     rows, cols = np.indices((size, size))
     held = (rows // width == cols // width) & (rows >= cols)
     joins = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-    return Support(held, rows > cols, joins), Support(joins, held, np.ones((size, size), bool))
+    masks = (held, rows > cols, joins, np.ones((size, size), bool))
+    for mask in masks:
+        mask.setflags(write=False)
+    held, lower, joins, every = masks
+    return Support(held, lower, joins), Support(joins, held, every)
 
 
 def solved(system, issue: Issue, *, supported: Supported | None = None):
