@@ -671,6 +671,17 @@ def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(r
     assert findings and all(f"no format for {np.dtype(dtype)}" in finding for finding in findings)
 
 
+@pytest.mark.parametrize("operands", [np.arange(256, dtype=np.uint8), np.arange(256, dtype=np.uint8).view(np.int8),
+                                     np.asarray([-2 ** 31, -1, 0, 1, 2 ** 31 - 1], np.int32)],
+                         ids=["u8", "s8", "s32"])
+def test_population_count_counts_the_words_at_their_own_width(operands):
+    mask = (1 << (operands.dtype.itemsize * 8)) - 1
+    expected = [(int(value) & mask).bit_count() for value in operands]
+    result, findings = ct.certified(jax.lax.population_count, operands)
+    assert not findings, findings
+    np.testing.assert_array_equal(result, expected)
+
+
 def test_an_integer_division_is_held_at_every_64_bit_magnitude():
     """An integer division truncates toward zero and wraps to its width, and its remainder takes the
     dividend's sign: int64's least value, -2^63, over 3 is -3074457345618258602, over -1 itself, uint64's

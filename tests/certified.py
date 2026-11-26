@@ -2047,6 +2047,7 @@ CONTRACTS = {
     jax.lax.shift_right_logical_p: _moved(_logical_shift(1)),
     jax.lax.shift_left_p: _moved(_logical_shift(-1)),
     jax.lax.bitcast_convert_type_p: _moved(_bitcast),
+    jax.lax.population_count_p: _moved(lambda params, value: np.bitwise_count(_bits(value))),
     jax.lax.reduce_and_p: _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
