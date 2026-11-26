@@ -176,16 +176,16 @@ class PhasePasses[L, E]:
         (`effective_precision`), its forms, recipe and outputs among them, which no tree or loss scale shows,
         whatever its objective records for inference (row 13537)."""
         from dew.nn.kernels import generation
-        from dew.nn.precision import Numerics, effective_precision
+        from dew.nn.precision import Numerics, effective_precision, precision_names
         from dew.registry import to_record
 
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
         numerics = to_record(generation.numerics(), Numerics)
-        # The precision an unpinned product multiplies at as it is read, resolved (`effective_precision`):
+        # The precision an unpinned product multiplies at as it is read, resolved (`effective_precision`) and
+        # named canonically (`precision_names`: 'highest' and 'float32' one), none where JAX's is unset:
         # numerics at "default" leave JAX's own setting, which another context may set otherwise.
-        products = effective_precision(None)
-        return {**objective.training_record(), **sampled, "numerics": numerics,
-                "products": None if products is None else str(products)}
+        products: list[JSON] = sorted(precision_names(effective_precision(None)))
+        return {**objective.training_record(), **sampled, "numerics": numerics, "products": products}
 
     def drawn_cap(self) -> int | None:
         """The cap of the pass count a run draws per microbatch, a batch's counted work's width

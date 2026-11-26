@@ -1237,7 +1237,8 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
         trainer(ambient, "ambient").fit(dataset(), steps=1)
     with pytest.raises(ValueError), jax.default_matmul_precision("default"):
         trainer(ambient, "ambient").fit(dataset(), steps=2)
-    with jax.default_matmul_precision("highest"):
+    # Under another spelling of the same precision ('float32' is 'highest'), it resumes.
+    with jax.default_matmul_precision("float32"):
         assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
 
 
