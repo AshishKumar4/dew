@@ -1197,7 +1197,8 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
 def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records_for_inference(tmp_path):
     """A trainer built directly over a directory whose run traced its programs under other numerics than
     it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its outputs
-    in bfloat16, or none given, JAX's own), which change no tree and no loss scale, refuses to resume, an
+    in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
+    tree and no loss scale, refuses to resume, an
     objective that records nothing for inference (no task) among them, as the run's training record holds
     them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537)."""
     import dataclasses
@@ -1217,9 +1218,9 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
 
     full = DTYPE_PRESETS["32-true"]
 
-    def trainer(numerics: Numerics | None) -> Trainer:
+    def trainer(numerics: Numerics | None, directory: str = "run") -> Trainer:
         return Trainer(Stated(), optax.sgd(0.1), key=jax.random.key(0),
-                       checkpoints=Checkpoints(str(tmp_path / "run")),
+                       checkpoints=Checkpoints(str(tmp_path / directory)),
                        advanced=TrainerAdvanced(numerics=numerics))
 
     assert Stated().inference_record() is None
@@ -1230,6 +1231,14 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
         with pytest.raises(ValueError):
             trainer(other).fit(dataset(), steps=2)
     assert int(trainer(trained).fit(dataset(), steps=2).step) == 2
+    # Numerics at "default" leave JAX's own precision, the run's then: resumed under another, refused.
+    ambient = Numerics(full, matmul="default")
+    with jax.default_matmul_precision("highest"):
+        trainer(ambient, "ambient").fit(dataset(), steps=1)
+    with pytest.raises(ValueError), jax.default_matmul_precision("default"):
+        trainer(ambient, "ambient").fit(dataset(), steps=2)
+    with jax.default_matmul_precision("highest"):
+        assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
 
 
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):

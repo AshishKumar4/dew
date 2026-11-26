@@ -172,15 +172,20 @@ class PhasePasses[L, E]:
         the law a pass count drawn per microbatch follows (`SampledPasses`), whose change would draw
         another schedule of passes from the same key and positions (row 10783), and the numerics its
         programs run under where it is read (`generation.numerics`: a trainer's `TrainerAdvanced.numerics`, a
-        run config's precision, else JAX's own), its products' precision, forms, recipe and outputs among
-        them, which no tree or loss scale shows, whatever its objective records for inference (row 13537)."""
+        run config's precision, else JAX's own) with the precision its unpinned products resolve to there
+        (`effective_precision`), its forms, recipe and outputs among them, which no tree or loss scale shows,
+        whatever its objective records for inference (row 13537)."""
         from dew.nn.kernels import generation
-        from dew.nn.precision import Numerics
+        from dew.nn.precision import Numerics, effective_precision
         from dew.registry import to_record
 
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
         numerics = to_record(generation.numerics(), Numerics)
-        return {**objective.training_record(), **sampled, "numerics": numerics}
+        # The precision an unpinned product multiplies at as it is read, resolved (`effective_precision`):
+        # numerics at "default" leave JAX's own setting, which another context may set otherwise.
+        products = effective_precision(None)
+        return {**objective.training_record(), **sampled, "numerics": numerics,
+                "products": None if products is None else str(products)}
 
     def drawn_cap(self) -> int | None:
         """The cap of the pass count a run draws per microbatch, a batch's counted work's width
