@@ -63,8 +63,8 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     args = SimpleNamespace(only=["forward"], claim=False, model="unused", flowers="unused",
                            torch_python="torch", out=tmp_path / "run.json")
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False)
-    forwards = [row.name for probe in gate.PROBES if probe.tool == "benchmark_forward.py"
-                for row in probe.rows]
+    forwards = [row.name for probe in gate.PROBES
+                if probe.tool == "benchmark_forward.py" and gate.chosen(probe, args.only) for row in probe.rows]
     assert forwards
     assert all(sample[name].startswith("failed: benchmark_forward.py exited 3") for name in forwards)
 
