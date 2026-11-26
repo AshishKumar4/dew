@@ -129,7 +129,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     int32 `[rows]` of a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read
     where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
     loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
-    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With
+    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads),
+    wide, rounded once (row 12396; a narrow prologue's routes round at its dtype first, row 13508). With
     a prologue, its side operands along the rows are the product's rows' (`gather`'s order, a normalized
     stream's scale gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's
     launch takes both (row 5391: an expert projection over a normalized or scaled token stream). `scatter`,
@@ -192,7 +193,6 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
-        # Gathered wide (exactly): its transpose sums a token's routes wide, as `_pulled` does (row 12396).
         lhs = lhs if gather is None else lhs.astype(at_least_fp32(lhs.dtype))[gather].astype(lhs.dtype)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
@@ -1933,8 +1933,8 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         return d_operand.astype(rounded if wide_rows else lhs.dtype), (), None
     # A gathered call's rows taken wide (exactly) into the prologue, run at its own dtype as the forward ran
     # it: each route's cotangent the prologue's VJP gives, widened, not rounded to the rows' dtype. A narrow
-    # prologue's VJP takes its operand's cotangent in its own dtype (reverse mode's: a value's cotangent is
-    # its dtype), as the portable program's does; an fp32 one's routes reach the sum unrounded.
+    # prologue's VJP takes its operand's cotangent in its own dtype first (reverse mode's: a value's
+    # cotangent is its dtype), each route rounded there before the sum (row 13508, open).
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs.astype(wide) if wide_rows else lhs,
                                              prologue_arrays, prologue_axes, group_sizes, d_operand, compute)
     sides = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))

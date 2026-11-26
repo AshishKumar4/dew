@@ -67,7 +67,7 @@ from dew.data.dataset import rows_of
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, float32_einsum
-from dew.nn.protocols import OutputTable, RematChoosing, forward_only, head_table
+from dew.nn.protocols import OutputTable, RematChoosing, head_table
 from dew.objectives.base import Aux, Objective, Step, _has_aux
 
 NOISE = jnp.float32
@@ -268,8 +268,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
 
         flat = leaves_by_path(params)
         try:
-            # The capture reads each call's values where it makes them: no module's own remat hides them.
-            with nn.intercept_methods(_outermost(captured)), forward_only():
+            with nn.intercept_methods(_outermost(captured)):
                 estimating._statistics_and_shares(variables, batch, step)
             gradients = self._sited(estimating, variables, batch, step, sites, cotangent, flat)
         except jax.errors.UnexpectedTracerError as escaped:

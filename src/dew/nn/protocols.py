@@ -36,11 +36,9 @@ callers add flags and absent values.
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Protocol, Self, runtime_checkable
 
 import jax
@@ -974,29 +972,6 @@ def fixed_remat[**Given, Value](function: Callable[Given, Value]) -> Callable[Gi
         with jax.named_scope(FIXED_SCOPE):
             return function(*args, **kwargs)
     return marked
-
-
-_FORWARD_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar("dew_forward_only", default=False)
-
-
-@contextlib.contextmanager
-def forward_only() -> Iterator[None]:
-    """Within it, a module's call is traced for its forward alone, its values read where its call makes
-    them (a node perturbation's capture of each Dense's input and output, `objectives.perturbation`): a
-    remat a module chooses inside its own call (`internal_remat`) is not taken, so no value it makes is
-    hidden in a checkpoint's trace; a model's own remat policy is its builder's to drop
-    (`RematChoosing.with_remat`). Its values are the same either way, a remat recomputing them as made."""
-    token = _FORWARD_ONLY.set(True)
-    try:
-        yield
-    finally:
-        _FORWARD_ONLY.reset(token)
-
-
-def internal_remat() -> bool:
-    """Whether a module takes a remat it chooses inside its own call (`forward_only`'s contract): not where
-    its call is traced for its forward alone."""
-    return not _FORWARD_ONLY.get()
 
 
 @dataclasses.dataclass(frozen=True)
