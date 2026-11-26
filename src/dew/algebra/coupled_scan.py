@@ -429,7 +429,8 @@ def _reader(query, scale):
     return scale * query, None
 
 
-def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool, reader_scale=1.0) -> Chunked:
+def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool,
+              reader_scale: float | np.floating) -> Chunked:
     """A chunk's values that read no state (`Chunked`), from its tokens' parts (`_chunk_parts`)."""
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
