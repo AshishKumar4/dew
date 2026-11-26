@@ -4,13 +4,12 @@ import ast
 import copy
 import dataclasses
 import itertools
-import re
 from collections import defaultdict
+from collections.abc import Collection
 
 from dew.algebra import printed
 
 
-_BINDER = re.compile(r"[pvx][0-9]+$")
 _MIN_SHARED = 6
 """Smaller fragments would add a call and arguments for little source reduction."""
 
@@ -18,7 +17,8 @@ _MIN_SHARED = 6
 class _Fragment(ast.NodeTransformer):
     """Alpha-rename a flat fragment. Only static broadcast shapes/axes may vary between copies."""
 
-    def __init__(self):
+    def __init__(self, scope: set[str]):
+        self.scope = scope
         self.inputs: dict[str, str] = {}
         self.bound: dict[str, str] = {}
 
@@ -27,7 +27,7 @@ class _Fragment(ast.NodeTransformer):
         return ast.Name(id=slot, ctx=ast.Load())
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        if not _BINDER.fullmatch(node.id):
+        if node.id not in self.scope:
             return node
         if isinstance(node.ctx, ast.Store):
             self.bound[node.id] = f"v{len(self.bound)}"
@@ -77,8 +77,8 @@ def _assigns(node: ast.stmt) -> bool:
             and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "bind")
 
 
-def _copy(name: str, first: int, nodes: list[ast.stmt]) -> _Copy:
-    normal = _Fragment()
+def _copy(name: str, first: int, nodes: list[ast.stmt], scope: set[str]) -> _Copy:
+    normal = _Fragment(scope)
     statements = []
     for node in nodes:
         # Visit the operands before allocating the SSA result names.
@@ -92,20 +92,30 @@ def _copy(name: str, first: int, nodes: list[ast.stmt]) -> _Copy:
     return _Copy(name, first, tuple(statements), tuple(normal.inputs), tuple(normal.bound))
 
 
-def _bodies(source: dict[str, str]) -> dict[str, list[ast.stmt]]:
+@dataclasses.dataclass(frozen=True)
+class _Body:
+    statements: list[ast.stmt]
+    scope: set[str]
+
+
+def _bodies(source: dict[str, str]) -> dict[str, _Body]:
     bodies = {}
     for name, text in source.items():
         (function,) = ast.parse(text).body
         assert isinstance(function, ast.FunctionDef)
-        bodies[name] = function.body
+        scope = {node.arg for node in ast.walk(function.args) if isinstance(node, ast.arg)}
+        scope.update(node.id for node in ast.walk(function)
+                     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+        bodies[name] = _Body(function.body, scope)
     return bodies
 
 
-def _largest(bodies: dict[str, list[ast.stmt]]) -> tuple[_Copy, ...]:
+def _largest(bodies: dict[str, _Body]) -> tuple[_Copy, ...]:
     """Find the shared region which saves the most source; only original primitive binds are eligible."""
     candidates = []
     for name, body in bodies.items():
-        for accepted, group in itertools.groupby(enumerate(map(_assigns, body)), key=lambda pair: pair[1]):
+        runs = itertools.groupby(enumerate(map(_assigns, body.statements)), key=lambda pair: pair[1])
+        for accepted, group in runs:
             if accepted:
                 indices = [index for index, _ in group]
                 candidates.extend((name, first, indices[-1] + 1 - first)
@@ -116,7 +126,8 @@ def _largest(bodies: dict[str, list[ast.stmt]]) -> tuple[_Copy, ...]:
         by_body: dict[tuple[_Assignment, ...], list[tuple[_Copy, int]]] = defaultdict(list)
         for name, first, available in candidates:
             if available >= width:
-                duplicate = _copy(name, first, bodies[name][first:first + width])
+                body = bodies[name]
+                duplicate = _copy(name, first, body.statements[first:first + width], body.scope)
                 by_body[duplicate.statements].append((duplicate, available))
         candidates = []
         for entries in by_body.values():
@@ -137,29 +148,33 @@ def _reads(statements: list[ast.stmt]) -> set[str]:
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
 
 
-def shared(source: dict[str, str]) -> dict[str, str]:
+def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[str, str]:
     """Emit private helpers for equivalent contiguous binds. Calls pass static axes and the original
     preceding values. They return only values used after at least one copy's span. No tracing decision
     moves into a run-time test, and each call executes the original primitive sequence in order."""
     forms = dict(source)
-    for number in itertools.count():
+    occupied = set(source).union(reserved)
+    numbers = itertools.count()
+    while True:
         bodies = _bodies(forms)
         copies = _largest(bodies)
         if not copies:
             return forms
         first = copies[0]
         width = len(first.statements)
-        suffixes = [_reads(bodies[found.name][found.first + width:]) for found in copies]
+        suffixes = [_reads(bodies[found.name].statements[found.first + width:]) for found in copies]
         kept = [index for index in range(len(first.written))
                 if any(found.written[index] in reads for found, reads in zip(copies, suffixes, strict=True))]
-        name = f"_shared_component_{number}"
+        while (name := f"_shared_component_{next(numbers)}") in occupied:
+            pass
+        occupied.add(name)
         helper = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
         helper += [line for statement in first.statements for line in statement.printed()]
         if kept:
             helper += printed.wrapped("    return (", [f"v{i}" for i in kept], ",)" if len(kept) == 1 else ")")
         forms[name] = "\n".join(helper)
         for found, reads in zip(copies, suffixes, strict=True):
-            nodes = bodies[found.name]
+            nodes = bodies[found.name].statements
             begin, end = nodes[found.first].lineno - 1, nodes[found.first + width - 1].end_lineno
             outputs = ", ".join(found.written[index] if found.written[index] in reads else "_"
                                 for index in kept)
@@ -168,4 +183,3 @@ def shared(source: dict[str, str]) -> dict[str, str]:
             call = printed.wrapped(f"    {outputs + ' = ' if outputs else ''}{name}(", list(found.arguments), ")")
             lines = forms[found.name].splitlines()
             forms[found.name] = "\n".join([*lines[:begin], *call, *lines[end:]])
-    return forms

@@ -247,11 +247,12 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             printed_by[found.name, text] = function
             emitted[function] = text.replace("def form(", f"def {function}(", 1)
         named[found] = printed_by[found.name, text]
+    declared = sorted({found.name for found in chosen})
     if all(isinstance(DECLARATIONS[name], ComponentForm) for name in names):
-        emitted = _component_sharing.shared(emitted)
+        emitted = _component_sharing.shared(emitted, reserved=declared)
     for source in emitted.values():
         body += ["", "", *source.splitlines()]
-    for name in sorted({found.name for found in chosen}):
+    for name in declared:
         own = [found for found in chosen if found.name == name]
         single = own[0].single
         policy, target = own[0].policy, own[0].target
