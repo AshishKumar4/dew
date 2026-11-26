@@ -732,8 +732,8 @@ def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_
     Splash attention's kind), lowered for a TPU here: a measuring tuning run of it would measure nothing it
     asked for, so its kernels are named by their compiler (`tuning._foreign_kernels`, which `tune` refuses
     with as `Untunable`), never passed by as a GPU's Triton kernels alone were (row 13534); in a branch of a
-    conditional a run may take as in the step's own flow. The same kernel behind a loop of no trips (a
-    counted loop's, or one whose condition its trace decided false), which no run reaches though JAX lowers
+    conditional a run may take as in the step's own flow. The same kernel behind a while loop of no trips (a
+    counted one's, or one whose condition its trace decided false), which no run reaches though JAX lowers
     it, beside a step's own XLA work, names none (row 13559). A step of
     Dew's own Mosaic GPU launches (the attention template's, lowered for an H100) names none: each call
     carries the launch that traced it (`KernelCall.launched`), whatever its kernel's name reads."""
@@ -759,10 +759,14 @@ def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_
     assert "mosaic_tpu: " in str(tuning.Untunable(foreign))
     # Taken where the data says: a run may take either branch.
     assert foreign_of(lambda x: jax.lax.cond(x[0, 0] > 0, step, lambda y: y + 1, x)) == foreign
-    # Behind a loop of no trips, a counted one's or a condition its trace decided false, beside the step's own
-    # work: lowered all the same, no run launches it.
-    for never in (lambda x: jax.lax.fori_loop(0, 0, lambda _, y: step(y), x) * 2 + 1,
-                  lambda x: jax.lax.while_loop(lambda _: False, step, x) * 2 + 1):
+    # Behind a loop of no trips, a counted one's (from 0 while below 0) or one whose condition its trace
+    # decided false, beside the step's own work: lowered all the same, no run launches it. (A fori_loop or
+    # scan of no trips JAX lowers no body for at all.)
+    def counted(x):
+        return jax.lax.while_loop(lambda held: held[0] < 0, lambda held: (held[0] + 1, step(held[1])),
+                                  (0, x))[1] * 2 + 1
+
+    for never in (counted, lambda x: jax.lax.while_loop(lambda _: False, step, x) * 2 + 1):
         lowered_never = jax.jit(never).trace(rows).lower(lowering_platforms=("tpu",))
         assert any(call.kind == "mosaic_tpu" for call in kernel_calls(lowered_never, unrun=True))
         assert tuning._foreign_kernels(lowered_never) == ()
