@@ -1015,7 +1015,8 @@ class Saturated:
 
 
 def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
-             saturation: Saturation, facts: Schedule | None = None, *, facts_settled: bool = False) -> Saturated:
+             saturation: Saturation, facts: Schedule | None = None, *,
+             facts_settled: bool = False) -> Saturated:
     """Run the rule sets to their fixpoint or limits. Reuse the regular fact closure from `graphed` or
     from a preceding run that changed nothing. A derivation's composite schedules keep their original
     call order: a later schedule can feed facts back into an earlier one."""
