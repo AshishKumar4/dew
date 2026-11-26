@@ -49,7 +49,9 @@ def _chunked_cov(x, y, w):
     return moments.chunked_covariance(x, y, w, tile=4, mode="merge")
 
 
-@pytest.mark.parametrize("taken", ORDER_SETS)
+# The complete reverse-over-reverse program peaks above 9 GiB cold on the standard CI host.
+@pytest.mark.parametrize("taken", [pytest.param(order, marks=pytest.mark.fresh_process)
+                                  if order == "grad of grad" else order for order in ORDER_SETS])
 def test_chunked_moments_holds_every_order(taken):
     """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
     (`moments.chunked_covariance`, merge) hold every derivative order finite against float64 truth and their
