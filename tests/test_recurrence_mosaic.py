@@ -49,6 +49,7 @@ from test_recurrence_chunk import (
     unit,
 )
 
+from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
@@ -821,8 +822,6 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
                     seeds=HOOK_SEEDS[hooks, packed])
 
 
-
-
 GROUPED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, reads='apart', ranks=2)
 """A readout apart from its token's two ranks' writes (Mamba-3 MIMO's, `recurrence.Hooks.ranks`)."""
 
@@ -947,6 +946,9 @@ forms' launches every form without the delta rule takes under the accurate numer
 RELEASED = frozenset({'minimax-text-01-lightning'})
 """The gate's forms without the delta rule that take their release's numbers where the run's fast forms do
 (`recurrence_chunk.chunk_rounding`'s `released`): lightning attention's, fla's simple GLA."""
+
+BOUNDED = {'kimi-linear-kda': KimiDeltaAttention.lower_bound}
+"""The gate's forms whose layer bounds their decays a token, as it declares it (`KimiDeltaAttention`)."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
 """The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
@@ -1281,7 +1283,6 @@ variants 117 on sm80 at 9e65ee222's gate, each about the forward's 89 (armada); 
 with its two-role walks 130.2 s on sm90 (train 630's CI, main f424ab7d8)."""
 
 
-
 def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
@@ -1292,6 +1293,8 @@ def _form(name: str, dtype) -> dict:
     if name in RELEASED:
         return {'delta': False, 'rounded': chunk_rounding(delta=False, dtype=dtype, released=True),
                 'values_gated': True}
+    if name in BOUNDED:
+        return {'rounded': True, 'decay_bound': BOUNDED[name]}
     return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
 
@@ -1862,8 +1865,6 @@ def test_a_training_launchs_backward_kernels_carry_its_launch():
     assert len(set(training.values())) == 1 and None not in training.values(), training
 
 
-
-
 def _step_certified(target: str, rows: int, *, packed: bool, op=None) -> list:
     """Qwen3.5-4B's gated delta net over `rows` rows of 12,288 tokens (`packed`: 17 documents a row) lowered
     for a compile-only `target` as a training step runs it (its gradient, certified as reverse mode runs it,
@@ -2362,8 +2363,6 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
     return [tiles, *rungs]
-
-
 
 
 def _cover(target: str) -> tuple[str, ...]:
