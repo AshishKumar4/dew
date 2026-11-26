@@ -60,13 +60,14 @@ class CrossPass:
     rank: int = 64
     additive: bool = True
     normalize_values: bool = True
-    scaled: bool = False
-    """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`)."""
-    gained: bool = True
-    """Whether each site's message query holds a gain (`AttentionResiduals.gained`; Inkling 2's none)."""
     scale_by_input_rms: bool = True
     normalize_message: bool = True
     norm_eps: float | None = None
+    scaled: bool = False
+    """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`); it and
+    `gained` follow the fields before them, which a positional spelling fills (row 13136)."""
+    gained: bool = True
+    """Whether each site's message query holds a gain (`AttentionResiduals.gained`; Inkling 2's none)."""
 
     def __post_init__(self):
         if self.block_size < 1 or self.rank < 1:
