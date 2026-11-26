@@ -88,16 +88,17 @@ def _decode_draw(rows, seed):
                  for shape in ((rows, 8), (8, 16), (8, 16), (16, 8), (rows, 8)))
 
 
-@pytest.mark.parametrize("rows", [1, 8])
-def test_the_opt_in_decode_region_lowers_as_one_call_with_the_written_math(rows):
+def _decoded_layer(*operands):
     from jax.extend import core
-    from reference_error import assert_as_exact, with_gradients
 
     from dew.algebra.fusion import lower_decode
 
-    args = _decode_draw(rows, 6107)[:-1]
-    traced = jax.jit(_decode_layer).trace(*args)
-    original = traced.jaxpr.jaxpr
+    # Construct the program at the Check 1 arm's trace, not in its closure. Its prepared
+    # executable then belongs to a stated function of the draw, with no pre-site compilation.
+    rows = operands[0].shape[0]
+    shapes = tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in operands)
+    traced = jax.make_jaxpr(_decode_layer)(*shapes)
+    original = traced.jaxpr
     assert lower_decode(original, rows=rows) is original
     with jax.disable_jit():
         assert lower_decode(original, rows=rows, enabled=True) is original
@@ -107,19 +108,21 @@ def test_the_opt_in_decode_region_lowers_as_one_call_with_the_written_math(rows)
     lhs = [(eq.primitive, eq.params) for eq in body.eqns if eq.primitive is jax.lax.dot_general_p]
     rhs = [(eq.primitive, eq.params) for eq in original.eqns if eq.primitive is jax.lax.dot_general_p]
     assert len(lhs) == 3 and lhs == rhs
-    chosen = traced.jaxpr.replace(jaxpr=selected)
-
     mesh = jax.sharding.AbstractMesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
     with jax.sharding.use_abstract_mesh(mesh):
-        placed = jax.make_jaxpr(_decode_layer)(*args).jaxpr
+        placed = jax.make_jaxpr(_decode_layer)(*shapes).jaxpr
     assert lower_decode(placed, rows=rows, enabled=True) is placed
 
-    def decoded(*operands):
-        (out,) = core.jaxpr_as_fun(chosen)(*operands)
-        return out
+    (out,) = core.jaxpr_as_fun(traced.replace(jaxpr=selected))(*operands)
+    return out
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+def test_the_opt_in_decode_region_lowers_as_one_call_with_the_written_math(rows):
+    from reference_error import assert_as_exact, with_gradients
 
     assert_as_exact(
-        with_gradients(decoded), with_gradients(_decode_layer), lambda seed: _decode_draw(rows, seed),
+        with_gradients(_decoded_layer), with_gradients(_decode_layer), functools.partial(_decode_draw, rows),
         "one-call decode SwiGLU and all four gradients", seeds=8, truth_fn=with_gradients(_wide_decode))
 
 
