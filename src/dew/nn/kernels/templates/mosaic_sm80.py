@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
+import importlib
 import itertools
 import operator
 from collections.abc import Callable, Iterator, Sequence
@@ -22,7 +23,6 @@ from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
-from jax.experimental.mosaic.gpu import mma as mosaic_mma
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 
@@ -772,6 +772,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         del pending
 
 
+_MOSAIC_MMA = importlib.import_module("jax.experimental.mosaic.gpu.mma")
+"""Mosaic GPU's mma.sync module (the package's `mma` its function): its single-tile product and TF32 rounding,
+which `_tiled_product` issues a tile at a time."""
+
+
 def _tiled_product(ctx, acc, left, *rights, rows: int, columns: int, depth: int, tiles: tuple):
     """`acc` plus one depth's products of `left` `[M, depth]` with `rights` (each `[depth, columns]`) on
     `tiles` alone (`MmaIssuer._supported`): each `(m, n, i)` its accumulator's tile at row tile `m` and column
@@ -779,11 +784,11 @@ def _tiled_product(ctx, acc, left, *rights, rows: int, columns: int, depth: int,
     operands rounded to TF32 once."""
     del ctx
     if left.mlir_dtype == ir.F32Type.get():
-        left, rights = mosaic_mma._rounded_to_tf32(left), tuple(map(mosaic_mma._rounded_to_tf32, rights))
+        left, rights = _MOSAIC_MMA._rounded_to_tf32(left), tuple(map(_MOSAIC_MMA._rounded_to_tf32, rights))
     acc = acc.copy()
     for m, n, index in tiles:
         at, span = slice(m * rows, (m + 1) * rows), slice(n * columns, (n + 1) * columns)
-        acc[at, span] = mosaic_mma._mma_single_tile(acc[at, span], left[at, slice(0, depth)], rights[index])
+        acc[at, span] = _MOSAIC_MMA._mma_single_tile(acc[at, span], left[at, slice(0, depth)], rights[index])
     return acc
 
 

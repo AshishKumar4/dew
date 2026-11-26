@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import COMPILES_ON_CPU, lowers
+from generation_support import COMPILES_ON_CPU, lowers
 from kernel_compile import lowered_for
 from test_recurrence_mosaic import resource_operands
 
