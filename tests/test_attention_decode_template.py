@@ -1331,11 +1331,12 @@ def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
     within their rows (`MosaicForward.parts`), short of the device: its plan splits the keys. Counted as
     parts times programs (2026-11-26 audit), the step filled the device on paper (192) and walked its keys
     in one slice."""
+    keys = 4096
     query = jnp.zeros((8, 1, 16, 64), jnp.float32)
-    key = jnp.zeros((8, KEYS, 8, 64), jnp.float32)
+    key = jnp.zeros((8, keys, 8, 64), jnp.float32)
     with generation.assumed("sm90"):
         work, *_ = attention_decode.planned(query, key, key, template.spans(
-            1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32)), template.Hooks())
+            1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32)), template.Hooks())
     assert work and all(plan.slices > 1 for plan in work.values()), work
 
 
