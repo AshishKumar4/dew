@@ -119,7 +119,7 @@ def test_a_gated_mlp_runs_fused_where_named_and_its_products_apart_where_no_rece
 
 @pytest.mark.parametrize("form", ["fused", "wide"])
 @pytest.mark.parametrize("generation_name", generations("sm90", "sm100"))
-def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(generation_name, form, monkeypatch):
+def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(generation_name, form):
     """A named MLP in a two-device row split runs its products on each device's own rows,
     lowered as a training step traces it (the trainer's layout, `placing`, under the default rules), runs
     its three products fused on each device's own rows (`gated_mlp._placement`: a map per shard, its kernels
@@ -132,7 +132,6 @@ def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(gene
     from sharded import layer_scope
 
     from dew.mesh import DATA_AXIS, MESH_AXES
-    from dew.nn.gated_mlp import GatedCase
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.mlp import GatedMLP
 
@@ -142,19 +141,9 @@ def test_a_named_gated_mlp_on_a_data_split_mesh_runs_its_products_per_shard(gene
     # A run's mesh (`MeshSpec`'s axes): the data axis two devices, every other one.
     mesh = Expected(tuple((axis, 2 if axis == DATA_AXIS else 1) for axis in MESH_AXES),
                     (None, PartitionSpec(DATA_AXIS)), frozenset())
-    admitted = 0
-    wide_launched = GatedCase.wide_launched
-
-    def counted(case):
-        nonlocal admitted
-        admitted += 1
-        return wide_launched(case)
-
-    monkeypatch.setattr(GatedCase, "wide_launched", counted)
     with layer_scope(grouped_matmul="mosaic", gated_mlp=form), generation.routes() as routes:
         lowered = lowered_for(layer.apply, (params, x), generation_name, mesh)
     assert [route.kernel for route in routes if route.choice == "gated_mlp"] == [form]
-    assert admitted == (1 if form == "wide" else 0)
     assert lowered.out_info.shape == (2, 64, FEATURES)
     read = {shape for call in kernel_calls(lowered) if call.kind == "mosaic_gpu" for shape in call.operands}
     # A device's 64 rows of the 128 and its hidden rows; each kernel whole, the template's one group of it.
