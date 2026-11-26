@@ -553,6 +553,7 @@ def test_a_tier_3_offset_norm_adds_its_offset_in_float32_as_its_source_does():
     does: an input `[1, 0]` under a weight `[2^-8, 0]` gives the source's own `1.421875` first, bit for bit,
     where the bf16 add rounded `1 + 2^-8` to 1 and gave `1.4140625` (row 13044's review)."""
     import torchax
+    from torchax.interop import jax_view
     from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
 
     from dew.interop.torchax_kernels import kernel_parts
@@ -574,7 +575,7 @@ def test_a_tier_3_offset_norm_adds_its_offset_in_float32_as_its_source_does():
     env = torchax.default_env()
     with env, torch.no_grad():
         norm = held.norm.to("jax")
-        got = np.asarray(torchax.interop.jax_view(norm(given.to("jax"))).astype(jnp.float32))
+        got = np.asarray(jax_view(norm(given.to("jax"))).astype(jnp.float32))
     np.testing.assert_array_equal(got, expected)
     assert float(expected[0, 0]) == 1.421875
 
