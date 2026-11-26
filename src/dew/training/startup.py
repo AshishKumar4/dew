@@ -187,10 +187,11 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
-    """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
-    or its model's record in its inference record (`Objective.inference_record`), the fields that say how
-    layers execute aside (a model's own fields its class marks as how it runs, `_computing`: a checkpoint a
-    fit's ladder climbed to recompute its layers resumes, row 12135), and each setting of what its
+    """Where the computation a checkpoint trained and this run's differ: each path of its objective's class,
+    its model's record or the numerics it ran under in its inference record (`Objective.inference_record`),
+    the fields that say how layers execute aside (a model's own fields its class marks as how it runs,
+    `_computing`: a checkpoint a fit's ladder climbed to recompute its layers resumes, row 12135), and each
+    setting of what its
     objective's loss computes (`trained` against `training`, `Objective.training_record`; row 9020: an LM's
     `z_loss` changed and resumed), where both state it and they disagree. A loop's passes (`Loop.PASSED`,
     which a phase sets) and a field one of them predates are no evidence, nor is a record either holds none
@@ -201,6 +202,11 @@ def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> 
         case dict(), dict() if "unrecorded" not in {*saved, *now}:
             found = [differs for name in ("objective", "model") if name in saved and name in now
                      for differs in _differing(*_computing(saved[name], now[name], name), name)]
+            # The numerics its programs ran under (`generation.run_precision`: a Python trainer's
+            # `TrainerAdvanced.numerics`, a run config's precision), which no tree or loss scale shows: the
+            # precision its unpinned products take among them (row 13537).
+            if "precision" in saved and "precision" in now:
+                found += _differing(saved["precision"], now["precision"], "precision")
     match trained, training:
         case dict(), dict():
             found += _differing(trained, training, "training")
