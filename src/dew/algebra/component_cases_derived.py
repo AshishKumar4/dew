@@ -31,6 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from dew.algebra import _generated
+
 
 def _keys_cotangent_0(x1, x2, x3, x4, x5):
     v6 = lax.broadcast_in_dim_p.bind(
@@ -122,8 +124,7 @@ _keys_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
 
 def keys_cotangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """keys_cotangent's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _keys_cotangent_forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_keys_cotangent_forms, operands, policy, target, single=True)
 
 
 _prefix_difference_forms: dict[tuple, Callable[..., tuple]] = {
@@ -134,8 +135,7 @@ _prefix_difference_forms: dict[tuple, Callable[..., tuple]] = {
 
 def prefix_difference(*operands, policy: str = 'default', target: str = 'sm90'):
     """prefix_difference's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _prefix_difference_forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_prefix_difference_forms, operands, policy, target, single=True)
 
 
 _queries_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
@@ -148,8 +148,7 @@ _queries_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
 
 def queries_cotangent(*operands, policy: str = 'accurate', target: str = 'sm90'):
     """queries_cotangent's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _queries_cotangent_forms[(policy, target, case)](*operands)
+    return _generated.call(_queries_cotangent_forms, operands, policy, target, single=False)
 
 
 _rounded_forms: dict[tuple, Callable[..., tuple]] = {
@@ -162,8 +161,7 @@ _rounded_forms: dict[tuple, Callable[..., tuple]] = {
 
 def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _rounded_forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_rounded_forms, operands, policy, target, single=True)
 
 
 _rounded_tangent_forms: dict[tuple, Callable[..., tuple]] = {
@@ -176,8 +174,7 @@ _rounded_tangent_forms: dict[tuple, Callable[..., tuple]] = {
 
 def rounded_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded_tangent's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _rounded_tangent_forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_rounded_tangent_forms, operands, policy, target, single=True)
 
 
 _scores_forms: dict[tuple, Callable[..., tuple]] = {
@@ -192,5 +189,4 @@ _scores_forms: dict[tuple, Callable[..., tuple]] = {
 
 def scores(*operands, policy: str = 'default', target: str = 'sm90'):
     """scores's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    return _scores_forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_scores_forms, operands, policy, target, single=True)
