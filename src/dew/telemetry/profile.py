@@ -540,10 +540,11 @@ def _export(capture: Path, converter: _Converter | None, metadata: dict[str, JSO
     # Its trace read where it stopped cleanly: a trace it cannot read (an OSError past its absence) fails
     # its export, its manifest saying so, which the export writes first (`exported`).
     inspected: list[Exception] = []
+    reasons: list[str] = []
     try:
         reasons = [] if failures else held_back(capture, metadata)
     except OSError as error:
-        reasons, inspected = [], [error]
+        inspected.append(error)
     metadata["capture_status"] = "failed" if failures or inspected else "partial" if reasons else "completed"
     metadata["capture_errors"] = [str(error) for error in [*failures, *inspected]]
     metadata["capture_reasons"] = [*reasons]

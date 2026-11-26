@@ -177,21 +177,31 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
                                          step: int) -> list[str]:
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
-    a pass count's sampled law among it, row 10783)."""
+    a pass count's sampled law among it, row 10783); and, for a trainer given a run's numerics
+    (`TrainerAdvanced.numerics`), the numerics the checkpoint's programs ran under (its record's
+    `precision`, `generation.run_precision`), which no tree or loss scale shows, the precision its unpinned
+    products take among them, as a run config's precision is compared (`RunConfig.check_resume`, row
+    13537)."""
+    from dew.nn.precision import Numerics
+    from dew.registry import to_record
+
     saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
     # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
     # checkpoint that records none, a fixed-pass run's, any run resumes).
     dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
                and "sampled_passes" not in now else [])
-    return differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
+    artifact = checkpoints.artifact(step)
+    precision = (_differing(artifact["precision"], to_record(trainer.numerics, Numerics), "precision")
+                 if trainer.numerics is not None and isinstance(artifact, dict) and "precision" in artifact
+                 else [])
+    return differing_records(artifact, trainer._artifact(), saved, now) + dropped + precision
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
-    """Where the computation a checkpoint trained and this run's differ: each path of its objective's class,
-    its model's record or the numerics it ran under in its inference record (`Objective.inference_record`),
-    the fields that say how layers execute aside (a model's own fields its class marks as how it runs,
-    `_computing`: a checkpoint a fit's ladder climbed to recompute its layers resumes, row 12135), and each
-    setting of what its
+    """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
+    or its model's record in its inference record (`Objective.inference_record`), the fields that say how
+    layers execute aside (a model's own fields its class marks as how it runs, `_computing`: a checkpoint a
+    fit's ladder climbed to recompute its layers resumes, row 12135), and each setting of what its
     objective's loss computes (`trained` against `training`, `Objective.training_record`; row 9020: an LM's
     `z_loss` changed and resumed), where both state it and they disagree. A loop's passes (`Loop.PASSED`,
     which a phase sets) and a field one of them predates are no evidence, nor is a record either holds none
@@ -202,11 +212,7 @@ def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> 
         case dict(), dict() if "unrecorded" not in {*saved, *now}:
             found = [differs for name in ("objective", "model") if name in saved and name in now
                      for differs in _differing(*_computing(saved[name], now[name], name), name)]
-            # The numerics its programs ran under (`generation.run_precision`: a Python trainer's
-            # `TrainerAdvanced.numerics`, a run config's precision), which no tree or loss scale shows: the
-            # precision its unpinned products take among them (row 13537).
-            if "precision" in saved and "precision" in now:
-                found += _differing(saved["precision"], now["precision"], "precision")
+
     match trained, training:
         case dict(), dict():
             found += _differing(trained, training, "training")

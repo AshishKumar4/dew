@@ -85,6 +85,7 @@ from dew.nn.kernels.generation import (
     tpu,
 )
 from dew.nn.kernels.options import (
+    Option,
     OuterProgram,
     attempting,
     collecting,
@@ -287,6 +288,19 @@ def _wheel_targets_registered() -> None:
         wheel.load()()
 
 
+def _refuse_other_options(compiled: Mapping[str, Option] | None, options: jax.stages.CompilerOptions | None,
+                          what: str) -> None:
+    """Refuse a program compiled ahead under `compiled`, XLA's options, for a run that compiles it under
+    `options` (`unlimited`: a compile's limit aside), its scoped ones among them (`compiled_with`): its
+    executable is another compile than the run's own (row 13553: one loaded under another option, which the
+    run's own compile would have sent XLA)."""
+    wanted = unlimited(options)
+    if (dict(compiled) if compiled else None) != (dict(wanted) if wanted else None):
+        raise NotTheStepCompiledAhead(
+            f"the {what} compiled ahead under XLA options {dict(compiled or {})}, and this run compiles it "
+            f"under {dict(wanted or {})}: compile it ahead under the run's options")
+
+
 class NotTheStepCompiledAhead(ValueError):
     """A run handed a step compiled ahead (`AheadOfTime`) lowers its step, or its sampled step, to another
     program than the one compiled: another config, data shape, rung or Dew, which the executable would not
@@ -300,23 +314,27 @@ class AheadProgram:
 
     program: str
     executable: Executable
+    options: dict[str, Option] | None = None
+    """The XLA options it compiled under (`AheadOfTime.options`)."""
 
     @staticmethod
-    def of(program: str, compiled: jax.stages.Compiled) -> AheadProgram:
-        """`compiled`, the executable `program` (`program_digest`) compiled to, as a program compiled
-        ahead."""
-        return AheadProgram(program, Executable.of(compiled))
+    def of(program: str, compiled: jax.stages.Compiled,
+           options: jax.stages.CompilerOptions | None) -> AheadProgram:
+        """`compiled`, the executable `program` (`program_digest`) compiled to under `options`, as a
+        program compiled ahead."""
+        return AheadProgram(program, Executable.of(compiled), None if options is None else dict(options))
 
     def taken(self, lowered: jax.stages.Lowered, devices: list,
               options: jax.stages.CompilerOptions | None) -> jax.stages.Compiled:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered` and compiles
-        under `options`: refused where that is another program than this one, or the options it compiled
-        under another's (`unlimited`: a compile's limit aside), and admitted as a compiled one is
+        under `options`: refused where that is another program than this one, or other options than it
+        compiled under (`AheadOfTime.options`), and admitted as a compiled one is
         (`dew.communicators.admit`)."""
-        if stated_digest(lowered, unlimited(options)) != self.program:
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the sampled step compiled ahead is another program than the one this run compiles: compile "
                 "it ahead from this run's config, with its inspection")
+        _refuse_other_options(self.options, options, "sampled step")
         return self.executable.loaded(devices)
 
 
@@ -399,6 +417,11 @@ class AheadOfTime:
     these as compiled here (`taking`), so its devices compile nothing before and at its first step, its
     placement included (Main, 11-07: an attention step compiled ahead still compiled its placement on the
     GPU, 5-7 s)."""
+
+    options: dict[str, Option] | None = None
+    """The XLA options it compiled under (`unlimited`: a compile's limit aside), its scoped ones among them
+    (`compiled_with`), which a run handed it compiles under too or refuses it (`taken`, row 13553: one
+    compiled under none of an option the run's own compile sends XLA was loaded for it)."""
 
     def taking(self) -> contextlib.AbstractContextManager[None]:
         """The block a run handed this step builds its start and its first step's copies in: each program
@@ -518,14 +541,14 @@ class AheadOfTime:
               ) -> jax.stages.Compiled:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered` and compiles under
         `options`: refused where that is another program than the one compiled ahead, a config, a data
-        shape, a rung or a Dew that differs, or other options than it compiled under (`unlimited`: a
-        compile's limit aside, its scoped XLA options among them, row 13553), which the executable would
-        not run as the run's step."""
-        if stated_digest(lowered, unlimited(options)) != self.program:
+        shape, a rung or a Dew that differs, or other options than it compiled under (`options`), which the
+        executable would not run as the run's step."""
+        if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
                 "ahead from this run's config and data (dew lower, target:ahead), with this Dew, and no plan "
                 "recorded for another rung")
+        _refuse_other_options(self.options, options, "step")
         return self.loaded()
 
 
@@ -1680,8 +1703,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                                       for executable, held, built in programs])
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape),
-        program_digest(lowered, unlimited(planned.options)),
-        Executable.of(compiled),
+        program_digest(lowered), Executable.of(compiled), options=unlimited(planned.options),
         flops=step_flops(compiled),
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
@@ -1745,8 +1767,8 @@ def _sampled_ahead(planned: Planned) -> AheadProgram | None:
         return None
     if planned.sampled.lowered is None:
         raise ValueError("a sampled step's plan was released before it was compiled ahead")
-    return AheadProgram.of(program_digest(planned.sampled.lowered, unlimited(planned.options)),
-                           planned.sampled.executable)
+    return AheadProgram.of(program_digest(planned.sampled.lowered), planned.sampled.executable,
+                           unlimited(planned.options))
 
 
 def prepare_host_step[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> HostStartup:

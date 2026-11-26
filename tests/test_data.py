@@ -361,12 +361,9 @@ def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
                               (TWO_CPUS, 10**6, 0)):
         _Counted.made = 0
         loading = Loading(workers="auto", threads=0, read_buffer=0, host=host, max_workers=most)
-        reader = compile(chain, seed=5, steps=steps, loading=loading).train(DataPartition())
-        try:
-            listed(reader, 1)
-            assert _Counted.made == 4, (host, steps, most, _Counted.made)
-        finally:
-            reader.close()
+        # Read in the process with no thread ahead: nothing runs past the batch read, so nothing is closed.
+        listed(compile(chain, seed=5, steps=steps, loading=loading).train(DataPartition()), 1)
+        assert _Counted.made == 4, (host, steps, most, _Counted.made)
 
 
 def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
