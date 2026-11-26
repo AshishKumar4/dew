@@ -737,10 +737,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
             fused=walk.fused, after=after is not None, vectors=family.stages_vectors)
         spans_of, score_refs, drop_of, l_ref = unflattened
-        # Each band's gradient ref beside its origins, what its tiles' columns are read by.
-        banded = tuple(zip(band_refs, [origins for origins, kind in zip(band_paired(score_refs, kinds), kinds,
-                                                                         strict=True) if kind is Kind.BAND],
-                           strict=True))
+        # Each band's gradient ref beside its origins, what its tiles' columns are read by; none where the
+        # program writes no hook gradient (a later share's, `_grading`).
+        band_origins = [origins for origins, kind in zip(band_paired(score_refs, kinds), kinds, strict=True)
+                        if kind is Kind.BAND]
+        banded = tuple(zip(band_refs, band_origins, strict=True)) if band_refs else ()
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
