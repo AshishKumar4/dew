@@ -437,7 +437,8 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
                       if other is not run and other.start_ns < run.end_ns and run.start_ns < other.end_ns]:
             raise AmbiguousCapture(f"{module}'s run under {directory} overlaps {beside} on TPU {device}, so "
                                    "the ops within it are not told apart")
-        program = trace.program_of(run) or own.fullmatch(run.name).group(3)
+        named = own.fullmatch(run.name)
+        program = trace.program_of(run) or (named.group(3) if named else None)
         inside = [op for op in planes.get(plane, [])
                   if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns]
         if foreign := [op.name for op in inside if trace.program_of(op) not in (None, program)]:
