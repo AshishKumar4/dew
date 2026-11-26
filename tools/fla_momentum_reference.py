@@ -19,9 +19,6 @@ fp32. The oracle is fla's own reference, `recurrent_momentum_delta_rule_ref`, in
 (`_dew_torch.precision.float64`) on the GPU, held at every seed to Dew's float64 token recurrence.
 """
 
-import os
-import sys
-import time
 
 import numpy as np
 
@@ -67,90 +64,36 @@ def run(arrays, *, rule, dtype, device, wide: bool) -> dict[str, np.ndarray]:
 
 
 def serve() -> None:
-    """The torch side (tools/reference_worker.py's protocol): each request a site's inputs with its `dtype`,
-    answered with fla's outputs and the reference's (`reference.<leaf>`, `truth.<leaf>`), after one `ready`
-    line of fla's, torch's and Triton's releases and the device."""
-    from importlib.metadata import version
-
-    import reference_worker
-    import torch
+    """The torch side: fla's `chunk_momentum_delta_rule` and its float64 reference
+    `recurrent_momentum_delta_rule_ref` on each request (`fla_recording.serve`)."""
+    import fla_recording
     from fla.ops.momentum_delta_rule import chunk_momentum_delta_rule, recurrent_momentum_delta_rule_ref
-    from reference_releases import require
 
-    from _dew_torch.precision import float64
+    def answered(arrays, *, dtype, device, wide: bool):
+        rule = recurrent_momentum_delta_rule_ref if wide else chunk_momentum_delta_rule
+        return run(arrays, rule=rule, dtype=dtype, device=device, wide=wide)
 
-    require(COHORT)
-    torch_release = version('torch').split('+')[0]
-    found = f"fla-core-{version('fla-core')}+torch-{torch_release}+triton-{version('triton')}"
-
-    def answer(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        dtype = getattr(torch, str(arrays.pop("dtype")))
-        began = time.perf_counter()
-        reference = run(arrays, rule=chunk_momentum_delta_rule, dtype=dtype, device="cuda", wide=False)
-        referenced = time.perf_counter()
-        with float64():
-            truth = run(arrays, rule=recurrent_momentum_delta_rule_ref, dtype=torch.float64, device="cuda",
-                        wide=True)
-        print(f"timed fla {referenced - began:.3f} s truth {time.perf_counter() - referenced:.3f} s",
-              file=sys.stderr, flush=True)
-        return reference_worker.paired(reference, truth)
-
-    reference_worker.serve(answer, f"{found} {torch.cuda.get_device_name()}")
+    fla_recording.serve(COHORT, answered, ("dtype",))
 
 
 def write_seeded(worker, names: list[str], out) -> None:
-    """Each named site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s session), recorded as a summary (`record_case`) into `out`, Dew's float64 token recurrence held
-    to fla's reference at every seed: a unit of the recording, which `reference_worker.merged_units` joins
-    into the fixture."""
+    """A unit of the recording at `names` (`fla_recording.write_seeded`), Dew's float64 token recurrence
+    (`momentum_sites.token_by_token`) held to fla's reference at every seed."""
     import functools
 
-    import jax
+    import fla_recording
     from momentum_sites import ruled, sites, token_by_token
-    from recorded_references import oracle_held, provenance, record_case
-    from reference_error import chain_roundings, widened
-    from reference_worker import arms
 
-    version, device = worker.started.split(maxsplit=1)
-    stored = {}
-    for name in names:
-        site, began = sites()[name], time.perf_counter()
-        sample = site.arrays(0)
-        dtype = str(sample["q"].dtype)
-
-        def fla(arrays, dtype=dtype):
-            request = {key: np.asarray(value, np.float32) for key, value in arrays.items()}
-            return arms(worker.ask(request | {"dtype": np.asarray(dtype)}))
-
-        exact_run = jax.jit(functools.partial(ruled, token_by_token, leaves=site.leaves))
-        with jax.enable_x64(new_val=True):
-            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(sample)))
-
-        evaluate = oracle_held(fla, exact_run, roundings, f"fla {name}")
-        stored.update(record_case(name, site.arrays, evaluate, store_inputs=False, summary=True))
-        print(f"{name}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
-    stored["provenance"] = provenance(
-        version, version, device.strip(),
-        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_momentum_reference.py "
-        "<fla-0.6 python> <unit> <site>...",
-        truth="fla's recurrent_momentum_delta_rule_ref in torch float64",
-        cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced "
-                    "chain_roundings")
-    np.savez(out, allow_pickle=False, **stored)
-    print(f"wrote {out}: {out.stat().st_size:,} bytes", flush=True)
-
-
-def main() -> None:
-    """The recorder's command line (`reference_worker.recording_command`), its sites `momentum_sites`'s."""
-    from pathlib import Path
-
-    from reference_worker import recording_command
-
-    fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "momentum_seeded.npz"
-    recording_command(__file__, "momentum_sites", serve=serve, write_seeded=write_seeded, fixture=fixture,
-                      license="MIT")
+    fla_recording.write_seeded(
+        worker, names, out, sites=sites(), options=lambda site, sample: {"dtype": str(sample["q"].dtype)},
+        exact=lambda site: functools.partial(ruled, token_by_token, leaves=site.leaves),
+        command="PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_momentum_reference.py "
+                "<fla-0.6 python> <unit> <site>...",
+        truth="fla's recurrent_momentum_delta_rule_ref in torch float64")
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    main()
+    import fla_recording
+
+    fla_recording.main(__file__, "momentum_sites", "momentum_seeded.npz", serve=serve,
+                       write_seeded=write_seeded)

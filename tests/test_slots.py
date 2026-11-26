@@ -306,3 +306,18 @@ def test_the_slot_forms_are_their_writes_shifted_by_a_common_large_offset_split_
             assert all(_equal(a, b) for a, b in zip(found, unshifted, strict=True))
 
 
+
+
+def test_each_slot_site_runs_its_form_and_its_token_recurrence():
+    """Every recorded site (tests/slots_sites.py) draws its arrays and runs its form and its recurrences a
+    token at a time to every leaf it records, finite (the recorder's Dew side,
+    tools/fla_slots_reference.py)."""
+    import slots_sites
+
+    for name, site in slots_sites.sites().items():
+        arrays = site.arrays(0)
+        for rule in (slots.lightnet if site.form == "lightnet" else slots.slot_attention,
+                     slots_sites.by_token(site.form)):
+            found = slots_sites.ruled(rule, site.form, arrays)
+            assert tuple(found) == site.leaves, name
+            assert all(np.all(np.isfinite(np.asarray(value, np.float64))) for value in found.values()), name
