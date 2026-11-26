@@ -16,7 +16,8 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, component_cases, error, generate, printed
+from dew.algebra import acceptance, error, generate, printed
+from dew.algebra import component_cases as component_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 

@@ -1349,9 +1349,10 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-The registry covers stable forms (`StableForm`, rows 9035 and 9037), including §1.5's acceptance cases
-(`dew.algebra.acceptance`). Template reductions and scans still derive their forms at trace time;
-surrogate bodies trace at their declaration. Generating those families remains parked (row 3272).
+The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
+(`ComponentForm`, rows 6109 and 6110). The component pilots generate recurrence scores and the two
+rounded-operand bodies, check them against independent references, and share the `--check` writer.
+Production still derives recurrence forms at trace time and traces the original surrogate bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1375,16 +1376,16 @@ class StableForm:                     # a numeric function of Dew's own
     function: Callable                # its math as written: the form as written and, at float64, the truth
     cases: Cases
 
-DECLARATIONS: dict[str, StableForm]  # each key is the declaring module and function name
+DECLARATIONS: dict[str, StableForm | ComponentForm]
 
-def declare(module: str, name: str, form: StableForm) -> StableForm: ...
+def declare(module: str, name: str, form: StableForm | ComponentForm): ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
-**Template and surrogate generation (rows 3272, 6109).** Keep one declaration registry and one writer.
-Extend the registry's value to a union of `StableForm`, a template declaration and `SurrogateBodies`;
-the built registry holds stable forms alone. The new records name the component functions, their cases,
-and the reference implementation. They add no run-time dispatch to the algebra engine.
+**Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
+its independent reference and its cases. The shared registry emits it without substituting an autodiff or
+lower-price implementation. Larger template and surrogate declarations will group such components and
+their trees and flags. The pilots add no run-time dispatch to the algebra engine.
 
 - **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
@@ -1414,15 +1415,14 @@ and the reference implementation. They add no run-time dispatch to the algebra e
   float64 references. Then run Check 1 and Check 2 at the real launch, and compare latency and memory
   against the existing template on the same device before activating it (§4). The checked-in module,
   typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
-  no replacement. Template and surrogate generation remain design capabilities, not implemented claims.
+  no replacement. Production integration of later components needs those receipts, not just a generated file.
 
-- `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
-  saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
-  error on its cases' draws against the declaration at float64 (check 1, `dew.parity.judge`: the gate's one
-  implementation), extracts per §1.5 under each policy the cases name (`dew.algebra.error.choose`), priced
-  for each target, and writes the module, one function a declaration picking its form by policy, target and
-  its operands' case. The suite that holds every generated module is one hand-written file
-  (`tests/test_algebra_generate.py`, `Generated.tests`): each form's check 1 site against its declaration.
+- `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it
+  saturates with the dev-time sets, measures error against the declaration at float64 and selects
+  by accuracy and price (`dew.algebra.error.choose`). For a component it checks the printed arithmetic
+  against the traced form and its declared reference, without searching for an alternative form. The
+  shared writer emits one function per declaration, keyed by policy, target and operand shapes and
+  dtypes. `tests/test_algebra_generate.py` holds Check 1 and checks regeneration in both processes.
 - The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
   parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
   measured, a compensated form's sums through `dew.nn.precision`, with no import of `dew.algebra`, linted
