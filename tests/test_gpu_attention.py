@@ -269,6 +269,7 @@ def _flash_inference_forward_is_on_par_on_an_a100():
     query heads over 8, width 128, causal), native: it launches FlashAttention-2's forward, and its output is
     on par with the reference path's from float64 (check 1). Its training, the template's, is the kernel
     matrix's cell (attention_kernels_matrix)."""
+    import tier_wire
     from attention_matrix import SEEDS
     from attention_oracle import attention_terms, kept
     from reference_error import assert_as_exact, equations
@@ -291,9 +292,14 @@ def _flash_inference_forward_is_on_par_on_an_a100():
     def terms(query, key, value):
         return attention_terms(query, key, value, np.zeros(np.shape(query)), keep)[0]
 
-    launched = {str(equation.params.get("target_name")) for equation in equations(
-        jax.make_jaxpr(attended("flash_inference"))(*draw(0)).jaxpr) if equation.primitive.name == "ffi_call"}
-    assert any("flash" in name for name in launched), launched
+    if not tier_wire.preparing():
+        # The call's launch, traced at the draw's shapes alone, in the GPU's run: a prepare's compile-only
+        # device runs no draw, and its arms' refusals are `assert_as_exact`'s to defer (row 13352).
+        shapes = jax.eval_shape(lambda: draw(0))
+        launched = {str(equation.params.get("target_name")) for equation in equations(
+            jax.make_jaxpr(attended("flash_inference"))(*shapes).jaxpr)
+            if equation.primitive.name == "ffi_call"}
+        assert any("flash" in name for name in launched), launched
     assert_as_exact(jax.jit(attended("flash_inference")), jax.jit(attended("reference")), draw,
                     "flash_inference's forward on an A100 at 2 x 4096", seeds=SEEDS, terms=terms)
 
