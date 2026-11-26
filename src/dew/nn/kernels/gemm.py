@@ -43,10 +43,9 @@ from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import SymbolicZero
 import numpy as np
 from flax.typing import PrecisionLike
-from jax.custom_derivatives import zero_from_primal
+from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
 from dew.algebra import bits
 from dew.nn.derivatives import (
