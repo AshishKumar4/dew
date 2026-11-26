@@ -166,3 +166,44 @@ def test_a_portable_band_gradient_holds_no_array_of_every_query_and_key():
              for var in equation.outvars]
     assert max(sizes) < HEADS * queries * queries, max(sizes)
 
+
+def test_one_querys_band_broadcast_over_the_calls_queries_is_on_par():
+    """A band of one query's values (`[1, H, 1, Kb]`) biasing a call of 256 queries on the template: every
+    query reads that row's band, as its written-out bias broadcasts (`BandBias.dense`), on par from float64
+    with the reference path's, its output and every gradient, the band's summed over the queries it biased.
+    The template padded the one row with zeros, and every query but the first read none of it (head
+    review)."""
+    queries, extent = 256, 64
+    width = band.band_width(extent)
+    offset = jnp.int32(0)
+
+    def drawn(seed):
+        rng = np.random.default_rng([0x13138, 1, seed])
+        query, key, value, cotangent = (
+            jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
+                (2, queries, HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH),
+                (2, queries, HEADS, WIDTH)))
+        values = jnp.asarray(0.5 * rng.standard_normal((1, HEADS, 1, width)), jnp.float32)
+        return query, key, value, values, cotangent
+
+    def attended(implementation):
+        def call(query, key, value, values):
+            bias = BandBias(values, offset, extent)
+            if implementation == "reference":
+                bias = bias.dense(queries)
+            return scaled_dot_product_attention(query, key, value, bias=bias, causal=True,
+                                                implementation=implementation)
+
+        return with_gradients(call)
+
+    keep = kept(queries, queries, causal=True)
+
+    def terms(query, key, value, values, dout):
+        dense = np.broadcast_to(np.asarray(BandBias(values, offset, extent).dense(queries)),
+                                (2, HEADS, queries, queries))
+        output, dq, dk, dv, bias = attention_terms(query, key, value, dout, keep, bias=dense)
+        return output, dq, dk, dv, _banded(bias.sum(axis=2, keepdims=True), extent, np.zeros(2), 1)
+
+    assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
+                    "one query's band over 256 queries", seeds=SEEDS, terms=terms)
+

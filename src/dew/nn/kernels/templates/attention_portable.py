@@ -563,7 +563,8 @@ def _band_added(band: jax.Array, piece: jax.Array, origins: jax.Array, row, head
     width = band.shape[-1]
     inside = (column >= 0) & (column < width)
     rows = jnp.arange(piece.shape[0])[:, None]
-    return band.at[row, head, rows, jnp.clip(column, 0, width - 1)].add(jnp.where(inside, piece, 0.0))
+    # Each entry within the band written once, by the one program of its key: set, those past it dropped.
+    return band.at[row, head, rows, jnp.where(inside, column, width)].set(piece, mode="drop")
 
 
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, *, score_mod,

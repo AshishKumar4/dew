@@ -516,6 +516,10 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
     # other axes.
     rows = ("activation_batch",)
+    if isinstance(bias, BandBias) and bias.values.shape[2] == 1 and query.shape[1] > 1:
+        # One query's band broadcast over the call's queries: its key vector written out, O(K), as every
+        # route reads it (`BandBias.dense`), each query its one row's.
+        bias = bias.dense(key.shape[1])
     separable = bias if isinstance(bias, SeparableBias) else None
     banded = bias if isinstance(bias, BandBias) else None
     dense = None if isinstance(bias, SeparableBias | BandBias) else bias
