@@ -2086,9 +2086,9 @@ def test_process_digest_keeps_repeated_descriptors_in_equation_order():
         return jax.lax.reduce_precision(jax.lax.reduce_precision(x, 8, first), 8, second)
 
     shape = jax.ShapeDtypeStruct((4,), jnp.float32)
-    direct = jax.make_jaxpr(functools.partial(formed, first=4, second=8))(shape)
+    direct = jax.make_jaxpr(lambda x: formed(x, first=4, second=8))(shape)
     reboxed = jax.make_jaxpr(lambda x: formed(x, 4, 8))(shape)
-    reversed_ = jax.make_jaxpr(functools.partial(formed, first=8, second=4))(shape)
+    reversed_ = jax.make_jaxpr(lambda x: formed(x, first=8, second=4))(shape)
     assert terms.body_key(direct) == terms.body_key(reboxed)
     assert terms.body_key(direct) != terms.body_key(reversed_)
 
