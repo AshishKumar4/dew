@@ -54,33 +54,41 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     return generation.linear_map(apply, pullback, (factor, operands, (gather, wide_operands)), rows)
 
 
-FLUSHING = ('cpu', 'tpu')
-"""The platforms whose float32 arithmetic flushes subnormal operands and results to zero (XLA's CPU, row 4023,
-and TPU), where a packed product's scales are applied in software (`scaled_exactly`, `raised_factor`); every
-other keeps them, its own multiply IEEE's."""
-
 FACTOR_RAISE = 62
-"""The power of two `raised_factor` raises a subnormal factor by: the least (`2**-149`) into the normals
-(`2**-87`), the largest still below `2**-64`, so no product of it overflows that the plain one would not."""
+"""The power of two `int8_epilogue` raises a subnormal scale by on a flushing platform: the least
+(`2**-149`) into the normals (`2**-87`), the largest still below `2**-64`, so no product of it overflows that
+the plain one would not."""
 
 
-def flushes() -> bool:
-    """Whether the platform the context places work on flushes float32 subnormals (`FLUSHING`)."""
-    return generation.placed_platform() in FLUSHING
+def flushing(software: Callable[..., jax.Array], native: Callable[..., jax.Array],
+             *operands: jax.Array) -> jax.Array:
+    """`software(*operands)` where the program runs on a platform whose float32 arithmetic flushes
+    subnormal operands and results to zero (XLA's CPU, row 4023, and TPU), `native(*operands)` elsewhere,
+    the platform the program lowers for deciding (`lax.platform_dependent`), not the one it is traced on
+    (row 13569: a program traced on a CUDA host and lowered for a CPU took the native multiply)."""
+    return jax.lax.platform_dependent(*operands, cpu=software, tpu=software, default=native)
 
 
-def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp32 `factor` as `(raised, k)`, `factor = raised * 2**-k`, exactly: a subnormal one raised by
-    `2**FACTOR_RAISE` from its bits (`float_bits.raised_exactly`) where the platform flushes it (`flushes`),
-    every other as it is (`k` 0), so the int8-row epilogue's products read it whole and lower by `k` with its
-    rows' shift (`ternary.ternary_weight_product`, `lowered_product`)."""
-    factor = jnp.asarray(factor, jnp.float32)
-    if not flushes():
-        return factor, jnp.zeros(factor.shape, jnp.int32)
-    binade = float_bits.binade_of(factor)
-    k = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024), jnp.int32(FACTOR_RAISE),
-                  jnp.int32(0))
-    return float_bits.raised_exactly(factor, k), k
+def int8_epilogue(product: jax.Array, peak: jax.Array, factor: jax.Array, shift: jax.Array) -> jax.Array:
+    """The int8-row ternary product's epilogue (`ternary.ternary_weight_product`): `product * peak * factor *
+    2**-shift` in `precision.twice_scaled`'s order and rounded once with its lowering
+    (`float_bits.lowered_rounded`); on a flushing platform (`flushing`) a subnormal `factor` raised by
+    `2**FACTOR_RAISE` from its bits and the last multiply exact and rounded once with the lowering
+    (`lowered_product`), so a subnormal scale survives (row 13340)."""
+    def software(product, peak, factor, shift):
+        binade = float_bits.binade_of(factor)
+        raised = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024),
+                           jnp.int32(FACTOR_RAISE), jnp.int32(0))
+        whole = float_bits.raised_exactly(factor, raised)
+        left, right = precision.twice_scaled_operands(product, peak, whole)
+        return lowered_product(left, right, shift + raised)
+
+    def native(product, peak, factor, shift):
+        left, right = precision.twice_scaled_operands(product, peak, factor)
+        return float_bits.lowered_rounded(left * right, shift)
+
+    product, peak, factor = (jnp.asarray(each, jnp.float32) for each in (product, peak, factor))
+    return flushing(software, native, product, peak, factor, jnp.asarray(shift, jnp.int32))
 
 
 def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -113,8 +121,9 @@ def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> ja
 
 
 def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
-    product, factor = product.astype(jnp.float32), jnp.asarray(factor, jnp.float32)
-    return lowered_product(product, factor, 0) if flushes() else product * factor
+    product, factor = jnp.broadcast_arrays(product.astype(jnp.float32), jnp.asarray(factor, jnp.float32))
+    return flushing(lambda product, factor: lowered_product(product, factor, 0), jnp.multiply, product,
+                    factor)
 
 
 def _scaled_tangent(primals, tangents):
@@ -132,7 +141,7 @@ def _scaled_tangent(primals, tangents):
 scaled_exactly = contracted("test_a_ternary_weight_product_holds_every_order")(
     declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent, symbolic_zeros=True))
 """`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: where the
-platform flushes subnormals (`flushes`), `lowered_product`'s one rounding, so a subnormal scale (a packed
+platform flushes subnormals (`flushing`), `lowered_product`'s one rounding, so a subnormal scale (a packed
 matrix's `2**-127`) or a subnormal result survives (row 13340); elsewhere the plain multiply. Its derivative
 is the plain product's, each perturbed operand's term alone."""
 

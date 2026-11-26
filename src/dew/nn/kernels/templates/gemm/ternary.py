@@ -17,7 +17,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
-from dew.nn.kernels.templates.gemm.factored import factored, flushes, lowered_product, raised_factor
+from dew.nn.kernels.templates.gemm.factored import factored, int8_epilogue
 from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -125,16 +125,9 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
         x_q, peak_raised, shift = _quantize_activations_peak(a)
         prod = precision.divided(run_dot(x_q), jnp.float32(127.0))
-        # A raised row's output lowered back by its shift and its raised scale's (`raised_factor`: a
-        # subnormal scale formed among the normals, row 13340), rounded once (`lowered_rounded`), past FTZ.
-        factor, raise_by = raised_factor(factor_of(s))
-        # `precision.twice_scaled`'s order; past a flushing platform its last multiply exact and rounded once
-        # with the lowering, elsewhere the multiply's own rounding, lowered (no scale owed a raise there).
-        left, right = precision.twice_scaled_operands(prod, peak_raised[:, None], factor)
-        owed = shift[:, None] + raise_by
-        if flushes():
-            return lowered_product(left, right, owed), prod
-        return float_bits.lowered_rounded(left * right, owed), prod
+        # A raised row's output lowered back by its shift, rounded once, past FTZ (`int8_epilogue`).
+        factor = jnp.broadcast_to(factor_of(s), prod.shape)
+        return int8_epilogue(prod, peak_raised[:, None], factor, shift[:, None]), prod
 
     def ste_derivative(primals, tangents, value):
         a, s = primals
