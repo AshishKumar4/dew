@@ -1324,6 +1324,7 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
 
 
+@INTERPRETS
 def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
     """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100 (132
     multiprocessors) launches 64 programs (a row's key head's packed query rows each), its parts stacked
