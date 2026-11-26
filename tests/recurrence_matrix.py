@@ -354,6 +354,9 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS, *, wi
     (`MODEL_WIDTHS`). Its routes are its family's (`CHOICES`). A cell reports its distance from Dew's own
     chunk math and the forms its call took."""
     named = dict(zip(AXES[family], case, strict=True)) | ({} if widths is None else {"widths": widths})
+    # One label for its recording, its compiled truths and its verdict: a model's widths' cell its own beside
+    # the drawn widths' cell of the same axes (`truths_ahead` refuses two sites of one label).
+    site = "-".join(named.values())
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
@@ -373,16 +376,16 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS, *, wi
         assert any(route.kernel == named["kernel"] for route in found)
     reference = _reference(named)
     upstream = reference.removeprefix("upstream ") if reference.startswith("upstream ") else None
-    if _held_to_a_recording(upstream, "-".join(named.values())):
+    if _held_to_a_recording(upstream, site):
         _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     held_to = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
     if run and named["kernel"] != "xla" and (distance := against_the_portable_math(
-            "-".join(case), _step(named, named["kernel"]), _step(named, "xla"),
+            site, _step(named, named["kernel"]), _step(named, "xla"),
             functools.partial(_drawn, named), with_gradients(truth), FEWEST_SEEDS)) is not None:
-        print(f"{'-'.join(case)} under the {generation.numerics().forms} forms, its distance against Dew's "
+        print(f"{site} under the {generation.numerics().forms} forms, its distance against Dew's "
               f"own chunk math's: {distance}", flush=True)
-    assert_as_exact(step, held_to, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
+    assert_as_exact(step, held_to, functools.partial(_drawn, named), site, seeds=seeds,
                     truth_fn=with_gradients(truth))
 
 
