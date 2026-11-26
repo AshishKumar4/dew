@@ -99,15 +99,13 @@ def finished(acc, total, fmt) -> Iv:
     return cast(Iv(np.where(quotient == 0, 0.0, lo), np.where(quotient == 0, 0.0, hi)), fmt)
 
 
-def witnessed(query, key, value, kept, *, interpret: bool, records=None,
+def witnessed(query, key, value, kept, records: dict, *,
               lane: Lane | None = None) -> dict[str, tuple[np.ndarray, ...]]:
-    """Each stored state and the output of the certify launch over `query`, `key` and `value` (`[B, S, H, D]`,
-    bf16) under the mask `kept` (`[B or 1, 1, Q, K]`, `attention_oracle.kept`'s), held to its enclosure:
-    for each record, the entries held and those inside. `records` replaces the launch's own (a fault)."""
+    """Each stored state and the output of a certify launch's `records` (`launched`) over `query`, `key` and
+    `value` (`[B, S, H, D]`, bf16), held to their enclosures under the mask `kept` (`[B or 1, 1, Q, K]`,
+    `attention_oracle.kept`'s): for each record, the entries held and those inside."""
     lane = attention_lane() if lane is None else lane
     q, k, v = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value))
-    if records is None:
-        records = launched(query, key, value, kept, interpret=interpret)
     count, width = records["m"].shape[2], records["tile"]
     factor = walk_factor(q.shape[3])
     lane = Lane(lane.reach, lane.flushes, width)
@@ -151,16 +149,31 @@ def certified(query, key, value, spans):
         return attention_mosaic.certified(query, key, value, spans, interpret=True)
 
 
-def spans_of(kept, batch: int):
-    """The template's spans of a causal or full call whose mask `kept` is (`template.spans`)."""
-    queries, keys = kept.shape[2:]
-    causal = bool(np.array_equal(kept[0, 0], np.tril(np.ones((queries, keys), bool))))
-    return template.spans(queries, keys, batch, causal=causal)
-
-
 SHAPE = (1, 512, 2, 64)
 """The witnessed call's `[B, S, H, D]`: a Hopper's and an Ampere's launch walk more than one key tile at
 this length, so a fault in the rescale has a second step to break."""
+
+FORMS = {"full": {}, "causal": {"causal": True},
+         "window": {"causal": True, "sliding_window": 192},
+         "documents": {"causal": True,
+                       "segment_ids": np.repeat(np.arange(1, 4, dtype=np.int32), (160, 224, 128))[None]}}
+"""Each witnessed form, its mask as `template.spans` and `attention_oracle.kept` both take it: full, causal, a
+causal window of 192 keys (each query's tiles partly walked), and three causal documents packed into the
+call, their bounds off the key tiles."""
+
+
+def mask_of(form: str):
+    """The keys each query of the witnessed call keeps under `form` (`attention_oracle.kept`)."""
+    return attention_oracle.kept(SHAPE[1], SHAPE[1], **FORMS[form])
+
+
+def spans_of(form: str, batch: int):
+    """The template's spans of the witnessed call under `form` (`template.spans`)."""
+    import jax.numpy as jnp
+
+    stated = {name: jnp.asarray(value) if name == "segment_ids" else value
+              for name, value in FORMS[form].items()}
+    return template.spans(SHAPE[1], SHAPE[1], batch, **stated)
 
 
 def operands(seed: int):
@@ -176,7 +189,7 @@ def operands(seed: int):
     return q, k, v
 
 
-def _certified_native(query, key, value, *, causal: bool, site: str):
+def _certified_native(query, key, value, *, form: str, site: str):
     """Run the native certify launch through `ahead_arm` (row 9546) so GPU-tier prepare compiles it without
     eagerly touching a compile-only device, and return `(block_k, (out, rows, sums))`."""
     import jax
@@ -186,35 +199,29 @@ def _certified_native(query, key, value, *, causal: bool, site: str):
 
     from dew.nn.kernels import generation
 
-    abstract_spans = jax.eval_shape(
-        lambda: template.spans(query.shape[1], key.shape[1], query.shape[0], causal=causal))
+    abstract_spans = jax.eval_shape(lambda: spans_of(form, query.shape[0]))
     declined = attention_mosaic.forward_declined(
         *(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (query, key, value)), abstract_spans)
     if declined is not None:
         pytest.skip(f"the Mosaic mainloop declines the witnessed call here: {declined}")
 
     def program(q, k, v):
-        spans = template.spans(q.shape[1], k.shape[1], q.shape[0], causal=causal)
-        tiles, result = attention_mosaic.certified(q, k, v, spans)
+        tiles, result = attention_mosaic.certified(q, k, v, spans_of(form, q.shape[0]))
         return jnp.asarray(tiles.block_k, jnp.int32), result
 
     shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value))
-    form = "causal" if causal else "full"
     label = f"attention witness, {site}, {form}, {generation.assumption()}, {shapes}"
     block_k, found = ahead_arm(jax.jit(program), label)(query, key, value)
     return int(np.asarray(block_k)), found
 
 
-def launched(query, key, value, mask, *, interpret: bool, site: str = "witness") -> dict:
-    """The certify launch's own records (`attention_mosaic.certified`) under `mask`, as float64, and the key
-    tile it walked (`tile`), each record's tiles that wide."""
+def launched(query, key, value, form: str, *, interpret: bool, site: str = "witness") -> dict:
+    """The certify launch's own records (`attention_mosaic.certified`) under `form` (`FORMS`), as float64,
+    and the key tile it walked (`tile`), each record's tiles that wide."""
     if not interpret:
-        queries, keys = mask.shape[2:]
-        causal = bool(np.array_equal(mask[0, 0], np.tril(np.ones((queries, keys), bool))))
-        block_k, (out, rows, sums) = _certified_native(query, key, value, causal=causal, site=site)
+        block_k, (out, rows, sums) = _certified_native(query, key, value, form=form, site=site)
     else:
-        spans = spans_of(mask, query.shape[0])
-        tiles, (out, rows, sums) = certified(query, key, value, spans)
+        tiles, (out, rows, sums) = certified(query, key, value, spans_of(form, query.shape[0]))
         block_k = tiles.block_k
     return {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
             "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64), "tile": block_k}
@@ -226,17 +233,16 @@ def refused(found: dict, name: str) -> int:
     return int(np.sum(rows & ~inside))
 
 
-def assert_witnessed(seed: int, causal: bool, *, interpret: bool, lane: Lane | None = None) -> None:
-    """Every stored state and the output of the certify launch over draw `seed`, causal or full, inside its
-    step's enclosure."""
+def assert_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None = None) -> None:
+    """Every stored state and the output of the certify launch over draw `seed` under `form` (`FORMS`), inside
+    its step's enclosure."""
     import tier_wire
 
     q, k, v = operands(seed)
-    mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=causal)
-    records = launched(q, k, v, mask, interpret=interpret)
+    records = launched(q, k, v, form, interpret=interpret)
     if not interpret and tier_wire.preparing():
         return
-    found = witnessed(q, k, v, mask, interpret=interpret, records=records, lane=lane)
+    found = witnessed(q, k, v, mask_of(form), records, lane=lane)
     for name, (rows, inside) in found.items():
         assert rows.any(), name
         assert inside[rows].all(), f"{name}: {refused(found, name)} of {int(rows.sum())} held entries outside"
@@ -244,27 +250,32 @@ def assert_witnessed(seed: int, causal: bool, *, interpret: bool, lane: Lane | N
 
 def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     """Each fault the witness exists for, refused at its elements: a dropped rescale, a maximum from the
-    wrong tile, sums rounded to bf16 where the walk holds fp32, and a causal launch's records held under a
-    mask one key short of its own. Both native programs launch before any check so GPU-tier prepare compiles
-    both (row 9546)."""
+    wrong tile, sums rounded to bf16 where the walk holds fp32, a causal launch's records held under a mask
+    one key short of its own, and a window's and the documents' records held as one undivided causal call's.
+    Every native program launches before any check so GPU-tier prepare compiles them all (row 9546)."""
     import tier_wire
 
     q, k, v = operands(2)
-    mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=False)
-    causal = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=True)
-    truth = launched(q, k, v, mask, interpret=interpret, site="faults")
-    claimed = launched(q, k, v, causal, interpret=interpret, site="faults")
+    mask, causal = mask_of("full"), mask_of("causal")
+    truth = launched(q, k, v, "full", interpret=interpret, site="faults")
+    claimed = launched(q, k, v, "causal", interpret=interpret, site="faults")
+    bounded = {form: launched(q, k, v, form, interpret=interpret, site="faults")
+               for form in ("window", "documents")}
     if not interpret and tier_wire.preparing():
         return
     m, acc = truth["m"], truth["acc"]
     alpha = np.exp2(np.where(np.isfinite(m[:, :, :-1]), m[:, :, :-1] - m[:, :, 1:], 0.0))
     dropped = dict(truth, acc=np.concatenate(
         [acc[:, :, :1], acc[:, :, 1:] + acc[:, :, :-1] * (1 - alpha)[..., None]], 2))
-    assert refused(witnessed(q, k, v, mask, interpret=interpret, records=dropped, lane=lane), "acc")
+    assert refused(witnessed(q, k, v, mask, dropped, lane=lane), "acc")
     wrong = dict(truth, m=np.concatenate([m[:, :, :1], m[:, :, :-1]], 2))
-    assert refused(witnessed(q, k, v, mask, interpret=interpret, records=wrong, lane=lane), "m")
+    assert refused(witnessed(q, k, v, mask, wrong, lane=lane), "m")
     narrowed = dict(truth, acc=np.asarray(nearest(acc, BFLOAT16)))
-    assert refused(witnessed(q, k, v, mask, interpret=interpret, records=narrowed, lane=lane), "acc")
+    assert refused(witnessed(q, k, v, mask, narrowed, lane=lane), "acc")
     shifted = causal & ~np.eye(SHAPE[1], dtype=bool)[None, None]
-    held = witnessed(q, k, v, shifted, interpret=interpret, records=claimed, lane=lane)
+    held = witnessed(q, k, v, shifted, claimed, lane=lane)
     assert sum(refused(held, name) for name in ("m", "l", "acc"))
+    for form, records in bounded.items():
+        # A window's or the documents' launch held as one undivided causal call: its bounds read.
+        held = witnessed(q, k, v, causal, records, lane=lane)
+        assert sum(refused(held, name) for name in ("m", "l", "acc")), form
