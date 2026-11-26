@@ -21,7 +21,7 @@ from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.block_draft import BlockDrafter, Context, Draft, DraftAttention, MarkovBlockDraft, draft
 from dew.nn.inputs import ModelInputs
-from dew.nn.kv_cache import CURSOR, KVCache
+from dew.nn.kv_cache import KVCache
 from dew.sampling import Sample, Sampling, Speculative, generate
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'inkling2-tiny'
@@ -143,7 +143,7 @@ def test_a_local_draft_layer_caches_its_window_alone(source):
     spec = RELEASE['mtp_config']
     for index in range(spec['num_hidden_layers']):
         held = drafter[f'layers_{index}']['self_attn']['held_context']
-        lengths = {leaf.shape[1] for name, leaf in held.items() if name != CURSOR}
+        lengths = {held[name].shape[1] for name in ('cached_key', 'cached_value')}
         expected = spec['sliding_window_size'] if index in spec['local_layer_ids'] else model.max_seq_len
         assert lengths == {expected}, (index, {name: leaf.shape for name, leaf in held.items()})
 
