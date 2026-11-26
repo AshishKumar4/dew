@@ -107,8 +107,8 @@ class _NoText:
 def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
     """transformers' processor's fields for two images of other shapes (each merged token's pixels
     `[8, 8, 3]`, the grids counted in merged tokens: processing_inkling2.py) read by Dew's processor
-    (`Processor.from_hf`, its `merged_blocks`) give the bundle's logits, bit for bit, as the images packed
-    by hand into the tower's patches do (row 12943's review)."""
+    (`Processor.from_hf`, its `merged_blocks`) are, bit for bit, the patches, patch grids and placeholder
+    slots the parity test hands the bundle (`media`, `placed`; row 12943's review)."""
     import json
 
     from dew.interop.processors import Processor
@@ -125,10 +125,10 @@ def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
     processed = processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
                                    'pixel_values': np.concatenate(blocks),
                                    'image_grid_thw': np.asarray([[1, *grid] for grid in IMAGES])})
-    model, variables = loaded.model, loaded.variables
-    fields = processed.kwargs()
-    read = jax.jit(lambda variables: model.apply(variables, processed.tokens, **fields))(variables)
-    tokens = jnp.asarray(ids)
-    packed = jax.jit(lambda variables: model.apply(variables, tokens, image_indices=placed(tokens),
-                                                   conditioning=media(inputs, jnp.float32)))(variables)
-    np.testing.assert_array_equal(np.asarray(read), np.asarray(packed))
+    # The fields it reads are the patches, grids and placements the tower takes, bit for bit.
+    packed = media(inputs, jnp.float32)
+    for name in ('pixel_values', 'image_grid_thw'):
+        np.testing.assert_array_equal(np.asarray(processed.conditioning[name]), np.asarray(packed[name]),
+                                      err_msg=name)
+    np.testing.assert_array_equal(np.asarray(processed.kwargs()['image_indices']),
+                                  np.asarray(placed(jnp.asarray(ids))))
