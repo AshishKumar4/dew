@@ -132,7 +132,8 @@ def _weights(totals, anchors, joined):
     anchor as the law weighs them (a state at a time, so a chunk's are its own, `merged_state_chunked`)."""
     holds, weighed = _mass(totals)
     present = jnp.isfinite(anchors)
-    return holds & present, jnp.where(weighed & present, totals, 0.0), jnp.where(present, anchors, joined), joined
+    return (holds & present, jnp.where(weighed & present, totals, 0.0),
+            jnp.where(present, anchors, joined), joined)
 
 
 
