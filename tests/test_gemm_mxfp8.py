@@ -74,6 +74,21 @@ def test_an_mxfp8_scale_byte_0xff_decodes_its_block_nan():
     np.testing.assert_array_equal(np.asarray(nan[1]), np.asarray(operand.decoded()[1]))
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.bfloat16, jnp.float16])
+def test_mxfp8_decodes_the_destination_bits_at_both_binade_edges(dtype):
+    numbers = [0.0, -0.0, 0.5, -0.5, 1, -1, 2, -2, 448, -448, np.nan]
+    codes = np.tile(np.asarray(numbers + [0] * (32 - len(numbers)), jnp.float8_e4m3fn), (4, 1))
+    stored = np.asarray([0, 1, 254, 255], np.uint8).reshape(4, 1).view(jnp.float8_e8m0fnu)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        expected = (codes.astype(np.float64) * stored.astype(np.float64)).astype(dtype)
+    with jax.enable_x64(dtype == jnp.float64):
+        got = np.asarray(jax.jit(lambda x, e: formats.MxFp8(x, e).decoded(dtype))(codes, stored))
+    np.testing.assert_array_equal(np.isnan(got), np.isnan(expected))
+    word = np.dtype(f"uint{got.dtype.itemsize * 8}")
+    numbers = ~np.isnan(expected)
+    np.testing.assert_array_equal(got.view(word)[numbers], expected.view(word)[numbers])
+
+
 GROUP_BLOCKS = (1, 0, 2, 1)
 """Each group's 128-row blocks: a one-block group, an empty one, two blocks, one."""
 
