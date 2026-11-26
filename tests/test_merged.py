@@ -912,7 +912,7 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     def step(p_in, st_in, low_s):
         resumed = attention_decode.resumable(spec, st_in)
         next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
-                                     jnp.swapaxes(resumed.acc, 1, 2))
+                                     jnp.swapaxes(resumed.acc, 1, 2), normalized=True)
         out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
                                      out_dtype=jnp.float32, out_heads=queries, initial=next_init)
         return resumed.m, out
