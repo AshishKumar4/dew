@@ -67,6 +67,18 @@ def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alo
                                stored=other).kind.matrix is None, timing
 
 
+def test_a_4b_cell_holds_at_the_rows_its_receipts_timed_and_not_past_them():
+    """The GH200's 4B 2,560 x 9,216 forward, a cell its receipts timed at 24,576 tokens alone
+    (`grouped_cells.FOUR_B_TIMED`, row 13167): the template's there, and past those rows (32,768, a count no
+    receipt timed) its kind's route, as a matrix no receipt timed takes at those rows."""
+    forward, four_b = grouped_cells.Made.FORWARD, (2560, 9216)
+    timed = _dense_case("sm90", forward, four_b, 24576)
+    assert timed.kind.matrix == four_b and _route(timed) == "mosaic"
+    past = _dense_case("sm90", forward, four_b, 32768)
+    assert past.kind.matrix is None
+    assert _route(past) == _route(_dense_case("sm90", forward, (4096, 9216), 32768))
+
+
 @pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
 def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
     """A dense kind runs the template whole only where every product any receipt timed of it is at parity in

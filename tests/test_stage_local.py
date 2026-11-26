@@ -991,13 +991,17 @@ def test_a_stage_local_state_handed_to_another_run_starts_it_on_its_stored_layer
     model, optimizer = decoder(), optax.adam(1e-2)
     trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
     stored = on_host(trainer(model, optimizer, STAGED, 8).stored(trained).variables)
-    four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
-    restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
-    assert int(restarted.step) == 2
+    # Read before the four-stage fit takes the state over (`Trainer.fit`'s `state`).
     flat = Trainer(LMObjective(model, SEQ, variables=trained.variables), optimizer, key=jax.random.key(0),
                    mesh=MeshSpec(fsdp=2), advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
                    tracker=None)
     started = on_host(flat.initial_state().variables)
+    four = trainer(model, optimizer, MeshSpec(fsdp=2, stage=4), 8)
+    restarted = four.fit(stream(), steps=2, log_every=1, state=trained)
+    assert int(restarted.step) == 2
+    # The four-stage run took the two-stage state over, its banks cut to four stages freed (row 12463's
+    # review: the banks it cut stayed alive beside their stacks).
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(trained.variables["params"]))
     assert jax.tree.structure(started) == jax.tree.structure(stored)
     for mine, theirs in zip(jax.tree.leaves(started), jax.tree.leaves(stored), strict=True):
         np.testing.assert_array_equal(mine, theirs)
@@ -1097,3 +1101,72 @@ def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     for held, after in zip(jax.tree.leaves(adapter.variables[FROZEN]),
                            jax.tree.leaves(again.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(after))
+
+
+def test_a_fit_handed_a_scanned_runs_state_holds_it_once():
+    """A scanned run's second fit, handed the state its first returned on its stored layers, stacks it by
+    stage giving it the handed moving arrays (`Staging.supplied`, consumed): through its steps the devices
+    hold the state once, the handed arrays consumed, as a plain layout's first step consumes them (row
+    12463: a 4B run's second fit held the handed layers beside their stacks, 69 of a GH200's 90 GiB, and
+    fit no rung); the objective's frozen tree is never given."""
+    import gc
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    model = models.build("causal_transformer", **{**TINY_DECODER, "vocab_size": VOCAB, "num_layers": 4,
+                                                  "max_seq_len": SEQ})
+    variables = dict(LMObjective(model, SEQ).init(jax.random.key(0)))
+    variables[FROZEN] = {"spare": jnp.ones((256,), jnp.float32)}
+    objective = LMObjective(model, SEQ, variables=variables)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), split=1)
+    rows = Pipeline(Memory(token_rows(VOCAB, 64, SEQ + 1))).repeat().batch(BATCH)
+    state = trainer.fit(rows, steps=1, log_every=100)
+    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state))
+    frozen = jax.tree.leaves(objective.variables[FROZEN])
+
+    def on_devices() -> int:
+        gc.collect()
+        return sum(array.nbytes for array in jax.live_arrays() if not array.is_deleted())
+
+    # Read against what the process holds beside the handed state (other cases' arrays in one worker).
+    beside = on_devices() - held
+    seen = []
+
+    def live(_) -> int:
+        seen.append((on_devices() - beside) / held)
+        return 0
+
+    trainer.fit(rows, state=state, steps=3, log_every=100, observe=Observe(1, live))
+    assert seen and max(seen) < 1.5, seen
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state.variables["params"]))
+    assert not any(leaf.is_deleted() for leaf in frozen)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_staged_run_handed_a_state_on_another_placement_frees_what_it_was_handed():
+    """A two-stage run handed a state on one device, which its placement reshards over its stages and fsdp
+    shards by slicing (JAX gives nothing over there), takes it over all the same: every handed moving array
+    is freed once the run has placed and stacked it (`Staging.supplied`), and the run trains from it (row
+    12463's review)."""
+    model, optimizer = decoder(), optax.adam(1e-2)
+    trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
+    handed = jax.device_put(trained, jax.devices()[0])
+    restarted = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=2, log_every=1, state=handed)
+    assert int(restarted.step) == 2
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(handed.variables["params"]))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_staged_runs_state_handed_to_a_run_keeping_every_layer_whole_frees_its_banks():
+    """A two-stage run's state, its banks stacked by stage, handed to a run over the same stages that keeps
+    every layer whole on every stage (`Layout(stage_local=False)`, no runs to stack), is taken over all the
+    same: its banks cut onto that run's layers (`received`) and its original banks freed once placed
+    (`Staging.supplied`), and the run trains from it (row 13238)."""
+    model, optimizer = decoder(), optax.adam(1e-2)
+    trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
+    whole = trainer(model, optimizer, STAGED, 8, stage_local=False)
+    restarted = whole.fit(stream(), steps=2, log_every=1, state=trained)
+    assert int(restarted.step) == 2
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(trained.variables["params"]))
+

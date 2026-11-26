@@ -149,7 +149,7 @@ seams: "scan-cells": {
 
 seams: "grouped-cells": {
 	kind:    "declared-set"
-	purpose: "the 4B's projections a receipt timed at 24,576-49,152 tokens, each a cell where its winner is not its kind's route (grouped_matmul.DECLARED, derived with the scoreboards' kinds and parity cells, grouped_cells.SCOREBOARDS); a cell leaves once the template catches up"
+	purpose: "the 4B's projections a receipt timed over grouped_cells.FOUR_B_TIMED's rows, each a cell where its winner is not its kind's route (grouped_matmul.DECLARED, derived with the scoreboards' kinds and parity cells, grouped_cells.SCOREBOARDS); a cell leaves once the template catches up"
 	paths:   ["src/dew/nn/kernels/grouped_cells.py"]
 	entries: "FOUR_B_CELLS"
 	declared: {

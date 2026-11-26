@@ -154,6 +154,89 @@ def test_a_product_whose_mode_states_no_rounding_is_factored_by_no_rule():
     assert not cheaper_spliced(scaled(jax.lax.DotAlgorithm(np.float32, np.float32, np.float32)), x, y, s)
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accumulation(side):
+    dims = (((1,), (1,)), ((), ()))
+    full = jax.lax.DotAlgorithmPreset.F32_F32_F32
+
+    def scaled(x, y, scale, precision, mesh=None):
+        s = scale
+        x, y = x.astype(s.dtype), y.astype(s.dtype)
+        if side == "left":
+            x = x * s[:, None]
+        else:
+            y = y * s[:, None]
+        if mesh is None:
+            return jax.lax.dot_general(x, y, dims, precision=precision)
+        with jax.sharding.use_abstract_mesh(mesh):
+            return jax.lax.dot_general(x, y, dims, precision=precision)
+
+    def draw(seed, length=128):
+        rng = np.random.default_rng(seed)
+        scales = 8 if side == "left" else 16
+        return (jnp.asarray(rng.integers(-128, 128, (8, length), dtype=np.int8)),
+                jnp.asarray(rng.integers(0, 256, (16, length), dtype=np.uint8)),
+                jnp.asarray(rng.uniform(0.125, 4.0, scales), jnp.float32))
+
+    def selected(s):
+        return jax.lax.select(s > 1, jax.lax.full(s.shape, 2.0, s.dtype), jax.lax.full(s.shape, 0.5, s.dtype))
+
+    def plain(x, y, s):
+        return scaled(x, y, selected(s), full)
+
+    def truth(x, y, s):
+        return scaled(x, y, selected(s), None)
+
+    assert cheaper_spliced(plain, *draw(0))
+    assert not cheaper_spliced(plain, *draw(0, length=257))
+    assert not cheaper_spliced(truth, *draw(0))  # an unspecified dot mode is not an integer proof
+    assert_as_exact(jax.jit(algebra.rewritten(plain)), jax.jit(plain), draw,
+                    f"transposed byte {side} dequantization", seeds=8, truth_fn=truth)
+
+    a = [3, -5] if side == "left" else [-5, 3]
+    b = [5, 3] if side == "left" else [3, 5]
+    x = jnp.broadcast_to(jnp.asarray([*a, *([0] * 126)], jnp.int8), (8, 128))
+    y = jnp.broadcast_to(jnp.asarray([*b, *([0] * 126)], jnp.uint8), (16, 128))
+    s = jnp.full((8 if side == "left" else 16,), 2.0, jnp.float32)
+
+    def rounded(x, y, s):
+        bad = jax.lax.full(s.shape, 1 + 2 ** -22, s.dtype)
+        other = jax.lax.full(s.shape, 0.5, s.dtype)
+        return scaled(x, y, jax.lax.select(s > 1, bad, other), full)
+
+    assert not cheaper_spliced(rounded, x, y, s)
+    np.testing.assert_array_equal(jax.jit(algebra.rewritten(rounded))(x, y, s), jax.jit(rounded)(x, y, s))
+
+    # Two dots of the same parameters in one region may have different contracting lengths.
+    def together(x, y, s, lx, ly):
+        return plain(x, y, s), plain(lx, ly, s)
+
+    lx, ly, _ = draw(0, length=257)
+    region = terms.region(jax.make_jaxpr(together)(x, y, s, lx, ly))
+    graph, _, (short, long) = program.graphed(region)
+    assert graph.check_bool(algebra.rules.exact_int8_product(short))
+    assert not graph.check_bool(algebra.rules.exact_int8_product(long))
+
+    # The caller and the e-graph are outside the declared mesh, but the written dot is not.
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
+    x_shape, y_shape, s_shape = (jax.ShapeDtypeStruct(a.shape, a.dtype) for a in (x, y, s))
+    with jax.sharding.use_abstract_mesh(mesh):
+        placed = jax.make_jaxpr(plain)(x_shape, y_shape, s_shape)
+    graph, _, (placed_dot,) = program.graphed(terms.region(placed))
+    assert not graph.check_bool(algebra.rules.exact_int8_product(placed_dot))
+
+    # Warm the shape-identical windows in both orders. Only the dot enters the local scope.
+    def scoped(x, y, s):
+        return scaled(x, y, selected(s), full, mesh)
+
+    for length, arms in ((128, (plain, scoped)), (96, (scoped, plain))):
+        inputs = draw(0, length)
+        for arm in arms:
+            assert cheaper_spliced(arm, *inputs) == (arm is plain)
+
+
 def test_a_saturation_of_no_growth_or_depth_is_refused():
     """A saturation's limits are each at least one (docs/design/algebra.md 6.6): one of none would stop
     every region before its first iteration and report it saturated."""

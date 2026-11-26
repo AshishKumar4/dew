@@ -54,6 +54,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.nn.vision.deepseek_v41 import DeepseekV41Projector, DeepseekV41Vision
     from dew.nn.vision.gemma3n import Gemma3nProjector, Gemma3nVision
     from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision, Gemma4VisionTransformer
+    from dew.nn.vision.inkling import InklingProjector, InklingVision
     from dew.nn.vision.lfm3 import Lfm3VlProjector, Lfm3VlVision
     from dew.nn.vision.llama4 import Llama4Projector, Llama4Vision, Llama4VisionTransformer
     from dew.nn.vision.mimo import MiMoProjector, MiMoVision
@@ -78,6 +79,8 @@ _EXPORTS = {
     "Llama4Projector": "dew.nn.vision.llama4",
     "Llama4Vision": "dew.nn.vision.llama4",
     "Llama4VisionTransformer": "dew.nn.vision.llama4",
+    "InklingProjector": "dew.nn.vision.inkling",
+    "InklingVision": "dew.nn.vision.inkling",
     "MiMoProjector": "dew.nn.vision.mimo",
     "MiMoVision": "dew.nn.vision.mimo",
     "MuseGlimmerProjector": "dew.nn.vision.muse_glimmer",
@@ -102,6 +105,8 @@ __all__ = [
     "Gemma4Vision",
     "Gemma4VisionTransformer",
     "GemmaProjector",
+    "InklingProjector",
+    "InklingVision",
     "Lfm3VlProjector",
     "Lfm3VlVision",
     "Llama4Projector",

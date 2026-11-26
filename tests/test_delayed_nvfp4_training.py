@@ -18,13 +18,15 @@ def test_a_split_step_rolls_the_largest_its_microbatches_recorded_into_each_hist
         whole, halves = delayed_lm(split=1), delayed_lm(split=2)
         started = histories(whole.place()[0])
         first = [whole.fit(data(), steps=1), halves.fit(data(), steps=1)]
+        # Read before the next fit takes the split run's state over (`Trainer.fit`'s `state`).
+        recorded = [histories(each) for each in first]
         # The split run's next step, from where its first left its histories.
         second = halves.fit(data(), state=first[1], steps=2)
     assert started and all(not history.any() for history in started), started
-    for one, other in zip(histories(first[0]), histories(first[1]), strict=True):
+    for one, other in zip(*recorded, strict=True):
         np.testing.assert_array_equal(one, other)
         assert one[0] > 0 and not one[1:].any(), one
-    for after, before in zip(histories(second), histories(first[1]), strict=True):
+    for after, before in zip(histories(second), recorded[1], strict=True):
         np.testing.assert_array_equal(after[1], before[0])
         assert after[0] > 0 and not after[2:].any(), after
 

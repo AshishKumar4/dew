@@ -1194,7 +1194,9 @@ class Trainer(Generic[Loss, Effects]):
         a directory that already holds a run (`Checkpoints.resumed`). An explicit `state` is the run's
         initial state, in place of initializing one and of restoring a checkpoint (a float64 truth's widened
         copy of another run's, say), not a continuation, which is a checkpoint's alone: its input reader
-        starts at the position `dataset` supplies.
+        starts at the position `dataset` supplies. The run takes it over: its moving arrays are the run's
+        to step and free (its frozen trees, which the objective holds, aside), so a caller reads the state
+        `fit` returns, not the one it handed, as JAX's donated arguments go.
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
         The run's length is one of `steps`, `epochs`, `tokens` and `examples` (`Horizon`). `tokens` stops at
@@ -1557,6 +1559,7 @@ class Trainer(Generic[Loss, Effects]):
             # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage. Its
             # run reads its data afresh: a clock of examples starts at none consumed, a run on another clock
             # keeps none, and its schedules take the run's own form (`reclocked`).
+            handed = initial
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(self._boxed_axes())):
@@ -1567,7 +1570,7 @@ class Trainer(Generic[Loss, Effects]):
             # devices (`_fitting`), as a fresh or resumed one is.
             return (int(initial.step), None,
                     lambda begun=None: self._staging.supplied(
-                        initial, lambda staged: self._validated(staged)[0]),
+                        initial, lambda staged: self._validated(staged)[0], consumed=True, sources=handed),
                     self._staging.stacked_shapes(initial), None)
         start = streaming.laid_start(self, run, dataset, resume)
         if checkpoints is not None and checkpoints.latest is not None:

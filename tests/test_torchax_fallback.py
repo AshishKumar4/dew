@@ -230,33 +230,44 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
-def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(loaded, tokens):
-    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs
-    (one `jax.checkpoint` a layer in the step's program), and its gradients are, bit for bit, the step's
-    without it; its record names its rung, and the ladder climbs no further."""
+@attending("reference")
+def test_a_recomputed_step_is_as_exact_as_transformers_and_keeps_less(source, loaded, tokens):
+    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs, and
+    holds less: its compiled step's temporaries below the unrecomputed step's. Its LM loss and every
+    parameter's gradient are as exact as transformers' own step over the same weights (check 1, torch's
+    float64 twin the truth, row 13147). Its record names its rung, and the ladder climbs no further."""
+    _, model = source
     recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
     assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
     assert loaded.model.recompute_record() is None
     assert loaded.model.restore_recompute(recomputed.model.recompute_record()) == recomputed.model
-    objective = LMObjective(recomputed, seq_len=SEQ, ema_decay=None)
     params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
 
-    def loss(params):
-        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
-    program = jax.make_jaxpr(jax.grad(loss))(params)
-    (checkpoint,) = (eqn.primitive for eqn in jax.make_jaxpr(jax.checkpoint(lambda x: x))(1.0).eqns)
-    checkpoints = [eqn for eqn in equations(program) if eqn.primitive is checkpoint]
-    assert len(checkpoints) == TINY["num_hidden_layers"], len(checkpoints)
-    # Recomputing a layer evaluates its program again: the same gradients, bit for bit, as the step that
-    # keeps its residuals, whose gradients are transformers' (`test_the_gradients_are_transformers`).
-    plain = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    def temporaries(held):
+        objective = LMObjective(held, seq_len=SEQ, ema_decay=None)
+        step = jax.jit(jax.grad(lambda params: objective_loss(
+            objective, {**held.variables, "params": params}, tokens, scalar=True)))
+        return step.lower(params).compile().memory_analysis().temp_size_in_bytes
 
-    def kept(params):
-        return objective_loss(plain, {**loaded.variables, "params": params}, tokens, scalar=True)
-    recomputed_gradients, kept_gradients = jax.jit(jax.grad(loss))(params), jax.jit(jax.grad(kept))(params)
-    for name, gradient in kept_gradients.items():
-        np.testing.assert_array_equal(np.asarray(recomputed_gradients[name]), np.asarray(gradient),
-                                      err_msg=name)
+    kept, recomputing = temporaries(loaded), temporaries(recomputed)
+    assert recomputing < kept, (recomputing, kept)
+    reference_model = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent)
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(loss_and_gradients(recomputed, model, params), reference_fn, token_draws(tokens),
+                    "torchax recomputed LM step", seeds=8, truth_fn=truth_fn)
 
 
 @pytest.mark.mesh
@@ -490,6 +501,98 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
 
     assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
                     token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+
+
+QWEN3_NEXT = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+              "head_dim": 16, "intermediate_size": 96, "vocab_size": 256, "max_position_embeddings": 64,
+              "tie_word_embeddings": False, "pad_token_id": 0, "linear_num_key_heads": 2,
+              "linear_num_value_heads": 4, "linear_key_head_dim": 16, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "layer_types": ["linear_attention", "full_attention"],
+              "mlp_only_layers": [0, 1], "partial_rotary_factor": 0.5}
+"""A dense hybrid Qwen3-Next: a gated delta net beside a full attention layer, each with an RMSNorm pair
+and a gated MLP."""
+
+
+def test_a_tier_3_sources_norms_products_and_delta_rule_run_dews_kernels_as_exact_as_transformers(
+        tokens, tmp_path):
+    """A source taken to tier 3 (`fallback='torchax'`) routes the parts Dew computes by kernels of its own
+    through them (`kernel_parts`, row 13044): its RMSNorms (Dew's fused norm), its gated MLPs' SiLU products
+    (Dew's fused SwiGLU) and its delta net's chunked rule (Dew's chunked recurrence), each identified by its
+    code; its LM loss and every parameter's gradient are as exact as transformers' own over the same
+    weights, measured from transformers in float64 (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    ran = loaded.model.graph.module._model
+    layer = ran.model.layers[0]
+    routed = [layer.input_layernorm, layer.post_attention_layernorm, layer.mlp, layer.linear_attn,
+              ran.model.norm]
+    assert all("forward" in vars(module) for module in routed)
+    dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
+                                                for name, leaf in loaded.variables["params"].items()})
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
+                    token_draws(tokens), "tier 3 Qwen3-Next LM step", seeds=UNREGISTERED_SEEDS,
+                    truth_fn=truth_fn)
+
+
+def test_a_tier_3_offset_norm_adds_its_offset_in_float32_as_its_source_does():
+    """A bf16 Qwen3-Next RMSNorm (Gemma's `(1 + w)` by code) routed through Dew's fused norm
+    (`kernel_parts`) adds its offset to its float32 weight, as its forward's `1.0 + self.weight.float()`
+    does: an input `[1, 0]` under a weight `[2^-8, 0]` gives the source's own `1.421875` first, bit for bit,
+    where the bf16 add rounded `1 + 2^-8` to 1 and gave `1.4140625` (row 13044's review)."""
+    import torchax
+    from torchax.interop import jax_view
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
+
+    from dew.interop.torchax_kernels import kernel_parts
+
+    class Held(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = transformers.Qwen3NextConfig(hidden_size=2)
+            self.norm = Qwen3NextRMSNorm(2).to(torch.bfloat16)
+
+    held, source = Held(), Qwen3NextRMSNorm(2).to(torch.bfloat16)
+    for norm in (held.norm, source):
+        norm.weight.data = torch.tensor([2.0 ** -8, 0.0], dtype=torch.bfloat16)
+    kernel_parts(held)
+    assert "forward" in vars(held.norm)
+    given = torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = source(given).float().numpy()
+    env = torchax.default_env()
+    with env, torch.no_grad():
+        norm = held.norm.to("jax")
+        got = np.asarray(jax_view(norm(given.to("jax"))).astype(jnp.float32))
+    np.testing.assert_array_equal(got, expected)
+    assert float(expected[0, 0]) == 1.421875
+
+
+def test_tier_3_leaves_the_mlps_its_swiglu_does_not_compute_as_their_source_writes_them():
+    """Gated MLPs `kernel_parts` recognizes by code but whose projections or arithmetic its SwiGLU does not
+    take keep their own forwards: GLM-4's packed `gate_up_proj` and LFM2's `w1`, `w3`, `w2`, where the
+    rewrite raised as it looked up Llama's names (row 13044's review)."""
+    from dew.interop.torchax_kernels import kernel_parts
+
+    tiny = {"hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
+            "intermediate_size": 48, "vocab_size": 64, "pad_token_id": 0}
+    glm = transformers.Glm4ForCausalLM(transformers.Glm4Config(**tiny))
+    lfm = transformers.Lfm2ForCausalLM(transformers.Lfm2Config(**tiny, layer_types=["full_attention"]))
+    for model, mlp in ((glm, glm.model.layers[0].mlp), (lfm, lfm.model.layers[0].feed_forward)):
+        kernel_parts(model)
+        assert "forward" not in vars(mlp), type(mlp).__name__
 
 
 QUALIFIED_SEEDS = 64
@@ -1828,53 +1931,279 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
                     truth_fn=torch_arm(wide, float64))
 
 
-def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(tmp_path):
-    """An unregistered source on Dew's attention (`dew_attention`), whose cache opens unlooped, opens none
-    looped: its
-    block runs once a pass, a cache keeping one entry a layer. Its loop exits no pass but its last, so a
-    loss weighing each pass's exit is refused as it is built, where a native looped decoder's is taken."""
+def test_a_looped_source_on_dews_attention_decodes_each_prefix_as_its_repeated_layers_run_it(tmp_path):
+    """An unregistered source on Dew's attention (`dew_attention`) looping its first layer (Cohere's, all
+    full layers) opens a decode cache whose later pass keeps entries of its own (row 13142), and decodes
+    through it: a prompt prefilled whole, then a token a call, each step's logits holding check 1 against
+    transformers' decoder of those layers repeated running that prefix whole, its float64 twin's one forward
+    the truth; its greedy generation (`TextGeneration`, as a run's preview and a saved run's task draw) is the
+    looped forward's argmax at each step. Its loop exits no pass but its last, so a loss weighing each
+    pass's exit is refused as it is built, where a native looped decoder's is taken."""
     from test_pass_weights import looped as native_looped
 
+    from dew.inference import TextGeneration
     from dew.objectives.lm import LMObjective
+    from dew.sampling import Sampling
 
-    saved_cohere(tmp_path)
+    model = saved_cohere(tmp_path)
     with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=16)
     assert isinstance(loaded, PretrainedFallback) and loaded.model.graph.dew_attention
-    loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
-    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1)))
-    with pytest.raises(Lacks):
-        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
-    with pytest.raises(Lacks):
-        looped.apply(loaded.variables, np.zeros((2, 1), np.int32), decode=True, mutable=["cache"])
+    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1), step_norm=False))
     with pytest.raises(ValueError):
         LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights="mean")
     # Weights on the last pass alone are its own loss, which reads no earlier exit.
     LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights=(0.0, 1.0))
     LMObjective(native_looped(), 16, pass_weights="mean")
+    state = model.state_dict()
+
+    def repeated(dtype):
+        config = transformers.CohereConfig(**{**COHERE, "num_hidden_layers": 3})
+        built = transformers.CohereForCausalLM(config)
+        weights = {name: value for name, value in state.items() if not name.startswith("model.layers.")}
+        for index, layer in enumerate((0, 0, 1)):
+            prefix = f"model.layers.{layer}."
+            weights |= {f"model.layers.{index}.{name.removeprefix(prefix)}": value
+                        for name, value in state.items() if name.startswith(prefix)}
+        built.load_state_dict(weights)
+        built.set_attn_implementation("eager")
+        return built.to(dtype).eval()
+
+    steps, vocab = 4, COHERE["vocab_size"]
+
+    @jax.jit
+    def decoded(variables, prompt, continued):
+        state = looped.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
+        logits, state = looped.apply({**variables, **state}, prompt, decode=True, mutable=["cache"])
+        stepped = [logits[:, -1]]
+        for step in range(steps):
+            logits, state = looped.apply({**variables, **state}, continued[:, step:step + 1], decode=True,
+                                         mutable=["cache"])
+            stepped.append(logits[:, 0])
+        return jnp.stack(stepped, axis=1)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x13142, seed])
+        return (rng.integers(0, vocab, (2, 6)).astype(np.int32),
+                rng.integers(0, vocab, (2, steps)).astype(np.int32))
+
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids).long()).logits.double().numpy()
+
+        def run(prompt, continued):
+            ids = np.concatenate([prompt, continued], axis=1)
+            if stepped:
+                return np.stack([forward(ids[:, :6 + step])[:, -1] for step in range(steps + 1)], axis=1)
+            return forward(ids)[:, 5:6 + steps]
+        return as_given(run)
+
+    with float64():
+        wide = repeated(torch.float64)
+    assert_as_exact(as_given(lambda prompt, continued: np.asarray(
+        decoded(loaded.variables, prompt, continued), np.float64)), theirs(repeated(torch.float32)), draw,
+        "looped tier 3 cached logits", seeds=8, truth_fn=theirs(wide, float64, stepped=False))
+    prompt, _ = draw(0)
+    task = TextGeneration(looped, loaded.variables, sampling=Sampling(temperature=0.0))
+    generated = np.asarray(task(prompt.tolist(), steps, key=0).tokens)
+    full = np.asarray(looped.apply(loaded.variables, jnp.asarray(generated)))
+    np.testing.assert_array_equal(generated[:, 6:], full[:, 5:-1].argmax(-1))
 
 
-def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
-    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) refuses
-    recomputing them and refuses training unseeded, either way leaving torchax's key as it was; the same
-    model traces unrecomputed under a dropout key after it, drawing from that key."""
+def test_a_recomputed_layer_that_drops_draws_its_forwards_draws(tmp_path):
+    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) trains
+    recomputed under a dropout key: each recomputed layer draws from the key its forward handed it, so its
+    step's gradients are, bit for bit, the unrecomputed step's under the same key (row 13147), and another
+    key draws otherwise. Unseeded, training is refused, leaving torchax's key as it was."""
     from dew.interop.torchax_fallback import _environment
 
     dropping = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
     torch.manual_seed(0)
     transformers.LlamaForCausalLM(dropping).save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
-    tokens = np.zeros((2, 8), np.int32)
+    tokens = np.random.default_rng(0x13147).integers(0, LLAMA["vocab_size"], (2, 8)).astype(np.int32)
     env = _environment()
     before = env.prng_key
     recomputed = loaded.model.clone(remat=True)
-    for model, rngs in ((recomputed, {"dropout": jax.random.key(1)}), (loaded.model, {})):
-        with pytest.raises(ValueError):
-            jax.make_jaxpr(lambda v, model=model, rngs=rngs: model.apply(v, tokens, train=True, rngs=rngs))(
-                loaded.variables)
-        assert env.prng_key is before
+    with pytest.raises(ValueError):
+        jax.make_jaxpr(lambda v: loaded.model.apply(v, tokens, train=True))(loaded.variables)
+    assert env.prng_key is before
 
-    def train(variables, key):
-        return loaded.model.apply(variables, tokens, train=True, rngs={"dropout": key})
-    first, second = (jax.jit(train)(loaded.variables, jax.random.key(seed)) for seed in (1, 2))
-    assert not np.array_equal(np.asarray(first), np.asarray(second))
+    def gradient(model, seed):
+        return jax.jit(jax.grad(lambda variables: jnp.sum(model.apply(
+            variables, tokens, train=True, rngs={"dropout": jax.random.key(seed)}))))(loaded.variables)
+
+    unrecomputed = jax.tree.leaves(gradient(loaded.model, 1))
+    for got, wanted in zip(jax.tree.leaves(gradient(recomputed, 1)), unrecomputed, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+    assert any(not np.array_equal(np.asarray(one), np.asarray(two)) for one, two in zip(
+        jax.tree.leaves(gradient(recomputed, 1)), jax.tree.leaves(gradient(recomputed, 2)), strict=True))
+
+
+def test_a_trace_held_inside_a_layer_keeps_another_threads_trace_out_until_it_leaves(tmp_path):
+    """One tier-3 source traced in two threads at once, a seeded training call (attention dropout) in one
+    and a plain evaluation in the other: the first held inside its first decoder layer (a forward pre-hook)
+    keeps the second, which has announced its call, from entering any trace until it is released, as one
+    trace at a time binds the module's parameters, training mode and seams (`_TRACING`); and each call's
+    logits are, bit for bit, what it gives alone (row 13156, the review of row 13139's witness)."""
+    import threading
+
+    torch.manual_seed(0)
+    config = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
+    transformers.LlamaForCausalLM(config).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    model = loaded.model
+    (ids,) = token_draw(0x13156, LLAMA["vocab_size"], (2, 12))(0)
+
+    def trained():
+        return np.asarray(model.apply(loaded.variables, ids, train=True, rngs={"dropout": jax.random.key(3)}))
+
+    def evaluated():
+        return np.asarray(model.apply(loaded.variables, ids))
+
+    alone = {"trained": trained(), "evaluated": evaluated()}
+    held, release, announced, entered = (threading.Event() for _ in range(4))
+    holder = {}
+
+    def hook(module, args):
+        if threading.current_thread() is holder.get("first") and not held.is_set():
+            held.set()
+            release.wait(timeout=600)
+        elif threading.current_thread() is holder.get("second"):
+            entered.set()
+
+    layer = model.graph.module._model.get_decoder().layers[0]
+    handle = layer.register_forward_pre_hook(hook)
+    ran = {}
+
+    def first():
+        holder["first"] = threading.current_thread()
+        ran["trained"] = trained()
+
+    def second():
+        holder["second"] = threading.current_thread()
+        held.wait(timeout=600)
+        announced.set()
+        ran["evaluated"] = evaluated()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    try:
+        for thread in threads:
+            thread.start()
+        assert held.wait(timeout=600) and announced.wait(timeout=600)
+        # Held inside a layer, the first trace keeps the second from reaching any layer while it waits.
+        assert not entered.wait(timeout=10)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=600)
+    finally:
+        release.set()
+        handle.remove()
+    assert sorted(ran) == ["evaluated", "trained"]
+    for name, logits in ran.items():
+        np.testing.assert_array_equal(logits, alone[name], err_msg=name)
+
+
+def test_two_variants_of_one_source_trace_side_by_side_as_each_does_alone(tmp_path):
+    """Two variants of one tier-3 source sharing its torch graph (`PretrainedFallback.with_model`'s): a loop
+    over its first layer and its layers recomputed, each one's gradient traced (an unjitted call traces) four
+    times in a thread of its own, both threads at once. Each gives what it gives alone, bit for bit: a
+    trace's layer seam, training mode and parameter binding are its own (row 13139), where a seam installed
+    in place on the shared layers wrapped or removed the other trace's."""
+    import threading
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    variants = (loaded.model.with_loop(Loop(steps=3, layers=(0, 1), step_norm=False)),
+                loaded.model.clone(remat=True))
+    assert variants[0].graph is variants[1].graph is loaded.model.graph
+    (ids,) = token_draw(0x13139, LLAMA["vocab_size"], (2, 12))(0)
+
+    def gradient(model):
+        return jax.grad(lambda variables: jnp.sum(model.apply(variables, ids, train=True)))(loaded.variables)
+
+    alone = [gradient(model) for model in variants]
+    start, ran = threading.Barrier(len(variants)), {}
+
+    def run(index):
+        start.wait()
+        ran[index] = [gradient(variants[index]) for _ in range(4)]
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(len(variants))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(ran) == [0, 1]
+    for index, runs in ran.items():
+        for each in runs:
+            for got, wanted in zip(jax.tree.leaves(each), jax.tree.leaves(alone[index]), strict=True):
+                np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+
+
+def test_a_plain_trace_nested_in_a_looped_ones_seam_runs_its_own_layers_and_leaves_the_mode(tmp_path):
+    """A tier-3 source's plain call traced inside another trace's loop seam (`_layer_seam`, its layers' one
+    dispatcher shared) runs its layers once, at the first pass, as it does alone, bit for bit: a trace's
+    seam is its own even where it runs none (row 13139's review); and a training call leaves the source
+    model in the mode it was loaded in (eval), where its wrapper's flag was restored onto it."""
+    from dew.interop.torchax_fallback import _environment, _layer_seam
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    source = loaded.model.graph.module._model
+    (ids,) = token_draw(0x13139, LLAMA["vocab_size"], (2, 12))(1)
+    alone = loaded.model.apply(loaded.variables, ids)
+    assert not source.training
+    loaded.model.apply(loaded.variables, ids, train=True)
+    assert not source.training
+    with _layer_seam(source, _environment(), layers=None, loop=Loop(steps=3, layers=(0, 1), step_norm=False)):
+        nested = loaded.model.apply(loaded.variables, ids)
+    np.testing.assert_array_equal(np.asarray(nested), np.asarray(alone))
+
+
+def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path):
+    """A source taken to tier 3 looping its first layer three passes runs a count a call gives
+    (`loop_passes`): its logits at each count are, bit for bit, the loop of that many passes' (each later pass
+    at or past the count skipped, as a native loop's counted pass, `looping.counted_branch`, row 13144); its
+    later passes run under one scan, the block traced once, so its program is as long at six passes as at
+    three; and a trainer drawing each microbatch's count (`TrainerAdvanced.sampled_passes`) steps it at more
+    than one count, every loss finite."""
+    from dew.training.compiler import DrawingStep
+    from dew.training.interval import Interval
+    from dew.training.phase_passes import SampledPasses
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    looped = loaded.model.with_loop(Loop(steps=3, layers=(0, 1), step_norm=False))
+    # A row a device of the trainer's data axis (a CPU run's eight).
+    (ids,) = token_draw(0x13144, LLAMA["vocab_size"], (8, 12))(0)
+    counted = jax.jit(lambda variables, ids, passes: looped.apply(variables, ids, method="logits",
+                                                                  loop_passes=passes))
+    for count in (1, 2, 3):
+        np.testing.assert_array_equal(
+            np.asarray(counted(loaded.variables, ids, jnp.int32(count))),
+            np.asarray(jax.jit(looped.with_passes(count).apply)(loaded.variables, ids)), err_msg=f"{count}")
+    # The block traced once under the passes' scan, whatever their count: one program as long at 3 as at 6.
+    def equations_at(steps):
+        model = looped.with_passes(steps)
+        return len(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(loaded.variables).jaxpr.eqns)
+
+    assert equations_at(3) == equations_at(6)
+    held = dataclasses.replace(loaded, model=looped)
+    trainer = Trainer(LMObjective(held, 11, ema_decay=None), optax.sgd(0.1), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(sampled_passes=SampledPasses(mean=2.0, dispersion=0.5, cap=3)))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.asarray(ids)}
+    step = trainer.compile(state, batch)
+    assert isinstance(step, DrawingStep)
+    counts, interval = [], Interval(0.0, None, microbatches=0)
+    for index in range(6):
+        step.drawn(interval, index)
+        counts.extend(step.counts)
+        state, loss, *_ = step(state, batch)
+        assert np.isfinite(float(loss)), (index, counts)
+    assert len(set(counts)) > 1, counts

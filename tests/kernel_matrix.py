@@ -295,6 +295,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_generated_recurrence_score_tile_holds_on_the_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
 )
 """GPU tier matrix flows by node id: seeded native cases, plus the gated MLP native route matrix."""
@@ -307,31 +308,11 @@ TPU_FLOWS: tuple[str, ...] = (
 
 
 def ops() -> dict[str, list]:
-    """Every kernel op Dew's dispatches serve (`selection.Op`), by its choice, read from the production
-    modules under `dew.nn` as they define them, a module's own or held in a module's mapping or sequence (a
-    layer's selectors by choice, `joined.JOINS`): none is listed here."""
-    import pkgutil
+    """Every kernel op Dew's dispatches serve (`selection.Op`), by its choice (`tools/kernel_choices.ops`,
+    which writes `dew.kernels.Kernels` from them)."""
+    from tools import kernel_choices
 
-    import dew.nn
-    from dew.nn.kernels import selection
-
-    def held(value):
-        if isinstance(value, selection.Op):
-            yield value
-        elif isinstance(value, dict):
-            for item in value.values():
-                yield from held(item)
-        elif isinstance(value, list | tuple):
-            for item in value:
-                yield from held(item)
-
-    found: dict[str, list] = {}
-    for module in pkgutil.walk_packages(dew.nn.__path__, "dew.nn."):
-        for value in vars(importlib.import_module(module.name)).values():
-            for op in held(value):
-                if all(op is not seen for seen in found.get(op.choice, [])):
-                    found.setdefault(op.choice, []).append(op)
-    return found
+    return kernel_choices.ops()
 
 
 def head_shapes(case: dict[str, str], heads: dict[str, tuple[int, int]]) -> tuple:

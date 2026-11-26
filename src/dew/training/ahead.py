@@ -604,10 +604,16 @@ class BuildTarget:
     serialization differs call to call (two calls on one A100 differ from byte 207 on, probe UB-TOPO,
     2026-11-11), so its digest names nothing. It names the compile, which no loader holds
     (`differences`)."""
+    device_kind: str | None = None
+    """The kind of GPU the programs were compiled for where a build states one (a host's own topology's, a
+    GH200's against the canonical H100's), whose own facts its launches derived from (`built_target`): a
+    device of another kind is refused (`differences`). None for a generation's canonical GPUs, which stand
+    for any of its parts, and for any other platform's (row 13252)."""
 
     @staticmethod
     def built(target: GpuTarget, devices: int, memory: int | None = None, *,
-              topology: bytes | None = None, chips: str | None = None) -> BuildTarget:
+              topology: bytes | None = None, chips: str | None = None,
+              device_kind: str | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
         holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
         was given one, under this process's JAX, jaxlib, computing XLA flags and host, and for a CUDA GPU
@@ -618,7 +624,8 @@ class BuildTarget:
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
                            computation_flags(), platform.machine(), memory,
                            plugin=plugin_builds() if cuda else "", libraries=cuda_libraries() if cuda else (),
-                           topology=None if topology is None else topology_digest(topology), chips=chips)
+                           topology=None if topology is None else topology_digest(topology), chips=chips,
+                           device_kind=device_kind)
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
@@ -635,7 +642,9 @@ class BuildTarget:
                   if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
-        built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices))
+        kind = devices[0].device_kind if devices[0].platform == "gpu" else None
+        built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices),
+                                  device_kind=kind)
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
@@ -645,7 +654,7 @@ class BuildTarget:
         where this build loaded it and other's version is another (a build that loaded none wrote none of
         its state), and never the topology, which names the compile and binds no loader."""
         named = [field.name for field in dataclasses.fields(self)
-                 if field.name not in ("memory", "topology", "libraries", "chips")]
+                 if field.name not in ("memory", "topology", "libraries", "chips", "device_kind")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
         theirs = dict(other.libraries)
@@ -655,6 +664,9 @@ class BuildTarget:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         if self.chips is not None and other.chips != self.chips:
             found.append(f"TPU chips {self.chips}, not {other.chips}")
+        # A kind where the build states one (a host's own GPUs'), which a canonical build never does.
+        if self.device_kind is not None and other.device_kind != self.device_kind:
+            found.append(f"device kind {self.device_kind}, not {other.device_kind}")
         return found
 
     def own_devices(self) -> list:
@@ -720,9 +732,10 @@ class AheadPrograms:
     convolution compiled without its GPU, as `compile_programs` reads one for its memory alone), which
     `loaded` refuses on any GPU (row 8688)."""
     kept: dict[str, KeptProgram] | None = None
-    """The programs a process compiled at Dew's compile point, each by its fingerprint (`KeptProgram`,
-    `keeping`): a process of their target runs each for a call that lowers to that program under those
-    options (`kept`); None for a file of named programs alone."""
+    """The programs a process compiled at Dew's compile point, each by its fingerprint on its devices
+    (`options.placed`; `KeptProgram`, `keeping`): a process of their target runs each for a call that lowers
+    to that program under those options over those devices (`kept`); None for a file of named programs
+    alone."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -865,7 +878,9 @@ class Keeping:
             self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
                                   "outside the process's default backend"
             return
-        self.kept[fingerprint] = KeptProgram(program.called, serialized, tuple(device.id for device in ran))
+        devices = tuple(device.id for device in ran)
+        # By its devices too (`options.placed`): one program kept for two of a host's devices is two.
+        self.kept[options.placed(fingerprint, devices)] = KeptProgram(program.called, serialized, devices)
 
     def save(self, path: str | Path) -> AheadPrograms:
         """Write the programs kept so far to `path` with this process's target, for `kept` in a process of
@@ -935,7 +950,10 @@ def kept(path: str | Path) -> Iterator[AheadPrograms]:
                      "every call compiles: %s", path, "; ".join(differences))
         yield programs
         return
-    with options.taking({fingerprint: each.loaded for fingerprint, each in programs.kept.items()}):
+    # Each by its fingerprint on the devices it was compiled for (`options.placed`): loaded onto those, it
+    # runs a call lowered over them alone.
+    with options.taking({options.placed(key.partition("@")[0], each.devices): each.loaded
+                         for key, each in programs.kept.items()}):
         yield programs
 
 
@@ -955,13 +973,15 @@ def _gpu_mesh(generation: str, multiprocessors: int | None) -> jax.sharding.Mesh
 
 
 @contextlib.contextmanager
-def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterator[None]:
+def lowering_for(generation: str, multiprocessors: int | None = None,
+                 device_kind: str | None = None) -> Iterator[None]:
     """Within the block, programs trace and lower as `compile_programs` lowers them for one GPU of the CUDA
-    `generation`: their launches derived for that GPU's facts (`assumed`, any GPU of the generation), on the
-    compile-only GPUs' abstract mesh, certified on the first (`report.certifying`). A program traced in it
-    holds the arrays a compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
+    `generation`: their launches derived for that GPU's facts (`assumed`; the `device_kind`'s where a host's
+    own topology states it, `built_target`, else any GPU of the generation's), on the compile-only GPUs'
+    abstract mesh, certified on the first (`report.certifying`). A program traced in it holds the arrays a
+    compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
     mesh = _gpu_mesh(generation, multiprocessors)
-    with (assumed(built_target(generation, multiprocessors), portable=True),
+    with (assumed(built_target(generation, multiprocessors, device_kind=device_kind), portable=True),
           jax.sharding.use_abstract_mesh(mesh.abstract_mesh), report.certifying(mesh.devices.flat[0])):
         yield
 
@@ -991,9 +1011,12 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     With `memory_only` every program compiles read offline (`report.read_offline`), refused for none, for
     its memory alone (`Executable.memory`, a convolution's workspace XLA's default where its device's
     compile may pick another): programs no process loads, which a prepare sizes a run by."""
-    target = built_target(generation, multiprocessors)
     gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
             else host_gpus(generation, topology, 1))
+    # A node's own topology states its GPUs' kind, whose facts its launches derive from as its run's do
+    # (row 13252); a canonical target's stand for any of the generation.
+    kind = None if topology is None else gpus[0].device_kind
+    target = built_target(generation, multiprocessors, device_kind=kind)
     mesh = jax.sharding.Mesh(np.asarray(gpus[:1]), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     lowerings = []
@@ -1005,7 +1028,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with lowering_for(generation, multiprocessors):
+                with lowering_for(generation, multiprocessors, kind):
                     return compiled(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
@@ -1034,8 +1057,10 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
     need = programs_need(gpus[0], [(executable.memory, 0, 0) for executable in built.values()])
-    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned, at_run=tuple(
-        name for name, compiled in zip(programs, executables, strict=True) if report.left_at_run(compiled)))
+    left = tuple(name for name, compiled in zip(programs, executables, strict=True)
+                 if report.left_at_run(compiled))
+    return AheadPrograms(BuildTarget.built(target, 1, need, device_kind=kind), built, tuned=tuned,
+                         at_run=left)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -1546,7 +1571,10 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # The allocator's limit the plan is made against, from the memory the GPUs' devices carry.
     capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
-    stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
+    # Its kind where the devices are a host's own (`_HOSTS_GPUS`), whose launches derive from that part's
+    # facts as its run does (row 13252); a canonical GPU's stands for any of its generation.
+    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else devices[0].device_kind
+    stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity, device_kind=kind)
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(devices) <= _HOSTS_GPUS
@@ -1625,7 +1653,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
+        built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices),
+                                device_kind=None if topology is None else devices[0].device_kind),
         refusals=report.refused_launches(), sampled=sampled,
         at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
         starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})

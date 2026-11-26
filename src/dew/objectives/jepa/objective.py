@@ -65,9 +65,10 @@ PREDICTOR = "predictor"
 LABEL_KEY = "label"
 
 
-def representation_health(z) -> dict[str, Moments]:
+def representation_health(z, real: jax.Array | None = None) -> dict[str, Moments]:
     """Return two collapse measures for pooled embeddings `[B, D]`, as metrics their batch's moments pool
-    (`Moments`), so a step read in several microbatches reports them as its whole batch would.
+    (`Moments`), so a step read in several microbatches reports them as its whole batch would; over the rows
+    `real` marks where given (`Objective.real_rows`), so a repeat filling a batch moves neither.
 
     `repr_std` is the per-dimension standard deviation across the batch. It
     goes to zero exactly when the encoder stops distinguishing inputs.
@@ -80,8 +81,8 @@ def representation_health(z) -> dict[str, Moments]:
     """
     product = functools.partial(jnp.matmul, out_sharding=whole_spec(z, 2))
     return {
-        "repr_std": Moments.of(z, "std"),
-        "repr_cov_offdiag": Moments.of(z, "offdiagonal", lambda a, b: accumulated(product, a, b)),
+        "repr_std": Moments.of(z, "std", real=real),
+        "repr_cov_offdiag": Moments.of(z, "offdiagonal", lambda a, b: accumulated(product, a, b), real=real),
     }
 
 
@@ -291,7 +292,8 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
         # Its parts' largest magnitudes under their names, as their histories lie (`part`, row 12721).
         amax = None if not step.amax else {CONTEXT_ENCODER: encoder.get(NVFP4_AMAX, {}),
                                            PREDICTOR: predictor.get(NVFP4_AMAX, {})}
-        return loss, Aux(representation_health(pooled), inspected=inspected, amax=amax)
+        health = representation_health(pooled, self.real_rows(batch, batch_size))
+        return loss, Aux(health, inspected=inspected, amax=amax)
 
     def evaluate(self, params, batch, step: Step):
         """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""

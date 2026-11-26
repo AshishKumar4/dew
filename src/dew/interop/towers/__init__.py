@@ -17,6 +17,7 @@ from dew.interop.towers import (
     gemma3n,
     gemma4,
     gemma4_unified,
+    inkling,
     lfm3,
     llama4,
     mimo,
@@ -34,7 +35,8 @@ from dew.registry import projectors, towers
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
-_PROJECTED = (deepseek_v41, gemma3n, gemma4, lfm3, llama4, mimo, moonvit, muse_glimmer, qwen35, siglip)
+_PROJECTED = (deepseek_v41, gemma3n, gemma4, inkling, lfm3, llama4, mimo, moonvit, muse_glimmer, qwen35,
+              siglip)
 """The family modules that declare projector layouts; each declares its towers' too."""
 
 TOWER_LAYOUTS: Mapping[type[TowerBase], TowerLayout] = MappingProxyType(

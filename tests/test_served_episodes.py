@@ -233,15 +233,24 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
             np.testing.assert_array_equal(scheduled[name], whole[name], err_msg=f"seed {seed}: {name}")
 
 
-@pytest.mark.parametrize(("max_seq_len", "n", "paged"), [(64, 1, True), (48, 1, False), (64, 2, False)],
-                         ids=["no pages declared", "too short for a page", "two samples a prompt"])
+# A turn's row at the measured crossover (`serving.SHARED_PAGES_FROM`, 2048) in whole pages of 64, its
+# prompt allowed to fill it; one of PROMPT tokens, below it.
+CROSSING = 2048 - RESPONSE
+
+
+@pytest.mark.parametrize(("max_seq_len", "prompt", "n", "paged"),
+                         [(2048 + 64, CROSSING, 1, True), (64, PROMPT, 1, False), (48, PROMPT, 1, False),
+                          (2048 + 64, CROSSING, 2, False)],
+                         ids=["no pages declared", "below the crossover", "too short for a page",
+                              "two samples a prompt"])
 def test_an_episode_schedulers_cohort_over_a_model_declaring_no_pages_is_served_where_pages_share(
-        max_seq_len, n, paged):
+        max_seq_len, prompt, n, paged):
     """An episode scheduler over a policy whose model declares no pages serves its cohort over pages of 64
     where a server over them shares its turns' histories (`served_layout`'s 'shared'): a model whose
-    max_seq_len holds a turn's row in whole pages; one too short to (a row of 36 slots past 48's whole
-    pages of 64) and a policy drawing two samples a prompt draw it whole. Either way its cohort is what the
-    policy collects prefilling every turn whole (row 7947)."""
+    max_seq_len holds a turn's row of at least the measured crossover's slots (`SHARED_PAGES_FROM`, row
+    7420) in whole pages; a row below it (pages lost there: M-IG-11), one too short for whole pages (a row
+    of 36 slots past 48's whole pages of 64) and a policy drawing two samples a prompt draw it whole.
+    Either way its cohort is what the policy collects prefilling every turn whole (row 7947)."""
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import RolloutScheduler
 
@@ -250,14 +259,14 @@ def test_an_episode_schedulers_cohort_over_a_model_declaring_no_pages_is_served_
     policy = TextGeneration(model, variables, n=n)
     collector_ = RolloutScheduler.episodes(
         policy, conversations, lambda episode: 1.0, objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE),
-        max_prompt_tokens=PROMPT, max_new_tokens=RESPONSE, max_turns=TURNS, sampling=SAMPLED
+        max_prompt_tokens=prompt, max_new_tokens=RESPONSE, max_turns=TURNS, sampling=SAMPLED
     ).acquisition.collector
     assert isinstance(collector_, EpisodeCollector)
     cache = collector_.cache
     assert (cache.layout.page_size if cache is not None and cache.layout is not None else None) == (
         64 if paged else None)
     if n == 1:
-        whole = EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE, TURNS,
+        whole = EpisodeCollector(policy, conversations, lambda episode: 1.0, prompt, RESPONSE, TURNS,
                                  sampling=SAMPLED)
         scheduled, drawn = collected(collector_, variables), collected(whole, variables)
         for name in ("contexts", "tokens"):

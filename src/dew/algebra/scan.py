@@ -67,7 +67,7 @@ from dew.nn.precision import (
     uncontracted,
     vanishing,
 )
-from dew.nn.programs import read_by
+from dew.nn.programs import holes, read_by
 
 Axes = tuple[str, ...]
 
@@ -1189,18 +1189,17 @@ def _pair_factors(left, right, decay, after):
 
 
 def _portable_pair_jvp(primals, tangents):
-    moving = tuple(i for i, t in enumerate(tangents) if t is not None and not isinstance(t, SymbolicZero))
+    live = tuple(t is not None and not isinstance(t, SymbolicZero) for t in tangents)
     value = _portable_pairs(*primals)
-    if not moving:
+    if not any(live):
         return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
+    operands, fill = holes(primals, live, is_leaf=lambda arg: arg is None)
 
-    def exact(*live):
-        full = list(primals)
-        for index, operand in zip(moving, live, strict=True):
-            full[index] = operand
-        return _pair_sum(_pair_factors(*full))
+    def exact(*active):
+        return _pair_sum(_pair_factors(*fill(active)))
 
-    return value, jax.jvp(exact, tuple(primals[i] for i in moving), tuple(tangents[i] for i in moving))[1]
+    directions = tuple(t for t, take in zip(tangents, live, strict=True) if take)
+    return value, jax.jvp(exact, tuple(operands), directions)[1]
 
 
 @custom_vmap

@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
+import importlib
 import itertools
 import operator
 from collections.abc import Callable, Iterator, Sequence
@@ -23,6 +24,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
 
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
@@ -39,6 +41,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.product import Support
 from dew.nn.programs import meshless
 
 
@@ -569,11 +572,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         out = self.products(self.zeros(shape), lhs, rhs)
         return between(), out
 
-    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True, support=None):
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         if not accumulate:
             # A fresh product: onto zeros, its accumulator a value (`read` is that value).
             acc = self.zeros(acc.shape)
+        if support is not None and not interpret:
+            return self._supported(acc, lhs, rhs, support)
         if jnp.dtype(lhs.dtype) != self.dtype:
             # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
             # depths are its own, its accumulator's the same.
@@ -716,11 +721,52 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # unrolled, spilled none (NSDBG-5).
         running, fresh = lax.optimization_barrier((running, self.zeros(running.shape)))
         fresh = self.products(fresh, lhs, rhs)
-        return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
+        # `scale(start, columns, partial)` scales the partial itself (`Issuer.summed_apart`, row 13257).
+        return running + (fresh if scale is None else scale(0, running.shape[1], fresh))
 
     def register_products(self, acc, parts, rhs):
         for formed in parts:
             acc = self.products(acc, mosaic.unscaled_part(formed), rhs)
+        return acc
+
+    @property
+    def term_tile(self) -> tuple[int, int] | None:
+        # Each instruction's tile of the accumulator, `m_warps * 16` rows by `atom_columns` (`MMALayouts`'
+        # base tile, every warp's 16 x 8 share of it issued together): one skipped is skipped for every warp.
+        return self.m_warps * 16, self.atom_columns
+
+    def _supported(self, acc, lhs, rhs, support: Support):
+        """`products` of `support`'s terms alone, `rhs` staged and `lhs` staged or in registers: each
+        instruction issued where a term of the support falls in its tile and depth (`Support.tiles` on
+        `term_tile`), each slice of either operand loaded where one reads it, none of a depth none takes. The
+        doubling's merges hold their terms in its blocks (`recurrence_algebra.doubled`): whole, an RTX PRO
+        6000's gated delta net solve issued 544 TF32 instructions and loaded and rounded 1408 operand words a
+        thread, 2.8 times fla's solve (M-JS-275)."""
+        if jnp.dtype(lhs.dtype) != self.dtype:
+            return self.for_dtype(lhs.dtype)._supported(acc, lhs, rhs, support)
+        depth = self.fragment_depth(int(rhs.shape[0]))
+        rows, columns = self.m_warps * 16, self.atom_columns
+        if not support.divides(rows, columns, depth):
+            # Its instructions do not tile the product: whole.
+            return self.products(acc, lhs, rhs)
+        issued = support.tiles(rows, columns, depth)
+        held = self._left(lhs) if isinstance(lhs, jax.Array) else None
+        for k in range(issued.shape[2]):
+            tiles = [(m, n) for m in range(issued.shape[0]) for n in range(issued.shape[1])
+                     if issued[m, n, k]]
+            if not tiles:
+                continue
+            read = sorted({n for _, n in tiles})
+            rights = [plgpu.load(rhs.at[pl.ds(k * depth, depth), pl.ds(n * columns, columns)],
+                                 layout=self.rhs, optimized=self._matrix_loads) for n in read]
+            product_of: Callable[..., jax.Array] = plgpu.inline_mgpu(
+                arg_types=(self.layout, self.lhs, *(self.rhs,) * len(rights)),
+                return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.dtype(jnp.float32), layout=self.layout))(
+                functools.partial(_tiled_product, rows=rows, columns=columns, depth=depth,
+                                  tiles=tuple((m, n, read.index(n)) for m, n in tiles)))
+            left = (held[:, k * depth:(k + 1) * depth] if held is not None
+                    else self._left(lhs.at[:, pl.ds(k * depth, depth)]))
+            acc = product_of(plgpu.layout_cast(acc, self.layout), left, *rights)
         return acc
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
@@ -734,6 +780,27 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     def settled(self, pending: int = 0) -> None:
         del pending
+
+
+_MOSAIC_MMA = importlib.import_module("jax.experimental.mosaic.gpu.mma")
+"""Mosaic GPU's mma.sync module (the package's `mma` its function): its single-tile product and TF32 rounding,
+which `_tiled_product` issues a tile at a time, the fork's own (private there: a pin renaming them fails
+tests/test_supported_products.py's compile)."""
+
+
+def _tiled_product(ctx, acc, left, *rights, rows: int, columns: int, depth: int, tiles: tuple):
+    """`acc` plus one depth's products of `left` `[M, depth]` with `rights` (each `[depth, columns]`) on
+    `tiles` alone (`MmaIssuer._supported`): each `(m, n, i)` its accumulator's tile at row tile `m` and column
+    tile `n` taking `left`'s row tile `m` times `rights[i]`, one instruction each (`mma`'s base tile), fp32
+    operands rounded to TF32 once."""
+    del ctx
+    if left.mlir_dtype == ir.F32Type.get():
+        left, rights = _MOSAIC_MMA._rounded_to_tf32(left), tuple(map(_MOSAIC_MMA._rounded_to_tf32, rights))
+    acc = acc.copy()
+    for m, n, index in tiles:
+        at, span = slice(m * rows, (m + 1) * rows), slice(n * columns, (n + 1) * columns)
+        acc[at, span] = _MOSAIC_MMA._mma_single_tile(acc[at, span], left[at, slice(0, depth)], rights[index])
+    return acc
 
 
 def _tf32_product(ctx, acc, left, right):
