@@ -63,11 +63,6 @@ FACTOR_RAISE = 62
 """The power of two `raised_factor` raises a subnormal factor by: the least (`2**-149`) into the normals
 (`2**-87`), the largest still below `2**-64`, so no product of it overflows that the plain one would not."""
 
-PRODUCT_FLOOR = -78
-"""The binade `lowered_product` raises a product of two float32 operands to at least: the least normal's past
-twice a significand's bits (`minexp + 2 * nmant`, and two more), so its exact residual, as far as 48 bits
-below it, is still a normal float32 a flushing platform keeps, and the tie it decides survives."""
-
 
 def flushes() -> bool:
     """Whether the platform the context places work on flushes float32 subnormals (`FLUSHING`)."""
@@ -88,32 +83,30 @@ def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
     return float_bits.raised_exactly(factor, k), k
 
 
+def _significand(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp32 `x` as its signed significand in `[1, 2)` and its binary exponent, read from its bits (a
+    subnormal's normalized, `float_bits.float_bits`); a zero, an infinity or a NaN as it is, exponent 0."""
+    sign, biased, fraction, normalized, exponent = float_bits.float_bits(x)
+    finite = (biased != 0xFF) & ((biased != 0) | (fraction != 0))
+    bits = sign | (127 << 23) | normalized
+    held = jax.lax.bitcast_convert_type(bits.astype(jnp.int32), jnp.float32)
+    return jnp.where(finite, held, x), jnp.where(finite, exponent, 0).astype(jnp.int32)
+
+
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
     """`left * right * 2**-k` (fp32 operands, `k` int32 at least 0, broadcast) rounded once to nearest even in
-    fp32, however far below its least normal, whatever the platform flushes: each subnormal operand raised
-    into the normals from its bits, then the right one so their product lies at `PRODUCT_FLOOR`'s binade or
-    past (never past `2**48`), multiplied exactly into a rounded product and its residual
-    (`precision.two_product`), the product lowered by every raise and `k` and rounded at its own place, the
-    residual deciding a tie (`float_bits.rounded_binary`'s `tail`)."""
+    fp32, however far below its least normal, whatever the platform flushes: each operand's significand in
+    `[1, 2)` read from its bits (a subnormal's normalized), their product formed exactly into a rounded
+    product and its residual (`precision.two_product`, every part of it a normal float32), its exponents
+    carried apart and the product rounded once at its own place, the residual deciding a tie
+    (`float_bits.rounded_binary`'s `tail`); a zero, an infinity or a NaN multiplied as IEEE's."""
     left, right = jnp.broadcast_arrays(jnp.asarray(left, jnp.float32), jnp.asarray(right, jnp.float32))
-    left_binade, right_binade = float_bits.binade_of(left), float_bits.binade_of(right)
-    # Read from the bits, as a flushing platform's compare of a subnormal with zero reads none.
-    live = (left_binade > -1024) & (right_binade > -1024)
-    tiny = jnp.finfo(jnp.float32).minexp
-
-    def normalized(binade):
-        return jnp.where(live & (binade < tiny), tiny - binade, 0).astype(jnp.int32)
-
-    raise_left, raise_right = normalized(left_binade), normalized(right_binade)
-    floor = jnp.where(live, jnp.clip(PRODUCT_FLOOR - left_binade - raise_left - right_binade - raise_right,
-                                     0, None), 0).astype(jnp.int32)
-    raise_right = raise_right + floor
-    high, low = precision.two_product(float_bits.raised_exactly(left, raise_left),
-                                      float_bits.raised_exactly(right, raise_right))
+    (left, left_exponent), (right, right_exponent) = _significand(left), _significand(right)
+    high, low = precision.two_product(left, right)
     _, sign, biased, fraction = float_bits.raw_fields(high)
     biased = biased.astype(jnp.int32)
     significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    exponent = jnp.maximum(biased, 1) - 150 - raise_left - raise_right - k
+    exponent = jnp.maximum(biased, 1) - 150 + left_exponent + right_exponent - k
     # The exact product's residual decides a tie at the lowered place, so it rounds once.
     tail = jnp.where(low == 0, 0, jnp.where((low > 0) == (high > 0), 1, -1)).astype(jnp.int32)
     top = biased == 0xFF

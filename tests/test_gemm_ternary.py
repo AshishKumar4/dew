@@ -116,16 +116,19 @@ EDGES = {
     "bf16 rows at a subnormal midpoint": (False, (129 / 128,), _MIDPOINT_SCALE),
     "int8 rows at a subnormal midpoint": (True, (129 / 128,), _MIDPOINT_SCALE),
     "an infinite row at a subnormal scale": (False, (np.inf,), 2.0 ** -127),
+    "bf16 rows of two binades near the floor": (False, (2.0 ** -120, 129 / 128 * 2.0 ** -126),
+                                                (1 + 2.0 ** -23) * 2.0 ** -7),
 }
 
 
 @pytest.mark.parametrize(("quantize", "entries", "scale"), EDGES.values(), ids=EDGES.keys())
 def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entries, scale):
-    """+1 codes times a row of equal entries (each its row's peak, so an int8 code holds it exactly) at a
+    """+1 codes times a row's entries (each a quantized row's peak, so an int8 code holds it exactly) at a
     scale: the product IEEE's float64 sum and one rounding to fp32 give, on the XLA route and the interpreted
     Mosaic one: an int8 epilogue's order kept finite past a normal scale; a normal scale's subnormal result;
-    a product next to a subnormal midpoint rounded once, quantized or not; an infinite row at a subnormal
-    scale infinite (`factored.lowered_product`, row 13340)."""
+    a product next to a subnormal midpoint rounded once, quantized or not, and one of normal operands near
+    the least normal whose exact residual decides it; an infinite row at a subnormal scale infinite
+    (`factored.lowered_product`, row 13340)."""
     values = np.zeros((256, 2), np.float32)
     values[:len(entries)] = 1.0
     weights = formats.TernaryWeights.of(values, scale=np.float32(scale))
