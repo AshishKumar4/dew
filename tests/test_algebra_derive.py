@@ -1959,74 +1959,95 @@ def test_a_normal_weight_quotient_preserves_stationary_covariance_rounding():
     np.testing.assert_array_equal(tangent, [0.0])
 
 
-def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
-    """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
-    all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_covariance_weight_jvp_stays_finite_when_the_centered_product_overflows(mode):
     from dew.algebra import moments
 
-    # Overflowing centered product (`cx * cy = 2^140`) with finite directed weight tangent (`dw = 2^-70`):
-    # multiplying `dtw` before `cx * cy` stays finite and equals `2^70` (matches plain covariance JVP).
-    scale_ov = np.float32(2.0 ** 70)
-    x_ov = jnp.asarray([[scale_ov, 0.0]], jnp.float32)
-    w_ov = jnp.asarray([[0.0, 1.0]], jnp.float32)
-    dw_ov = jnp.asarray([[np.float32(2.0 ** -70), 0.0]], jnp.float32)
-    for mode in ("walk", "merge"):
-        _, (_, _, dc_ov) = jax.jvp(
-            lambda w_, m=mode: moments.chunked_covariance(x_ov, x_ov, w_, tile=1, mode=m),
-            (w_ov,), (dw_ov,))
-        assert float(dc_ov[0]) == float(scale_ov)
-    # Mixed 2nd-order derivatives at zero individual weights and all-zero weights match plain declaration.
-    x_zm = jnp.asarray([[0.0, 2.0]], jnp.float32)
-    dw_unit = jnp.asarray([[0.0, 1.0]], jnp.float32)
-    for w_list in ([[1.0, 0.0]], [[0.0, 0.0]]):
-        w_zm = jnp.asarray(w_list, jnp.float32)
-        plain_dm_dx = jax.grad(lambda x_, w_: moments.weighted_moments(x_, w_)[0].sum(), argnums=0)
-        plain_dv_dx = jax.grad(lambda x_, w_: moments.weighted_moments(x_, w_)[1].sum(), argnums=0)
-        ref_hm = jax.jvp(lambda w_, fn=plain_dm_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
-        ref_hv = jax.jvp(lambda w_, fn=plain_dv_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
-        for mode in ("walk", "merge"):
-            ch_dm_dx = jax.grad(
-                lambda x_, w_, m=mode: moments.chunked_moments(x_, w_, tile=1, mode=m)[0].sum(), argnums=0)
-            ch_dv_dx = jax.grad(
-                lambda x_, w_, m=mode: moments.chunked_moments(x_, w_, tile=1, mode=m)[1].sum(), argnums=0)
-            got_hm = jax.jvp(lambda w_, fn=ch_dm_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
-            got_hv = jax.jvp(lambda w_, fn=ch_dv_dx: fn(x_zm, w_), (w_zm,), (dw_unit,))[1]
-            np.testing.assert_array_equal(np.asarray(got_hm), np.asarray(ref_hm))
-            np.testing.assert_array_equal(np.asarray(got_hv), np.asarray(ref_hv))
-            # Jitted value VJP with zero individual weights must stay linear in value tangents.
-            got_gx_m = jax.jit(ch_dm_dx)(x_zm, w_zm)
-            got_gx_v = jax.jit(ch_dv_dx)(x_zm, w_zm)
-            np.testing.assert_array_equal(np.asarray(got_gx_m), np.asarray(plain_dm_dx(x_zm, w_zm)))
-            np.testing.assert_array_equal(np.asarray(got_gx_v), np.asarray(plain_dv_dx(x_zm, w_zm)))
+    # The centered product is 2^140, but its weight direction is only 2^-70.
+    x = jnp.asarray([[2.0 ** 70, 0.0]], jnp.float32)
+    w = jnp.asarray([[0.0, 1.0]], jnp.float32)
+    dw = jnp.asarray([[2.0 ** -70, 0.0]], jnp.float32)
+    _, (_, _, dc) = jax.jvp(lambda q: moments.chunked_covariance(x, x, q, tile=1, mode=mode), (w,), (dw,))
+    np.testing.assert_array_equal(dc, [2.0 ** 70])
 
-    # Direct `derive.derive` forms (without `chunked_moments` custom tangent) preserve zero-weight JVP
-    # without `L^2` overflow on `x=[2^70, 2^70]`, `w=[1, 0]` (or `[0, 1]`), both via `step` and `merge`.
-    forms_w = derive.derive(moments.declaration("weighted"), accurate=False, saturation=SATURATION)
-    shapes_w = dict.fromkeys(("x", "w"), ((1, 1), jnp.float32))
-    for x_dir, w_dir, dw_dir, exp_dm, exp_dv in (
-        ([[0.0, 2.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
-        ([[10.0, 12.0]], [[1.0, 0.0]], [[0.0, 1.0]], 2.0, 4.0),
-        ([[float(scale_ov), float(scale_ov)]], [[1.0, 0.0]], [[0.0, 1.0]], 0.0, 0.0),
-        ([[float(scale_ov), float(scale_ov)]], [[0.0, 1.0]], [[1.0, 0.0]], 0.0, 0.0),
-        ([[3.0, 5.0]], [[0.0, 0.0]], [[1.0, 2.0]], 13.0, 59.0),
-    ):
-        xd, wd, dwd = (jnp.asarray(v, jnp.float32) for v in (x_dir, w_dir, dw_dir))
-        for use_merge in (False, True):
-            def direct_walk(w_, merge=use_merge, xv=xd):
-                empty = forms_w.init(shapes_w)
-                s0 = forms_w.step(empty, {"x": xv[:, :1], "w": w_[:, :1]})
-                if merge:
-                    s1 = forms_w.step(empty, {"x": xv[:, 1:], "w": w_[:, 1:]})
-                    fin = forms_w.merge(s0, s1, shapes=shapes_w)
-                else:
-                    fin = forms_w.step(s0, {"x": xv[:, 1:], "w": w_[:, 1:]})
-                return forms_w.finish(fin, {"x": xv[:, :1], "w": w_[:, :1]}, shapes=shapes_w)
 
-            _, (dm_dir, dv_dir) = jax.jvp(direct_walk, (wd,), (dwd,))
-            assert float(dm_dir[0]) == exp_dm and float(dv_dir[0]) == exp_dv
-            if exp_dv == 0.0:
-                gw_v = jax.grad(lambda w_, fn=direct_walk: fn(w_)[1].sum())(wd)
-                np.testing.assert_array_equal(np.asarray(gw_v), np.zeros((1, 2), np.float32))
+def _value_gradients(mode, moment):
+    from dew.algebra import moments
+
+    def written(x, w):
+        return moments.weighted_moments(x, w)[moment].sum()
+
+    def chunked(x, w):
+        return moments.chunked_moments(x, w, tile=1, mode=mode)[moment].sum()
+
+    return jax.grad(written), jax.grad(chunked)
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize("moment", [0, 1], ids=["mean", "variance"])
+@pytest.mark.parametrize("mass", [1.0, 0.0], ids=["one-zero", "all-zero"])
+def test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction(mode, moment, mass):
+    x = jnp.asarray([[0.0, 2.0]], jnp.float32)
+    w = jnp.asarray([[mass, 0.0]], jnp.float32)
+    dw = jnp.asarray([[0.0, 1.0]], jnp.float32)
+    plain, chunked = _value_gradients(mode, moment)
+    _, expected = jax.jvp(lambda q: plain(x, q), (w,), (dw,))
+    _, actual = jax.jvp(lambda q: chunked(x, q), (w,), (dw,))
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize("moment", [0, 1], ids=["mean", "variance"])
+@pytest.mark.parametrize("mass", [1.0, 0.0], ids=["one-zero", "all-zero"])
+def test_jitted_chunked_moment_value_gradient_matches_the_direct_zero_weight_gradient(mode, moment, mass):
+    x = jnp.asarray([[0.0, 2.0]], jnp.float32)
+    w = jnp.asarray([[mass, 0.0]], jnp.float32)
+    plain, chunked = _value_gradients(mode, moment)
+    np.testing.assert_array_equal(jax.jit(chunked)(x, w), plain(x, w))
+
+
+def _direct_moment_forms(x, mode):
+    """Differentiate the derived forms themselves, not chunked moments' custom tangent."""
+    from dew.algebra import moments
+
+    forms = derive.derive(moments.declaration("weighted"), accurate=False, saturation=SATURATION)
+    shapes = dict.fromkeys(("x", "w"), ((1, 1), jnp.float32))
+
+    def evaluate(w):
+        empty = forms.init(shapes)
+        left = {"x": x[:, :1], "w": w[:, :1]}
+        right = {"x": x[:, 1:], "w": w[:, 1:]}
+        first = forms.step(empty, left)
+        final = (forms.step(first, right) if mode == "walk"
+                 else forms.merge(first, forms.step(empty, right), shapes=shapes))
+        return forms.finish(final, left, shapes=shapes)
+
+    return evaluate
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize(("values", "weights", "direction", "expected"), [
+    ([0.0, 2.0], [1.0, 0.0], [0.0, 1.0], (2.0, 4.0)),
+    ([10.0, 12.0], [1.0, 0.0], [0.0, 1.0], (2.0, 4.0)),
+    ([2.0 ** 70, 2.0 ** 70], [1.0, 0.0], [0.0, 1.0], (0.0, 0.0)),
+    ([2.0 ** 70, 2.0 ** 70], [0.0, 1.0], [1.0, 0.0], (0.0, 0.0)),
+    ([3.0, 5.0], [0.0, 0.0], [1.0, 2.0], (13.0, 59.0)),
+], ids=["one-zero", "shifted", "large-right-zero", "large-left-zero", "all-zero"])
+def test_direct_weighted_moment_forms_keep_zero_weight_jvp(mode, values, weights, direction, expected):
+    x, w, dw = (jnp.asarray([row], jnp.float32) for row in (values, weights, direction))
+    _, (dm, dv) = jax.jvp(_direct_moment_forms(x, mode), (w,), (dw,))
+    np.testing.assert_array_equal(dm, [expected[0]])
+    np.testing.assert_array_equal(dv, [expected[1]])
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize("weights", [[1.0, 0.0], [0.0, 1.0]], ids=["right-zero", "left-zero"])
+def test_direct_weighted_variance_pullback_is_zero_at_equal_large_values(mode, weights):
+    x = jnp.full((1, 2), 2.0 ** 70, jnp.float32)
+    w = jnp.asarray([weights], jnp.float32)
+    evaluate = _direct_moment_forms(x, mode)
+    dw = jax.grad(lambda q: evaluate(q)[1].sum())(w)
+    np.testing.assert_array_equal(dw, np.zeros((1, 2), np.float32))
 
 
 def test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding():
