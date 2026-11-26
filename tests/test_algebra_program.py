@@ -2093,6 +2093,26 @@ def test_process_digest_keeps_repeated_descriptors_in_equation_order():
     assert terms.body_key(direct) != terms.body_key(reversed_)
 
 
+def test_equal_string_parameters_with_distinct_encodings_stay_distinct():
+    class Mode(str):
+        def __new__(cls, direction):
+            value = super().__new__(cls, "fold")
+            value.direction = direction
+            return value
+
+        def __repr__(self):
+            return f"Mode({self.direction})"
+
+    first, second = Mode(1), Mode(-1)
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32)
+    traced = jax.make_jaxpr(lambda x: -(-x))(shape)
+    head, tail = traced.eqns
+    head = head.replace(params={"mode": first})
+    same = traced.replace(jaxpr=traced.jaxpr.replace(eqns=[head, tail.replace(params={"mode": first})]))
+    changed = traced.replace(jaxpr=traced.jaxpr.replace(eqns=[head, tail.replace(params={"mode": second})]))
+    assert terms.body_key(same) != terms.body_key(changed)
+
+
 def _bf16_rms(x, w):
     """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
     mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
