@@ -1338,13 +1338,15 @@ class RowPlan:
         from dew.nn.kernels.options import program
 
         words = jax.random.key_data(key.addressable_data(0))
-        shards = math.prod(sharding.mesh.shape[axis] for axis in request_axes(sharding.mesh))
+        mesh = self.mesh
+        assert mesh is not None
+        shards = math.prod(mesh.shape[axis] for axis in request_axes(mesh))
         laid = (shards * words.shape[0], *words.shape[1:])
         roots = jax.make_array_from_single_device_arrays(laid, sharding, [
             jax.device_put(words, device) for device in sharding.addressable_devices_indices_map(laid)])
         placed = jax.make_array_from_process_local_data(sharding, indices)
         return program(_row_keys, static_argnames=("impl", "mesh"), out_shardings=sharding)(
-            roots, placed, impl=jax.random.key_impl(key), mesh=sharding.mesh)
+            roots, placed, impl=jax.random.key_impl(key), mesh=mesh)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
