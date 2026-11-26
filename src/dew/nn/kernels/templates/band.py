@@ -5,6 +5,8 @@ operand's (`attention.Kind`) and an input-conditioned relative bias's (`dew.nn.a
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.templates.axes import whole
+
 BAND_GROUP = 768
 """The queries one band origin serves (`band_origins`): a multiple of every program's query rows a launch
 of the template holds (64 to 256: one to three 64-row consumers, two 128-row ones), so a tile of a band
@@ -18,7 +20,7 @@ walk (16 to 256 keys), so a band's column of a key tile is a whole tile of it.""
 def band_width(extent: int) -> int:
     """The columns a band of `extent` holds a query (`band_origins`): every key within `extent` of each query
     of a `BAND_GROUP`, from the group's origin, in whole `BAND_ALIGN`s."""
-    return -(-(BAND_GROUP + extent + BAND_ALIGN - 2) // BAND_ALIGN) * BAND_ALIGN
+    return whole(BAND_GROUP + extent + BAND_ALIGN - 2, BAND_ALIGN)
 
 
 def band_origins(offset: jax.Array, queries: int, extent: int) -> jax.Array:

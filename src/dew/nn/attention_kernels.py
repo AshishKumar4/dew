@@ -721,6 +721,8 @@ class Timed:
     rows: tuple[int, ...] | None = None
     heads: tuple[tuple[int, int], ...] | None = None
     dtypes: tuple[str, ...] | None = None
+    pairs: tuple[tuple[int, int], ...] | None = None
+    """The (rows, tokens) pairs a sweep timed, queries and keys alike, exactly where given."""
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls: none holds a separable bias
@@ -738,12 +740,18 @@ class Timed:
                 and (case.documents is None or self.documents is True)
                 and (self.rows is None or case.rows in self.rows)
                 and (self.heads is None or (case.heads, case.kv_heads) in self.heads)
-                and (self.dtypes is None or case.dtype.name in self.dtypes))
+                and (self.dtypes is None or case.dtype.name in self.dtypes)
+                and (self.pairs is None or (case.queries == case.keys
+                                            and (case.rows, case.queries) in self.pairs)))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
-    # Interim, until M-NA-44 times them: up to 32768 tokens, cited from M-ET-51, which holds no sums.
-    **{(where, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for where in ('sm80', 'sm90')},
+    # M-NA-44's A100 sweep, exactly: its six (rows, tokens) pairs, widths 64 and 128, 32/8, causal and full.
+    ('sm80', CallKind.of(jnp.bfloat16)): Timed(
+        1024, 32768, (64, 128), (4,), windows=False, documents=False, heads=((32, 8),), dtypes=("bfloat16",),
+        pairs=((4, 1024), (2, 2048), (2, 4096), (1, 8192), (1, 16384), (1, 32768))),
+    # Interim on an H100, until M-NA-44's GH200 rows land: up to 32768 tokens, cited from M-ET-51.
+    ('sm90', CallKind.of(jnp.bfloat16)): Timed(0, 32768),
     **{(where, CallKind.of(jnp.float32)): Timed(0, 1024) for where in ('sm80', 'sm90')},
     ('sm100', CallKind.of(jnp.bfloat16)): Timed(
         256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
@@ -760,13 +768,18 @@ unwindowed, cuDNN against the template's forward and training step (`DECLARED`);
 none timed; 128 tokens waits for the grid's other rounds, its margins 1.09 to 1.60 against five-round
 receipts' spread of up to 1.33. Its calls of packed documents those of 12288 tokens, 16/4 at width 256,
 causal (Qwen3.5-4B's decision row), the one shape their receipt timed.
-On an H100 and an A100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training
-step, an interim placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
-(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100, CELLS-a100), and M-ET-51, which meant to time
-FlashAttention against the template from 1024 to 32768 tokens there, holds no sums (its GH200 half timed
-out, neither half's survive, its record's provenance correction of 2026-11-20); M-NA-44 times that sweep,
-and its receipt replaces this placeholder. An fp32 call's: up to 1024 tokens, a training step's attention
-at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100).
+On an A100 a bf16 call's: 1024 to 32768 tokens (4 x 1024, 2 x 2048, 2 x 4096, 1 x 8192, 1 x 16384,
+1 x 32768), widths 64 and 128, 32 query heads over 8, causal and full, unwindowed and of no documents
+(M-NA-44-a100 at c0a4b1ce7, check 1 over 40 draws and five interleaved rounds): FlashAttention-2's forward
+holds check 1 at every one and runs 1.007 to 1.70 times faster than the template's, and its training fails
+it at every one (dK 1.73 to 1.79 times the reference's error, dV to 1.65 where causal, against 1.5), so
+the cell's kernel infers on FlashAttention-2 and trains on the template ('flash_inference').
+On an H100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training step, an interim
+placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
+(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100), and M-ET-51 holds no sums; M-NA-44's GH200 rows time
+that sweep, and their receipt replaces this placeholder.
+On an H100 and an A100 an fp32 call's: up to 1024 tokens, a training step's attention at Qwen3-8B's widths,
+1 x 1024 (CELLS-h100, CELLS-a100).
 On an RTX PRO 6000 a bf16 call's: 1 x 4096 at width 64, 32 query heads over 8, causal, its forward and its
 training step, exactly (M-NA-35-prefill-g4: FlashAttention-2 against the template, causal 271.4 against
 311.0 us, the causal step 935.6 against 1501.1; its full forward 420.9 against 537.5, its full training no
@@ -823,9 +836,9 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
                  "16/4 and 32/8: cuDNN faster at all 105 cells, by 1.85 times or more from 256 tokens (the "
                  "template's training 9.15 times at 1 x 32768 8/2 d128). Three cells are no timed win: "
-                 "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete, "
-                 "row 5671 (it wedged at the first), cuDNN the one measured route that runs there, re-timed "
-                 "once the stall is fixed. Earlier, five rounds each (ET-CUDNNROWS-b200 "
+                 "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete "
+                 "there (row 5671's barrier race, since fixed): cuDNN the one measured route at them, a "
+                 "paired native re-time pending. Earlier, five rounds each (ET-CUDNNROWS-b200 "
                  "against -rung, -att4b and -20261112-fix): "
                  "Qwen 3.5-4B's full attention, 16 query heads over 4 of 256, causal bf16, at 1 x 12288 its "
                  "forward 0.838 against 5.015 ms and a training step's attention 4.504 against 28.60 (the "
@@ -991,8 +1004,9 @@ taken of and the template for one differentiated, where a cell declares it (`pri
 
 
 def _decode_preferred(case: AttentionCase) -> str:
-    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`; the
-    template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
+    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`, the
+    default by policy: the template's decode measured mixed against it, M-DD-10's 0.540 to 1.750 times over
+    GH200 dense cells, and M-NA-34 times the priced planner's), which hands a call it does not take to the
     next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere; the
     kernel computing a quantized model's rule where the rule owns the call's products, as attention's
     (`AttentionCase.quantized`); the template for a call of each query's own sinks."""
@@ -1043,7 +1057,8 @@ kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the r
 (`decode_attention.PRODUCTS`), the fast form's alone (`_FAST`: a run's accurate numerics, the 2026-11-26
 audit found, ran them anyway); the attention template's decode (`attention_decode.attend`, through
 `attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
-until it measures faster than the decode kernel (rows 4042 to 4045, 4075), and ahead of the reference path,
+the decode kernel the default until a like-for-like receipt ranks them (M-DD-10 mixed, M-NA-34 pending), and
+ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 

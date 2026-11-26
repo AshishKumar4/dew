@@ -1,13 +1,15 @@
-"""A split walk's slices merged where its launch wrote them: one Mosaic GPU launch on NVIDIA sm80+ CUDA GPUs
-(row 9795), one Pallas Triton launch on pre-Ampere CUDA GPUs (`platform="cuda"`), and the law's own XLA path
-elsewhere and under differentiation.
+"""A split walk's slices merged where its launch wrote them, beside an initial state where a call resumes one:
+on a CUDA GPU one shared Pallas launch (`_kernel`), its lowering the merge choice's (`_uses_mosaic`:
+Pallas Triton an unhooked merge's on sm80 and sm90, where M-NA-4 timed it faster at B1, Mosaic GPU a hooked
+merge's and sm100's; `generation.chosen(merge=...)` names one), and the law's own XLA path elsewhere and
+under differentiation.
 
 A decode step's walk splits a row's keys across programs (`attention_decode`), each slice's output, maximum
 and denominator padded to its launch's tile of rows. The law merges them (`attention_algebra.merged_state`:
 `slice_state` of each, then `finished_merged`), which in XLA took the padded arrays' slices, their selects and
 the law's total and output as separate launches around it. `merged_padded` takes the launch's padded arrays as
-they are; on a CUDA GPU it lowers as one Pallas launch (Mosaic GPU on sm80+, `merged_mosaic`'s; Pallas Triton
-on pre-Ampere CUDA GPUs) that reads them in place and runs the law's own functions on each row (`slice_state`,
+they are; on a CUDA GPU it lowers as one Pallas launch (`_uses_mosaic`'s choice: `merged_mosaic`'s Mosaic GPU
+or Pallas Triton) that reads them in place and runs the law's own functions on each row (`slice_state`,
 `finished_merged`), and on non-CUDA platforms and under differentiation as the law's path on their slices
 (`_value`), which its derivative always is (a `jax.custom_jvp` whose rule is `jax.jvp` of `_value`): a step
 faster than main's merge at every decode cell measured, its outputs bit for bit the law's (M-ET-87i).

@@ -1121,19 +1121,23 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
-    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
+    ("sm80", 8192, 128, True), ("sm90", 32768, 64, True), ("sm80", 4096, 128, False),
+    ("sm80", 8192, 256, False),
     ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm120", 4096, 64, True),
     ("sm120", 4096, 128, False), ("sm86", 4096, 128, False), ("sm100", 4096, 256, True),
     ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
     ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
-    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "g4-measured",
+    ids=["a100-measured", "h100-longest", "a100-off-pair", "wider", "longer", "longer-narrower",
+         "g4-measured",
          "g4-wider", "a10-unmeasured", "b200-measured", "b200-longest", "b200-shortest", "b200-shorter",
          "b200-narrower", "b200-longer"])
 def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts_shapes(
         generation_name, tokens, width, declared):
-    """A bf16 causal call over 8 key heads: on an A100 or an H100, whose declared cell names FlashAttention
-    (`attention_kernels.DECLARED`), in that cell up to 32768 tokens (`MEASURED`'s interim placeholder until
-    M-NA-44); on a G4 at 4096 tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
+    """A bf16 causal call of one row over 8 key heads: on an A100, whose declared cell names FlashAttention's
+    forward (`attention_kernels.DECLARED`), M-NA-44's sweep exactly (its (rows, tokens) pairs, 1 x 8192 among
+    them and 1 x 4096 not, widths 64 and 128, 32/8); on an
+    H100 up to 32768 tokens (`MEASURED`'s interim placeholder until M-NA-44's GH200 rows); on a G4 at 4096
+    tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
     timed, in none (an A100's receipt declared its FlashAttention-2 for every mma.sync GPU, 2026-11-26
     audit); on a B200, whose cell names cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64,
     128 and 256, four query heads a key head. A call none declares takes the template (row 5285)."""
@@ -1145,6 +1149,19 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
     with generation.assumed(generation_name):
         cell = attention_case(query, key, causal=True).cell
     assert (cell in attention_kernels.DECLARED) == declared
+
+
+def test_an_a100_call_off_its_receipts_heads_takes_no_declared_cell():
+    """An A100 bf16 causal call at a pair M-NA-44 timed (1 x 8192, width 128) but over 8 query heads of 2,
+    a layout no receipt timed (its sweep's 32/8 alone), is a cell none declares: it takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, 8192, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 8192, 2, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        cell = attention_case(query, key, causal=True).cell
+    assert cell not in attention_kernels.DECLARED
 
 
 def _launches(fn, *operands) -> set[str]:
