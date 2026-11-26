@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from generation_support import generations
 from reference_error import assert_as_exact, with_gradients
 from test_gemm_formed import FEATURES, HIDDEN, _draw
@@ -15,7 +16,9 @@ from test_gemm_formed import FEATURES, HIDDEN, _draw
 from dew.nn import activations
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import generation
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import LowPrecision, Numerics, projection_role
+from dew.nn.protocols import forward_only
 
 SEEDS = 8
 ACTIVATIONS = [("swiglu", None), ("swiglu", 1.5), ("geglu", None)]
@@ -605,3 +608,69 @@ def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
         assert_as_exact(with_gradients(wide_recomputed), jax.jit(apart), _draw,
                         f"wide swiglu recomputed on {generation_name}", seeds=SEEDS, truth_fn=truth)
+
+
+class _HoldingItsHidden(GatedMLP):
+    """A gated MLP whose down projection reads its gated product as a value it holds for reverse mode (the
+    path before `_gated_down`): the reference its value and gradients are bitwise."""
+
+    def _gated_down(self, product, halves, train):
+        return self._down(product(*halves), train)
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.25], ids=["plain", "dropout"])
+@pytest.mark.parametrize("packed", [False, True], ids=["apart", "packed"])
+def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed, dropout):
+    """A gated MLP of bf16 projections, its gate and up apart or packed (`[..., 2, H]`), unrematerialized,
+    in training (its dropout's key fixed): its output and its pullback under one cotangent, every
+    parameter's and the input's, bitwise the path that held its hidden product, and its reverse mode holds
+    the gate's and the up projection's outputs (or their packed one) and never the down projection's input
+    (`GatedMLP._gated_down`: 18 GiB at Qwen3.5-4B's 8 x 4096 tokens), formed again from them."""
+    tokens, hidden, features = 24, 48, 16
+    rng = np.random.default_rng(13460)
+    x = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
+    layer, before = (cls(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, packed=packed,
+                         dropout_rate=dropout) for cls in (GatedMLP, _HoldingItsHidden))
+    params = layer.init(jax.random.key(0), x)
+    rngs = {"dropout": jax.random.key(7)}
+
+    def apply_of(module):
+        return lambda variables, rows: module.apply(variables, rows, train=True, rngs=rngs)
+
+    got, want = (jax.jit(with_gradients(apply_of(module)))(params, x, cotangent)
+                 for module in (layer, before))
+    jax.tree.map(np.testing.assert_array_equal, got, want)
+
+    def witnessed(module) -> tuple[bool, bool]:
+        """Whether `module`'s pullback holds its hidden product (the down projection's input, or before its
+        dropout the product's own output), and whether it holds its projections' outputs, each read where
+        the layer makes it, for its forward alone (`forward_only`: the same values, none hidden)."""
+        seen = {}
+
+        def read(next_fun, args, kwargs, context):
+            out = next_fun(*args, **kwargs)
+            name = context.module.name
+            if context.method_name == "__call__" and name in ("gate_proj", "up_proj", "gate_up_proj"):
+                seen[name] = out
+            elif context.method_name == "__call__" and name in ("down_proj", "dropout"):
+                seen[f"{name} input"] = args[0]
+            return out
+
+        with nn.intercept_methods(read), forward_only():
+            apply_of(module)(params, x)
+        _, pull = jax.vjp(apply_of(module), params, x)
+        held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
+                if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
+
+        def holds(value) -> bool:  # held as made, or reshaped (the packed pair `[..., 2, H]`)
+            value = np.asarray(value)
+            return any(leaf.size == value.size and np.array_equal(leaf.ravel(), value.ravel())
+                       for leaf in held)
+
+        hidden = [seen[name] for name in ("down_proj input", "dropout input") if name in seen]
+        projected = [seen[name] for name in (("gate_up_proj",) if packed else ("gate_proj", "up_proj"))]
+        return any(holds(value) for value in hidden), all(holds(value) for value in projected)
+
+    assert witnessed(before)[0], "the path holding its hidden product shows it held"
+    assert witnessed(layer) == (False, True)

@@ -30,6 +30,7 @@ from .activations import (
     Xielu,
     gated_product,
     packed_gated_product,
+    placed_gate_up,
     swiglu_clamped,
     ungated_activation,
 )
@@ -41,7 +42,7 @@ from .kernels.generation import Choice
 from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
-from .protocols import ProjectionGroup
+from .protocols import ProjectionGroup, fixed_remat, internal_remat
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
@@ -276,7 +277,10 @@ class GatedMLP(nn.Module):
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
                 gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
-                return self._down(packed_gated_product(activation, axes=axes)(gate_up), train)
+                # The pair placed before the checkpoint (`placed_gate_up`, the product's own placement), so
+                # its reverse mode recomputes the product from the placed pair, moving none again.
+                placed = placed_gate_up(gate_up)
+                return self._gated_down(packed_gated_product(activation, axes=axes), (placed,), train)
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -290,7 +294,7 @@ class GatedMLP(nn.Module):
         gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        return self._down(gated_product(activation, axes=axes)(gate, up), train)
+        return self._gated_down(gated_product(activation, axes=axes), (gate, up), train)
 
     def _fusable(self) -> bool:
         """Whether the gated product and its three projections may run fused (`dew.nn.gated_mlp`), where the
@@ -368,6 +372,23 @@ class GatedMLP(nn.Module):
         if out is None:
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
+
+    def _gated_down(self, product: Callable, halves: tuple, train: bool):
+        """The down projection of the gated product of `halves` (the gate's and the up projection's
+        outputs, or both packed), the product formed again from them in reverse mode, never held beside
+        them: a `[tokens, hidden]` residual a layer less, a third of an MLP's (Qwen3.5-4B's 18 GiB at 8 x
+        4096 tokens unrematerialized). Its value and every gradient are the product's and the projection's
+        as they are, bitwise: the same functions, the product's recomputation its forward's."""
+        if not internal_remat():  # traced for its forward alone (`protocols.forward_only`)
+            return self._down(product(*halves), train)
+
+        # The product always recomputed, a checkpoint no remat rung sets (`fixed_remat`); the down
+        # projection's own values left at its rung's scope, which a rung's policy saves or drops by name.
+        def run(module, *held):
+            return module._down(fixed_remat(product)(*held), train)
+
+        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads.
+        return nn.remat(run, policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:

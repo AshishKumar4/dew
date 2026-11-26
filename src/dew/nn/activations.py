@@ -379,7 +379,6 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
     from .kernels import norm_swiglu
-    from .sharding import whole_along
 
     portable = _portable(_gate_function(activation, implementation),
                          lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
@@ -387,9 +386,18 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
         activation, portable,
         lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
         lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
-    # The pair whole on each device before either product reads it (`whole_along`, row 12224), its mesh axis
-    # moved onto the hidden width where it divides it, so each device computes its share (row 12225).
-    return lambda gate_up: product(whole_along(gate_up, -2, onto=-1))
+    return lambda gate_up: product(placed_gate_up(gate_up))
+
+
+def placed_gate_up(gate_up: jax.Array) -> jax.Array:
+    """A packed projection's `[..., 2, H]` gate and up placed as its gated product reads them: the pair
+    whole on each device (`whole_along`, row 12224), its mesh axis moved onto the hidden width where it
+    divides it, so each device computes its share (row 12225). One rule for every reader of the pair
+    (`packed_gated_product`, and `GatedMLP` placing it before the checkpoint its product is recomputed
+    in), a placed pair placed again moving nothing."""
+    from .sharding import whole_along
+
+    return whole_along(gate_up, -2, onto=-1)
 
 
 def _portable(activate, halves):
