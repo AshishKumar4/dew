@@ -1745,8 +1745,9 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         dtype = DTYPES[fmt.name]
         endpoints = np.asarray([fmt.emin - fmt.precision, fmt.emin, fmt.emax + 1], dtype)
-        value[:12] = np.concatenate((endpoints, np.nextafter(endpoints, np.asarray(-np.inf, dtype)),
-                                     np.nextafter(endpoints, np.asarray(np.inf, dtype)), [0, -np.inf, np.inf]))
+        value[:12] = np.concatenate((
+            endpoints, np.nextafter(endpoints, np.asarray(-np.inf, dtype)),
+            np.nextafter(endpoints, np.asarray(np.inf, dtype)), [0, -np.inf, np.inf]))
         drawn = [value]
     elif primitive in (jax.lax.log1p_p, jax.lax.expm1_p):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
