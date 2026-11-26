@@ -49,7 +49,7 @@ def _operands(name: str, seed: int) -> tuple[np.ndarray, np.ndarray]:
     return (rng.normal(size=(ROWS, DEPTH)).astype(dtype), rng.normal(size=(WIDTH, DEPTH)).astype(dtype))
 
 
-def _product(kernel: str, interpret_on_cpu: bool, lhs, rhs) -> jax.Array:
+def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
     with generation.chosen(grouped_matmul=kernel):
         return gemm.fp8_codes_product(lhs, rhs, out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
 
@@ -63,8 +63,8 @@ def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, in
         return jnp.asarray(lhs, jnp.float64) @ jnp.asarray(rhs, jnp.float64).T
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu)),
-                        jax.jit(functools.partial(_product, "xla", interpret_on_cpu)),
+        assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu=interpret_on_cpu)),
+                        jax.jit(functools.partial(_product, "xla", interpret_on_cpu=interpret_on_cpu)),
                         functools.partial(_operands, name), f"fp8 codes product {name}", seeds=8,
                         truth_fn=truth)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}
@@ -108,7 +108,7 @@ def test_an_fp8_codes_product_differentiates_its_rows_alone(kernel):
     e4m3 = jnp.float8_e4m3fn
 
     def product(rows, weights):
-        return _product(kernel, True, rows.astype(e4m3), weights.astype(e4m3))
+        return _product(kernel, rows.astype(e4m3), weights.astype(e4m3), interpret_on_cpu=True)
 
     with generation.assumed("sm80"):
         _, tangent = jax.jvp(lambda rows: product(rows, jnp.asarray(w)), (jnp.asarray(x),),

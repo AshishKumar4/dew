@@ -673,11 +673,11 @@ def dot_general(xla, path: tuple | None = None):
 
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
-        # Empty products keep XLA's dimension numbers and bias rule but have no template work.
+        # An empty product is the layer's plain dot: no launch takes zero work (`recipe_general` declines it).
         nonempty = lhs.size != 0 and rhs.size != 0
         # The run's low-precision recipe takes the product where the projection's role takes it.
-        if nonempty and not kwargs and (recipe := recipe_general(
-                lhs, rhs, dimension_numbers, out_dtype, tensor_scale=tensor_scale)) is not None:
+        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype,
+                                                    tensor_scale=tensor_scale)) is not None:
             return added(recipe)
         plain = (nonempty and not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
@@ -812,7 +812,9 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype,
     later scale's call the first one's program)."""
     from dew.nn.precision import recipe_role
 
-    if recipe_role() is None:
+    # An empty product is its layer's plain dot, whatever the recipe: no quantizer takes zero work, and no
+    # empty operand lays out as matrices (row 13328).
+    if recipe_role() is None or lhs.size == 0 or rhs.size == 0:
         return None
     rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
     groups = matrices.shape[0]

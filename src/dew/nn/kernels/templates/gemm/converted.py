@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import typing
 from typing import ClassVar
 
 import jax
@@ -62,8 +61,9 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
         # Its codes' layout is the caller's, whole steps and tiles (`STEP`): the call is not padded.
         return True
 
-    def _streamed_matrix(self, kernel: typing.Any, trans_rhs: bool) -> tuple:
+    def _streamed_matrix(self, kernel: Codes | grouped_matmul._PackedMatrix, trans_rhs: bool) -> tuple:
         del trans_rhs
+        assert isinstance(kernel, Codes), "a converting launch streams a matrix of codes"
         return kernel.codes, True, {}
 
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family):
