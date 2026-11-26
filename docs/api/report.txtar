@@ -1451,4 +1451,4 @@ dew.telemetry.records.TrialFinished
   overrides: Mapping[str, JSON]
   value: float
 dew.data.generation.GENERATION_SCHEMA = 2
-dew.training.rungs.RECORD_VERSION = 3
+dew.training.rungs.RECORD_VERSION = 4
