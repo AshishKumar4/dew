@@ -2420,3 +2420,21 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_a_gathered_rows_cotangent_sums_its_routes_wide_before_it_rounds():
+    """A bf16 row read by two routes of a gathered projection (`gemm`'s `gather`), their cotangents 256 and
+    -255.5 times a unit matrix: its cotangent the routes' fp32 sum, 0.5, rounded once to bf16, where each
+    route rounded first (256 and -256, its 255.5 a bf16 tie) summed 0 (row 12396, as the packed kernel's
+    pullback sums them)."""
+    tokens = jnp.ones((1, 64), jnp.bfloat16)
+    matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
+    table = jnp.zeros((2,), jnp.int32)
+    cotangent = jnp.zeros((2, 64), jnp.float32).at[:, 0].set(jnp.asarray([256.0, -255.5]))
+
+    def product(rows):
+        return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), out_dtype=jnp.float32, gather=table)
+
+    _, pull = jax.vjp(product, tokens)
+    (d_tokens,) = pull(cotangent)
+    assert float(d_tokens[0, 0]) == 0.5
