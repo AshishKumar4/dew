@@ -393,11 +393,12 @@ def _exceptional_products(operands, form: Ratio, rank: int):
     terms = []
     for coefficient, factors in form.numerator:
         values = [held[index] for kind, index in factors if kind != "m"]
-        masks = [_laid_to(operands[index], rank) != 0 for kind, index in factors if kind == "m"]
-        finite = functools.reduce(jnp.logical_and, (keep for keep, _ in values))
-        present = functools.reduce(jnp.logical_and, masks, True)
+        exceptional = ~functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        for kind, index in factors:
+            if kind == "m":
+                exceptional = exceptional & (_laid_to(operands[index], rank) != 0)
         sign = functools.reduce(jnp.multiply, (value for _, value in values), coefficient)
-        terms.append(jnp.sum(jnp.where(present & ~finite, sign, 0.0), axis=axes, keepdims=True))
+        terms.append(jnp.sum(jnp.where(exceptional, sign, 0.0), axis=axes, keepdims=True))
     total = functools.reduce(jnp.add, terms)
     total = jnp.sum(total, axis=form.across, keepdims=True)
     return jnp.squeeze(total, form.axis) if form.reduced else total
