@@ -1338,7 +1338,9 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
     key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
     # The walk's columns its launch splits the value's 64 into (an fp32 step's parts' launch's).
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma", columns=32)
-    with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+    # Its parts' walk is the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
+    with (generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}),
+          jax.default_matmul_precision("default")):
         work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
         traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
             query, key, key).jaxpr
@@ -1358,7 +1360,7 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
                 *(jax.random.normal(stream, (8, keys, kv_heads, 64), jnp.float32) for stream in streams[1:]))
 
     def ours(query, key, value):
-        with generation.assumed("sm90"):
+        with generation.assumed("sm90"), jax.default_matmul_precision("default"):
             return attention_decode.attend(query, key, value, spans, interpret=True)
 
     def reference(query, key, value):

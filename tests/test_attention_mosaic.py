@@ -1772,11 +1772,14 @@ def test_a_call_over_runs_is_on_par_interpreted(case, form):
 @pytest.mark.parametrize("score", [(), ("softcap",)], ids=["plain", "softcap"])
 @pytest.mark.parametrize("call", CALLS)
 def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
-    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`): its operands as three bf16 parts
-    each, every product its parts' six (`product.terms`), on par with the reference path in fp32 (check
-    1), under no hook and a score hook."""
+    """An fp32 call's forward on the one mainloop (`MosaicForward.parts`) at the default precision, which
+    alone takes its parts: its operands as three bf16 parts each, every product its parts' six
+    (`product.terms`), on par with the reference path in fp32 (check 1), under no hook and a score hook."""
     spans = template.spans(128, 128, 1, **CALLS[call])
-    _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
+    # Its parts are the default precision's alone (`MosaicForward.refusal`); the suite runs at HIGHEST.
+    with jax.default_matmul_precision("default"):
+        _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score,
+                     dtype=jnp.float32)
 
 
 def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
@@ -1791,7 +1794,8 @@ def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
         op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None, natural=False)
         bound = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         assert op.parts > 1
-        assert op.refusal(bound, family) is None
+        with jax.default_matmul_precision("default"):
+            assert op.refusal(bound, family) is None
         with jax.default_matmul_precision("highest"):
             refused = op.refusal(bound, family)
     assert refused is not None and refused.code == "dtype"
