@@ -31,6 +31,28 @@ def _rows(seed: int, *shapes: tuple[int, ...]) -> tuple[np.ndarray, ...]:
     return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes)
 
 
+def test_a_norm_of_norms_backward_reuses_a_reduction_through_a_cotangent_sum():
+    from jax._src.ad_util import add_jaxvals_p
+
+    def norm(values, axis):
+        return jnp.sqrt(jnp.sum(values * values, axis=axis, keepdims=True))
+
+    def loss(rows):
+        positive = 2 + jnp.tanh(rows)
+        return norm(positive / norm(positive, -1), 0).sum()
+
+    gradient = jax.grad(loss)
+    rewritten = algebra.rewritten(gradient)
+    rows = jax.ShapeDtypeStruct((32, 128), jnp.float32)
+    original, selected = (list(_equations(jax.make_jaxpr(arm)(rows).jaxpr))
+                          for arm in (gradient, rewritten))
+    assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in selected) < sum(
+        eq.primitive is jax.lax.reduce_sum_p for eq in original)
+    assert any(eq.primitive is add_jaxvals_p for eq in selected)
+    assert_as_exact(jax.jit(rewritten), jax.jit(gradient), lambda seed: _rows(seed, rows.shape),
+                    "norm of norms backward", seeds=8)
+
+
 def test_structural_closed_preserves_equation_source_info_and_nested_body_provenance():
     """`program._STRUCTURAL_CLOSED` declines whole-body substitution of a modified body across differing
     equation `source_info` (`name_stack` / traceback) or nested body provenance (row 13020), while still

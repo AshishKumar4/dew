@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
+from jax._src import ad_util
 from jax._src import api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
@@ -824,7 +825,7 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     facts: list = [*registered]
     facts += [set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent)))
               for term, extent in region.shapes]
-    arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
+    arithmetic = (jax.lax.add_p, ad_util.add_jaxvals_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
             facts.append(rules.plain(i64(index)))

@@ -550,14 +550,14 @@ class Term(Expr):
   leaves; a recurrence's prefix is the scan derivation's (`linear_scan`, §6.9), which reads the token update,
   not a prefix term.
 - The language's operations are declared, one declaration an operation, on JAX's primitive objects
-  (`terms.OPERATIONS`, an `Operation` each): its symbol in the language (the primitive's own name), the term
-  it is written as, what its value proves of its operand's magnitude and sign (§6.3) and whether the
-  special-function units evaluate it (§6.5). An equation is of the language by its primitive's object, never
-  its name: another library's or a user's primitive under one of these names is a leaf, as is the sum JAX's
-  derivatives accumulate cotangents and tangents with (`add_any`), which no rule reads (row 5346: reading it
-  as `add` reaches a backward's own sums, and takes the gate's step programs and the pass's seconds measured
-  with it first). What JAX itself states of a primitive (a call's program, an entrywise operation, a
-  reduction) every reader takes from `dew.nn.programs`.
+  (`terms.OPERATIONS`, an `Operation` each): its symbol in the language, the term it is written as,
+  what its value proves of its operand's magnitude and sign (§6.3), and its cost (§6.5). An equation is
+  of the language by its primitive object, never its name. A foreign primitive is opaque. A JAX tangent
+  sum (`add_any`) is written as `add` for equal-shape float16, bfloat16, float32 and float64 arrays. Its
+  parameter slot retains JAX's original primitive for replay with the operands aligned as traced. Other
+  tangent sums remain opaque. This exposes one fewer reduction in a norm-of-norms backward (row 13132);
+  it is not a claim that every normalization backward runs in a single pass. What JAX itself states of a
+  primitive (a call's program, an entrywise operation, a reduction) every reader takes from `dew.nn.programs`.
 - `terms.region(closed) -> Region` converts a window's equations (`program._windows`):
   - every equation outside the language becomes a `leaf` for each of its outputs;
   - a `Protected` span (§6.10) is one marked call, a `leaf` for each of its outputs, its equations kept as

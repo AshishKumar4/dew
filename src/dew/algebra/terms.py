@@ -45,6 +45,7 @@ from egglog.declarations import (
     TypeRefWithVars,
 )
 from egglog.runtime import RuntimeExpr
+from jax._src import ad_util
 from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
@@ -110,9 +111,9 @@ OPERATIONS: dict[jcore.Primitive, Operation] = {}
 """The language's operations, each by its JAX primitive object: elementwise arithmetic and comparisons, casts,
 the layout changes, the reductions a rule reads, and products (`dot_general`); an optimization barrier among
 the unaries, whose value is its operand's, which no rule rewrites through (a value rounded once before its
-readers, as a declaration's dropped products are). Every other equation is a leaf of the region, another
-library's primitive of one of these names among them, and the sum JAX's derivatives accumulate with
-(`add_any`), which no rule reads."""
+readers, as a declaration's dropped products are). JAX's tangent sum (`add_any`) is an add only
+for ordinary, equal-shape floating arrays; other equations outside the language are opaque, including
+another library's primitive of the same name."""
 
 
 def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
@@ -123,6 +124,7 @@ def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
 
 _speaks("binary", jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p,
         jax.lax.atan2_p, jax.lax.rem_p, jax.lax.nextafter_p)
+OPERATIONS[ad_util.add_jaxvals_p] = OPERATIONS[jax.lax.add_p]
 _speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
@@ -164,12 +166,6 @@ WRITTEN = {"binary": Written("binary", 2, "symbol"), "comparison": Written("comp
 """Each kind of operation (`Operation.kind`) as its term, the one statement of the correspondence: an
 equation is written as a term by it (`_term`, `spoken_as`) and a term's operation read back by it
 (`written_as`, a rule's left side's head)."""
-
-
-def symbol(primitive: jcore.Primitive) -> str | None:
-    """`primitive`'s symbol in the language (`OPERATIONS`), None for one it does not speak."""
-    spoken_as = OPERATIONS.get(primitive)
-    return None if spoken_as is None else spoken_as.symbol
 
 
 def _symbols(chosen: Callable[[Operation], bool]) -> frozenset[str]:
@@ -1184,7 +1180,7 @@ def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnit
                     apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart]:
     """The finite magnitude bound and `Apart` proven of `equation`'s single output from its operands'."""
     operands = [magnitude_of(atom) for atom in equation.invars]
-    name = symbol(equation.primitive)
+    name = spoken_as(equation)
     held_apart = [apart_of(atom) for atom in equation.invars]
     # An exponential of a value at most 0 is at most 1 in the reals, at most 2 as computed: a native
     # exponential is not certified under 1 (`ex2.approx`'s relative error, 2**-22.5, is more than an ulp
@@ -1199,11 +1195,22 @@ def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnit
 
 
 def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
-    """`equation`'s declared `Operation` where the term language speaks it (one output, matching arity)."""
+    """Read a declared operation only where the equation has its arity, result and supported values."""
     operation = OPERATIONS.get(equation.primitive)
-    if operation is None or len(equation.outvars) != 1:
+    if operation is None or len(equation.outvars) != 1 or len(equation.invars) != WRITTEN[operation.kind].arity:
         return None
-    return operation if len(equation.invars) == WRITTEN[operation.kind].arity else None
+    if equation.primitive is ad_util.add_jaxvals_p:
+        left, right = (operand.aval for operand in equation.invars)
+        made = equation.outvars[0].aval
+        if not (isinstance(left, ShapedArray) and isinstance(right, ShapedArray)
+                and isinstance(made, ShapedArray)):
+            return None
+        if (made.dtype not in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64)
+                or left.dtype != made.dtype or right.dtype != made.dtype
+                or not jax_core.definitely_equal_shape(left.shape, made.shape)
+                or not jax_core.definitely_equal_shape(right.shape, made.shape)):
+            return None
+    return operation
 
 
 def _composed_broadcast(
@@ -1400,7 +1407,7 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
         return NOWHERE
     if not jnp.issubdtype(aval.dtype, jnp.floating):
         # An integer keeps a sign through the operations that keep one alone: its arithmetic wraps.
-        name = symbol(equation.primitive)
+        name = spoken_as(equation)
         kept = name in KEEPING_SIGN and (
             name != "convert_element_type" or _keeps_sign(equation.invars[0], equation.outvars[0])) and not (
             name.startswith("reduce_") and _reduced(equation) < 1)
@@ -1453,7 +1460,7 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
                  dtype: DTypeLike) -> Apart:
     """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
     own bound is read: whether its operands make it finite."""
-    name = symbol(equation.primitive)
+    name = spoken_as(equation)
     first, floors, signs = operands[0], [held.floor for held in operands], [held.sign for held in operands]
     numbers, finite = all(held.number for held in operands), all(held.finite for held in operands)
     known = [floor for floor in floors if floor is not None]
@@ -1549,7 +1556,7 @@ def _transcendental_apart(name: str, first: Apart, bound: Magnitude | None) -> A
 def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
                  dtype: DTypeLike) -> Apart:
     """A square's or an integer power's `Apart`, of `dtype`, before its dtype holds it (`_float_apart`)."""
-    power = 2 if symbol(equation.primitive) == "square" else equation.params["y"]
+    power = 2 if equation.primitive is jax.lax.square_p else equation.params["y"]
     if power == 0:
         # JAX lowers a zeroth power to ones.
         return Apart(0, 1, number=True, finite=True)
@@ -1587,7 +1594,7 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apa
       reciprocal of a power that underflows to zero is infinite)."""
     if not jnp.issubdtype(dtype, jnp.floating):
         return None
-    name, upper, held = symbol(equation.primitive), operands[0], apart[0]
+    name, upper, held = spoken_as(equation), operands[0], apart[0]
     above = held.above
     if name == "div":
         floor = apart[1].floor
@@ -1646,7 +1653,7 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     if not jnp.issubdtype(dtype, jnp.integer):
         return real
     full = _integer_range(dtype)
-    name = symbol(equation.primitive)
+    name = spoken_as(equation)
     source = equation.invars[0].aval
     from_unsigned = isinstance(source, ShapedArray) and jnp.issubdtype(source.dtype, jnp.unsignedinteger)
     wraps = jnp.issubdtype(dtype, jnp.unsignedinteger) and (
@@ -1687,7 +1694,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
       fast accumulation) proves none (`contraction_slack`).
     A quotient, a root, a logarithm and a power are bounded where an operand's floor holds them
     (`_apart_bound`). Any other equation proves none."""
-    name = symbol(equation.primitive)
+    name = spoken_as(equation)
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
     if name in BITWISE:
@@ -1843,10 +1850,8 @@ def written_as(constructor: str, named: str | None = None) -> str | None:
 def spoken_as(equation: jcore.JaxprEqn) -> str | None:
     """The symbol `equation` is spoken as in the language (`_term` makes a term of it), None for one outside
     it: a protected span is one marked call (`dew.nn.derivatives.Protected`), no equation of it."""
-    operation = OPERATIONS.get(equation.primitive)
-    if operation is None or len(equation.outvars) != 1:
-        return None
-    return operation.symbol if len(equation.invars) == WRITTEN[operation.kind].arity else None
+    operation = _in_language(equation)
+    return operation.symbol if operation is not None else None
 
 
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
