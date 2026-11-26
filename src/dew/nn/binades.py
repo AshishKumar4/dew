@@ -122,7 +122,7 @@ def _pytorch_product(seed: jax.Array, coefficient: jax.Array, special: jax.Array
     product, IEEE's), its sign and zeros its own, and differentiated as the plain product is
     (`derivatives.surrogate`: `dseed * coefficient + seed * dcoefficient`), so no rescale enters a
     derivative at any order."""
-    from .derivatives import surrogate
+    from .derivatives import contracted, surrogate
 
     def forward(seed, coefficient, special):
         return jnp.where(special, seed * coefficient, _flush_safe(seed, coefficient))
@@ -133,11 +133,16 @@ def _pytorch_product(seed: jax.Array, coefficient: jax.Array, special: jax.Array
         from jax.custom_derivatives import SymbolicZero
 
         (seed, coefficient, _), (moved_seed, moved_coefficient, _) = primals, tangents
-        terms = [moved * held for moved, held in ((moved_seed, coefficient), (seed, moved_coefficient))
-                 if not isinstance(moved, SymbolicZero)]
-        return sum(terms[1:], terms[0]) if terms else jnp.zeros_like(value)
+        terms = [tangent * held for tangent, held in ((moved_seed, coefficient), (seed, moved_coefficient))
+                 if not isinstance(tangent, SymbolicZero)]
+        if not terms:
+            return jnp.zeros_like(value)
+        # One term alone as it is, its sign kept (a zero's no `+0` from a sum).
+        return terms[0] if len(terms) == 1 else terms[0] + terms[1]
 
-    return surrogate(forward, derivative, symbolic_zeros=True)(seed, coefficient, special)
+    # The division's derivative, which the division's contract holds at every order.
+    return contracted("test_the_precision_seams_hold_every_order")(
+        surrogate(forward, derivative, symbolic_zeros=True))(seed, coefficient, special)
 
 
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
