@@ -422,6 +422,24 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
                for rollout in watched.rollouts if int(rollout.task) % 5 == 1)
 
 
+def test_a_shared_cache_stating_a_prefix_cache_or_host_pages_serves_paged_below_the_crossover():
+    """A server over `PagedKV(shared=True)` that states a requirement of pages, a prefix cache
+    (`prefix_cache=True`) or pages offloaded to the host (`host_pages`), keeps its pages below the measured
+    crossover (`SHARED_PAGES_FROM`), as before it, and `served_layout` names them alike: the crossover
+    chooses pages over whole rows only where the server chooses, where a stated requirement was refused over
+    the whole rows it fell back to (row 13278)."""
+    from model_support import serving_task
+
+    from dew.inference.serving import PAGE_SIZE, SHARED_PAGES_FROM, PagedRows, served_layout
+
+    capacity = SHARED_PAGES_FROM - 2 * PAGE_SIZE
+    task = serving_task(capacity=SHARED_PAGES_FROM)
+    for cache in (PagedKV(shared=True, prefix_cache=True), PagedKV(shared=True, host_pages=2)):
+        server = Server.from_task(task, slots=2, capacity=capacity, cache=cache)
+        assert isinstance(server.rows, PagedRows), cache
+        assert served_layout(task, capacity, cache) is not None, cache
+
+
 def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
     """A server whose caller says its requests repeat prompts (`Server.from_task`'s `PagedKV(shared=True)`),
     as a served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix

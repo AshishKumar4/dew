@@ -109,14 +109,12 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
 
 
 def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], tree) -> Candidate | None:
-    """`candidate` with its float sums compensated (`printed.source`, the error-free derivation, §6.9): each
-    addition and subtraction a double word, each sum's reduction compensated, both in spans the pass never
-    rewrites, returning its outputs in their structure `tree`; None where it holds no sum, or an equation
-    no plain call writes (`printed.Unprintable`). The e-graph holds no such form: its equality is the
-    reals', in which an addition's rounding error is zero, so extraction would cancel what the derivation
-    keeps. Proposed after every uncompensated form at its own form's price (`Candidate.compensated`): its
-    compensation's arithmetic lies in protected spans, which the cost model prices as the values they
-    make."""
+    """The dev-time error-free derivation (`printed.source`, §6.9): hold the additions, subtractions and
+    the products they read as pairs, and compensate sum reductions. Their residuals are protected
+    operations, not equalities over the reals, in which they would be extracted as zero. As with any
+    stable candidate, the caller's gate checks the actual requested range, including overflow and
+    underflow. Proposed after uncompensated forms at its written form's price (`Candidate.compensated`).
+    Return None when there is no transform to apply, or the candidate cannot be printed."""
     closed = jax.make_jaxpr(candidate.function)(*operands)
     if printed.refused(closed, compensated=True) is not None:
         return None

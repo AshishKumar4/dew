@@ -794,6 +794,28 @@ def test_weighted_central_moments_derive_and_match_float64_at_high_mean(mode):
         draw_shifted, f"weighted central moments ({mode})", seeds=16)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+def test_masked_variance_ignores_nonfinite_samples_before_the_square(dtype):
+    from dew.algebra import moments
+
+    x = np.asarray([[1, 3, np.inf, -np.inf], [np.nan, np.inf, -np.inf, 1]], dtype)
+    mask = np.asarray([[True, True, False, False], [False, False, False, False]])
+    direction = np.asarray([[1, 0, np.inf, np.inf], [np.inf, np.inf, np.inf, np.inf]], dtype)
+
+    def orders(x, mask, direction):
+        def sum_var(value):
+            return moments.masked_moments(value, mask)[1].sum()
+
+        gradient, mixed = jax.jvp(jax.grad(sum_var), (x,), (direction,))
+        return moments.masked_moments(x, mask), gradient, mixed
+
+    (mean, variance), gradient, mixed = jax.jit(orders)(x, mask, direction)
+    np.testing.assert_array_equal(mean, [2, 0])
+    np.testing.assert_array_equal(variance, [1, 0])
+    np.testing.assert_array_equal(gradient, [[-1, 1, 0, 0], [0, 0, 0, 0]])
+    np.testing.assert_array_equal(mixed, [[0.5, -0.5, 0, 0], [0, 0, 0, 0]])
+
+
 @pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
     """Masked unweighted variance (`moments.chunked_moments` with boolean mask) with wholly-masked tiles
@@ -1048,49 +1070,78 @@ def test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs(dtype, mode)
         jax.jit(moments.weighted_covariance), draw_cov, f"narrow cov {dtype} ({mode})", seeds=8)
 
 
-def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors():
-    """Derived central moments preserve exact JVP and VJP derivatives with respect to zero weights within and
-    across tiles (including multi-tile zero-mass merges and per-axis extreme cross scales) and keep
-    opposite-sign extreme anchors finite and accurate."""
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors(mode):
+    """Weight JVPs and projected reverse derivatives stay exact, including a zero-mass tile and an
+    opposite-sign anchor whose difference would overflow float32."""
     from dew.algebra import moments
 
+    def weight_orders(function):
+        @jax.jit
+        def forward(x, w, dw):
+            return jax.jvp(lambda weights: function(x, weights), (w,), (dw,))
+
+        def mean(x, w):
+            return function(x, w)[0].sum()
+
+        def variance(x, w):
+            return function(x, w)[1].sum()
+
+        # Stage each projected gradient separately. A materialized zero cotangent would exercise
+        # a different transpose path from discarding the other result before reverse AD.
+        return forward, jax.jit(jax.grad(mean, argnums=1)), jax.jit(jax.grad(variance, argnums=1))
+
+    forward, mean_grad, variance_grad = weight_orders(moments.weighted_moments)
+    orders = {tile: weight_orders(functools.partial(moments.chunked_moments, tile=tile, mode=mode))
+              for tile in (1, 2)}
+    dw = jnp.ones((1, 2), jnp.float32)
     for x_vals, w_vals in (([0.0, 2.0], [1.0, 0.0]), ([10.0, 12.0], [1.0, 0.0]),
                            ([12.0, 10.0], [0.0, 1.0]), ([2.0 ** 70, 2.0 ** 70], [1.0, 0.0]),
                            ([2.0 ** 70, 2.0 ** 70], [0.0, 1.0])):
-        x, w, dw = (jnp.asarray([vals], jnp.float32) for vals in (x_vals, w_vals, [1.0, 1.0]))
-        ref_val, ref_jvp = jax.jvp(lambda w_, x_=x: moments.weighted_moments(x_, w_), (w,), (dw,))
-        ref_gm = jax.grad(lambda w_, x_=x: moments.weighted_moments(x_, w_)[0].sum())(w)
-        ref_gv = jax.grad(lambda w_, x_=x: moments.weighted_moments(x_, w_)[1].sum())(w)
-        for tile in (1, 2):
-            for mode in ("walk", "merge"):
-                def run(w_, x_=x, t=tile, m=mode):
-                    return moments.chunked_moments(x_, w_, tile=t, mode=m)
-                got_val, got_jvp = jax.jvp(run, (w,), (dw,))
-                got_gm = jax.grad(lambda w_, f=run: f(w_)[0].sum())(w)
-                got_gv = jax.grad(lambda w_, f=run: f(w_)[1].sum())(w)
-                for g, r in (*zip(got_val, ref_val, strict=True), *zip(got_jvp, ref_jvp, strict=True),
-                             (got_gm, ref_gm), (got_gv, ref_gv)):
-                    assert np.all(np.isfinite(np.asarray(g)))
-                    np.testing.assert_array_equal(np.asarray(g), np.asarray(r))
+        x, w = (jnp.asarray([values], jnp.float32) for values in (x_vals, w_vals))
+        expected = jax.tree.leaves((forward(x, w, dw), mean_grad(x, w), variance_grad(x, w)))
+        for run, dm, dv in orders.values():
+            actual = jax.tree.leaves((run(x, w, dw), dm(x, w), dv(x, w)))
+            for found, want in zip(actual, expected, strict=True):
+                assert np.all(np.isfinite(np.asarray(found)))
+                np.testing.assert_array_equal(np.asarray(found), np.asarray(want))
 
-    # All-zero weights and chained zero-mass tiles: exact primal and weight gradients.
     x_zero, w_zero = jnp.asarray([[5.0, 7.0]], jnp.float32), jnp.asarray([[0.0, 0.0]], jnp.float32)
+    for run, dm, dv in orders.values():
+        (m_z, v_z), _ = run(x_zero, w_zero, dw)
+        assert float(m_z[0]) == 0.0 and float(v_z[0]) == 0.0
+        np.testing.assert_array_equal(np.asarray(dm(x_zero, w_zero)), np.asarray(x_zero))
+        np.testing.assert_array_equal(np.asarray(dv(x_zero, w_zero)), np.asarray(x_zero ** 2))
+
+    run, _, dv = orders[1]
     x_three = jnp.asarray([[10.0, 20.0, 30.0]], jnp.float32)
     w_three = jnp.asarray([[0.0, 0.0, 1.0]], jnp.float32)
-    ref_v3 = jax.grad(lambda w_: moments.weighted_moments(x_three, w_)[1].sum())(w_three)
-    for mode in ("walk", "merge"):
-        for tile in (1, 2):
-            m_z, v_z = moments.chunked_moments(x_zero, w_zero, tile=tile, mode=mode)
-            assert float(m_z[0]) == 0.0 and float(v_z[0]) == 0.0
-            np.testing.assert_array_equal(
-                np.asarray(jax.grad(lambda w_, t=tile, m=mode: moments.chunked_moments(
-                    x_zero, w_, tile=t, mode=m)[0].sum())(w_zero)), np.asarray(x_zero))
-            np.testing.assert_array_equal(
-                np.asarray(jax.grad(lambda w_, t=tile, m=mode: moments.chunked_moments(
-                    x_zero, w_, tile=t, mode=m)[1].sum())(w_zero)), np.asarray(x_zero ** 2))
-        np.testing.assert_array_equal(
-            np.asarray(jax.grad(lambda w_, m=mode: moments.chunked_moments(
-                x_three, w_, tile=1, mode=m)[1].sum())(w_three)), np.asarray(ref_v3))
+    np.testing.assert_array_equal(np.asarray(dv(x_three, w_three)),
+                                  np.asarray(variance_grad(x_three, w_three)))
+    big = np.float32(2.0 ** 127)
+    x_ext, w_ext = jnp.asarray([[big, -big]], jnp.float32), jnp.asarray([[0.0, 1.0]], jnp.float32)
+    (m_ext, v_ext), _ = run(x_ext, w_ext, dw)
+    assert float(m_ext[0]) == -float(big) and float(v_ext[0]) == 0.0
+    assert float(dv(x_ext, w_ext)[0, 1]) == 0.0
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_chunked_covariance_preserves_zero_weight_derivatives_and_extreme_anchors(mode):
+    """Keep the directional covariance and its transpose through zero-mass tiles and exponent gaps."""
+    from dew.algebra import moments
+
+    def covariance(x, y, w, *, tile):
+        return moments.chunked_covariance(x, y, w, tile=tile, mode=mode)[2]
+
+    def forward(x, y, w, dw, *, tile):
+        return jax.jvp(lambda weights: covariance(x, y, weights, tile=tile), (w,), (dw,))
+
+    def total(x, y, w, *, tile):
+        return covariance(x, y, w, tile=tile).sum()
+
+    evaluate = jax.jit(forward, static_argnames=("tile",))
+    pullback = jax.jit(jax.grad(total, argnums=2), static_argnames=("tile",))
+    states = jax.jit(functools.partial(moments.chunked_covariance, tile=1, mode=mode))
 
     # Large-offset, cross-scale, and >277-bit zero-mass covariance merges (final-center JVP/VJP).
     large, hi_x, lo_y = np.float32(2.0 ** 70), np.float32(2.0 ** 120), np.float32(2.0 ** -100)
@@ -1109,30 +1160,19 @@ def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors()
         ([big, 0.0], [tiny, 0.0], [0.0, 0.0], [1.0, 0.0], 1, 2.0),
     ):
         xl, yl, wl, dwl = (jnp.asarray([row], jnp.float32) for row in (x_row, y_row, w_row, dw_row))
-        for mode in ("walk", "merge"):
-            def cov_fn(w_, x_=xl, y_=yl, t=tile, m=mode):
-                return moments.chunked_covariance(x_, y_, w_, tile=t, mode=m)[2]
-            val_l, jvp_l = jax.jvp(cov_fn, (wl,), (dwl,))
-            grad_l = jax.grad(lambda w_, f=cov_fn: f(w_).sum())(wl)
-            assert float(val_l[0]) == 0.0 and float(jvp_l[0]) == expect_jvp
-            assert np.all(np.isfinite(np.asarray(grad_l)))
-            assert float(jnp.sum(grad_l * dwl)) == expect_jvp
+        val_l, jvp_l = evaluate(xl, yl, wl, dwl, tile=tile)
+        grad_l = pullback(xl, yl, wl, tile=tile)
+        assert float(val_l[0]) == 0.0 and float(jvp_l[0]) == expect_jvp
+        assert np.all(np.isfinite(np.asarray(grad_l)))
+        assert float(jnp.sum(grad_l * dwl)) == expect_jvp
 
     # Opposite-sign extreme anchors (`2^127 - (-2^127)`) stay finite and exact in both orders and modes.
     for x_pair, y_pair in (([-big, big], [-1.0, 1.0]), ([big, -big], [1.0, -1.0])):
         x_ext, y_ext = jnp.asarray([x_pair], jnp.float32), jnp.asarray([y_pair], jnp.float32)
         for w_pair in ([0.5, 0.5], [0.25, 0.25]):
             w_ext = jnp.asarray([w_pair], jnp.float32)
-            for mode in ("walk", "merge"):
-                mx, my, cov = moments.chunked_covariance(x_ext, y_ext, w_ext, tile=1, mode=mode)
-                assert float(mx[0]) == 0.0 and float(my[0]) == 0.0 and float(cov[0]) == float(big)
-    x_ext0, w_ext0 = jnp.asarray([[big, -big]], jnp.float32), jnp.asarray([[0.0, 1.0]], jnp.float32)
-    for mode in ("walk", "merge"):
-        m_e0, v_e0 = moments.chunked_moments(x_ext0, w_ext0, tile=1, mode=mode)
-        assert float(m_e0[0]) == -float(big) and float(v_e0[0]) == 0.0
-        dv_e0 = jax.grad(
-            lambda w_, m=mode: moments.chunked_moments(x_ext0, w_, tile=1, mode=m)[1].sum())(w_ext0)
-        assert float(dv_e0[0, 1]) == 0.0
+            mx, my, cov = states(x_ext, y_ext, w_ext)
+            assert float(mx[0]) == 0.0 and float(my[0]) == 0.0 and float(cov[0]) == float(big)
 
 
 def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight():

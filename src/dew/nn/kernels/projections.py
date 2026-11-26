@@ -676,8 +676,8 @@ def dot_general(xla, path: tuple | None = None):
         # An empty product is the layer's plain dot: no launch takes zero work (`recipe_general` declines it).
         nonempty = lhs.size != 0 and rhs.size != 0
         # The run's low-precision recipe takes the product where the projection's role takes it.
-        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype,
-                                                    tensor_scale=tensor_scale)) is not None:
+        if nonempty and not kwargs and (recipe := recipe_general(
+                lhs, rhs, dimension_numbers, out_dtype, tensor_scale=tensor_scale)) is not None:
             return added(recipe)
         plain = (nonempty and not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)

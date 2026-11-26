@@ -77,6 +77,39 @@ CONSTRUCT_CELLS = [(name, a, b) for name in CONSTRUCT for a, b in itertools.prod
                    if name != "div" or POINTS[b] != 0]
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_base2_exponent_in_the_top_binade_keeps_its_finite_product_and_differentials(dtype):
+    factor = math.log2(math.e)
+    top = 2.0 ** (np.finfo(dtype).maxexp - 1)
+    x = np.asarray([top, -top, top / 2, -top / 2], dtype)
+    direction = np.asarray([1, -2, 0, 4], dtype)
+
+    def orders(x, direction):
+        value, tangent = jax.jvp(scaled.base2, (x,), (direction,))
+        _, pullback = jax.vjp(scaled.base2, x)
+        (cotangent,) = pullback((direction, direction))
+        return value, tangent, cotangent
+
+    with jax.enable_x64(dtype is np.float64):
+        (high, low), (dh, dl), cotangent = jax.jit(orders)(x, direction)
+    leading = dtype(factor)
+    residual = dtype(factor - float(leading))
+    # Normalizing each limb before comparison avoids overflowing the float64 oracle's own product.
+    normalized = x / top
+    np.testing.assert_array_equal(np.asarray(high) / top, normalized * leading)
+    np.testing.assert_array_equal(np.asarray(low) / top, normalized * residual)
+    np.testing.assert_array_equal(dh, direction * leading)
+    np.testing.assert_array_equal(dl, direction * residual)
+    np.testing.assert_array_equal(cotangent, direction * leading)
+
+
+def test_nonfinite_base2_exponents_have_no_rounding_residual():
+    x = np.asarray([-np.inf, np.inf, np.nan, np.finfo(np.float32).max], np.float32)
+    high, low = jax.jit(scaled.base2)(x)
+    np.testing.assert_array_equal(np.asarray(high), [-np.inf, np.inf, np.nan, np.inf])
+    np.testing.assert_array_equal(np.asarray(low), np.zeros_like(x))
+
+
 @pytest.mark.parametrize(("name", "x", "y"), CONSTRUCT_CELLS,
                          ids=[f"{n}-{a}-{b}" for n, a, b in CONSTRUCT_CELLS])
 def test_a_scaled_operation_at_degenerate_inputs_lands_its_float64_truth(name, x, y):
@@ -287,6 +320,89 @@ def test_a_merge_of_anchors_whose_difference_passes_the_format_weighs_its_scaled
     assert merges[0] == merges[1]
 
 
+@pytest.mark.parametrize(("dtype", "power", "shift"), [
+    (np.float32, 127, 128), (np.float32, 127, 129), (jnp.bfloat16, 127, 128), (np.float16, 15, 16),
+])
+def test_a_merge_keeps_tiny_units_at_opposite_binade_edges(dtype, power, shift):
+    from reference_error import assert_as_exact
+
+    units = windows.Units(scale=2.0 ** -shift)
+
+    def found(y, t, a, dt):
+        def mean(weight):
+            return means.merged_output(y, weight, a, units, 0)[0]
+
+        value, tangent = jax.jvp(mean, (t,), (dt,))
+        return value, tangent, jax.grad(mean)(t)
+
+    def reference(y, t, a, dt):
+        # Independent factors: both powers are normal in f32, so no subnormal constant is multiplied.
+        first = shift // 2
+        x = a.astype(jnp.result_type(a.dtype, jnp.float32))
+        x = (x * (2.0 ** -first)) * (2.0 ** (first - shift))
+        factors = jnp.exp(x - jnp.max(x))
+
+        def mean(weight):
+            mass = factors * weight
+            return (jnp.sum(mass * y[:, 0]) / jnp.sum(mass)).astype(y.dtype)
+
+        value, tangent = jax.jvp(mean, (t,), (dt,))
+        return value, tangent, jax.grad(mean)(t)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (np.asarray([[0.], [2.]], dtype), np.asarray(rng.uniform(0.75, 1.25, 2), dtype),
+                np.asarray([-2.0 ** power, 2.0 ** power], dtype), np.asarray([1, 0], dtype))
+
+    assert_as_exact(found, reference, draw, "tiny merge units and mass derivatives",
+                    seeds=8, truth_fn=reference)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_a_narrow_finished_state_lands_mean_and_mass_in_its_own_format(dtype):
+    def run(y, t, a):
+        return means.merged_state(y, t, a, windows.Units(), 0)
+
+    inputs = (np.asarray([[0], [2]], dtype), np.asarray([1, 3], dtype), np.asarray([1, 1], dtype))
+    for result, expected in zip(jax.jit(run)(*inputs), ([1.5], 4, 1), strict=True):
+        assert result.dtype == dtype
+        np.testing.assert_array_equal(result, np.asarray(expected, dtype))
+
+
+@pytest.mark.parametrize(("dtype", "mantissa"), [(jnp.bfloat16, 7), (np.float16, 10)])
+def test_a_narrow_merged_total_rounds_once_above_its_midpoint(dtype, mantissa):
+    totals = np.asarray([[1, 2.0 ** -(mantissa + 1), 0], [1, 2.0 ** -(mantissa + 1), 2.0 ** -24]], dtype)
+    anchors = np.zeros_like(totals)
+    run = jax.jit(lambda t, a: means.merged_total(t, a, windows.Units(scale=0), 1)[0])
+    np.testing.assert_array_equal(run(totals, anchors), np.asarray([1, 1 + 2.0 ** -mantissa], dtype))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, np.float16])
+def test_two_words_at_narrow_underflow_and_overflow_boundaries_round_once(dtype):
+    limits = jnp.finfo(dtype)
+    boundary = 2 - 2.0 ** -(limits.nmant + 1)
+    heads = np.asarray([1, 1, -1, boundary, boundary], np.float32)
+    tails = np.asarray([-2.0 ** -24, 2.0 ** -24, -2.0 ** -24, -2.0 ** -24, 2.0 ** -24], np.float32)
+    halfway = limits.minexp - limits.nmant - 1
+    exponents = np.asarray([halfway, halfway, halfway, limits.maxexp - 1, limits.maxexp - 1], np.int32)
+    landed = jax.jit(lambda a, b, e: windows._landed((a, b, e), dtype))(heads, tails, exponents)
+    smallest = limits.smallest_subnormal
+    expected = np.asarray([0, smallest, -smallest, limits.max, np.inf], dtype)
+    np.testing.assert_array_equal(np.asarray(landed).view(np.uint16), expected.view(np.uint16))
+
+
+def test_a_narrow_mass_relocates_before_rounding_past_its_last_binade():
+    totals, anchors = np.asarray([65504, 16], np.float16), np.zeros(2, np.float16)
+    total, anchor = jax.jit(lambda t, a: means.merged_total(t, a, windows.Units(), 0))(totals, anchors)
+    move = 2 * math.log(2)
+    landed_at = np.float16(move)
+    if float(landed_at) < move:
+        landed_at = np.nextafter(landed_at, np.float16(np.inf))
+    reconstructed = np.float64(totals).sum() * np.exp(-float(landed_at))
+    np.testing.assert_array_equal(anchor, landed_at)
+    np.testing.assert_array_equal(total, np.float16(reconstructed))
+
+
 @pytest.mark.parametrize(("outputs", "totals", "anchors"), [((2, 2, 1), (1, 2), (2, 2)),
                                                             ((1, 2, 1), (2, 2), (2, 2))],
                          ids=["totals shared by a batch", "outputs shared by a batch"])
@@ -450,6 +566,55 @@ def test_an_empty_rows_anchor_is_chosen_by_the_law_before_its_mass_and_tangent()
     _, _, empty = jax.jit(lambda: means.merged_state(jnp.zeros((2, 1)), jnp.zeros(2),
                                                      jnp.full(2, -jnp.inf), units, 0))()
     assert float(empty) == -math.inf
+
+
+def test_nonfinite_anchors_remove_stale_mass_and_its_derivatives():
+    units = windows.Units()
+    outputs = np.broadcast_to(np.asarray([2, 13, 4], np.float32)[:, None, None], (3, 3, 1))
+    totals = np.ones((3, 3), np.float32)
+    anchors = np.asarray([[0, 0, 0], [-np.inf, np.inf, np.nan], [0, 0, 0]], np.float32)
+    direction = np.broadcast_to(np.asarray([1, 2.0 ** 127, 0], np.float32)[:, None], totals.shape)
+
+    def orders(y, t, a, dt):
+        def run(w):
+            return means.merged_state(y, w, a, units, 0)
+
+        def forward(w):
+            return jax.jvp(run, (w,), (dt,))
+
+        found, tangent = forward(t)
+        mixed = jax.jvp(lambda w: forward(w)[1][0], (t,), (dt,))[1]
+        transpose = jax.grad(lambda w: run(w)[0].sum())(t)
+        return found, tangent, mixed, transpose
+
+    (mean, mass, peak), (dm, dmass, dpeak), mixed, transpose = jax.jit(orders)(outputs, totals, anchors,
+                                                                             direction)
+    np.testing.assert_array_equal(mean, np.full((3, 1), 3))
+    np.testing.assert_array_equal(mass, [2, 2, 2])
+    np.testing.assert_array_equal(peak, [0, 0, 0])
+    np.testing.assert_array_equal(dm, np.full((3, 1), -0.5))
+    np.testing.assert_array_equal(dmass, [1, 1, 1])
+    np.testing.assert_array_equal(dpeak, [0, 0, 0])
+    np.testing.assert_array_equal(mixed, np.full((3, 1), 0.5))
+    np.testing.assert_array_equal(transpose, np.broadcast_to([[-0.5], [0], [0.5]], totals.shape))
+
+
+def test_a_streamed_empty_walk_does_not_put_stale_readouts_in_its_hull():
+    from dew.nn.kernels.templates import attention_algebra
+
+    units = windows.Units()
+    outputs = np.asarray([[[2.], [17.]], [[13.], [19.]]], np.float32)
+    totals = np.asarray([[0., 2.], [1., 1.]], np.float32)
+    anchors = np.asarray([[0., 8.], [-np.inf, np.nan]], np.float32)
+    valid = np.asarray([[True, False], [True, True]])
+
+    @jax.jit
+    def merged(y, t, a, v):
+        return attention_algebra.finished_merged_chunked(units, lambda i: (y[i], a[i], t[i], v[i]), 2)
+
+    mean, peak, mass, *_ = merged(outputs, totals, anchors, valid)
+    np.testing.assert_array_equal(mean, [0.])
+    assert float(mass) == 0.0 and float(peak) == 0.0
 
 
 @pytest.mark.parametrize("jitted", [True, False], ids=["jitted", "op by op"])

@@ -5,7 +5,6 @@ other (api03), and a block naming them runs them."""
 import dataclasses
 import typing
 
-import kernel_matrix
 import pytest
 
 from dew import kernels
@@ -14,19 +13,22 @@ from dew.nn.kernels import generation
 
 def test_the_kernels_type_names_every_choice_with_exactly_its_kernels():
     """`Kernels`' fields are the kernel choices (`generation.CHOICES`), each a choice among exactly the
-    kernels its op's selectors hold (`kernel_matrix.ops`, the production modules' every `selection.Op`, the
-    generic path among them) or a site decides by name (`generation.SITE_KERNELS`): a kernel added to an op,
-    or a choice added, without its field fails here."""
-    served: dict[str, set[str]] = {choice: {kernel.name for op in found for kernel in op.kernels}
-                                   for choice, found in kernel_matrix.ops().items()}
-    for choice, named in generation.SITE_KERNELS.items():
-        served.setdefault(str(choice), set()).update(named)
+    kernels its op's selectors hold (`tools/kernel_choices.served`, the production modules' every
+    `selection.Op`, the generic path among them) or a site decides by name (`generation.SITE_KERNELS`), and
+    its block is the one `tools/kernel_choices.py` writes from them (row 12776): a kernel added to an op, or
+    a choice added, without its field fails here."""
+    from tools import kernel_choices
+
+    served = kernel_choices.served()
+    text = kernel_choices.MODULE.read_text()
+    first, last = kernel_choices.block(text)
+    wanted = kernel_choices.rendered(served, kernel_choices.keyword_only_now())
+    assert text.splitlines()[first:last + 1] == wanted
     hints = typing.get_type_hints(kernels.Kernels)
-    offered = {field.name: {value for member in typing.get_args(hints[field.name])
-                            for value in typing.get_args(member)}
+    offered = {field.name: frozenset(value for member in typing.get_args(hints[field.name])
+                                     for value in typing.get_args(member))
                for field in dataclasses.fields(kernels.Kernels)}
-    assert set(offered) == set(generation.CHOICES)
-    assert offered == {choice: served.get(choice, set()) for choice in offered}
+    assert set(offered) == set(map(str, generation.CHOICES)) and offered == served
 
 
 def test_a_block_runs_the_kernels_its_choices_name_and_its_names_over_them():
