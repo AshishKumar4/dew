@@ -73,7 +73,8 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
 def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
     values = np.tile(np.asarray([[-1, -1], [0, 0], [1, 1], [0, 0]], np.float32), (64, 1))
     scale = np.asarray([2.0 ** -127, -2.0 ** -127], np.float32)
-    packed = formats.TernaryWeights.of(values, scale=scale)
+    # Stored at a subnormal scale (a matrix no `TernaryWeights.of` packs, row 13340), decoded exactly.
+    packed = dataclasses.replace(formats.TernaryWeights.of(values, scale=np.ones(2, np.float32)), scale=scale)
     with jax.enable_x64(dtype == jnp.float64):
         decoded = np.asarray(jax.jit(lambda stored: stored.decoded(dtype))(packed))
     expected = (values.astype(np.float64) * scale.astype(np.float64)).astype(dtype)
