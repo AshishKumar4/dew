@@ -1792,3 +1792,43 @@ def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_ta
         lambda u: algebra.output_of(u, d, guarded=False), (a,), (a,)))(big[:, None], big)
     np.testing.assert_array_equal(np.asarray(val), np.ones((1, 1), np.float32))
     np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))
+
+
+CERTIFIED_FORMS = {"full": {}, "causal": {"causal": True}, "window": {"causal": True, "sliding_window": 8},
+                   "documents": {"causal": True, "segment_ids": np.asarray([[0] * 10 + [1] * 14])}}
+"""The forms attention's plain-JAX mainloop is certified under: a 24-token call's keys whole, causal, in a
+causal window of 8 and in two packed documents."""
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("form", list(CERTIFIED_FORMS))
+@pytest.mark.parametrize("capped", [False, True], ids=["plain", "capped"])
+def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form, capped, monkeypatch):
+    """Attention's plain-JAX mainloop, the path every CPU and TPU call runs (`attention_portable`): its
+    forward with residuals (`xla_mainloop`) and its backward from them (`backward`), under each form and
+    plain or under Gemma 2's cap (`template.Capped`), run one primitive at a time, every element of every
+    operation within its own operation's certified contract (check 2, tests/certified.py), over drawn
+    queries, keys, values and output cotangents, its tiles cutting the call into three of each: the
+    library's own program, without the test lane's wide CPU arithmetic."""
+    from certified import assert_certified
+
+    from dew.nn import precision
+
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
+    tiles = attention_portable.Tiles(8, 8, 8)
+    spans = template.spans(24, 24, 1, **CERTIFIED_FORMS[form])
+    hooks = template.Hooks(score=Hook(template.Capped(5.0))) if capped else template.Hooks()
+
+    def forward(q, k, v, do):
+        return attention_portable.xla_mainloop(tiles, q, k, v, spans, hooks, residuals=True)
+
+    def backward(q, k, v, do):
+        return attention_portable.backward(tiles, q, k, v, spans, hooks, do)
+
+    def draw(seed):
+        rng = np.random.default_rng([6130, seed])
+        return tuple(jnp.asarray(rng.standard_normal((1, 24, 2, 16)), dtype) for _ in range(4))
+
+    label = f"{jnp.dtype(dtype).name} {form} {'capped' if capped else 'plain'}"
+    assert_certified(forward, draw, f"the plain-JAX forward, {label}", seeds=2)
+    assert_certified(backward, draw, f"the plain-JAX backward, {label}", seeds=2)
