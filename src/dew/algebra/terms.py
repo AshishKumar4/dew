@@ -1449,8 +1449,8 @@ def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: l
     made = _float_apart(equation, name, operands, bounds, aval.dtype)
     # Finite where its operands make it so and its own bound is within its dtype; a finite value is a number.
     finite = made.finite and _within(bound, aval.dtype)
-    dyadic = (name == "broadcast_in_dim" and operands[0].dyadic_scale
-              or name == "select_n" and all(held.dyadic_scale for held in operands[1:]))
+    dyadic = ((name == "broadcast_in_dim" and operands[0].dyadic_scale)
+              or (name == "select_n" and all(held.dyadic_scale for held in operands[1:])))
     made = made._replace(number=made.number or finite, finite=finite, dyadic_scale=dyadic)
     return _held_apart(made, aval.dtype)
 
