@@ -26,6 +26,7 @@ def test_a_lora_start_keeping_its_base_compiles_in_the_room_its_admission_reads(
     a LoRA base kept)."""
     from affine_run import Replaying
 
+    from dew._cache import uncached
     from dew.data.dataset import Loader
 
     rows = Replaying(lambda position: {"text": jnp.asarray(TEXT, jnp.int32)})
@@ -45,5 +46,7 @@ def test_a_lora_start_keeping_its_base_compiles_in_the_room_its_admission_reads(
     measured = first_probe(roomy)
     assert measured["fits"] is True and isinstance(measured["headroom"], int), measured
     # The room its admission reads as the step's exactly, and 64 KiB beside it: less than the base's bytes.
-    probe = first_probe(roomy - measured["headroom"] + (1 << 16))
+    # Compiled anew, not read from the persistent cache, whose binary no limit stops (`limit_exited`).
+    with uncached():
+        probe = first_probe(roomy - measured["headroom"] + (1 << 16))
     assert probe["fits"] is True and 0 <= probe["headroom"] <= 1 << 16, probe
