@@ -66,7 +66,6 @@ from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.dense import NVFP4_AMAX
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
-from dew.nn.kernels.generation import drawing
 from dew.nn.kernels.options import Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
@@ -1370,17 +1369,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         return Partial(self._drawn) if held is None else Partial(self._drawn, variables=held)
 
     def _drawn(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        """`init` within `generation.drawing`: its forward runs for the variables its modules make, none of
-        its values reaching them, so every selector takes its op's generic program and no launch is derived,
-        traced or certified at the draw's shapes (row 11803). The one way a draw runs (`initializer`,
-        `drawn.traced_draw`, `parameter_axes`, row 12090), so every objective's passes through it once, its
-        own `init` whole: a critic's, an encoder and predictor's, a feature probe's (Train 1205's review
-        F2)."""
-        from dew.algebra import passes
+        """`init` within a fresh draw (`dew.objectives.drawn.fresh_draw`): its forward runs for the variables
+        its modules make, none of its values reaching them, so every selector takes its op's generic program
+        and no launch is derived, traced or certified at the draw's shapes, and no body of it is rewritten
+        (row 11803). The one way a draw runs (`initializer`, `drawn.traced_draw`, `parameter_axes`, row
+        12090), so every objective's passes through it once, its own `init` whole: a critic's, an encoder and
+        predictor's, a feature probe's (Train 1205's review F2)."""
+        from dew.objectives.drawn import fresh_draw
 
-        # Its forward's bodies are not rewritten either (`dew.objectives.drawn.drawing`): none of its values
-        # reaches the variables.
-        with drawing(), passes(on=False):
+        with fresh_draw():
             # An override may take its variables by keyword alone, as the base names them.
             return self.init(key) if variables is None else self.init(key, variables=variables)
 

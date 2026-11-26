@@ -1,12 +1,12 @@
 """How a token objective runs its model's vocabulary head: one policy every objective that scores
 tokens through a head takes, and the fit ladder moves.
 
-A head keeps its whole fp32 logits for the backward pass (`head_tile` None), saving their recomputation
-for their memory (faster on an A100's Qwen3-0.6B step, slower on an RTX 4080's under XLA's Triton GEMM
-fusions, `chunked.chunked_cross_entropy`), or computes them a tile at a time (`head_tile`), whose
-temporaries stay one tile in size whatever the vocabulary. A tiled head scored for a summed loss may
-take its gradient in the forward (`head_fused`, `chunked.fused_head_loss`), faster than the tiled
-backward but holding a chunk of the whole vocabulary's logits beside it. The trainer's fit ladder
+A head keeps its whole logits for the backward pass (`head_tile` None; a bf16 head's as bf16), saving
+their recomputation for their memory (faster on an A100's Qwen3-0.6B step, slower on an RTX 4080's under
+XLA's Triton GEMM fusions, `chunked.chunked_cross_entropy`), or computes them a tile at a time
+(`head_tile`), whose temporaries stay one tile in size whatever the vocabulary. A tiled head scored for a
+summed loss may take its gradient in the forward (`head_fused`, `chunked.fused_head_loss`), faster than
+the tiled backward but holding a chunk of the whole vocabulary's logits beside it. The trainer's fit ladder
 moves a step from the whole logits to the fused tile to the tiled backward before it recomputes
 more (`dew.training.memory.recompute_more`), reading the head the objective reports
 (`Objective.program_key`), and a resumed run climbs to the rung it recorded.

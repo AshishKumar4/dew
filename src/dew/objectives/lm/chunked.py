@@ -256,6 +256,46 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
+def _whole_logits(states, matrix, precision: jax.lax.PrecisionLike) -> jax.Array:
+    """The whole head's `[tokens, vocab]` product as `_tile_logits` forms it, a bf16 head's held as bf16:
+    its values are bf16's (`bf16_product`), so where no device splits its contraction (`_contracted_whole`)
+    a GPU's product writes them as bf16 from its fp32 sums, and the fp32 product is never held beside its
+    rounding (a Qwen3.5-4B step at 8 x 4096 tokens on one H100 held both at its peak, 30.3 and 15.2 GiB).
+    A split contraction sums its shards' partials in fp32 before it rounds, as XLA's partitioner sums them
+    in the product's own type. Its readers widen it where they read it."""
+    if precision is not BF16:
+        return _tile_logits(states, matrix, precision)
+
+    def written(states, matrix):
+        if not _contracted_whole():
+            return _tile_logits(states, matrix, precision).astype(jnp.bfloat16)
+        numbers = (((1,), (1,)), ((), ()))
+        # Behind a barrier, as `bf16_logits` holds its rounding: XLA's excess precision would otherwise widen
+        # a bf16 result its readers widen, skipping the rounding a tiled head's logits take.
+        return jax.lax.optimization_barrier(jax.lax.dot_general(
+            states.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), numbers,
+            precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.bfloat16))
+
+    return jax.lax.platform_dependent(
+        states, matrix, cuda=written,
+        default=lambda states, matrix: _tile_logits(states, matrix, precision).astype(jnp.bfloat16))
+
+
+def _contracted_whole() -> bool:
+    """Whether no device splits a product's contraction as it traces, proved by the mesh in context: every
+    axis of it that is not manual is one device (a step on one GPU, which the trainer traces under its mesh,
+    a `shard_map`'s body over every axis). With none in context nothing proves it: a program's devices are
+    its arguments' shardings', which no trace reads."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return not mesh.empty and all(size == 1 for name, size in mesh.shape.items()
+                                  if name not in mesh.manual_axes)
+
+
+def _widened(raw: jax.Array) -> jax.Array:
+    """Whole logits as their readers compute over them: at least fp32 (`_whole_logits`' bf16 widened)."""
+    return raw.astype(jnp.promote_types(raw.dtype, jnp.float32))
+
+
 def _online_softmax(first, second):
     """The online softmax's combine of two parts of a row, each `(maximum, total, rest)`: the larger
     maximum, and each part's two sums of exponentials rescaled to it and added. A function of the module,
@@ -676,8 +716,8 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
-    raw = _tile_logits(flat, table.astype(operands), precision)
-    logits = _without(capped_logits(columns.logits(raw), softcap, temperature), 0, excluded)
+    raw = _whole_logits(flat, table.astype(operands), precision)
+    logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
@@ -689,8 +729,9 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
 
 def _whole_head(hidden, table, targets, excluded, softcap, chunks: int, precision: jax.lax.PrecisionLike,
                 predict: bool, temperature: float, columns: _Columns, picked: bool, group: tuple[str, ...]):
-    """The whole head's outputs behind a backward that keeps its fp32 logits (`_whole_head_bwd`), which a
-    derivative's own forward forms whole; with nothing to differentiate, the tiled forward over one
+    """The whole head's outputs behind a backward that keeps its logits (`_whole_head_bwd`; a bf16 head's as
+    bf16, `_whole_logits`), which a derivative's own forward forms whole; with nothing to differentiate, the
+    tiled forward over one
     vocabulary tile, a token tile's logits at a time, so an evaluation or a scoring pass holds no whole
     logits, and a tangent is that tiled forward's (`linear_tangent`)."""
     statics = (chunks, precision, predict, temperature, picked, group)
@@ -714,9 +755,8 @@ def _whole_head_fwd(chunks, precision, predict, temperature, picked, group, hidd
     raw, normalizer, outputs = _whole_head_terms(hidden, table, targets, excluded, softcap, precision,
                                                  predict, temperature, columns, picked)
     outputs, normalizer = _shared_partition(outputs, normalizer, group)
-    # The fp32 product before the per-column terms and the cap is kept, so
-    # the backward multiplies nothing it did not have to: the state and head
-    # products alone.
+    # The product before the per-column terms and the cap is kept (a bf16 head's as bf16, `_whole_logits`),
+    # so the backward multiplies nothing it did not have to: the state and head products alone.
     return outputs, (raw, normalizer)
 
 
@@ -732,7 +772,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    logits, pullback = _capped(raw, softcap, columns, temperature)
+    logits, pullback = _capped(_widened(raw), softcap, columns, temperature)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
     d_states, d_table, d_cap, d_columns = _head_backward(
         pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
@@ -839,10 +879,11 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     keep what each tile's addition drops (`dew.nn.precision.running_sum`),
     three times their bytes, so they round once as the whole head's products do.
     The default is the measured one (`chunked_tile`); a tile wider than the input is one
-    tile. A `tile` of None keeps the whole fp32 logits for the backward
-    instead of recomputing them; which is faster depends on the workload and
-    the compiler's options: on one A100, Qwen3-0.6B's head at 4096 tokens took
-    33.1 ms with the logits held, at 4.6 GiB, against 60.2 ms tiled, where on
+    tile. A `tile` of None keeps the whole logits for the backward (a bf16
+    head's as bf16, its values bf16's) instead of recomputing them; which is
+    faster depends on the workload and the compiler's options: on one A100,
+    Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits held, at
+    4.6 GiB, against 60.2 ms tiled, where on
     an RTX 4080 at 4096 tokens under XLA's Triton GEMM fusions the whole step
     took 286.0 ms against 114.6 ms at a 4096 x 8192 tile (docs/performance.md;
     `LMObjective.head_tile`).

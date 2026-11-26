@@ -37,12 +37,23 @@ def drawing() -> Iterator[None]:
     collective, where JAX's threefry kernel, unpartitioned, held 6.44 GB). The setting is in JAX's trace
     context and jit key, so every site of the program enters it alike; a step, whose draws fuse into what
     reads them, keeps JAX's default.
-    The algebra pass is off within it (`dew.algebra.passes`): the forward an init traces makes no variable,
-    so its bodies, rewritten again under this program's own trace context, rewrote nothing the run reads (an
-    every-template step's start missed 562 of its 803 structural lookups on an sm100, row 11803)."""
-    from dew.algebra import passes
+    Within it the draw's forward is a fresh draw's (`fresh_draw`), as its trace and its init's are."""
+    with jax_config.threefry_rolled_lowering(new_val=True), fresh_draw():
+        yield
 
-    with jax_config.threefry_rolled_lowering(new_val=True), passes(on=False):
+
+@contextlib.contextmanager
+def fresh_draw() -> Iterator[None]:
+    """Where a model's draw of its variables traces, is lowered or runs: its init (`Objective._drawn`), its
+    trace (`traced_draw`) and its start's compile (`drawing`). Its forward makes no variable, so every
+    selector takes its op's generic program (`generation.drawing`: no launch derived, traced or certified at
+    the draw's shapes, row 11803) and no body of it is rewritten (`dew.algebra.passes` off: an every-template
+    step's start missed 562 of its 803 structural lookups on an sm100, rewriting again under its own trace
+    context what no run reads, row 11803)."""
+    from dew.algebra import passes
+    from dew.nn.kernels import generation
+
+    with generation.drawing(), passes(on=False):
         yield
 
 
@@ -154,19 +165,14 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
     (`held_context`) over arguments of the same paths and shapes in this process is read
     (`dew._cache.holding`, `held_signature`): a trainer's refit traces its start once (PF03)."""
     def made() -> TracedDraw[Tree, Built, Rest]:
-        from dew.nn.kernels import generation
         from dew.nn.kernels.templates import report
 
         traced, through = passed_through(function, lambda built: parts.split(built)[1])
         # The launches its trace reaches certified aside and settled as it ends (`report.certifying_aside`):
         # certified in turn they took a start's tracing thread before its step's lowering (row 5324); a
         # launch the settling refused leaves the start's lowering to step past it.
-        # A draw selects no kernel (`generation.drawing`): its forward's values reach none of the variables.
-        from dew.algebra import passes
-
-        # Nor is a body of its forward rewritten (`drawing`'s algebra pass off): none of its values is a
-        # variable.
-        with report.certifying_aside(), generation.drawing(), passes(on=False):
+        # A fresh draw's (`fresh_draw`): its forward's values reach none of the variables.
+        with report.certifying_aside(), fresh_draw():
             trace = owned_program(traced).trace(held, key)
         abstract = trace.out_info
         leaves = jax.tree.structure(parts.split(abstract)[1]).num_leaves
