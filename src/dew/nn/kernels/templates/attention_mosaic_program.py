@@ -280,10 +280,19 @@ def query_swizzle(family: mosaic.Family) -> int | None:
     return swizzling.NARROWEST_SWIZZLE_BYTES if family.operands_in_registers else None
 
 
+PARKED_SWIZZLE_BYTES = 64
+"""The swizzle a parked backward stages its transposed streams at (`BackwardTiles.parked`): a load half the
+widest granule's depth, its fragments half as many registers (an A100's d128 dQ at 64 x 64 on one consumer:
+255 registers and 32 bytes spilled at the widest, 238 and none at 64 bytes; probe f39a1e785)."""
+
+
 def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
     """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
-    transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
-    return dict.fromkeys(names, swizzling.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
+    transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), 64 bytes where a backward parks
+    its dV sums (`BackwardTiles.parked`), the family's own otherwise."""
+    if tiles.narrow:
+        return dict.fromkeys(names, swizzling.NARROWEST_SWIZZLE_BYTES)
+    return dict.fromkeys(names, PARKED_SWIZZLE_BYTES) if getattr(tiles, "parked", False) else {}
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -365,6 +374,13 @@ class BackwardTiles:
     (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
     of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
     registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
+    parked: bool = False
+    """Whether the keys-first dK/dV launch parks its fp32 dV sums in a shared tile of each consumer's across a
+    step's score, dP and dK products, read back for dV's product alone, its transposed streams staged at 64
+    bytes (`PARKED_SWIZZLE_BYTES`): where dK's and dV's sums beside a step's products pass a consumer's
+    registers on a family reading its operands from them (an A100's at 64 x 64, width 128, one consumer:
+    255 registers and 264 bytes spilled unparked, 244 and none parked, its dQ launch's 238 and none at the
+    staging; probe f39a1e785)."""
     dkv_blocks: tuple[int, int] | None = None
     """The dK/dV launch's own query tile and key block where they are not the config's (`dkv`): a walk whose
     products a role issues (`placed.Tcgen05Walked`) holds a block of its issuer's rows, the dK/dV launch's
@@ -404,7 +420,7 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
 
 
 def _products(family: mosaic.Family, dtype, *products: resources.Product, narrow: bool = False,
-              lhs_swizzle: int | None = None) -> list:
+              parked: bool = False, lhs_swizzle: int | None = None) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.product_phases`; none where they read shared memory, wgmma's): each product
     (`resources.Product`) its operands' fragments beside the tiles it holds at once (`beside`: its output, a
@@ -416,7 +432,7 @@ def _products(family: mosaic.Family, dtype, *products: resources.Product, narrow
     a left operand in shared memory loaded at its stage's (`lhs_swizzle`: a forward's query block,
     `query_swizzle`; the family's own where None). Products naming one right `source` read one staged
     operand, live through the intervening products too."""
-    narrowest = swizzling.NARROWEST_SWIZZLE_BYTES if narrow else None
+    narrowest = (swizzling.NARROWEST_SWIZZLE_BYTES if narrow else PARKED_SWIZZLE_BYTES if parked else None)
     return resources.product_phases(family, dtype, *products, lhs_swizzle=lhs_swizzle, rhs_swizzle=narrowest)
 
 
@@ -437,10 +453,15 @@ class _Issuing(NamedTuple):
 def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool, *,
                 shape: tuple[int, int] | None = None):
     """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `parts`' products with `rhs`,
-    a tile in shared memory, issued into it in place (`operands.Issuer`'s carried accumulator), each part's
+    a tile in shared memory, issued into it in place (`operands.Issuer`'s carried accumulator; sums parked
+    in a shared tile read back first, `BackwardTiles.parked`), each part's
     left operand in registers and formed as it is taken (`algebra.formed_parts`); an fp16 part's
     (`product.Scaled`) its own accumulator, restored by its row's power of two (`algebra.restored`) and
     added in."""
+    if acc is not None and not isinstance(acc, jax.Array):
+        # Sums parked in a shared tile (`BackwardTiles.parked`), read back for their product alone.
+        mosaic.synced(interpret)
+        acc = family.tile_of(acc)
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     products = (("part", part, right) for part in parts)

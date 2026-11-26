@@ -2226,16 +2226,27 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         residing = [] if dq.products_overlap or (not dq.budgets_registers and dq.programs(1) < 2) else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
-        for wanted in (*residing, fits):
+        # Whole columns of a key block whose dK and dV sums pass a consumer's registers beside a step's
+        # products, dV's parked in shared memory across them (`BackwardTiles.parked`), before smaller tiles
+        # at more programs: on a family reading its operands from registers, its consumers each their own key
+        # block (an A100's bf16 at width 128, 2 x 4096 causal: 64 x 64 on one consumer 9.70 ms where it
+        # spilled, the 32 x 32 derived at two programs 12.39, M-NA-45); where the unparked tile holds, it. Its
+        # values wider than 64 columns alone: at 64 dK's and dV's sums held beside a 64 x 64 step unparked.
+        wide = ba.arguments["value"].shape[-1] > 64
+        parking = [] if not (wide and dq.operands_in_registers) or split_queries(dq) or dkv else [
+            lambda config: (config.parked and fits(config)
+                            and not fits(dataclasses.replace(config, parked=False)))]
+        for wanted in (*parking, *residing, fits):
+            parked = bool(parking) and wanted is parking[0]
             for columns in (1, 2, 4):
                 fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, dq) else ()
                 for rows in (None, *fewer):
                     walks = _query_walk(rows)
                     for staged in (False, True):
-                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
-                                  ) -> BackwardTiles:
+                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged,
+                                  parked=parked) -> BackwardTiles:
                             return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
-                                                 columns=columns, staged_logits=staged, **dkv)
+                                                 columns=columns, staged_logits=staged, parked=parked, **dkv)
 
                         if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
                                               overlapped=False, walks=walks, rows=rows):

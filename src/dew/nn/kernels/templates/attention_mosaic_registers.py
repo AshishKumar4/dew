@@ -528,7 +528,7 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
                           beside=[logits] * 2, transposed=True, source="values"),
         resources.Product(block_q, block_k, width // config.columns,
                           beside=cotangents[1:], held=True, source="keys"),
-        narrow=config.narrow)
+        narrow=config.narrow, parked=config.parked)
     # A score hook's slopes and parameters live until its pullback takes them (`gradient.pulled`).
     hooked = [logits] * slopes + held
     if accurate and family.operands_in_registers:
@@ -628,7 +628,7 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
             resources.Product(block_k, block_q, value_width, beside=[logits]),
             resources.Product(block_k, block_q, width, beside=[logits]),
             resources.Product(block_q, block_k, width, beside=dq_tile),
-            narrow=config.narrow)
+            narrow=config.narrow, parked=config.parked)
         if not family.operands_in_registers:
             # A family reading its operands from shared memory holds the weights narrowed for dV's product
             # beside the pullback until they are staged: wgmma's at 64 x 64, width 128, under a softcap held
@@ -675,16 +675,20 @@ def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: i
     # and the score cotangents in registers, its share of their columns.
     weights = (block_k, queries, dtype)
     columns = config.columns
+    # Parked (`BackwardTiles.parked`), dV's sums leave the carry for a shared tile across the scores' and
+    # dP's products, back in registers from dV's product through dK's.
+    parked = carried[1:] if config.parked else []
+    carried = carried[:1] if config.parked else carried
     dq_product = (resources.Product(queries, block_k, width,
                                     beside=[step[0], (queries, width, jnp.float32)]),) if config.fused else ()
     fragments = _products(
         family, dtype,
         resources.Product(block_k, width, queries, beside=step[:1], transposed=True),
         resources.Product(block_k, value_width, queries, beside=step, transposed=True),
-        resources.Product(block_k, queries, value_width // columns, beside=[weights], held=True),
-        resources.Product(block_k, queries, width // columns, beside=[weights], held=True),
+        resources.Product(block_k, queries, value_width // columns, beside=[weights, *parked], held=True),
+        resources.Product(block_k, queries, width // columns, beside=[weights, *parked], held=True),
         *dq_product,
-        narrow=config.narrow)
+        narrow=config.narrow, parked=config.parked)
     if accurate and family.operands_in_registers:
         # The accurate form's dK parts issued against one right operand, the queries, held at its whole depth
         # across them, beside the cotangents fp32, dV's weights and the part (an A100's dK/dV at 64 x 64:
@@ -693,13 +697,13 @@ def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: i
         right = (queries, width // columns * family.rhs_copies, dtype)
         # A score hook's parameters' key gradients beside them (an A100's at 64 x 64 under a key bias spilled
         # 32 bytes, acchook3).
-        fragments.append([step[0], weights, weights, right, *held])
+        fragments.append([step[0], weights, weights, right, *held, *parked])
     if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's dV and dK parts scaled (`product.Scaled`): each product its own accumulator, restored and
         # added into dV's or dK's (`operands.Issuer.summed`), beside the cotangents and both parts, formed
         # first.
         restore = (block_k, max(width, value_width) // columns, jnp.float32)
-        fragments.append([step[0], weights, weights, restore])
+        fragments.append([step[0], weights, weights, restore, *parked])
     phases = resources.live_registers(family, carried, step, pullback, *added, *fragments)
     return phases + statistics + vectors
 
