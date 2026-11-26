@@ -84,11 +84,10 @@ def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp32 `x` as its signed significand in `[1, 2)` (`_significand`, read from its bits) and its binary
-    exponent; a zero, an infinity or a NaN as it is, exponent 0."""
-    _, biased, fraction, _, exponent = float_bits.float_bits(x)
-    finite = (biased != 0xFF) & ((biased != 0) | (fraction != 0))
-    return jnp.where(finite, _significand(x), x), jnp.where(finite, exponent, 0).astype(jnp.int32)
+    """An fp32 `x` as its signed significand in `[1, 2)` and its binary exponent, one read of its bits
+    (`_decoded`); a zero, an infinity or a NaN as it is, exponent 0."""
+    significand, exponent, finite = _decoded(x)
+    return jnp.where(finite, significand, x), jnp.where(finite, exponent, 0).astype(jnp.int32)
 
 
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
@@ -562,6 +561,13 @@ FACTORED_LEAD = 6
 def _significand(x: jax.Array) -> jax.Array:
     """A finite fp32 `x`'s significand with its sign, in [1, 2), from its bits (`float_bits`): a subnormal's
     normalized, read where a process flushes subnormal operands; 0 for zero."""
-    sign, biased, fraction, normalized, _ = float_bits.float_bits(x.astype(jnp.float32))
-    one = sign | (127 << 23) | normalized
-    return jnp.where((biased == 0) & (fraction == 0), 0.0, jax.lax.bitcast_convert_type(one, jnp.float32))
+    return _decoded(x)[0]
+
+
+def _decoded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_significand`'s significand of an fp32 `x` (0 for zero), its binary exponent and whether it is finite
+    and nonzero, from one read of its bits (`float_bits.float_bits`)."""
+    sign, biased, fraction, normalized, exponent = float_bits.float_bits(x.astype(jnp.float32))
+    one = jax.lax.bitcast_convert_type(sign | (127 << 23) | normalized, jnp.float32)
+    zero = (biased == 0) & (fraction == 0)
+    return jnp.where(zero, 0.0, one), exponent, ~zero & (biased != 0xFF)
