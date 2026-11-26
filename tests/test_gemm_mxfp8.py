@@ -304,3 +304,14 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     assert (held[2] == 0xFF).all() and (np.delete(held, 2, axis=0) != 0xFF).all()
     expected = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32)).scales
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
+
+
+@pytest.mark.parametrize("order", ["cancelling first", "small first"])
+def test_an_mxfp8_sum_keeps_a_small_block_between_blocks_that_cancel(order):
+    """Three blocks' partials 32 x 2^60, 32 x 2^-20 and -32 x 2^60, the small one before or after the two
+    that cancel: the sum is the small one's, 2^-15, whatever the blocks' order (row 13248: a running sum held
+    at 2^65 aligned the small block to nothing before the large ones cancelled)."""
+    signs, exponents = (((1, -1, 1), (30, 30, -10)) if order == "cancelling first"
+                        else ((1, 1, -1), (30, -10, 30)))
+    out = _blocks_product(signs, exponents, exponents)
+    np.testing.assert_array_equal(out, np.full((128, 128), 2.0 ** -15, np.float32))
