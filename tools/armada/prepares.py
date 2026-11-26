@@ -34,13 +34,20 @@ for sm90, 580 s on an armada container (2026-11-22; 80 to 322 s on a GPU node's 
 PREPARE_TARGETS = 4
 """How many of the plan's targets a dry prepare's task may take before its file is prepared in groups
 (`groups_of`), as the tier's run cuts it, each group a task of its own."""
-PREPARE_SHARE = 0.5
-"""The most of its task's deadline (the session's `DEADLINE`) a dry prepare's group is cut to take
-(`groups_of`): a prepare's time varies with its container, and a group cut to its whole deadline ran past it
-(train 1247: seven of 178 groups, each cut to about 1,580 s, killed at their deadline)."""
-CUT_SHORT = 0.9
-"""The share of its deadline past which a timed row ran out of its time (`planned`): what it took is no more
-than a floor of its work, which counts twice."""
+PREPARE_WALL = 600.0
+"""A dry prepare task's shared budget (`run`), whatever its deadline: its topology, baseline lookups,
+processes and their records' publication draw on it (a baseline unwritten by its end leaving its row stale,
+row 13014); its restorations, local git calls, and a red row's revocation of its green epoch may run past it.
+It sits under a train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
+margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
+(`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
+their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
+CUT_SHORT = 0.75
+"""The share of a dry prepare's full cap (`cap_after` of `PREPARE_WALL`) past which a timed row ran out of its
+time (`planned`): what it took is no more than a floor of its work, which counts twice. A tuning heuristic,
+no bound: a process starts late where its task's topology, baseline lookup and earlier rows drew on the shared
+budget, its cap that much earlier (a cold attention cut capped at 217 s, 2026-11-25), and a row that
+completes may take past it too, counting twice all the same."""
 TOPOLOGY_SCRIPT = ("import sys; from pathlib import Path; sys.path.insert(0, 'tests'); "
                    "import generation_support; "
                    "generation_support.node_topology(Path(sys.argv[1]), sys.argv[2])")
@@ -157,25 +164,30 @@ def parsed(row_variant: str) -> tuple[str, bool]:
     return named.removesuffix(USERS), named.endswith(USERS)
 
 
-def groups_of(seconds: float | None, target: float, deadline: float) -> int:
+def groups_of(seconds: float | None, target: float, bound: float) -> int:
     """How many groups a file whose prepare took `seconds` (None: never timed) is prepared in: one, or as
-    many as hold it within `PREPARE_TARGETS` of the plan's `target` each and `PREPARE_SHARE` of a task's
-    `deadline`."""
-    budget = min(PREPARE_TARGETS * target, PREPARE_SHARE * deadline)
+    many as hold it within `PREPARE_TARGETS` of the plan's `target` each and a dry prepare's cap (`bound`,
+    `cap_after`)."""
+    budget = min(PREPARE_TARGETS * target, bound)
     return 1 if seconds is None else max(1, math.ceil(seconds / budget))
 
 
 def process(ci, python: str, file: str, group: str, verdict: Path, left: float, *, unit: str, threads: str,
             users: bool, variant: str, cache: str = "off", common: str = "", recorded: bool = False,
             environ: Mapping[str, str] | None = None, kept: Mapping[str, tuple[str, str]] | None = None,
-            judged: Callable[[list[dict]], list[dict]] | None = None, capped: bool = False) -> int:
+            judged: Callable[[list[dict]], list[dict]] | None = None, capped: bool = False,
+            written: list[set[str]] | None = None, ends: float | None = None) -> int:
     """One process of a GPU tier part's prepare (ci.py's `gpu_prepared`) or a dry prepare (`run`): test file
     `file`'s `group` run on the CPU alone under the prepare's word and its unit's name (`unit`), a user's
     process's flags where `users` (`VARIANTS`), its row named for `variant`, within what is `left` of its
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
-    `PREPARE_HOLDS`); a part's never, whose run reads every program it prepares."""
+    `PREPARE_HOLDS`), its records published by its task's end (`ends`, `tested`'s `publish_by`; a red's epoch
+    revoked past it), what is `left` read from it as the process starts; a part's never, whose run reads every
+    program it prepares."""
+    if ends is not None:
+        left = min(left, ends - time.monotonic())
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:
         why = "not prepared: its lane's prepare had no time left for it"
         verdict.write_text(json.dumps({"rows": [ci.stale_row(python, file, ci.varied(group, variant), why)]}))
@@ -185,19 +197,28 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # prepared is kept, its end in time to upload it: a cap of the time it has but its end's.
     # A part's clears any cap it inherits (its environment's, its caller's).
     # Of memory, a share of each limit binding it (`held_caps`), its end's the rest.
-    cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
+    cap = {wire.PREPARE_BY: repr(time.monotonic() + cap_after(ci, left)) if capped else "",
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
     # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
                      recorded=recorded, variant=variant, kept=kept, judged=judged,
-                     recycle_at=RECYCLE_AT if capped else None)
+                     recycle_at=RECYCLE_AT if capped else None, written=written,
+                     publish_by=ends if capped else None)
 
 
 CAP_MARGIN = 240.0
 """What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
 running at its cap, its programs' upload to the shared cache, its report."""
+
+
+def cap_after(ci, left: float) -> float:
+    """The seconds into a dry prepare given `left` past which it starts no further test (`process`'s cap):
+    what it has but its end's (its grace, its group's settling, its reader's last ten seconds) and
+    `CAP_MARGIN`, or half of that where the margin would take more."""
+    mine = left - ci.session.GRACE - ci.SETTLE - 10.0
+    return max(mine - CAP_MARGIN, mine / 2)
 
 
 RECYCLE_AT = 3 << 30
@@ -221,32 +242,31 @@ def held_caps(ci) -> str:
     limit, which would key every prepare row by its host's (followed.py's `LIMITS`); a JSON list of
     `[path, bytes]` pairs (a cgroup's name may hold any separator), "" where none states one."""
     reader, root = ci.host.cgroups(), ci.host.cgroup_root()
-    caps = [[str(level), int(limit * HELD_SHARE)] for level in reader.levels(reader.own(root), root)
-            if (limit := reader.memory(level)) is not None]
+    caps = [[str(level), int(limit * HELD_SHARE)] for level, limit in reader.memory_limits(root)]
     return json.dumps(caps) if caps else ""
 
 
 def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple[float, float] | None],
-            target: float, varied: str, deadline: float) -> list[tuple[str, str]]:
+            target: float, varied: str, bound: float) -> list[tuple[str, str]]:
     """The dry prepares' rows (`run`), each a file and its group: each GPU tier file of `files`
     (`tier_files`) for each generation of `PREPARED`, its lane's process and, where it holds a test of a
     user's process, that process's, each a row (`variant`, after `varied`, ci.py's `VARIED`). A file is
-    prepared in groups of its tests (`G/N`, `prepared_cut`), each a row: as many as its prepare's
-    work needs to hold each within `PREPARE_TARGETS` targets and `PREPARE_SHARE` of a task's `deadline`
+    prepared in groups of its tests (`G/N`, `prepared_cut`), each a row: as many as its prepare's work
+    needs to hold each within `PREPARE_TARGETS` targets and a dry prepare's cap, `bound` (`cap_after`)
     (`took`, by file and variant: the rows ci.py's `measured_cut` sums, and the longest of them, past
-    `CUT_SHORT` of the deadline a floor that counts twice), and before any run of it is timed one a
-    `gpu`-marked test, so no first prepare of a file sets a train's wall (Main, 2026-11-22:
-    tests/test_gpu_flows.py's ten flows, whole, ran past a task's 1,575 s). A timed file is cut as its work
-    needs, never by a record's count of its tests, which a parametrization since may have outgrown: a group
-    its task finds no prepared test for prepares nothing."""
+    `CUT_SHORT` of the cap a floor that counts twice, as a capped row stops at it whatever is left), and
+    before any run of it is timed one a `gpu`-marked test, so no first prepare of a file sets a train's
+    wall (Main, 2026-11-22: tests/test_gpu_flows.py's ten flows, whole, ran past a task's 1,575 s). A
+    timed file is cut as its work needs, never by a record's count of its tests, which a parametrization
+    since may have outgrown: a group its task finds no prepared test for prepares nothing."""
     found = []
     for name, users, tests in files:
         for generation in PREPARED:
             processes = (False, True) if users else (False,)
-            timed = [seconds * (2 if longest >= CUT_SHORT * deadline else 1) for each in processes
+            timed = [seconds * (2 if longest >= CUT_SHORT * bound else 1) for each in processes
                      if (measured := took(name, variant(generation, users=each))) is not None
                      for seconds, longest in [measured]]
-            count = groups_of(max(timed), target, deadline) if timed else tests
+            count = groups_of(max(timed), target, bound) if timed else tests
             cuts = [f"{index}/{count}" for index in range(1, count + 1)] if count > 1 else [""]
             found += [(name, f"{cut}{varied}{variant(generation, users=each)}")
                       for cut in cuts for each in processes]
@@ -280,6 +300,20 @@ def identity(record: Mapping) -> str:
     return f"{named} [{record['cell']}]" if record.get("cell") else named
 
 
+def skipped_whole(record: Mapping, untried: set[str]) -> bool:
+    """Whether a cell `record` is of a test main's run skipped whole (`untried`, node ids): its structured
+    test, exactly; a reused row's identity alone only where it reads one way, a skipped node id, " @ ", then
+    a remainder holding no " @ " (its where and any label, `identity`), so a parameter id that holds " @ "
+    and shares a skipped one's start is never taken for it."""
+    if "test" in record:
+        return record["test"] in untried
+    for test in untried:
+        if record["identity"].startswith(f"{test} @ "):
+            if " @ " not in record["identity"][len(test) + 3:]:
+                return True
+    return False
+
+
 def as_ran(row: dict, stale: str) -> dict:
     """A dry prepare's `row`, red as its whole group as it ran (`group`), however it went red: the land queue
     grades such a row again by its group alone (ops queue/suspect_items.py), whose task runs it as a
@@ -300,7 +334,9 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
     any unprepared `stale`, not graded and run again, never green. A reused row is graded again against the
     baseline that stands now, and every red row is its group's as it ran (`as_ran`). A cell its prepare's
     time cap left (where `capped_at`, tests/tier_wire.py's `CAPPED`) is named and counted (`capped`, kept
-    with a reused row) but judged by neither."""
+    with a reused row) but judged by neither, and a test main's run skipped whole at its cap (its node id at
+    the cap, unlabeled: tests/conftest.py's skip) was never tried there, so this run's cells of it are held
+    to nothing, as main's runs are where main has none; a cell or site main capped exempts no sibling."""
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
@@ -314,7 +350,12 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
         if capped and (found.get("output") or "").startswith(head := capped_banner(capped)):
             found = {**found, "output": found["output"][len(head):].lstrip("\n")}
         if isinstance(before, set):
-            new = [record for record in judged_ if record["identity"] not in before]
+            # Main's decision_laya prepare capped its five tests, which a run that reached them failed
+            # alike at main's commit (2026-11-25): no run of main's says how they go.
+            whole = f" @ {capped_at}"
+            untried = {cell[:-len(whole)] for cell in before if cell.endswith(whole)}
+            new = [record for record in judged_ if record["identity"] not in before
+                   and not skipped_whole(record, untried)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
                     for record in new]
@@ -364,7 +405,7 @@ def entries(ci, python: str, timings: dict, target: float, cache: str, stamped: 
         return None if found is None else (sum(found), max(found))
     parted = ci.run_keys.parted_record()
     files = tier_files(ci.test_files(), {name: list(tests) for name, tests in parted.items()})
-    rows_ = planned(files, took, target, ci.VARIED, ci.session.DEADLINE)
+    rows_ = planned(files, took, target, ci.VARIED, cap_after(ci, PREPARE_WALL))
     if not rows_:
         return []
     missed: dict[str, int] = {}
@@ -531,6 +572,9 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
     that declares it compiles at run is neither. A row left no time is said stale. The fixtures are the task's
     own fetch's (ci.py's `task`)."""
     began = time.monotonic()
+    # The task's shared budget, PREPARE_WALL: its topology, baseline lookups and processes draw on it, so no
+    # dry prepare task's pytest sets a train's wall (its records' publication and restores may run past it).
+    deadline = min(deadline, PREPARE_WALL)
     names, kept = ci.kept_of([test.removeprefix(TOKEN) for test in tests])
     units = [(name, split) for name in names] + list(kept)
     wire, rows_ = ci.tier_wire(), []
@@ -542,6 +586,8 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
         """Each of `rest` not prepared, said stale (`ci.stale_row`): the plan's next run of it its grade."""
         return [ci.stale_row(python, name, group, f"not prepared: {why}") for name, group in rest]
 
+    # Each row's checkout writes (`ci.tested`'s), so the next row runs on the commit's checkout (row 13000).
+    written: list[set[str]] = []
     with tempfile.TemporaryDirectory(prefix="dry-prepare-", dir=Path.cwd().parent) as scratch:
         for index, (name, group) in enumerate(units):
             left = deadline - (time.monotonic() - began)
@@ -562,18 +608,22 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
                     break
             before_ = before(ci, python, name, group, time.monotonic() + min(looked, room / 4))
             verdict = out.with_name(f"{out.name}.{index}")
+            untouched = ci.untracked() if index < len(units) - 1 else set()
             process(
                 ci, python, name, ci.cut_of(group), verdict, deadline - (time.monotonic() - began),
                 unit=ci.row(python, name, group), threads=str(max(1, len(os.sched_getaffinity(0)))),
                 users=users, variant=row_variant, cache=cache, common=common(), recorded=True, capped=True,
                 # The node's one GPU, counted as a node's prepare counts its own (tests/lane_environment.py).
                 environ={wire.TRUTHS: str(truths), wire.TOPOLOGY: str(topology), "CUDA_VISIBLE_DEVICES": "0"},
-                kept={name: kept[(name, group)]} if (name, group) in kept else None,
+                kept={name: kept[(name, group)]} if (name, group) in kept else None, written=written,
+                ends=began + deadline,
                 judged=lambda found, truths=truths, before_=before_, generation=generation: graded(
                     found, unprepared_in(truths, (wire.UNPREPARED, wire.DEFERRED), ci.grading.owning),
                     before_, generation, lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
                     ci.grading.STALE, wire.CAPPED))
             rows_ += [nothing_timed(found) for found in json.loads(verdict.read_text())["rows"]]
+            if index < len(units) - 1:
+                ci.restored(written[-1] if written else set(), untouched, out)
     out.write_text(json.dumps({"rows": rows_}))
     # Its rows its verdict: a red one the suite's red exit, as every task's (.armada.json's task.redExit).
     return ci.told(out, 0)

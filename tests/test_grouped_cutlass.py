@@ -12,7 +12,9 @@ import pytest
 from reference_error import equations
 
 from dew.nn.kernels import gemm, generation, grouped_cutlass
+from dew.nn.kernels.templates.gemm import sides as hook_sides
 from dew.nn.kernels.templates.gemm.hooks import Hooks
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @pytest.mark.mesh(devices=2)
@@ -67,8 +69,8 @@ def test_a_call_naming_cutlass_takes_its_rows_through_a_prologue(monkeypatch):
     sizes = jnp.asarray([64, 64], jnp.int32)
 
     def loss(x, w, weights):
-        out = gemm.gemm(x, w, sizes, prologue=lambda rows, scale: rows * scale[:, None],
-                        prologue_operands=((weights, ("rows",)),), out_dtype=jnp.bfloat16)
+        out = gemm.gemm(x, w, sizes, prologue=Hook(lambda rows, scale: rows * scale[:, None],
+                                                   (Side(weights, ("rows",)),)), out_dtype=jnp.bfloat16)
         return jnp.sum(out.astype(jnp.float32))
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="cutlass"):
@@ -92,7 +94,7 @@ def test_a_cutlass_launch_forms_a_singleton_sides_rows_as_xla_forms_them():
     def prologue(x, s):
         return x * s.sum(axis=1, keepdims=True)
 
-    squeezed, axes, positions = gemm._launchable((scale,), (("rows", None),))
+    squeezed, axes, positions = hook_sides.launchable((scale,), (("rows", None),))
     hooks = Hooks(prologue, axes, prologue_broadcast=positions)
     formed = grouped_cutlass._formed(rows, squeezed, hooks)
     want = prologue(rows, scale).astype(jnp.bfloat16)

@@ -31,7 +31,7 @@ from dew.nn import derivatives
 from dew.nn.float_bits import TWO_FACTOR_REACH, exact_power2, raised_exactly
 from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
-from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
+from dew.nn.kernels.templates.product import Blocks, Exact, Support, Transposed
 from dew.nn.precision import (
     at_least_fp32,
     compensated_add,
@@ -557,7 +557,12 @@ def derived_tile(name: str, apart: int = 0):
                          saturation=SATURATION)
 
 
-def doubled(a, issue: Issue):
+Supported = Callable[[str, "Operand", "Operand", Support], jax.Array]
+"""A product of a `Support`'s terms alone (`operands.Issuer.supported`): `doubled`'s merges, whose terms lie
+in its blocks."""
+
+
+def doubled(a, issue: Issue, *, supported: Supported | None = None):
     """`factor`'s doubling on one tile: `(I - A)^-1` `[C, C]` of a strictly lower `a`, every level's blocks
     held in place in the tile, for a mainloop whose products take whole tiles (Mosaic GPU's, a warpgroup's 64
     rows, which hold no block of their own, and whose element-wise steps take 32 of a tile's entries a
@@ -566,24 +571,47 @@ def doubled(a, issue: Issue):
     pairs of `s`-blocks as `X_2s = X_s + (M_s * (X_s A)) X_s` ('merge' twice), `M_s` each pair's lower block:
     the block-diagonal `X_s` against the whole tile, masked there, is its odd blocks' rows of `A` over the
     even ones', so the join is `factor`'s `X2 A21 X1` there and zero elsewhere, the same terms, and a
-    mainloop stages `A` once."""
+    mainloop stages `A` once. Given `supported`, each merge is issued of its terms alone (`_merges_support`):
+    the inverse block-diagonal, `A` strictly lower, the joins in their blocks."""
     size = a.shape[-1]
     rows, cols = _grid(a.shape)
     inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
     width = 2
     while width < size:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
+        if supported is None:
+            inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
+        else:
+            joining, joined = _merges_support(size, width)
+            joins = jnp.where(lower, supported("merge", inverse, a, joining), 0.0)
+            inverse = inverse + supported("merge", joins, inverse, joined)
         width *= 2
     return inverse
 
 
-def solved(system, issue: Issue):
+@functools.cache
+def _merges_support(size: int, width: int) -> tuple[Support, Support]:
+    """`doubled`'s two merges' supports at blocks of `width` (`Support`): the inverse `X_s` lower-triangular
+    in its `width`-blocks, `A` strictly lower, the joins `M_s * (X_s A)` read in each odd block's rows over
+    the block before's columns; then those joins against the inverse, every output read (the sum's). Formed
+    once a size and width, so every trace and part of a merge reads one support and its tiles
+    (`Support.tiles`)."""
+    rows, cols = np.indices((size, size))
+    held = (rows // width == cols // width) & (rows >= cols)
+    joins = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
+    masks = (held, rows > cols, joins, np.ones((size, size), bool))
+    for mask in masks:
+        mask.setflags(write=False)
+    held, lower, joins, every = masks
+    return Support(held, lower, joins), Support(joins, held, every)
+
+
+def solved(system, issue: Issue, *, supported: Supported | None = None):
     """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
     diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
-    product)."""
+    product), its merges of their supports alone where `supported` (`doubled`'s)."""
     rows, cols = _grid(system.shape)
-    return doubled(-system, issue) - jnp.where(rows == cols, 1.0, 0.0)
+    return doubled(-system, issue, supported=supported) - jnp.where(rows == cols, 1.0, 0.0)
 
 
 def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:

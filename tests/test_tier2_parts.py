@@ -185,6 +185,39 @@ def _renamed_mixtral() -> str:
                           "    _input_embed_layer = \"tok_embeddings\"", 1)
 
 
+def _hybrid(family: str, prefix: str) -> tuple[str, str]:
+    """A decoder of `family`'s (transformers' `qwen3_5` or `qwen3_next`) classes, its causal LM, model,
+    layers, delta nets and gated attention, under a model type no family registers, as remote code and its
+    configuration: Tier 2 reads its delta net layers beside its attention ones."""
+    text = "Text" if family == "qwen3_5" else ""
+    modeling = f'''
+from transformers.models.{family}.modeling_{family} import {prefix}ForCausalLM
+
+from .configuration_{family}_hybrid import HybridConfig
+
+
+class HybridForCausalLM({prefix}ForCausalLM):
+    config_class = HybridConfig
+'''
+    configuration = f'''
+from transformers.models.{family}.configuration_{family} import {prefix}{text}Config
+
+
+class HybridConfig({prefix}{text}Config):
+    model_type = "{family}_hybrid"
+'''
+    return modeling, configuration
+
+
+_DELTA_NETS = {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 16,
+               "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4,
+               "layer_types": ["linear_attention", "full_attention"],
+               "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
+                                   "partial_rotary_factor": 0.5}}
+"""A hybrid Qwen source's delta nets and rotary beside `TINY`: two key heads serving four value heads, and
+a rope over half of each attention head."""
+
+
 SOURCES = {
     "renamed": ("renamed_llama", "renamed", _renamed_llama, RENAMED_CONFIG, "RenamedConfig",
                 "RenamedForCausalLM"),
@@ -192,16 +225,36 @@ SOURCES = {
     "renamed-moe": ("renamed_moe", "renamedmoe", _renamed_mixtral, RENAMED_MOE_CONFIG, "RenamedMoeConfig",
                     "RenamedmoeForCausalLM"),
     "latent": ("latent_olmo", "latent", lambda: LATENT, LATENT_CONFIG, "LatentConfig", "LatentForCausalLM"),
+    **{f"{family.replace('_', '-')}-hybrid": (
+        f"{family}_hybrid", f"{family}_hybrid",
+        lambda family=family, prefix=prefix: _hybrid(family, prefix)[0], _hybrid(family, prefix)[1],
+        "HybridConfig", "HybridForCausalLM")
+       for family, prefix in (("qwen3_5", "Qwen3_5"), ("qwen3_next", "Qwen3Next"),
+                              ("kimi_linear", "KimiLinear"))},
 }
 """Each source: its model_type, its modules' stem (`modeling_<stem>.py` and `configuration_<stem>.py`), its
 modeling code, its configuration code, and its config and causal LM classes."""
 
 FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
+          "qwen3-5-hybrid": _DELTA_NETS,
+          # Its delta layer's feed-forward routed (four experts, two a token, beside a sigmoid-gated shared
+          # expert), its attention layer's dense (`mlp_only_layers`): both read (row 13143).
+          "qwen3-next-hybrid": {**_DELTA_NETS, "mlp_only_layers": [1], "num_experts": 4,
+                                "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+                                "shared_expert_intermediate_size": 48},
+          # A delta attention layer beside a latent one, both feed-forwards dense (`mlp_layer_types`), the
+          # latent's keys a head each (its keys expand to every head, as DeepSeek's do).
+          "kimi-linear-hybrid": {"linear_num_heads": 2, "linear_head_dim": 16, "linear_conv_kernel_dim": 4,
+                                 "layer_types": ["linear_attention", "full_attention"],
+                                 "mlp_layer_types": ["dense", "dense"], "q_lora_rank": None,
+                                 "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
+                                 "v_head_dim": 16, "num_key_value_heads": 4},
           # The rotary turns DeepSeek's rotated slice of each head (`qk_rope_head_dim`).
           "latent": {"head_dim": 8, "num_key_value_heads": 4}}
 """Each source's config fields beside `TINY`."""
 
-SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8}
+SEEDS = {"renamed": 8, "mixed": 32, "renamed-moe": 8, "latent": 8, "qwen3-5-hybrid": 8,
+         "qwen3-next-hybrid": 8, "kimi-linear-hybrid": 8}
 """Each source's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
@@ -247,7 +300,7 @@ def sources(tmp_path_factory):
 
 
 @attending("reference")
-@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z0-9-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_of_known_parts_loads_natively_from_its_own_code(sources, name):
     """The source verifies from parts (no registered family's whole convention computes it), loads as a
@@ -276,7 +329,7 @@ def test_a_model_of_known_parts_loads_natively_from_its_own_code(sources, name):
 
 
 @attending("reference")
-@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z0-9-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(sources, name):
     """A decoder assembled from parts reads its pad row off its source's own table, the nn.Embedding
@@ -404,7 +457,7 @@ def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
 
 
 @attending("reference")
-@pytest.mark.shared_setup("tier2_sources", by=r"[a-z-]+")
+@pytest.mark.shared_setup("tier2_sources", by=r"[a-z0-9-]+")
 @pytest.mark.parametrize("name", sorted(SOURCES))
 def test_a_model_loaded_from_parts_saves_under_its_own_names_and_reloads(sources, tmp_path, name):
     """A decoder assembled from parts saves under its source's config and tensor names (each tensor at

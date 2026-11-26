@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from jax._src import api_util, config as jax_config
+from jax._src import ad_util, api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
@@ -288,13 +288,13 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
     kept in `spliced`, by the id of the equation each replaces, where given (`_reclosed` reads them)."""
     made_by = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
     spliced = {} if spliced is None else spliced
-    windows = _windows(jaxpr)
+    windows = _window_clusters(jaxpr)
     deriving = ((_deriving(accurate, saturation) if _deriving_key is None else _deriving_key)
                 if windows else None)
     held = _held(jaxpr) if windows else None
-    for window, yielded in windows:
+    for window, yielded, origins in windows:
         began = time.perf_counter()
-        done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held))
+        done, reused = _derived(window, accurate, saturation, deriving, _declared(window, held, origins))
         seconds = time.perf_counter() - began
         landed = _splices(window, yielded, done, made_by, spliced) if done.picked else {}
         spliced.update(landed)
@@ -318,15 +318,10 @@ _DERIVED: collections.OrderedDict[Hashable, Held[Rewrite]] = collections.Ordered
 read first."""
 
 
-def structure(window: jcore.Jaxpr) -> Hashable:
-    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
-    type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
-    abstract value); each equation's primitive, its
-    parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
-    output's position, or a literal's value and type) and its outputs' types; and which values it yields.
-    Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
-    every compile's of one step."""
-    position = {var: index for index, var in enumerate(window.invars)}
+def structure_of(invars: Sequence[jcore.Var], eqns: Sequence[jcore.JaxprEqn],
+                 outvars: Sequence) -> Hashable:
+    """Structural key over `(invars, eqns, outvars)` without allocating a synthetic `Jaxpr`."""
+    position = {var: index for index, var in enumerate(invars)}
 
     def operand(atom) -> Hashable:
         if isinstance(atom, jcore.Literal):
@@ -335,14 +330,32 @@ def structure(window: jcore.Jaxpr) -> Hashable:
         return position[atom]
 
     equations = []
-    for equation in window.eqns:
-        equations.append((terms.parameters_key(equation.primitive, equation.params),
+    for equation in eqns:
+        primitive, params = equation.primitive, equation.params
+        signature: Hashable = terms.parameters_key(primitive, params)
+        if (primitive is jax.lax.dot_general_p
+                and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
+            # Empty operand meshes do not imply that the dot was traced outside an explicit scope.
+            signature = (signature, terms.unplaced_dot(equation))
+        equations.append((signature,
                           tuple(map(operand, equation.invars)),
                           tuple(terms.parameter_key(var.aval) for var in equation.outvars)))
         for var in equation.outvars:
             position[var] = len(position)
-    return (tuple(terms.parameter_key(var.aval) for var in window.invars), tuple(equations),
-            tuple(map(operand, window.outvars)))
+    return (tuple(terms.parameter_key(var.aval) for var in invars), tuple(equations),
+            tuple(map(operand, outvars)))
+
+
+def structure(window: jcore.Jaxpr) -> Hashable:
+    """What a window's derivation (`_region`) reads of it: each input's type (its aval: shape, dtype, weak
+    type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
+    abstract value); each equation's primitive, its
+    parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
+    output's position, or a literal's value and type), its outputs' types, and a full-fp32 dot's placement
+    admission in its recorded equation context; and which values it yields.
+    Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
+    every compile's of one step."""
+    return structure_of(window.invars, window.eqns, window.outvars)
 
 
 def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
@@ -365,22 +378,30 @@ def _held(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, terms.Magnitude | None], 
 def _declared(
     window: jcore.Jaxpr,
     proven: tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]] | None,
+    eq_origins: Sequence[jcore.Var] = (),
 ) -> dict[int, terms.Proven]:
-    """What `window`'s inputs hold (`terms.Proven`, by input index): each one as the program proves it
-    (`_held`), its magnitude's bound as its power of two where the program bounds one and the rest
-    (`terms.Apart`), so a bound a window cuts its equations below holds within it (a scale's under a
-    broadcast, three equations below the sum that reads it), and no more: a value the program proves no
-    number (a NaN's tanh made outside the window) bounds nothing the window makes of it, where the window
-    took every input for a finite real (spec alignment, 8993)."""
+    """What `window`'s inputs and internal equations hold (`terms.Proven`, inputs at `0..len(invars)-1` and
+    proven internal equation outputs at `len(invars) + eq_idx`): each as the enclosing program proves it
+    (`_held`), so multi-hop proofs whose origin lies outside `WINDOW` (e.g. `_SoftmaxTrack` across
+    `reduce_max -> sub -> exp -> reduce_sum`) stay proven inside the window."""
     declared: dict[int, terms.Proven] = {}
     if proven is None:
         return declared
     held, apart = proven
-    for index, var in enumerate(window.invars):
+
+    def entry_for(var: jcore.Var) -> terms.Proven:
         bound = held.get(var)
         magnitude = (None if bound is None or bound >= 1024
                      else 0.0 if bound == terms.NOTHING else math.ldexp(1.0, bound))
-        declared[index] = terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
+        return terms.Proven(magnitude, apart.get(var, terms.NOWHERE))
+
+    for index, var in enumerate(window.invars):
+        declared[index] = entry_for(var)
+    base = len(window.invars)
+    for eq_idx, orig_var in enumerate(eq_origins):
+        entry = entry_for(orig_var)
+        if entry.bound is not None or entry.apart.floor is not None or entry.apart.sign != 0:
+            declared[base + eq_idx] = entry
     return declared
 
 
@@ -494,11 +515,16 @@ def _placed(window: jcore.Jaxpr, traced: jcore.Jaxpr, kept: list) -> dict[int, l
 
 
 def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
+    """`jaxpr`'s windows, each cluster a jaxpr of its own and its yielded variables (`_window_clusters`)."""
+    return [(window, yielded) for window, yielded, _ in _window_clusters(jaxpr)]
+
+
+def _window_clusters(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var], list[jcore.Var]]]:
     """`jaxpr`'s windows, each cluster a jaxpr of its own: each head a rule may lower the price at
     (`rules.heads`) with the equations of the language that make its operands, `WINDOW` deep, windows that
     share an equation joined up to `CLUSTER` equations; its inputs each value it reads from outside it, its
     outputs each value it makes that the program reads outside it (the values the rewrite may compute anew),
-    in program order; and those values as `jaxpr` names them. None where `jaxpr` holds no head."""
+    in program order; those values as `jaxpr` names them; and each internal equation's original output var."""
     active = rules.head_primitives()
     candidates = [(equation, name) for equation in jaxpr.eqns
                   if (name := terms.spoken_as(equation)) is not None and name in active]
@@ -566,7 +592,12 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
             if out in returned or len(readers) > len(cluster) or any(r not in cluster for r in readers):
                 outputs.append(fresh[out])
                 yielded.append(out)
-        windows.append((jcore.Jaxpr([], list(outside), outputs, equations), yielded))
+        win_debug = (jaxpr.debug_info._replace(arg_names=None, result_paths=None)
+                     if jaxpr.debug_info is not None
+                     else jcore.DebugInfo("algebra_window", "window", None, None))
+        origins = [member.outvars[0] for member in members]
+        windows.append((jcore.Jaxpr([], list(outside), outputs, equations, debug_info=win_debug),
+                        yielded, origins))
     return windows
 
 
@@ -770,6 +801,23 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
     return graph, bundle, roots
 
 
+def dtype_parameter(region: terms.Region, index: int, primitive, params):
+    """What an equation's parameters say about its result dtype, or None if its constructor decides."""
+    if primitive is jax.lax.convert_element_type_p:
+        dtype = params["new_dtype"]
+    elif primitive is jax.lax.dot_general_p and (product := region.products.get(index)) is not None:
+        dtype = product.made
+    elif primitive is jax.lax.is_finite_p:
+        dtype = jnp.bool_
+    elif (op := terms.OPERATIONS.get(primitive)) is not None and op.kind in ("unary", "binary"):
+        dtype = params.get("out_dtype")
+        if dtype is None:
+            return rules.same_dtype(i64(index))
+    else:
+        return None
+    return set_(rules.param_dtype(i64(index))).to(String(np.dtype(dtype).name))
+
+
 def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     """The facts `region`'s parameters and literals state, registered in `graph` (`graphed`'s) beside
     `registered` in one call (egglog's every call its own program: 200 facts took 98 ms one at a time, 53 at
@@ -783,10 +831,12 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     facts: list = [*registered]
     facts += [set_(rules.shape(term)).to(Vec[i64](*(i64(size) for size in extent)))
               for term, extent in region.shapes]
-    arithmetic = (jax.lax.add_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
+    arithmetic = (jax.lax.add_p, ad_util.add_jaxvals_p, jax.lax.mul_p, jax.lax.sub_p, jax.lax.div_p)
     for index, (primitive, params) in enumerate(region.params):
         if primitive in arithmetic and params.get("out_dtype") is None:
             facts.append(rules.plain(i64(index)))
+        if (fact := dtype_parameter(region, index, primitive, params)) is not None:
+            facts.append(fact)
         if primitive is jax.lax.broadcast_in_dim_p:
             rank, laid = len(params["shape"]), tuple(params["broadcast_dimensions"])
             missing = [axis for axis in range(rank) if axis not in laid]
@@ -797,9 +847,18 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     sizes = {size for _, extent in region.shapes for size in extent}
     facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
     widened = {np.dtype(narrow): f"convert_{np.dtype(narrow).name}" for narrow in terms.WIDENED}
+    seen_terms: set[Hashable] = set()
     for term, _ in region.shapes:
         named = terms.key(term)
+        if named in seen_terms:
+            continue
+        seen_terms.add(named)
         bound = region.magnitudes.get(named)
+        dtype = region.dtypes.get(named)
+        cast = get_callable_args(term, terms.Term.convert) if dtype == jnp.float32 else None
+        if cast is not None and region.dtypes.get(terms.key(cast[0])) in (jnp.int8, jnp.uint8):
+            facts.append(rules.int8_values(term))
+            bound = 8 if bound is None else min(8, bound)
         if bound is not None:
             facts += rules.made(term, i64(bound))
         held = region.floors.get(named)
@@ -807,15 +866,20 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             facts.append(set_(rules.log2_floor(term)).to(i64(held.floor)))
             if held.positive:
                 facts.append(rules.positive(term))
-        dtype = region.dtypes.get(named)
-        if dtype is not None and (back := widened.get(dtype)) is not None:
-            facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
+            if held.dyadic_scale:
+                facts.append(rules.dyadic_scale(term))
+        if dtype is not None:
+            if terms._extended_dtype(dtype) is None and dtype != jax.dtypes.float0:
+                facts.append(set_(rules.dtype(term)).to(String(np.dtype(dtype).name)))
+            if (back := widened.get(dtype)) is not None:
+                facts.append(set_(rules.narrowed(term)).to(i64(region.stock[back])))
         if (args := get_callable_args(term, terms.Term.reduce)) is not None:
-            _, params = region.params[terms.integer(args[3])]
+            primitive, params = region.params[terms.integer(args[3])]
             extent = region.shape(args[0])
             length = math.prod(extent[axis] for axis in params["axes"])
             facts.append(set_(rules.sum_length(term)).to(i64(max(length - 1, 0).bit_length())))
-    # A bound of numbers alone (the declared ranges', the constants', and what the equations prove of them)
+            if primitive is jax.lax.reduce_sum_p and _counts_exactly(region, args[0], dtype, length):
+                facts.append(rules.counting_sum(term))
     # holds where the program's values are: a new intermediate under the narrowest float's largest power of
     # two is finite wherever the program is. A bound over an unbounded operand would bound nothing: the
     # program's value may sit far below it while a new intermediate overflows (0.5 x + 0.5 y at 3e38
@@ -832,13 +896,24 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
         graph.register(*facts)
 
 
+def _counts_exactly(region: terms.Region, operand: terms.Term, dtype, length: int) -> bool:
+    """Two counts of predicate elements fit the unit-spaced integer range of the accumulator."""
+    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+        return False
+    cast = get_callable_args(operand, terms.Term.convert)
+    if cast is None or region.dtypes.get(terms.key(cast[0])) != jnp.bool_:
+        return False
+    limits = jnp.finfo(dtype)
+    return (region.dtypes.get(terms.key(operand)) == dtype
+            and 2 * length <= 2 ** min(limits.nmant + 1, limits.maxexp - 1))
+
+
 def _products(region: terms.Region) -> list:
     """The facts a region's products state, each of a mode whose rounding is stated
     (`terms.contraction_slack`): which compute in their operands' dtype (`rules.plain`: no
     accumulation wider than their operands they round back from), which of those are matrix products
     (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
     each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
-    plain_numbers = (((1,), (0,)), ((), ()))
     facts: list = []
     for term, extent in region.shapes:
         if len(extent) == 2:
@@ -866,8 +941,14 @@ def _products(region: terms.Region) -> list:
         # rule may move (base review 3232beb7c).
         if len(operands) == 1 and (wanted is None or operands == {jnp.dtype(wanted)}):
             facts.append(rules.plain(i64(index)))
-            if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:
-                facts.append(rules.matrix_product(i64(index)))
+            if len(extent) == 2 and len(region.shape(args[0])) == len(region.shape(args[1])) == 2:
+                (left_axes, right_axes), batches = jax.tree.map(int, params["dimension_numbers"])
+                if left_axes == (1,) and right_axes in ((0,), (1,)) and batches == ((), ()):
+                    facts.append(set_(rules.matrix_product(i64(index))).to(i64(1 - right_axes[0])))
+                    # Each |byte| < 256: K <= 256 keeps arbitrary integer partial sums below 2**24.
+                    if (right_axes == (1,) and 0 < length <= 256 and operands == {np.dtype(jnp.float32)}
+                            and terms.key(term) in region.unplaced_full_fp32):
+                        facts.append(rules.exact_int8_product(term))
     matrices = {extent for _, extent in region.shapes if len(extent) == 2}
     for extent in sorted(matrices):
         for axis in (0, 1):
@@ -880,8 +961,6 @@ def _products(region: terms.Region) -> list:
         if terms.typed_key(value):
             continue
         literal = terms.Term.literal(i64(index))
-        if _power_of_two(value):
-            facts.append(rules.exact_scale(literal))
         # A finite positive real alone: an infinite scale keeps no order (a zero times it is NaN, where the
         # maximum taken first is finite), so an extremum takes it out of none (spec alignment, 8992).
         if (np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value > 0
@@ -1186,6 +1265,7 @@ class _Body:
     made: jcore.Jaxpr | None
     record: fusion.Recorded
     rewrites: tuple
+    provenance: str | None = None
 
 
 _REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, collections.OrderedDict[Hashable, Held[_Body]]] = (
@@ -1228,7 +1308,8 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         with kernel_report.recording() as regions:
             made, record = fusion.recorded(
                 lambda: _rewritten(closed, accurate, saturation, kernels, _cleaned=_cleaned, _scope=scope))
-        fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
+        prov = None if made is closed else terms.provenance_key(closed)
+        fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten), prov))
         return fresh[0]
 
     def resolve() -> _Body:
@@ -1240,9 +1321,12 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         context_key = fusion.choice_context_of(scope.fusion_base) if kernels else None
         struct_key = (body_digest, key, context_key, bool(_cleaned))
         hit = _cache.holding(_STRUCTURAL_CLOSED, struct_key, rewrite, STRUCTURAL_HELD)
-        if hit.made is None or hit.made.debug_info == closed.debug_info:
+        if hit.made is None:
             return hit
-        return _Body(hit.made.replace(debug_info=closed.debug_info), hit.record, hit.rewrites)
+        prov = terms.provenance_key(closed)
+        if hit.provenance == prov:
+            return hit
+        return _cache.holding(_STRUCTURAL_CLOSED, (struct_key, prov), rewrite, STRUCTURAL_HELD)
     # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
     body = _cache.holding(rewrites, key, resolve, fusion.DECISIONS_HELD)
     reused = not fresh
@@ -1254,15 +1338,6 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         for made_report in body.rewrites:
             kernel_report.record_rewrite(dataclasses.replace(made_report, reused=True))
     return closed if body.made is None else body.made
-
-
-def _power_of_two(value) -> bool:
-    """Whether a literal is a scalar power of two, a multiply by which rounds nothing: a float's of any dtype,
-    ml_dtypes' (bfloat16, float8) among them, which numpy's own type tree does not place among its floats."""
-    if np.ndim(value) != 0 or not jnp.issubdtype(np.asarray(value).dtype, jnp.floating):
-        return False
-    mantissa, _ = np.frexp(float(value))
-    return mantissa in (0.5, -0.5)
 
 
 def node_count(graph: EGraph) -> int:

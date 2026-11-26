@@ -308,14 +308,24 @@ def _lightning_parts(shape: Shape, given: dict) -> tuple:
 
 
 def gated_hooks(shape: Shape):
-    """A gated delta rule's or KDA's shape's hooks: the draws' sigmoid write gates of unit keys and queries
-    (`recurrence.Hooks.write_bound`, `unit_queries`), as layers declare, so an arm runs the own pairs folded
-    as Kimi Linear's layer runs them (`recurrence_chunk._unit_pairs`); this and
-    tools/benchmark_recurrence_mosaic.py's arms alike (row 12214)."""
+    """A gated delta rule's or KDA's shape's hooks as its layer declares them (`GatedDeltaNet.declared`,
+    `KimiDeltaAttention.declared`: a sigmoid's write gates; Kimi's unit queries and least log decay a token),
+    so an arm times the program its layer runs; this and tools/benchmark_recurrence_mosaic.py's arms alike.
+    Built here, the gated delta nets' arms timed unit queries their layers never declare and Kimi's no
+    decay bound, its clamped prefix (row 12263)."""
+    from dew.nn import kda, linear
     from dew.nn.kernels import recurrence
 
+    features = shape.value_heads * shape.value_width
+    if shape.kind == 'kda':
+        layer = kda.KimiDeltaAttention(emb_features=features, num_heads=shape.value_heads,
+                                       head_dim=shape.key_width)
+    else:
+        layer = linear.GatedDeltaNet(emb_features=features, num_k_heads=shape.key_heads,
+                                     num_v_heads=shape.value_heads, head_k_dim=shape.key_width,
+                                     head_v_dim=shape.value_width)
     return recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                            scale=shape.key_width ** -0.5, write_bound=1.0, unit_queries=True)
+                            scale=shape.key_width ** -0.5, **layer.declared)
 
 
 def _gated_parts(shape: Shape, given: dict) -> tuple:

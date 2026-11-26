@@ -1900,6 +1900,69 @@ CODEC_FIELDS = frozenset({QUANTIZATION_CONFIG, EXPERT_DTYPE})
 weights they name and refuses a format it cannot, before a family translator sees the config."""
 
 
+# --------------------------------------------------------------------------
+# Inkling 2's experts (quant_method modelopt under model_type inkling2_loop)
+# --------------------------------------------------------------------------
+#
+# thinkingmachines/Inkling-2-Mini states `{quant_method: modelopt, quant_algo: NVFP4}` and stores its
+# routed experts alone quantized, in no ModelOpt export's names: each layer's `w13_weight` and `w2_weight`
+# `[experts, rows, columns]` beside `_scale`, either NVFP4 (U8 packed E2M1 pairs, the even element in the
+# low nibble, an F8_E4M3 scale per 16 values and a per-expert factor `_amax` [experts] over
+# `_outer_scale_denominator` [1], layers 0-19) or MXFP8 (F8_E4M3 values under a U8 power-of-two exponent
+# per 32, layers 20-23; read off the release's shard headers). transformers dequantizes them so
+# (core_model_loading.py `Inkling2LoopDequantizeExperts` at 3a96649): every product in float32, the
+# group's scale first and the expert's factor after.
+
+INKLING2_TYPES = ("inkling2_loop", "inkling2_loop_text")
+"""The model types whose `modelopt` quantization is Inkling 2's own expert storage."""
+
+_INKLING2_PARTS = ("_scale", "_amax", "_outer_scale_denominator")
+
+
+def _inkling2_names(tensors: Mapping[str, Stored]) -> tuple[str, ...]:
+    names = tuple(sorted(name.removesuffix("_scale") for name in tensors
+                         if name.endswith((".w13_weight_scale", ".w2_weight_scale"))))
+    for name in names:
+        held = [part for part in ("", "_amax", "_outer_scale_denominator") if name + part in tensors]
+        if held not in ([""], ["", "_amax", "_outer_scale_denominator"]):
+            raise ValueError(f"{name} holds {held} beside its scale: MXFP8 its values alone, NVFP4 its "
+                             "codes, amax and outer_scale_denominator")
+    return names
+
+
+def _decode_inkling2(tensors: Mapping[str, Stored], name: str) -> Stored:
+    """One expert bank, float32 `[experts, rows, columns]`, as transformers dequantizes it."""
+    stored, scales = unread.held(tensors[name]), unread.held(tensors[name + "_scale"])
+    if name + "_amax" not in tensors:
+        if stored.dtype != ml_dtypes.float8_e4m3fn or stored.shape[-1] != scales.shape[-1] * 32:
+            raise ValueError(f"{name} is MXFP8, F8_E4M3 values under one exponent per 32, got {stored.dtype} "
+                             f"{stored.shape} under {scales.shape}")
+        values = stored.astype(np.float32).reshape(*scales.shape, 32) * e8m0_scales(scales)[..., None]
+        return values.reshape(stored.shape)
+    codes = _bytes(stored, _CODE_DTYPES)
+    if scales.dtype != ml_dtypes.float8_e4m3fn or codes.shape[-1] * 2 != scales.shape[-1] * 16:
+        raise ValueError(f"{name} is NVFP4, packed E2M1 pairs under an F8_E4M3 scale per 16, got "
+                         f"{codes.shape} under {scales.dtype} {scales.shape}")
+    factor = (unread.held(tensors[name + "_amax"], np.float32)
+              / unread.held(tensors[name + "_outer_scale_denominator"], np.float32))
+    groups = unread.lookup(_E2M1_BYTES, codes).reshape(*scales.shape, 16)
+    values = groups * scales.astype(np.float32)[..., None]
+    values = values * factor.reshape(-1, *(1,) * (values.ndim - 1))
+    return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
+
+
+def _encode_inkling2(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
+    raise ValueError(f"{name}: Inkling 2 is read from its release alone, its experts written back by no "
+                     "exporter")
+
+
+def inkling2_experts() -> SourceQuantization:
+    """Inkling 2's NVFP4 and MXFP8 expert banks (the section above), read and written by no exporter."""
+    return SourceQuantization(
+        _inkling2_names, lambda name: tuple(name + part for part in _INKLING2_PARTS), _decode_inkling2,
+        _encode_inkling2)
+
+
 def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | None:
     """A config's `quantization_config`, or its text_config's where it declares it there alone (KimiK3Config
     lifts `text_config.quantization_config` onto itself, configuration_kimi_k3.py:282-283); None for
@@ -1975,6 +2038,11 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if method == "gptq":
         return gptq(_integer_bits(quantization, "gptq"),
                     v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
+    if method == "modelopt" and config.get("model_type") in INKLING2_TYPES:
+        if quantization.get("quant_algo") != "NVFP4":
+            raise ValueError(f"Inkling 2's release states quant_algo 'NVFP4' over its experts, got "
+                             f"{quantization.get('quant_algo')!r}")
+        return inkling2_experts()
     if method == "modelopt":
         return modelopt_nvfp4(config, quantization, grid)
     raise ValueError(

@@ -83,3 +83,22 @@ def test_two_bf16_parts_of_a_value_sum_within_its_staged_reach():
     total = sum(np.asarray(part, np.float64) for part in product.formed(jnp.asarray(x), 2))
     found = staged(point(x), dataclasses.replace(rw.interpreted_lane(), held=2, wide=True))
     assert np.all((found.lo <= total) & (total <= found.hi)), x[(total < found.lo) | (total > found.hi)]
+
+
+def test_a_key_decays_solve_is_enclosed_as_its_own_bundle_rounds_it():
+    """An H100's Kimi delta attention solve issues by the intra walk's bundle (`intra.sub_chunked`:
+    mma.sync's, one TF32 part rounded to nearest, a tie away), not its other launches' warpgroup MMA's two
+    bf16 parts: a system whose one pair 0.9979 rounds to TF32 0.998046875, a bf16 midpoint stored as 1.0.
+    The solve's lane (`Lane.solving`) encloses that inverse; the call's lane, taken for the solve, rounds
+    0.9979 to bf16 0.99609375 and does not (head review of a61e73fc4)."""
+    lane = dataclasses.replace(rw.interpreted_lane(), held=1, merged=2, tf32="read", solve=(1, "rna"))
+    pairs = np.zeros((rw.SUB, rw.SUB))
+    pairs[1, 0] = np.float32(0.9979)
+    system = point(pairs)
+
+    def stored(solving):
+        return staged(rw.solved_blocks(system, solving), lane)
+
+    native = np.full(pairs.shape, -1.0)
+    assert within(native, stored(lane.solving()))[1, 0]
+    assert not within(native, stored(lane))[1, 0]

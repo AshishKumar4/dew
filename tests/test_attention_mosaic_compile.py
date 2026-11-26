@@ -44,6 +44,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     bundles,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -119,9 +120,9 @@ def _gated_hooks(hooks: str, queries: int, width: int):
             jnp.arange(1, dtype=jnp.int32), jnp.arange(4, dtype=jnp.int32), 0.1))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, queries, width, rows=1, heads=4)
     params, initial = draw_hooks(0)
-    return template.Hooks(score_mod, tuple(template.Param(value, kind) for value, kind in zip(params, kinds,
-                                                                                               strict=True)),
-                          initial)
+    return template.Hooks(score=Hook(score_mod, tuple(Side(value, kind)
+                                                      for value, kind in zip(params, kinds, strict=True))),
+                          initial=initial)
 
 
 def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none",
@@ -941,9 +942,9 @@ def test_the_launches_lower_for_an_h100(call, accurate):
     score_mod, kinds, draw_hooks = score_hooks(FORWARD_HOOKS["all"][0], tokens, tokens, 128)
     params, initial = draw_hooks(0)
     gate = hooks_for(HOOKS["gate"], tokens, 128, gate_of(tokens, 128))
-    hooks = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                            for value, kind in zip(params, kinds, strict=True)), initial,
-                           gate.output_mod, gate.output_params)
+    hooks = template.Hooks(score=Hook(score_mod, tuple(Side(value, kind)
+                                                       for value, kind in zip(params, kinds, strict=True))),
+                           initial=initial, output=gate.output)
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         for forward_hooks in (None, hooks):
             for training in (template.Kept.NONE, template.Kept.SPLIT):
@@ -1056,13 +1057,13 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
         del q_pos
         return applied(q.astype(jnp.float32)).astype(q.dtype)
 
-    for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
+    for hooks in (template.Hooks(score=Hook(score_mod)), template.Hooks(output=Hook(output_mod))):
         for differentiated in (False, True):
             assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
                                                             differentiated=differentiated)
     # A query prologue a launch takes on its query tile (`attention_mosaic_forward._prologued`).
     assert not attention_mosaic_program.approximate(
-        template.Hooks(query_mod=query_mod), (64, 64), 64, differentiated=False,
+        template.Hooks(query=Hook(query_mod)), (64, 64), 64, differentiated=False,
         query=(64, 64, jnp.bfloat16))
 
 
@@ -1145,9 +1146,8 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
     params, initial = draw_hooks(0)
 
     def backward_of(q, k, v, dout, residuals, params, initial):
-        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                                 for value, kind in zip(params, kinds, strict=True)),
-                                initial)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        hooked = template.Hooks(score=Hook(score_mod, sides), initial=initial)
         return attention_route.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
@@ -1173,15 +1173,36 @@ def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, n
     params, initial = draw_hooks(0)
 
     def trained(q, k, v, params, initial):
-        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                                 for value, kind in zip(params, kinds, strict=True)),
-                                initial)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        hooked = template.Hooks(score=Hook(score_mod, sides), initial=initial)
         return attention_mosaic.forward(q, k, v, spans, hooked, natural=natural,
                                         residuals=template.Kept.SPLIT)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(trained).trace(q, kv, kv, params, initial).lower(lowering_platforms=("cuda",))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("axes", [template.Kind.TILE, ("batch", "heads", "queries", "keys")],
+                         ids=["kind", "tuple"])
+def test_a_dense_bias_lowers_for_an_h100_whichever_way_its_axes_are_named(axes):
+    """A dense score bias (a `[B, H, Q, K]` side operand) streamed by an H100's producer lowers in the forward
+    whether its axes are a `Kind` or the plain tuple of them: a launch's kinds read through `kind_of`, where
+    a plain tuple missed its tile's stream and was sliced as a vector's (row 13032, Train 1291's review)."""
+    queries = keys = 256
+    spans = template.spans(queries, keys, 1, causal=True)
+    q = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((1, keys, 2, 128), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((1, 4, queries, keys), jnp.float32)
+
+    def forward(q, k, v, bias):
+        hooked = template.Hooks(score=Hook(lambda s, q_pos, k_pos, b: s + b, (Side(bias, axes),)))
+        return attention_mosaic.forward(q, k, v, spans, hooked)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(forward).trace(q, kv, kv, bias).lower(lowering_platforms=("cuda",))
 
 
 @COMPILES_ON_CPU
@@ -1201,7 +1222,7 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     def score_mod(s, q_pos, k_pos):
         return s + 0.01 * (q_pos[:, :1] if axis == 0 else k_pos[:1, :]).astype(s.dtype)
 
-    hooks = template.Hooks(score_mod)
+    hooks = template.Hooks(score=Hook(score_mod))
     query = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, queries, 2, 128), jnp.bfloat16)
 
@@ -1374,18 +1395,14 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
 
 
 @COMPILES_ON_CPU
-def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pending():
+def test_sm90_fused_and_coop_backward_pipeline_dq_dkv():
     """Row 5272: sm90 fused (d64, d128) and cooperative (d256) backward kernels stage P/dS under one
-    proxy fence and pipeline dQ/dV/dK WGMMAs via `product(..., pending=2)` with zero register spills, while
-    synchronous issuers (`MmaIssuer`) refuse nonzero `pending`."""
+    proxy fence and pipeline dQ/dV/dK WGMMAs, dQ read with dV's and dK's groups in flight
+    (`Issuer.product_with`), with zero register spills."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused, bundles
-
-    mma = bundles.named("mma.sync", jnp.bfloat16, None)
-    with pytest.raises(ValueError):
-        mma.product(jnp.zeros((16, 16), jnp.bfloat16), jnp.zeros((16, 16), jnp.bfloat16), (16, 16), pending=1)
+    from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused
 
     spans = template.spans(512, 512, 1, causal=True)
     with generation.assumed("sm90"):
@@ -2101,3 +2118,25 @@ def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without
         case = KernelCase(f"paired backward {config}", lambda: op.lowering(ba, config))
         found = compile_mosaic_kernels([case], "sm80")
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@lowers("sm120")
+def test_a_g4s_full_training_step_lowers_with_no_value_of_another_trace(without_deterministic_ops):
+    """A G4's (sm120) non-causal training step (32 query heads over 8 key heads 64 wide, bf16, 1 x 4096)
+    lowers: its fused backward's tile chooses masked or whole scores by a branch, whose rows a ring's slots
+    hold once read (`rings.Slots`), so they are read ahead of the branches; one read within the first left
+    the next a tracer of that branch's ended trace, a constant no lowering handles (row 13106, NA35's live
+    G4 run: `foreach()` in a held launch, "No constant handler for DynamicJaxprTracer" without one)."""
+    query = jax.ShapeDtypeStruct((1, 4096, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.bfloat16)
+
+    def step(q, k, v):
+        def loss(q, k, v):
+            out = scaled_dot_product_attention(q, k, v, causal=False, implementation="template")
+            return jnp.sum(out.astype(jnp.float32))
+        return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(step).trace(query, key, key).lower(lowering_platforms=("cuda",))
+

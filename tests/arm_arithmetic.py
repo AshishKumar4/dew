@@ -353,12 +353,14 @@ class Written:
     (`arm_forms._written_twin`). Its `lower` and `trace` are the program an uncommitted call runs, for the
     platform the context places a call on."""
 
-    def __init__(self, fn, compile: Callable = jax.jit):
-        self.fn, self.compile, self._made, self._compiled = fn, compile, {}, {}
+    def __init__(self, fn, compile: Callable = jax.jit, *, own_options: dict | None = None):
+        self.fn, self.compile, self.own_options = fn, compile, own_options
+        self._made, self._compiled = {}, {}
 
     def program(self, platform: str):
         if platform not in self._made:
-            self._made[platform] = self.compile(products_held(self.fn), compiler_options=as_written(platform))
+            options = {**as_written(platform), **(self.own_options or {})}
+            self._made[platform] = self.compile(products_held(self.fn), compiler_options=options)
         return self._made[platform]
 
     def ran_on(self, *inputs, **options) -> str:
@@ -376,9 +378,11 @@ class Written:
 
     def _on_tpu(self, inputs, options):
         """The TPU's compiled twin of a call on `inputs`, None where the TPU compiles none (`ran_on`)."""
-        # Arrays by their types, any other leaf (an option's flag) by its value.
+        # Arrays, JAX's or NumPy's (a draw's host operand, a NumPy scalar), by their types; any other leaf (an
+        # option's flag) by its value.
         leaves, structure = jax.tree.flatten((inputs, options))
-        key = (tuple(jax.typeof(leaf) if isinstance(leaf, jax.Array) else leaf for leaf in leaves), structure)
+        key = (tuple(jax.typeof(leaf) if isinstance(leaf, jax.Array | np.ndarray | np.generic) else leaf
+                     for leaf in leaves), structure)
         if key not in self._compiled:
             try:
                 self._compiled[key] = self.program("tpu").lower(*inputs, **options).compile()

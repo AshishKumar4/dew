@@ -32,7 +32,6 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     Kept,
     KeySpans,
-    Param,
     Split,
     floating_params,
     prescaled,
@@ -40,7 +39,9 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     reference,
     takes_output_residuals,
+    walked_initial,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import configured_precision
 
 
@@ -88,7 +89,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
     hooks = Hooks() if hooks is None else hooks
-    if hooks.output_mod is not None:
+    walked_initial(hooks.initial)
+    if hooks.output.fn is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
     config = _Config(scale, *run_forms(natural, accurate),
@@ -317,15 +319,15 @@ def _attend_backward(config: _Config, saved: Residuals, operands: tuple, dout: j
     # loads them, of the operands as the forward took them (`narrowed`); the prologues' own pullbacks run
     # here, in XLA, beside their neighbours, at those operands.
     narrow_query, narrow_key, _ = config.narrowed(query, key, value)
-    dquery, query_params = _pulled(narrow_query, hooks.query_mod, hooks.query_params, grads.query)
-    dkey, key_params = _pulled(narrow_key, hooks.key_mod, hooks.key_params, grads.key)
+    dquery, query_params = _pulled(narrow_query, hooks.query.fn, hooks.query.sides, grads.query)
+    dkey, key_params = _pulled(narrow_key, hooks.key.fn, hooks.key.sides, grads.key)
     inputs, hooked = with_gradients_formed(
         (dquery.astype(query.dtype), dkey.astype(key.dtype), grads.value.astype(value.dtype)),
         _hooks_cotangent(hooks, grads, query_params, key_params))
     return (*inputs, zero_from_primal(spans), hooked)
 
 
-def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.Array
+def _pulled(operand: jax.Array, mod, params: tuple[Side, ...], cotangent: jax.Array
             ) -> tuple[jax.Array, tuple]:
     """`cotangent`, of `operand` `[B, T, H, D]` under its prologue `mod` (`prologued`), taken back to
     `operand` and to the prologue's parameters: each floating one's gradient, zeros of the others (positions,
@@ -338,7 +340,7 @@ def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.A
         given = [param.value for param in params]
         for index, value in zip(floating, values, strict=True):
             given[index] = value
-        return prologued(operand, mod, tuple(map(Param, given, (param.kind for param in params))))
+        return prologued(operand, mod, tuple(map(Side, given, (param.axes for param in params))))
 
     _, pull = jax.vjp(applied, operand, *(params[index].value for index in floating))
     found = pull(cotangent.astype(operand.dtype))
@@ -373,9 +375,9 @@ def _route(config: _Config) -> Callable:
             widened = tuple(
                 dataclasses.replace(p, value=p.value.astype(wide))
                 if jnp.issubdtype(p.value.dtype, jnp.floating) else p
-                for p in hooks.score_params)
-            return reference(nq, nk, nv, spans, dataclasses.replace(hooks, score_params=widened),
-                             scale=scale)
+                for p in hooks.score.sides)
+            widened_hooks = dataclasses.replace(hooks, score=dataclasses.replace(hooks.score, sides=widened))
+            return reference(nq, nk, nv, spans, widened_hooks, scale=scale)
 
     return contracted("test_a_fused_attention_kernel_holds_every_order")(
         generation.linear_tangent(forward, backward_rule, portable, kind=KernelGlue(), primal=primal))
@@ -394,6 +396,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     resources, else the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
     them (`rounded` False, `_Config.operand_dtype`). `interpret` runs the GPU mainloops on the CPU, as the
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
+    walked_initial(hooks.initial)
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": scale, "natural": natural, "accurate": accurate}
     on_mosaic = _on_mosaic() or interpret
@@ -429,17 +432,16 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 def _hooks_cotangent(hooks: Hooks, grads: Gradients, query_params: tuple = (), key_params: tuple = ()
                      ) -> Hooks:
     """The cotangent of `hooks` in its own structure: each score and prologue parameter's gradient in its
-    `Param` (`_pulled`'s for the prologues', `zero_from_primal` for non-floating params), the initial state's
-    where there is one, and `zero_from_primal` along non-differentiable fields (`drop`, `output_params`)."""
-    def given(params: tuple[Param, ...], found) -> tuple[Param, ...]:
+    `Side` (`_pulled`'s for the prologues', `zero_from_primal` for non-floating params), the initial state's
+    where there is one, and `zero_from_primal` along non-differentiable fields (`drop`, the output hook's)."""
+    def given(params: tuple[Side, ...], found) -> tuple[Side, ...]:
         return tuple(
             dataclasses.replace(param, value=grad if jnp.issubdtype(param.value.dtype, jnp.inexact)
                                 else zero_from_primal(param.value))
             for param, grad in zip(params, found, strict=True))
 
-    return Hooks(score_mod=hooks.score_mod, score_params=given(hooks.score_params, grads.score_params),
-                 initial=grads.initial, output_mod=hooks.output_mod,
-                 output_params=zero_from_primal(hooks.output_params), drop=zero_from_primal(hooks.drop),
-                 rounds=hooks.rounds, query_mod=hooks.query_mod,
-                 query_params=given(hooks.query_params, query_params), key_mod=hooks.key_mod,
-                 key_params=given(hooks.key_params, key_params))
+    return Hooks(score=Hook(hooks.score.fn, given(hooks.score.sides, grads.score_params)),
+                 initial=grads.initial, output=zero_from_primal(hooks.output),
+                 drop=zero_from_primal(hooks.drop),
+                 rounds=hooks.rounds, query=Hook(hooks.query.fn, given(hooks.query.sides, query_params)),
+                 key=Hook(hooks.key.fn, given(hooks.key.sides, key_params)))

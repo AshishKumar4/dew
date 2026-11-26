@@ -22,7 +22,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
+from kernel_compile import TPU_TOPOLOGIES, Uncounted, compile_kernels, failures, gate_generations
 
 from dew import _facts
 from dew.nn.kernels import (
@@ -1105,11 +1105,63 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
 
 @COMPILES_FOR_TPU
 @pytest.mark.usefixtures("libtpu_shared")
-@pytest.mark.parametrize("tpu", ["v5e", "v6e"])
+@pytest.mark.parametrize("tpu", sorted(TPU_TOPOLOGIES))
+def test_a_compile_only_tpu_is_its_generations_target_and_holds_its_stated_vmem(tpu):
+    """Each TPU generation Dew states a compile-only topology of (`GpuTarget.compile_topology`): libtpu's
+    devices of it resolve to that generation's target, a TPU's (a TPU7x's kind, 'TPU7x', among them), and its
+    stated VMEM is what libtpu holds a Mosaic kernel to: pipelined blocks within its scoped limit compile and
+    past it are refused, a scratch within its VMEM compiles and past it is refused (row 9026)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.training.ahead import compile_only_tpus
+
+    device = compile_only_tpus(TPU_TOPOLOGIES[tpu])[0]
+    target = generation.gpu_target(device.device_kind)
+    assert (target.generation, generation.tpu(target)) == (tpu, True), device.device_kind
+    placed = NamedSharding(Mesh(np.array([device]), ("x",)), PartitionSpec())
+
+    def compiles(rows: int, **options) -> bool:
+        scratch = options.pop("scratch", None)
+
+        def kernel(x_ref, o_ref, *scratches):
+            for held in scratches:
+                held[...] = jnp.zeros(held.shape, held.dtype)
+            o_ref[...] = x_ref[...] + sum(jnp.sum(held[...], axis=0, keepdims=True) for held in scratches)
+
+        shape = (8, 128) if scratch else (rows, 128)
+        call = pl.pallas_call(
+            kernel, out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
+            scratch_shapes=[pltpu.VMEM((scratch, 128), jnp.float32)] if scratch else [],
+            **({} if scratch else {"grid": (1,), "in_specs": [pl.BlockSpec(shape, lambda i: (0, 0))],
+                                   "out_specs": pl.BlockSpec(shape, lambda i: (0, 0))}),
+            compiler_params=pltpu.CompilerParams(**options))
+        operand = jax.ShapeDtypeStruct(shape, jnp.float32, sharding=placed)
+        try:
+            jax.jit(call).trace(operand).lower(lowering_platforms=("tpu",)).compile()
+        except jax.errors.JaxRuntimeError:
+            return False
+        return True
+
+    # A block's pipeline holds two buffers of it in the scoped limit: 0.8 and 1.5 of it held.
+    row_bytes = 128 * 4
+    assert compiles(int(0.4 * target.scoped_vmem) // row_bytes)
+    assert not compiles(int(0.75 * target.scoped_vmem) // row_bytes)
+    unbounded = {"vmem_limit_bytes": 4 * 2 ** 30}
+    assert compiles(0, scratch=(target.vmem_bytes - 8 * 2 ** 20) // row_bytes, **unbounded)
+    assert not compiles(0, scratch=(target.vmem_bytes + 2 * 2 ** 20) // row_bytes, **unbounded)
+
+
+@COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
+@pytest.mark.parametrize("tpu", sorted(TPU_TOPOLOGIES))
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's launches on a TPU core (the MXU's bundle: `MosaicGmm` forward and input gradient,
-    `MosaicTgmm`), at the tile each derives from the TPU's facts (its scoped VMEM a measurement's: v5e 16 MiB,
-    v6e 32 MiB, M-EM-37), compiled by libtpu for a compile-only TPU of the generation on this CPU."""
+    `MosaicTgmm`), at the tile each derives from the TPU's facts (its scoped VMEM a measurement's: v5e and
+    v5p 16 MiB, v6e and TPU7x 32 MiB, M-EM-37 and FS-9026-VMEM4/5), compiled by libtpu for a compile-only TPU
+    of each generation Dew states a topology of (`GpuTarget.compile_topology`, a v5p's and a TPU7x's among
+    them, row 9026) on this CPU."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -2056,7 +2108,7 @@ def test_a_walk_ranks_the_qkv_input_gradients_as_a_gh200_ran_them():
     joined: its chain's fp32 hand-offs, written and read back, were no part of it."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
-    step = pricing.step_seconds(tile, target, (2, 2))
+    step = pricing.step_seconds(tile, target, (2, 2), issued=jnp.bfloat16)
 
     def launch(contraction: int, depth: int, width: int, stored: float) -> float:
         walk = pricing.split_walk(tile, groups=1, rows=contraction, depth=depth, width=width,
@@ -2122,4 +2174,41 @@ def test_a_walk_stores_each_output_and_reads_each_epilogue_operand_at_its_dtype(
                  for count in (1, 4)}
         assert walks[4].stored == walks[1].stored
         assert walks[4].stored * 2 == walks[4].passes
+
+
+def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_on_that_kind_alone():
+    """A build that states the kind of GPU it compiled for (a host's own topology's) takes that part's facts
+    within its generation (`built_target`: a GH200's own, not the canonical H100's),
+    refuses a part of another generation, and keeps the canonical target for a kind the table names no part
+    of; its build target loads on that kind alone, where a canonical build loads on any part of its
+    generation (row 13252)."""
+    from dew.nn.kernels.generation import built_target, gpu_target
+    from dew.training.ahead import BuildTarget
+
+    gh200 = built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    canonical = built_target("sm90")
+    assert gh200 == gpu_target("NVIDIA GH200 480GB") and gh200 != canonical
+    assert built_target("sm90", 114, device_kind="NVIDIA GH200 480GB").multiprocessors == 114
+    assert built_target("sm90", device_kind="NVIDIA H999 unknown") == canonical
+    assert built_target("sm90", device_kind=canonical.device_kind) == canonical
+    with pytest.raises(ValueError):
+        built_target("sm80", device_kind="NVIDIA GH200 480GB")
+    stated = BuildTarget.built(gh200, 1, device_kind="NVIDIA GH200 480GB")
+    anywhere = BuildTarget.built(canonical, 1)
+    h100 = dataclasses.replace(stated, device_kind=gpu_target("sm90").device_kind)
+    assert stated.differences(stated) == [] and stated.differences(h100) != []
+    assert anywhere.differences(h100) == [] and anywhere.differences(stated) == []
+
+
+def test_a_programs_lowering_for_a_stated_kind_derives_its_launches_from_that_part():
+    """Within `lowering_for` of a stated kind (a node's own topology's, as `compile_programs` and a prepare's
+    trace read it) the GPU in effect is that part's target, and the generation's canonical one without it
+    (row 13252: a GH200 prepare's launches priced as the canonical H100's)."""
+    from dew.nn.kernels.generation import built_target, gpu_target
+    from dew.training.ahead import lowering_for
+
+    with lowering_for("sm90", device_kind="NVIDIA GH200 480GB"):
+        assert gpu_target() == built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    with lowering_for("sm90"):
+        assert gpu_target() == built_target("sm90")
 

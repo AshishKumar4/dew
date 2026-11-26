@@ -1642,11 +1642,11 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): XLA compiles the
     step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
     the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
-    refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
-    canonical build's beside it in one record directory. Its runs score no split midway, whose programs a
-    build compiles too (row 4752), so its three builds are their steps' alone (row 3981); the first alone
-    inspects, so compiles a sampled step, which no rung record's key holds. Its GPUs' room is what the step
-    needs at two microbatches, less than one needs (each measured, `need_run`)."""
+    refused; the rung its plan recorded is that GPU's, apart from the canonical build's beside it in one
+    record directory. Its runs score no split midway, whose programs a build compiles too (row 4752), so its
+    three builds are their steps' alone (row 3981); the first alone inspects, so compiles a sampled step
+    and keeps a record of its own (the rung key states inspection) beside the second's for the same GPU.
+    Its GPUs' room is what the step needs at two microbatches, less than one needs (`need_run`)."""
     import dataclasses
 
     from run_kinds import lm
@@ -1694,7 +1694,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     assert pcie.derived_for(held) == pcie.target
     with pytest.raises(ValueError):
         pcie.derived_for(gpu_target("sm90"))
-    assert len(list(records.rglob("*.json"))) == 2
+    assert len(list(records.rglob("*.json"))) == 3  # inspected, uninspected and canonical: one record each
 
 
 def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and_loads_where_that_is_held():
@@ -1926,13 +1926,13 @@ each buffer of a value a parameter is then larger than one microbatch's activati
 
 @pytest.mark.parametrize(("generation", "dtype"), ACCUMULATION_CELLS)
 def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_parameter(generation, dtype):
-    """Row 1900: a step that pools four microbatches into a commit, compiled ahead for a GPU, holds
-    beyond the step that commits each one its window's gradient sum, a value a parameter in the
-    parameter's dtype, among its arguments, and no more temporaries than one microbatch's activations,
-    nor more at its peak, outputs included, as XLA's memory analysis of both programs states them. A
-    resident copy of the parameters, a second gradient buffer or a narrow copy kept beside the sum,
-    each two bytes a parameter or more, exceeds that: row 1661's 14 GB on a 4B run surfaced only on a
-    GPU, and this finds its kind on a CPU host."""
+    """Row 1900: a step that pools four microbatches into a commit, compiled ahead for a GPU, holds beyond the
+    step that commits each one its window's gradient sum, a value a parameter in the parameter's dtype, among
+    its arguments, and no more temporaries than one microbatch's activations, nor more at its peak, outputs
+    included, as XLA's memory analysis of both programs states them. A resident copy of the parameters, a
+    second gradient buffer or a narrow copy kept beside the sum, each two bytes a parameter or more, exceeds
+    that: row 1661's 14 GB on a 4B run surfaced only on a GPU, and this finds its kind on a CPU host. Its need
+    holds the window its builder outputs twice at most (row 12400)."""
     from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
@@ -1941,8 +1941,7 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
         trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=AdamW(), lr=1e-3),
                           key=jax.random.key(0), mesh=MeshSpec().build(gpus(generation)),
                           advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
-                          accumulation=accumulation,
-                          split=1)
+                          accumulation=accumulation, split=1)
         trainer.validate(steps=8)
         return compile_ahead(trainer, token_rows(VOCAB, rows, SEQ_LEN + 1))
 
@@ -1956,13 +1955,15 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     # The window's arguments: its gradient sum, and at most a token row a microbatch it holds to replay.
     assert window.argument_bytes - one.argument_bytes <= gradient + held
     # Its temporaries beside the committing step's: fewer than the smallest buffer the cell catches, a narrow
-    # copy's two bytes a parameter. XLA schedules for a target of stated memory, which may hold a
-    # microbatch's working set a little longer, so they are not held to one microbatch's activations.
+    # copy's two bytes a parameter (XLA's schedule for a stated memory may hold a microbatch's working set
+    # longer, so not one microbatch's activations).
     narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
     assert window.temp_bytes - one.temp_bytes < narrow
-    # Its whole peak, outputs that alias no argument among it: the sum and the rows beside the committing
-    # step's, and less than a narrow copy more.
+    # Its whole peak, outputs aliasing no argument: the sum and rows beside the step's, less a narrow copy.
     assert window.peak_bytes - one.peak_bytes < gradient + held + narrow
+    (built,) = [window.starts[digest].memory for digest in set(window.starts) - set(one.starts)
+                if window.starts[digest].memory.argument == 0]
+    assert window.built.memory - one.built.memory <= 2 * built.output + held + narrow
 
 
 def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):

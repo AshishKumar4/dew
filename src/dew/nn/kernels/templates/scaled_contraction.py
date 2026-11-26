@@ -82,6 +82,10 @@ class Form:
     divisor: tuple[Term, ...] = ()
     divided: str = ""
     narrowed: tuple[tuple[int, int, str], ...] = ()
+    units: tuple[int, ...] = ()
+    """The operands of ones a transpose adds along letters no other factor of a term reads, each a factor of
+    the cotangent's group: held apart from the group's other factors (`_parts`), whose product over their
+    letters it would form, and counted in its group as the factor it is (`_band`)."""
 
     def letters(self, group: tuple[Factor, ...]) -> str:
         """`group`'s letters, each once, in the order its factors' subscripts name them."""
@@ -132,6 +136,18 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
     return letters, significand, jnp.where(live, exponent - largest, 0), jnp.squeeze(largest, summed)
 
 
+def _parts(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dtype) -> list:
+    """`group` held (`_held`) as its factors other than its units and each unit apart (`Form.units`): a
+    unit's significand one and its exponent zero, so the parts' product is the group's, each part's
+    offsets the group's, with no product over the unit's letters formed."""
+    units = [factor for factor in group if factor[0] in form.units]
+    if not units:
+        return [_held(form, group, arrays, dtype)]
+    rest = tuple(factor for factor in group if factor[0] not in form.units)
+    parts = ((rest,) if rest else ()) + tuple((unit,) for unit in units)
+    return [_held(form, part, arrays, dtype) for part in parts]
+
+
 WINDOW = 24
 """The binades a window of the banded sum spans (`_banded`): fp32's significand, so a sum within it lies in
 `[2^-23, 2)` of its top, its least bit at least `2^-46`, two exact limbs of `UNIT`."""
@@ -162,9 +178,10 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     group's values span more than a band (`_band`) the sum taken again a band pair at a time into exponent
     bins (`_banded`), so a part beneath terms that cancel survives them. A non-finite output IEEE's, as one
     exponent lands it; a float64 sum's one exponent spans the float32 operands it takes."""
-    precision = PRECISION if dtype == jnp.float32 else jax.lax.Precision.HIGHEST
-    shaped = Form(form.subscripts, terms, out)
-    held = [[_held(shaped, group, arrays, dtype) for group in groups] for _, groups in terms]
+    precision = PRECISION
+    shaped = Form(form.subscripts, terms, out, units=form.units)
+    held = [[part for group in groups for part in _parts(shaped, group, arrays, dtype)]
+            for _, groups in terms]
     scales = [sum((_laid(largest, "".join(letter for letter in letters if letter in out), out)
                    for letters, _, _, largest in groups), jnp.zeros((1,) * len(out), jnp.int32))
               for groups in held]
@@ -434,7 +451,8 @@ def _jvp(primals, tangents, *, form: Form):
             terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for (sign, groups), _, _ in below]
     if not terms:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
-    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided, narrowed)
+    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided, narrowed,
+                   form.units)
     return out, contract(tangent, *operands)
 
 
@@ -450,6 +468,7 @@ def _transpose(cotangent, *arrays, form: Form):
     below: tuple[Factor, ...] = ()
     shared = [arrays[index] for index in known]
     shared_subscripts = [form.subscripts[index] for index in known]
+    kept_units = tuple(place[index] for index in form.units if index in place)
     if form.divisor:
         if any(index not in place for _, groups in form.divisor for group in groups for index, _ in group):
             raise NotImplementedError("a scaled contraction is linear in no divisor's operand")
@@ -458,14 +477,16 @@ def _transpose(cotangent, *arrays, form: Form):
         # The divisor carried apart from its binades, as the forward keeps it unlanded: its significand at
         # its exponent `e` held out of the graph (a contraction of the primals again, its derivatives with it)
         # and `2^-e` an exponent operand, so a divisor past the format divides finite (`y + z` at 2^127).
-        unlanded, joined = _sum(_held_out(shared), Form(tuple(shared_subscripts), divisor, form.divided),
+        unlanded, joined = _sum(_held_out(shared), Form(tuple(shared_subscripts), divisor, form.divided,
+                                                         units=kept_units),
                                 divisor, form.divided, _dtype(shared))
         exponent = jax.lax.stop_gradient(jnp.where(unlanded == 0, 0, joined + binade_of(unlanded)))
         shared.append(-exponent)
         shared_subscripts.append(form.divided)
         lowering = len(shared) - 1
         lowered = tuple((sign, (*groups, ((lowering, 0),))) for sign, groups in divisor)
-        significand = contract(Form(tuple(shared_subscripts), lowered, form.divided), *shared)
+        significand = contract(Form(tuple(shared_subscripts), lowered, form.divided, units=kept_units),
+                               *shared)
         shared.append(jnp.where(significand == 0, jnp.ones((), significand.dtype), significand))
         shared_subscripts.append(form.divided)
         below = ((len(shared) - 1, -1), (lowering, 0))
@@ -474,6 +495,7 @@ def _transpose(cotangent, *arrays, form: Form):
             continue
         subscript = form.subscripts[linear]
         operands, subscripts = list(shared), list(shared_subscripts)
+        units = list(kept_units)
         operands.append(cotangent)
         subscripts.append(form.out)
         pulled = len(operands) - 1
@@ -503,16 +525,18 @@ def _transpose(cotangent, *arrays, form: Form):
                 operands.append(jnp.ones([array.aval.shape[subscript.index(letter)] for letter in unread],
                                          array.aval.dtype))
                 subscripts.append(unread)
+                units.append(len(operands) - 1)
                 extra = ((len(operands) - 1, 1),)
             pulled_term = (sign, (*(group for group in rest if group), ((pulled, 1), *below, *extra)))
             (rounded.setdefault(marks[t], []) if t in marks else terms).append(pulled_term)
         if not terms and not rounded:
             # An operand no term reads (a sum's operand its own transpose carried along): no cotangent.
             continue
-        landed = (contract(Form(tuple(subscripts), tuple(terms), subscript), *operands) if terms
+        pulled_form = functools.partial(Form, tuple(subscripts), out=subscript, units=tuple(units))
+        landed = (contract(pulled_form(tuple(terms)), *operands) if terms
                   else jnp.zeros(array.aval.shape, _dtype(operands)))
         for dtype, apart in rounded.items():
-            alone = contract(Form(tuple(subscripts), tuple(apart), subscript), *operands)
+            alone = contract(pulled_form(tuple(apart)), *operands)
             landed = landed + alone.astype(dtype).astype(alone.dtype)
         out[linear] = landed.astype(array.aval.dtype)
     return out
@@ -551,8 +575,8 @@ def _batched(arrays, dims, *, form: Form):
     terms = spanned(form.terms)
     divisor = spanned(form.divisor) if form.divisor else ()
     divided = letter + form.divided if form.divisor else ""
-    return contract(Form(tuple(subscripts), terms, letter + form.out, divisor, divided, form.narrowed),
-                    *operands), 0
+    return contract(Form(tuple(subscripts), terms, letter + form.out, divisor, divided, form.narrowed,
+                         form.units), *operands), 0
 
 
 batching.primitive_batchers[scaled_contraction_p] = _batched

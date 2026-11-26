@@ -1,6 +1,7 @@
 """A launch's work counted from its kernel's emission (`templates.emission`, row 5895): a step of its walk
 counted from its body, as each warpgroup runs it."""
 
+import contextlib
 import math
 
 import jax
@@ -68,11 +69,11 @@ def _kernel(body, predicate):
 
 @pytest.mark.parametrize("operation", [jnp.exp, jnp.sqrt, lax.rsqrt, jnp.tanh], ids=lambda f: f.__name__)
 def test_a_square_root_counts_on_the_special_function_units_as_an_exponential_does(operation):
-    """A row's sqrt or rsqrt counts one special-function operation an element and no operation of the CUDA
-    cores, as an exp or a tanh does: each an fp32 MUFU on sm80, sm90 and sm100 (`emission.SPECIAL_FUNCTIONS`,
-    their SASS), where a square root counted on the CUDA cores."""
+    """A row's sqrt or rsqrt counts one special-function operation an element, as an exp or a tanh does: each
+    an fp32 MUFU on sm80, sm90 and sm100 (`emission.SPECIAL_FUNCTIONS`, their SASS; XLA's beside the fp32
+    instructions refining it, `XLA_FORMS`), where a square root counted on the CUDA cores alone."""
     role = _emitted(operation, _ROW).roles[0]
-    assert (role.fixed.exponentials, role.fixed.operations) == (128, 0), role.fixed
+    assert role.fixed.exponentials == 128, role.fixed
 
 
 @pytest.mark.parametrize("operation", [jnp.exp, jnp.log, jnp.tanh, jax.nn.sigmoid], ids=lambda f: f.__name__)
@@ -988,24 +989,43 @@ def test_a_laid_out_row_reduction_issues_its_butterfly_once(laid_out, rounds, wh
     assert fixed.operations == 64 * 64 - held + rounds * held + 64, (fixed, held)
 
 
-def test_a_replicated_rows_reduction_combines_each_copy():
+@pytest.mark.parametrize("target", ["sm90", "sm100", "sm100 placed"])
+def test_a_replicated_rows_reduction_combines_each_copy(target):
     """A 1 x 64 fp32 row a row at a time (`swizzling._row_layout`: two values a lane, every warp of the
     warpgroup a copy) summed along it: each of the 128 threads combines its two values, then five rounds
     across the warp's 32 lanes, a shuffle and a combine each, 768 combines where the row's 64 elements
-    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum, which a Blackwell may take
-    by one `redux.sync` across the warp, keeps the elements' price (the review of 8d026cf4a, P2)."""
+    alone counted 576 (the review of lane/toolkit ca6da710b, P2). Its maximum alike on a Hopper, and on a
+    datacenter Blackwell by one `redux.sync` across the warp, the elements' price (the review of 8d026cf4a,
+    P2; Mosaic GPU's float `redux` is compute capability 10.x's alone, train 1286's review), assumed or
+    placed on a compile-only mesh's abstract device unassumed, whose capability Mosaic GPU reads (the
+    review of lane/toolkit 4d9a4198c)."""
     from dew.nn.kernels.templates import swizzling
 
     def body(out_ref, smem):
         row = plgpu.layout_cast(smem[...], swizzling._row_layout((1, 64), jnp.float32))
         out_ref[...] = reduce(row, axis=1)
 
-    for reduce, work in ((jnp.sum, Work(operations=128 * (1 + 5), shuffles=128 * 5)),
-                         (jnp.max, Work(operations=64))):
+    butterfly = Work(operations=128 * (1 + 5), shuffles=128 * 5)
+    generation_named = target.split()[0]
+
+    @contextlib.contextmanager
+    def placed():
+        if target.endswith("placed"):
+            # Unassumed, whatever the process assumes around it (a GPU tier's prepare, its own generation).
+            abstract = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("data",)), generation_named)
+            with generation.assumed(None), jax.sharding.use_abstract_mesh(abstract):
+                yield
+        else:
+            with generation.assumed(generation_named):
+                yield
+
+    for reduce, work in ((jnp.sum, butterfly),
+                         (jnp.max, Work(operations=64) if generation_named == "sm100" else butterfly)):
         launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
                               thread_name="wg", scratch_types=[plgpu.SMEM((1, 64), jnp.float32)])
         traced = jax.make_jaxpr(launch)().jaxpr
-        fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
+        with placed():
+            fixed = emission.emitted(traced, 1, "wg", forms=emission.ACCURATE_FORMS).roles[0].fixed
         assert (fixed.operations, fixed.shuffles) == (work.operations, work.shuffles), (reduce, fixed)
 
 
@@ -1090,6 +1110,33 @@ def test_a_compile_only_gpu_mesh_lowers_for_cuda_unassumed():
     assert fixed.operations == 0, fixed
 
 
+def test_a_devices_lowering_platform_is_one_rule_for_concrete_and_abstract_gpus():
+    """The platform JAX lowers for on a GPU device, one rule (`programs.lowering_platform`) the count reads
+    too (`generation.lowering_platform`): a client's ROCm, oneAPI or CUDA build's by its version, else `cuda`
+    where the device states an NVIDIA compute capability (a compile-only client's, an abstract device's of
+    a compile-only mesh, no client) and None where it states none (train 1286's review: generation's own
+    rule read a concrete ROCm device as unnamed; the review of lane/toolkit 4d9a4198c: any other client
+    read as CUDA's)."""
+    from types import SimpleNamespace
+
+    from jax._src.mesh import AbstractDevice
+
+    from dew.nn import programs
+
+    def device(version: str, capability: str | None = None):
+        return SimpleNamespace(platform="gpu", client=SimpleNamespace(platform_version=version),
+                               compute_capability=capability)
+
+    assert programs.lowering_platform(device("rocm 6.4.1", "gfx942")) == "rocm"
+    assert programs.lowering_platform(device("oneapi 2025.1")) == "oneapi"
+    assert programs.lowering_platform(device("cuda 12090", "9.0")) == "cuda"
+    # A compile-only client's version, its device kind, names no platform: its capability does.
+    assert programs.lowering_platform(device("NVIDIA H100", "9.0")) == "cuda"
+    assert programs.lowering_platform(device("a GPU")) is None
+    assert programs.lowering_platform(AbstractDevice("NVIDIA H100", 132, "gpu", "9.0")) == "cuda"
+    assert programs.lowering_platform(AbstractDevice("a GPU", 1, "gpu")) is None
+
+
 def test_a_walks_platform_chosen_mask_is_static():
     """A walk's step reading a platform-chosen index tile (an iota or its reverse, `lax.platform_dependent`)
     times a literal: the choice is its compile's, a constant, so the multiply is of the program's constants
@@ -1163,6 +1210,79 @@ def test_an_fp32_division_in_a_kernel_issues_a_reciprocal_and_its_refinement():
     assert priced(jnp.float32, hopper, None) == Work(exponentials=128, operations=6 * 128)
     assert priced(jnp.float32, tpu, None) == Work(operations=128)
     assert priced(jnp.int32, hopper, emission.ACCURATE_FORMS) == Work(integer_operations=128)
+
+
+@pytest.mark.parametrize("forms", [None, emission.ACCURATE_FORMS], ids=["xla", "kernel"])
+def test_an_integer_power_prices_as_its_multiplies_and_a_negative_ones_division(forms):
+    """`x ** y` issues as its lowering does: repeated squaring's multiplies (`x ** 2` one, `x ** 5` three:
+    x², x⁴, x⁴·x), and a negative power those beside the reciprocal (`x ** -1` an fp32 division of one by x:
+    XLA's div.rn.f32, a kernel's div.full.f32), never one operation whatever its exponent (row 12948)."""
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def priced(primitive, operands, **params) -> Work:
+        return emission.operation_work(primitive, [row] * operands, [row], params, hopper, forms=forms)
+
+    multiply, divide = priced(lax.mul_p, 2), priced(lax.div_p, 2)
+    assert priced(lax.integer_pow_p, 1, y=2) == multiply
+    assert priced(lax.integer_pow_p, 1, y=5) == multiply + multiply + multiply
+    assert priced(lax.integer_pow_p, 1, y=-1) == divide
+    assert priced(lax.integer_pow_p, 1, y=-2) == multiply + divide
+
+
+@pytest.mark.parametrize("approx", [False, True], ids=["accurate", "approximate"])
+def test_a_kernels_erf_and_atan2_issue_their_polynomials(approx):
+    """A Mosaic GPU kernel's fp32 erf issues the polynomial its PTX holds an element whatever `approx_math`
+    (math.erf: one ex2.approx beside 21 fp32 instructions, its FMAs, selects and compares, and two integer
+    ones), and its atan2 a reciprocal's MUFU and a division's form beside 30 fp32 instructions and three
+    integer ones (FS-ERF-FORMS1, sm90's PTX), as a traced kernel's count reads them (`launch_work`): never
+    one operation an element, nor unpriced (row 12426, whose fork patch lowers both at warpgroup semantics).
+    A bfloat16 one is unmeasured: its erf one operation an element, its atan2 unpriced (the review of
+    lane/toolkit 8e40bc612)."""
+    def work(operation, dtype) -> Work:
+        row = jax.ShapeDtypeStruct((128,), dtype)
+
+        def body(rows, out, staged):
+            staged[...] = operation(rows[...])
+            out[...] = staged[...]
+
+        launch = plgpu.kernel(body, out_type=row, num_threads=1, thread_name="wg",
+                              scratch_types=[plgpu.SMEM((128,), dtype)],
+                              compiler_params=plgpu.CompilerParams(approx_math=approx))
+        traced = jax.make_jaxpr(launch)(row).jaxpr
+        (kernel,) = [equation for equation in programs.equations(traced)
+                     if equation.primitive in programs.NATIVE_KERNELS]
+        return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+
+    with generation.assumed("sm90"):
+        copied = work(lambda rows: rows, jnp.float32)
+        erf = work(lax.erf, jnp.float32)
+        atan2 = work(lambda rows: lax.atan2(rows, rows + 1), jnp.float32)
+        narrow = {name: work(operation, jnp.bfloat16) for name, operation in (
+            ("copied", lambda rows: rows), ("erf", lax.erf), ("atan2", lambda rows: lax.atan2(rows, rows)))}
+    added = {unit: (getattr(erf, unit) - getattr(copied, unit), getattr(atan2, unit) - getattr(copied, unit))
+             for unit in ("exponentials", "operations", "integer_operations", "unpriced_operations")}
+    # atan2's divisor, `rows + 1`, an fp32 add an element beside its form.
+    assert added == {"exponentials": (128, 2 * 128), "operations": (21 * 128, (30 + 7 + 1) * 128),
+                     "integer_operations": (2 * 128, 3 * 128), "unpriced_operations": (0, 0)}, added
+    assert narrow["erf"].operations - narrow["copied"].operations == 128, narrow
+    assert narrow["atan2"].unpriced_operations - narrow["copied"].unpriced_operations == 128, narrow
+
+
+def test_xlas_fp32_log_issues_more_than_its_division_and_its_exponential():
+    """XLA's own fp32 logarithm is libdevice's polynomial, no MUFU at all: nineteen fp32 instructions, a
+    conversion and four integer ones an element, more issue than its IEEE division's MUFU.RCP and six or its
+    exponential's MUFU.EX2, its range reduction's six and a shift, each more than a square root's MUFU.RSQ
+    beside two FMULs and an FSETP (the SASS of XLA's fusions for an H100 and an A100 alike, M-FS-78). So the
+    algebra takes a log over a division only where it saves one."""
+    hopper = generation.gpu_target("sm90")
+    row = jax.ShapeDtypeStruct((128,), jnp.float32)
+
+    def issued(primitive, operands) -> float:
+        return cost.issued(emission.operation_work(primitive, [row] * operands, [row], {}, hopper))
+
+    assert issued(lax.log_p, 1) > max(issued(lax.div_p, 2), issued(lax.exp_p, 1))
+    assert min(issued(lax.div_p, 2), issued(lax.exp_p, 1)) > issued(lax.sqrt_p, 1)
 
 
 @pytest.mark.parametrize(("body", "fused"), [

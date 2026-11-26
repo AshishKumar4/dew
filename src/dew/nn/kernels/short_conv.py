@@ -228,8 +228,8 @@ def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, seg
 
 def conv_pieces(convolved, parts, dtype):
     """`convolved` `[B, S, D]` as `causal_conv1d` returns it for `parts` (the whole, where None), in `dtype`:
-    each piece split off in order and the `head`-wide groups of a normalised one l2-normalised
-    (`l2_normed`)."""
+    each piece split off in order and the `head`-wide groups of a normalised one l2-normalised, rounded once
+    to `dtype` (`l2_normed`, its tangent free of cancellation under a checkpointed scanned backward)."""
     if parts is None:
         return convolved.astype(dtype)
     pieces, first = [], 0
@@ -238,7 +238,5 @@ def conv_pieces(convolved, parts, dtype):
         first += width
         if head is not None:
             piece = l2_normed(piece.reshape(*piece.shape[:-1], -1, head), dtype).reshape(piece.shape)
-        else:
-            piece = piece.astype(dtype)
-        pieces.append(piece)
+        pieces.append(piece.astype(dtype))
     return tuple(pieces)

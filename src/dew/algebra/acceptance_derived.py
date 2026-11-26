@@ -26,19 +26,12 @@ Receipts:
 
 from collections.abc import Callable
 
-import jax.numpy as jnp
 from jax import lax
+
+from dew.algebra import _generated
 
 
 def _lse_folded_probabilities_0(x1, x2, x3):
-    v4 = lax.log_p.bind(x3, accuracy=None)
-    v5 = lax.add_p.bind(x2, v4)
-    v6 = lax.sub_p.bind(x1, v5)
-    v7 = lax.exp_p.bind(v6, accuracy=None)
-    return (v7,)
-
-
-def _lse_folded_probabilities_1(x1, x2, x3):
     v4 = lax.sub_p.bind(x1, x2)
     v5 = lax.exp_p.bind(v4, accuracy=None)
     v6 = lax.div_p.bind(v5, x3)
@@ -55,25 +48,27 @@ def _normalized_values_product_0(x1, x2, x3):
     return (v6,)
 
 
+_lse_folded_probabilities_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+        _lse_folded_probabilities_0,
+    ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+        _lse_folded_probabilities_0,
+}
+
+
 def lse_folded_probabilities(*operands, policy: str = 'default', target: str = 'sm90'):
     """lse_folded_probabilities's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_0,
-        ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_1,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_lse_folded_probabilities_forms, operands, policy, target, single=True)
+
+
+_normalized_values_product_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
+        _normalized_values_product_0,
+    ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
+        _normalized_values_product_0,
+}
 
 
 def normalized_values_product(*operands, policy: str = 'default', target: str = 'sm90'):
     """normalized_values_product's generated form for `policy` and `target` at its operands' case."""
-    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_0,
-        ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _generated.call(_normalized_values_product_forms, operands, policy, target, single=True)

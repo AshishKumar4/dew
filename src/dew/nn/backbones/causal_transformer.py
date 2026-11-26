@@ -319,6 +319,10 @@ class CausalTransformer(LinearProducts):
     """A vocabulary bias added in fp32 after a tied or untied head's product, as
     Phi's, GPT-J's and ModernBERT's decoders add one (`output_table`'s `bias`)."""
     tie_embeddings: bool = True
+    output_vocab: int | None = None
+    """The head's logits' width where it is narrower than the table's rows (`vocab_size`): the head
+    keeps every row as stored and scores the first `output_vocab` alone (`logits_width`). Inkling 2's
+    head scores 200058 of its 201024 released rows, the rest padding no tokenizer id reaches."""
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
@@ -426,9 +430,17 @@ class CausalTransformer(LinearProducts):
 
     def __post_init__(self):
         settle_fields(self)
+        if self.output_vocab is not None and not 0 < self.output_vocab <= self.vocab_size:
+            raise ValueError(f"a head scores at most its table's {self.vocab_size} rows, got "
+                             f"output_vocab={self.output_vocab}")
         # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
         _ = self.wiring
         super().__post_init__()
+
+    @property
+    def logits_width(self) -> int:
+        """`LogitsWidth`: the head's logits' width, its first `output_vocab` rows or every row."""
+        return self.vocab_size if self.output_vocab is None else self.output_vocab
 
     @property
     def wiring(self) -> BlockWiring:
@@ -518,7 +530,10 @@ class CausalTransformer(LinearProducts):
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
             qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
-            mixer=kind.mixer)
+            mixer=kind.mixer,
+            mixer_conv=kind.mixer_conv,
+            feedforward_conv=kind.feedforward_conv,
+            depth_sites=kind.depth_sites)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
         """The fraction of a kind's head its rotary turns, None for all of
@@ -823,6 +838,8 @@ class CausalTransformer(LinearProducts):
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              normalize_values=self.attention_residuals.normalize_values,
+                                             scaled=self.attention_residuals.scaled,
+                                             gained=self.attention_residuals.gained,
                                              name='output_res')
         if self.engram is not None:
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
@@ -947,6 +964,9 @@ class CausalTransformer(LinearProducts):
             hyper_connections=None if spec.streams is None else self.hyper_connections,
             streams_at_ends=(False, False) if spec.streams is None else spec.streams,
             residual_site=spec.residual_site,
+            depth_sites=spec.kind.depth_sites,
+            mixer_conv=spec.kind.mixer_conv,
+            feedforward_conv=spec.kind.feedforward_conv,
             cross_pass=self.loop.messages if spec.messaged and self.loop is not None else None,
             dropout_rate=self.dropout_rate,
             remat=self.remat,
@@ -1400,9 +1420,7 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = self.exit_states(x)
-        self._gate_exit(hidden)
-        hidden = self.head_states(hidden)
+        hidden = self.head_states(self.exit_states(x))
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
@@ -1415,14 +1433,6 @@ class CausalTransformer(LinearProducts):
         """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
         passes under one scan, so a step's program holds two passes whatever the loop's count."""
         return run_loop(self, x, **stack)
-
-    def _gate_exit(self, normed):
-        """Sow the exit gate's logit for the output's states into `exits`, after each earlier pass's."""
-        if self.loop is None or not self.loop.exit_gate:
-            return
-        logit = self.early_exit_gate(normed)
-        if not self.is_initializing():
-            self.sow(EXITS, 'logits', logit)
 
     def exit_states(self, x):
         """The stack's one residual `x` as it leaves for the head and the exit gate: through the final norm
@@ -1455,12 +1465,14 @@ class CausalTransformer(LinearProducts):
         return normed.astype(wide) / jnp.asarray(self.logits_scaling, wide)
 
     def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
-              span: tuple[int, int] | None = None, prior_bank=None):
+              span: tuple[int, int] | None = None, prior_bank=None, kv_store=None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages
         (`decoder_stages.stack`), each layer of a looped block that passes messages reading `prior_bank`
-        (`Loop.messages`)."""
+        (`Loop.messages`), its layers' providers' publications read from and left in `kv_store` (a loop's
+        part's, `dew.nn.backbones.looping`; a fresh one where None)."""
         return decoder_stages.stack(self, x, train=train, decode=decode, per_layer_input=per_layer_input,
-                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank)
+                                    attention_metadata=attention_metadata, span=span, prior_bank=prior_bank,
+                                    kv_store=kv_store)
 
     def residual_summary(self, x) -> jax.Array:
         """The `[B, S, D]` summary of the residual `x` a block of a looped pass leaves its pass after
@@ -1518,7 +1530,7 @@ class CausalTransformer(LinearProducts):
         return banked_collections(groups, self.variables)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, per_layer_input,
-                       attention_metadata=None, first: int = 0) -> jnp.dtype:
+                       attention_metadata=None, first: int = 0, kv_store=None) -> jnp.dtype:
         """Return the dtype the residual stream settles in: `x`'s promoted with layer `first`'s output.
 
         A scan carries one dtype through, and each pipeline stage takes the
@@ -1531,8 +1543,10 @@ class CausalTransformer(LinearProducts):
         call's own path: opened beyond them, an attention sowing its QK-Clip
         maxima decided a kernel for a mask the call never builds (a cache made
         under a chosen template refused, row 4101). Its routes are no route the
-        call takes (`generation.routes`, alone). A banked store answers from
-        its bank's first row without fetching it.
+        call takes (`generation.routes`, alone). It reads a copy of the
+        publications the span enters with (`kv_store`), so a span opening on
+        a layer that reads its provider's reads them. A banked store answers
+        from its bank's first row without fetching it.
         """
         layer = self.layers[first]
         streams = x.streams if isinstance(x, Carried) else x
@@ -1541,7 +1555,8 @@ class CausalTransformer(LinearProducts):
         with generation.routes(alone=True):
             output = jax.eval_shape(lambda held: layer.apply(
                 held, x, mutable=opened, rngs={'params': jax.random.key(0)},
-                train=train, decode=decode, kv_store={} if self.provides else None,
+                train=train, decode=decode,
+                kv_store=dict(kv_store) if kv_store is not None else ({} if self.provides else None),
                 per_layer_input=None if per_layer_input is None else per_layer_input.layer(first),
                 attention_metadata=attention_metadata), self._layer_shapes_at(first))
         output = output if opened is False else output[0]

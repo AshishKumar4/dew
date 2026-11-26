@@ -332,32 +332,40 @@ def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
     path's) on par with the plain merge's from float64 (check 1, test_merged's draws): the kernel and the
     law's composition it replaces are two programs, each held to the one truth (testing.md), never to each
     other's bits."""
-    from dew.nn.kernels import tuning
-    from dew.nn.kernels.templates import merged
 
     spec, ours, _ = test_merged._merges(form)
     reference = as_given(test_merged.state_orders(test_merged._plain_state(spec)))
     orders = jax.jit(test_merged.state_orders(test_merged.finished_state(ours, spec)))
     assert_as_exact(orders, reference, test_merged._drawn, f"a padded merge on this gpu, {form}",
                     seeds=test_merged.MERGE_SEEDS)
-    # Single stats writer holds behaviorally across 1-block and 2-block channel schedules (row 12222),
-    # and padded trailing columns (`read_width > width`) never contaminate valid outputs.
-    padded, stacked = test_merged._drawn(0)[:2]
-    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(64)}):
-        one_block = jax.jit(lambda p, s: tuple(ours(p, s)))(padded, stacked)
-    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(32)}):
-        two_blocks = jax.jit(lambda p, s: tuple(ours(p, s)))(padded, stacked)
-    for lhs, rhs in zip(one_block, two_blocks, strict=True):
-        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
-    nan_pad = jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)
-    padded_wide = jnp.concatenate([padded, nan_pad], axis=-1)
-    with_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
-    # And on Mosaic GPU's merge where Pallas Triton serves the unhooked one (`merged.MOSAIC_SLOWER`).
-    with tuning.pinned({merged.MergedPadded: merged.MergeConfig(64)}):
-        mosaic_pad = jax.jit(lambda p, s: tuple(ours(p, s)))(padded_wide, stacked)
-    for lhs, rhs, pinned in zip(one_block, with_pad, mosaic_pad, strict=True):
-        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(rhs))
-        np.testing.assert_array_equal(np.asarray(lhs), np.asarray(pinned))
+    # Its schedules each held to the one truth (testing.md: two programs never to each other's bits): one
+    # stats writer across a 1-block and a 2-block channel schedule (row 12222), padded trailing columns of
+    # NaN (`read_width > width`) never reaching its outputs, on Pallas Triton's merge and on Mosaic GPU's
+    # where Triton serves the unhooked one (`merged.MOSAIC_SLOWER`).
+    for label, block, pad in (("one block", 64, False), ("two blocks", 32, False),
+                              ("padded columns", None, True), ("padded columns, mosaic", 64, True)):
+        orders = jax.jit(test_merged.state_orders(test_merged.finished_state(_scheduled(ours, block, pad),
+                                                                             spec)))
+        assert_as_exact(orders, reference, test_merged._drawn, f"a padded merge on this gpu, {form}, {label}",
+                        seeds=test_merged.MERGE_SEEDS)
+
+
+def _scheduled(merge, block: int | None, pad: bool):
+    """`merge` (`test_merged._merges`') on Mosaic GPU's launch at the channel block `block` (on the
+    generation's own merge at its derivation's where None), its slices' columns padded by 32 of NaN where
+    `pad`: each schedule a program of its own."""
+    from dew.nn.kernels import generation, tuning
+    from dew.nn.kernels.templates import merged
+
+    def run(padded, stacked):
+        if pad:
+            padded = jnp.concatenate([padded, jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)], -1)
+        if block is None:
+            return merge(padded, stacked)
+        pinned = tuning.pinned({merged.MergedPadded: merged.MergeConfig(block)})
+        with generation.chosen(merge="mosaic"), pinned:
+            return merge(padded, stacked)
+    return run
 
 
 def test_the_decode_matrix_holds_on_this_gpu():

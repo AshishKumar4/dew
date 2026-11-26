@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.continuum import HeadTerms, HeadTransform, _head_growth, _squared_norm, continuum_modules
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, watched_or_owned
 
 from ..activations import _SLOPES, UNGATED, ungated_activation
 from ..blocks import normal_kernel
@@ -107,17 +107,43 @@ def head_logits(decoder: CausalTransformer, x):
         x = decoder.project_out(x)
     # fp32 logits whose product follows the compute dtype
     # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
+    width = decoder.logits_width
     if decoder.tie_embeddings:
-        logits = head_product('...d,vd->...v', x, decoder.embed_tokens.embedding, decoder.precision)
+        logits = head_product('...d,vd->...v', x, decoder.embed_tokens.embedding[:width], decoder.precision)
+    elif decoder.lm_head.features == width or not _scored_alone(decoder):
+        # Every column the head stores, its first `width` scored (`output_vocab`).
+        logits = decoder.lm_head(x)[..., :width]
     else:
-        logits = decoder.lm_head(x)
+        # Its first `width` columns alone contracted, by the layer's own promotion and product (its
+        # `dot_general`): a stored column past them, finite in fp32 and inf in the bf16 product's operands,
+        # would meet its zero cotangent in the states' pullback as inf times zero (row 13135).
+        head = decoder.lm_head
+        states, kernel, _ = head.promote_dtype(x, decoder.applied_kernel("lm_head")[:, :width], None,
+                                               dtype=head.dtype)
+        logits = head.dot_general(states, kernel, (((states.ndim - 1,), (0,)), ((), ())),
+                                  precision=head.precision)
     # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
     computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
     # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
-    return capped_logits(scaled_logits(logits, token_gains(decoder),
-                                       decoder.head_bias_value if decoder.head_bias else None),
+    return capped_logits(scaled_logits(logits, _scored(token_gains(decoder), width),
+                                       _scored(decoder.head_bias_value if decoder.head_bias else None,
+                                               width)),
                          decoder.final_logit_softcap).astype(
         output_dtype(computed if decoder.dtype is None else decoder.dtype))
+
+
+def _scored_alone(decoder: CausalTransformer) -> bool:
+    """Whether the untied head's call is its kernel's plain product, which `head_logits` takes over the
+    scored columns alone: not at init, which creates the kernel, nor where the layer holds more than its
+    kernel (an adapter's factors, a packed kernel's codes, a recipe's amax history) or another computes or
+    watches the call (`watched_or_owned`: an adapter's or a checkpoint quantization's interceptor, Qwix, a
+    capture of its output), nor over rounded operands (`linear_product`)."""
+    if decoder.is_initializing():
+        return False
+    head = decoder.lm_head
+    held = {collection: set(leaves) for collection, leaves in head.variables.items()}
+    return (held == {"params": {"kernel"}} and not watched_or_owned(head)
+            and decoder.linear_product("lm_head"))
 
 
 def output_table(decoder: CausalTransformer) -> OutputTable | None:
@@ -149,15 +175,25 @@ def quantizer(decoder: CausalTransformer, layer: nn.Module):
 
 def head_table(decoder: CausalTransformer) -> OutputTable:
     """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
-    embeddings, with `logits_from_hidden`'s scale, bias, softcap, precision and compute dtype, a checkpoint's
-    quantizer of its input, and `project_out` before it past an embedding's own width (`Projection`)."""
+    embeddings, whole (`OutputTable.scored` its first `logits_width` rows where it scores fewer), with
+    `logits_from_hidden`'s scale, bias, softcap, precision and compute dtype, a checkpoint's quantizer of its
+    input, and `project_out` before it past an embedding's own width (`Projection`)."""
+    width = decoder.logits_width
     matrix = decoder.embed_tokens.embedding if decoder.tie_embeddings else decoder.applied_kernel("lm_head")
+    stored = matrix.shape[0 if decoder.tie_embeddings else 1]
     projection = None if decoder.embedding_features is None else Projection(
         decoder.applied_kernel("project_out"), decoder.precision, compute=decoder.dtype,
         input_quantizer=quantizer(decoder, decoder.project_out),
         path=projections.kernel_path(decoder.project_out))
-    return OutputTable(matrix, decoder.tie_embeddings, decoder.head_bias_value if decoder.head_bias else None,
+    return OutputTable(matrix, decoder.tie_embeddings,
+                       _scored(decoder.head_bias_value if decoder.head_bias else None, width),
                        decoder.final_logit_softcap, decoder.precision, compute=decoder.dtype,
                        input_quantizer=(None if decoder.tie_embeddings
                                         else quantizer(decoder, decoder.lm_head)),
-                       scale=token_gains(decoder), projection=projection)
+                       scale=_scored(token_gains(decoder), width), projection=projection,
+                       scored=None if width == stored else width)
+
+
+def _scored(per_token: jax.Array | None, width: int) -> jax.Array | None:
+    """A per-token term of the head (its bias, its gains) over the tokens it scores, its first `width`."""
+    return None if per_token is None else per_token[..., :width]

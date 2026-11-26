@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.programs import holes, own_preset
 from dew.nn.residuals import Residual
 
@@ -60,7 +61,7 @@ from .attention_parallel import (
     tensor_shards,
     visibility_refused,
 )
-from .attention_sinks import sink_softmax
+from .attention_sinks import sink_column, sink_softmax
 from .attention_tpu import splash_mask_descriptor, tpu_attention
 from .decode_geometry import folded_attention, folds, grouped_query
 from .documents import (
@@ -79,6 +80,7 @@ from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template
 from .precision import (
+    EXACT_FLOAT32,
     asks_default_precision,
     at_least_fp32,
     at_precision,
@@ -180,9 +182,41 @@ class SeparableBias(NamedTuple):
         return self.rows[..., :, None] + self.columns[..., None, :]
 
 
-def dense_bias(bias):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class BandBias:
+    """An additive bias held within a band of keys about each query, `values` `[B or 1, H or 1, Q,
+    template.band_width(extent)]`: query `q`'s column `c` the bias of key `template.band_origins(offset, Q,
+    extent)[q] + c`, every key outside its band biased by nothing. Every key within `extent - 1` before a
+    query's place through its place (`offset`, `[]` or `[B]` int32: a query's place less its index, the key
+    it is at; 0 from the first key) lies in its band: an input-conditioned relative bias (Inkling 2's,
+    `attention_terms.relative_band`) at `Q band_width` entries a head, where its `[B, H, Q, K]` writing out
+    holds 96 GiB at 32768 keys. Every route takes it written out (`dense`)."""
+
+    values: jax.Array
+    offset: jax.Array
+    extent: int = dataclasses.field(metadata={"static": True})
+
+    def __post_init__(self):
+        # A tree's rebuild (`jax.tree.map`'s, a transform's) passes leaves of any kind: an array's checked.
+        if not hasattr(self.values, "shape"):
+            return
+        if self.extent < 1 or self.values.shape[-1:] != (template.band_width(self.extent),):
+            raise ValueError(f"a band of extent {self.extent} holds {template.band_width(self.extent)} "
+                             f"columns a query, got values {jnp.shape(self.values)}")
+
+    def dense(self, keys: int) -> jax.Array:
+        """The bias written out over `keys`, `[B or 1, H or 1, Q, K]` (`template.band_dense`)."""
+        return template.band_dense(self.values, self.offset, self.extent, keys)
+
+
+def dense_bias(bias, keys: int | None = None):
     """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
-    any other as it is."""
+    a `BandBias` over `keys` (`BandBias.dense`), any other as it is."""
+    if isinstance(bias, BandBias):
+        if keys is None:
+            raise ValueError("a band bias is written out over the call's keys, which its caller states")
+        return bias.dense(keys)
     return bias.dense() if isinstance(bias, SeparableBias) else bias
 
 
@@ -402,8 +436,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     validity and places with
     their rows. Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
-    if sinks is not None and sinks.shape != (query.shape[2],):
-        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and sinks.shape not in ((query.shape[2],), query.shape[:3]):
+        raise ValueError(f"sinks hold one logit a query head, or one a query and head, got {sinks.shape}")
     quantized = quantized_rule(sinks is not None, bool(dropout_rate))
     if quantized == 'reference':
         raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
@@ -426,21 +460,20 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
         capped = None if softcap is None else template.Capped(softcap)
         if rows_bias is not None and columns_bias is not None:
-            params = (template.Param(rows_bias, template.Kind.QUERY),
-                      template.Param(columns_bias, template.Kind.KEY))
+            params = (Side(rows_bias, template.Kind.QUERY),
+                      Side(columns_bias, template.Kind.KEY))
         elif bias is None:
             params = ()
         elif bias.shape[2] == 1:
-            params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
+            params = (Side(bias[:, :, 0], template.Kind.KEY),)
         else:
-            params = (template.Param(bias, template.Kind.TILE),)
+            params = (Side(bias, template.Kind.TILE),)
         score_mod = capped if not params else template.Biased(capped)
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
         hooks = template.Hooks(
-            score_mod=score_mod,
-            score_params=params,
+            score=Hook(score_mod, params),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         if quantized:
@@ -459,7 +492,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     separable = bias if isinstance(bias, SeparableBias) else None
     dense = None if isinstance(bias, SeparableBias) else bias
     return on_attention_shards(local, query, key, value, coordinates=dropout_seed is not None,
-                      sinks=(sinks, ("activation_heads",)),
+                      sinks=(sinks, ("activation_heads",) if sinks is None or sinks.ndim == 1
+                             else ("activation_batch", "activation_length", "activation_heads")),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
                       starts=(starts, rows), block_groups=(block_groups, ("activation_batch", None)),
                       image_groups=(image_groups, ("activation_batch", None)),
@@ -653,8 +687,8 @@ def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor,
         rows_per_block = length // skipped.shape[-2]
         logits = jnp.where(jnp.repeat(skipped, rows_per_block, axis=-2), -jnp.inf, logits)
     walked = logit_floor is not None or skipped is not None
-    if sinks is not None and sinks.shape != (heads,):
-        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and sinks.shape not in ((heads,), (*logits.shape[:-3], logits.shape[-2], heads)):
+        raise ValueError(f"sinks hold one logit a query head, or one a query and head, got {sinks.shape}")
     if sinks is not None and not walked:
         widest = jnp.promote_types(logits.dtype, sinks.dtype)
         return sink_softmax(logits, sinks, at_least_fp32(widest) if wide else None)
@@ -707,11 +741,11 @@ def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision
 
 def _floored_softmax(logits: jax.Array, floor, sinks: jax.Array | None = None) -> jax.Array:
     """The softmax of `logits` `[..., H, Q, K]` over the keys from a starting maximum `floor`
-    (`reference_attention`'s `logit_floor`) and each head's sink `[H]` beside them where given: `m = max(m,
+    (`reference_attention`'s `logit_floor`) and the sink beside them where given (`sink_column`): `m = max(m,
     floor, sink)`, each weight `exp(logit - m)` over their sum and the sink's `exp(sink - m)`, a row of no
     weight 0, its maximum -inf shifting by none."""
     most = jnp.maximum(jnp.max(logits, axis=-1, initial=-jnp.inf), jnp.asarray(floor, logits.dtype))
-    sink = None if sinks is None else sinks.astype(logits.dtype)[:, None]
+    sink = None if sinks is None else sink_column(sinks.astype(logits.dtype), logits.shape)[..., 0]
     if sink is not None:
         most = jnp.maximum(most, sink)
     shift = jnp.where(jnp.isfinite(most), most, 0.0)
@@ -836,7 +870,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     without `causal` to the keys within w - 1 of i (`window_sides`); both read
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table) or is a
-    `SeparableBias` (FoX's). `sinks` is one learned value-free logit per query head
+    `SeparableBias` (FoX's) or a `BandBias` (a bias within a band of keys about each
+    query, Inkling 2's relative one). `sinks` is one learned value-free logit per query head
     in the denominator. `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits`
     forms them wide, which the reference alone does (`reference_only`). `scale_logits`
     applies the scale `D ** -0.5` to the fp32 logits after the product (jax.nn's
@@ -912,6 +947,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
+    bias = bias.dense(key.shape[-3]) if isinstance(bias, BandBias) else bias  # every route's, written out
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -1020,6 +1056,9 @@ def _unread(value, heads: int, fill: float, sinks, precision) -> jax.Array:
     values read by its query heads in place), so values whose sum overflows read their finite mean as that
     path reads them; NaN where `fill` is NaN, whose gradient is NaN at every value."""
     *rows, keys, kv_heads, width = value.shape
+    if sinks is not None and sinks.ndim != 1:
+        raise ValueError("a row seeing no key under a finite fill reads a head's sink, not a query's: "
+                         "fill a query's sinks' masked keys -inf")
     if fill != fill:
         share = jnp.full((heads,), jnp.nan, jnp.float32)
     elif sinks is None:
@@ -1399,7 +1438,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
         if generation.numerics().forms == "accurate":
-            precision = jax.lax.Precision.HIGHEST
+            precision = EXACT_FLOAT32
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
@@ -1510,7 +1549,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
                     and not isinstance(bias, SeparableBias)),
         separable_bias=isinstance(bias, SeparableBias),
-        sinks=sinks is not None, softcap=softcap,
+        sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),

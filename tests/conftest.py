@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import urllib.parse
 from datetime import timedelta
 from pathlib import Path
@@ -621,6 +622,10 @@ class WorkerRequests(list):
     def __init__(self):
         super().__init__()
         self.connections: set[int] = set()
+        # The writes the Worker answers 503, as an unavailable one does: each to a path holding one of these.
+        self.refusing: set[str] = set()
+        # The writes the Worker holds unanswered that long, as a stalled one does: path part to seconds.
+        self.stalling: dict[str, float] = {}
 
 
 @pytest.fixture
@@ -686,6 +691,12 @@ def cache_worker():
         def do_PUT(self):
             if not self._authorized():
                 return
+            if any(part in self.path for part in seen.refusing):
+                self._answer(503, close=True)
+                return
+            for part, seconds in seen.stalling.items():
+                if part in self.path:
+                    time.sleep(seconds)
             if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
                 self._answer(413, close=True)
                 return

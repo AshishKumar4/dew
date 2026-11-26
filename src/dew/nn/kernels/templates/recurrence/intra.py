@@ -549,14 +549,12 @@ def _solved(call: Call, totals, inverse_tiles: tuple, solve: tuple, stored: Call
 
 def _pair_swizzles(call: Call, blocks: dict, keys: int) -> dict[str, int]:
     """The intra walk's streams' swizzles: each its widest at `keys` columns (`resources.widest_swizzle`), or
-    unswizzled (`swizzling.UNSWIZZLED`) where an fp32 call with a decay a key dimension (its prefix's limbs,
-    `Call.prefix_limbs`) takes mma.sync's products (its issuer's, `mosaic_sm80.MmaIssuer`, an A100's and a
-    consumer Blackwell's alike): Mosaic GPU synthesizes no shared-memory transfer from a
-    128-byte swizzled fp32 tile into the register layout a TF32 product's operand takes beside that decay, so
-    an A100's fast fp32 Kimi delta attention lowered no intra launch (row 12647); a decay a head's fp32 call
-    lowers swizzled."""
-    plain = (isinstance(call.family, mosaic_sm80.MmaIssuer) and call.given.stored == jnp.float32
-             and call.prefix_limbs > 0)
+    unswizzled (`swizzling.UNSWIZZLED`) where an fp32 call takes mma.sync's products (its issuer's,
+    `mosaic_sm80.MmaIssuer`, an A100's and a consumer Blackwell's alike): Mosaic GPU synthesizes no
+    shared-memory transfer from a 128-byte swizzled fp32 tile into the register layout a TF32 product's
+    operand takes, so an A100's fast fp32 Kimi delta attention lowered no intra launch (row 12647). The walk
+    serves a decay a key dimension alone, so no term of it states one (row 12853)."""
+    plain = isinstance(call.family, mosaic_sm80.MmaIssuer) and call.given.stored == jnp.float32
     return {name: swizzling.UNSWIZZLED if plain else resources.widest_swizzle(dtype, keys)
             for name, (_, dtype) in blocks.items()}
 

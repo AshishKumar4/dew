@@ -55,6 +55,7 @@ import numpy as np
 import pytest
 import syrk_matrix
 import test_contracts_gemm as contracts_gemm
+import test_declared_cells_memory as declared_cells_memory
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
@@ -193,6 +194,32 @@ def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
+    """A dense bf16 product the template leaves to XLA, no derivative taken, stores bf16 directly
+    (`gemm_xla.direct_dtype`, row 12898): check 1 against XLA's own dense dot (Dense's, the reference's bf16
+    product) from float64 truth, over draws whose rows cancel to below a bf16 ulp of their terms."""
+    from dew.nn.kernels import gemm
+
+    def draw(seed):
+        rng = np.random.default_rng(12898 + seed)
+        x = rng.normal(size=(512, 1024))
+        w = rng.normal(size=(1024, 768)) / np.sqrt(1024)
+        x[:, 512:] = -x[:, :512] * (1 + 2.0 ** -9)  # each row's second half nearly cancels its first
+        w[512:] = w[:512]
+        return x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)
+
+    def dew_fn(x, w):
+        with generation.chosen(grouped_matmul="xla"):
+            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def plain(x, w, *, wide=None, out=jnp.bfloat16):
+        return jax.lax.dot(x.astype(wide or x.dtype), w.astype(wide or w.dtype),
+                           preferred_element_type=wide).astype(out)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "xla fallback dense bf16 512x1024x768", seeds=8,
+                    truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -200,6 +227,14 @@ def _syrk_and_tail_cells():
                   native=lambda case: {"launch": "syrk", "form": case[1]},
                   fault=lambda case: ("native SYRK upper-triangle mirror store (row 11941)"
                                       if case[1] == "gram" else None)),
+        Cell("an XLA fallback's dense bf16 product holds check 1 against XLA's own dot",
+             an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90",
+             fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
+        *(Cell(f"an XLA fallback's {product} tangent sums its terms before rounding",
+               functools.partial(TANGENT_SUMS, product),
+               "sm90", fault=CUBLAS_BF16, at_run=EXACT_TANGENT,
+               native={"launch": "xla fallback", "pass": f"{product} tangent"})
+          for product in ("gemm", "gemm_t")),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
@@ -220,6 +255,21 @@ SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+TANGENT_SUMS = declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding
+"""The tangent's cancellation check (tests/test_declared_cells_memory.py), run on CUDA's fallback."""
+
+EXACT_TANGENT = "an exact value its run compiles and reads, no check-1 site for a prepare to compile ahead"
+"""Why the fallback's tangent cells run their programs at run (`Cell.at_run`): each asserts one exact
+tangent, bitwise, where a compile-only prepare's program has no device to run on (main f37f47cdf's sm90
+prepare: 'Executable' object has no attribute 'local_devices')."""
+
+EXACT_OVERFLOW = "an exact finite value its run compiles and reads, no check-1 site for a prepare to compile"
+"""Why the blockwise FP8 overflow witness runs at its run (`Cell.at_run`): it asserts one exact value of a
+native launch, which a compile-only prepare's device cannot run (row 13257)."""
+
+CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
+"""Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
@@ -253,9 +303,11 @@ def _toolkit_cells() -> list[Cell]:
     ]
 
 
-KERNEL_PARTS = 4
+KERNEL_PARTS = 6
 """The kernels flow's parts (`in_parts`): its prepare alone 164 s warm on a GH200's host (MAINGPU-63d4814e1),
-and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound."""
+and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound; six
+since its native tail and fallback cells, whose sm90 prepare group took 647 s against a 606 s bound
+(row 13037), so a group packs smaller parts under it."""
 
 JOIN_PARTS = 2
 """The join matrix's parts (`in_parts`): its prepare 153 s warm on a GH200's host (MAINGPU-63d4814e1)."""
@@ -300,7 +352,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, jnp.bfloat16, "sm80",
                                  tiling.Tiles(*tile, warpgroups=1, cluster=1, family="mma.sync", programs=2)),
-               "sm80", fault=BALANCED_TAIL)
+               # An A100's cp.async pipelines, which a GPU copying by TMA lowers as another kernel and refuses
+               # (`lowers_as`; main's GH200 tier, rows 13127, 13129, 13130).
+               "sm80", mosaic=True, fault=BALANCED_TAIL)
           for rows, depth, width, tile in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
@@ -310,6 +364,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
+        Cell("a blockwise FP8 product at large finite scales is finite",
+             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
@@ -531,5 +588,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
         gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
     for scale, out_dtype, d_x in gradients:
-        assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
-        assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])
+        # Every feature of the cotangent's row 64 (or 256 through the scale), every other row zero: exact.
+        want = np.zeros((8, 16), np.float32)
+        want[0] = 64.0 * (4.0 if scale > 1 else 1.0)
+        np.testing.assert_array_equal(np.asarray(d_x, np.float32), want, err_msg=str(out_dtype))

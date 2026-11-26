@@ -325,6 +325,43 @@ a float32 scalar, one a layer in a scanned stack), named and placed as its histo
 a training step takes the largest of across its calls and microbatches and rolls in (`rolled`)."""
 
 
+NVFP4_PENDING = 'nvfp4_pending'
+"""The collection of the largest magnitudes a delayed-scaling NVFP4 run recorded in calls an optimizer that
+holds updates back (`optax.MultiSteps`) took in but applied no update in, which the call that applies one
+rolls in with its own (`rolled_waiting`, row 12994): each history's (`NVFP4_HISTORY`) mirror, float32 `[]`
+(`[layers]` in a scanned stack), -1 where nothing waits (a magnitude is never below zero, and zero is one). A
+run whose optimizer applies every update holds none."""
+
+
+def pending_amax(histories: Mapping) -> dict:
+    """An `NVFP4_PENDING` collection for `histories` with nothing waiting: each history's newest place, -1."""
+    return {name: pending_amax(value) if isinstance(value, Mapping) else jnp.full_like(value[..., 0], -1.0)
+            for name, value in histories.items()}
+
+
+def rolled_waiting(histories: Mapping, pending: Mapping, amaxes: Mapping, applied: jax.Array,
+                   taken: jax.Array) -> tuple[dict, dict]:
+    """`histories` and their `NVFP4_PENDING` collection `pending` after a step under an optimizer that holds
+    updates back: each history `amaxes` holds a largest for waits on the larger of it and what waited where
+    the optimizer `taken` the step's input (a skipped input's records wait for no update); where the step
+    `applied` an update, every history something waits for rolls it in, newest (`rolled`), a projection an
+    earlier call ran and this one did not among them, and nothing waits after."""
+    def at(name, history):
+        if isinstance(history, Mapping):
+            return rolled_waiting(history, pending[name], amaxes.get(name, {}), applied, taken)
+        waiting = pending[name]
+        if name in amaxes:
+            recorded = jnp.reshape(jnp.asarray(amaxes[name], waiting.dtype), waiting.shape)
+            waiting = jnp.where(taken, jnp.maximum(waiting, recorded), waiting)
+        newest = jnp.reshape(waiting.astype(history.dtype), (*history.shape[:-1], 1))
+        moved = jnp.concatenate([newest, history[..., :-1]], axis=-1)
+        rolls = jnp.reshape(applied & (waiting >= 0), (*history.shape[:-1], 1))
+        return jnp.where(rolls, moved, history), jnp.where(applied, jnp.full_like(waiting, -1.0), waiting)
+
+    pairs = {name: at(name, value) for name, value in histories.items()}
+    return {name: pair[0] for name, pair in pairs.items()}, {name: pair[1] for name, pair in pairs.items()}
+
+
 def amax_history(layer: nn.Module, name: str, shape: tuple[int, ...]) -> nn.Variable | None:
     """`layer`'s amax history for its projection `name` by a `shape` (`[..., depth, width]`, a product's
     extents as matrices) matrix, held at its path as `name` (`NVFP4_HISTORY`), where the run trains in a

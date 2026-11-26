@@ -28,6 +28,7 @@ from typing import Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src import core as jax_core
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
@@ -54,6 +55,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.product import Support
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
 from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
@@ -399,6 +401,10 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 """The product groups committed under one predicate alone, none within it (`issued_one_of`'s cases'
 own)."""
 
+_HERE = _cache.untraced(contextvars.ContextVar[tuple[list, ...]]("here", default=()))
+"""The blocks counting the product groups committed in their own trace (`committed_here`), each its trace
+and its count so far."""
+
 
 def refuse_staging(family, chunks: tuple[int, int] | None, outputs: tuple = ()) -> tuple[tuple, ...]:
     """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole, and any of
@@ -431,6 +437,10 @@ def committed() -> None:
         _UNSURE.set(_UNSURE.get() + 1)
     if _PREDICATED.get() == 1:
         _ONCE_PREDICATED.set(_ONCE_PREDICATED.get() + 1)
+    here = jax_core.find_top_trace(())
+    for block in _HERE.get():
+        if block[0] is here and not _PREDICATED.get():
+            block[1] += 1
 
 
 def commits() -> int:
@@ -445,6 +455,22 @@ def sure_commits() -> int:
     group, whichever predicated ones a run commits too, as groups complete in their order (theme K01-e's
     review P0: a wait counting a predicated group a run skipped read the group before it unfinished)."""
     return _COMMITTED.get() - _UNSURE.get()
+
+
+@contextlib.contextmanager
+def committed_here() -> Iterator[Callable[[], int]]:
+    """Within the block, the product groups committed in its own trace (`committed`), a count read by the
+    callable it yields: none in a trace inside it (a branch's or a loop's, which a run may take none or many
+    of; a scope's too, which runs once but traces apart) nor under a predicate a run decides
+    (`predicated`), so every run of the block commits each it counts. A read of a product leaving that many
+    groups in flight waits on the product's own (`Issuer.product_with`), where a declared count a branch
+    committed fewer than read the product unfinished (row 10851)."""
+    block = [jax_core.find_top_trace(()), 0]
+    token = _HERE.set((*_HERE.get(), block))
+    try:
+        yield lambda: block[1]
+    finally:
+        _HERE.reset(token)
 
 
 def predicated(issue: Callable):
@@ -1236,17 +1262,16 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, running `between()` while the product runs
-        and returning `(between(), product)` out of the accumulator's scope (`WgmmaIssuer`). `pending` is
-        the count of this warpgroup's later product groups left in flight when the accumulator is read
-        (issued by `between()` before the read); synchronous issuers take `pending=0` only and raise
-        `ValueError` otherwise."""
+        and returning `(between(), product)` out of the accumulator's scope (`WgmmaIssuer`): the product read
+        once at most the groups `between()` committed in its own trace are in flight (`committed_here`), so
+        those run on past it; a synchronous issuer's done as it is issued."""
 
-    def product(self, lhs, rhs, shape: tuple[int, int], *, pending: int = 0) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape` (`product_with` with no overlapped work)."""
-        return self.product_with(lhs, rhs, shape, lambda: None, pending=pending)[1]
+        return self.product_with(lhs, rhs, shape, lambda: None)[1]
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -1269,19 +1294,28 @@ class Issuer[Accumulator](abc.ABC):
     def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
-        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
-        by an IEEE add."""
+        fp32 sum of its products, scaled by `scale(start, columns, partial)` where given (its columns' scaling
+        of the partial from `start`, which takes the partial so it can order its scales to keep the
+        intermediate normal: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`, row 13257),
+        added into `running` by an IEEE add."""
         rows, columns = running.shape
         fresh = self.product(lhs, rhs, (rows, columns))
-        return running + (fresh if scale is None else fresh * scale(0, columns))
+        return running + (fresh if scale is None else scale(0, columns, fresh))
 
     @abc.abstractmethod
-    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
-                 ) -> Accumulator:
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True,
+                 support: Support | None = None) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
-        done)."""
+        done); of `support`'s terms alone where given, which only an issuer whose instructions each take a
+        tile of their own (`term_tile`) issues, its others refusing it (`whole_products`)."""
+
+    @property
+    def term_tile(self) -> tuple[int, int] | None:
+        """The tile of a product's outputs each of its instructions takes, rows by columns, every thread's
+        share of it issued together, so an instruction skipped is skipped for every thread alike (`products`'
+        `support`); None where its instructions take the whole product at once (a warpgroup's, a CTA's)."""
+        return None
 
     def issued_unless(self, idle: jax.Array, acc, issue: Callable):
         """`issue()`'s accumulator, its products issued only where `idle` (traced, one value across the
@@ -1380,12 +1414,14 @@ class Issuer[Accumulator](abc.ABC):
             return value
         return value[:, first:first + (value.shape[1] - first if columns is None else columns)]
 
-    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool) -> Accumulator:
+    def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool, *,
+               support: Support | None = None) -> Accumulator:
         """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
         shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
-        (`products`)."""
+        (`products`), of `support`'s terms alone where given (a part of a zero is zero)."""
         for i, j in product.terms(len(left), len(right)):
-            acc = self.products(acc, left[i], right[j])
+            acc = self.products(acc, left[i], right[j]) if support is None else self.products(
+                acc, left[i], right[j], support=support)
         return acc
 
     def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
@@ -2127,6 +2163,13 @@ class Transport[Allocated, Opened](abc.ABC):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
 
+def whole_products(issuer: Issuer, support: Support | None) -> None:
+    """Refuses a product of a `support` (`Issuer.products`') on `issuer`, whose instructions take
+    its products whole (`Issuer.term_tile` None)."""
+    if support is not None:
+        raise NotImplementedError(f"{type(issuer).__name__} issues its products whole, none of a support")
+
+
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
     """An instruction family's bundle (design §6, one mainloop per overlap structure): an issuer and its
     accumulator home (`Issuer`) composed with an execution policy (`Transport`), so a mainloop holds no
@@ -2190,7 +2233,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
         """fp32 `value`'s `count` bf16 parts (`product.formed`), natively each saturating one in the family's
-        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits."""
+        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits; a family of no
+        register layout (a TPU core's, `mosaic_tpu.MxuIssuer`) forms them portably."""
         if interpret:
             return product.formed(value, count)
         narrowed = functools.partial(inline_forms.satfinite_bf16, layout=self.layout)

@@ -25,6 +25,11 @@ class Slow:
         return self
 
 
+AT_RUN = "times calls on this GPU, which no prepare can time: no check-1 site"
+"""Why a timing test here compiles at its run (`compiles_at_run`)."""
+
+
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_benchmark_times_each_call_until_its_output_is_ready_after_untimed_warm_ups():
     traced = []
 
@@ -130,6 +135,7 @@ def scheduled(monkeypatch, seed: int) -> Scheduled:
     return clock
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_comparison_reads_two_arms_paired_and_role_swapped_against_their_own_noise(monkeypatch):
     """Two calls compared (`compared`): one taking four times the other's 12 ms, timed in role-swapped
     pairs, read as their paired ratio, and the faster call against itself (its A/A), each interval at a
@@ -334,6 +340,7 @@ print(json.dumps(found))
 behaviours read into a JSON object of truths (its test's)."""
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
 def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
     """In a process that runs no command buffers (`benchmark.UNGRAPHED_FLAG`, the timing tool's device
@@ -353,6 +360,7 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
     assert found == dict.fromkeys(outcomes, True), found
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monkeypatch):
     """In a process whose XLA runs command buffers, which CUPTI does not read whole (a conditional node's
     branch unrecorded, G4-LF-2; an A100's measured call failing, row 4880), a call is read as a program of
@@ -397,6 +405,7 @@ def test_a_timing_runs_a_call_without_the_command_buffers_its_process_runs(monke
             session.kernels(compiled, x)
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkeypatch):
     """`tools/benchmark_kernels.py projection` names its grouped matmul by kernel (`--kernel`, `--against`):
     a kernel of the grouped selector's or the selector's own ('auto') is taken, any other name refused at the

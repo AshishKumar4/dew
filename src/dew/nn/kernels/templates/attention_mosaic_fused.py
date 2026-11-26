@@ -217,12 +217,10 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
     stage_shape = ((consumers, buffers, max(block_q, block_k), stage_width) if buffers > 1
                    else (consumers, max(block_q, block_k), stage_width))
-    # The stage's fp32 rows at the narrowest swizzle where its adds read it: a wgmma accumulator's stores
-    # into it then take no select a register pair (the 128-byte swizzle's: 256 FSEL of the fused dK/dV's
-    # 3,432 instructions, a compile-only sm90's at Qwen3-8B's widths; 32-byte, 80, and 9 registers fewer;
-    # M-NA-28-gh200's 160M FSEL against FlashAttention 3's 68M, row 5272).
-    stage = family.staged_memory(stage_shape, jnp.float32,
-                                 swizzling.NARROWEST_SWIZZLE_BYTES if held else None)
+    # The stage at the family's swizzle: at the narrowest one its wgmma accumulator's stores took no select a
+    # register pair (8% fewer instructions, 9 registers), but the stores' shared-memory bank conflicts rose
+    # (9.5M to 11.5M) and the fused dK/dV ran 23.8% longer on a GH200 (M-NA-32-gh200, row 5272).
+    stage = family.staged_memory(stage_shape, jnp.float32)
     kv_swizzles = transposed_swizzles(config, "keys", "values")
     staged_swizzle = swizzling.UNSWIZZLED if family.relay_bytes(block_q, block_k) else None
     scoped = [family.staged_memory((consumers, block_k, width), dtype, kv_swizzles.get("keys")),
@@ -247,8 +245,9 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
 def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref,
                q_rhs, k_rhs, do_rhs, *, looped: bool = False) -> tuple[jax.Array, tuple]:
     """Issue dQ, dV, and dK for a bf16/fp32 backward query tile: on overlapping shared-memory issuers
-    (wgmma), issue dV and dK inside dQ's product scope and read dQ with `pending=2` so dQ/dV/dK issue
-    back-to-back with no wait bubble and `add_dq` overlaps dV/dK (row 5272, 10867)."""
+    (wgmma), issue dV and dK inside dQ's product scope and read dQ with their two groups in flight
+    (`Issuer.product_with`) so dQ/dV/dK issue back-to-back with no wait bubble and `add_dq` overlaps dV/dK
+    (row 5272, 10867)."""
     family, tiles = walk.program.family, walk.program.tiles
     dk_acc, dv_acc = accumulators
     shape = (tiles.block_q, k_rhs.shape[-1])
@@ -258,7 +257,7 @@ def dq_and_dkv(walk: _Backward, accumulators: tuple, weights_ref, cotangents_ref
             issue(dv_acc, weights_ref.transpose((1, 0)), do_rhs)
             issue(dk_acc, cotangents_ref.transpose((1, 0)), q_rhs)
 
-        _, dq = family.product_with(cotangents_ref, k_rhs, shape, issue_dkv, pending=2)
+        _, dq = family.product_with(cotangents_ref, k_rhs, shape, issue_dkv)
     else:
         dq = (None if family.operands_in_registers
               else family.product(cotangents_ref, k_rhs, shape))
@@ -303,8 +302,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
         family.staged(part, cotangents_staged)
         _, dq = family.product_with(
             cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1]),
-            lambda: family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot),
-            pending=1)
+            lambda: family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot))
         add_dq(q_first, dq)
         return carry, (dk_acc, dv_acc)
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,

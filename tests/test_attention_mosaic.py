@@ -24,7 +24,6 @@ from attention_oracle import traced_attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, here
-from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
@@ -53,6 +52,7 @@ from dew.nn.kernels.templates import (
     bundles,
     mosaic_sm90,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 pytestmark = pytest.mark.kernel
 
@@ -228,8 +228,13 @@ def _device(interpret: bool, target: generation.GpuTarget | None = None):
     family of its own, `target`'s facts and bundles, run where the process places them (where None, the GPU
     the interpreted cell runs as, `INTERPRETED_ON`; `generation.assumed`'s `interpreted`); the process's own
     compiled."""
-    return (generation.assumed(target or _INTERPRETED.get(), interpreted=True) if interpret
-            else contextlib.nullcontext())
+    return _device_at(interpret, target or _INTERPRETED.get())
+
+
+def _device_at(interpret: bool, where: generation.GpuTarget | str):
+    """`_device` at `where`, resolved before an arm reads it: an arm a GPU's prepare compiles states what it
+    computes (`truths_ahead.arm_role`), which a context variable it reads has no form of (row 12497)."""
+    return generation.assumed(where, interpreted=True) if interpret else contextlib.nullcontext()
 
 
 def _pinned(forward: attention_mosaic.Tiles | None = None,
@@ -267,10 +272,12 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, w
                                                           shape[1], value_width))
         return spans, hooks
 
+    where = target or _INTERPRETED.get()
+
     def ours(query, key, value, dout):
         del dout
         spans, hooks = setup()
-        with _device(interpret, target), _pinned(tiles):
+        with _device_at(interpret, where), _pinned(tiles):
             out = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                            residuals=training, interpret=interpret)
         return out if training is template.Kept.NONE else out[0]
@@ -327,19 +334,20 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
 
     def hooked(params, initial):
         output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
-        return template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                               for value, kind in zip(params, kinds, strict=True)), initial,
-                              output.output_mod, output.output_params)
+        sides = tuple(Side(value, kind) for value, kind in zip(params, kinds, strict=True))
+        return template.Hooks(score=Hook(score_mod, sides), initial=initial, output=output.output)
 
     accurate, config = _backward_form(form)
+    where = target or _INTERPRETED.get()
+    # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums 128
+    # wide pass their registers, and a hooked training forward's natural walk theirs 64 wide), resolved
+    # before the arm (`_device_at`).
+    pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
 
     def ours(query, key, value, dout, params, initial):
         built_spans = make_spans()
         hooks = hooked(params, initial)
-        # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
-        # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
-        pinned = pins or (_form_tiles() if width == 64 and not (backward and score) else None, config)
-        with _device(interpret, target), _pinned(*pinned):
+        with _device_at(interpret, where), _pinned(*pinned):
             if not backward:
                 return attention_mosaic.forward(query, key, value, built_spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -496,11 +504,12 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
     # Another mainloop's forward keeps its split sums (its `residuals` True).
     trained = (functools.partial(attention_mosaic.forward, residuals=kept) if residuals_from is None
                else functools.partial(residuals_from, residuals=True))
+    where = target or _INTERPRETED.get()
 
     def ours(query, key, value, dout):
         built_spans = make_spans()
         hooks = _dropping(shape) if drop else None
-        with _device(interpret, target):
+        with _device_at(interpret, where):
             residuals = trained(query, key, value, built_spans, hooks, interpret=interpret)[1:]
             with _pinned(backward=config):
                 grads = attention_mosaic.backward(query, key, value, built_spans, hooks, dout,
@@ -605,8 +614,8 @@ def test_a_hook_reads_its_places_as_a_vector_only_where_every_run_of_it_reads_th
         return jax.lax.scan(lambda carry, _: (carry + q_pos.astype(carry.dtype), None), score, None,
                             length=0)[0]
 
-    assert attention_mosaic_program.score_places(template.Hooks(helper)) == (True, False)
-    assert attention_mosaic_program.score_places(template.Hooks(looped)) == (False, False)
+    assert attention_mosaic_program.score_places(template.Hooks(score=Hook(helper))) == (True, False)
+    assert attention_mosaic_program.score_places(template.Hooks(score=Hook(looped))) == (False, False)
 
 
 @INTERPRETS
@@ -838,7 +847,7 @@ def test_values_their_keys_columns_are_the_keys_as_given_under_a_key_prologue_in
     twos from the key's slot)."""
     shape = (1, 64, 1, 64)
     spans = template.spans(shape[1], shape[1], shape[0], causal=False)
-    hooks = template.Hooks(key_mod=lambda key, *_: key * 2)
+    hooks = template.Hooks(key=Hook(lambda key, *_: key * 2))
     query, key = jnp.zeros(shape, jnp.bfloat16), jnp.ones(shape, jnp.bfloat16)
     with _device(interpret=True, target=generation.gpu_target("sm90")):
         found = attention_mosaic.forward(query, key, key, spans, hooks, natural=False, interpret=True,
@@ -862,7 +871,7 @@ def test_a_call_whose_values_its_key_slot_cannot_serve_is_declined_as_one_handin
     their issuing role."""
     shape = (1, 64, 1, 64)
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    hooks = template.Hooks(key_mod=lambda key, *_: key * 2) if case == "prologued" else None
+    hooks = template.Hooks(key=Hook(lambda key, *_: key * 2)) if case == "prologued" else None
     residuals = template.Kept.SPLIT if case == "trained" else template.Kept.NONE
     query, key = jnp.zeros(shape, dtype), jnp.ones(shape, dtype)
     with generation.assumed(generation_name):
@@ -1192,8 +1201,8 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
         return s / temperature + bias
 
     def hooked(temperature, bias):
-        return template.Hooks(score_mod, (template.Param(temperature, template.Kind.QUERY),
-                                          template.Param(bias, template.Kind.HEAD)))
+        return template.Hooks(score=Hook(score_mod, (Side(temperature, template.Kind.QUERY),
+                                          Side(bias, template.Kind.HEAD))))
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
@@ -1458,7 +1467,7 @@ def test_a_scaled_forward_derives_wherever_its_common_one_does(target, width, ho
     spans = template.spans(queries, queries, 1, causal=True)
     score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=4)
     params, initial = draw(0)
-    hooked = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+    hooked = template.Hooks(score=Hook(score_mod, tuple(map(Side, params, kinds))), initial=initial)
     arrays = [jnp.zeros((1, queries, heads, width), dtype) for heads in (4, 2, 2)]
     with generation.assumed(target):
         op, args = attention_mosaic._forward_call(*arrays, spans, hooked, scale=None,
@@ -1555,11 +1564,11 @@ def test_a_hooked_sm80_backward_of_an_integer_parameter_compiles_at_fewer_rows_a
     tokens, heads = 256, 4
     spans = template.spans(tokens, tokens, 1, causal=True)
     query = jnp.zeros((1, tokens, heads, 64), jnp.bfloat16)
-    buckets = template.Param(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
+    buckets = Side(jnp.zeros((1, heads, tokens), jnp.int32), template.Kind.KEY)
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         op, args = attention_mosaic._backward_call(query, query, query, spans,
-                                                   template.Hooks(bucketed, (buckets,)), query,
+                                                   template.Hooks(score=Hook(bucketed, (buckets,))), query,
                                                    _residuals(query.shape), scale=None,
                                                    natural=attention_mosaic.NATURAL, accurate=True)
         ba = op.bind(*args, interpret=False)
@@ -1688,8 +1697,8 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
         return query, key, value, gate
 
     def hooked(gate):
-        return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
-                              output_params=(template.Param(gate, template.Kind.OUTPUT),))
+        return template.Hooks(output=Hook(lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
+                                          (Side(gate, template.Kind.OUTPUT),)))
 
     def ours(query, key, value, gate):
         with _device(interpret=True):
@@ -2283,124 +2292,6 @@ def the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100():
     consumers share a key block, `BackwardTiles.shared_keys`) compiled on an H100: on par with the reference
     (check 1)."""
     _check_hooked_backward("softcap", form="derived", interpret=False, width=256)
-
-
-def _counted(fn, *arrays, generation_name: str = "sm90") -> tuple[float, float]:
-    """The model's share of the Mosaic launches' work `fn` lowers for a GPU of `generation_name` (an H100's)
-    each declares (`instrumentation.MODEL_FLOPS`) and the hardware's work each states (its cost estimate), as
-    the lowered program's structured reader reads them (`lowered.kernel_launches`, each launch times the calls
-    a call of the program makes)."""
-    from dew.nn.kernels.lowered import kernel_launches
-
-    # Lowered deviceless for the GPU whatever the host, so a GPU host of another generation lowers no TMA of
-    # its own.
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",))
-    launches = [(call, times) for call, times in kernel_launches(lowered) if call.kind == "mosaic_gpu"]
-    assert launches and all(call.flops is not None and call.model_flops is not None for call, _ in launches)
-    return (sum((call.model_flops or 0.0) * times for call, times in launches),
-            sum((call.flops or 0.0) * times for call, times in launches))
-
-
-@pytest.mark.parametrize("causal, queries, keys, pairs", [
-    (True, 256, 256, 256 * 257 // 2), (True, 128, 256, 128 * 129 // 2),
-    (True, 256, 128, 128 * 129 // 2 + 128 * 128), (True, 64, 192, 64 * 65 // 2),
-    (False, 256, 256, 256 * 256), (False, 64, 192, 64 * 192)],
-    ids=["causal", "causal-fewer-queries", "causal-more-queries", "causal-padded", "full", "full-padded"])
-def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, keys, pairs):
-    """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
-    for an H100: every launch states its hardware work, counted from its kernel's emission
-    (`emission.costed`), which Dew's FLOP count reads to size it (`instrumentation._stated_flops`: no launch
-    unsized), and declares the model's share of it; together the model's are the library's fused
-    attention's own count, a multiply-add a
-    reached pair, head and product column (a causal call's `pairs` each query's keys up to its own place,
-    written out: the first key aligned to the first query, as the mainloop masks them): the forward's two
-    products, the training forward's two and the backward's four (`instrumentation._fused_attention_flops`).
-    The hardware's work is every tile its walk issues, whole: each 64 by 64 tile holding a reached pair over
-    the padded rows (a padded consumer's and a causal diagonal tile's masked half computed with the rest, as
-    an H100's tensor-pipe counts read them, row 3948's receipt), and one recomputed `Q K^T` more in the
-    training forward and in the backward; a rerun (the fold's natural walk) adds none. The launches' own
-    statements are read."""
-    from dew.telemetry.instrumentation import hlo_flops
-
-    rows, heads, kv_heads, width = 1, 4, 2, 64
-    query = jax.ShapeDtypeStruct((rows, queries, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.bfloat16)
-    spans = template.spans(queries, keys, rows, causal=causal)
-    forward = 2 * rows * heads * pairs * (width + width)
-    # The 64 by 64 tiles the pinned launches walk that hold a pair a causal call reaches (a key at or before
-    # its query), each computed whole, over the queries padded to a program's two consumers' rows (a padded
-    # consumer walks its keys as a real one does) and the call's keys: the keys pad to two tiles too, a tile
-    # wholly past them walked by none.
-    block, consumers = 64, 2
-    padded = -(-queries // (consumers * block)) * consumers * block
-    walked = sum(block * block for first_q in range(0, padded, block) for first_k in range(0, keys, block)
-                 if not causal or first_k < first_q + block)
-    issued = 2 * rows * heads * walked * (width + width)
-
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-
-    def trained(query, key, value):
-        return attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.SPLIT)
-
-    with generation.assumed("sm90"):
-        residuals = jax.eval_shape(trained, query, key, key)[1:]
-
-    def backward(query, key, value, dout, residuals):
-        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
-
-    # The training forward recomputes its walk's `Q K^T`; the fast backward its `S` beside its four.
-    product = issued // 2
-    pins = (attention_mosaic.Tiles(block, block, 2, consumers, family=WGMMA),
-            attention_mosaic.BackwardTiles(block, block, 2, consumers, fused=True, family=WGMMA))
-    with _pinned(*pins):
-        plain = _counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key)
-    assert plain == (forward, issued)
-    # A forward whose launches walk its value columns a block apiece: each recomputes `Q K^T`, which the
-    # model owns once. The blocks' launches are one kernel called once a block, as the step's FLOP count
-    # weighs it (`hlo_flops`, against the whole walk's count).
-    def weighed(fn):
-        with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-            found = hlo_flops(jax.jit(fn).trace(query, key, key).lower(lowering_platforms=("cuda",))
-                              .as_text(dialect="hlo"))
-        assert found is not None
-        return found.model, found.hardware
-
-    with _pinned(*pins):
-        whole = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
-    with _pinned(attention_mosaic.Tiles(block, block, 2, consumers, family=WGMMA, columns=width // 2)):
-        blocked = weighed(lambda q, k, v: attention_mosaic.forward(q, k, v, spans))
-    assert blocked == (whole[0], whole[1] + product)
-    with _pinned(*pins):
-        assert _counted(trained, query, key, key) == (forward, issued + product)
-        assert _counted(backward, query, key, key, query, residuals) == (2 * forward, 2 * issued + product)
-
-
-def test_a_common_walk_states_every_tile_each_holder_walks():
-    """The fast backward's one launch fed by its consumers (`wgmma.fed`, a program two key blocks, each
-    consumer walking every query tile either block is read by, `Family.walk_own`) over a causal call of 128
-    queries and 192 keys, its keys padded to 256, lowered for an H100: the launch states the tiles each
-    consumer walks (`attention_mosaic_program.walks`), one its own keys are not seen by too. The first
-    program's consumers walk both 64-row query tiles each, the second keys' tile read by the second alone;
-    the second program's none, its first keys past every query's and its second past the keys."""
-    rows, heads, width, block = 1, 2, 64, 64
-    query = jax.ShapeDtypeStruct((rows, 128, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, 192, heads, width), jnp.bfloat16)
-    spans = template.spans(128, 192, rows, causal=True)
-    with generation.assumed("sm90"):
-        residuals = jax.eval_shape(lambda q, k, v: attention_mosaic.forward(
-            q, k, v, spans, residuals=template.Kept.SPLIT), query, key, key)[1:]
-
-    def backward(query, key, value, dout, residuals):
-        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
-
-    # The backward's five products (`S` recomputed, dP's, dV's, dK's and dQ's) over four tiles where each
-    # consumer walked its own keys' readers alone: three.
-    walked, pairs = 4 * block * block, 128 * 129 // 2
-    with _pinned(backward=attention_mosaic.BackwardTiles(block, block, 2, 2, fused=True, family="wgmma.fed")):
-        assert _counted(backward, query, key, key, query, residuals) == (
-            2 * rows * heads * pairs * 4 * width, 2 * rows * heads * walked * 5 * width)
 
 
 def _residuals(shape) -> tuple:

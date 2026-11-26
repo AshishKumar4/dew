@@ -22,10 +22,12 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_decode,
     emission,
     merged,
     merged_mosaic,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -316,13 +318,16 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
 
 
+@contextlib.contextmanager
 def _mosaic_served(name: str):
-    """Mosaic GPU serving `name`'s unhooked merges as they lower: a config pinned (`tuning.pinned`) where
-    Pallas Triton serves the generation's unhooked merge (`merged.MOSAIC_SLOWER`), 16 channels a program,
-    which every width and split here takes; else nothing held."""
+    """Mosaic GPU serving `name`'s unhooked merges as they lower: named (`generation.chosen(merge=...)`)
+    where Pallas Triton serves the generation's unhooked merge (`merged.MOSAIC_SLOWER`), its config pinned
+    at 16 channels a program, which every width and split here takes; else nothing held."""
     if name not in merged.MOSAIC_SLOWER:
-        return contextlib.nullcontext()
-    return tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)})
+        yield
+        return
+    with generation.chosen(merge="mosaic"), tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+        yield
 
 
 @COMPILES_ON_CPU
@@ -405,16 +410,18 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "pinned"])
+@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "named"])
 def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
-    """Rows 9795, 12398: the generations where Mosaic GPU's merge measured slower (`merged.MOSAIC_SLOWER`,
-    an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled executables carry it: a
-    plain merge, and a finished one with a resumed state (`Initial`, the form row 11857's GPU run found
-    Pallas Triton refusing), each unhooked as the measured one was. Mosaic serves there a hooked merge (a
-    sigmoid output hook) and one whose config is pinned, as its executable carries its kernel; Pallas Triton
-    lowers no Mosaic GPU primitive rule's `platform_index`. Each generation's Triton compiles, and the
-    Hopper's hooked and pinned Mosaic ones, a case of its own (`where`: together 189 s, the two Mosaic
-    compiles 161 s, row 12698)."""
+    """Rows 9795, 12398, 12480: the generations where Mosaic GPU's merge measured slower
+    (`merged.MOSAIC_SLOWER`, an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled
+    executables carry it: a plain merge, and a finished one with a resumed state (`Initial`, the form row
+    11857's GPU run found Pallas Triton refusing), each unhooked as the measured one was, a held config's pin
+    moving none (it flipped the lowering unseen), and a hooked one named Triton
+    (`generation.chosen(merge=...)`). Mosaic serves there a hooked merge (a sigmoid output hook) and one
+    named Mosaic, as its executable carries its kernel; Pallas Triton lowers no Mosaic GPU primitive rule's
+    `platform_index`. A merge named Mosaic as it traces lowers on it past the block that names it (row
+    13170). Each generation's Triton compiles, and the Hopper's hooked and named Mosaic ones, a case of its
+    own (`where`: together 189 s, the two Mosaic compiles 161 s, row 12698)."""
     from fla_gdn_support import KernelCase
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
@@ -439,16 +446,19 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
 
     def hooked(p, s):
         return merged.merged_finished(spec, p, s, queries=2, width=16, out_dtype=jnp.bfloat16, out_heads=2,
-                                      output_mod=jax.nn.sigmoid)
+                                      output=Hook(jax.nn.sigmoid))
 
     launches._register_mosaic_gpu_lowerings()
     assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
         plgpu_core.WGxWG_SEMANTICS]
     if where in merged.MOSAIC_SLOWER:
         with generation.assumed(where):
-            records = compile_kernels([
-                KernelCase("plain", lambda: (plain, (padded, stacked))),
-                KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], where)
+            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+                records = compile_kernels([
+                    KernelCase("plain", lambda: (plain, (padded, stacked))),
+                    KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], where)
+            with generation.chosen(merge="triton"):
+                records += compile_kernels([KernelCase("hooked", lambda: (hooked, small))], where)
         for record in records:
             assert "error" not in record and sorted(record["thunks"]) == ["merged_padded"], record
         return
@@ -456,9 +466,13 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
         if where == "hooked":
             records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
         else:
-            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
-                records = compile_mosaic_kernels(
-                    [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
+            def named(p, s):
+                # Named as it traces, inside the jitted body: its lowering, past the block, takes it.
+                with generation.chosen(merge="mosaic"):
+                    return plain(p, s)
+
+            records = compile_mosaic_kernels(
+                [KernelCase("named", lambda: (named, (padded, stacked)))], "sm90")
     for record in records:
         assert not mosaic_failures([record]), record
         assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
@@ -889,8 +903,8 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                     "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)
 
 def test_resumable_split_merge_preserves_subnormal_initial_mass():
-    """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its
-    natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
+    """Row 10818: `attention_decode.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps
+    its natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
     low-logit slice (`-140`) preserves the resumed output instead of letting the low-logit slice overwrite
     it."""
     batch, slices, rows, kv_heads, width, queries = 1, 2, 4, 1, 16, 2
@@ -909,9 +923,9 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     low_stacked = jnp.stack([low_m, low_t])
 
     def step(p_in, st_in, low_s):
-        resumed = algebra.resumable(spec, st_in)
+        resumed = attention_decode.resumable(spec, st_in)
         next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
-                                     jnp.swapaxes(resumed.acc, 1, 2))
+                                     jnp.swapaxes(resumed.acc, 1, 2), normalized=True)
         out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
                                      out_dtype=jnp.float32, out_heads=queries, initial=next_init)
         return resumed.m, out
@@ -946,22 +960,22 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
 
     cases = [
         (lambda o: jnp.tanh(o * 0.5), ()),
-        (lambda o, h: o * h.reshape(()), (template.Param(head_scale, template.Kind.HEAD),)),
-        (lambda o, q: o * q, (template.Param(query_scale, template.Kind.QUERY),)),
-        (lambda o, q: o + q, (template.Param(shared_query, template.Kind.QUERY),)),
-        (lambda o, g: o * jax.nn.sigmoid(g), (template.Param(gate, template.Kind.OUTPUT),)),
+        (lambda o, h: o * h.reshape(()), (Side(head_scale, template.Kind.HEAD),)),
+        (lambda o, q: o * q, (Side(query_scale, template.Kind.QUERY),)),
+        (lambda o, q: o + q, (Side(shared_query, template.Kind.QUERY),)),
+        (lambda o, g: o * jax.nn.sigmoid(g), (Side(gate, template.Kind.OUTPUT),)),
     ]
     for mod, params in cases:
         for init in (None, initial):
             got = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
                                          out_dtype=jnp.bfloat16, out_heads=out_heads, initial=init,
-                                         output_mod=mod, output_params=params)
+                                         output=Hook(mod, params))
             state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=init)
             base = template.ungrouped_rows(
                 algebra.finish(spec, state, initial=True, normalized=True)[0], out_heads)
             wide_params = tuple(
-                template.Param(p.value.astype(jnp.float32) if jnp.issubdtype(p.value.dtype, jnp.floating)
-                               else p.value, p.kind) for p in params)
+                Side(p.value.astype(jnp.float32) if jnp.issubdtype(p.value.dtype, jnp.floating)
+                               else p.value, p.axes) for p in params)
             ref = jnp.swapaxes(template.output_hooked(jnp.swapaxes(base, 1, 2), mod, wide_params),
                                1, 2).astype(jnp.bfloat16)
             np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
@@ -972,21 +986,18 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
 
     ref_both = merged.merged_finished(
         spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(template.Param(gate, template.Kind.OUTPUT),
-                       template.Param(head_scale, template.Kind.HEAD)))
+        output=Hook(gated_mod, (Side(gate, template.Kind.OUTPUT),
+                                Side(head_scale, template.Kind.HEAD))))
     vmapped = jax.vmap(lambda p, s, g: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(template.Param(g, template.Kind.OUTPUT),
-                       template.Param(head_scale, template.Kind.HEAD))))(
+        output=Hook(gated_mod, (Side(g, template.Kind.OUTPUT),
+                                Side(head_scale, template.Kind.HEAD)))))(
         padded[None], stacked[None], gate[None])
     np.testing.assert_array_equal(np.asarray(vmapped[0]), np.asarray(ref_both))
     vmapped_head = jax.vmap(lambda p, s, g, h: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=gated_mod,
-        output_params=(template.Param(g, template.Kind.OUTPUT),
-                       template.Param(h, template.Kind.HEAD))))(
+        output=Hook(gated_mod, (Side(g, template.Kind.OUTPUT),
+                                Side(h, template.Kind.HEAD)))))(
         padded[None], stacked[None], gate[None], head_scale[None])
     np.testing.assert_array_equal(np.asarray(vmapped_head[0]), np.asarray(ref_both))
 
@@ -996,15 +1007,14 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
     def fn(p, g):
         return merged.merged_finished(
             spec, p, stacked, queries=queries, width=width, out_dtype=jnp.float32, out_heads=out_heads,
-            output_mod=lambda o, x: o * jax.nn.sigmoid(x),
-            output_params=(template.Param(g, template.Kind.OUTPUT),))
+            output=Hook(lambda o, x: o * jax.nn.sigmoid(x), (Side(g, template.Kind.OUTPUT),)))
 
     def law(p, g):
         st = algebra.merged_state(spec, *merged._trimmed(p, stacked, queries=queries, width=width))
         un = template.ungrouped_rows(st.acc, out_heads)
         return jnp.swapaxes(template.output_hooked(
             jnp.swapaxes(un, 1, 2), lambda o, x: o * jax.nn.sigmoid(x),
-            (template.Param(g, template.Kind.OUTPUT),)), 1, 2)
+            (Side(g, template.Kind.OUTPUT),)), 1, 2)
 
     dp, dg = jnp.ones_like(padded) * 0.1, jnp.ones_like(gate_f32) * 0.1
     p_out, t_out = jax.jvp(fn, (padded, gate_f32), (dp, dg))
@@ -1014,18 +1024,14 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
     with pytest.raises(ValueError):
         merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
                                out_heads=out_heads,
-                               output_params=(template.Param(gate, template.Kind.OUTPUT),))
-    with pytest.raises(ValueError):
-        merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
-                               out_heads=out_heads, output_mod=lambda o, k: o + k,
-                               output_params=(template.Param(jnp.zeros((batch, out_heads, 8)),
-                                                             template.Kind.KEY),))
+                               output=Hook(lambda o, k: o + k,
+                                           (Side(jnp.zeros((batch, out_heads, 8)), template.Kind.KEY),)))
 
 
-def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype():
     """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
-    batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
-    and `launch_work` keys hook pricing on the active JAX trace context."""
+    batch extent, and `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed
+    in-kernel."""
     spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
     queries, out_heads = tokens * group, kv_heads * group
@@ -1041,21 +1047,21 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     p2, s2 = jnp.stack([padded, padded * 0.5], axis=0), jnp.stack([stacked, stacked], axis=0)
     got_sh = jax.vmap(lambda p, s, q: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o + x, output_params=(template.Param(q, template.Kind.QUERY),)))(
+        output=Hook(lambda o, x: o + x, (Side(q, template.Kind.QUERY),))))(
         p2, s2, q_shared_v)
     for idx in range(2):
         ref_i = merged.merged_finished(
             spec, p2[idx], s2[idx], queries=queries, width=width, out_dtype=jnp.bfloat16,
-            out_heads=out_heads, output_mod=lambda o, x: o + x,
-            output_params=(template.Param(q_shared_v[idx], template.Kind.QUERY),))
+            out_heads=out_heads,
+            output=Hook(lambda o, x: o + x, (Side(q_shared_v[idx], template.Kind.QUERY),)))
         np.testing.assert_array_equal(np.asarray(got_sh[idx]), np.asarray(ref_i))
     got_unsh = jax.vmap(lambda p, s, q: merged.merged_finished(
         spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o * x, output_params=(template.Param(q, template.Kind.QUERY),)))(
+        output=Hook(lambda o, x: o * x, (Side(q, template.Kind.QUERY),))))(
         padded[None], stacked[None], query_scale[None])
     ref_unsh = merged.merged_finished(
         spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-        output_mod=lambda o, x: o * x, output_params=(template.Param(query_scale, template.Kind.QUERY),))
+        output=Hook(lambda o, x: o * x, (Side(query_scale, template.Kind.QUERY),)))
     np.testing.assert_array_equal(np.asarray(got_unsh[0]), np.asarray(ref_unsh))
     # A gate shared across the batch (`Kind.OUTPUT`, `[1, T, H, Dv]` a mapped element) reads as each row's.
     shared_gate = jax.random.normal(k4, (1, tokens, out_heads, width), jnp.bfloat16)
@@ -1064,7 +1070,7 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     def gated(p, s, g):
         return merged.merged_finished(
             spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-            output_mod=lambda o, x: o * x, output_params=(template.Param(g, template.Kind.OUTPUT),))
+            output=Hook(lambda o, x: o * x, (Side(g, template.Kind.OUTPUT),)))
 
     got_gated = jax.vmap(gated)(p2, s2, gates)
     for idx in range(2):
@@ -1084,6 +1090,13 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     op_b = dataclasses.replace(op_a, output_mod=branch_b)
     assert op_a.traced("output_mod", op_a.output_mod) != op_b.traced("output_mod", op_b.output_mod)
 
+
+def test_a_merges_price_is_held_by_its_hook_as_its_epilogue_calls_it_for_its_target():
+    """Row 12420: a merge's priced work (`launch_work`) is held by its output hook as its epilogue calls it on
+    the launch's target (`merged._epilogue_programs`): its 16-bit gate widened to fp32, at each candidate
+    block, traced for the B200 it is priced for whatever the ambient GPU, under the trace context a hook
+    reads; a hook closing over an array held once for its program."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     def ctx_hook(o, g):
         return o * jax.nn.sigmoid(g) if _CTX_HOOK_MODE.get() == "sigmoid" else o + g
 
@@ -1103,17 +1116,58 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     finally:
         _CTX_HOOK_MODE.reset(token)
     assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
+    # A merge's plan is held by its hook as the epilogue calls it: its 16-bit gate widened to fp32 (a bf16 key
+    # held the gated hook's plan for the subtracting one, its exponentials unpriced; a hook holding its gate
+    # to fp32 raised as it was priced).
+
+    def strict(o, g):
+        assert g.dtype == jnp.float32, g.dtype
+        return o * g
+
+    def gating(o, g):
+        return o * jax.nn.sigmoid(g) if g.dtype == jnp.float32 else o + g
+
+    def subtracting(o, g):
+        return o - g if g.dtype == jnp.float32 else o + g
+
+    worked = {hook: merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                                       output_mod=hook, output_kinds=(template.Kind.OUTPUT,),
+                                       output_specs=(g_s,))
+              for hook in (strict, gating, subtracting)}
+    assert worked[gating].exponentials > worked[subtracting].exponentials, worked
+    # Keyed as traced for the launch's target, not the ambient one: hooks alike on an A100 and apart on a
+    # B200 hold their own B200 plans.
+
+    def on_b200(alike, apart):
+        def hook(o, g):
+            return apart(o, g) if generation.gpu_target().generation == "sm100" else alike(o, g)
+        return hook
+
+    with generation.assumed("sm80"):
+        gated, subtracted = (merged.launch_work(
+            spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+            output_mod=on_b200(lambda o, g: o + g, apart), output_kinds=(template.Kind.OUTPUT,),
+            output_specs=(g_s,)) for apart in (lambda o, g: o * jax.nn.sigmoid(g), lambda o, g: o - g))
+    assert gated.exponentials > subtracted.exponentials, (gated, subtracted)
+    # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
+    # array is planned once for its program, as one that holds none is.
     captured = jnp.ones((), jnp.float32)
 
-    def unholdable(o, g):
+    def closing(o, g):
         return o + g + captured
 
-    assert not tuning.holdable(unholdable)
-    cached_before = merged._planned_block_cached.cache_info().currsize
-    merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
-                       output_mod=unholdable, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
-    assert merged._planned_block_cached.cache_info().currsize == cached_before
-    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; pricing must still cache-hit.
+    def newest():
+        # The plan last read and what holds it: a plan made again is held anew.
+        key = next(reversed(merged._PLANNED))
+        return key, merged._PLANNED[key]
+
+    held = []
+    for _ in range(2):
+        merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                           output_mod=closing, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
+        held.append(newest())
+    assert held[0][0] == held[1][0] and held[0][1] is held[1][1]
+    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; its pricing reads the held plan.
     op_prep = merged.MergedPadded(
         units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
         output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
@@ -1121,9 +1175,9 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     with generation.assumed("sm100"):
         ba_prep = op_prep.bind(p_s, s_s, (g_s,))
         op_prep._get_heuristics_config(ba_prep)
-        hits_before = merged._planned_block_cached.cache_info().hits
+        made = newest()
         op_prep._get_heuristics_config(ba_prep)
-    assert merged._planned_block_cached.cache_info().hits > hits_before
+        assert newest()[0] == made[0] and newest()[1] is made[1]
 
 
 @COMPILES_ON_CPU
@@ -1158,8 +1212,8 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
     def call(p, s, *extra_p, fn=mod, param_kinds=kinds):
         return merged.merged_finished(
             spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
-            output_mod=fn, output_params=tuple(
-                template.Param(val, k) for val, k in zip(extra_p, param_kinds, strict=True)))
+            output=Hook(fn, tuple(
+                Side(val, k) for val, k in zip(extra_p, param_kinds, strict=True))))
 
     bool_gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bool_)
     int_head = jax.ShapeDtypeStruct((out_heads,), jnp.int32)
@@ -1231,6 +1285,6 @@ def test_a_finished_merge_reads_its_output_parameters_as_a_launch_keeps_them():
         gate = jnp.full((batch, tokens, kv_heads * group, width), 1 + 2.0 ** -25, jnp.float64)
         out = merged.merged_finished(
             spec, padded, stacked, queries=tokens * group, width=width, out_dtype=jnp.float32,
-            out_heads=kv_heads * group, output_mod=lambda o, g: o * (g - 1),
-            output_params=(template.Param(gate, template.Kind.OUTPUT),))
+            out_heads=kv_heads * group,
+            output=Hook(lambda o, g: o * (g - 1), (Side(gate, template.Kind.OUTPUT),)))
     np.testing.assert_array_equal(np.asarray(out), 0.0)

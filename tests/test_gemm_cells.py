@@ -67,6 +67,18 @@ def test_a_timed_product_is_recognized_over_its_receipts_rows_and_arithmetic_alo
                                stored=other).kind.matrix is None, timing
 
 
+def test_a_4b_cell_holds_at_the_rows_its_receipts_timed_and_not_past_them():
+    """The GH200's 4B 2,560 x 9,216 forward, a cell its receipts timed at 24,576 tokens alone
+    (`grouped_cells.FOUR_B_TIMED`, row 13167): the template's there, and past those rows (32,768, a count no
+    receipt timed) its kind's route, as a matrix no receipt timed takes at those rows."""
+    forward, four_b = grouped_cells.Made.FORWARD, (2560, 9216)
+    timed = _dense_case("sm90", forward, four_b, 24576)
+    assert timed.kind.matrix == four_b and _route(timed) == "mosaic"
+    past = _dense_case("sm90", forward, four_b, 32768)
+    assert past.kind.matrix is None
+    assert _route(past) == _route(_dense_case("sm90", forward, (4096, 9216), 32768))
+
+
 @pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
 def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
     """A dense kind runs the template whole only where every product any receipt timed of it is at parity in
@@ -124,3 +136,19 @@ def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
                             if isinstance(op, grouped_matmul.MosaicGmm)}
             with tuning.pinned({grouped_matmul.MosaicGmm: tile}), pytest.raises(tuning.Unpinnable):
                 jax.jit(run).trace(*shapes(264))
+
+
+@pytest.mark.parametrize(("operands", "rate"), [("float8_e4m3fn", "eight"), ("bfloat16", "tensor")])
+def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
+    """A step's products are priced at the tensor rate of the dtype its MMA issues (`pricing.step_seconds`'s
+    `issued`): an 8-bit float's on an H100, which doubles the 16-bit rate, so a cooperative 128 x 256 FP8 step
+    within its products' time takes half a bf16 step's; a bf16 one, the 16-bit rate (row 13008)."""
+    from dew.nn.kernels.templates import cost
+    from dew.nn.kernels.templates.gemm import pricing, tiling
+
+    h100 = generation.gpu_target("sm90")
+    tiles = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
+    size = jnp.dtype(operands).itemsize
+    step = pricing.step_seconds(tiles, h100, (size, size), issued=jnp.dtype(operands))
+    rates = cost.rates(h100, device=False)
+    assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]

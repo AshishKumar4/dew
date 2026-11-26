@@ -225,6 +225,27 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
         np.asarray(large["w"], np.float64))
 
 
+def test_normuon_normalizes_a_complex_update_by_its_entries_magnitudes():
+    """NorMuon's normalization of a complex update (`scale_by_neuron_norm`) decays each neuron's mean
+    squared magnitude `|z|^2` (`z conj(z)`'s real part): a purely imaginary update `i A` keeps the moment
+    the real update `A` keeps, bit for bit, and a finite update, where `square` (`z^2 = -A^2`) turned its
+    moment negative and its update NaN (the 2026-11-26 audit)."""
+    from dew.optim import scale_by_neuron_norm
+
+    norm = scale_by_neuron_norm(0.95)
+    real = np.random.default_rng(0x479).normal(size=(24, 16)).astype(np.float32)
+
+    def normalized(update):
+        tree = {"w": jnp.asarray(update)}
+        updated, state = jax.jit(lambda tree: norm.update(tree, norm.init(tree)))(tree)
+        return np.asarray(updated["w"]), [np.asarray(leaf) for leaf in jax.tree.leaves(state)]
+
+    imaginary, moment = normalized((1j * real).astype(np.complex64))
+    assert np.all(np.isfinite(imaginary))
+    for got, wanted in zip(moment, normalized(real)[1], strict=True):
+        np.testing.assert_array_equal(got, wanted)
+
+
 @attending("xla")
 def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
     """A flat attention stores each projection as one `[C, heads * head_dim]` matrix and declares it so

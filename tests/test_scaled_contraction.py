@@ -336,3 +336,107 @@ def test_terms_that_cancel_keep_the_term_beneath_them():
     big = jnp.float32(2.0 ** 127)
     np.testing.assert_array_equal(np.asarray(contract(form, big, big, jnp.float32(2.0 ** -30))), 2.0 ** -30)
 
+
+
+ATTENTION_MEAN = Form(("bhgqk", "bkhd"), ((1, (((0, 1),), ((1, 1),))),), "bhgqd",
+                      divisor=((1, (((0, 1),),)),), divided="bhgq")
+"""The reference attention's mean (`attention._scaled_mean`): masses over keys `k` against values, divided by
+the masses' own sum over `k`, which the result does not read."""
+
+
+def test_a_transposed_letter_no_factor_reads_forms_no_product_over_the_others():
+    """The masses' cotangent of the attention mean at the sm90 matrix cell's width (1024 queries and keys,
+    256 channels, eight heads in four groups): the divisor's term reads `k` through the masses alone, its
+    unit operand along `k` held apart from the cotangent's group it is a factor of (`Form.units`), so no
+    array the lowered program forms is larger than a sum's operands or its terms' results, where held with
+    it the group formed `bhgqdk`, 8 GiB, four held at once (row 12979). Lowered, never compiled or run."""
+    from jax.extend.mlir import ir
+
+    from dew.nn.kernels.lowered import read_operations
+
+    masses = jax.ShapeDtypeStruct((1, 4, 2, 1024, 1024), jnp.float32)
+    values = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.float32)
+    grad = jax.grad(lambda m, v: jnp.sum(contract(ATTENTION_MEAN, m, v)), argnums=(0, 1))
+
+    def size(operation):
+        ranked = [ir.RankedTensorType(result.type) for result in operation.results
+                  if isinstance(result.type, ir.RankedTensorType)]
+        return max((int(np.prod(kind.shape)) for kind in ranked), default=None)
+
+    # What a sum forms beside its operands: its terms' results, one a term, stacked to join them.
+    from reference_error import equations
+
+    from dew.nn.kernels.templates.scaled_contraction import scaled_contraction_p
+
+    sums = [equation for equation in equations(jax.make_jaxpr(grad)(masses, values))
+            if equation.primitive is scaled_contraction_p]
+    bound = max(max(*(int(np.prod(atom.aval.shape)) for atom in equation.invars),
+                    len(equation.params["form"].terms) * int(np.prod(equation.outvars[0].aval.shape)))
+                for equation in sums)
+    largest = max(read_operations(jax.jit(grad).lower(masses, values), size))
+    assert largest <= bound, (largest, bound)
+
+
+def test_a_transposes_unit_operand_takes_no_band_from_the_groups_beside_it():
+    """`y[d] = w[d] s_0 sum_k x[k]` times 57 scalars, each a group: `x`'s cotangent against `2^127` and
+    `2^-30` at `w = [0, 1]` is `2^-30` at every `k`, exactly. The transpose's unit operand along `k` is a
+    factor of the cotangent's group (`Form.units`), so the term keeps its band; a group of its own left
+    none, and the sum, unbanded, read `2^-30` beneath `2^127` as zero."""
+    scalars = 58
+    subscripts = ("k", "d", *("",) * scalars)
+    weight = ((1, 1), (2, 1))
+    groups = (weight, ((0, 1),), *(((3 + index, 1),) for index in range(scalars - 1)))
+    form = Form(subscripts, ((1, groups),), "d")
+    ones = [jnp.float32(1.0)] * scalars
+    w = jnp.asarray([0.0, 1.0], jnp.float32)
+    _, pull = jax.vjp(lambda x: contract(form, x, w, *ones), jnp.ones(3, jnp.float32))
+    (found,) = pull(jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(found), np.full(3, 2.0 ** -30, np.float32))
+
+
+def test_a_scalar_group_keeps_its_band_beside_a_term_that_cancels():
+    """`sum_k a[k] s - t` at `a = [1, 2^-60]`, `s = t = 1`, each operand a group: `2^-60`, the small part in
+    a band of its own beneath the `1 - 1` that cancels, where a band wide enough to hold both rounded it
+    away."""
+    form = Form(("k", "", ""), ((1, (((0, 1),), ((1, 1),))), (-1, (((2, 1),),))), "")
+    a = jnp.asarray([1.0, 2.0 ** -60], jnp.float32)
+    one = jnp.float32(1.0)
+    np.testing.assert_array_equal(np.asarray(contract(form, a, one, one)), np.float32(2.0 ** -60))
+
+
+def test_a_transposes_transpose_bands_its_unit_as_a_group_once_its_partner_is_taken():
+    """`sum_k x[k] - sum_k w[k] x[k]` at `w = [1, 0]`: its pullback, transposed again against `[1, 2^-60]`,
+    is `2^-60` exactly. The first transpose's unit along `k` is a factor of its cotangent's group; the
+    second takes that cotangent away, and the unit, left that group's one factor, keeps the band the group
+    had: banded as no group, the band held both parts and `1 - 1` rounded away the `2^-60`."""
+    form = Form(("k", "k"), ((1, (((0, 1),),)), (-1, (((1, 1),), ((0, 1),)))), "")
+    w = jnp.asarray([1.0, 0.0], jnp.float32)
+    _, pull = jax.vjp(lambda x: contract(form, x, w), jnp.ones(2, jnp.float32))
+    (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((jnp.asarray([1.0, 2.0 ** -60], jnp.float32),))
+    np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -60))
+
+
+def test_a_quotients_transposes_transpose_keeps_its_unit_beside_the_divisors_factors():
+    """`prod(s) (sum_k x[k] - sum_k w[k] x[k]) / d` over 57 scalar groups at `w = [1, 0]`, `s = d = 1`: its
+    pullback, transposed again against `[2^127, 2^-30]`, is `2^-30` exactly. Once the second transpose takes
+    the first's cotangent away, its unit stays in the group the divisor's reciprocal and exponent hold, as
+    one of its factors; a group of its own left the term no band, and `2^-30` rounded away beneath the
+    cancelling `2^127`."""
+    scalars = 57
+    singles = tuple(((2 + index, 1),) for index in range(scalars))
+    divisor = 2 + scalars
+    form = Form(("k", "k", *("",) * scalars, ""),
+                ((1, (((0, 1),), *singles)), (-1, (((1, 1),), ((0, 1),), *singles))), "",
+                divisor=((1, (((divisor, 1),),)),), divided="")
+    w = jnp.asarray([1.0, 0.0], jnp.float32)
+    ones = [jnp.float32(1.0)] * (scalars + 1)
+    _, pull = jax.vjp(lambda x: contract(form, x, w, *ones), jnp.ones(2, jnp.float32))
+    cotangent = jnp.asarray([2.0 ** 127, 2.0 ** -30], jnp.float32)
+    (back,) = jax.linear_transpose(pull, jnp.float32(1.0))((cotangent,))
+    np.testing.assert_array_equal(np.asarray(back), np.float32(2.0 ** -30))
+
+
+def test_an_empty_group_is_the_scalar_one():
+    """A term of one empty group is the product of no factors: one."""
+    form = Form(("",), ((1, ((),)),), "")
+    np.testing.assert_array_equal(np.asarray(contract(form, jnp.float32(3.0))), np.float32(1.0))

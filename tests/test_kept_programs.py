@@ -675,3 +675,23 @@ def test_a_librarys_sentinel_in_its_closure_is_stated_by_its_cell():
     assert stated(jax.vmap(_doubled), "a batch") == stated(jax.vmap(_doubled), "a batch made again")
     assert stated(jax.vmap(_doubled), "a batch") != stated(jax.vmap(_halved), "another's batch")
     assert stated(jax.vmap(_doubled), "a batch") != stated(jax.vmap(_doubled, axis_name="i"), "a named axis")
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_program_kept_for_one_device_runs_on_no_other(tmp_path):
+    """One program kept for each of two devices of a host is two executables, each run on its own device
+    alone (`options.placed`): handed the file, a call on the second device runs there, where its
+    fingerprint, which holds no device, took the first's executable onto the first device (row 13168)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.training.ahead import keeping, kept
+
+    first, second = jax.devices()[:2]
+    values = jnp.arange(12, dtype=jnp.float32)
+    with keeping() as programs:
+        np.asarray(owned_program(lambda held: held * 3)(jax.device_put(values, first)))
+    programs.save(tmp_path / "kept.programs")
+    with kept(tmp_path / "kept.programs"):
+        answer = owned_program(lambda held: held * 3)(jax.device_put(values, second))
+    assert answer.devices() == {second}
+    np.testing.assert_array_equal(np.asarray(answer), np.asarray(values) * 3)
+

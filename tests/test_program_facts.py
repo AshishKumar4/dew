@@ -15,6 +15,7 @@ from test_algebra import rows
 from dew import algebra
 from dew.nn import flops, programs
 from dew.nn.kernels.templates import attention, attention_mosaic_program, layout
+from dew.nn.kernels.templates.hooks import Hook
 
 
 def named(name: str, function, operands: int = 1) -> jcore.Primitive:
@@ -127,7 +128,7 @@ def test_a_tile_layout_takes_a_placement_inside_a_nested_call_as_the_identity():
             t * 2.0, jax.sharding.NamedSharding(explicit, jax.sharding.PartitionSpec())))(logits)
 
     with jax.set_mesh(explicit):
-        assert attention_mosaic_program.transposable(attention.Hooks(score_mod=resharded))
+        assert attention_mosaic_program.transposable(attention.Hooks(score=Hook(resharded)))
     assert not attention_mosaic_program.transposable(
-        attention.Hooks(score_mod=lambda logits, q_pos, k_pos: scored(logits)))
+        attention.Hooks(score=Hook(lambda logits, q_pos, k_pos: scored(logits))))
 

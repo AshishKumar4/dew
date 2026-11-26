@@ -176,7 +176,6 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
         prefix_refs, refs = refs[:len(prefix)], refs[len(prefix):]
         (do_ref, v_new_ref, dv_ref, h_ref, dh_ref, a_ref, beta_ref, _taken_ref, dq_ref, dk_ref, *rest) = refs
         dr_ref, dg_ref, da_ref, db_ref = rest if reading else (None, *rest)
-        squared = landing[_square_landing(call, keys)]
         weights, scratch = staging
         n, h = at["chunks"], at["heads"]
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
@@ -217,10 +216,15 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
                 read=stream_tile(slots, "reads", given) if reading else None)
             d_betas = d_betas + beta_terms
 
-            # The weights' terms stored once every key block's are in.
+            # The weights' terms stored once every key block's are in: the inverse's gradient a key block's
+            # columns at a time through the key block's landing, whose `[C, C]` own landing, held for this
+            # one store a program, took Kimi delta attention's reads past a 99 KB part's shared memory by its
+            # 16 KB (102560 bytes of 101376 at 16 keys and 128 values on sm120, row 12890).
             @pl.when(index == steps - 1)
             def _():
-                square.store(da_ref, d_system, row, chunk, h * chunk, chunk, family=family, smem=squared)
+                for start in range(0, chunk, keys):
+                    square.store(da_ref, d_system[:, start:start + keys], row, chunk, h * chunk + start, keys,
+                                 family=family, smem=landing["block"])
                 db_ref.at[h, span][...] = d_betas
 
             return (d_system, d_betas, *sums_carried()), accumulators
@@ -523,27 +527,17 @@ def _key_memory_held(call: Call, keys: int, values: int, *, reads: bool = False)
         product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
         product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
     # Under `reads`, the reads read beside the queries and keys, and in fp32 beside them where the weights'
-    # terms are formed; ptxas holds more on the 99 KB parts than this counts (row 12890,
-    # `template.READS_SHARED`).
+    # terms are formed.
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)] + (sums if walked else []), phases=(
         apart + fresh + memory,
         [f32(chunk, keys)] * (4 + reads) + apart + fresh + held_tile(held, chunk, keys) * (2 + reads)
         + [f32(chunk, chunk)] * merged + merging))
 
 
-def _square_landing(call: Call, keys: int) -> str:
-    """The landing a launch stores a chunk's `[C, C]` fp32 tile through: its key blocks' where they are as
-    wide as a chunk, else its own (`_landings`)."""
-    return "block" if keys == call.chunk else "square"
-
-
 def _landings(call: Call, keys: int) -> dict:
-    """A launch's landing tiles for its fp32 stores: a key block's `[C, keys]`, and a chunk's `[C, C]` where
-    it is not one (`_square_landing`)."""
-    chunk = call.chunk
-    square = fp32_operand(call)
-    return {"block": square.landing(chunk, keys),
-            **({} if keys == chunk else {"square": square.landing(chunk, chunk)})}
+    """A launch's landing tile for its fp32 stores, a key block's `[C, keys]`: the key block's gradients' and,
+    a key block's columns at a time, the inverse's (`_key_memory_back`)."""
+    return {"block": fp32_operand(call).landing(call.chunk, keys)}
 
 
 @lowered_once

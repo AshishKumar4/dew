@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from jax.custom_derivatives import zero_from_primal
 from jax.sharding import PartitionSpec as P
 
-from dew.mesh import logical_spec, mesh_axes
+from dew.mesh import logical_spec, mesh_axes, spec_axes
 from dew.nn.categorical import (
     kl_divergence,
     label_entry,
@@ -83,6 +83,7 @@ from dew.nn.protocols import (
     StatesVocabulary,
     forward_method,
     head_table,
+    logits_width,
 )
 
 
@@ -171,10 +172,10 @@ def final_read(model, variables, *args, **kwargs):
 
 def _refuse_unlike_logits(model, read) -> None:
     """Refuse what a model's forward gave (`final_read`'s read, beside its sown collections where any were
-    opened) unless it is `[B, S, vocab]`, `vocab` its `vocab_size` where it declares one
-    (`StatesVocabulary`)."""
+    opened) unless it is `[B, S, vocab]`, `vocab` the width of its logits where it declares its vocabulary
+    (`logits_width`: a head scoring fewer ids than its table holds rows, `output_vocab`, scores those)."""
     logits = read[0] if isinstance(read, tuple) else read
-    vocabulary = model.vocab_size if isinstance(model, StatesVocabulary) else None
+    vocabulary = logits_width(model) if isinstance(model, StatesVocabulary) else None
     if jnp.ndim(logits) != 3 or (isinstance(vocabulary, int) and jnp.shape(logits)[-1] != vocabulary):
         raise ValueError(f"a {type(model).__name__} has no `logits`, so its `__call__` is read as its "
                          f"logits, [B, S, vocab{'' if vocabulary is None else f' = {vocabulary}'}], and "
@@ -214,7 +215,7 @@ class _Columns(NamedTuple):
 
     @classmethod
     def of(cls, head: OutputTable, dtype) -> "_Columns":
-        vocab = head.matrix.shape[0 if head.vocab_major else 1]
+        vocab = head.vocab
         columns = cls(*(None if terms is None else jnp.asarray(terms, dtype)
                         for terms in (head.scale, head.bias)))
         if any(terms.shape != (vocab,) for terms in jax.tree.leaves(columns)):
@@ -874,7 +875,8 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # A traced cap keeps `final_logit_softcap` differentiable; the head is
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
-    table = head.matrix if vocab_major else head.matrix.T
+    held = head.scored_matrix()
+    table = held if vocab_major else held.T
     product = _head_product(head, hidden)
 
     def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False,
@@ -1065,7 +1067,8 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
     precision = _head_product(head, states)
-    table = head.matrix if head.vocab_major else head.matrix.T
+    held = head.scored_matrix()
+    table = held if head.vocab_major else held.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)
 
@@ -1144,7 +1147,8 @@ def head_divergence(hidden, head: OutputTable, reference, reference_head: Output
     hidden, reference = head.states(hidden), jax.lax.stop_gradient(reference_head.states(reference))
     if hidden.shape[:-1] != kept.shape or reference.shape[:-1] != kept.shape:
         raise ValueError(f"{hidden.shape[:-1]} and {reference.shape[:-1]} states for {kept.shape} positions")
-    table, other = (side.matrix if side.vocab_major else side.matrix.T for side in (head, reference_head))
+    table, other = (side.scored_matrix() if side.vocab_major else side.scored_matrix().T
+                    for side in (head, reference_head))
     if table.shape[0] != other.shape[0]:
         raise ValueError(f"the KL compares two distributions column by column, and the head scores "
                          f"{table.shape[0]} ids where the reference's scores {other.shape[0]}")
@@ -1237,7 +1241,7 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
     sums = column_logits is None and reference is None
     operands = (hidden, table, targets, excluded, cap, columns, *(() if reference is None else (reference,)))
     spec = token_spec(jax.tree.leaves(targets)[0].shape)
-    axes = {axis for entry in spec for axis in mesh_axes(entry)}
+    axes = spec_axes(spec)
     if not axes:
         return head(*operands)
     # The head arrives in its own shards on the token axes and is gathered
@@ -1393,7 +1397,8 @@ def support_log_probs(hidden, head: OutputTable, targets, support_ids, support_c
     scores 0.0 here.
     """
     hidden = head.states(hidden)
-    table = jnp.asarray(head.matrix) if head.vocab_major else jnp.asarray(head.matrix).T
+    held = jnp.asarray(head.scored_matrix())
+    table = held if head.vocab_major else held.T
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
     blocks = -(-kept // block)

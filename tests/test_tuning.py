@@ -682,6 +682,30 @@ def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(mad
         assert (kept() is not None) == cached
 
 
+def test_a_launch_whose_trace_reads_a_value_of_the_trace_around_it_runs_itself():
+    """A launch whose trace reads a value of the trace around it that is none of its operands (one its caller
+    left where the launch reads it) is no function of its key, so no trace of it is held: it runs itself, each
+    call reading its own, where its held trace ran without the value it read and raised ("foreach() argument
+    2 is shorter than argument 1": an sm120 attention training step's fused backward, Main's G4 run)."""
+    around = []
+
+    @tuning.lowered_once(())
+    def launch(x):
+        return x + around[-1]
+
+    def stepped(scale: float):
+        @jax.jit
+        def step(x, y):
+            around.append(y * scale)
+            return launch(x)
+        return step
+
+    # Two steps traced apart over the same operands: the second takes the verdict the first held.
+    x = jnp.arange(4.0)
+    for scale in (1.0, 2.0):
+        assert jnp.array_equal(stepped(scale)(x, jnp.float32(1.0)), x + scale)
+
+
 def _halved_score(scores):
     """A module's score hook (the prepared-hook witness's)."""
     return scores * 0.5 + 1.0

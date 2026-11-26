@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from kernel_compile import TPU_TOPOLOGIES
 from reference_error import assert_as_exact
 
 from dew import algebra
@@ -238,11 +239,6 @@ def test_a_program_naming_a_dot_algorithm_compiles_for_a_gpu():
     split = functools.partial(jnp.dot, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
     with generation.assumed("sm90"):
         owned_program(split).compiled(operand, operand)
-
-
-TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
-"""Each TPU generation's compile-only topology (`dew.training.ahead.compile_only_tpus`), of which a product
-takes one chip."""
 
 
 def _compiles_on_a_tpu(generation_name: str, preset: jax.lax.DotAlgorithmPreset) -> bool:

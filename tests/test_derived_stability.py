@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     attention_triton,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @contextlib.contextmanager
@@ -114,15 +115,15 @@ def _edges(dtype) -> dict:
     pair = (_rows([[0.0], [0.0]], dtype), _rows([[0.0]], dtype), _rows([[big]], dtype),
             _rows([[0.0], [4.0]], dtype))
     return {
-        "a query a hook empties": (*pair, spans_two, template.Hooks(score_mod=_emptied)),
+        "a query a hook empties": (*pair, spans_two, template.Hooks(score=Hook(_emptied))),
         "a query no span reaches": (*pair, empty, None),
         "keys past a whole tile": (_rows(drawn[0][:12], dtype), _rows(drawn[1][:12], dtype),
                                    _rows(drawn[2][:12], dtype), _rows(drawn[3][:12], dtype),
                                    template.spans(12, 12, 1), None),
         "an infinite hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                          template.Hooks(score_mod=_poisoned(jnp.inf))),
+                                          template.Hooks(score=Hook(_poisoned(jnp.inf)))),
         "a NaN hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                    template.Hooks(score_mod=_poisoned(jnp.nan))),
+                                    template.Hooks(score=Hook(_poisoned(jnp.nan)))),
         "values at the largest": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),
                                   _rows([[largest]] * 16, dtype), _rows(drawn[3], dtype), causal, None),
         "values at the least": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),
@@ -249,13 +250,13 @@ def _witness(keys: list[float], values: list[list[float]], douts: list[list[floa
     query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
     key = jnp.broadcast_to(_channel([keys]), (batch, count, 1, WIDTH))
     table = jnp.asarray(bias, jnp.float32)[None, None]
-    hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
-        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),))
+    hooks = template.Hooks(score=Hook(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (Side(
+        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),)))
     # An unchecked entry's every channel unchecked: an inf cotangent's NaN reaches them all.
     expected = {name: np.where(np.isnan(first), np.nan, np.pad(first, ((0, 0),) * 3 + ((0, WIDTH - 1),)))
                 for name, rows in gradients.items() if name != "bias"
                 for first in (_held(rows)[:, :, None, None],)}
-    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score_params[0].value.shape)
+    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score.sides[0].value.shape)
     spans = template.spans(queries, count, batch, **{name: jnp.asarray(bound, jnp.int32)
                                                       for name, bound in (bounds or {}).items()})
     return (query, key, _channel(values), _channel(douts), hooks, spans), expected
@@ -360,6 +361,29 @@ def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witne
                 got = np.asarray(made.score_params[0] if name == "bias" else getattr(made, name), np.float32)
                 held = ~np.isnan(want)
                 np.testing.assert_array_equal(got[held], want[held], err_msg=f"{witness} {mainloop} {name}")
+
+
+def test_a_shared_bias_summed_a_slab_at_a_time_is_its_exact_sum():
+    """A tile bias's gradient summed across 4 rows (`template.raised_sum`) a slab of its columns at a time
+    where its digits would hold more entries than its cap (row 10694: 5.47 GiB at once on an
+    A100), each column still its exact sum rounded once: rows of `±2^100` under shifts of 150 that cancel to
+    0 beside a 2^-149 part kept, and a row's own scale per column, the same bits as the whole sum's."""
+    rng = np.random.default_rng(10694)
+    grad = rng.standard_normal((4, 2, 3, 64)).astype(np.float32)
+    grad[:2, :, :, :8] = np.float32(2.0 ** 100) * np.array([1, -1], np.float32)[:, None, None, None]
+    grad[2:, :, :, :8] = np.float32(2.0 ** -149) * np.array([1, 0], np.float32)[:, None, None, None]
+    shift = jnp.asarray(np.array([150, 150, 0, 3], np.int32)).reshape(4, 1, 1, 1)
+    whole = np.asarray(template.raised_sum(jnp.asarray(grad), shift, (0,)))
+    slabbed = np.asarray(template.raised_sum(jnp.asarray(grad), shift, (0,), most=2 * 3 * 4 * 16))
+    assert slabbed.shape == whole.shape == (1, 2, 3, 64)
+    np.testing.assert_array_equal(slabbed.view(np.uint32), whole.view(np.uint32))
+    truth = sum(grad[row].astype(np.float64) * 2.0 ** int(np.asarray(shift).ravel()[row]) for row in range(4))
+    np.testing.assert_array_equal(slabbed[0, :, :, :8], np.float32(truth[:, :, :8]))
+    # A negative axis the sum's own: rows of 64 summed whole, never slabbed along themselves (at a cap of 96
+    # entries a slab the kept axis needs three slabs, the summed one two, the fewer).
+    ones = jnp.ones((3, 64), jnp.float32)
+    summed = template.raised_sum(ones, jnp.zeros((3, 1), jnp.int32), (-1,), most=96)
+    np.testing.assert_array_equal(np.asarray(summed), np.full((3, 1), 64.0, np.float32))
 
 
 def test_the_references_tangent_keeps_a_part_beneath_values_that_cancel():

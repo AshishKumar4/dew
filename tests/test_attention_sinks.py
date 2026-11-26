@@ -80,6 +80,95 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
                                      implementation=implementation, sinks=jnp.zeros(2))
 
 
+def _scores_whole(attend, *operands) -> bool:
+    """Whether `attend`'s program forms a whole score array of its operands' every row, head, query and key
+    (`[..., Q, K]` of `B H Q K` entries) in the memory its kernels' launches read and write, at any depth
+    but a kernel's own (`reference_error.equations` past `programs.opaque`): the reference path's, which a
+    streamed kernel never holds; a key mask, `[B, 1, Q, K]`, holds no head's."""
+    from reference_error import equations
+
+    from dew.nn import programs
+
+    rows, queries, heads, _ = operands[0].shape
+    keys = operands[1].shape[1]
+
+    def whole(shape) -> bool:
+        return tuple(shape[-2:]) == (queries, keys) and np.prod(shape) >= rows * heads * queries * keys
+
+    return any(whole(getattr(var.aval, "shape", ())) for equation in equations(
+        jax.make_jaxpr(attend)(*operands).jaxpr, skip=programs.opaque) for var in equation.outvars)
+
+
+def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them():
+    """Each query's own sinks (`[B, S, H]`, projected) on a TPU's causal bf16 call and an H100's decode step:
+    splash, which takes a head's (`[H]`), refuses them by name, its refusals naming the requirement, and the
+    call left to its selectors streams them, forming no whole `[B, H, Q, K]` score array as the reference
+    path does. The
+    route was overridden after selection, so a published route named splash while the template ran, and
+    then left to the reference path's whole scores (row 13108)."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+
+    def attend(sinks, **options):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, sinks=sinks, **options)
+
+    query = jnp.zeros((1, 2048, 4, 128), jnp.bfloat16)
+    sinks = jnp.zeros((1, 2048, 4), jnp.float32)
+    with generation.assumed("v5e"):
+        with pytest.raises(KernelRefused) as refused:
+            attend(sinks, causal=True, implementation="tpu")(query, query, query)
+        assert "query_sinks" in {refusal.code for refusal in refused.value.refusals}
+        assert not _scores_whole(attend(sinks, causal=True), query, query, query)
+        assert _scores_whole(attend(sinks, causal=True, implementation="reference"), query, query, query)
+    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 4096, 4, 128), jnp.bfloat16)
+    lengths, own = jnp.asarray([3000, 2000], jnp.int32), jnp.zeros((2, 1, 4), jnp.float32)
+    with generation.assumed("sm90"):
+        assert not _scores_whole(attend(own, key_value_seq_lengths=lengths), step, cache, cache)
+        assert _scores_whole(attend(own, key_value_seq_lengths=lengths, implementation="reference"),
+                             step, cache, cache)
+
+
+def test_a_masked_call_with_a_heads_sinks_picks_its_kernel():
+    """A call that built its mask, naming that it has sinks by a flag (`mask_kernel`'s `sinks`, a sliding
+    layer's of GPT-OSS), picks a kernel that takes them: the flag no query's own sinks, where reading it
+    as an array raised AttributeError in every model with sinks (train 1313's batch-12)."""
+    from dew.nn.attention import mask_kernel
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((1, 4, 8, 64), jnp.bfloat16)
+    key = jnp.zeros((1, 64, 2, 64), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        # cuDNN, which takes a mask as its bias, takes no sinks.
+        assert mask_kernel("auto", query, key, as_bias=True, sinks=True) != "cudnn"
+
+
+def test_a_decode_step_under_accurate_numerics_streams_on_the_template():
+    """A bf16 decode step with a head's sinks on an H100 under a run's accurate numerics (`Numerics(forms=
+    "accurate")`): the decode kernel and cuDNN, which compute the fast form alone, refuse it when named, and
+    the call left to its selector forms no whole score array (`_scores_whole`), the template's decode
+    streaming it ahead of the reference path; the decode kernel ran it in its fast form (the 2026-11-26
+    audit's decode finding)."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.precision import Numerics
+
+    def attend(**options):
+        sinks = jnp.zeros((4,), jnp.float32)
+        return lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, sinks=sinks, key_value_seq_lengths=lengths, **options)
+
+    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 4096, 4, 128), jnp.bfloat16)
+    lengths = jnp.asarray([3000, 2000], jnp.int32)
+    with generation.assumed("sm90"), generation.run_precision(Numerics(forms="accurate")):
+        for named in ("decode", "cudnn"):
+            with generation.chosen(decode=named), pytest.raises(KernelRefused) as refused:
+                jax.eval_shape(attend(), step, cache, cache)
+            assert "form" in {refusal.code for refusal in refused.value.refusals}
+        assert not _scores_whole(attend(), step, cache, cache)
+
+
 @pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
 def test_a_masked_key_weighs_nothing_beside_a_sink_however_low_its_logit(heads, kv_heads, dtype):

@@ -1316,6 +1316,73 @@ def _negated(a, b, *, path: str, interpret: bool):
                          interpret=interpret, name="negated")(a, b)
 
 
+def _read_past(a, b, *, between: str):
+    """`a @ b` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup a program, two programs) read through
+    `product_with` while `between` issues products into two accumulators the program scoped before it:
+    "two" issues both in the product's own trace, "eight" four into each there, "branch" one under a branch
+    on the program's index, which one program takes and the other does not, "scope" one within a scope of
+    its own."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.FED
+    shape = (LANDED, LANDED)
+
+    def body(a_gmem, b_gmem, out_gmem):
+        def scoped(a_smem, b_smem, out_smem, first, second):
+            swizzling.copied(a_gmem, a_smem)
+            swizzling.copied(b_gmem, b_smem)
+            plgpu.commit_smem()
+            mosaic.synced(interpret=False)
+
+            def issued():
+                if between in ("two", "eight"):
+                    for _ in range(1 if between == "two" else 4):
+                        family.products(first, a_smem, b_smem)
+                        family.products(second, a_smem, b_smem)
+                elif between == "branch":
+                    @pl.when(jax.lax.axis_index("programs") == 0)
+                    def _():
+                        family.products(first, a_smem, b_smem)
+                else:
+                    pl.run_scoped(lambda third: family.products(third, a_smem, b_smem),
+                                  plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
+            _, value = family.product_with(a_smem, b_smem, shape, issued)
+            plgpu.store(out_smem, value, optimized=False)
+            plgpu.commit_smem()
+            mosaic.synced(interpret=False)
+            # Each program its own rows of the output.
+            stores.store_rows(out_smem, out_gmem, jax.lax.axis_index("programs") * LANDED, 0,
+                              jnp.int32(LANDED), 0, LANDED, copy=swizzling.coalesced,
+                              widest=resources.copied_rows(LANDED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
+        accumulators = (plgpu.WGMMAAccumulatorRef(shape, jnp.float32),) * 2
+        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                      swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((2 * LANDED, LANDED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(2,), grid_names=("programs",), consumers=1,
+                         interpret=False, name="read_past")(a, b)
+
+
+@pytest.mark.parametrize(("between", "in_flight"), [("two", 2), ("eight", 7), ("branch", 0), ("scope", 0)])
+def test_a_products_read_leaves_in_flight_the_groups_every_run_commits_past_it(between, in_flight):
+    """Traced for an H100: a product read through `product_with` (`Issuer.product_with`) leaves in flight the
+    groups its overlapped work committed in its own trace, two issued there, at most the seven a wait's
+    immediate holds of eight, and none of one a branch commits, which a run may skip, nor of one a scope
+    of its own commits: its read's wait counts them
+    (`mosaic.committed_here`), where callers declared a count, which a branch that committed fewer read the
+    product unfinished by (row 10851)."""
+    a = b = np.zeros((LANDED, LANDED), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(functools.partial(_read_past, between=between))(a, b)
+    # The product's read is the kernel's one accumulator read: its wait the groups it leaves in flight.
+    waits = [equation.params["wait_n"] for equation in equations(traced.jaxpr)
+             if equation.primitive.name == "wgmma_accumulator_deref"]
+    assert waits == [in_flight], waits
+
+
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
     """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
     on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
@@ -1408,16 +1475,21 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
     full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
     starts, on_gpu = np.arange(64)[:, None] // 16 * 16, here() != "cpu"
     run = jax.jit(_bounded, static_argnames=("family", "interpret"))
-    for bounds, constant in (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47)):
+    cases = (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47))
+    # Every bound's arm called before any is judged, so a GPU tier's prepare, whose arms give zeros, reaches
+    # each (row 10697: it stopped at the first one's check).
+    got = []
+    for bounds, constant in cases:
         operands, bounded = (a, b, c, np.asarray(bounds, np.int32)), family.bounded(constant)
         if on_gpu:
-            got = ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
-                            f"bounded products: {m_warps} warps at {constant}")(*operands)
+            got.append(ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
+                                 f"bounded products: {m_warps} warps at {constant}")(*operands))
         else:
             with generation.assumed("sm80"):
-                got = run(*operands, family=bounded, interpret=INTERPRETED)
+                got.append(run(*operands, family=bounded, interpret=INTERPRETED))
+    for (bounds, constant), found in zip(cases, got, strict=True):
         expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
-        np.testing.assert_array_equal(np.asarray(got), np.stack(expected))
+        np.testing.assert_array_equal(np.asarray(found), np.stack(expected))
     if on_gpu:
         return
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c, np.zeros(2, np.int32))]
@@ -1957,6 +2029,9 @@ def test_a_product_issued_within_a_staged_block_is_refused():
 
 @pytest.mark.gpu(reason="compiles a launch under each lowering semantics and runs it on this GPU")
 @pytest.mark.generations("sm90", "sm100")
+@pytest.mark.skipif(not here().startswith("sm") or not generation.architecture(here()).tma,
+                    reason="copies its tiles out by TMA, which a GPU before Hopper has none of (row 10697: "
+                           "an A100's compile of it aborted its file's process)")
 @pytest.mark.parametrize("semantics", [plgpu.LoweringSemantics.Lane, plgpu.LoweringSemantics.Warpgroup],
                          ids=["lane", "warpgroup"])
 def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semantics):
@@ -2196,6 +2271,90 @@ def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bun
     np.testing.assert_array_equal(got, PERSISTED_STEPS * first)
 
 
+def _branch_first_walk(x, w, *, family, interpret):
+    """`x @ w + w[0]` through a plain walk of `PERSISTED_STEPS` steps whose step first reads `w`'s slot inside
+    a branch (a cond's, at its first step): the branch reads its block's first row into the walk's carry,
+    which the read adds to every row of the sums, and the step then multiplies by the slot past the branch.
+    The read a branch makes acquires the slot within that branch, which the step's own read then takes."""
+    rows, columns = family.rows, w.shape[1]
+    family = family.specialized(rows, columns)
+    shape = (rows, columns)
+
+    def body(x_gmem, w_gmem, o_gmem):
+        def scope(*, streams):
+            def read(carry, sums):
+                for first, (value,) in family.chunks(sums):
+                    added = carry[None, first:first + value.shape[1]]
+                    o_gmem[:, pl.ds(first, value.shape[1])] = value + added
+
+            multiplied = _multiplying(family, 'x', 'w', interpret)
+
+            def step(index, slots, carry, accumulators):
+                first_row = jax.lax.cond(index == 0, lambda: slots['w'][0].astype(jnp.float32),
+                                         lambda: jnp.zeros((columns,), jnp.float32))
+                carry, accumulators = multiplied(index, slots, carry, accumulators)
+                return carry + first_row, accumulators
+
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+            walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read,
+                               carry=jnp.zeros((columns,), jnp.float32))
+            family.run(streams["walked"], walk, interpret)
+
+        family.scoped(scope, streams={"walked": family.streams({'x': ((rows, PERSISTED_DEPTH), x.dtype),
+                                                               'w': ((PERSISTED_DEPTH, columns), w.dtype)},
+                                                              2, 1)})
+
+    out = jax.ShapeDtypeStruct(shape, jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="branch_first")(x, w)
+
+
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES[:2])
+def test_a_slot_a_branch_reads_first_is_the_steps_own_past_the_branch(bundle):
+    """A walk's step whose first read of a slot is inside a branch (a cond's) and whose next is its own, past
+    the branch: the branch's acquire, its wait and its slot's index the branch's own, holds for none of the
+    step's reads after it, which acquire the slot again (a wait again for the same turn returns at once).
+    Interpreted on the host's CPU, the branch's row and the walk's product reach the output, `x @ w + w[0]`
+    exactly; traced for an H100, the branch waits on the slot's load before it reads the slot, and the step
+    waits on that barrier again past the branch. A slot held from the branch's read carried
+    its index past the branch, a value of a trace that had ended: an sm120 attention training step's fused
+    backward raised as it lowered (row 13106); a branch that formed its slot with no wait of its own read
+    it before its load (row 13113)."""
+    family, target, interpret = _once_bundle(bundle)
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target), on_the_host():
+        got = np.asarray(_branch_first_walk(x, w, family=family, interpret=interpret))
+    want = np.asarray(x, np.float32) @ np.asarray(w, np.float32) + np.asarray(w, np.float32)[0]
+    np.testing.assert_array_equal(got, want)
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda x, w: _branch_first_walk(x, w, family=family, interpret=False))(x, w)
+    (branch,) = [equation for equation in equations(traced.jaxpr) if equation.primitive.name == "cond"
+                 and any(inner.primitive.name == "get" for each in equation.params["branches"]
+                         for inner in each.jaxpr.eqns)]
+    (reading,) = [each.jaxpr for each in branch.params["branches"]
+                  if any(inner.primitive.name == "get" for inner in each.jaxpr.eqns)]
+    order = [inner.primitive.name for inner in reading.eqns
+             if inner.primitive.name in ("barrier_wait", "get")]
+    assert order[:2] == ["barrier_wait", "get"], order
+    # The barrier the branch waits on, as the step's trace holds it: the cond's operand the branch reads.
+    (waited,) = [inner.invars[0] for inner in reading.eqns if inner.primitive.name == "barrier_wait"][:1]
+    barrier = branch.invars[1 + reading.invars.index(waited)]
+    (around,) = [jaxpr for jaxpr in _jaxprs(traced.jaxpr) if branch in jaxpr.eqns]
+    past = around.eqns[around.eqns.index(branch) + 1:]
+    assert any(equation.primitive.name == "barrier_wait" and equation.invars[0] is barrier
+               for equation in past)
+
+
+def _jaxprs(jaxpr):
+    """`jaxpr` and every program within it, at any depth."""
+    yield jaxpr
+    from jax.extend import core as jcore
+
+    for inner in jcore.subjaxprs(jaxpr):
+        yield from _jaxprs(inner)
+
+
 def _once_bundle(bundle: str):
     """`bundle`'s family, the target it is assumed on, and how its kernel is interpreted: a GPU family's by
     Mosaic GPU's interpreter, a TPU core's by Pallas's."""
@@ -2345,3 +2504,29 @@ def test_a_staged_outputs_launch_states_its_cost():
     [estimate] = [equation.params["cost_estimate"] for equation in equations(traced.jaxpr)
                   if "cost_estimate" in equation.params]
     assert (estimate.bytes_accessed, estimate.flops, estimate.transcendentals) == (stored, 0, 0)
+
+
+@pytest.mark.parametrize("family", [bundles.MmaFed(jnp.bfloat16), bundles.MmaProduced(jnp.bfloat16),
+                                    mosaic_sm80.Mma(jnp.bfloat16), "wgmma"],
+                         ids=["mma.sync fed", "mma.sync produced", "mma.sync on cp.async", "wgmma"])
+def test_a_staged_batch_is_fenced_for_asynchronous_product_readers_alone(family):
+    """A consumer's staged batch for products to read (`Family.staged_all`) takes the async proxy's fence
+    (`plgpu.commit_smem`) where its products read shared memory asynchronously (wgmma's), and none where
+    they read it through the warpgroup's own ldmatrix, mma.sync's on any movement: TMA rings its consumer
+    or a producer fills as on cp.async (a Kimi intra walk's three fences a step on a GH200, M-JS-272)."""
+    from jax._src.pallas.mosaic_gpu import primitives as gpu
+
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.WGMMA if family == "wgmma" else family
+
+    def body(out_ref, source, staging):
+        value = plgpu.load(source, layout=family.layout, optimized=False)
+        family.staged_all([(value, staging)])
+
+    tile = plgpu.SMEM((64, 64), jnp.bfloat16)
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32), num_threads=1,
+                          thread_name="wg", scratch_types=[tile, tile])
+    fences = [equation for equation in equations(jax.make_jaxpr(launch)().jaxpr)
+              if equation.primitive is gpu.commit_smem_p]
+    assert bool(fences) == (family is mosaic_sm90.WGMMA), fences

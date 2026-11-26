@@ -46,12 +46,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.custom_batching import custom_vmap
+from jax.custom_derivatives import SymbolicZero
 from jax.extend import core as jcore
 
 from dew import _cache
 from dew._cache import ALGEBRA
-from dew.algebra import carry, cost, derive, linear_scan, program, terms
+from dew.algebra import carry, cost, derive, linear_scan, program, ratios, terms, windows
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
+from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.nested import nested
 from dew.nn.precision import (
@@ -64,7 +67,7 @@ from dew.nn.precision import (
     uncontracted,
     vanishing,
 )
-from dew.nn.programs import read_by
+from dew.nn.programs import holes, read_by
 
 Axes = tuple[str, ...]
 
@@ -1162,14 +1165,82 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
     return jnp.where(active, _factored(left, right, between, joined, issue, role, back=back), 0.0)
 
 
+def _pair_sum(factors: tuple[jax.Array, ...]) -> jax.Array:
+    """Contract the leading key axis without landing a product before it meets the other factors."""
+    form = ratios.Ratio(((1.0, tuple(("v", i) for i in range(len(factors)))),), (), 0,
+                        reduced=True, units=windows.Units(), ieee_products=True)
+    return ratios.ratio(list(factors), form)
+
+
+def _tiny_factor(operand, decay, product):
+    def nonzero(value):
+        _, _, exponent, fraction = float_bits.raw_fields(value)
+        return (exponent != 0) | (fraction != 0)
+
+    return (jnp.abs(product) < jnp.finfo(product.dtype).tiny) & nonzero(operand) & nonzero(decay)
+
+
+def _pair_factors(left, right, decay, after):
+    """Broadcast pair operands along query and key rows, with the contracted channel first."""
+    left, right = (jnp.moveaxis(part, -1, 0) for part in (left, right))
+    first = left[..., :, None], right[..., None, :], jnp.moveaxis(decay, -1, 0)
+    return first if after is None else (*first[:2], first[2][..., :, None],
+                                       jnp.moveaxis(after, -1, 0)[..., None, :])
+
+
+def _portable_pair_jvp(primals, tangents):
+    live = tuple(t is not None and not isinstance(t, SymbolicZero) for t in tangents)
+    value = _portable_pairs(*primals)
+    if not any(live):
+        return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
+    operands, fill = holes(primals, live, is_leaf=lambda arg: arg is None)
+
+    def exact(*active):
+        return _pair_sum(_pair_factors(*fill(active)))
+
+    directions = tuple(t for t, take in zip(tangents, live, strict=True) if take)
+    return value, jax.jvp(exact, tuple(operands), directions)[1]
+
+
+@custom_vmap
+def _pair_dispatch(left, right, decay, after):
+    if after is None:
+        decayed = right[..., None, :, :] * decay
+        tiny = jnp.any(_tiny_factor(right[..., None, :, :], decay, decayed))
+
+        def ordinary():
+            return _portable_einsum("...ik,...ijk->...ij", left, decayed)
+    else:
+        leading, trailing = left * decay, right * after
+        tiny = jnp.any(_tiny_factor(left, decay, leading)) | jnp.any(_tiny_factor(right, after, trailing))
+
+        def ordinary():
+            return _portable_einsum("...ik,...jk->...ij", leading, trailing)
+
+    return lax.cond(tiny, lambda: _pair_sum(_pair_factors(left, right, decay, after)), ordinary)
+
+
+@_pair_dispatch.def_vmap
+def _batch_pair_dispatch(size, batched, *operands):
+    # Reduce across the batch before choosing the path so vmap does not evaluate both. Shape-safe
+    # broadcasting allows further enclosing maps to add axes using this same rule.
+    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)),
+                         operands, tuple(batched))
+    return _pair_dispatch(*placed), True
+
+
+_portable_pairs = contracted("test_a_decayed_pair_holds_its_derivatives")(
+    declared_tangent(Protected(), _pair_dispatch, _portable_pair_jvp, symbolic_zeros=True))
+
+
 def _factored(left, right, between, joined, issue: Callable, role: str, *, back: bool = False):
     """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
     (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
     is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
-    `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
-    across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
-    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
-    (`joined`: `between` less a strict pairing's diagonal). Decays a token `back` (`between_before`, row `i`
+    with a dot unless a factor underflows; then the portable contraction holds all factors until the sum
+    lands (row 12888). A sub-chunk's own pairs are elementwise over its keys (at most SUB^2 K a sub-chunk,
+    not C^2 K), by the pairing's own decays (joined less a strict pairing's diagonal). Decays a token back
+    (between_before, row i
     `between`'s row `i - 1`) factor as `between_back_ip between_back_(p+1)j`, the key's factor read at the
     reference's next row, its own sub-chunk's first: `between_back_pj` is a token short of `p`, which the
     pair's whole decay spans (`exp(G_{i-1} - G_p) exp(G_p - G_j)`)."""
@@ -1177,6 +1248,7 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
 
     count = left.shape[0]
     sub = recurrence_algebra.SUB
+    work = at_least_fp32(jnp.result_type(left, right, joined))
     starts = range(0, count, sub)
     rows = []
     for first in starts:
@@ -1185,15 +1257,20 @@ def _factored(left, right, between, joined, issue: Callable, role: str, *, back:
         for start in starts:
             keys = slice(start, min(start + sub, count))
             if start > first:
-                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start),
-                                        at_least_fp32(jnp.result_type(left, right, joined))))
+                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), work))
             elif start == first:
-                blocks.append(_portable_einsum("ik,ijk->ij", left[own],
-                                               right[None, keys] * joined[own, keys]))
+                decay = joined[own, keys]
+                blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
+                                              decay.astype(work), None) if issue is _issued else
+                              _portable_einsum("ik,ijk->ij", left[own], right[None, keys] * decay))
             else:
                 reference = first - 1
-                blocks.append(issue(role, left[own] * between[own, reference],
-                                    (right[keys] * between[reference + back, keys]).T))
+                before, after = between[own, reference], between[reference + back, keys]
+                if issue is _issued:
+                    blocks.append(_portable_pairs(left[own].astype(work), right[keys].astype(work),
+                                                  before.astype(work), after.astype(work)))
+                else:
+                    blocks.append(issue(role, left[own] * before, (right[keys] * after).T))
         rows.append(jnp.concatenate(blocks, axis=1))
     return jnp.concatenate(rows, axis=0)
 
