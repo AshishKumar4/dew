@@ -810,6 +810,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
     hasher = hashlib.blake2b(digest_size=20)
     opaques: list[Hashable] = []
     ctx_keys: dict[int, Hashable] = {}
+    plain_types: dict[int, Hashable] = {}
     position: dict[jcore.Var, int] = {}
 
     def feed(part: Hashable) -> None:
@@ -817,9 +818,18 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
         hasher.update(b"\0")
 
     def aval_key(given) -> Hashable:
-        if in_process and isinstance(given, ShapedArray):
-            return _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
-        return _collect_opaque(parameter_key(given), opaques)
+        if not in_process or not isinstance(given, ShapedArray):
+            return _collect_opaque(parameter_key(given), opaques)
+        # A body's binders hold their avals live. Ordinary repeated avals need no second walk through
+        # the nested shape and placement key. A key that appends an opaque still gets fresh slots.
+        identity = id(given)
+        if (ready := plain_types.get(identity)) is not None:
+            return ready
+        before = len(opaques)
+        key = _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
+        if len(opaques) == before:
+            plain_types[identity] = key
+        return key
 
     def feed_atom(atom) -> None:
         if isinstance(atom, jcore.Literal):

@@ -86,6 +86,7 @@ def _rounded_half(x):
 def _rounded_half_truth(x):
     return x.astype(jnp.float16).astype(x.dtype)
 
+
 def _rounded(x):
     return precision._rounded(x, jnp.bfloat16)
 
@@ -108,8 +109,8 @@ ROUNDED = declare(__name__, "rounded", ComponentForm(_rounded, _rounded_truth, _
 TANGENT = declare(__name__, "rounded_tangent", ComponentForm(
     _tangent, _tangent_truth, _cases(((16, 32), (16, 32), (16, 32)))))
 PAIRS = declare(__name__, "pairs", ComponentForm(_pairs, _pairs_truth, _cases(((32, 32), (32, 32), (32,)))))
-ROUNDED_HALF = declare(__name__, "rounded_half", ComponentForm(_rounded_half, _rounded_half_truth,
-                                                           _cases(((16, 32),))))
+ROUNDED_HALF = declare(__name__, "rounded_half", ComponentForm(
+    _rounded_half, _rounded_half_truth, _cases(((16, 32),))))
 KEYS_COTANGENT = declare(__name__, "keys_cotangent", ComponentForm(
     _keys_cotangent, _keys_truth, _backward_cases(((64, 32), (64, 32), (32,), (32,), (64, 32)), mask_count=1)))
 QUERIES_COTANGENT = declare(__name__, "queries_cotangent", ComponentForm(
