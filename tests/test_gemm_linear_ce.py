@@ -171,7 +171,7 @@ def test_linear_cross_entropy_mixed_dtype_refuses_native():
     with generation.assumed("sm90"):
         ba = linear_ce.MOSAIC_LINEAR_CE.bind(
             jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((64, 64), jnp.float32),
-            jax.ShapeDtypeStruct((64,), jnp.int32), None, transpose_rhs=True, softcap=None, interpret=True)
+            jax.ShapeDtypeStruct((64,), jnp.int32), None, transpose_rhs=True, interpret=True)
         assert not linear_ce.MOSAIC_LINEAR_CE.eligible(ba, generation.gpu_target())
         tile = linear_ce.derive_linear_ce((64, 64, 64), jnp.bfloat16, generation.gpu_target(), interpret=True)
         assert tile is not None
@@ -258,47 +258,6 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
                 x, head, targets, chunks=1, tile=(64, 64), predict=False)
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
-
-
-def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
-    """The fused linear cross entropy's launch at a softcap of 20, interpreted as an H100's, on par (check 1)
-    with the production path's capped loss (`chunked`'s, `precision.capped_logits`), each from an
-    independent float64 cross entropy of `cap * tanh(z / cap)` (row 13353)."""
-
-    rows, depth, vocab = 256, 128, 1024  # a loss a row: enough rows a seed that the gate resolves its ratio
-
-    def draw(seed):
-        rng = np.random.default_rng(13353 + seed)
-        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(vocab, depth)), jnp.bfloat16),
-                jnp.asarray(rng.integers(0, vocab, size=(rows,)), jnp.int32))
-
-    def fused(x, w, t):
-        with generation.assumed("sm90"):
-            tile = linear_ce.derive_linear_ce((rows, vocab, depth), jnp.bfloat16, generation.gpu_target(),
-                                              interpret=True)
-            loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1,
-                                           interpret=True)
-            return loss
-
-    def portable(x, w, t):
-        # The production path's capped loss (`chunked`'s, its cap `precision.capped_logits`), chunked as the
-        # launch's online sums are.
-        with generation.chosen(linear_ce="xla"):
-            loss, _, _ = chunked.chunked_cross_entropy(
-                x, OutputTable(w, vocab_major=True, softcap=20.0, precision=chunked.BF16), t, chunks=4,
-                tile=(64, 256), predict=False)
-            return loss
-
-    def truth(x, w, t):
-        # Its operands widened to float64 by the gate (`assert_as_exact`): the cap's quotient exact there.
-        capped = 20.0 * jnp.tanh(jnp.dot(x, w.T) / 20.0)
-        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(rows), t]
-
-    label = "capped linear_ce"
-    dew_fn, ref_fn = jax.jit(fused), jax.jit(portable)
-    assert_as_exact(dew_fn, ref_fn, draw, label, seeds=seeds_for(ref_fn, draw, label, truth_fn=truth,
-                                                                  dew_fn=dew_fn), truth_fn=truth)
 
 
 def test_a_capped_logit_of_zero_at_a_cap_past_its_reciprocals_range_is_zero():

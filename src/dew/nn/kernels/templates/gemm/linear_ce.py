@@ -47,7 +47,7 @@ from dew.nn.kernels.templates.gemm.pricing import (
     tile_rows,
 )
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
-from dew.nn.precision import capped_logits, exact_products
+from dew.nn.precision import exact_products
 from dew.nn.sharding import automatic_axes
 
 LINEAR_CE = "dew_linear_ce"
@@ -117,7 +117,7 @@ def linear_ce_launch_of(tiles: Tiles, shape: tuple[int, int, int], dtype, *, tra
 
 
 def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smems, side_barriers, row_stage,
-                           out_m, out_l, out_t, out_r, vocab: int, softcap: float | None, columns: int,
+                           out_m, out_l, out_t, out_r, vocab: int, columns: int,
                            family: mosaic.Family, tiles: Tiles, round_logits: bool = False) -> None:
     """Reduce one `[share, columns]` fp32 logit tile into per-row `(m, l, target_logit, rest)` summaries
     through the toolkit's native side-operand staging (`family.loaded`/`side_tile`) and vector store
@@ -141,8 +141,6 @@ def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smem
             bias_col = family.side_tile(side_smems[1].at[wg].at[slice(start, start + z.shape[1])],
                                         ("columns",)).astype(jnp.float32)
             z = z + jax.lax.broadcast_in_dim(bias_col, z.shape, (1,))
-        if softcap is not None:
-            z = capped_logits(z, softcap)  # the reference's cap, its division correctly rounded (row 13353)
         col_global = col_tile + start + family.iota(z.shape, 1)
         in_vocab = col_global < vocab
         z_masked = jnp.where(in_vocab, z, jnp.float32(-jnp.inf))
@@ -187,7 +185,7 @@ def _merge_summaries(out_m: jax.Array, out_l: jax.Array, out_t: jax.Array, out_r
 
 
 def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Tiles,
-              transpose_rhs: bool = True, bias: jax.Array | None = None, softcap: float | None = None,
+              transpose_rhs: bool = True, bias: jax.Array | None = None,
               round_logits: bool = False, multiprocessors: int,
               interpret: bool | plgpu.InterpretGPUParams = False, registers: int | None = None,
               shared: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -227,7 +225,7 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
         bias_f32 = jnp.pad(bias_f32, ((0, v_pad - v),))
     out_m, out_l, out_t, out_r = _linear_ce_mainloop(
         x, weight, targets_i32, bias_f32, (m_pad, v_pad, k_pad, v), tiles=tiles,
-        transpose_rhs=transpose_rhs, softcap=softcap, round_logits=round_logits,
+        transpose_rhs=transpose_rhs, round_logits=round_logits,
         multiprocessors=multiprocessors, interpret=interpret, has_bias=bias_f32 is not None,
         registers=registers, shared=shared)
     if m_pad != m:
@@ -235,11 +233,11 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
     return _merge_summaries(out_m, out_l, out_t, out_r)
 
 
-@tuning.lowered_once(("shape", "tiles", "transpose_rhs", "softcap", "round_logits", "multiprocessors",
+@tuning.lowered_once(("shape", "tiles", "transpose_rhs", "round_logits", "multiprocessors",
                       "interpret", "has_bias", "registers", "shared"))
 def _linear_ce_mainloop(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
                         shape: tuple[int, int, int, int], *, tiles: Tiles, transpose_rhs: bool,
-                        softcap: float | None, round_logits: bool = False, multiprocessors: int, interpret,
+                        round_logits: bool = False, multiprocessors: int, interpret,
                         has_bias: bool = False, registers: int | None = None, shared: int | None = None
                         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compiled/interpreted persistent Mosaic GEMM + online-softmax summary mainloop."""
@@ -298,7 +296,7 @@ def _linear_ce_mainloop(x: jax.Array, weight: jax.Array, targets: jax.Array, bia
                 _linear_ce_finish_tile(
                     wg, tile, accs, targets_gmem=targets_gmem, bias_gmem=bias_gmem,
                     side_smems=side_smems, side_barriers=side_barriers, row_stage=row_stage,
-                    out_m=out_m, out_l=out_l, out_t=out_t, out_r=out_r, vocab=vocab, softcap=softcap,
+                    out_m=out_m, out_l=out_l, out_t=out_t, out_r=out_r, vocab=vocab,
                     columns=block_n, family=family, tiles=tiles, round_logits=round_logits)
             family.persist(streams, (total_tiles,), schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
@@ -344,7 +342,7 @@ def derive_linear_ce(shape: tuple[int, int, int], dtype, target, *, transpose_rh
         ba = MOSAIC_LINEAR_CE.bind(jax.ShapeDtypeStruct((m, k), dtype),
                                    jax.ShapeDtypeStruct(w_shape, dtype),
                                    jax.ShapeDtypeStruct((m,), jnp.int32), bias_spec,
-                                   transpose_rhs=transpose_rhs, softcap=None, interpret=interpret)
+                                   transpose_rhs=transpose_rhs, interpret=interpret)
     multiprocessors = target.multiprocessors or 1
     for tried in (tried for layouts in groups for tried in derivation.paired_first(layouts, m)):
         family0 = tried[0]
@@ -428,17 +426,17 @@ class MosaicLinearCE(TilesTemplate):
                                 refused=lambda candidate: report.refused(self, ba, candidate, target), ba=ba)
 
     def _fwd(self, x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None = None, *,
-             transpose_rhs: bool = True, softcap: float | None = None, round_logits: bool = False,
+             transpose_rhs: bool = True, round_logits: bool = False,
              interpret: bool = False, config: Tiles, return_residuals: bool = False):
         del return_residuals
         target = generation.gpu_target()
-        bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=softcap,
-                          round_logits=round_logits, interpret=interpret)
+        bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, round_logits=round_logits,
+                          interpret=interpret)
         mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = linear_ce(x, weight, targets, tiles=config, transpose_rhs=transpose_rhs, bias=bias,
-                        softcap=softcap, round_logits=round_logits, multiprocessors=mp,
+                        round_logits=round_logits, multiprocessors=mp,
                         interpret=grouped_launch.INTERPRETED if interpret else False,
                         registers=regs, shared=shared)
         return out, None
@@ -519,10 +517,10 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
                 jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
                 jax.ShapeDtypeStruct(targets.shape, jnp.int32),
                 None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
-                transpose_rhs=transpose_rhs, softcap=None, round_logits=round_logits, interpret=False))
+                transpose_rhs=transpose_rhs, round_logits=round_logits, interpret=False))
 
         case = LinearCECase(not automatic_axes(), exact, dtype_ok, plan)
         if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
             return None
-        return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=None,
+        return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
                                 round_logits=round_logits, interpret=interpreting)
