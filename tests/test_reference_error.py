@@ -338,6 +338,10 @@ def test_check_1_reads_a_discrete_leaf_in_its_own_representation():
     assert np.isclose(log_mse, 2 * np.log(2.0**64))
     with pytest.raises(ValueError):
         _error_rows([np.asarray([1], np.uint64)], [np.asarray([1], np.int64)], xp=np)
+    # A boolean leaf against signed or unsigned 0/1 counts compares exactly.
+    for counts in (np.asarray([0, 1], np.int64), np.asarray([0, 1], np.uint8)):
+        [(log_mse, *_)] = _error_rows([np.asarray([False, True])], [counts], xp=np)
+        assert log_mse == -np.inf, counts.dtype
 
     def counted(value):
         return as_given(lambda seed: {"count": np.asarray([value], np.int64)})

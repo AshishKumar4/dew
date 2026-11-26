@@ -888,11 +888,14 @@ def _discrete_errors(reference, truth, xp):
     would make two that differ by one agree (row 13543); None for a leaf of floats. Each value is laid in
     unsigned 64 bits by its order (a signed one's sign bit flipped), its difference the larger less the
     smaller, which wraps at no extreme, then signed and read in float64 (exact below 2^53). Leaves of
-    signed and unsigned values apart are refused: no one order of 64 bits holds both."""
+    signed and unsigned values apart are refused: no one order of 64 bits holds both; a boolean takes the
+    other's."""
     held, true = xp.asarray(reference), xp.asarray(truth)
     if not all(xp.issubdtype(leaf.dtype, xp.integer) or leaf.dtype == bool for leaf in (held, true)):
         return None
-    signed = {bool(xp.issubdtype(leaf.dtype, xp.signedinteger)) for leaf in (held, true)}
+    # A boolean's 0 and 1 hold either order: the other leaf's names it.
+    signed = {bool(xp.issubdtype(leaf.dtype, xp.signedinteger)) for leaf in (held, true)
+              if leaf.dtype != bool} or {False}
     if len(signed) > 1:
         raise ValueError(f"a discrete leaf of {held.dtype} against a truth of {true.dtype}: its signed and "
                          "unsigned values hold no one order to compare")

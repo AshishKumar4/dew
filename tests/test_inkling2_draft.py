@@ -190,6 +190,37 @@ def test_a_load_keeping_no_prediction_depths_reads_no_draft(tmp_path):
 
 
 @attending('reference')
+def test_the_markov_heads_packed_projection_writes_its_live_kernels(source):
+    """The Markov head's `rnn_proj` an export writes packs its step's and its context's live kernels back
+    (`Packed`, row 13538): one weight of each changed, the written tensor is the release's with exactly those
+    two entries changed, at the step's columns (the first 2r) and the context's (after them), its bias the
+    context's."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.decoder_parts import packed_layouts
+    from dew.interop.hf_decoders import family_entry
+
+    layouts = {layout.name: layout for layout in source.weight_layouts if '.markov_head.rnn_' in layout.name}
+    packed = packed_layouts(layouts, family_entry(RELEASE['model_type']).packed)
+    head = source.variables['params']['block_drafter']['markov_head']
+    rank = RELEASE['mtp_config']['markov_rank']
+    step = {'kernel': head['rnn_step']['kernel'].at[1, 2].add(1.0)}
+    context = {**head['rnn_context'], 'kernel': head['rnn_context']['kernel'].at[3, 4].add(1.0)}
+    drafter = {**source.variables['params']['block_drafter'],
+               'markov_head': {**head, 'rnn_step': step, 'rnn_context': context}}
+    changed = {**source.variables, 'params': {**source.variables['params'], 'block_drafter': drafter}}
+    given = load_file(TINY / 'mtp.safetensors')
+    expected = np.asarray(given['markov_head.rnn_proj.weight'], np.float32).copy()
+    expected[2, 1] += 1.0
+    expected[4, 2 * rank + 3] += 1.0
+    weight = [layout for name, layout in packed.items() if name.endswith('markov_head.rnn_proj.weight')]
+    bias = [layout for name, layout in packed.items() if name.endswith('markov_head.rnn_proj.bias')]
+    assert len(weight) == 1 and len(bias) == 1, sorted(packed)
+    np.testing.assert_array_equal(np.asarray(weight[0].source_array(changed), np.float32), expected)
+    np.testing.assert_array_equal(np.asarray(bias[0].source_array(changed), np.float32),
+                                  np.asarray(given['markov_head.rnn_proj.bias'], np.float32))
+
+
 def test_a_release_writes_each_sidecars_tensors_to_its_own_file(tmp_path):
     """A release whose family keeps more of its tensors beside its weights (`Placed.sidecars`, Inkling 2's
     `mtp.safetensors`) writes each sidecar's tensors to its own file under their own names, the prefix
