@@ -1255,7 +1255,7 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     from dew.training.startup import resumed_step
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
-    trainer.reading(loader, examples=examples, steps=steps)
+    trainer._reading(loader, examples=examples, steps=steps)
     trainer.validate(steps=steps)
     checkpoints = trainer.checkpoints
     resumed = resumed_step(trainer, resume)

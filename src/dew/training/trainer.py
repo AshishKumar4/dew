@@ -541,7 +541,7 @@ class Trainer(Generic[Loss, Effects]):
                 self._key = request_key(self._given_key)
         return self._key
 
-    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
+    def _reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), and the batches its steps read, each
         phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
         do."""
@@ -733,7 +733,7 @@ class Trainer(Generic[Loss, Effects]):
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the
         mesh lacks.
         """
-        self.scheduled(None if steps is None else steps // self.accumulation)
+        self._scheduled(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state)[1]
@@ -1326,8 +1326,8 @@ class Trainer(Generic[Loss, Effects]):
                             max_tokens=max_tokens),
             update=self.update,
             startup=startup, resume=self.data_resume)
-        self.reading(loader, device_prefetch, examples=examples, steps=steps)
-        self.scheduled(None if steps is None else steps // self.accumulation)
+        self._reading(loader, device_prefetch, examples=examples, steps=steps)
+        self._scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
         # and its refusals made before anything is placed (`_preflight`).
         logged, evaluated, saved, local, suites = FitPlan.cadences(
@@ -1349,7 +1349,7 @@ class Trainer(Generic[Loss, Effects]):
             summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
             else cooldowns.branches(steps, tokens, self.accumulation, self._shape.examples))
 
-    def scheduled(self, updates: int | None) -> None:
+    def _scheduled(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
         `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
         transformation keeps it."""

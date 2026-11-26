@@ -417,7 +417,7 @@ class TrainerConfig:
         records a step early and a pass over the data is that many steps longer. Its updates are the steps
         over the accumulation, an update of tokens read against the loader's token batches
         (`accumulation`): the config stays as authored, which its record holds and its trainer resolves as
-        it reads the loader (`Trainer.reading`)."""
+        it reads the loader (`Trainer._reading`)."""
         dataset = dataset if self.batch_ramp is None else ramped(dataset, self.batch_ramp)
         return dataset, self.total_steps(dataset)
 

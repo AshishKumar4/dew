@@ -233,7 +233,7 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
                           accumulation=accumulation,
                           split=split)
         # A configured optimizer built over the run's updates, as a fit builds it.
-        trainer.scheduled((steps + padded) // accumulation)
+        trainer._scheduled((steps + padded) // accumulation)
         state = trainer.initial_state()
         steps_by = {False: (trainer.compile(state, batch), None)}
         if long:

@@ -176,7 +176,7 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     batch, _ = split_fields(batch)
     # An objective that names its input field alone reads its shape off the batch, as `fit` does.
     trainer._declare_input(lambda: batch)
-    trainer.scheduled(None if steps is None else steps // trainer.accumulation)
+    trainer._scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     # The step at that phase's pass count, as `fit` and a step compiled ahead build it, not the run's base.
     with trainer.phase_passes.scoped(trainer, trainer._compiler):

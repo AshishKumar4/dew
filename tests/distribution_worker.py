@@ -247,7 +247,7 @@ def main() -> None:
             # The float32 run's start, drawn by a trainer of the float32 model, its optimizer built over the
             # run's length as each fit builds the run's (`Trainer.scheduled`), widened.
             narrowed = trainer_of(None)
-            narrowed.scheduled(args.steps)
+            narrowed._scheduled(args.steps)
             initial = widened_start(narrowed)
         seeds = range(args.first_draw, args.first_draw + args.draws)
         runs = (run(drawn(seed), **({} if initial is None else {"state": copied(initial)})) for seed in seeds)
