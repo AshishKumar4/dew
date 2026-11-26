@@ -118,8 +118,10 @@ def test_an_unscored_column_enters_no_product_of_a_bf16_models_head(tied):
                                hidden)
         return logits, pull(jnp.ones_like(logits))[0]
 
-    logits, gradient = jax.jit(pulled)(with_row(float(np.finfo(np.float32).max)))
-    zero_logits, zero_gradient = jax.jit(pulled)(with_row(0.0))
+    # Run op by op, as an unjitted call runs: compiled, the unfixed head's pullback came out finite here (its
+    # compiler free to drop the product over the cotangent's zero columns), op by op NaN.
+    logits, gradient = pulled(with_row(float(np.finfo(np.float32).max)))
+    zero_logits, zero_gradient = pulled(with_row(0.0))
     assert logits.shape[-1] == SCORED and bool(jnp.all(jnp.isfinite(gradient)))
     np.testing.assert_array_equal(np.asarray(logits, np.float32), np.asarray(zero_logits, np.float32))
     np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.asarray(zero_gradient, np.float32))

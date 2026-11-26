@@ -37,19 +37,22 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     `threshold` (`QKClip`), in at least fp32 and returned in `x`'s dtype."""
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
-    # The head over its largest magnitude `m`, whose squares sum in range where a finite head's own
-    # overflow (1e20's square is fp32's infinity, row 13137): the clip is `unit * min(threshold / (|unit| +
-    # eps / m), m)`, `x * min(threshold / (|x| + eps), 1)` for any `m` > 0, so `m` is held constant
-    # (`stop_gradient`) and the derivative is the clip's own; a zero head divides by 1.
+    # A head past 2^(maxexp/2), whose squares can overflow (1e20's is fp32's infinity, row 13137), is scaled
+    # by `s` = 2^-(maxexp/2 + 6) first, a power of two whose reciprocal is normal: the clip is then
+    # `y * min(threshold / (|y| + eps s), 1 / s)` of `y = x s`, which is `x * min(threshold / (|x| + eps), 1)`
+    # with no reciprocal of the head's size (XLA turns a division by it into a product by its reciprocal,
+    # subnormal past 2^126 in fp32 and flushed to zero). `s` is held constant (`stop_gradient`): the clip is
+    # the same at either, and so its derivative.
+    half = jnp.finfo(wide).maxexp // 2
     largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x_wide), axis=-1, keepdims=True))
-    divisor = jnp.where(largest > 0, largest, 1)
-    unit = x_wide / divisor
-    squared = jnp.sum(jnp.square(unit), axis=-1, keepdims=True)
+    factor = jnp.where(largest > 2.0 ** half, jnp.asarray(2.0 ** -(half + 6), wide), jnp.asarray(1, wide))
+    scaled = x_wide * factor
+    squared = jnp.sum(jnp.square(scaled), axis=-1, keepdims=True)
     # A zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's
     # constant region), where the square root's would be infinite times zero.
     held = squared > 0
     length = jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
-    return (unit * jnp.minimum(threshold / (length + eps / divisor), divisor)).astype(x.dtype)
+    return (scaled * jnp.minimum(threshold / (length + eps * factor), 1 / factor)).astype(x.dtype)
 
 
 def log_ratio_scale(positions, floor: float, scale: float, *, dtype: DTypeLike) -> jax.Array:
