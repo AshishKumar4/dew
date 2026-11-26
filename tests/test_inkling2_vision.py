@@ -209,11 +209,14 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
                                           err_msg=f'{type(given).__name__} {name}')
 
 
-def test_a_transparent_image_is_laid_over_the_checkerboard_however_it_is_given(tmp_path):
-    """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule) whether the
-    image is given as a PIL image, its encoded bytes or its file's path, each read through the public
-    processor alike: transformers' `load_image` converts a path's image to RGB first, its transparent
-    pixels black (row 13341). A tokenizer padding a side that is neither is refused (row 13342)."""
+def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path):
+    """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule), and a JPEG
+    turned by its EXIF orientation reads upright, whether the image is given through the public processor
+    as a PIL image, its encoded bytes, its file's path or a data URI: transformers' `load_image` converts a
+    path's image to RGB first, its transparent pixels black (row 13341). A tokenizer padding a side that is
+    neither is refused (row 13342)."""
+    import base64
+
     from PIL import Image
 
     directory = _bundle_with_tokenizer(tmp_path)
@@ -221,17 +224,33 @@ def test_a_transparent_image_is_laid_over_the_checkerboard_however_it_is_given(t
     loaded = Pretrained.load(directory, dtype='float32')
     rgba = np.zeros((16, 24, 4), np.uint8)
     rgba[4:12, 8:16] = (200, 30, 90, 255)
-    stored = tmp_path / 'transparent.png'
-    Image.fromarray(rgba, 'RGBA').save(stored)
-    with Image.open(stored) as opened:
-        opened.load()
-        forms = {'PIL': opened, 'bytes': stored.read_bytes(), 'path': stored}
-        read = {name: loaded.processor._media_reference(text='w1 <|image|>', images=[given])['pixel_values']
-                for name, given in forms.items()}
-    blacked = loaded.processor._media_reference(text='w1 <|image|>', images=[rgba[..., :3]])['pixel_values']
-    assert not np.array_equal(read['PIL'], blacked)
-    for name in ('bytes', 'path'):
-        np.testing.assert_array_equal(read[name], read['PIL'], err_msg=name)
+    transparent = tmp_path / 'transparent.png'
+    Image.fromarray(rgba, 'RGBA').save(transparent)
+    turned = tmp_path / 'turned.jpg'
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation: the stored image turned a quarter, read upright.
+    drawn = np.random.default_rng(13341).integers(0, 256, (16, 40, 3), np.uint8)
+    Image.fromarray(drawn).save(turned, exif=exif)
+
+    def read(given):
+        return {name: np.asarray(value) for name, value in
+                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
+
+    for stored, kind in ((transparent, 'png'), (turned, 'jpeg')):
+        encoded = stored.read_bytes()
+        with Image.open(stored) as image:
+            image.load()
+            forms = {'PIL': read(image), 'bytes': read(encoded), 'path': read(stored),
+                     'data URI': read(f'data:image/{kind};base64,{base64.b64encode(encoded).decode()}')}
+        for name in ('bytes', 'path', 'data URI'):
+            for field, value in forms[name].items():
+                np.testing.assert_array_equal(value, forms['PIL'][field],
+                                              err_msg=f'{stored.name} {name} {field}')
+    blacked = read(rgba[..., :3])
+    assert any(not np.array_equal(blacked[field], value) for field, value in read(transparent).items())
+    upright = read(np.asarray(Image.open(turned).transpose(Image.Transpose.ROTATE_270)))
+    for field, value in read(turned).items():
+        np.testing.assert_array_equal(value, upright[field], err_msg=field)
     loaded.processor._media_reference.tokenizer.padding_side = 'middle'
     with pytest.raises(ValueError):
-        loaded.processor._media_reference(text='w1 <|image|>', images=[rgba])
+        loaded.processor('w1 <|image|>', images=[rgba])

@@ -41,17 +41,19 @@ rescale factor 1 / 255, fused as the reference fuses them."""
 
 
 def rgb(image: object) -> np.ndarray:
-    """An image as `[height, width, 3]` uint8, as the reference reads one: a path, a URL or encoded bytes
-    decoded in its own mode (`opened`); a PIL image converted to RGBA where it holds transparency and else
-    to RGB; an RGBA array laid over the checkerboard (`composited`); an RGB array as it is. Its alpha rule
-    holds however the image is given: transformers' `load_image` converts a path's or a URL's to RGB, its
-    transparent pixels black, before any processor reads it."""
-    from PIL import Image
+    """An image as `[height, width, 3]` uint8, as the reference reads one: a path, a URL, a base64 string
+    or data URI, or encoded bytes decoded in its own mode (`opened`); a PIL image turned upright by its EXIF
+    orientation, as transformers' `load_image` turns one, and converted to RGBA where it holds transparency
+    and else to RGB; an RGBA array laid over the checkerboard (`composited`); an RGB array as it is. Its
+    alpha rule and its orientation hold however the image is given: transformers' `load_image` converts a
+    path's or a URL's to RGB, its transparent pixels black, before any processor reads it."""
+    from PIL import Image, ImageOps
 
     if isinstance(image, str | Path | bytes | bytearray):
         image = opened(image)
     if isinstance(image, Image.Image):
-        image = np.asarray(image.convert("RGBA" if image.has_transparency_data else "RGB"))
+        upright = ImageOps.exif_transpose(image)
+        image = np.asarray(upright.convert("RGBA" if upright.has_transparency_data else "RGB"))
     held = np.asarray(image)
     if held.ndim != 3 or held.shape[-1] not in (3, 4) or held.dtype != np.uint8:
         raise ValueError(f"an image is [height, width, 3 or 4] uint8 or a PIL image, got {held.dtype} "
@@ -60,11 +62,14 @@ def rgb(image: object) -> np.ndarray:
 
 
 def opened(image: str | Path | bytes | bytearray):
-    """An encoded image decoded as PIL opens it, EXIF-transposed as transformers' `load_image` transposes
-    one, in its own mode: a URL's bytes fetched (`http://`, `https://`), a path's read, bytes as given."""
+    """An encoded image as PIL opens it, in its own mode, from each form transformers' `load_image` reads:
+    a URL's bytes fetched (`http://`, `https://`), a file's path, a base64 string or data URI
+    (`data:image/...;base64,...`) decoded, and bytes as given."""
+    import base64
+    import binascii
     import io
 
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     if isinstance(image, str) and image.startswith(("http://", "https://")):
         import requests
@@ -72,8 +77,14 @@ def opened(image: str | Path | bytes | bytearray):
         response = requests.get(image, timeout=60)
         response.raise_for_status()
         image = response.content
-    held = Image.open(io.BytesIO(image) if isinstance(image, bytes | bytearray) else Path(image))
-    return ImageOps.exif_transpose(held)
+    elif isinstance(image, str) and not Path(image).is_file():
+        try:
+            image = base64.b64decode(image.split(",", 1)[1] if image.startswith("data:image/") else image,
+                                     validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError(f"an image string is a URL, a file's path, base64 or a data URI: {image[:64]!r}"
+                             ) from error
+    return Image.open(io.BytesIO(image) if isinstance(image, bytes | bytearray) else Path(image))
 
 
 def composited(rgba: np.ndarray) -> np.ndarray:
