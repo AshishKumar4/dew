@@ -432,3 +432,98 @@ def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkey
         again = forward(x, kernel, jnp.asarray([6, 10], jnp.int32))
         assert np.asarray(out).shape == np.asarray(again).shape == (16, 4)
         assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}
+
+
+def _tpu_capture(directory, ops, runs):
+    """A capture under `directory` as JAX writes a TPU's (plugins/profile/<run>/<host>.xplane.pb): `ops`, each
+    (device, name, start ms, end ms, program id or None for a host transfer), on each TPU's `XLA Ops` line,
+    and `runs`, each (device, module name, start ms, end ms, program id), on its `XLA Modules` line, every
+    event carrying XLA's program_id stat."""
+    from jax.profiler import ProfileData
+
+    names = sorted({name for _, name, *_ in [*ops, *runs]})
+
+    def events(listed, device):
+        return "".join(
+            f"events {{ metadata_id: {names.index(name) + 1} offset_ps: {round(start * 1e9)} "
+            f"duration_ps: {round((end - start) * 1e9)}"
+            + ("" if program is None else f" stats {{ metadata_id: 1 int64_value: {program} }}") + " } "
+            for each, name, start, end, program in listed if each == device)
+
+    metadata = "".join(f'event_metadata {{ key: {index} value {{ id: {index} name: "{name}" }} }} '
+                       for index, name in enumerate(names, 1))
+    planes = [f'planes {{ id: {plane} name: "/device:TPU:{device}" '
+              f'lines {{ id: 1 name: "XLA Ops" timestamp_ns: 0 {events(ops, device)}}} '
+              f'lines {{ id: 2 name: "XLA Modules" timestamp_ns: 0 {events(runs, device)}}} {metadata}'
+              'stat_metadata { key: 1 value { id: 1 name: "program_id" } } }'
+              for plane, device in enumerate(sorted({device for device, *_ in [*ops, *runs]}), 1)]
+    run = directory / "plugins" / "profile" / "run"
+    run.mkdir(parents=True)
+    (run / "host.xplane.pb").write_bytes(ProfileData.text_proto_to_serialized_xspace(" ".join(planes)))
+
+
+def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path):
+    """A TPU call's device time (`benchmark.tpu_ops`, the kernel tuner's on a TPU core) is the ops of its
+    program's one run on its devices, each its device milliseconds: another program's ops and run, a host
+    transfer and another device's left out; a call on two devices, each one's. A capture where the call's
+    program did not run on one of its devices, or ran there without an op, is refused, though another
+    program ran there (`NoKernels`), and one where it ran twice on a device is refused as ambiguous
+    (`AmbiguousCapture`)."""
+    from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
+
+    ops = [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7), (0, "transfer", 1.0, 1.5, None),
+           (0, "fusion.4", 2.0, 3.0, 9), (1, "fusion.9", 0.0, 4.0, 7)]
+    runs = [(0, "jit_run(7)", 0.0, 1.0, 7), (0, "jit_other(9)", 2.0, 3.0, 9), (1, "jit_run(7)", 0.0, 4.0, 7)]
+    one = tmp_path / "one"
+    _tpu_capture(one, ops, runs)
+    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run")] == [("fusion.1", 0.25),
+                                                                                   ("custom-call.2", 0.75)]
+    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run")] == ["fusion.1", "custom-call.2", "fusion.9"]
+    for devices in ({2}, set()):
+        with pytest.raises(NoKernels):
+            tpu_ops(one, devices, "jit_run")
+    with pytest.raises(NoKernels):
+        tpu_ops(one, {0}, "jit_idle")
+    # A call on TPUs 0 and 1 whose capture holds its run on TPU 0 alone, another program's on TPU 1; or its
+    # run on TPU 1 with no op of its own: part of the call, refused.
+    half = tmp_path / "half"
+    _tpu_capture(half, ops, [runs[0], (1, "jit_other(9)", 0.0, 4.0, 9)])
+    with pytest.raises(NoKernels):
+        tpu_ops(half, {0, 1}, "jit_run")
+    idle = tmp_path / "idle"
+    _tpu_capture(idle, ops[:4], runs)
+    with pytest.raises(NoKernels):
+        tpu_ops(idle, {0, 1}, "jit_run")
+    twice = tmp_path / "twice"
+    _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
+    with pytest.raises(AmbiguousCapture):
+        tpu_ops(twice, {0}, "jit_run")
+    # Another program's run overlapping the call's, and its op inside the call's window: left out by program.
+    overlapped = tmp_path / "overlapped"
+    _tpu_capture(overlapped, [*ops, (0, "fusion.5", 0.5, 0.75, 9)], [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
+    assert [op.name for op in tpu_ops(overlapped, {0}, "jit_run")] == ["fusion.1", "custom-call.2"]
+    # A run stating no program: its ops are not told apart from another's.
+    unnamed = tmp_path / "unnamed"
+    _tpu_capture(unnamed, ops, [(0, "jit_run", 0.0, 1.0, None)])
+    with pytest.raises(AmbiguousCapture):
+        tpu_ops(unnamed, {0}, "jit_run")
+
+
+def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():
+    """A TPU call is timed as a compiled program called with its dynamic operands (`benchmark._program_of`),
+    whose module names its runs (`_module_of`); a jitted function, whose call may run no program (with JIT
+    disabled) or take other operands than its compile (static arguments), and a plain function are
+    refused (`AmbiguousCapture`)."""
+    from dew.telemetry.benchmark import AmbiguousCapture, _module_of, _program_of
+
+    def scaled(x):
+        return x * 2.0
+
+    # On this host's CPU, whatever device a prepare makes the default (a compile-only GPU's holds no array).
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
+        jitted = jax.jit(scaled)
+        compiled = jitted.lower(jnp.ones((8,), jnp.float32)).compile()
+    assert _program_of(compiled) is compiled and _module_of(compiled) == "jit_scaled"
+    for refused in (jitted, scaled):
+        with pytest.raises(AmbiguousCapture):
+            _program_of(refused)

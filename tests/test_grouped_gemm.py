@@ -108,6 +108,22 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
 FORMAT = {jnp.bfloat16: BFLOAT16, jnp.float16: FLOAT16, jnp.float32: FLOAT32}
 
 
+def pinned_dense_holds_check_1(generation_name: str, pin: tiling.Tiles, draw, label: str):
+    """A dense bf16 product through the template's forward pinned to `pin` on `generation_name`, interpreted
+    on the CPU, holding check 1 against float64 truth over `draw`'s operands."""
+    def dew_fn(x, w):
+        with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: pin})):
+            return gemm.gemm(x, w, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    assert_as_exact(
+        jax.jit(dew_fn),
+        jax.jit(lambda x, w: jax.lax.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)),
+        draw, label, seeds=8,
+        truth_fn=lambda x, w: jax.lax.dot(x.astype(jnp.float64), w.astype(jnp.float64),
+                                          preferred_element_type=jnp.float64))
+
+
 def held(got, products, out, label):
     """Every element of `got` a value its exact `products` admit, in `out` (`native_dot_holds`), at the
     lane's flushing (an interpreted kernel's sums are XLA's on the CPU)."""
@@ -1434,6 +1450,31 @@ def test_tpu_gemm_derives_legal_vmem_bounded_tiles_from_step_seconds(tpu_name):
 
 
 @INTERPRETS
+def test_each_tuning_variant_of_a_tpu_projection_holds_check_1_interpreted():
+    """An opt-in tuning run on a TPU core (the MXU's bundle) times a dense projection's derived tile and its
+    legal neighbours (`Template.variants`, `MosaicGmm.neighbours`: its rows, columns and depth the next block
+    either side), and each of them, pinned, holds check 1 interpreted on the CPU: a tuner picks among
+    kernels the gate already holds (row 9034)."""
+    rows, depth, width = 512, 1024, 1024
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("v5e"):
+        ba = launch.bind(bf16((rows, depth)), bf16((1, depth, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        variants = launch.variants(ba)
+    assert len(variants) > 1 and all(config.family == "mxu" for config in variants), variants
+    assert {config.block_k for config in variants} != {variants[0].block_k}, variants
+
+    def draw(seed):
+        rng = np.random.default_rng(9034 + seed)
+        return (jnp.asarray(rng.standard_normal((rows, depth)) / 32.0, jnp.bfloat16),
+                jnp.asarray(rng.standard_normal((depth, width)) / 32.0, jnp.bfloat16))
+
+    for config in variants:
+        pinned_dense_holds_check_1("v5e", config, draw, f"v5e variant {config}")
+
+
+@INTERPRETS
 def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1():
     """On Ampere (`mma.sync`), `pricing.dense_tail` prices multi-wave persistent L2 drift once so planner
     (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, a tail's partials within the
@@ -2097,7 +2138,6 @@ def test_dense_gemm_takes_split_and_unsplit_pins_and_holds_check_1():
     """A deep dense GEMM's tile on sm90, and its transposed input gradient's on sm80, run split in two or
     unsplit alike (both legal), and pinned split or unsplit an sm90 product holds check 1 against float64
     truth (row 10151)."""
-    from dew.nn.kernels import tuning
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -2120,18 +2160,7 @@ def test_dense_gemm_takes_split_and_unsplit_pins_and_holds_check_1():
 
     for splits in (1, 2):
         pin = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", splits=splits)
-
-        def dew_fn(x, w, *, pinned=pin):
-            with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
-                  tuning.pinned({grouped_matmul.MosaicGmm: pinned})):
-                return gemm.gemm(x, w, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
-
-        assert_as_exact(
-            jax.jit(dew_fn),
-            jax.jit(lambda x, w: jax.lax.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)),
-            draw, f"dense explicit splits={splits}", seeds=8,
-            truth_fn=lambda x, w: jax.lax.dot(x.astype(jnp.float64), w.astype(jnp.float64),
-                                              preferred_element_type=jnp.float64))
+        pinned_dense_holds_check_1("sm90", pin, draw, f"dense explicit splits={splits}")
 
 
 def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():

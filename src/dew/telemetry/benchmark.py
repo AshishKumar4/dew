@@ -23,6 +23,7 @@ import dataclasses
 import html
 import math
 import os
+import re
 import select
 import statistics
 import threading
@@ -205,7 +206,11 @@ H100's 50 MB, a B200's 126 MB), so a read of them leaves none of a timed call's 
 
 
 def eviction() -> jax.Array:
-    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device."""
+    """The buffer an eviction reads: `EVICTION_BYTES` of zeros, on the default device; on a TPU none (an
+    empty buffer): an eviction empties a GPU's L2, and Dew states no TPU cache a call's operands stay warm in
+    between its runs, so a TPU's call runs as it is (`behind`)."""
+    if jax.default_backend() == "tpu":
+        return jnp.zeros(0, jnp.float32)
     return jnp.zeros(EVICTION_BYTES // 4, jnp.float32)
 
 
@@ -241,6 +246,8 @@ def behind(call: Callable) -> Callable:
     cache times this program and leaves the read's kernel out (`DeviceTime.behind`): CUPTI reads a call
     after an untimed run of it, which refills a cache an eviction run before the call emptied."""
     def run(evicting, args):
+        if not evicting.size:  # a TPU's (`eviction`)
+            return evicting, call(*args)
         evicted, args = jax.lax.optimization_barrier((evicting_read(evicting), args))
         return evicted, call(*args)
     return run
@@ -385,12 +392,149 @@ def _nothing() -> None:
     """A call that launches no kernel, which a session's finalizing read runs (`DeviceTime._detach`)."""
 
 
+class CaptureHeld(CuptiHeld):
+    """The profiler's one capture is another's (a run's `jax.profiler` trace), so a TPU's call is read
+    nowhere (`TpuTime`): a TPU's `CuptiHeld`, which the kernel tuner and a benchmark take alike."""
+
+
+class AmbiguousCapture(NoKernels):
+    """A TPU call whose ops a capture does not tell apart (`tpu_ops`): its program ran more than once while
+    it ran, or which program or devices it ran on cannot be named. It times nothing, as a call of no kernel
+    does (`NoKernels`)."""
+
+
+def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple[KernelTime, ...]:
+    """The ops one call of the program `module` names ran on the TPU `devices` (their ids), as the newest
+    capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
+    (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`), and the ops of that run's program within
+    it (`XLA Ops`, its program_id), each its device milliseconds; another program's ops, a host transfer and
+    another device's left out. A call of one program always runs its module (`_module_of`), so a run of
+    another executable of the same name beside it is a second run, refused with the rest of a capture where
+    it ran twice on one device or states no program (`AmbiguousCapture`). The call ran on every one of
+    `devices`, so a capture holding no run of it, or no op of its run, on any one of them holds part of the
+    call and is refused (`NoKernels`), never read as the whole."""
+    from dew.telemetry import trace
+
+    modules, _ = trace.device_events(directory, tpu_line="XLA Modules")
+    own = re.compile(re.escape(module) + r"(\.\d+)?(\(\d+\))?")
+    runs = {device: [run for run in modules.get(f"/device:TPU:{device}", []) if own.fullmatch(run.name)]
+            for device in sorted(set(devices))}
+    if not runs:
+        raise NoKernels(f"a call of {module} names no TPU its run is read on")
+    if missing := [device for device, each in runs.items() if not each]:
+        raise NoKernels(f"the capture under {directory} holds no run of {module} on TPU {missing} of the "
+                        f"call's {sorted(runs)}")
+    if any(len(each) > 1 for each in runs.values()):
+        raise AmbiguousCapture(f"the capture under {directory} holds {module} run more than once on a device "
+                               f"of TPU {sorted(runs)}, which no one call's own are told apart from")
+    planes, _ = trace.device_events(directory)
+    timed = []
+    for device, (run,) in runs.items():
+        if (program := trace.program_of(run)) is None:
+            raise AmbiguousCapture(f"{module}'s run under {directory} states no program, so its ops are not "
+                                   "told apart from another program's beside it")
+        ran = [KernelTime(op.name, op.duration_ns / 1e6) for op in planes.get(f"/device:TPU:{device}", [])
+               if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns and trace.program_of(op) == program]
+        if not ran:
+            raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
+                            f"{sorted(runs)}")
+        timed += ran
+    return tuple(timed)
+
+
+class TpuTime:
+    """The device time of each TPU call `device_time`'s session reads, as `DeviceTime` reads a GPU's: the
+    ops its program ran on its devices in its one run, as one profiler capture of the call holds them
+    (`tpu_ops`, through Dew's one reading of a capture), each its duration on the device, which no host
+    dispatch enters. The call runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and
+    stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is a compiled
+    program called with its dynamic operands (`_program_of`), whose module names its runs; a call of another
+    kind, or whose devices its arrays do not name, is refused (`AmbiguousCapture`)."""
+
+    def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
+        """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
+        L2 a TPU has none of."""
+        del evicted
+        return self._read(fn, *args)
+
+    def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
+        """The ops of one call of `program`, compiled by its caller to run behind `evicting` (`behind`, which
+        a TPU's empty eviction leaves out), called as `DeviceTime.behind` calls it, its arguments one
+        tuple."""
+        return self._read(program, evicting, args)
+
+    def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
+        """One call's device seconds, its ops' summed (`kernels`)."""
+        return sum(op.milliseconds for op in self.kernels(fn, *args, evicted=evicted)) / 1e3
+
+    def _read(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
+        """One capture of `fn(*args)` after an untimed call, by Dew's profiler (`dew.telemetry.profile
+        .Profiler`: no reports and no HLO, its trace alone read), on the devices the untimed call's output
+        is on (its arguments' where it holds no array), its program named by its module."""
+        import tempfile
+
+        from dew.telemetry.profile import CaptureOptions, Profiler
+
+        program = _program_of(fn)
+        module = _module_of(program)
+        warm = jax.block_until_ready(program(*args))
+        devices = (_devices_of(warm) or _devices_of(args))
+        if not devices:
+            raise AmbiguousCapture(f"{fn}'s call names no device its arrays are on, so its ops are not told "
+                                   "apart from another device's")
+        with tempfile.TemporaryDirectory() as directory:
+            options = CaptureOptions().profile_options()
+            # Its trace alone read: no live executable's HLO exported beside it.
+            options.enable_hlo_proto = False
+            profiler = Profiler(directory, options=options, reports=False)
+            try:
+                profiler.start()
+            except RuntimeError as error:
+                raise CaptureHeld(str(error)) from error
+            try:
+                jax.block_until_ready(program(*args))
+            finally:
+                profiler.stop()
+            (capture,) = profiler.captures
+            return tpu_ops(capture, devices, module)
+
+
+def _devices_of(tree) -> set[int]:
+    """The ids of the devices the arrays of `tree` are on."""
+    return {device.id for leaf in jax.tree.leaves(tree) if isinstance(leaf, jax.Array)
+            for device in leaf.devices()}
+
+
+def _program_of(fn: Callable) -> jax.stages.Compiled:
+    """The one executable a TPU call is timed as: `fn` itself, compiled (`jax.stages.Compiled`, the kernel
+    tuner's), called with its dynamic operands, so the program its module names is the one that runs. Any
+    other callable is refused (`AmbiguousCapture`): a jitted function's call may run no program (under
+    `jax.disable_jit`) or a program its own call chooses (Dew's `OuterProgram`), and its compile takes other
+    operands than its call (static arguments)."""
+    if isinstance(fn, jax.stages.Compiled):
+        return fn
+    raise AmbiguousCapture(f"{fn} is no compiled program: a TPU call is timed as one "
+                           "(`jax.stages.Compiled`), called with its dynamic operands")
+
+
+def _module_of(program: jax.stages.Compiled) -> str:
+    """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its HLO's own."""
+    text = program.as_text()
+    found = None if text is None else re.match(r"\s*HloModule\s+([\w.]+)", text)
+    if found is None:
+        raise AmbiguousCapture(f"{program} states no module name")
+    return found.group(1)
+
+
 @contextlib.contextmanager
-def device_time() -> Iterator[DeviceTime]:
-    """A session of GPU device timing (`DeviceTime`): CUPTI subscribed for each call it reads and
+def device_time() -> Iterator[DeviceTime | TpuTime]:
+    """A session of device timing: on a GPU `DeviceTime`, CUPTI subscribed for each call it reads and
     detached from the process when it ends, however it ends, so a profile capture or Nsight can
-    subscribe after. CUPTI takes one subscriber; where another holds it, a read raises `CuptiHeld`.
-    Dew's one reader of CUPTI (Mosaic GPU's profiler's `Cupti`)."""
+    subscribe after (CUPTI takes one subscriber; where another holds it, a read raises `CuptiHeld`), Dew's
+    one reader of CUPTI (Mosaic GPU's profiler's `Cupti`); on a TPU `TpuTime`, a capture a call."""
+    if jax.default_backend() == "tpu":
+        yield TpuTime()
+        return
     from jax.experimental.mosaic.gpu import profiler
 
     session = DeviceTime(profiler.Cupti(finalize=False))
