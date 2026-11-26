@@ -41,24 +41,6 @@ TERNARY_GROUP = 256
 row 1464): sixteen uint32 words a column (a 64-byte row), each word's sixteen 2-bit codes decoding into
 sixteen-depth slices."""
 
-WINDOW_GROUP = 128
-"""Dew: the depths of a column a bfloat16 window matrix (`formats.Bf16Window`, row 5387) shares a base
-exponent and an escape table over: its nibbles' staged group (`window_nibble_depth`), two of its bytes'."""
-
-
-def window_byte_depth(group, word, code):
-    """Dew: the depth `formats.Bf16Window`'s byte plane gives word `word`'s byte `code` (`0..3`) of its
-    64-deep `group`: each byte's sixteen-depth slice holds the group's words in order, as a stage decode
-    reads them a lane at a time (`ternary_staged_depth`'s order)."""
-    return 64 * group + 16 * code + word
-
-
-def window_nibble_depth(group, word, code):
-    """Dew: the depth `formats.Bf16Window`'s nibble plane gives word `word`'s nibble `code` (`0..7`) of its
-    `WINDOW_GROUP`-deep `group`."""
-    return WINDOW_GROUP * group + 16 * code + word
-
-
 TERNARY_STEP = 256
 """Depth step for inline BitNet b1.58 ternary weight decode (`mosaic_gpu.gmm`'s `packed_format='ternary'`)."""
 

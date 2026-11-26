@@ -379,13 +379,10 @@ class LinearProducts(nn.Module):
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
         frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
         (`nn.with_logical_partitioning`)."""
-        from dew.nn.kernels.formats import Bf16Window, NvFp4, TernaryWeights
+        from dew.nn.kernels.formats import NvFp4, TernaryWeights
 
         module = getattr(self, name)
         kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
-        if isinstance(kernel, Bf16Window):
-            # A lossless bfloat16 window's weights, each its bits again (row 5387).
-            return kernel.decoded()
         if isinstance(kernel, TernaryWeights):
             # A BitNet b1.58 matrix's codes times its scale (row 1464).
             return kernel.decoded(jnp.float32)
@@ -600,45 +597,6 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: jnp.asarray(held[(*site, leaf)])
                                                      for leaf in FROZEN_FP8}) for site in sites}
     rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
-    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
-    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
-    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
-
-
-def bf16_windows(variables: Variables, *, sites: Sequence[str] | None = None) -> Variables:
-    """`variables` with each frozen bfloat16 `[in, out]` kernel of `sites` (`/`-joined paths of the layers
-    under `params`; every two-axis bfloat16 kernel where None) stored as its lossless window
-    (`formats.Bf16Window`, row 5387) in `QUANTIZATION` at its layer's path, its parameter gone, which its
-    Dense serves as it is (`dense.packed_matrix`): 13 bits a weight where 16 were, each weight its bits
-    again decoded. A kernel no window holds (a group of more escapes than it stores) is refused by its
-    site's name, as is a named site of no such kernel; frozen, its layer takes no gradient in it."""
-    from dew.nn.kernels.formats import Bf16Window
-
-    params = flatten_dict(dict(variables.get("params", {})))
-    kernels = {path[:-1]: leaf for path, leaf in params.items()
-               if path[-1] == "kernel" and isinstance(leaf, jax.Array | np.ndarray) and leaf.ndim == 2
-               and leaf.dtype == jnp.bfloat16}
-    named = {tuple(site.split("/")) for site in sites} if sites is not None else set(kernels)
-    if missing := named - set(kernels):
-        raise ValueError(f"no two-axis bfloat16 kernel at {sorted('/'.join(site) for site in missing)}")
-    windows = {(*site, "kernel"): Bf16Window.of(kernels[site], site="/".join(site)) for site in sorted(named)}
-    held = {**flatten_dict(dict(variables.get(QUANTIZATION, {}))), **windows}
-    rest = {path: leaf for path, leaf in params.items() if path not in windows}
-    return {**variables, "params": unflatten_dict(rest), QUANTIZATION: unflatten_dict(held)}
-
-
-def decoded_bf16_windows(variables: Variables) -> Variables:
-    """`variables` with each lossless bfloat16 window in `QUANTIZATION` (`bf16_windows`) its kernel again
-    in `params`, bitwise the one it stored, the collection gone where the windows were all it held."""
-    from dew.nn.kernels.formats import Bf16Window
-
-    held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
-                        is_leaf=lambda _, leaf: isinstance(leaf, Bf16Window))
-    windows = {path: leaf for path, leaf in held.items() if isinstance(leaf, Bf16Window)}
-    if not windows:
-        return variables
-    kernels = {path: leaf.decoded() for path, leaf in windows.items()}
-    rest = {path: leaf for path, leaf in held.items() if path not in windows}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
