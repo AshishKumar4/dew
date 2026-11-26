@@ -1223,12 +1223,15 @@ def _stated_caps(launches: Sequence[mainloop.Launch], family: mosaic.Family) -> 
 
 def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers, residents: resources.Residents,
              keys: mainloop.Keys) -> mainloop.Tiles:
-    """`tiles`, its forward's too, its launches' producers lowered to `producers`, held to `residents`'
-    programs a multiprocessor and walking `keys`' key blocks."""
+    """`tiles`, its forward's too, its launches' producers lowered to `producers` and held to `residents`'
+    programs a multiprocessor; the training call's walking `keys`' key blocks, a backward's alone (its
+    forward's, `Tiles.forward`, as they were: a refusal of a forward alone is read at its own tiles,
+    `_refused_kernels`)."""
     def held(each: mainloop.Tiles) -> mainloop.Tiles:
-        return dataclasses.replace(each, producers=producers, residents=residents, keys=keys)
+        return dataclasses.replace(each, producers=producers, residents=residents)
 
-    return dataclasses.replace(held(tiles), forward=None if tiles.forward is None else held(tiles.forward))
+    return dataclasses.replace(held(tiles), keys=keys,
+                               forward=None if tiles.forward is None else held(tiles.forward))
 
 
 MOSAIC = Mosaic()

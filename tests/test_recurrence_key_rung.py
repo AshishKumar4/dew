@@ -23,7 +23,8 @@ def test_a_spilled_keys_backward_walks_half_its_key_block_and_nothing_else_moves
     """The gated delta net's 16-bit training at Qwen3.5-27B's widths on an sm120, its keys' backward refused
     for a spill (as its packed training's spilled 8 bytes at 255 registers, row 13064): the call's tiles
     derive again with that launch alone at half its key block (`Tiles.keys`), its programs twice as many,
-    every other launch as it was; refused at every narrower block, its training derives none."""
+    every other launch and the forward alone's tiles as they were (head review of 78586ea1f); refused at
+    every narrower block, its training derives none."""
     facts = generation.gpu_target("sm120")
     q = k = jax.ShapeDtypeStruct((1, 256, 16, 128), jnp.bfloat16)
     v = jax.ShapeDtypeStruct((1, 256, 48, 128), jnp.bfloat16)
@@ -37,7 +38,8 @@ def test_a_spilled_keys_backward_walks_half_its_key_block_and_nothing_else_moves
         report.refuse_launch(template.MOSAIC, bound, tiles, {KEYS})
         narrowed = template.MOSAIC.derived(bound, facts)
         assert narrowed is not None and narrowed.keys.of(KEYS) == block // 2
-        assert dataclasses.replace(narrowed, keys=mainloop.Keys(), forward=tiles.forward) == tiles
+        assert narrowed.forward == tiles.forward
+        assert dataclasses.replace(narrowed, keys=mainloop.Keys()) == tiles
         assert _keys_back(bound, narrowed, facts).programs == 2 * _keys_back(bound, tiles, facts).programs
         rung = narrowed
         while rung is not None and rung.keys.of(KEYS):
