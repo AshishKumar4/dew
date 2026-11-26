@@ -46,6 +46,7 @@ def test_the_covariance_merge_holds_every_order(orders, placement):
     c_mx, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
     for edge, scale in EDGES.items():
         assert_contract(_covariance, (x * scale, y * scale, _weights(w, scale)),
-                        (dx * scale, dy * scale, dw * scale), (c_mx, c_my, c_cov), f"chunked covariance {edge}",
-                        plain_fn=moments.weighted_covariance, truth_fn=moments.weighted_covariance,
+                        (dx * scale, dy * scale, dw * scale), (c_mx, c_my, c_cov),
+                        f"chunked covariance {edge}", plain_fn=moments.weighted_covariance,
+                        truth_fn=moments.weighted_covariance,
                         taking=orders, placement=placement)
