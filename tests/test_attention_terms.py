@@ -278,6 +278,24 @@ def test_a_float64_giant_heads_subnormal_gain_tangent_stays_in_float64():
         np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
 
 
+def test_a_tiny_epsilons_radial_share_survives_a_giant_head():
+    """`[2^62, 0, ...]` clipped to `2^61` with epsilon `2^-62`: a radial seed `2^120` moves the clip along
+    the head by `2^-5`, both ways, jitted, where `eps * s` (`2^-129`) flushed before its division by the
+    scaled length and the share was zero (row 13169's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    x[0], seed[0] = 2.0 ** 62, 2.0 ** 120
+
+    def clip(x):
+        return clipped(x, 2.0 ** 61, 2.0 ** -62)
+
+    moved = jax.jit(lambda x, seed: jax.jvp(clip, (x,), (seed,))[1])(jnp.asarray(x), jnp.asarray(seed))
+    pulled = jax.jit(lambda x, seed: jax.vjp(clip, x)[1](seed)[0])(jnp.asarray(x), jnp.asarray(seed))
+    for derivative in (np.asarray(moved), np.asarray(pulled)):
+        assert derivative[0] == 2.0 ** -5, derivative
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped

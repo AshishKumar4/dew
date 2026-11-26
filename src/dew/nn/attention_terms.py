@@ -101,7 +101,9 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
     whole where it is normal, else as `v threshold / (|y| + eps s) s` over the operands' significands
     (`binades.balanced`). The scale is constant (no
-    tangent). Its contract: the first derivative exact across the format's range, the head's at any size,
+    tangent). Its contract: the first derivative kept in the format's range as exactly as the plain
+    formula's derivative keeps it in range (its radial subtraction `dx - u (u . dx)` cancels alike near an
+    axis), the head's at any size,
     for a seed whose entries are each below `2^(maxexp - 1) / D` (D the head's width: `2^123` for 8 in fp32),
     so its projection `u . dx` and its parts `dx - u (u . dx)` stay finite, but for a component or a product
     of terms below the normal range relative to the head (`2^-126` of its largest in fp32), which flushes as
@@ -114,7 +116,9 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     denominator = length + eps * factor
     ratio = threshold * factor / denominator
     share = jnp.where(ratio < 1, 1.0, jnp.where(ratio == 1, 0.5, 0.0)).astype(x.dtype)
-    radial_share = (1 - share) + share * (eps * factor / denominator)
+    # Epsilon's relative share `eps s / (|y| + eps s)` over the operands' significands (`binades.balanced`):
+    # `eps s` alone may be subnormal where the share is not (epsilon 2^-62 beside a head 2^62).
+    radial_share = (1 - share) + share * balanced(jnp.full_like(denominator, eps), (factor,), (denominator,))
     residuals = (scaled / jnp.where(length > 0, length, 1), radial_share, ratio, factor, denominator)
 
     def moved(residuals, tangent):
