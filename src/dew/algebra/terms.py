@@ -128,6 +128,7 @@ _speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
         jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
+_speaks("unary", jax.lax.bitcast_convert_type_p)
 _speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
 _speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
         jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p)
@@ -1341,6 +1342,15 @@ def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
         # variation. Unlike an ordinary add, accumulation demands identical placed input types.
         mesh = made.sharding.mesh
         if mesh.explicit_axes or mesh.manual_axes:
+            return None
+    if equation.primitive is jax.lax.bitcast_convert_type_p:
+        source, unsigned = equation.invars[0].aval, equation.outvars[0].aval
+        # A stored-float predicate is local and has no algebraic facts. Rank-changing bitcasts
+        # stay opaque: the walk cannot infer where a resegmented axis goes.
+        if not (isinstance(source, ShapedArray) and isinstance(unsigned, ShapedArray)
+                and jnp.issubdtype(source.dtype, jnp.floating)
+                and jnp.issubdtype(unsigned.dtype, jnp.unsignedinteger)
+                and jax_core.definitely_equal_shape(source.shape, unsigned.shape)):
             return None
     return operation
 

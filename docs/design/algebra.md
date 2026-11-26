@@ -1550,6 +1550,8 @@ signed integer digits and becomes a significand with its power of two; a large t
 words is normalized before joining a product. The evaluator visits the occupied bin combinations in bounded
 chunks and reduces the signed products before dividing and landing. This preserves lower terms when a
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
+Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
+directions. A finite observation at zero weight retains its one-sided weight derivative.
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded
