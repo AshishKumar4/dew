@@ -1257,7 +1257,7 @@ class CausalTransformer(LinearProducts):
         if self.loop is None:
             return tuple(range(self.num_layers))
         first, end = self.loop.layers or (0, self.num_layers)
-        return (*range(first), *range(first, end) * self.loop.steps, *range(end, self.num_layers))
+        return (*range(first), *tuple(range(first, end)) * self.loop.steps, *range(end, self.num_layers))
 
     def anchor_embeddings(self, tokens):
         """`tokens` `[B]` embedded as the first layer reads them (`token_embeddings`, `scaled_embeddings`):

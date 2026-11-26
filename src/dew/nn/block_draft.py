@@ -30,7 +30,6 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import prefix_sum
-from dew.nn.activations import gated_product
 from dew.nn.attention import reference_attention
 from dew.nn.dense import Dense
 from dew.nn.kv_cache import (
@@ -234,7 +233,8 @@ class DraftAttention(nn.Module):
 
 
 class DraftMLP(nn.Module):
-    """A draft layer's gated MLP: `down(silu(gate(x)) * up(x))`."""
+    """A draft layer's gated MLP: `down(silu(gate(x)) * up(x))`, its product in at least fp32 rounded once
+    (vLLM's `silu_and_mul`, its sigmoid `gate / (1 + exp(-gate))`)."""
 
     features: int
     emb_features: int
@@ -247,7 +247,10 @@ class DraftMLP(nn.Module):
         self.down_proj = dense(self.emb_features)
 
     def __call__(self, x):
-        return self.down_proj(gated_product('swiglu')(self.gate_proj(x), self.up_proj(x)))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        wide = at_least_fp32(gate.dtype)
+        gated = gate.astype(wide) / (1.0 + jnp.exp(-gate.astype(wide)))
+        return self.down_proj((gated * up.astype(wide)).astype(gate.dtype))
 
 
 class DraftLayer(nn.Module):
