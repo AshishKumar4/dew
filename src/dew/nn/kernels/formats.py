@@ -301,6 +301,7 @@ def _mxfp8_decode_tangent(dtype, primals, tangents):
     value = _decode_mxfp8(dtype, *primals)
     if isinstance(moved, SymbolicZero):
         return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
+
     def applied(scales, direction):
         return _decode_mxfp8(dtype, direction, *scales)
 
@@ -309,7 +310,8 @@ def _mxfp8_decode_tangent(dtype, primals, tangents):
         wide = jnp.promote_types(dtype, jnp.float32)
         return _mxfp8_scale_arithmetic(wide, cotangent, *scales).astype(codes.dtype)
 
-    direction = generation.linear_map(applied, pulled, (exponents, invalid), moved, out_aval=jax.typeof(value))
+    direction = generation.linear_map(applied, pulled, (exponents, invalid), moved,
+                                      out_aval=jax.typeof(value))
     return value, direction
 
 
