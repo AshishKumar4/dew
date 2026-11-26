@@ -870,6 +870,12 @@ def test_a_correctly_rounded_divisions_denominator_derivative_keeps_its_derivati
     for moving, expected in ((1.0, -(2.0 ** 32)), (2.0 ** 90, -(2.0 ** 122))):
         moved = jax.jit(lambda n, m=moving: jax.jvp(tangent, (n,), (np.float32(m),))[1])(numerator)
         assert float(moved) == expected, moving
+    # An infinite numerator's lane, PyTorch's own: its tangent's derivative in the numerator is `-1 / d^2`
+    # under a fixed seed, its constant seed adding no `0 * inf` term.
+    def unit(n):
+        return jax.jvp(lambda d: divided(n, d), (np.float32(1),), (np.float32(1),))[1]
+
+    assert float(jax.jit(lambda n: jax.jvp(unit, (n,), (np.float32(1),))[1])(np.float32(np.inf))) == -1.0
     # A zero seed's tangent keeps its sign: `-0` in, the negated `+0` out, as the plain product gives.
     zero = jax.jit(lambda: jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(-0.0),))[1])()
     assert float(zero) == 0.0 and not np.signbit(np.asarray(zero))

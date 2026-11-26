@@ -128,11 +128,16 @@ def _pytorch_product(seed: jax.Array, coefficient: jax.Array, special: jax.Array
         return jnp.where(special, seed * coefficient, _flush_safe(seed, coefficient))
 
     def derivative(primals, tangents, value):
-        # The lane mask, boolean, takes no tangent.
-        (seed, coefficient, _), (moved_seed, moved_coefficient, _) = primals, tangents
-        return moved_seed * coefficient + seed * moved_coefficient
+        # The lane mask, boolean, takes no tangent; a factor no derivative moves adds no term, as JAX's
+        # product rule omits it (its constant beside an infinite factor, no `0 * inf`).
+        from jax.custom_derivatives import SymbolicZero
 
-    return surrogate(forward, derivative)(seed, coefficient, special)
+        (seed, coefficient, _), (moved_seed, moved_coefficient, _) = primals, tangents
+        terms = [moved * held for moved, held in ((moved_seed, coefficient), (seed, moved_coefficient))
+                 if not isinstance(moved, SymbolicZero)]
+        return sum(terms[1:], terms[0]) if terms else jnp.zeros_like(value)
+
+    return surrogate(forward, derivative, symbolic_zeros=True)(seed, coefficient, special)
 
 
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
