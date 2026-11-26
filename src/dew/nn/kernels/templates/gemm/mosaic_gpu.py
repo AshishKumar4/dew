@@ -1178,7 +1178,7 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
     tabled = gather is not None or scatter is not None
-    extent = (m if bounded and not tabled else -(-m // row_tile) * row_tile if dense
+    extent = (m if bounded and not tabled else axes.whole(m, row_tile) if dense
               else row_tiles.row_extent(m, row_tile, unit))
     walked = rows_extended(walked, axis, extent)
     if scatter is not None:
@@ -1443,19 +1443,19 @@ def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
     """Dew: a step-scaled walk's scaling of a step's exact partial (`gmm`'s and `tgmm`'s `step_scales`,
     `mosaic.Issuer.summed_apart`'s `scale(start, columns, partial)`): times this consumer's rows' scales
     (`row_scales`) and the tile's columns' (`column_scales`: one a column, or the tile's block's at `offset`,
-    `per` columns a scale), in `precision.twice_scaled`'s order, as XLA's arm scales (two scales near 2^64
-    overflow multiplied first though the scaled partial is finite: row 13257). `index` is the step's."""
-    from dew.nn.precision import twice_scaled
+    `per` columns a scale), in `precision.scaled_partial`'s order, as XLA's arm scales (two scales near 2^64
+    overflow multiplied first though the scaled partial is finite: rows 13257, 13274). `index` the step's."""
+    from dew.nn.precision import scaled_partial
 
     del index
     rows = slots['row_scales'].at[0, mine_rows][...]
     column_scales = slots['column_scales']
     if per == 1:
-        return lambda start, columns, partial: twice_scaled(
+        return lambda start, columns, partial: scaled_partial(
             partial, rows[:, None], column_scales.at[0, pl.ds(start, columns)][...][None, :])
     # A weight block's one scale beside the rows' vector, each broadcast over the partial's entries.
     block = column_scales[0, offset]
-    return lambda start, columns, partial: twice_scaled(partial, rows[:, None], block)
+    return lambda start, columns, partial: scaled_partial(partial, rows[:, None], block)
 
 
 def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, column_tile, *,
@@ -1962,7 +1962,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         None if table is None else rows_padded(_normalized_gather(table, operand.shape[row_axis]),
                                                0, math.lcm(8, block_k))
         for operand, table in zip((lhs, rhs), tables, strict=True))
-    k = -(-k // multiple) * multiple
+    k = axes.whole(k, multiple)
     prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
     bounded = family_of(tiles, lhs.dtype).bounded_loads and not interpret and tables[0] is None
     if ragged and not bounded:

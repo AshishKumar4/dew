@@ -45,8 +45,9 @@ def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]
     n = jnp.sum(mask.astype(x.dtype), axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
     mean = jnp.sum(jnp.where(mask, x, jnp.zeros_like(x)), axis=-1) / safe_n
-    diff = x - mean[..., None]
-    m2 = jnp.sum(jnp.where(mask, diff * diff, jnp.zeros_like(x)), axis=-1)
+    # Mask before any nonlinear operation can make its pullback multiply an inactive infinity.
+    diff = jnp.where(mask, x - mean[..., None], jnp.zeros_like(x))
+    m2 = jnp.sum(jax.lax.square(diff), axis=-1)
     return mean, m2 / safe_n
 
 

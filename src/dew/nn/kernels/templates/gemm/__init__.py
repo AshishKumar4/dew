@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import jax
 from jax import numpy as jnp
 
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.sharding import explicit_spec
 
 
@@ -19,7 +20,7 @@ def rows_extended(array: jax.Array, axis: int, extent: int) -> jax.Array:
 def rows_padded(array: jax.Array, axis: int, multiple: int) -> jax.Array:
     """`array` with zeros after its own along `axis` up to a multiple of `multiple`: the row blocks a
     kernel's loads or its group metadata tile by."""
-    return rows_extended(array, axis, -(-array.shape[axis] // multiple) * multiple)
+    return rows_extended(array, axis, whole(array.shape[axis], multiple))
 
 
 def sides_padded(sides: Sequence[jax.Array], axes_of: Sequence[tuple[str, ...]], multiple: int, *,

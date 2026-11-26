@@ -142,6 +142,7 @@ __all__ = [
     "running_total",
     "scaled",
     "scaled_logits",
+    "scaled_partial",
     "span_means",
     "spread",
     "sqrt_or_zero",
@@ -1746,6 +1747,32 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
     kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
     return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+
+
+def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax.Array:
+    """A block-scaled step's `partial` times its `row` and `column` scales, each entry in `twice_scaled`'s
+    order (the row scale first where that intermediate is normal or the partial zero, else the column's),
+    or the scales' own product first where neither intermediate is normal and it is: a subnormal row scale
+    beside a column scale near the largest (2**-128 and 2**127 of a 2.25 partial: 1.125, row 13274), which
+    a recipe's block scales may be, as no NVFP4 tensor scale is. The one rule a blockwise product's every
+    arm scales its own partials by, a kernel's step and XLA's (`mosaic_gpu._step_scaling`,
+    `xla_products.step_scaled`), whatever its codes' format (row 13291): the same partial and scales give
+    the same value in each, though a step's partial itself is each arm's (Hopper's tensor cores align
+    within a step where XLA's fp32 sum does not, docs/design/testing.md). Each order's operands are chosen
+    before they multiply, so no cotangent reaches an unchosen product; its tests are comparisons alone."""
+    tiny = jnp.finfo(partial.dtype).tiny
+
+    def normal(value):  # Not `jnp.isfinite`, which Mosaic GPU lowers none of.
+        magnitude = jnp.abs(value)
+        return (magnitude < np.inf) & (magnitude >= tiny)
+
+    kept = normal(partial * row) | (partial == 0)
+    # The first two orders' first product one multiplication by the scale `kept` chose: a kernel holds one
+    # tile of it, and where `kept` fails, the column-first intermediate whose failure joins the scales.
+    once = partial * jnp.where(kept, row, column)
+    scales = row * column
+    joined = ~normal(once) & (partial != 0) & normal(scales)
+    return jnp.where(joined, partial, once) * jnp.where(joined, scales, jnp.where(kept, column, row))
 
 
 @_protected
