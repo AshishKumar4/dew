@@ -82,13 +82,18 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
 
 def _scores_whole(attend, *operands) -> bool:
     """Whether `attend`'s program forms a whole `[..., Q, K]` score array of its operands' queries and keys
-    at any depth (`programs.equations`): the reference path's, which a streamed kernel never holds."""
+    in the memory its kernels' launches read and write, at any depth but a kernel's own (`programs.bodies`):
+    the reference path's, which a streamed kernel never holds."""
     from dew.nn import programs
 
     queries, keys = operands[0].shape[1], operands[1].shape[1]
-    traced = jax.make_jaxpr(attend)(*operands).jaxpr
-    return any(getattr(var.aval, "shape", ())[-2:] == (queries, keys)
-               for equation in programs.equations(traced) for var in equation.outvars)
+
+    def formed(jaxpr) -> bool:
+        return any(getattr(var.aval, "shape", ())[-2:] == (queries, keys)
+                   for equation in jaxpr.eqns for var in equation.outvars) or any(
+            formed(inner) for equation in jaxpr.eqns for inner in programs.bodies(equation))
+
+    return formed(jax.make_jaxpr(attend)(*operands).jaxpr)
 
 
 def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them():
@@ -104,8 +109,8 @@ def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse
     def attend(sinks, **options):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, sinks=sinks, **options)
 
-    query = jnp.zeros((1, 512, 4, 128), jnp.bfloat16)
-    sinks = jnp.zeros((1, 512, 4), jnp.float32)
+    query = jnp.zeros((1, 2048, 4, 128), jnp.bfloat16)
+    sinks = jnp.zeros((1, 2048, 4), jnp.float32)
     with generation.assumed("v5e"):
         with pytest.raises(KernelRefused) as refused:
             attend(sinks, causal=True, implementation="tpu")(query, query, query)
