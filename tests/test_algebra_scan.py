@@ -971,7 +971,9 @@ def test_a_tiny_prepared_reader_leaves_a_steep_decays_factors_on_the_state():
         return forms.mapped(prepared, state, kept), leaving[1]
 
     giant = np.float32(2.0 ** 127)
-    output, leaving = run(np.full((2, 1), giant), np.full((1, 1), giant), np.asarray([-149.5, 0], np.float32))
+    rows = np.full((2, 1), giant, np.float32)
+    memory = np.full((1, 1), giant, np.float32)
+    output, leaving = run(rows, memory, np.asarray([-149.5, 0], np.float32))
     np.testing.assert_array_equal(output, np.full((2, 1), np.float32(2.0 ** -23.5)))
     np.testing.assert_array_equal(leaving, np.full((1, 1), np.float32(2.0 ** -22.5)))
 

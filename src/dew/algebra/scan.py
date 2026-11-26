@@ -235,9 +235,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         if unlanded:
             split = _unlanded_split(extents, corrected=corrected, base2=affine.base2,
                                     scale=affine.reader_scale)
-            live, cut = vanished(exponent, affine.base2)
-            steps = _factors(affine.base2, live, ~cut)
-            given, entering = (tokens, decays, entering, steps), None
+            given, entering = (tokens, decays, entering, _token_factors(exponent, affine.base2)), None
         else:
             form = _form(extents, corrected, saturation)
             # The largest values that read no state: operands of the function the carry reads.
@@ -1022,15 +1020,11 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
                    if corrected and before else None)
         # A cut key's state selected out before its decay, so a memory past the largest before a document's
         # start is no 0 times inf.
-        if isinstance(decay, _Split):
-            h = jnp.where(_crossed(decay.first)[:, None], 0.0, h)
-            factors = jax.tree.map(lambda part: part[:, None], decay)
-            held = _scaled(jnp.where(index % apart == 0, h, held) if apart else h, factors)
-            h = _scaled(h, factors) * along[None, :]
-        else:
-            h = jnp.where(_crossed(decay)[:, None], 0.0, h)
-            held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
-            h = decay[:, None] * h * along[None, :]
+        leading = decay.first if isinstance(decay, _Split) else decay
+        h = jnp.where(_crossed(leading)[:, None], 0.0, h)
+        factors = jax.tree.map(lambda part: part[:, None], decay)
+        held = _scaled(jnp.where(index % apart == 0, h, held) if apart else h, factors)
+        h = _scaled(h, factors) * along[None, :]
         if corrected:
             h = h - strength * a[:, None] * (_portable(c[None, :], h) if entered is None else entered)
         h = h + b[:, None] * value[None, :]
@@ -1683,6 +1677,20 @@ def _exponents(exponent, floor: float) -> tuple:
     first = jnp.maximum(exponent, floor)
     second = jnp.maximum(exponent - first, floor)
     return first, second, exponent - first - second
+
+
+def _token_factors(exponent, base2: bool) -> _Split:
+    live, cut = vanished(exponent, base2)
+    if not base2:
+        return _factors(False, live, ~cut)
+    # A native exp2 at the least normal can round below it before multiplying the state.
+    # Put back an exact integral power after exponentiating just the fractional remainder.
+    def formed(part):
+        power = jnp.floor(part)
+        return _exp(True, part - power) * float_bits.exact_power2(power.astype(jnp.int32), part.dtype)
+
+    first, second, rest = map(formed, _exponents(live, jnp.finfo(exponent.dtype).minexp))
+    return _Split(jnp.where(cut, -0.0, first), second, rest)
 
 
 def _factors(base2: bool, exponent, kept) -> _Split:
