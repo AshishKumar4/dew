@@ -269,8 +269,8 @@ class Evaluated:
             if left != (1,) or right not in ((0,), (1,)) or batches != ((), ()):
                 raise Inadmissible("not a nonbatched matrix product over the left columns")
             return 1 - right[0]
-        if name == "exact_int8_product":
-            return values[0]["dimension_numbers"] == DOTS[-1]["dimension_numbers"]
+        if name in ("exact_int8_product", "dyadic_scale"):
+            return True
         if name == "matrix":
             return values[0].ndim == 2
         if name in ("plain_of", "swap_of"):
@@ -581,6 +581,7 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
     positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | set(logged)
     counted = _named(conditions, "counting_sum")
     exact = _named(conditions, "exact_scale")
+    exact |= _named(conditions, "dyadic_scale")
     integers = _named(conditions, "int8_values")
     drawn = sorted(operand for operand in admitted.arrays if operand not in units)
 

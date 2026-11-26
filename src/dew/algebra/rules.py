@@ -78,13 +78,18 @@ def matrix_product(params: i64) -> i64: ...
 
 
 @function
-def exact_int8_product(params: i64) -> Unit: ...
-"""A short full-fp32 matrix product, exact on casts from either signed or unsigned bytes."""
+def exact_int8_product(term: Term) -> Unit: ...
+"""This short full-fp32 dot, exact on byte casts; a parameter index does not encode its length."""
 
 
 @function
 def int8_values(term: Term) -> Unit: ...
 """Float32 values obtained by widening intact integer bytes."""
+
+
+@function
+def dyadic_scale(term: Term) -> Unit: ...
+"""Every scale is a positive power of two from 2**-100 through 2**100."""
 
 
 @function
@@ -805,8 +810,7 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     lifted_by: tuple[list, list] = ([], [])
     for kept_axis in (1, 0):
         proof = () if kept_axis == 1 else (
-            exact_int8_product(params), int8_values(x), int8_values(y), positive(s),
-            eq(var("scale_floor", i64)).to(log2_floor(s)), var("scale_floor", i64) >= i64(-126))
+            exact_int8_product(t), int8_values(x), int8_values(y), dyadic_scale(s))
         for lift_axis, laid_axis, lift in ((0, 1, row_lift), (1, 1 - kept_axis, column_lift)):
             side = s.shaped("broadcast_in_dim", laid)
             operand = x if lift_axis == 0 else y
@@ -816,6 +820,7 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
                 lifted_by[lift_axis].append(rule(
                     eq(t).to(written), eq(matrix_product(params)).to(i64(kept_axis)), *proof,
                     plain(multiplied), matrix(x), matrix(y), along(laid, i64(laid_axis)),
+                    eq(shape(scaled_operand)).to(shape(operand)),
                     eq(product_extent).to(shape(t)), eq(lift).to(lifted(product_extent, i64(lift_axis))),
                     *contracted, *facts, *dominated(power, "new"), *more,
                     *dominated(scaled_power, "scaled")).then(

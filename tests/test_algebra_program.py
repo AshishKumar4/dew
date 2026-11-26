@@ -160,8 +160,8 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
     full = jax.lax.DotAlgorithmPreset.F32_F32_F32
 
     def scaled(x, y, scale, precision):
-        s = jax.lax.clamp(0.125, scale, 4.0)
-        x, y = x.astype(scale.dtype), y.astype(scale.dtype)
+        s = scale
+        x, y = x.astype(s.dtype), y.astype(s.dtype)
         if side == "left":
             x = x * s[:, None]
         else:
@@ -175,17 +175,42 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
                 jnp.asarray(rng.integers(0, 256, (16, length), dtype=np.uint8)),
                 jnp.asarray(rng.uniform(0.125, 4.0, scales), jnp.float32))
 
+    def selected(s):
+        return jax.lax.select(s > 1, jax.lax.full(s.shape, 2.0, s.dtype), jax.lax.full(s.shape, 0.5, s.dtype))
+
     def plain(x, y, s):
-        return scaled(x, y, s, full)
+        return scaled(x, y, selected(s), full)
 
     def truth(x, y, s):
-        return scaled(x, y, s, None)
+        return scaled(x, y, selected(s), None)
 
     assert cheaper_spliced(plain, *draw(0))
     assert not cheaper_spliced(plain, *draw(0, length=257))
     assert not cheaper_spliced(truth, *draw(0))  # an unspecified dot mode is not an integer proof
     assert_as_exact(jax.jit(algebra.rewritten(plain)), jax.jit(plain), draw,
                     f"transposed byte {side} dequantization", seeds=8, truth_fn=truth)
+
+    a = [3, -5] if side == "left" else [-5, 3]
+    b = [5, 3] if side == "left" else [3, 5]
+    x = jnp.broadcast_to(jnp.asarray([*a, *([0] * 126)], jnp.int8), (8, 128))
+    y = jnp.broadcast_to(jnp.asarray([*b, *([0] * 126)], jnp.uint8), (16, 128))
+    s = jnp.full((8 if side == "left" else 16,), 1 + 2 ** -22, jnp.float32)
+
+    def rounded(x, y, s):
+        return scaled(x, y, s, full)
+
+    assert not cheaper_spliced(rounded, x, y, s)
+    np.testing.assert_array_equal(jax.jit(algebra.rewritten(rounded))(x, y, s), jax.jit(rounded)(x, y, s))
+
+    # Two dots of the same parameters in one region may have different contracting lengths.
+    def together(x, y, s, lx, ly):
+        return plain(x, y, s), plain(lx, ly, s)
+
+    lx, ly, _ = draw(0, length=257)
+    region = terms.region(jax.make_jaxpr(together)(x, y, s, lx, ly))
+    graph, _, (short, long) = program.graphed(region)
+    assert graph.check_bool(algebra.rules.exact_int8_product(short))
+    assert not graph.check_bool(algebra.rules.exact_int8_product(long))
 
 
 def test_a_saturation_of_no_growth_or_depth_is_refused():

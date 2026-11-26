@@ -942,7 +942,15 @@ def _products(region: terms.Region) -> list:
                             and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32
                             and params.get("out_sharding") is None
                             and not (mesh.explicit_axes or mesh.manual_axes)):
-                        facts.append(rules.exact_int8_product(i64(index)))
+                        facts.append(rules.exact_int8_product(term))
+                        for operand in args[:2]:
+                            mul = get_callable_args(operand, terms.Term.binary)
+                            if mul is None or terms.text(mul[1]) != "mul":
+                                continue
+                            for side in (mul[0], mul[2]):
+                                laid = get_callable_args(side, terms.Term.shaped)
+                                if laid is not None and _dyadic_scale(region, laid[0]):
+                                    facts.append(rules.dyadic_scale(laid[0]))
     matrices = {extent for _, extent in region.shapes if len(extent) == 2}
     for extent in sorted(matrices):
         for axis in (0, 1):
@@ -963,6 +971,21 @@ def _products(region: terms.Region) -> list:
         if np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype, jnp.inexact) and value == 1:
             facts.append(rules.unit(literal))
     return facts
+
+
+def _dyadic_scale(region: terms.Region, term: terms.Term) -> bool:
+    """Trace a scale through layouts that replicate it and choices of independently exact scales."""
+    if (literal := get_callable_args(term, terms.Term.literal)) is not None:
+        value = region.literals[terms.integer(literal[0])]
+        if np.ndim(value) != 0 or np.asarray(value).dtype != np.float32:
+            return False
+        fraction, exponent = math.frexp(float(value))
+        return fraction == 0.5 and -100 <= exponent - 1 <= 100
+    if (laid := get_callable_args(term, terms.Term.shaped)) is not None:
+        return terms.text(laid[1]) == "broadcast_in_dim" and _dyadic_scale(region, laid[0])
+    if (choice := get_callable_args(term, terms.Term.select)) is not None:
+        return _dyadic_scale(region, choice[1]) and _dyadic_scale(region, choice[2])
+    return False
 
 
 @dataclasses.dataclass(frozen=True)
