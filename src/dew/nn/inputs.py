@@ -1343,24 +1343,27 @@ class RowPlan:
         roots = jax.make_array_from_single_device_arrays(laid, sharding, [
             jax.device_put(words, device) for device in sharding.addressable_devices_indices_map(laid)])
         placed = jax.make_array_from_process_local_data(sharding, indices)
-        return program(_row_keys, static_argnames=("impl", "shards"), out_shardings=sharding)(
-            roots, placed, impl=jax.random.key_impl(key), shards=shards)
+        return program(_row_keys, static_argnames=("impl", "mesh"), out_shardings=sharding)(
+            roots, placed, impl=jax.random.key_impl(key), mesh=sharding.mesh)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
         return host_rows(leaf, self.rows)
 
 
-def _row_keys(roots: jax.Array, rows: jax.Array, impl, shards: int) -> jax.Array:
+def _row_keys(roots: jax.Array, rows: jax.Array, impl, mesh: jax.sharding.Mesh) -> jax.Array:
     """Each row's root key folded by its index in `rows` (`RowPlan.keys`): `roots` the key data of `impl`
-    for each of the `shards` row shards in turn, stacked along its first axis, each shard's rows taking its
-    root. Each root broadcast over a new axis of its shard's rows, merged after the shard axis, so an
-    Explicit row axis keeps its sharding where a repeat of it would be refused."""
-    held = roots.reshape(shards, -1, *roots.shape[1:])
-    per = rows.shape[0] // shards
-    words = jnp.broadcast_to(held[:, None], (shards, per, *held.shape[1:])).reshape(shards * per,
-                                                                                     *held.shape[1:])
-    return jax.vmap(jax.random.fold_in)(jax.random.wrap_key_data(words, impl=impl), rows)
+    for each of the row shards in turn, stacked along its first axis. Each shard's device wraps its own
+    root and folds its own rows (`jax.shard_map` over the rows' axes), so no reshape moves a sharded axis,
+    Auto or Explicit, and the key data keeps its own shape."""
+    spec = jax.sharding.PartitionSpec(request_axes(mesh))
+
+    def folded(root, own):
+        key = jax.random.wrap_key_data(root, impl=impl)
+        return jax.random.key_data(jax.vmap(lambda row: jax.random.fold_in(key, row))(own))
+
+    words = jax.shard_map(folded, mesh=mesh, in_specs=(spec, spec), out_specs=spec)(roots, rows)
+    return jax.random.wrap_key_data(words, impl=impl)
 
 
 @dataclass(frozen=True)

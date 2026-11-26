@@ -5,6 +5,7 @@ A multimodal batch carries token ids under "text" and processed images under
 copying resident inputs through the host.
 """
 
+import jax
 import numpy as np
 import pytest
 from model_support import attending
@@ -88,23 +89,34 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     assert keys.sharding == NamedSharding(mesh, P(request_axes(mesh)))
 
 
+def _wider_threefry():
+    """A PRNG implementation whose key data is two-dimensional, `(1, 2)`: threefry's, its words in a row."""
+    from jax.extend import random as extended
+
+    base = extended.threefry_prng_impl
+    return extended.define_prng_impl(
+        key_shape=(1, 2), seed=lambda seed: base.seed(seed)[None],
+        split=lambda key, shape: base.split(key[0], shape)[..., None, :],
+        random_bits=lambda key, width, shape: base.random_bits(key[0], width, shape),
+        fold_in=lambda key, data: base.fold_in(key[0], data)[None], name="wide threefry2x32")
+
+
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("explicit", [False, True], ids=["auto", "explicit"])
-@pytest.mark.parametrize("impl", ["threefry2x32", "rbg"])
+@pytest.mark.parametrize("explicit", [(), ("data",), ("data", "tensor")], ids=["auto", "data", "data-tensor"])
+@pytest.mark.parametrize("impl", ["threefry2x32", "rbg", "wide"])
 def test_row_plan_folds_its_rows_keys_under_the_mesh_in_context(explicit, impl):
-    """Under the mesh its rows sit on in context (`jax.set_mesh`), its row axis Auto or Explicit, a plan's
-    row keys fold on the mesh from the request's key of either implementation (two key words or four) by
-    each row's global index, as on one device (row 13493), with no host read."""
-    import jax
+    """Under the mesh its rows sit on in context (`jax.set_mesh`), its row axes Auto or Explicit, a plan's
+    row keys fold on the mesh from the request's key of any implementation (two key words, four, or a
+    two-dimensional key's) by each row's global index, as on one device (row 13493), with no host read."""
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.nn.inputs import RowPlan, request_axes
     from dew.training import MeshSpec
 
-    mesh = MeshSpec(data=4, explicit=("data",) if explicit else ()).build()
+    mesh = MeshSpec(explicit=explicit).build(jax.devices()[:4])
     plan = RowPlan(mesh, 6, 8, 0, 1)
-    key = jax.random.key(11, impl=impl)
+    key = jax.random.key(11, impl=_wider_threefry() if impl == "wide" else impl)
     with jax.set_mesh(mesh), guarded(allow=("host_to_device",)):
         keys = plan.keys(key)
         jax.block_until_ready(keys)
