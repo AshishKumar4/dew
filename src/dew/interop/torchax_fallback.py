@@ -1765,7 +1765,8 @@ class TorchCausalLM(nn.Module):
     layers before and after it once, every pass reading the call's positions and masks, the decoder's
     final norm (its `norm`) between passes under `step_norm` (`_layer_seam`). A tier-3 source holds no
     exit gate, cross-pass messages or θ rows Dew would draw, so a loop stating any is refused as it runs
-    (`runnable_loop`), as is a cached call (its cache keeps one entry a layer); a run sets it through
+    (`runnable_loop`); with Dew's attention, a cached call keeps an entry for each pass of a looped layer
+    (`_cache_entry`); a run sets it through
     `Looping` (`with_loop`, `with_passes`), which declares no parameter the source lacks."""
 
     @property
