@@ -2226,11 +2226,12 @@ def test_a_programs_lowering_over_a_hosts_own_gpus_derives_for_its_kind_and_admi
 def test_a_build_pinned_to_a_kind_loads_on_no_list_mixing_kinds_in_either_order():
     """A list of GPUs of one generation and multiprocessors whose kinds differ (an H100's and an H200's, both
     132) states no one kind (`held_kind`), whichever comes first: a build pinned to the H100 is refused
-    there, a generation's canonical build is not (row 13276)."""
+    there, a generation's canonical build is not, and none is made over them as a host's own (`host_kind`,
+    which every build over a host's GPUs is pinned by) (row 13276)."""
     from dataclasses import dataclass
 
     from dew.nn.kernels.generation import built_target
-    from dew.training.ahead import BuildTarget, held_kind
+    from dew.training.ahead import BuildTarget, held_kind, host_kind
 
     @dataclass(frozen=True)
     class Gpu:
@@ -2238,11 +2239,14 @@ def test_a_build_pinned_to_a_kind_loads_on_no_list_mixing_kinds_in_either_order(
         platform: str = "gpu"
 
     h100, h200 = Gpu("NVIDIA H100 80GB HBM3"), Gpu("NVIDIA H200")
-    assert held_kind([h100, h100]) == h100.device_kind
+    assert held_kind([h100, h100]) == host_kind([h100, h100]) == h100.device_kind
     pinned = BuildTarget.built(built_target("sm90", device_kind=h100.device_kind), 2,
                                device_kind=h100.device_kind)
     canonical = BuildTarget.built(built_target("sm90"), 2)
     for mixed in ([h100, h200], [h200, h100]):
         assert held_kind(mixed) is None
+        # No build is made over them as a host's own (`host_gpus`, the step's and a program's compile).
+        with pytest.raises(ValueError, match="several kinds"):
+            host_kind(mixed)
         loading = dataclasses.replace(pinned, device_kind=held_kind(mixed))
         assert pinned.differences(loading) != [] and canonical.differences(loading) == []

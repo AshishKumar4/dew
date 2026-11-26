@@ -184,7 +184,7 @@ def host_gpus(generation: str, topology: str | Path, count: int, share: float = 
         STATED_GPUS.update(dict.fromkeys(devices, StatedGpu(memory, share)))
     if len(devices) < count:
         raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
-    held = gpu_target(devices[0].device_kind).generation
+    held = gpu_target(host_kind(devices[:count])).generation
     if held != gpu_target(generation).generation:
         raise ValueError(f"the topology at {topology} holds {devices[0].device_kind} GPUs ({held}), not "
                          f"{generation}")
@@ -965,6 +965,19 @@ class Compile(Protocol):
                  out_shardings: jax.sharding.Sharding) -> OuterProgram | jax.stages.Wrapped: ...
 
 
+def host_kind(devices: Sequence) -> str:
+    """The one kind a host's own GPUs (`host_gpus`) state, which a build over them is pinned to and its
+    launches derive from (`built_target`); refused where they state several, however alike their
+    generation and multiprocessors (an H100's and an H200's, 132 each): a build of one kind over them would
+    not load on the mesh it was built over (row 13276)."""
+    kind = held_kind(devices)
+    if kind is None:
+        kinds = sorted({device.device_kind for device in devices})
+        raise ValueError(f"these GPUs are of several kinds, {kinds}: a build over a host's own GPUs is for "
+                         "one kind; compile over GPUs of one")
+    return kind
+
+
 def held_kind(devices: Sequence) -> str | None:
     """The kind every GPU of `devices` states (`device_kind`), None where they are not all GPUs of one kind:
     what a build that pins a kind is held to on each device it runs on (`BuildTarget.device_kind`), a list
@@ -987,7 +1000,7 @@ def lowering_for(generation: str, multiprocessors: int | None = None,
     gpus = compile_only_gpus(generation, multiprocessors=multiprocessors) if devices is None else devices
     mesh = jax.sharding.Mesh(np.asarray(list(gpus)[:1]), ("devices",))
     host = set(gpus) <= _HOSTS_GPUS
-    target = built_target(generation, multiprocessors, device_kind=held_kind(gpus) if host else None)
+    target = built_target(generation, multiprocessors, device_kind=host_kind(gpus) if host else None)
     with (assumed(target, portable=not host), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
           report.certifying(mesh.devices.flat[0])):
         yield
@@ -1022,7 +1035,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             else host_gpus(generation, topology, 1))
     # A node's own topology states its GPUs' kind, whose facts its launches derive from as its run's do
     # (row 13252); a canonical target's stand for any of the generation.
-    kind = None if topology is None else held_kind(gpus)
+    kind = None if topology is None else host_kind(gpus)
     target = built_target(generation, multiprocessors, device_kind=kind)
     mesh = jax.sharding.Mesh(np.asarray(gpus[:1]), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -1580,7 +1593,7 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # The GPU XLA compiles for, as its compile-only devices state it.
     # Its kind where the devices are a host's own (`_HOSTS_GPUS`), whose launches derive from that part's
     # facts as its run does (row 13252); a canonical GPU's stands for any of its generation.
-    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else held_kind(devices)
+    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else host_kind(devices)
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity, device_kind=kind)
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
@@ -1661,7 +1674,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices),
-                                device_kind=None if topology is None else devices[0].device_kind),
+                                device_kind=None if topology is None else host_kind(devices)),
         refusals=report.refused_launches(), sampled=sampled,
         at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
         starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
