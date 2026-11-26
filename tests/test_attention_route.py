@@ -1168,11 +1168,9 @@ def _launches(fn, *operands) -> set[str]:
 def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
     """A bf16 causal call named onto 'flash_inference' on an A100: undifferentiated, it launches
     FlashAttention's forward alone where this host lowers it for the target
-    (`attention_kernels.flash_lowered`) and is refused, named (`selection.Unlowerable`, its kernel 'flash'),
-    where it does not, never another kernel nor an import error (head review); differentiated, the template's
-    kernels alone, forward and derivatives, which lower for the target on any host (row 13288)."""
+    (`attention_kernels.flash_lowered`); differentiated, the template's kernels alone, forward and
+    derivatives, which lower for the target on any host (row 13288)."""
     from dew.nn import attention_kernels
-    from dew.nn.kernels import selection
 
     query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
@@ -1181,15 +1179,42 @@ def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
         return scaled_dot_product_attention(query, key, value, causal=True, implementation="flash_inference")
 
     with generation.assumed("sm80"):
-        if attention_kernels.flash_lowered():
-            assert _launches(call, query, key, key) == {"flash"}
-        else:
-            with pytest.raises(selection.Unlowerable) as refused:
-                jax.eval_shape(call, query, key, key)
-            assert refused.value.kernel == "flash"
+        inferred = _launches(call, query, key, key) if attention_kernels.flash_lowered() else {"flash"}
         trained = _launches(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
                             query, key, key)
-    assert trained == {"template"}, trained
+    assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
+
+
+def test_flash_inference_without_its_wheel_trains_a_rematerialized_block_and_refuses_its_inference(
+        monkeypatch):
+    """On a host whose FlashAttention wheel is absent (`attention_kernels.flash_architectures` None), lowering
+    for an A100: a 'flash_inference' call inside a rematerialized block under a named-residual policy
+    (`decoder_block`'s) lowers its training step, the template's alone, though the block stages its primal
+    before it is differentiated (row 13318: the primal arm raised as it staged); the call undifferentiated
+    refuses its program as it lowers, named (`selection.Unlowerable`, its kernel 'flash')."""
+    from jax.ad_checkpoint import checkpoint_policies
+
+    from dew.nn import attention_kernels
+    from dew.nn.kernels import selection
+
+    monkeypatch.setattr(attention_kernels, "flash_architectures", lambda: None)
+    query = jax.ShapeDtypeStruct((1, 512, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
+
+    def call(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="flash_inference")
+
+    block = jax.checkpoint(call, policy=checkpoint_policies.save_only_these_names("attention_output"))
+
+    def loss(query, key, value):
+        return jnp.sum(block(query, key, value).astype(jnp.float32))
+
+    with generation.assumed("sm80"):
+        assert not attention_kernels.flash_lowered()
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        with pytest.raises(selection.Unlowerable) as refused:
+            jax.jit(call).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert refused.value.kernel == "flash"
 
 
 def test_an_a100s_declared_16_bit_cell_is_flash_inference():

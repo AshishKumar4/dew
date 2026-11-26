@@ -22,6 +22,8 @@ import numpy as np
 import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
+from jax.extend import core
+from jax.interpreters import mlir
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
@@ -1310,11 +1312,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             # and derivatives its second's (`attention_kernels.primal_alone`).
             def on(implementation):
                 def run(query, key, value, bias, sinks, *extra):
-                    # Each arm lowered as its own kernel is where it runs: one this host lowers for no
-                    # GPU of the target refuses its program, named (`attention_kernels.unlowered`), as the
-                    # kernel named alone does, the other arm's program compiled ahead whatever it.
+                    # An arm this host lowers for no GPU of the target (`attention_kernels.unlowered`)
+                    # stages its output's shapes, which a program keeping it refuses, named, as it lowers
+                    # (`unlowered_launch`): a rematerialized block stages the primal before its derivative
+                    # replaces it (row 13318), the differentiated program compiled ahead whatever it.
                     if (why := unlowered(implementation)) is not None:
-                        raise Unlowerable(generation.Choice.ATTENTION, implementation, why)
+                        like = jax.eval_shape(on(differentiated), query, key, value, bias, sinks, *extra)
+                        return unlowered_launch(generation.Choice.ATTENTION, implementation, why, like)
                     return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
                                 **operands_of(extra))
                 return run
@@ -1346,6 +1350,34 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     filled = functools.partial(ran, 'reference' if templated else 'template', mask_fill)
     return _filled(ran, filled, mask_fill, live, query, key, value, bias=bias, sinks=sinks, softcap=softcap,
                    precision=precision, dropping=dropout_seed is not None)
+
+
+# A kernel's launch this host lowers for no GPU of the target, staged as its output's shapes alone and
+# refused, named, where a program keeps it as it lowers (`selection.Unlowerable`): a split kernel's arm a
+# rematerialized block stages before it is differentiated, whose differentiated program never lowers it.
+_unlowered_p = core.Primitive("dew_unlowered_kernel")
+_unlowered_p.multiple_results = True
+_unlowered_p.def_abstract_eval(lambda *_, avals, choice, kernel, why: avals)
+
+
+def _refused(*_, avals, choice, kernel, why):
+    raise Unlowerable(choice, kernel, why)
+
+
+_unlowered_p.def_impl(_refused)
+mlir.register_lowering(_unlowered_p, lambda ctx, *_, avals, choice, kernel, why: _refused(
+    choice=choice, kernel=kernel, why=why, avals=avals))
+
+
+def unlowered_launch(choice: str, kernel: str, why: str, like) -> object:
+    """A launch of `kernel` this host lowers for no GPU of the target (`why`), its output `like`'s tree of
+    shapes (`jax.eval_shape` of a kernel computing the same function): staged, a program that keeps it
+    refuses it, named, as it lowers, and one whose derivative replaces it (a split kernel's primal under
+    `nn.remat`) never lowers it."""
+    leaves, tree = jax.tree.flatten(like)
+    avals = tuple(core.ShapedArray(leaf.shape, leaf.dtype) for leaf in leaves)
+    outputs = _unlowered_p.bind(avals=avals, choice=str(choice), kernel=kernel, why=why)
+    return jax.tree.unflatten(tree, outputs)
 
 
 def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False,
