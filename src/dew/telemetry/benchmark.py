@@ -419,6 +419,8 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     own = re.compile(re.escape(module) + r"(\.\d+)?(\(\d+\))?")
     runs = {device: [run for run in modules.get(f"/device:TPU:{device}", []) if own.fullmatch(run.name)]
             for device in sorted(set(devices))}
+    if not runs:
+        raise NoKernels(f"a call of {module} names no TPU its run is read on")
     if missing := [device for device, each in runs.items() if not each]:
         raise NoKernels(f"the capture under {directory} holds no run of {module} on TPU {missing} of the "
                         f"call's {sorted(runs)}")

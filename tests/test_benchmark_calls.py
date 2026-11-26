@@ -479,8 +479,9 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run")] == [("fusion.1", 0.25),
                                                                                    ("custom-call.2", 0.75)]
     assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run")] == ["fusion.1", "custom-call.2", "fusion.9"]
-    with pytest.raises(NoKernels):
-        tpu_ops(one, {2}, "jit_run")
+    for devices in ({2}, set()):
+        with pytest.raises(NoKernels):
+            tpu_ops(one, devices, "jit_run")
     with pytest.raises(NoKernels):
         tpu_ops(one, {0}, "jit_idle")
     # A call on TPUs 0 and 1 whose capture holds its run on TPU 0 alone, another program's on TPU 1; or its
