@@ -1374,8 +1374,11 @@ the accurate query cotangent, the key-first weight consumer and the value-gradie
 pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
 solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
 the selective scan's packed and unpacked decay. The same writer checks rounded-operand forward and
-tangent bodies. Every case holds its own independent reference. The backward weight, dropout and decay
-pilots also exercise each primitive on the CPU. Production still uses the written bodies (row 3272).
+tangent bodies. Additional cases cover the masked softcap hook and its slope, projected sink state,
+document-aware sliding visibility, GDN value pullback, KDA end-gated writes, the selective adjoint,
+Mamba-SSD chunk forward and pullback, and GEMM partial scaling and blockwise FP8 epilogue. Each case
+has an independent reference. The template component suites check their primitives on the CPU.
+Production still uses the written bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)
