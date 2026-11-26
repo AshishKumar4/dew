@@ -50,6 +50,15 @@ def rows_permuted(x: jax.Array, permutation: jax.Array, axis: int = 0) -> jax.Ar
     return x.at[(slice(None),) * axis + (permutation,)].get(out_sharding=placed)
 
 
+def rows_gathered_wide(x: jax.Array, rows: jax.Array) -> jax.Array:
+    """`x`'s rows at `rows` (`x[rows]`), gathered through its wide form (exactly: at least fp32), so the
+    transpose sums the cotangents of every place a row is read at wide and rounds once: a token's routes
+    (`gemm`'s portable gather, the expert exchange's, row 12396)."""
+    from dew.nn.precision import at_least_fp32
+
+    return x.astype(at_least_fp32(x.dtype))[rows].astype(x.dtype)
+
+
 def scattered(outs, scatter: jax.Array | None):
     """`outs` (one output or a tuple), each row `i` written at row `scatter[i]` (a product's `scatter`, a
     permutation, so every row is written once), as XLA's program and a launch's stores give them; as they
