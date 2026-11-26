@@ -80,16 +80,28 @@ def visible_gpus(visible: str) -> int:
     return len(visible_list(visible))
 
 
-def visible_list(visible: str) -> list[str]:
+def visible_list(visible: str, physical: int | None = None) -> list[str]:
     """The GPUs a CUDA_VISIBLE_DEVICES value makes visible, in order: its entries up to the first that names
-    no GPU (a negative index, `-1` among them), past which CUDA enumerates none, so `0,2,-1,1` shows `0` and
-    `2` alone (row 13104)."""
+    no GPU, past which CUDA enumerates none (row 13104): an empty or negative one (`0,2,-1,1` shows `0` and
+    `2` alone), or, where the host's `physical` GPUs are counted, an index past them (`0,99,1` on two shows
+    `0` alone). An identifier by UUID is kept as listed."""
     shown = []
     for entry in (part.strip() for part in visible.split(",")):
-        if not entry or (entry.lstrip("-").isdigit() and int(entry) < 0):
+        index = int(entry) if entry.lstrip("-").isdigit() else None
+        if not entry or (index is not None and (index < 0 or (physical is not None and index >= physical))):
             break
         shown.append(entry)
     return shown
+
+
+def verified_visible(visible: str, physical: int | None) -> list[str] | None:
+    """The GPUs `visible` makes visible on a host of `physical` GPUs (`visible_list`) where each is known to
+    be one of them, an index below their count; None where that is not known: the host's GPUs uncounted, or
+    an entry by UUID, which only its driver resolves."""
+    if physical is None:
+        return None
+    shown = visible_list(visible, physical)
+    return shown if all(entry.isdigit() for entry in shown) else None
 
 
 def cuda_driver() -> ctypes.CDLL | None:

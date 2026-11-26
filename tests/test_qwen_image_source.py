@@ -180,7 +180,8 @@ def cudnn_case():
         mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
         times = jnp.asarray([731.0, 42.0])
         condition = DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask)
-        initialized = attending("cudnn")(jax.jit(model.init))
+        # Initialized through XLA's attention, which the host holds; cuDNN's is the pullback's under test.
+        initialized = attending("xla")(jax.jit(model.init))
         params = initialized(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times, condition)["params"]
 
     @jax.jit

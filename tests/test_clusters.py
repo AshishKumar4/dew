@@ -124,31 +124,28 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
 
 
 def test_dew_launch_shows_each_process_its_own_gpus_alone():
-    """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`, the
-    ordinals the pool may use, in order), numbered from 0 for JAX, so a process of one GPU opens no
-    neighbour's whatever pool it joins and keeps XLA's CUDA graphs (row 12761: every rank counted the host's
-    eight)."""
+    """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`), numbered
+    from 0 for JAX, so a process of one GPU opens no neighbour's whatever pool it joins and keeps XLA's CUDA
+    graphs (row 12761: every rank counted the host's eight): the host's own ordinals where the pool states
+    none, or its places in a pool's list known to name the host's GPUs alone, as CUDA enumerates it (up to an
+    index naming none, row 13104). A list not known so (the host's GPUs uncounted) is split by place, the
+    pool's list left whole, so no process sees a GPU the pool hid; a pool kept off its GPUs likewise. The
+    hosts are a remote one that answers nothing (`gpu-host.invalid`), whatever machine runs this."""
     from dew._cli.launch import Launch
+    from dew._pool import verified_visible
     from dew.clusters import LOCAL_DEVICES
 
-    launch = Launch(command=("python", "train.py"), processes_per_host=2,
-                    env=("CUDA_VISIBLE_DEVICES=4,5,6,7", "JAX_PLATFORMS=cuda"))
-    pool = launch.pool(["localhost"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in pool] == [
-        ("4,5", "0,1"), ("6,7", "0,1")]
-    # A host no one counted the GPUs of (a remote one whose nvidia-smi does not answer) and whose pool lists
-    # none: each process its host's own ordinals from its first, as JAX_LOCAL_DEVICE_IDS named them.
-    uncounted = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1, port=8476,
-                       env=("JAX_PLATFORMS=cuda",)).pool(["gpu-host.invalid"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in uncounted] == [
-        ("0", "0"), ("1", "0")]
-    # A pool's list that ends at an index naming no GPU shows those before it alone, as CUDA enumerates them:
-    # its processes split those, never one listed past the end (row 13104: rank 1 took the `1` CUDA hid).
-    ended = Launch(command=("python", "train.py"), processes_per_host=2,
-                   env=("CUDA_VISIBLE_DEVICES=0,2,-1,1", "JAX_PLATFORMS=cuda")).pool(["localhost"])
-    assert [process.env["CUDA_VISIBLE_DEVICES"] for process in ended] == ["0", "2"]
-    # A pool kept off its GPUs takes its devices by their places, its GPUs left as it hid them.
-    on_cpu = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
-                    env=("JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=")).pool(["localhost"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in on_cpu] == [
-        ("", "0"), ("", "1")]
+    cases = (("4,5,6,7", 8), ("0,2,-1,1", 4), ("0,99,1", 2), ("0,1", None), ("GPU-3f2a,1", 4))
+    shown = [verified_visible(*case) for case in cases]
+    assert shown == [["4", "5", "6", "7"], ["0", "2"], ["0"], None, None]
+
+    def pool(*env: str) -> list[tuple[str, str]]:
+        launch = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
+                        port=8476, env=env)
+        return [(process.env.get("CUDA_VISIBLE_DEVICES", ""), process.env[LOCAL_DEVICES])
+                for process in launch.pool(["gpu-host.invalid"])]
+
+    assert pool("JAX_PLATFORMS=cuda") == [("0", "0"), ("1", "0")]
+    hidden = "CUDA_VISIBLE_DEVICES=0,2,-1,1"
+    assert pool("JAX_PLATFORMS=cuda", hidden) == [("0,2,-1,1", "0"), ("0,2,-1,1", "1")]
+    assert pool("JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=") == [("", "0"), ("", "1")]
