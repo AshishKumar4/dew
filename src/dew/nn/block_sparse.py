@@ -475,6 +475,7 @@ class BlockSparseAttentionMixer(AttentionMixer):
     selection: Literal["moba", "infllm", "msa"] = "moba"
     block: int = 512
     top_k: int = 3
+    index_width: int = 64
 
     # It selects over each row's cache whole, one document a row.
     packed_cache = False
