@@ -192,6 +192,35 @@ def test_the_recurrence_decode_cells_covering_keeps_both_its_idle_row_checks():
             "the decode kernel's drawing rows step beside idle ones as with none"} <= kept
 
 
+def test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100(tmp_path, monkeypatch):
+    """The gated delta net's GPU cell at Qwen3.5-27B's widths (tests/recurrence_matrix.py's
+    `a_gated_delta_nets_training_step_at_a_models_widths_is_on_par`) prepared as an A100 part prepares it
+    (`truths_ahead.prepared` on a compile-only sm80 node, its unit's needs filed, `tier_wire.unit_needs`): its
+    float64 truth's program and its terms' program each within a lane of a 40 GB A100's tier (7.1 GiB) by
+    their filed admissions, which named them (row 13580: at two rows over 1,024 tokens its terms' program
+    asked 40.37 GiB and its truth's 38.9, past the whole device, and left test_gpu_recurrence
+    unschedulable)."""
+    import json
+
+    import model_flows
+    import recurrence_matrix
+    import tier_wire
+    from truths_ahead import prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    monkeypatch.setenv(tier_wire.UNIT, "a part")
+    monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
+    with prepared(tmp_path / "sites", stamp="a", target=model_flows.node_target()):
+        recurrence_matrix.a_gated_delta_nets_training_step_at_a_models_widths_is_on_par("sm80")
+    filed = json.loads(tier_wire.needs_file(tmp_path, "a part").read_text())["programs"]
+    asked = {program.get("label"): program["resident"] + program["beside"] + program["temporaries"]
+             for program in filed}
+    kinds = {kind for label in asked for kind in ("truth", "terms") if kind in str(label)}
+    assert kinds == {"truth", "terms"}, asked
+    assert max(asked.values()) <= 6 * 2 ** 30, asked
+
+
 def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_path, monkeypatch):
     """A matrix case pinned to its generation (`generation_support.pinned`, as every *_matrix.py pins its
     cases) runs in a GPU part's prepare on the node's CPU when the node is that generation, as its run runs
