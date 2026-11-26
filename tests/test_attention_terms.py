@@ -123,21 +123,32 @@ def test_a_zero_head_passes_its_gradient_through_the_clip():
     assert bool(jnp.all(jnp.isfinite(gradient)))
 
 
-def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold():
-    """fp32 heads of eight whose squares' sum overflows, one component 2^66 or -2^127 (whose reciprocal is
-    subnormal too) or four of 2^63, and four of 2^61 just inside the bound past which the clip prescales,
-    clip to length 8 along themselves, bit for bit (powers of two, which the clip's arithmetic keeps exact),
-    with a finite gradient, where their summed squares' infinity clipped the first three to zero (row
-    13137)."""
+@pytest.mark.parametrize(("head", "threshold", "clipped_head"), [
+    ({0: 2.0 ** 66}, 8.0, {0: 8.0}),
+    ({3: -(2.0 ** 127)}, 8.0, {3: -8.0}),
+    ({3: -(2.0 ** 127)}, 1.0, {3: -1.0}),
+    ({0: 2.0 ** 63, 1: 2.0 ** 63, 2: 2.0 ** 63, 3: 2.0 ** 63}, 8.0, {0: 4.0, 1: 4.0, 2: 4.0, 3: 4.0}),
+    ({4: 2.0 ** 61, 5: 2.0 ** 61, 6: 2.0 ** 61, 7: 2.0 ** 61}, 8.0, {4: 4.0, 5: 4.0, 6: 4.0, 7: 4.0}),
+    ({0: 2.0 ** 62, 1: 2.0 ** -100}, 2.0 ** 61, {0: 2.0 ** 61, 1: 2.0 ** -101}),
+], ids=["one-past-the-square", "one-near-the-largest", "near-the-largest-gain-subnormal", "four-past",
+        "four-at-the-bound", "a-small-component-kept"])
+def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold(head, threshold, clipped_head):
+    """fp32 heads of eight whose squares' sum overflows (one component 2^66 or -2^127, whose reciprocal is
+    subnormal too, under a threshold whose gain stays normal or does not; four of 2^63), four just inside
+    the bound past which the clip takes its length scaled, and a head keeping a small component beside a
+    large one, clip to the threshold along themselves, bit for bit (powers of two, which the clip's
+    arithmetic keeps exact), with a finite gradient, where their summed squares' infinity clipped the
+    overflowing ones to zero (row 13137)."""
     from dew.nn.attention_terms import clipped
 
-    x = np.zeros((4, 8), np.float32)
-    x[0, 0], x[1, 3], x[2, :4], x[3, 4:] = 2.0 ** 66, -(2.0 ** 127), 2.0 ** 63, 2.0 ** 61
-    out, pull = jax.vjp(lambda x: clipped(x, 8.0, 1e-6), jnp.asarray(x))
-    expected = np.zeros((4, 8), np.float32)
-    expected[0, 0], expected[1, 3], expected[2, :4], expected[3, 4:] = 8, -8, 4, 4
+    x, expected = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    for at, value in head.items():
+        x[at] = value
+    for at, value in clipped_head.items():
+        expected[at] = value
+    out, pull = jax.vjp(lambda x: clipped(x, threshold, 1e-6), jnp.asarray(x))
     np.testing.assert_array_equal(np.asarray(out), expected)
-    (gradient,) = pull(jnp.arange(32, dtype=jnp.float32).reshape(4, 8))
+    (gradient,) = pull(jnp.arange(8, dtype=jnp.float32))
     assert bool(jnp.all(jnp.isfinite(gradient)))
 
 

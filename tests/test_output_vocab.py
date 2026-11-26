@@ -131,8 +131,8 @@ def test_an_unscored_column_enters_no_product_of_a_bf16_models_head(tied):
 def test_a_narrow_heads_call_keeps_its_adapters_its_watchers_and_its_promotion():
     """An untied head scoring 48 of its 64 columns: under an adapter set adapting it (`dew.lora.AdapterSet`,
     each row its own adapter), a capture of its call (`capture_intermediates`), and over states of a dtype
-    other than the model's (bf16 into a float32 model, promoted as its layer promotes them), its logits are,
-    bit for bit, the full head's first 48 under the same, and the capture sees its call (row 13135's
+    other than the model's (float64 into a float32 model, promoted as its layer promotes them), its logits
+    are, bit for bit, the full head's first 48 under the same, and the capture sees its call (row 13135's
     review: the scored product runs where nothing else takes or watches the head's call)."""
     from dew.lora import AdapterSet, LoRA
 
@@ -158,7 +158,9 @@ def test_a_narrow_heads_call_keeps_its_adapters_its_watchers_and_its_promotion()
     logits, state = narrow.apply(variables, ids, capture_intermediates=True, mutable=["intermediates"])
     assert "lm_head" in state["intermediates"]
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(full.apply(variables, ids))[..., :SCORED])
-    hidden = jnp.asarray(rng.normal(size=(2, 9, TINY_DECODER["emb_features"])), jnp.bfloat16)
-    np.testing.assert_array_equal(
-        np.asarray(narrow.apply(variables, hidden, method="logits_from_hidden")),
-        np.asarray(full.apply(variables, hidden, method="logits_from_hidden"))[..., :SCORED])
+    # float64 states into a float32 head: its layer takes both operands at float32, as the full head's does.
+    with jax.enable_x64(new_val=True):
+        hidden = jnp.asarray(rng.normal(size=(2, 9, TINY_DECODER["emb_features"])), jnp.float64)
+        np.testing.assert_array_equal(
+            np.asarray(narrow.apply(variables, hidden, method="logits_from_hidden")),
+            np.asarray(full.apply(variables, hidden, method="logits_from_hidden"))[..., :SCORED])

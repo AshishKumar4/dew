@@ -960,8 +960,8 @@ dew.nn.cross_pass.CrossPass
   additive: bool = True
   normalize_values: bool = True
   scale_by_input_rms: bool = True
-  normalize_message: bool = True
   norm_eps: float | None = None
+  normalize_message: bool = True
   scaled: bool = False
   gained: bool = True
 dew.nn.dex.DifferentialExtension

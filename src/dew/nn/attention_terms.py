@@ -38,12 +38,13 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
     # A head past 2^cut, `cut` = (maxexp - bits(D)) // 2 - 1, whose D squares' sum can overflow (1e20's square
-    # is fp32's infinity, row 13137), is scaled by `s` = 2^(cut - maxexp) first, so its largest is at most
-    # 2^cut: a power of two whose reciprocal is normal. The clip is then `y * min(threshold / (|y| + eps s),
-    # 1 / s)` of `y = x s`, which is `x * min(threshold / (|x| + eps), 1)` with no reciprocal of the head's
-    # size (XLA turns a division by it into a product by its reciprocal, subnormal past 2^126 in fp32 and
-    # flushed to zero). `s` is held constant (`stop_gradient`): the clip is the same at either, and so its
-    # derivative; a head within 2^cut takes `s` = 1, its arithmetic unchanged.
+    # is fp32's infinity, row 13137), has its length taken over `y = x s`, `s` = 2^(cut - maxexp), so its
+    # largest is at most 2^cut: a power of two whose reciprocal is normal. Its gain `min(threshold / (|x| +
+    # eps), 1)` is `min(threshold s / (|y| + eps s), 1)`, which multiplies the head itself, its small
+    # components kept, where it is normal; where it is subnormal (a head near fp32's largest under a small
+    # threshold, which XLA's products flush to zero), `y * min(threshold / (|y| + eps s), 1 / s)`, the same
+    # clip with no factor below normal. `s` is held constant (`stop_gradient`): the clip is the same at
+    # either, and so its derivative; a head within 2^cut takes `s` = 1, its arithmetic unchanged.
     maxexp = jnp.finfo(wide).maxexp
     cut = (maxexp - x.shape[-1].bit_length()) // 2 - 1
     largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x_wide), axis=-1, keepdims=True))
@@ -54,7 +55,9 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     # constant region), where the square root's would be infinite times zero.
     held = squared > 0
     length = jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
-    return (scaled * jnp.minimum(threshold / (length + eps * factor), 1 / factor)).astype(x.dtype)
+    gain = jnp.minimum(threshold * factor / (length + eps * factor), 1)
+    rescaled = scaled * jnp.minimum(threshold / (length + eps * factor), 1 / factor)
+    return jnp.where(gain >= jnp.finfo(wide).tiny, x_wide * gain, rescaled).astype(x.dtype)
 
 
 def log_ratio_scale(positions, floor: float, scale: float, *, dtype: DTypeLike) -> jax.Array:
