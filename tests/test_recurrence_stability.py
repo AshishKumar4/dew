@@ -107,8 +107,12 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
     hooks read it from (`_decayed`)."""
     if hooks.rated:
         # The log decay is `rate * dt`: dt the target over each head's rate, in float64 on the host and
-        # rounded once (`hosted`), the same on every host and backend.
-        dt = np.asarray(target, np.float64) / np.asarray(operands.rate, np.float64)
+        # rounded once (`hosted`), the same on every host and backend; a traced target's (a derivative taken
+        # through the decays, tests/test_derived_stability.py) the program's own division.
+        try:
+            dt = np.asarray(target, np.float64) / np.asarray(operands.rate, np.float64)
+        except jax.errors.TracerArrayConversionError:
+            return dataclasses.replace(operands, beta=target / operands.rate)
         return dataclasses.replace(operands, beta=hosted(dt))
     if hooks.gates is not None:
         # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero. Each branch takes
