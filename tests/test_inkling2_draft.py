@@ -197,11 +197,8 @@ def test_the_markov_heads_packed_projection_writes_its_live_kernels(source):
     context's."""
     from safetensors.numpy import load_file
 
-    from dew.interop.decoder_parts import packed_layouts
-    from dew.interop.hf_decoders import family_entry
-
-    layouts = {layout.name: layout for layout in source.weight_layouts if '.markov_head.rnn_' in layout.name}
-    packed = packed_layouts(layouts, family_entry(RELEASE['model_type']).packed)
+    # The loader's own layouts of the packed tensors (`decoder_bindings`), which an export writes.
+    layouts = {layout.name: layout for layout in source.weight_layouts}
     head = source.variables['params']['block_drafter']['markov_head']
     rank = RELEASE['mtp_config']['markov_rank']
     step = {'kernel': head['rnn_step']['kernel'].at[1, 2].add(1.0)}
@@ -213,11 +210,9 @@ def test_the_markov_heads_packed_projection_writes_its_live_kernels(source):
     expected = np.asarray(given['markov_head.rnn_proj.weight'], np.float32).copy()
     expected[2, 1] += 1.0
     expected[4, 2 * rank + 3] += 1.0
-    weight = [layout for name, layout in packed.items() if name.endswith('markov_head.rnn_proj.weight')]
-    bias = [layout for name, layout in packed.items() if name.endswith('markov_head.rnn_proj.bias')]
-    assert len(weight) == 1 and len(bias) == 1, sorted(packed)
-    np.testing.assert_array_equal(np.asarray(weight[0].source_array(changed), np.float32), expected)
-    np.testing.assert_array_equal(np.asarray(bias[0].source_array(changed), np.float32),
+    weight, bias = (layouts[f'mtp.markov_head.rnn_proj.{leaf}'] for leaf in ('weight', 'bias'))
+    np.testing.assert_array_equal(np.asarray(weight.export(changed), np.float32), expected)
+    np.testing.assert_array_equal(np.asarray(bias.export(changed), np.float32),
                                   np.asarray(given['markov_head.rnn_proj.bias'], np.float32))
 
 
