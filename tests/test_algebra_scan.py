@@ -916,6 +916,42 @@ def test_equal_reader_scales_keep_their_own_dtypes_and_query_cotangents():
             np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 1), 0.5, np.float32))
 
 
+@pytest.mark.parametrize("reads", ["before", "after"])
+@pytest.mark.parametrize("large", ["reader", "state"])
+def test_a_prepared_chunk_keeps_a_subnormal_read_scale_until_the_state_contraction(reads, large):
+    def read(h, q, b, v, g):
+        return np.float32(2.0 ** -128) * (q @ h)
+
+    declaration = scan.Scan(scalar_step, read, SCALAR_SSD, walked="time", state=((1, 1), jnp.float32),
+                            reads=reads)
+    forms = scan.derive_scan(declaration, saturation=SATURATION)
+    giant = np.float32(2.0 ** 127)
+    reader = np.full((2, 1), giant if large == "reader" else 1, np.float32)
+    memory = np.full((1, 1), giant if large == "state" else 1, np.float32)
+    cotangent = np.full_like(reader, 2.0 ** 126)
+
+    def run(q, h):
+        chunk = {"q": q, "b": jnp.zeros_like(q), "v": jnp.zeros_like(q), "g": jnp.zeros(2, q.dtype)}
+        state = (jnp.asarray(0, q.dtype), h)
+        prepared = forms.prepare(chunk)
+        _, held = forms.step(state, prepared)
+        mapped = forms.mapped(prepared, state, held)
+        replayed, _ = forms.replay(chunk, h)
+        return mapped, replayed
+
+    @jax.jit
+    def orders(q, h, ct):
+        outputs, pull = jax.vjp(run, q, h)
+        zero = jnp.zeros_like(ct)
+        return outputs, (pull((ct, zero)), pull((zero, ct)))
+
+    outputs, pullbacks = orders(reader, memory, cotangent)
+    for output, (dq, dh) in zip(outputs, pullbacks, strict=True):
+        np.testing.assert_array_equal(output, np.full_like(reader, 0.5))
+        np.testing.assert_array_equal(dq, np.broadcast_to(memory * 0.25, reader.shape))
+        np.testing.assert_array_equal(dh, reader[:1] * 0.5)
+
+
 def ones_chunk(g, dtype=jnp.float32):
     """A chunk of unit readers, keys and writes at log decays `g`."""
     tokens = g.shape[0]
