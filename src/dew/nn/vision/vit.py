@@ -282,6 +282,17 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                       precision=precision, name=f"blocks_{index}")
 
 
+def _joined_special_tokens(layout: ViTLayout, segment: jax.Array) -> jax.Array:
+    """A packed row's full-layer `segment` ids `[B, patches]` with its special tokens' (a class token,
+    registers) beside them, in its first frame: a row one image, as a tower holding them packs it."""
+    if set(layout.attention) != {"full"} or set(layout.order) != {"patches"} or any(layout.sinks):
+        raise ValueError("a packed image's special tokens join its patches in full layers alone, in their own "
+                         "order and with no sinks")
+    tokens = layout.special_tokens
+    joined = jnp.ones((segment.shape[0], tokens.count), segment.dtype)
+    return jnp.concatenate([joined, segment] if tokens.cls == "first" else [segment, joined], axis=1)
+
+
 def _gather(x, index):
     """`x`'s rows `[B, L, ...]` taken in `index` `[B, L]` order; None takes them as they are."""
     if x is None or index is None:
@@ -414,13 +425,7 @@ class VisionTransformer(nn.Module):
             "window": None if windows is None else jnp.where(valid, windows + 1, 0),
         }
         if tokens.count and not images:
-            # A packed row is one image here, its special tokens (a class token, registers) in its frame.
-            if set(lay.attention) != {"full"} or set(lay.order) != {"patches"} or any(lay.sinks):
-                raise ValueError("a packed image's special tokens join its patches in full layers alone, in "
-                                 "their own order and with no sinks")
-            joined = jnp.ones((segments["full"].shape[0], tokens.count), segments["full"].dtype)
-            segments["full"] = jnp.concatenate(
-                [joined, segments["full"]] if tokens.cls == "first" else [segments["full"], joined], axis=1)
+            segments["full"] = _joined_special_tokens(lay, segments["full"])
         current = "patches"
         for index in range(lay.depth):
             wanted = lay.order[index]
