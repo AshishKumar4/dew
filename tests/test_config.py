@@ -171,6 +171,19 @@ def test_a_token_budget_refuses_a_ramp_or_a_budget_under_one_token():
         TrainerConfig(update_tokens=96, batch_ramp=Ramp(start=8, increment=8, samples=8))
 
 
+def test_a_stop_naming_no_class_reads_as_the_one_class_its_fields_build():
+    """A run record's `trainer.stop` naming no class reads through the registry's one rule, as an override
+    gives it (row 12115): a pause's fraction a `Pause`, as a record written while `stop` held a Pause alone
+    does (ledger 1552), and a plateau's metric and evaluations a `Plateau`, which a pause's legacy reading
+    refused as a Pause of unknown fields."""
+    from dew.training.budget import Pause, Plateau
+
+    record = RunConfig().to_dict()
+    for stop, kind in (({"fraction": 0.5}, Pause), ({"metric": "val/loss", "evals": 3}, Plateau)):
+        read = RunConfig.from_dict({**record, "trainer": {**record["trainer"], "stop": stop}}).trainer.stop
+        assert isinstance(read, kind), read
+
+
 def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
     """The data's batch stage is the run's one batch: a budget of tokens an update sets the
     accumulation to that many of the data's token batches (`TrainerConfig.accumulation`), and refuses
