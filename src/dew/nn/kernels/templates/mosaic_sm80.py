@@ -721,7 +721,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # unrolled, spilled none (NSDBG-5).
         running, fresh = lax.optimization_barrier((running, self.zeros(running.shape)))
         fresh = self.products(fresh, lhs, rhs)
-        return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
+        # `scale(start, columns, partial)` scales the partial itself (`Issuer.summed_apart`, row 13257).
+        return running + (fresh if scale is None else scale(0, running.shape[1], fresh))
 
     def register_products(self, acc, parts, rhs):
         for formed in parts:

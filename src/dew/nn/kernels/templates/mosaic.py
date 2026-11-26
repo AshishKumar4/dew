@@ -1300,12 +1300,13 @@ class Issuer[Accumulator](abc.ABC):
     def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
-        fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
-        `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
-        by an IEEE add."""
+        fp32 sum of its products, scaled by `scale(start, columns, partial)` where given (its columns' scaling
+        of the partial from `start`, which takes the partial so it can order its scales to keep the
+        intermediate normal: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`, row 13257),
+        added into `running` by an IEEE add."""
         rows, columns = running.shape
         fresh = self.product(lhs, rhs, (rows, columns))
-        return running + (fresh if scale is None else fresh * scale(0, columns))
+        return running + (fresh if scale is None else scale(0, columns, fresh))
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True,
