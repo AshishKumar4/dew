@@ -253,9 +253,14 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     # own, a query's own counted once however many name it), those it reaches alone: up to its own.
     forced = ((index < initial) | ((index > own - local) & (index <= own))) & (index <= own)
     # Ranked ahead of every other visible block within the one `top_k`, as M3's index kernels prioritize
-    # them (`top_k_selection`: a block of the forced mask scored past every score).
-    ranked = jnp.where(forced, jnp.inf, pooled)
-    chosen = top_k_selection(ranked, keep | forced, top_k)
+    # them: the forced first (lower blocks first), then the rest's top by score (`top_k_selection`), the
+    # forced bit ahead of any score, an infinite one too.
+    forced = jnp.broadcast_to(forced, pooled.shape)
+    slots = min(top_k, blocks)
+    first = jax.lax.top_k(forced.astype(jnp.int32), slots, is_stable=True)[1]
+    first = jnp.where(jnp.take_along_axis(forced, first, axis=-1), first, -1)
+    both = jnp.concatenate([first, top_k_selection(pooled, keep & ~forced, slots)], axis=-1)
+    chosen = jnp.take_along_axis(both, jnp.argsort(both < 0, axis=-1, stable=True)[..., :slots], axis=-1)
     # Its `top_k` slots whatever its blocks: -1 past those it holds.
     return jnp.pad(chosen, ((0, 0),) * 3 + ((0, top_k - chosen.shape[-1]),), constant_values=-1)
 

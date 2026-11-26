@@ -347,7 +347,8 @@ def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach(
     the rest empty (-1) whatever its `top_k`; M3's forcing (the first block and the two ending at its own)
     for a query of the first block, its own once, not the first and its own as two (row 13501); a top of
     one with its own forced alone, its own; with two first blocks forced, a query of the first block its
-    first alone, the second not yet past it; and no block past the keys' last (16 queries over 8 keys)."""
+    first alone, the second not yet past it; no block past the keys' last (16 queries over 8 keys); and its
+    own forced ahead of blocks scored +inf."""
     scores = jnp.where(jnp.tril(jnp.ones((16, 16), bool)), 0.0, -jnp.inf)[None, None]
     one = np.asarray(block_sparse.msa_selection(scores, block=16, top_k=16))
     np.testing.assert_array_equal(one[0, 0], np.array([[0] + [-1] * 15] * 16))
@@ -360,6 +361,11 @@ def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach(
     np.testing.assert_array_equal(two[0, 0, 0], [0, -1, -1, -1])
     rectangular = np.asarray(block_sparse.msa_selection(scores[..., :8], block=8, top_k=4, local=1))
     np.testing.assert_array_equal(rectangular[0, 0, 8], [0, -1, -1, -1])
+    # The forced bit ahead of any score: blocks 0 and 1 scored +inf, its own (2) finite, a top of two.
+    infinite = jnp.where(jnp.tril(jnp.ones((24, 24), bool)),
+                         jnp.where(jnp.arange(24) < 16, jnp.inf, 0.0), -jnp.inf)[None, None]
+    tied = np.asarray(block_sparse.msa_selection(infinite, block=8, top_k=2, initial=0, local=1))
+    np.testing.assert_array_equal(tied[0, 0, 16], [2, 0])
 
 
 def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense_call():
