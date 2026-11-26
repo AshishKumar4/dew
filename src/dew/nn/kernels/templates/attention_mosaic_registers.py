@@ -13,7 +13,7 @@ from jax.core import ShapedArray
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, resources, swizzling
-from dew.nn.kernels.templates.attention import Kind
+from dew.nn.kernels.templates.attention import TILED, Kind
 from dew.nn.kernels.templates.attention_mosaic_program import (
     STATISTICS,
     BackwardTiles,
@@ -63,7 +63,8 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
                      else (family.column_registers, family.row_registers))
     step, vectors = [], 0
     for kind, dtype in params:
-        if kind is Kind.TILE:
+        if kind in TILED:
+            # A band's tile beside its query tile's origin, a scalar (`attention_mosaic_program._param`).
             step.append((block_q, block_k, dtype))
         elif kind is Kind.KEY:
             vectors += keys(block_k, dtype) + (keys(block_k, jnp.float32) if grads == "keys" else 0)
