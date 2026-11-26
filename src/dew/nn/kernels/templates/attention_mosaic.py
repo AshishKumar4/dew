@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention import (
     logit_scale,
     prologued,
     prologues_taken,
+    walked_initial,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
@@ -1412,6 +1413,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `value` its keys' leading columns (`MosaicForward.in_key`): its programs read them from the key's slot,
     and the value array, a view of the key's, is no operand of the launch.
     """
+    walked_initial(None if hooks is None else hooks.initial)
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
     in_key = reads_in_key(in_key, key, value, hooks, residuals, table=table, scales=scales)

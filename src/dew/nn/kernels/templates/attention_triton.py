@@ -65,6 +65,7 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     scored,
     shared_place,
+    walked_initial,
     within,
 )
 from dew.nn.kernels.templates.base import Template
@@ -702,6 +703,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     forward keeps where the call takes it). The operands pad to whole blocks of the largest tile and to
     power-of-two head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
+    walked_initial(None if hooks is None else hooks.initial)
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
     # The prologues taken as XLA's program before the launch (`prologues_taken`).

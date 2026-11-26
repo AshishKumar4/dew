@@ -40,7 +40,7 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     reference,
     takes_output_residuals,
-    unnormalized,
+    walked_initial,
 )
 from dew.nn.precision import configured_precision
 
@@ -89,8 +89,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
     hooks = Hooks() if hooks is None else hooks
-    # A resumed state's output its numerator again, as the walk resumes from its sums (`Initial.normalized`).
-    hooks = dataclasses.replace(hooks, initial=unnormalized(hooks.initial))
+    walked_initial(hooks.initial)
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")

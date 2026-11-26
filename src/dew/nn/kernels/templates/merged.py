@@ -283,7 +283,8 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
                       has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                       out_heads: int | None = None, family: str | None = None,
                       output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-                      output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[cost.Work, int]:
+                      output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False
+                      ) -> tuple[cost.Work, int]:
     """Full launch work and grid size at `block` channels for the selected backend (`merged_mosaic.launch`
     when `family` is set, else Pallas Triton `_launch`) on the common one-window path
     (`means.merged_state_chunked`): one anchor/hull joining pass plus one window's two dependent passes
@@ -308,11 +309,12 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
         launch = functools.partial(
             merged_mosaic.launch, units=units, queries=queries, width=width, block=block, raw_scale=raw_scale,
             out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
-            family=family)
+            family=family, normalized=normalized)
     else:
         launch = functools.partial(
             _launch, units=units, queries=queries, width=width, block=block, raw_scale=raw_scale,
-            out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds)
+            out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
+            normalized=normalized)
     with generation.as_target(target):
         (kernel,) = (equation for equation in programs.equations(
             jax.make_jaxpr(launch)(padded, stacked, *extra_s, *output_specs).jaxpr)
@@ -393,7 +395,8 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
                            target: generation.GpuTarget, has_initial: bool, raw_scale: float | None,
                            out_dtype, out_heads: int | None, output_mod: Callable | None,
                            output_kinds: tuple[Kind, ...],
-                           output_specs: tuple[jax.ShapeDtypeStruct, ...]) -> tuple[int, cost.Work]:
+                           output_specs: tuple[jax.ShapeDtypeStruct, ...], normalized: bool
+                           ) -> tuple[int, cost.Work]:
     _, slices, _, _, _ = padded.shape
     total_slices = slices + int(has_initial)
     family = (generation.family(target.generation)
@@ -402,7 +405,8 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
 
     candidates = {block: _launch_for_block(
         units, padded, stacked, queries, width, block, target, has_initial, raw_scale, out_dtype, out_heads,
-        family=family, output_mod=output_mod, output_kinds=output_kinds, output_specs=output_specs)
+        family=family, output_mod=output_mod, output_kinds=output_kinds, output_specs=output_specs,
+        normalized=normalized)
         for block in blocks}
 
     def seconds(block: int) -> float:
@@ -417,7 +421,8 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                    queries: int, width: int, target: generation.GpuTarget, has_initial: bool = False,
                    raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None,
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
-                   output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[int, cost.Work]:
+                   output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False
+                   ) -> tuple[int, cost.Work]:
     """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
     held through `_cache.holding` (the one owner of what a process derives once and the facts it read, row
     12420) by the call's shapes, the target, the output hook as its epilogue computes it at each candidate
@@ -432,10 +437,10 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
         hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks,
                                     mosaic=_uses_mosaic(target, output_mod))
     key = (units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
-           output_kinds, output_specs, hooked, fusion.choice_context())
+           output_kinds, output_specs, hooked, normalized, fusion.choice_context())
     return _cache.holding(_PLANNED, key, lambda: _compute_planned_block(
         units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
-        output_mod, output_kinds, output_specs), PLANNED_HELD)
+        output_mod, output_kinds, output_specs, normalized), PLANNED_HELD)
 
 
 def _epilogue_programs(output_mod: Callable | None, output_kinds: tuple[Kind, ...],
@@ -484,12 +489,14 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
                 has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                 out_heads: int | None = None, output_mod: Callable | None = None,
                 output_kinds: tuple[Kind, ...] = (),
-                output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> cost.Work:
+                output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False) -> cost.Work:
     """One native `merged_padded` launch's device work at `_channel_block`'s chosen block (`_planned_block`,
     row 8779): common-path arithmetic across the grid, valid device traffic with row-stat stores counted once
-    per row (row 8809), span `3 * chunks`, one kernel."""
+    per row (row 8809), span `3 * chunks`, one kernel; its initial state its output where `normalized`
+    (`template.Initial.normalized`)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
-                          raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs)[1]
+                          raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs,
+                          normalized)[1]
 
 
 MOSAIC_SLOWER = frozenset({"sm80", "sm90"})
@@ -559,7 +566,7 @@ class MergedPadded(tuning.KernelOp):
         block, _ = _planned_block(
             self.units, padded_s, stacked_s, self.queries, self.width, generation.gpu_target(),
             bool(init_args), self.raw_scale, self.out_dtype, self.out_heads, self.output_mod,
-            self.output_kinds, out_specs)
+            self.output_kinds, out_specs, self.normalized)
         return MergeConfig(block)
 
     def remaining(self, ba) -> MergeConfig | None:
@@ -624,7 +631,8 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
     padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
                            for operand in (padded, stacked))
     block, _ = _planned_block(units, padded_s, stacked_s, queries, width, target, bool(init_args),
-                              raw_scale, out_dtype, out_heads, output_mod, output_kinds, out_specs)
+                              raw_scale, out_dtype, out_heads, output_mod, output_kinds, out_specs,
+                              normalized)
     return _launch(
         padded, stacked, *extra, units=units, queries=queries, width=width, block=block,
         raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod,

@@ -445,6 +445,42 @@ def test_a_decode_steps_state_near_fp32s_largest_resumes_each_rows_own_output_in
                                   np.broadcast_to(np.asarray(magnitudes / 2)[:, None, None, None], out.shape))
 
 
+@INTERPRETS
+def test_a_resumed_decode_state_takes_its_steps_output_hook_at_one_slice_interpreted():
+    """A decode step of 256 rows (one slice: its programs fill the device) resumed from a state over the
+    first four of eight keys that weigh alike, values of one, under an output hook doubling its output:
+    the step's output is two, the hook applied past the merge of the resumed state (`Initial.normalized`),
+    where a hook of no parameters was dropped there and the output was one."""
+    rows = 256
+    query = jnp.zeros((rows, 1, 4, 64), jnp.bfloat16)
+    key = jnp.zeros((rows, KEYS, 4, 64), jnp.bfloat16)
+    value = jnp.ones((rows, KEYS, 4, 64), jnp.bfloat16)
+    lengths, cut = jnp.full((rows,), 8, jnp.int32), jnp.full((rows,), 4, jnp.int32)
+    first = template.spans(1, KEYS, rows, lengths=cut)
+    rest = template.spans(1, KEYS, rows, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(
+            initial=state, output_mod=lambda o: o * 2.0), interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), 2.0)
+
+
+def test_a_resumed_decode_state_is_no_walks_initial_state():
+    """A resumed decode state holds its output (`Initial.normalized`), which no walk resumes from (each
+    reads its numerator): the template's route and its reference refuse it, as the decode step alone merges
+    it past its own walk; a numerator held read four keys of value two as one quarter of their output."""
+    from dew.nn.kernels.templates import attention_route
+
+    query = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    key = value = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    spans = template.spans(4, 4, 1)
+    state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 4.0), jnp.full((1, 2, 4, 64), 2.0),
+                             normalized=True)
+    for walk in (attention_route.attend, template.reference):
+        with pytest.raises(ValueError):
+            walk(query, key, value, spans, template.Hooks(initial=state))
+
+
 def test_a_resumed_states_output_spans_fp32s_range_as_its_finish_held_it():
     """A finished state whose output holds fp32's largest and least magnitudes in one row (2^127 and
     2^-149) over a total of four, resumed (`attention_decode.resumable`) and taken back as a merge takes an

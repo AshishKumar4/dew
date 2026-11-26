@@ -42,6 +42,7 @@ from dew.nn.kernels.templates.attention import (
     ranges_walk,
     shared_place,
     sums_units,
+    walked_initial,
     within,
 )
 from dew.nn.precision import power2
@@ -265,7 +266,7 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
     and, with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
     None)."""
     initial = None
-    if hooks.initial is not None:
+    if walked_initial(hooks.initial) is not None:
         state = hooks.initial
         widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
         initial = (call.rows(state.m, algebra.LEAST), call.rows(state.total),
