@@ -145,44 +145,23 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                           interpret_on_cpu=interpret_on_cpu)
         d_kernel = d_kernel[0] if group_sizes is None else d_kernel
     # The factors' gradients from `scaled` (the rank-wide product's cotangent) and from `t` as the forward
-    # multiplied it, rounded to the rows' dtype: under narrow rows each a narrow product summed in fp32 (the
-    # adapter apart's), else fp32 operands at a precision keeping them.
+    # multiplied it, rounded to the rows' dtype: `b`'s under narrow rows a narrow product summed in fp32 (the
+    # adapter apart's), else each fp32 operands at a precision keeping them.
     kept = _kept(precision)
 
-    def factor(left, right, dtype, at, operand, *, summed=None):
+    def factor(left, right, dtype, at, operand):
         if group_sizes is None:
             return jnp.dot(left.T.astype(dtype), right.astype(dtype), precision=at,
                            preferred_element_type=wide)
         return gemm_t(left.astype(dtype), right.astype(dtype), group_sizes,
-                      out_dtype=formed_in(operand) if summed is None else summed, precision=at,
+                      out_dtype=formed_in(operand), precision=at,
                       interpret_on_cpu=interpret_on_cpu)
 
     if wants_a:
-        if jnp.dtype(work) == jnp.dtype(jnp.bfloat16) and jnp.dtype(lhs.dtype) == jnp.dtype(jnp.bfloat16):
-            # bf16 rows times the wide `scaled` whole: `scaled` as three bf16 terms summing to it exactly
-            # (bf16 holds fp32's range; each term the last one's rounding residual), multiplied as one
-            # product of three times the rank's columns, every product exact and each block's fp32 sum
-            # added: the fp32 operands' product the narrow arithmetic computes in one pass of the rows
-            # (row 1304's review: `scaled` rounded once lost a cancellation the fp32 sum keeps).
-            # Each block's sum fp32 until they are combined. The split is taken where it is `scaled` whole
-            # (its terms' sum `scaled` again: no term past bf16's range or below its least subnormal) and
-            # its products finite; else the wide product, the same value wherever no product underflows.
-            terms = _bf16_terms(scaled)
-            exact = jnp.all(sum(term.astype(wide) for term in terms) == scaled)
-
-            def split():
-                blocks = factor(lhs, jnp.concatenate(terms, axis=-1), work, precision, a, summed=wide)
-                width = scaled.shape[-1]
-                parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
-                return parts[0] + parts[1] + parts[2]
-
-            def whole():
-                return factor(lhs, scaled, wide, kept, a, summed=wide)
-
-            d_a = jax.lax.cond(exact, split, whole)
-            d_a = jax.lax.cond(jnp.all(jnp.abs(d_a) < jnp.inf), lambda: d_a, whole)
-        else:
-            d_a = factor(lhs, scaled, wide, kept, a)
+        # fp32 operands at a precision keeping them whatever the rows' width: `scaled` rounded to the rows'
+        # dtype loses a cancellation its fp32 sum keeps, and a sum split into narrow terms rounds each term's
+        # sum apart, off the one fp32 sum at a bf16 tie (row 1304's review).
+        d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:
         # `t` holds the scale already: tᵀ · dy is the factor's gradient whole; `t` in the rows' dtype is the
         # operand the forward multiplied, in range wherever that product was.
@@ -194,15 +173,6 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                       zip((d_kernel, d_a, d_b, d_scale), (kernel, a, b, scale), strict=True))
     d_lhs, gradients = with_gradients_formed(d_lhs, gradients)
     return d_lhs, *gradients, zero_from_primal(group_sizes)
-
-
-def _bf16_terms(value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`value` (fp32) as three bf16 terms whose fp32 sum is it exactly: each the rounding of the last's
-    residual, which fp32 holds exactly (a residual of a bf16 rounding has at most 16 of fp32's digits)."""
-    high = value.astype(jnp.bfloat16)
-    rest = value - high.astype(value.dtype)
-    middle = rest.astype(jnp.bfloat16)
-    return high, middle, (rest - middle.astype(value.dtype)).astype(jnp.bfloat16)
 
 
 def _kept(precision: PrecisionLike) -> PrecisionLike:

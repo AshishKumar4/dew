@@ -1679,40 +1679,26 @@ def test_a_bf16_adapted_products_factor_gradient_keeps_a_cancellation_of_its_wid
 
 
 
-@pytest.mark.parametrize("case", ["scale near fp32's largest", "high term's product past fp32's largest",
-                                  "residual below bf16's least"])
-def test_a_bf16_adapted_products_factor_gradient_is_the_wide_products_where_the_split_is_not(case):
-    """A bf16 adapted product's rank factor gradient, bf16 rows, cotangent and output, where its three-term
-    split of the wide cotangent fails: a scale near fp32's largest (`scaled` rounding to bf16's infinity), a
-    high term's product with the rows past fp32's largest though the whole product is finite (an fp32
-    factor), and a residual below bf16's least subnormal (a cotangent 2^-125 + 2^-137 against -2^-125): each
-    the wide product's value, the split sent back to it (row 1304's review)."""
+def test_a_bf16_adapted_products_factor_gradient_rounds_its_one_fp32_sum():
+    """A bf16 adapted product's rank factor gradient rounds the one fp32 sum of its wide cotangent's products
+    to bf16: rows of one, `b` [[1, 1]], cotangents [1, 2^-8] and [2^-24, 2^-36], scale 1 sum to
+    1 + 2^-8 + 2^-24 + 2^-36, whose fp32 rounding lies above bf16's tie at 1 + 2^-8, so 1 + 2^-7, where
+    terms of it summed apart round to the tie and down to 1 (row 1304's review)."""
     from dew.nn.kernels import low_rank
 
     bf16 = jnp.bfloat16
-    if case == "scale near fp32's largest":
-        x, b, dy = jnp.full((1, 1), 0.25, bf16), jnp.ones((1, 1), bf16), jnp.ones((1, 1), bf16)
-        scale, a_dtype = float(jnp.finfo(jnp.float32).max), bf16
-        want = np.float64(np.float32(scale)) / 4
-    elif case == "high term's product past fp32's largest":
-        x, b, dy = jnp.full((1, 1), 2.0 ** 64, bf16), jnp.ones((1, 1), bf16), jnp.ones((1, 1), bf16)
-        scale, a_dtype = (1 - 2.0 ** -9) * 2.0 ** 64, jnp.float32
-        want = (1 - 2.0 ** -9) * 2.0 ** 128
-    else:
-        x, b = jnp.full((2, 1), 2.0 ** 20, bf16), jnp.ones((1, 2), bf16)
-        dy = jnp.asarray([[1.0, 2.0 ** -12], [-1.0, 0.0]], bf16)
-        scale, a_dtype = 2.0 ** -125, bf16
-        want = 2.0 ** -117
-    w = jnp.zeros((1, b.shape[1]), bf16)
-    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, scale, out_dtype=bf16),
-                      jnp.zeros((1, 1), a_dtype))
+    x, w, b = jnp.ones((2, 1), bf16), jnp.zeros((1, 2), bf16), jnp.ones((1, 2), bf16)
+    dy = jnp.asarray([[1.0, 2.0 ** -8], [2.0 ** -24, 2.0 ** -36]], bf16)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 1.0, out_dtype=bf16,
+                                                  precision=jax.lax.Precision.HIGHEST),
+                      jnp.zeros((1, 1), bf16))
     (d_a,) = pull(dy)
-    assert float(np.asarray(d_a, np.float64)[0, 0]) == float(np.asarray(want, a_dtype)), (case, d_a)
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == 1.0 + 2.0 ** -7
 
 
-def test_a_grouped_bf16_adapted_products_factor_gradient_rounds_its_terms_once():
-    """A grouped bf16 adapted product's rank factor gradient sums its split cotangent's three blocks in fp32
-    and rounds once to bf16, as the dense one does: rows of one, `b` [[1, 2^-8]], cotangents [1, 2^-8] and
+def test_a_grouped_bf16_adapted_products_factor_gradient_rounds_its_one_fp32_sum():
+    """A grouped bf16 adapted product's rank factor gradient sums its wide cotangent's products in fp32 and
+    rounds once to bf16, as the dense one does: rows of one, `b` [[1, 2^-8]], cotangents [1, 2^-8] and
     [2^-8, 0], scale 1 give 1 + 2^-7, where rounding each block first gives 1 (row 1304's review)."""
     from dew.nn.kernels import low_rank
 
