@@ -595,7 +595,12 @@ def test_a_dense_layer_serves_a_packed_ternary_kernel_as_its_ternary_product(use
     rng = np.random.default_rng(1464)
     codes = rng.integers(-127, 128, size=(16, 256)).astype(np.float32)
     codes[:, 0] = 127
-    x = jnp.asarray((codes * 2.0 ** -7).reshape(2, 8, 256), jnp.bfloat16)
+    values = codes * 2.0 ** -7
+    # One entry off the int8 grid (2^-9 beside a peak of 127 * 2^-7): its code is zero, which an
+    # unquantized product would not read.
+    values[0, 1] = 2.0 ** -9
+    codes[0, 1] = 0
+    x = jnp.asarray(values.reshape(2, 8, 256), jnp.bfloat16)
     weights = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32), scale=0.5)
     bias = jnp.asarray(rng.standard_normal((64,)) * 4, jnp.float32).astype(jnp.bfloat16).astype(jnp.float32)
     layer = Dense(64, dtype=jnp.bfloat16, use_bias=use_bias)

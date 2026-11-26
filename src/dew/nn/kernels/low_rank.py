@@ -149,12 +149,13 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
     # adapter apart's), else fp32 operands at a precision keeping them.
     kept = _kept(precision)
 
-    def factor(left, right, dtype, at, operand):
+    def factor(left, right, dtype, at, operand, *, summed=None):
         if group_sizes is None:
             return jnp.dot(left.T.astype(dtype), right.astype(dtype), precision=at,
                            preferred_element_type=wide)
-        return gemm_t(left.astype(dtype), right.astype(dtype), group_sizes, out_dtype=formed_in(operand),
-                      precision=at, interpret_on_cpu=interpret_on_cpu)
+        return gemm_t(left.astype(dtype), right.astype(dtype), group_sizes,
+                      out_dtype=formed_in(operand) if summed is None else summed, precision=at,
+                      interpret_on_cpu=interpret_on_cpu)
 
     if wants_a:
         if jnp.dtype(work) == jnp.dtype(jnp.bfloat16) and jnp.dtype(lhs.dtype) == jnp.dtype(jnp.bfloat16):
@@ -163,11 +164,16 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
             # product of three times the rank's columns, every product exact and each block's fp32 sum
             # added: the fp32 operands' product the narrow arithmetic computes in one pass of the rows
             # (row 1304's review: `scaled` rounded once lost a cancellation the fp32 sum keeps).
-            terms = _bf16_terms(scaled)
-            blocks = factor(lhs, jnp.concatenate(terms, axis=-1), work, precision, a)
+            # Each block's sum fp32 until they are combined; a split's term or product past fp32's range
+            # (a scaled cotangent near its largest) is the wide product's to form, its result finite
+            # wherever that product's is.
+            blocks = factor(lhs, jnp.concatenate(_bf16_terms(scaled), axis=-1), work, precision, a,
+                            summed=wide)
             width = scaled.shape[-1]
             parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
-            d_a = parts[0] + parts[1] + parts[2]
+            split = parts[0] + parts[1] + parts[2]
+            finite = jnp.all(jnp.abs(split) < jnp.inf)
+            d_a = jax.lax.cond(finite, lambda: split, lambda: factor(lhs, scaled, wide, kept, a))
         else:
             d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:

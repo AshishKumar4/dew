@@ -1676,3 +1676,50 @@ def test_a_bf16_adapted_products_factor_gradient_keeps_a_cancellation_of_its_wid
                       jnp.ones((1, 1), bf16))
     (d_a,) = pull(dy)
     assert float(np.asarray(d_a, np.float64)[0, 0]) == -2.0 ** -15 - 2.0 ** -22
+
+
+
+@pytest.mark.parametrize(("x_value", "a_dtype"), [(0.25, jnp.bfloat16), (2.0 ** 64, jnp.float32)],
+                         ids=["scale near fp32's largest", "high term's product past fp32's largest"])
+def test_a_bf16_adapted_products_factor_gradient_stays_finite_where_the_wide_product_is(x_value, a_dtype):
+    """A bf16 adapted product's rank factor gradient at fp32's range edges: a scale near fp32's largest
+    (`scaled` rounding to bf16's infinity) and a cotangent whose bf16 high term's product with the rows
+    passes fp32's largest though the whole product does not; each the wide product's finite value, the
+    three-term split's overflow sent back to it (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    if a_dtype == jnp.bfloat16:
+        scale, through = float(jnp.finfo(jnp.float32).max), 1.0
+    else:
+        scale, through = 1.0, (1 - 2.0 ** -9) * 2.0 ** 64
+    x = jnp.full((1, 1), x_value, bf16)
+    w = jnp.zeros((1, 1), bf16)
+    b = jnp.ones((1, 1), bf16)
+    dy = jnp.full((1, 1), through, jnp.float32)
+
+    def adapted(a):
+        return low_rank.low_rank(x, w, a, b, scale, out_dtype=jnp.float32)
+
+    _, pull = jax.vjp(adapted, jnp.zeros((1, 1), a_dtype))
+    (d_a,) = pull(dy)
+    want = np.float64(x_value) * np.float64(scale) * np.float64(np.float32(through))
+    assert np.isfinite(np.asarray(d_a, np.float64)).all()
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == float(np.asarray(want, a_dtype))
+
+
+def test_a_grouped_bf16_adapted_products_factor_gradient_rounds_its_terms_once():
+    """A grouped bf16 adapted product's rank factor gradient sums its split cotangent's three blocks in fp32
+    and rounds once to bf16, as the dense one does: rows of one, `b` [[1, 2^-8]], cotangents [1, 2^-8] and
+    [2^-8, 0], scale 1 give 1 + 2^-7, where rounding each block first gives 1 (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    x, w = jnp.ones((2, 1), bf16), jnp.zeros((1, 1, 2), bf16)
+    b = jnp.asarray([[[1.0, 2.0 ** -8]]], bf16)
+    dy = jnp.asarray([[1.0, 2.0 ** -8], [2.0 ** -8, 0.0]], bf16)
+    sizes = jnp.asarray([2], jnp.int32)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 1.0, sizes, out_dtype=bf16),
+                      jnp.ones((1, 1, 1), bf16))
+    (d_a,) = pull(dy)
+    assert float(np.asarray(d_a, np.float64)[0, 0, 0]) == 1.0 + 2.0 ** -7

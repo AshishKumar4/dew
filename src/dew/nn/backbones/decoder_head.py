@@ -150,13 +150,24 @@ def output_table(decoder: CausalTransformer) -> OutputTable | None:
     """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
     (`head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
     level, or where `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s
-    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's."""
+    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's; or where it serves a
+    packed ternary kernel (`_ternary`)."""
     layers = [*([] if decoder.tie_embeddings else [decoder.lm_head]),
               *([] if decoder.embedding_features is None else [decoder.project_out])]
     if (decoder.head_transform is not None or decoder.continuum is not None
-            or any(set(layer.variables.get("params", {})) != {"kernel"} for layer in layers)):
+            or any(set(layer.variables.get("params", {})) != {"kernel"} or _ternary(layer)
+                   for layer in layers)):
         return None
     return head_table(decoder)
+
+
+def _ternary(layer) -> bool:
+    """Whether `layer` serves a packed BitNet b1.58 kernel (`dense.Dense._packed`, row 1464): its input
+    quantized a token at a time, so no matrix alone is its product, whatever its `params` hold."""
+    from dew.nn.dense import QUANTIZATION
+    from dew.nn.kernels.formats import TernaryWeights
+
+    return isinstance(layer.variables.get(QUANTIZATION, {}).get("kernel"), TernaryWeights)
 
 
 def vocabulary_rows(decoder: CausalTransformer) -> jax.Array:
