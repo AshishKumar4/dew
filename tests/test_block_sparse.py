@@ -435,6 +435,20 @@ def test_nsa_attention_holds_check_1_against_its_branches_written_out():
                     "NSA attention's three branches gated", seeds=SEEDS)
 
 
+def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
+    """A decoder of block-selected attention by InfLLM-V2's selection (`block_sparse_attention`,
+    `selection="infllm"`) over a row shorter than the selection's dense cut (8192 keys) attends densely:
+    its logits are the same model's under causal attention's mixer, its parameters the same, bit for bit
+    (`infllm_attention`'s dense branch is the plain causal call)."""
+    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4, top_k=2),
+                  dtype="float32")
+    dense = tiny(mixer=mixers.build("attention"), dtype="float32")
+    tokens = jax.random.randint(jax.random.key(0), (2, 16), 0, VOCAB)
+    params = dense.init(jax.random.key(1), tokens)
+    np.testing.assert_array_equal(np.asarray(infllm.apply(params, tokens)),
+                                  np.asarray(dense.apply(params, tokens)))
+
+
 def test_a_cached_generation_selects_the_blocks_its_full_forward_selects():
     """A decoder of block-selected attention (`block_sparse_attention`, MoBA's) at blocks of two places, a
     query's own and one earlier: a left-padded batch drawn through the cache, each step selecting over the

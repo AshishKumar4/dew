@@ -373,7 +373,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
     template's indexed form (`selected_attention`): a selection a query head's, over its group's keys. A
     cached call selects over its cache's keys, a document a row."""
 
-    selection: Literal["moba"] = "moba"
+    selection: Literal["moba", "infllm"] = "moba"
     block: int = 512
     top_k: int = 3
 
@@ -399,6 +399,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         if not self.is_initializing() and self.is_mutable_collection(QK):
             raise ValueError(f"{self.name}: QK-Clip's logit maxima are a dense call's, which block-selected "
                              "attention forms none of")
+        if self.selection == "infllm":
+            return checkpoint_name(self._infllm(query, key, value, masking, append), Residual.CONTEXT)
         if append is None:
             documents = masking.documents
             if isinstance(documents, CrossDocuments):
@@ -424,6 +426,19 @@ class BlockSparseSelfAttention(CausalSelfAttention):
             wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
 
 
+    def _infllm(self, query, key, value, masking, append):
+        """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
+        selected blocks of `block`, `top_k` of them, past it), a row one document of every token real: a
+        packed row's documents, a row's hidden tokens or a cache's slots its selection would read across."""
+        if append is not None or masking.documents is not None or masking.valid is not None:
+            raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's real tokens, "
+                             "its own: no cache, packed documents or hidden token")
+        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k, dtype=self.ctx.dtype,
+                                precision=self.ctx.precision,
+                                force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
+                                wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockSparseAttentionMixer(AttentionMixer):
     """Block-selected attention (`BlockSparseSelfAttention`): each query reads its own block and the earlier
@@ -432,7 +447,7 @@ class BlockSparseAttentionMixer(AttentionMixer):
     own queries and keys, no parameter of its own, and a cached call's its cache's keys again, so it keeps no
     state beside them."""
 
-    selection: Literal["moba"] = "moba"
+    selection: Literal["moba", "infllm"] = "moba"
     block: int = 512
     top_k: int = 3
 
