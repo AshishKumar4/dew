@@ -580,8 +580,7 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
     _logged(matched[1], logged)
     positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | set(logged)
     counted = _named(conditions, "counting_sum")
-    exact = _named(conditions, "exact_scale")
-    exact |= _named(conditions, "dyadic_scale")
+    exact = _named(conditions, "dyadic_scale")
     integers = _named(conditions, "int8_values")
     drawn = sorted(operand for operand in admitted.arrays if operand not in units)
 
