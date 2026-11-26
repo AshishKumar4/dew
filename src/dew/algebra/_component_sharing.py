@@ -9,7 +9,6 @@ from collections.abc import Collection
 
 from dew.algebra import printed
 
-
 _MIN_SHARED = 6
 """Smaller fragments would add a call and arguments for little source reduction."""
 
@@ -35,7 +34,7 @@ class _Fragment(ast.NodeTransformer):
             return ast.Name(id=self.bound[node.id], ctx=node.ctx)
         return self._input(node.id)
 
-    def visit_keyword(self, node: ast.keyword) -> ast.keyword:
+    def visit_keyword(self, node: ast.keyword) -> ast.AST:
         if node.arg in ("shape", "broadcast_dimensions") and _extent(node.value, self.bound):
             return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
         return self.generic_visit(node)
@@ -168,11 +167,12 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
         while (name := f"_shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
-        helper = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
-        helper += [line for statement in first.statements for line in statement.printed()]
+        fragment_lines = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
+        fragment_lines += [line for statement in first.statements for line in statement.printed()]
         if kept:
-            helper += printed.wrapped("    return (", [f"v{i}" for i in kept], ",)" if len(kept) == 1 else ")")
-        forms[name] = "\n".join(helper)
+            tail = ",)" if len(kept) == 1 else ")"
+            fragment_lines += printed.wrapped("    return (", [f"v{i}" for i in kept], tail)
+        forms[name] = "\n".join(fragment_lines)
         for found, reads in zip(copies, suffixes, strict=True):
             nodes = bodies[found.name].statements
             begin, end = nodes[found.first].lineno - 1, nodes[found.first + width - 1].end_lineno
@@ -180,6 +180,7 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
                                 for index in kept)
             if len(kept) == 1:
                 outputs += ","
-            call = printed.wrapped(f"    {outputs + ' = ' if outputs else ''}{name}(", list(found.arguments), ")")
+            assigned = f"{outputs} = " if outputs else ""
+            call = printed.wrapped(f"    {assigned}{name}(", list(found.arguments), ")")
             lines = forms[found.name].splitlines()
             forms[found.name] = "\n".join([*lines[:begin], *call, *lines[end:]])
