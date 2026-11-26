@@ -503,6 +503,50 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                     token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
+QWEN3_NEXT = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+              "head_dim": 16, "intermediate_size": 96, "vocab_size": 256, "max_position_embeddings": 64,
+              "tie_word_embeddings": False, "pad_token_id": 0, "linear_num_key_heads": 2,
+              "linear_num_value_heads": 4, "linear_key_head_dim": 16, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "layer_types": ["linear_attention", "full_attention"],
+              "mlp_only_layers": [0, 1], "partial_rotary_factor": 0.5}
+"""A dense hybrid Qwen3-Next: a gated delta net beside a full attention layer, each with an RMSNorm pair
+and a gated MLP."""
+
+
+def test_a_tier_3_sources_norms_products_and_delta_rule_run_dews_kernels_as_exact_as_transformers(
+        tokens, tmp_path):
+    """A source taken to tier 3 (`fallback='torchax'`) routes the parts Dew computes by kernels of its own
+    through them (`kernel_parts`, row 13044): its RMSNorms (Dew's fused norm), its gated MLPs' SiLU products
+    (Dew's fused SwiGLU) and its delta net's chunked rule (Dew's chunked recurrence), each identified by its
+    code; its LM loss and every parameter's gradient are as exact as transformers' own over the same
+    weights, measured from transformers in float64 (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    ran = loaded.model.graph.module._model
+    layer = ran.model.layers[0]
+    routed = [layer.input_layernorm, layer.post_attention_layernorm, layer.mlp, layer.linear_attn,
+              ran.model.norm]
+    assert all("forward" in vars(module) for module in routed)
+    dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
+                                                for name, leaf in loaded.variables["params"].items()})
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
+                    token_draws(tokens), "tier 3 Qwen3-Next LM step", seeds=UNREGISTERED_SEEDS,
+                    truth_fn=truth_fn)
+
+
 QUALIFIED_SEEDS = 64
 """The qualified source's check-1 seeds."""
 

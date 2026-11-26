@@ -473,6 +473,20 @@ def test_representation_health_is_the_float64_statistics():
     assert all(float(collapsed[name].mean()[0]) < 1e-6 for name in ("repr_std", "repr_cov_offdiag"))
 
 
+def test_representation_health_counts_no_row_filling_a_batch():
+    """A batch's collapse measures over its real rows (`Objective.real_rows`), a repeat filling it marked
+    out (`VALID_ROWS`), are, bit for bit, those of its real rows alone, whatever the filler holds (a NaN
+    too), where the filler's rows moved both (the 2026-11-26 audit)."""
+    (z,) = redundant_embeddings(0)
+    filled = np.concatenate([z[:24], np.full((8, z.shape[1]), np.nan, np.float32)])
+    real = jnp.arange(32) < 24
+    marked = representation_health(jnp.asarray(filled), real)
+    alone = representation_health(jnp.asarray(z[:24]))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        np.testing.assert_array_equal(np.asarray(marked[name].mean()[0]), np.asarray(alone[name].mean()[0]),
+                                      err_msg=name)
+
+
 # --- EMA target encoder ----------------------------------------------------
 
 def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):
