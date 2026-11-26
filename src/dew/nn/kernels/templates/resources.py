@@ -18,6 +18,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import copies
+from dew.nn.kernels.templates.axes import whole
 
 if TYPE_CHECKING:
     from jax._src.pallas.core import MemoryRef
@@ -156,7 +157,7 @@ column it allocated to a 32-bit word there), unaligned as a barrier is."""
 
 def allocated(*sizes: int) -> int:
     """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
-    return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
+    return sum(whole(size, SMEM_ALIGNMENT) for size in sizes)
 
 
 def _register_words(tiles) -> float:
@@ -567,7 +568,7 @@ def vector_registers(layout, length: int, dtype) -> int:
     layout, packed `dtype` entries sharing a register."""
     tiled = layout.to_mgpu()
     tile = tiled.tiling.tiles[0][0]
-    entries = math.prod(tiled.registers_shape((-(-length // tile) * tile,))) * tiled.vector_length
+    entries = math.prod(tiled.registers_shape((whole(length, tile),))) * tiled.vector_length
     return -(-entries * jax.dtypes.itemsize_bits(dtype) // 32)
 
 

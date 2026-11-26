@@ -250,7 +250,7 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
             built[0].validate(steps=STEPS)
         steps = built[0]
         start = initial(int(seed))
-        state = steps.staged(wide(start) if exact else jax.tree.map(jnp.copy, start))
+        state = steps._as_step(wide(start) if exact else jax.tree.map(jnp.copy, start))
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
             built.append(steps.compile(state, batch))
@@ -366,7 +366,7 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     ids = jnp.asarray(token_rows(VOCAB, 2, SEQ, seed=3457)["text"])
     # Both in the step's form, the stored state staged again (`Trainer.staged`): one program, bit for bit.
     np.testing.assert_array_equal(np.asarray(model.apply(dict(trained.variables), ids)),
-                                  np.asarray(model.apply(dict(run.staged(stored).variables), ids)))
+                                  np.asarray(model.apply(dict(run._as_step(stored).variables), ids)))
     generated = [run.objective.pipeline(held)([[1, 2]], 4, key=0).host() for held in (trained, stored)]
     np.testing.assert_array_equal(np.asarray(generated[0].tokens), np.asarray(generated[1].tokens))
     assert int(trainer(model, optimizer, STAGED, 8).fit(stream(), steps=STEPS + 1, log_every=1,
@@ -825,7 +825,7 @@ def test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own():
     with stacked(scanned=False):
         looped = trainer(plain.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=plain.variables)
         looped.validate(steps=1)
-        received = looped.staged(moved)
+        received = looped._as_step(moved)
     assert "stages" not in received.variables["params"]
     for name, leaves in on_host(run.stored(moved).variables["params"]).items():
         np.testing.assert_array_equal(np.asarray(jax.tree.leaves(leaves)[0]),
@@ -850,7 +850,7 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
     with stacked(scanned=False):
         looped = trainer(decoder(**kinds), optimizer, MeshSpec(fsdp=2), 8)
         looped.validate(steps=1)
-        received = looped.staged(moved)
+        received = looped._as_step(moved)
     for mine, theirs in zip(jax.tree.leaves(on_host((received.variables, received.opt_state))),
                             jax.tree.leaves(on_host(((stored := scanned.stored(moved)).variables,
                                                      stored.opt_state))), strict=True):

@@ -27,6 +27,7 @@ from dew.nn.kernels.templates import (
     rings,
     tail as tail_of,
 )
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.gemm import derivation
 from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     APPROX_MATH,
@@ -209,9 +210,9 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
 
     family = family_of(tiles, x.dtype)
     m_unit, n_unit, k_unit = tile_rows(tiles, family), tile_columns(tiles, family), tiles.block_k
-    m_pad = -(-m // m_unit) * m_unit
-    v_pad = -(-v // n_unit) * n_unit
-    k_pad = -(-k // k_unit) * k_unit
+    m_pad = whole(m, m_unit)
+    v_pad = whole(v, n_unit)
+    k_pad = whole(k, k_unit)
     if m_pad != m or k_pad != k:
         x = jnp.pad(x, ((0, m_pad - m), (0, k_pad - k)))
     if v_pad != v or k_pad != k:
@@ -349,9 +350,9 @@ def derive_linear_ce(shape: tuple[int, int, int], dtype, target, *, transpose_rh
         row_unit = family0.role_rows * min(family0.consumers, CONSUMERS) * family0.cluster
         col_unit = family0.column_unit(dtype) * (family0.cluster if family0.pairs_product else 1)
         step_unit = family0.depths(dtype)[-1]
-        aligned_m = -(-m // row_unit) * row_unit
-        aligned_v = -(-v // col_unit) * col_unit
-        aligned_k = -(-k // step_unit) * step_unit
+        aligned_m = whole(m, row_unit)
+        aligned_v = whole(v, col_unit)
+        aligned_k = whole(k, step_unit)
 
         def candidate(tile: Tiles) -> bool:
             if refused is not None and refused(tile):

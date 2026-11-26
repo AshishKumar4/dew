@@ -23,7 +23,7 @@ from collections.abc import Callable
 
 from jax import numpy as jnp
 
-from dew.nn.kernels.templates import mosaic, resources, stores, swizzling
+from dew.nn.kernels.templates import axes, mosaic, resources, stores, swizzling
 from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS, Tiles
 
@@ -109,7 +109,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         """The tile `consumers` take at `programs` a multiprocessor, and whether it is the balanced one
         staged busy: at the widest width its registers hold, its rows at their balance."""
         role = math.lcm(family.role_rows * consumers, units[0])
-        most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        most_rows = max(role, rows // 2 // role * role if grouped else axes.whole(rows, role))
         padded = grouped and not dense
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
                                    multiprocessors=multiprocessors, grouped=padded)
@@ -195,8 +195,8 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
     if seconds is None:
         return None
     row_tile, columns = pricing.tile_rows(tile, family), pricing.tile_columns(tile, family)
-    row_work = (rows + row_tile / 2) if padded else (-(-rows // row_tile) * row_tile)
-    col_pad = (-(-width // columns) * columns) / max(width, 1)
+    row_work = (rows + row_tile / 2) if padded else (axes.whole(rows, row_tile))
+    col_pad = (axes.whole(width, columns)) / max(width, 1)
     return (seconds * row_work * col_pad / (tile.block_m * columns * tile.block_k),
             1.0 / tile.block_m + 1.0 / columns)
 

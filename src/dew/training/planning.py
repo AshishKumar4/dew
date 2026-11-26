@@ -178,6 +178,10 @@ class Candidate:
     """The bytes the state it was lowered from held on each of this process's devices as it was lowered
     (`resident_on`), read off the placed arrays before their shapes stood for them (`prepared`): the
     arguments its step reuses where they lie, which its compile's limit gives back (`FitSearch.limited`)."""
+    arguments: Mapping[Hashable, int] = dataclasses.field(default_factory=dict)
+    """The bytes its step's arguments take of each of this process's devices as XLA counts them (its
+    prepared state's trees and its batch, placed), which a search before the state is placed reads its
+    compile's limit by (`FitSearch.limited`)."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -1222,7 +1226,14 @@ class FitSearch[LossT, EffectsT]:
         As given where a device states no limit or is no GPU."""
         devices = local_devices(self.mesh)
         # The fit check's own held and built bytes (`fitting`): the state's unplaced bytes count in both.
-        limit = (compile_limit(devices, candidate.held, candidate.built, candidate.resident)
+        # Before the state is placed its admission reads every argument in use already but those the state
+        # places and the step builds (`fitting`): the frozen arrays its build keeps as they are, and the
+        # batch, which an unplaced state's shapes hold none of (row 12882: the limit gave back nothing of
+        # them, 4.1 GiB short where 4 GiB of frozen arrays a device were kept).
+        resident = candidate.resident if self.unplaced is None else {
+            device: max(candidate.arguments.get(device, 0) - candidate.built - self.unplaced, 0)
+            for device in devices}
+        limit = (compile_limit(devices, candidate.held, candidate.built, resident)
                  if all(device.platform == "gpu" for device in devices) else None)
         return options if limit is None else {**(options or {}), LIMIT_EXIT: limit}
 

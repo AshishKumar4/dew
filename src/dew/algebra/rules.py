@@ -454,9 +454,6 @@ bounded form where the total is at least one: under a total below one `exp(x - m
 normal range where the folded exponent does not (at `x - m = -95` and `t = exp(-10)` the fold gives 1.2e-37
 and the quotient a flushed zero), which a declaration of such totals measures at dev time (§1.5) and
 refuses."""
-_POSITIVE = Drawn(((64, 1024), ()), scale=lambda rng, shape, drawn: (
-    rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape) if shape
-    else np.exp(rng.standard_normal(shape))))
 _ROW_SCALED = Drawn(((64, 1024), (64,), (64, 1024)))
 
 
@@ -720,11 +717,9 @@ def _reuse() -> tuple[RuleFamily, ...]:
 
 
 def _linear() -> tuple[RuleFamily, ...]:
-    """Distributivity over operands of one shape, a positive scalar's scale out of a maximum or minimum
-    (the same element wins, with its original rounding), and two matrix products sharing an operand as
-    one product with the others summed. A scalar stays on its original side of a contraction: a power
-    of two can flush an operand or product even when the final written result is normal (row 13162).
-    A value a
+    """Distributivity over operands of one shape, and two matrix products sharing an operand as one
+    product with the others summed. A scalar stays on its original side of a contraction: a power of two
+    can flush an operand or product even when the final written result is normal (row 13162). A value a
     broadcast lays along every axis but a sum's taken out of the sum where the other factor has the product's
     shape (the broadcast's extent along the axis the product's or 1, as an elementwise product broadcasts a
     unit axis), and a matrix product of an operand scaled along its kept axis (a dequant's row or column
@@ -777,35 +772,7 @@ def _linear() -> tuple[RuleFamily, ...]:
         union(t).with_(a.binary("mul", sum_of, multiplied)), *made(sum_of, power + length),
         *made(a.binary("mul", sum_of, multiplied), scaled)),),
         (lambda x, s: jnp.sum(s[:, None] * x, -1), lambda x, s: s * jnp.sum(x, -1), _SCALED)))
-    return (*families, *_extrema(), *_scale_lifts())
-
-
-def _extrema() -> tuple[RuleFamily, ...]:
-    """A positive scalar's scale out of a maximum and a minimum (`_linear`'s)."""
-    x, a, t = vars_("x a t", Term)
-    axes = var("axes", Vec[i64])
-    laid, multiplied, summed = vars_("laid multiplied summed", i64)
-    scalar = Vec[i64].empty()
-    families = []
-    # A positive scale out of a maximum or a minimum: the scaled elements' order is the elements', so the
-    # reduced element is one, its one rounding of `c x` the result's; a scale broadcast to the operand's
-    # shape (a scalar's) leaves the reduced value's as a scalar's.
-    for reduced, extremum, named in (("max", jnp.max, "maximum"), ("min", jnp.min, "minimum")):
-        out_of = []
-        for scaled in (lambda c: x.binary("mul", c, multiplied), lambda c: c.binary("mul", x, multiplied)):
-            out_of += [
-                rule(eq(t).to(scaled(a).reduce(reduced, axes, summed)), positive_scale(a), plain(multiplied),
-                     eq(shape(a)).to(scalar)).then(
-                    union(t).with_(x.reduce(reduced, axes, summed).binary("mul", a, multiplied))),
-                rule(eq(t).to(scaled(a.shaped("broadcast_in_dim", laid)).reduce(reduced, axes, summed)),
-                     positive_scale(a), plain(multiplied), eq(shape(a)).to(scalar),
-                     eq(shape(x)).to(shape(a.shaped("broadcast_in_dim", laid)))).then(
-                    union(t).with_(x.reduce(reduced, axes, summed).binary("mul", a, multiplied))),
-            ]
-        families.append(RuleFamily(f"a positive scale out of a {named}", tuple(out_of), (
-            lambda x, c, extremum=extremum: extremum(x * c, -1),
-            lambda x, c, extremum=extremum: extremum(x, -1) * c, _POSITIVE)))
-    return tuple(families)
+    return (*families, *_scale_lifts())
 
 
 def _scale_lifts() -> tuple[RuleFamily, ...]:
@@ -1030,11 +997,9 @@ register(Rules.declared("linear", "reorders", _linear(),
 register(Rules.declared("reuse", "reorders", _reuse(),
                         "docs/design/algebra.md §1.4; the reuse probe of 2026-11-05 (benchmark_step and the "
                         "parallelism matrix: 42 to 452 of 423 to 794 divisions a suite share a divisor), "
-                        "each reciprocal guarded by its divisor's floor and bound (row 9035). Dev time "
-                        "until its receipt is measured (row 9777): of the nine perf-gate steps compiled "
-                        "ahead for an H100, it changes finetune-4b's program alone (the survey of "
-                        "2026-11-20, every set against it left out, A/A digests equal), whose timing with "
-                        "and without it is M-DC-14's",
+                        "each reciprocal guarded by its divisor's floor and bound (row 9035). Dev-only "
+                        "pending the default-route SimpleDiT-B native receipt (row 9777; M-AL-2). "
+                        "Compile-only optimized HLO changes, but do not establish accuracy or speed",
                         dev=True))
 register(Rules.declared("joined", "reorders", _joined(),
                         "docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it "
@@ -1077,28 +1042,11 @@ def heads(primitive: str, operands: Sequence[str | None]) -> bool:
 
 
 def reorderable(region: terms.Region) -> bool:
-    """Whether a reordering rule may fire in `region`: each makes its new intermediate, and the value it
-    gives, of operands the program states a number bound of (`dominated`, `made`: a sum's terms, a product's
-    moved factor), so it needs a bounded term other than a literal. A literal's scale an extremum reduces
-    moves out of it making no new magnitude (`positive_scale`), so a value scaled by a literal under a
-    maximum or a minimum admits it too. A program's own math over its unbounded values (most
-    of a training step's: a gemma3n step's 2879 regions each fired commutativity alone) admits none, and is
-    left as traced. It reads the region's records alone, so a window's structure (`terms.Skeleton`) decides it
-    before its terms are built."""
+    """A reordering needs a bounded nonliteral term. Each new intermediate and the replacement value
+    must be dominated by an operand with a proved magnitude bound. The region's skeleton suffices to
+    decide whether to try reordering before building its terms."""
     literals = region.literal_keys
-    if any(bound is not None and named not in literals for named, bound in region.magnitudes.items()):
-        return True
-    by_literal: set = set()
-    for term, _ in region.shapes:
-        found = terms.binary_of(term)
-        if found is None or found[0] != "mul":
-            continue
-        _, left, right = found
-        if left in literals or right in literals:
-            by_literal.add(terms.key(term))
-    extrema = (terms.reduce_of(term) for term, _ in region.shapes)
-    return any(found is not None and found[0] in ("max", "min") and found[1] in by_literal
-               for found in extrema)
+    return any(bound is not None and named not in literals for named, bound in region.magnitudes.items())
 
 
 @contextlib.contextmanager

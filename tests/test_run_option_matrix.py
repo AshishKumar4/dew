@@ -418,5 +418,5 @@ def test_a_kinds_run_spreads_its_split_axis_by_the_link_it_states(kind, tmp_path
     run = trained(kind, tmp_path, "linked", **{"trainer.steps": 1, "trainer.checkpoint_every": 1,
                                                 "diagnostics.links": stated})
     with Checkpoints(str(run)) as checkpoints:
-        figures = checkpoints.rung(checkpoints.latest)["links"]
+        figures = checkpoints._rung(checkpoints.latest)["links"]
     assert list(figures.values()) == [4.5e11]

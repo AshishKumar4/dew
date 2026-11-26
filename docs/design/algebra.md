@@ -29,15 +29,14 @@ traces each surrogate's written bodies, not its pilot's generated functions.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate` | stable forms and flat component pilots | search and sample stable forms; check components as written (§1.5) | checked-in modules with a shared accuracy and regeneration suite |
-| Dev time (planned) | the same generator, as a declaration changes | template reduction and scan declarations, and the two bodies of a declared surrogate | dev-time rules with the family's independent accuracy and performance gates | checked-in Python and its Check 1, Check 2 and regeneration coverage (§6.11) |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
-- **Dev time** generates stable forms and checked component pilots registered with `declare`. The
-  generator writes `*_derived.py` beside the declaring module. `tests/test_algebra_generate.py` checks
-  each function against independent truth and regenerates on the recorded platform. The recurrence score
-  tile and rounded-operand bodies do not replace production forms. Forward and backward template tiles,
-  online step and combine, and surrogate cutover remain measured work (rows 3272, 6109).
+- **Dev time** searches and checks stable numeric forms. It emits flat template and surrogate component
+  pilots as written, without searching them for alternatives. Both write checked-in `*_derived.py`
+  alongside their declarations. Production cutover (rows 3272, 6109) remains open: representative
+  live launches need Check 1 and Check 2, and matched native step time, peak memory, and first-start
+  trace/lower cost against current trace-time derivation. Until then the production default stays.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -152,26 +151,27 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     Hoist a laid factor out of a sum, distribute, or factor a shared operand out of two products.
     A scalar power of two crossing a contraction needs a proof that the reordered intermediates
     neither flush nor overflow (row 13162); that move is not admitted today. A row or column scale
-    can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
-    comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
-    attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
+    can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). An extremum
+    stays over its written rounded products: scaling can collapse distinct values into a tie and
+    change how its cotangent is shared.
     The direct transposed byte product distinguishes the RHS kept axis. It lifts a positive dyadic
     scale only over exact byte casts and full float32 accumulation with at most 256 contracted entries
     (row 13172): every integer partial sum fits, and the shift stays normal for each nonzero term.
     The enclosing proof follows literal scales through broadcasts and selection. Arbitrary scales,
     unproven modes and explicit/manual placements do not take this transposed rewrite.
   - **identities** (compile time and dev time): commutativity, two float32 negations, and a proved
-    float16 or bfloat16 round trip through float32 inside an existing window. The casts must preserve the
-    original abstract value and carry no explicit or manual placement. The narrow value must be known to
-    contain only zeros or normal magnitudes (including infinities), without assuming finite program
+    float16 or bfloat16 round trip through float32. A matched cast pair can start its own window.
+    Both casts must preserve the original abstract value and carry no explicit or manual placement.
+    The narrow value must be known to contain only zeros or normal magnitudes (including infinities),
+    without assuming finite program
     inputs. CPU casts independently quiet float16 signaling NaNs and erase bfloat16 NaN payloads;
     a combined XLA round trip can hide this by deleting both casts. Narrow subnormals remain as
     written until preservation is known for every lowering; a bfloat16 subnormal is subnormal in float32
     too. A reciprocal square root's form and a magnitude's magnitude remain XLA's simplifier's.
   - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
-    dev-only until a changed default-route executable has a native receipt (row 9777). M-DC-14's
-    compile-only survey forcing XLA attention found a changed 4B step; the subsequent default-route
-    survey fired no match and did not time it. An equal term is one e-class and extraction prices a shared
+    dev-only until a changed default-route executable has a native receipt (row 9777; M-AL-2). The
+    compile-only default-route SimpleDiT-B comparison changes the optimized HLO; it is not a timing
+    or native accuracy receipt. An equal term is one e-class and extraction prices a shared
     one once, so a value written twice is read once without a rule. The rules relate a new value to another
     the program holds or hoist a division past a broadcast or square root: a quotient by a value whose
     reciprocal the program holds, `a / y` as `a (1/y)`, also for a held `integer_pow(y, -1)` and
@@ -694,8 +694,7 @@ accurate forms): no infinity where the reference is finite. A reordering is admi
 bound under the program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
 its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
-admits nothing (but a positive scale out of a maximum or a minimum, which makes no new intermediate a bound
-would have to hold): the reference's value may sit far below any bound over it while the new intermediate
+admits nothing: the reference's value may sit far below any bound over it while the new intermediate
 overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. The value a rule gives is
 held too, as it rounds what it factors before the product: float32's `a x + a y` at `a = (2**24 - 4) 2**104`,
 `x = 1`, `y = 3 2**-24` rounds to the largest, where `a (x + y)` rounds `x + y` to `1 + 2**-22` and overflows,
@@ -798,6 +797,10 @@ def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]: ...  # e
 def cheapest(graph, root, model, *, exact=False, checked=False): ...  # extract.py: greedy-dag, each shared node once
 def extracted(graph, root, model): ...          # the exact extractor (a MILP), the oracle under `checked`
 ```
+
+Cached forms share a target's pricing facts (`cost.pricing_key`), excluding only the allocator's memory
+capacity. Bandwidth, on-chip limits, and every other hardware fact remain part of the price key. The
+actual capacity still governs which compiler and training plans fit; it is not changed while tracing.
 
 - A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
   with each shared e-class counted once, and a span is the largest any chosen node states (`extract.Level`'s
@@ -1368,11 +1371,13 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
 (`ComponentForm`, rows 6109 and 6110). The generated components cover the online-softmax step and pairwise
-split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents and its
-key-first weight consumer, recurrence scores, compensated prefix differences, and the chunk carry and
-reverse carry with already-gated keys and queries. The recurrence cases include padded tokens and a top
-binade memory carried into the normal range. Attention's forward cases include an entirely masked tile,
-empty slices, and a large shared maximum with separate masses. The same writer checks rounded-operand
+split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents, its
+key-first weight consumer and value-gradient tile, recurrence scores, compensated prefix differences,
+chunk carries and reverse carries with gated keys and queries, the strict-lower solver's shared doubling
+stage, weighted value application, and whole-tile inverse adjoint. Recurrence cases include padded tokens
+and top-binade values; the checked stages compose a complete solve and a strict-lower pullback.
+Attention's forward cases include a wholly masked tile, empty slices, and a large shared maximum
+with separate masses. The same writer checks rounded-operand
 forward and tangent bodies and holds every generated case against its own reference.
 Production still uses the trace-time derivations and original surrogates (row 3272).
 
@@ -1556,6 +1561,13 @@ chunks and reduces the signed products before dividing and landing. This preserv
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
 directions. A finite observation at zero weight retains its one-sided weight derivative.
+For a finite row with a nonzero stored subnormal weight, weighted moments keep the mass and its
+weighted products unlanded in the same ratios used for their derivatives. Other rows keep their
+ordinary path. The float-mass monoid requires zero or normal weights. A generic declaration may
+substitute the protected weighted law only after proving that domain, not as a bitwise rewrite or
+canonical recognition. A selection can prove every weight zero or normal even when its zero arm
+prevents any strict positive bound.
+
 Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
 or missing observations. Its covariance term centers and differentiates only pairs that are present.
 

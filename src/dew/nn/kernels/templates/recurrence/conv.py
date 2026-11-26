@@ -24,6 +24,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
 from dew.nn.kernels.templates import cost, mosaic, outputs, scan
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.precision import compensated_add, compensated_sum, logistic_and_slope, logistic_value
 
 TOKENS = 64
@@ -418,7 +419,7 @@ def _backward_walk(piece: _Piece, dy_ref, outs, *, activation: bool, tokens: int
     # The walk's tokens a whole number of turns (`backward_unrolled`): those past the block's last K-1 add
     # only to tokens no program here owns.
     unrolled = backward_unrolled(piece.lanes, count, family)
-    steps = -(-(tokens + count - 1) // unrolled) * unrolled
+    steps = whole(tokens + count - 1, unrolled)
     last = piece.start + steps - 1
 
     def gradient(t, window, dy):

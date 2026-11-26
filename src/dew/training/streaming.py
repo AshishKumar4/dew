@@ -285,7 +285,7 @@ def resumed_layout(trainer, step: int | None) -> Layout | None:
     checkpoints = trainer.checkpoints
     if checkpoints is None or step is None:
         return None
-    rung = checkpoints.rung(step)
+    rung = checkpoints._rung(step)
     host = () if rung is None else listed(record(rung, "rung").get("host", []), "rung host", read=text,
                                           what="the layout's host fields")
     return dataclasses.replace(trainer._given_layout, host=host)

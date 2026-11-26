@@ -66,8 +66,11 @@ def _priced(target: generation.GpuTarget) -> generation.GpuTarget:
     (`generation.TARGETS`) at `target`'s size (its multiprocessors and shared memory), as a launch's identity
     reads it (`report._identity`), so the config a priced choice takes on one part is the one every part of
     its generation and size takes (row 8372: a GH200's own prices took 64-key tiles where the H100's took 128
-    and named its kernels apart). Pricing alone: a launch's other schedule decisions that read a part's live
-    facts (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ."""
+    and named its kernels apart). A build of a stated part (`training.ahead.BuildTarget.device_kind`) prices
+    as one of its generation still: a run of a canonical build reads the part it runs on, and a part's own
+    facts priced there named a GH200's kernels apart from the H100 build it ran (row 13252, reopened).
+    Pricing alone: a launch's other schedule decisions that read a part's live facts
+    (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ."""
     canonical = generation.TARGETS.get(target.generation)
     if canonical is None:
         return target

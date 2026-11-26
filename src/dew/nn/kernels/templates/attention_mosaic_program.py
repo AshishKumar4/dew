@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import (
     after_walk,
     attention_algebra as algebra,
     axes,
+    band,
     bundles,
     emission,
     handoffs,
@@ -37,6 +38,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import (
+    TILED,
     WIDEST_POWER,
     Draw,
     Dropout,
@@ -44,6 +46,7 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     PaddedCall,
+    band_origins_of,
     block_map,
     differentiable,
     drops_in_place,
@@ -53,7 +56,6 @@ from dew.nn.kernels.templates.attention import (
     key_tiles,
     kind_of,
     shared_place,
-    whole,
 )
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.hooks import Side
@@ -67,7 +69,7 @@ def few_rows(family: mosaic.Family, rows: int | None) -> bool:
     issuer's rows (`query_rows`)."""
     if rows is None or rows >= family.role_rows:
         return False
-    padded = -(-rows // family.rows) * family.rows
+    padded = axes.whole(rows, family.rows)
     return family.specialized(padded, family.role_rows) != family
 
 
@@ -209,7 +211,7 @@ def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
     """The least query tile a launch of `rows` rows takes on `family`: a role's whole swizzled rows
     (`extents`), or the issuer's rows where the launch's rows are fewer than a role's (`few_rows`)."""
     if few_rows(family, rows):
-        return -(-rows // family.rows) * family.rows
+        return axes.whole(rows, family.rows)
     return extents(family, dtype, rows)[-1]
 
 
@@ -398,7 +400,7 @@ class BackwardTiles:
 def _width(width: int, family: mosaic.Family, dtype) -> int:
     """A head width as a launch stages it: as `padded_call` pads it (`head_width`: a power of two to 256,
     whole groups of 64 columns past it) in whole swizzled rows (`Family.column_unit`)."""
-    return whole(head_width(width), family.column_unit(dtype))
+    return axes.whole(head_width(width), family.column_unit(dtype))
 
 
 def _products(family: mosaic.Family, dtype, *products: resources.Product, narrow: bool = False,
@@ -494,7 +496,7 @@ def dkv_holders(config: BackwardTiles) -> int:
 def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int, int]:
     """A call's queries and keys as a launch at `config` pads them (`padded_call`, `_block`)."""
     block = _block(config)
-    return whole(max(queries, 1), block), whole(max(keys, 1), block)
+    return axes.whole(max(queries, 1), block), axes.whole(max(keys, 1), block)
 
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
@@ -1058,7 +1060,10 @@ def riding(family: mosaic.Family, kinds: Iterable[Kind], along: str) -> tuple[in
     (its `Kind`), where `family` loads its operands so (`streams_operands`)."""
     if not streams_operands(family):
         return ()
-    return tuple(index for index, kind in enumerate(kinds) if along in kind)
+    # A band rides a walk along the keys, its block at the column its program's query tile's origin decides
+    # (`score_views`); along the queries each step's tile has its own origin, read where its step reads it.
+    return tuple(index for index, kind in enumerate(kinds)
+                 if (along == "keys" if kind is Kind.BAND else along in kind))
 
 
 def score_streams(family: mosaic.Family, params: tuple, along: str, held: int, step: int) -> dict:
@@ -1066,19 +1071,32 @@ def score_streams(family: mosaic.Family, params: tuple, along: str, held: int, s
     `Family.streams` takes them: a step's `step` entries along the walk's axis, of a tile the program's
     `held` rows of the axis it holds (its queries, keys first its keys), of a vector one row."""
     kinds = tuple(kind for kind, _ in params)
-    return {score_stream(index): ((held if kinds[index] is Kind.TILE else 1, step), params[index][1])
+    return {score_stream(index): ((held if kinds[index] in TILED else 1, step), params[index][1])
             for index in riding(family, kinds, along)}
 
 
-def score_views(family: mosaic.Family, refs: tuple, kinds: tuple, along: str, row, head, held) -> dict:
+def score_views(family: mosaic.Family, refs: tuple, kinds: tuple, along: str, row, head, held,
+                band: tuple[int, int] | None = None) -> dict:
     """The views the riding parameters' streams load a step's block from (`score_streams`, `rings.viewed`),
     at the shared batch row and head of each (`shared_place`): a tile's `[Qp, Kp]` (keys first `[Kp, Qp]`)
-    at the program's `held` tile and the step's, a vector's `[H, N]` at its head and the step's."""
+    at the program's `held` tile and the step's, a vector's `[H, N]` at its head and the step's; a band's
+    `[Qp, Kb]` at the held tile and the step's keys' block of its band from the tile's origin (`band`: the
+    held tile's rows and a step's keys; its origin's blocks off, clamped within the band: a step past it
+    reads a block it leaves, `_param`'s zeros there)."""
     views = {}
+    paired = band_paired(refs, kinds)
     for index in riding(family, kinds, along):
         ref = refs[index]
         shared_row, shared_head = shared_place(ref.shape, row, head)
-        if kinds[index] is Kind.TILE:
+        if kinds[index] is Kind.BAND:
+            assert band is not None and paired[index] is not None, "a band rides by its origins and steps"
+            (rows, step), origins = band, paired[index]
+            origin_row, _ = shared_place(origins.shape, row, 0)
+            off = lax.div(family.scalar_of(origins.at[origin_row, 0, pl.ds(held * rows, 1)]), step)
+            last = ref.shape[-1] // step - 1
+            views[score_stream(index)] = (ref.at[shared_row, shared_head],
+                                          lambda at, off=off, last=last: (held, jnp.clip(at - off, 0, last)))
+        elif kinds[index] is Kind.TILE:
             views[score_stream(index)] = (ref.at[shared_row, shared_head], lambda step: (held, step))
         else:
             views[score_stream(index)] = (ref.at[shared_row], lambda step, at=shared_head: (at, step))
@@ -1093,21 +1111,23 @@ def held_params(family: mosaic.Family, refs: tuple, kinds: tuple, row, head, fir
     is `along` the queries a KEY's) of its `count` entries from `first`, in the accumulator's row layout;
     None for a parameter along the walk's own axis, which each step reads at its own entries."""
     vector = Kind.QUERY if along == "keys" else Kind.KEY
+    origins = set(band_origins_of(kinds).values())
 
-    def held(ref, kind):
+    def held(ref, kind, index):
         if kind is Kind.HEAD:
             return ref[head]
-        if kind is not vector:
+        if kind is not vector or index in origins:
+            # A band's origins its tiles read as a scalar (`_band_param`), no vector of them.
             return None
         shared_row, shared_head = shared_place(ref.shape, row, head)
         places = {"batch": shared_row, "heads": shared_head, kind[-1]: pl.ds(first, count)}
         return family.rows_of(ref.at[axes.placed(kind, places)])
 
-    return tuple(held(ref, kind) for ref, kind in zip(refs, kinds, strict=True))
+    return tuple(held(ref, kind, index) for index, (ref, kind) in enumerate(zip(refs, kinds, strict=True)))
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
-           keys_first: bool = False, held=None, slot=None, at: tuple = (0, 0)):
+           keys_first: bool = False, held=None, slot=None, at: tuple = (0, 0), origins=None):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
     an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
@@ -1120,8 +1140,14 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     walk's `held` value of it (`held_params`), where it holds one, is the tile's, its vector broadcast along
     the tile's rows; a step's `slot` of it where it rides the walk's stream (`score_streams`), the tile's
     share of the slot from `at` (its rows' first and its columns'), a vector's along the tile's columns, the
-    stream's axis."""
+    stream's axis. A band's (`Kind.BAND`) the tile at the keys' column of its query tile's band from their
+    origin (`origins`, its QUERY side after it, a scalar a query tile: one origin a `band.BAND_GROUP`),
+    zeros where the tile lies past the band (`band.band_column`), its keys-first copy `[B, H, Kb, Qp]`'s
+    where its rows are its keys."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
+    if kind is Kind.BAND:
+        return _band_param(family, ref, origins, row, head, first, k_first, queries, keys,
+                           keys_first=keys_first, slot=slot, at=at)
     if held is not None:
         return held if kind is Kind.HEAD else algebra.expand(held, like)
     if slot is not None:
@@ -1144,6 +1170,47 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     along_rows = (kind is Kind.QUERY) != keys_first
     return (algebra.expand(family.rows_of(block), like) if along_rows
             else algebra.across(family.columns_of(block), like))
+
+
+def _band_param(family: mosaic.Family, ref, origins, row, head, first, k_first, queries: int, keys: int, *,
+                keys_first: bool, slot=None, at: tuple = (0, 0)):
+    """A band side's tile (`_param`'s): its query tile's origin read as a scalar, the tile at the keys'
+    column within the band, from the walk's stream where it rides it (`slot`, `score_views`' block at the
+    column, the tile's share from `at`) or from the band itself, zeros past it."""
+    origin_row, _ = shared_place(origins.shape, row, 0)
+    origin = family.scalar_of(origins.at[origin_row, 0, pl.ds(first, 1)])
+    row, head = shared_place(ref.shape, row, head)
+    column, inside = band.band_column(origin, k_first, keys, ref.shape[-2 if keys_first else -1])
+    if slot is not None:
+        tile = family.tile_of(slot.at[pl.ds(at[0], queries), pl.ds(at[1], keys)])
+        return mosaic.selected(inside, tile, jnp.zeros(tile.shape, tile.dtype))
+    places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "band": pl.ds(column, keys)}
+    laid = Kind.BAND[:2] + Kind.BAND[2:][::-1] if keys_first else Kind.BAND
+    tile = family.tile_of(ref.at[axes.placed(laid, places)])
+    # Zeros past the band, selected (a splat predicate's, `mosaic.selected`), not scaled: a clamped column's
+    # -inf bias times zero is NaN.
+    return mosaic.selected(inside, tile, jnp.zeros(tile.shape, tile.dtype))
+
+
+def band_paired(refs: tuple, kinds: tuple[Kind, ...]) -> tuple:
+    """Each score side's origins where it is a band's (its QUERY side after it, `band_origins_of`), else
+    None: what `_param` reads a band by."""
+    pairs = band_origins_of(kinds)
+    return tuple(refs[pairs[index]] if index in pairs else None for index in range(len(kinds)))
+
+
+ORIGINS_READ = 0
+"""What a band's origins side gives its hook (`Kind.BAND`'s, `template.Banded`, which takes and leaves it):
+none of its values, its tiles reading them as a scalar a query tile (`_band_param`)."""
+
+
+def params_read(refs: tuple, kinds: tuple[Kind, ...], read: Callable) -> tuple:
+    """Each score side's tile, `read(index, ref, kind, origins)`'s (a `_param` of it), a band's read by its
+    origins (`band_paired`), and its origins' side `ORIGINS_READ`, which its hook leaves."""
+    origins = band_paired(refs, kinds)
+    skipped = set(band_origins_of(kinds).values())
+    return tuple(jnp.int32(ORIGINS_READ) if index in skipped else read(index, ref, kind, origins[index])
+                 for index, (ref, kind) in enumerate(zip(refs, kinds, strict=True)))
 
 
 class _Spans(NamedTuple):

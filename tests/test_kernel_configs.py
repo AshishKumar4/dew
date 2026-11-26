@@ -2217,11 +2217,11 @@ def test_a_programs_lowering_over_a_hosts_own_gpus_derives_for_its_kind_and_admi
     with lowering_for("sm90", devices=own):
         assert gpu_target() == built_target("sm90", device_kind=own[0].device_kind)
         assert not assumption().portable and report._certifying_device() == own[0]
-        refused = attention_kernels._unlowered("cudnn")
+        refused = attention_kernels.unlowered("cudnn")
         assert refused is None or "compiled for any" not in refused
     with lowering_for("sm90"):
         assert gpu_target() == built_target("sm90") and assumption().portable
-        assert "compiled for any" in attention_kernels._unlowered("cudnn")
+        assert "compiled for any" in attention_kernels.unlowered("cudnn")
 
 
 def test_a_build_pinned_to_a_kind_loads_on_no_list_mixing_kinds_in_either_order():

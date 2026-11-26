@@ -14,6 +14,7 @@ import numpy as np
 from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
+from jax.typing import DTypeLike
 
 from dew.nn import programs
 
@@ -51,6 +52,8 @@ class Apart(NamedTuple):
     unit_norm: bool = False
     dyadic_scale: bool = False
     """A float32 positive power of two from 2**-100 through 2**100, at every element."""
+    nonzero_floor: int | None = None
+    """A magnitude floor only for nonzero elements; unlike `floor` it does not exclude zero."""
 
     @property
     def above(self) -> int | None:
@@ -162,10 +165,14 @@ def _held_apart(apart: Apart, dtype) -> Apart:
     unit = apart.unit_norm and jnp.dtype(dtype).itemsize >= 2
     floor = (apart.floor if apart.floor is not None and int(floats.minexp) <= apart.floor < int(floats.maxexp)
              else None)
+    nonzero = apart.nonzero_floor
+    if nonzero is not None and not int(floats.minexp) <= nonzero < int(floats.maxexp):
+        nonzero = None
     dyadic = apart.dyadic_scale and dtype == jnp.float32
-    if floor == apart.floor and unit == apart.unit_norm and dyadic == apart.dyadic_scale:
+    if (floor == apart.floor and unit == apart.unit_norm and dyadic == apart.dyadic_scale
+            and nonzero == apart.nonzero_floor):
         return apart
-    return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic)
+    return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic, nonzero_floor=nonzero)
 
 
 def _constant_apart(value) -> Apart:
@@ -239,6 +246,161 @@ def _shared_sign(operands: Sequence[Apart], bounds: Sequence[Magnitude | None]) 
     if all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True)):
         return -1
     return 0
+
+
+def _keeps_sign(source, out) -> bool:
+    """Whether a value of `source`'s dtype at most 0 stays at most 0 as `out`'s: a conversion that keeps
+    every nonpositive value's sign (a float's to a float, an integer's to a float, a signed integer's to a
+    signed one at least as wide), or any other equation `KEEPING_SIGN` names. A negative value converted to
+    a boolean is true, to an unsigned integer positive, to a narrower signed one wraps (int32's -200 is int8's
+    56), and a float's to an integer may pass its range."""
+    if not all(isinstance(atom.aval, ShapedArray) for atom in (source, out)):
+        return False
+    given, made = np.dtype(source.aval.dtype), np.dtype(out.aval.dtype)
+    if jnp.issubdtype(made, jnp.floating):
+        return jnp.issubdtype(given, jnp.floating) or jnp.issubdtype(given, jnp.signedinteger)
+    return (jnp.issubdtype(given, jnp.signedinteger) and jnp.issubdtype(made, jnp.signedinteger)
+            and made.itemsize >= given.itemsize)
+
+
+def _integer_range(dtype) -> Magnitude:
+    """The power of two bounding every value of the integer `dtype`: a signed one of `bits` bits
+    `2**(bits - 1)`, an unsigned one `2**bits`."""
+    integers = jnp.iinfo(dtype)
+    return integers.bits - (integers.min < 0)
+
+
+def _extremes(name: str, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
+    """`_apart` of a maximum, a minimum or a clamp, XLA's: the minimum of its upper bound and the maximum of
+    its operand and its lower bound (`_extreme`), finite between finite bounds whatever its operand."""
+    if name == "clamp":
+        lower, operand, upper = operands
+        lb, ob, ub = bounds
+        clamped = _extreme(-1, [_extreme(1, [operand, lower], [ob, lb]), upper], [None, ub])
+        # Finite where it is a number between finite bounds, whatever its operand: an infinity clamps to one.
+        return clamped._replace(finite=clamped.number and lower.finite and upper.finite)
+    return _extreme(1 if name == "max" else -1, operands, bounds)
+
+
+def _extreme(side: int, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
+    """`_apart` of a maximum (`side` 1) or a minimum (-1) of `operands`: on the side of an operand on that
+    side (including exact zero `NOTHING`), else of theirs where they share one; at least the largest floor of
+    an operand on that side, else the least of all their floors (it is one of them); a number, and finite,
+    where they all are."""
+    floors = [held.floor for held in operands]
+    known = [floor for floor in floors if floor is not None]
+    if any(_side_matches(h, b, side) for h, b in zip(operands, bounds, strict=True)):
+        sign = side
+    elif all(_side_matches(h, b, 1) for h, b in zip(operands, bounds, strict=True)):
+        sign = 1
+    elif all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True)):
+        sign = -1
+    else:
+        sign = 0
+    beyond = [held.floor for held in operands if held.sign == side and held.floor is not None]
+    least = min(known) if len(known) == len(floors) else None
+    return Apart(max(beyond) if beyond else least, sign, all(held.number for held in operands),
+                 all(held.finite for held in operands))
+
+
+def _transcendental_apart(name: str, first: Apart, bound: Magnitude | None) -> Apart:
+    """`Apart` for elementary unary transcendentals and roots (`_float_apart`)."""
+    if name in ("exp", "exp2"):
+        floor = None
+        if first.finite and bound is not None and bound <= 6:
+            floor = -(math.floor(2 ** bound * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
+        return Apart(floor, 1, first.number, first.finite or (first.number and first.sign < 0))
+    if name == "sqrt":
+        real, above = first.number and first.sign > 0, first.above
+        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
+    if name == "rsqrt":
+        real = first.number and first.sign > 0
+        floor = (-bound) // 2 - 1 if real and first.finite and bound not in (None, NOTHING) else None
+        return Apart(floor, 1 if first.positive else 0, real, first.positive)
+    if name == "logistic":
+        return Apart(None, 1, first.number, first.number)
+    if name in ("log", "log2"):
+        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
+    nonneg = _side_matches(first, bound, 1)
+    return Apart(None, 1 if nonneg else 0, first.number and nonneg, first.finite and nonneg)
+
+
+def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
+                 dtype: DTypeLike) -> Apart:
+    """A square's or an integer power's `Apart`, of `dtype`, before its dtype holds it (`_float_apart`)."""
+    power = 2 if equation.primitive is jax.lax.square_p else equation.params["y"]
+    if power == 0:
+        # JAX lowers a zeroth power to ones.
+        return Apart(0, 1, number=True, finite=True)
+    # An even power is at least 0 (a zero's reciprocal squared is positive infinity); an odd one keeps its
+    # operand's sign, a negative odd one only of an operand that is no zero.
+    sign = 1 if power % 2 == 0 else operand.sign if power > 0 or operand.floor is not None else 0
+    if power >= 1:
+        return Apart(None if operand.floor is None else power * operand.floor, sign, operand.number,
+                     operand.finite)
+    # A negative power is the reciprocal of the positive one, which must be a float for its reciprocal to
+    # be above zero; of a number it is a number (an infinity of a zero), finite of one held away from zero.
+    floor, reach = None, int(jnp.finfo(dtype).maxexp)
+    if operand.finite and bound is not None and bound != NOTHING and -power * bound < reach:
+        floor = power * bound
+    return Apart(floor, sign, operand.number, operand.number and operand.floor is not None)
+
+
+def _apart_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
+                 apart: list[Apart], dtype: DTypeLike) -> Magnitude | None:
+    """`_real_bound`'s bound of an equation of a float `dtype` whose result shrinks with an operand or needs
+    one away from zero, each operand's magnitude read only where it is proven finite (`Apart.finite`: an
+    infinite dividend's quotient is infinite whatever bounds it, and a value that overflowed in a narrower
+    dtype reads small in a wider one) and each held where the equation needs it, None otherwise; a divisor, a
+    reciprocal root's operand and a negative power's base are read by their floor alone, which an infinite one
+    holds too, its result a zero:
+    - a quotient `x / y` of a finite `|x| <= 2**a` and `|y| >= 2**l`: at most `2**(a - l)`, a power the
+      rounded quotient is at most (a division by a reciprocal's product rounds under it as well);
+    - `sqrt` of a finite `0 <= x <= 2**a`: at most `2**ceil(a / 2)`; `rsqrt` of `x >= 2**l`: at most
+      `2**-(l // 2)`, and a power more for a native reciprocal root's rounding;
+    - `log`, `log2` of a finite `2**l <= x <= 2**a`: at most `max(|l|, |a|)` in magnitude (a natural
+      logarithm's is smaller), and a power more for the native function's rounding;
+    - a power `x**y` of a finite `2**l <= x <= 2**a` and a finite `|y| <= 2**b <= 64`: `2**(y log2 x)`, at
+      most `2**(2**b max(|l|, |a|))`, and a power more;
+    - an integer power of `y <= -1` of `|x| >= 2**l`: at most `2**(y l)`, where `2**(-y l)` is a float (the
+      reciprocal of a power that underflows to zero is infinite)."""
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return None
+    upper, held = operands[0], apart[0]
+    above = held.above
+    if name == "div":
+        floor = apart[1].floor
+        if upper is None or not held.finite or floor is None:
+            return None
+        return upper if upper == NOTHING else upper - floor
+    if name == "sqrt":
+        if upper is None or not held.finite or held.sign <= 0:
+            return None
+        return upper if upper == NOTHING else -((-upper) // 2)
+    if name == "rsqrt":
+        return None if above is None else -(above // 2) + 1
+    if name in ("log", "log2"):
+        if above is None or not held.finite or upper is None or upper == NOTHING:
+            return None
+        return _log2(max(abs(above), abs(upper), 1)) + 1
+    if name == "pow":
+        exponent = operands[1]
+        if above is None or not (held.finite and apart[1].finite) or upper is None or upper == NOTHING:
+            return None
+        if exponent is None or exponent > 6:
+            return None
+        return math.ceil(2.0 ** max(exponent, -64) * max(abs(above), abs(upper))) + 1
+    # An integer power of a negative exponent.
+    power = equation.params["y"]
+    if power == 0:
+        return UNIT
+    if held.floor is None or -power * held.floor < int(jnp.finfo(dtype).minexp):
+        return None
+    return power * held.floor
+
+
+APART_BOUNDED = frozenset({"div", "sqrt", "rsqrt", "log", "log2", "pow"})
+"""The operations whose bound `_apart_bound` states, a negative integer power's beside them."""
 
 
 def _reshape_kept(kept: tuple[int | None, ...], in_shape: tuple[int, ...],

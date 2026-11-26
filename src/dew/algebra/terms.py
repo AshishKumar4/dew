@@ -53,6 +53,7 @@ from jax.extend import core as jcore
 from jax.typing import DTypeLike
 
 from dew.algebra._proofs import (
+    APART_BOUNDED,
     NOTHING,
     NOWHERE,
     UNIT,
@@ -60,22 +61,28 @@ from dew.algebra._proofs import (
     Apart,
     Magnitude,
     Proven,
+    _apart_bound,
     _apart_of,
     _constant_apart,
     _declared,
     _declared_apart,
     _deep_nonlang,
     _deep_refine,
+    _extremes,
     _held_apart,
     _host_array,
+    _integer_range,
+    _keeps_sign,
     _log2,
     _magnitude,
     _NormTrack,
+    _power_apart,
     _reduced,
     _shape,
     _shared_sign,
     _side_matches,
     _SoftmaxTrack,
+    _transcendental_apart,
     _within,
     dtype_lossless_in as dtype_lossless_in,
     typed_key,
@@ -327,16 +334,6 @@ def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
     if (args := get_callable_args(term, Term.reduce)) is None:
         return None
     return text(args[1]), key(args[0])
-
-
-def binary_of(term: Term | Skeleton) -> tuple[str, Hashable, Hashable] | None:
-    """A binary term's operation name and its operands' keys (`key`), None where `term` is no binary: an
-    egglog term's or a skeleton's alike."""
-    if isinstance(term, Skeleton):
-        return (term.form[2], term.form[1], term.form[3]) if term.form[0] == "binary" else None
-    if (args := get_callable_args(term, Term.binary)) is None:
-        return None
-    return text(args[1]), key(args[0]), key(args[2])
 
 
 @dataclasses.dataclass
@@ -1075,11 +1072,14 @@ def _merge_proven(out_var: jcore.Var, bound: Magnitude | None, proved: Apart,
     ext_apart = _held_apart(_declared_apart(ext), out_var.aval.dtype)
     floors = [f for f in (proved.floor, ext_apart.floor) if f is not None]
     floor = max(floors) if floors else None
+    nonzero = proved.nonzero_floor
+    if (other := ext_apart.nonzero_floor) is not None and (nonzero is None or other > nonzero):
+        nonzero = other
     sign = proved.sign if proved.sign != 0 else ext_apart.sign
     merged = _held_apart(Apart(
         floor, sign, proved.number or ext_apart.number,
         proved.finite or ext_apart.finite, proved.unit_norm or ext_apart.unit_norm,
-        proved.dyadic_scale or ext_apart.dyadic_scale,
+        proved.dyadic_scale or ext_apart.dyadic_scale, nonzero,
     ), out_var.aval.dtype)
     bounds = [b for b in (bound if proved.finite else None,
                           ext_bound if ext_apart.finite else None) if b is not None]
@@ -1459,15 +1459,32 @@ def _proven_walk(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | Non
     return held, apart
 
 
+def input_proof(value, dtype) -> tuple[Magnitude | None, Apart]:
+    """An explicitly declared interval, in the dtype at which it enters the walk."""
+    return _declared(value), _held_apart(_declared_apart(value), dtype)
+
+
+def normal_or_zero(dtype, bound: Magnitude | None, apart: Apart) -> bool:
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return True
+    floor = apart.floor if apart.floor is not None else apart.nonzero_floor
+    return apart.finite and (bound == NOTHING or (floor is not None and floor >= jnp.finfo(dtype).minexp))
+
+
+def literal_proof(atom: jcore.Literal) -> tuple[Magnitude | None, Apart]:
+    return _magnitude(atom.val), _constant_apart(atom.val)
+
+
 def proven(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | None = None,
            targets: Sequence[jcore.Var] | None = None,
-           deep: bool = False) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
+           deep: bool = False, given: Mapping[jcore.Var, tuple[Magnitude | None, Apart]] | None = None,
+           ) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
     """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), without building terms or
     interning parameters (`dew.algebra.program._held`), sharing `_propagate_facts` with `_region` so both
     produce identical facts when `deep=False`. With `deep=True` and optional `consts`/`targets`, walks only
     the dependency slice of `targets` without touching tracers or device arrays, peeling called bodies and
     tracking `concatenate`, slicing, NaN guards, and unit-norm denominators."""
-    return _proven_walk(jaxpr, consts=consts, targets=targets, deep=deep)
+    return _proven_walk(jaxpr, consts=consts, targets=targets, deep=deep, init=given)
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)
@@ -1476,28 +1493,6 @@ INTEGRAL = _symbols(lambda operation: operation.integral)
 BITWISE = _symbols(lambda operation: operation.bitwise)
 KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
 """The symbols whose operations' values prove each fact of their operand's (`Operation`)."""
-
-
-def _keeps_sign(source, out) -> bool:
-    """Whether a value of `source`'s dtype at most 0 stays at most 0 as `out`'s: a conversion that keeps
-    every nonpositive value's sign (a float's to a float, an integer's to a float, a signed integer's to a
-    signed one at least as wide), or any other equation `KEEPING_SIGN` names. A negative value converted to
-    a boolean is true, to an unsigned integer positive, to a narrower signed one wraps (int32's -200 is int8's
-    56), and a float's to an integer may pass its range."""
-    if not all(isinstance(atom.aval, ShapedArray) for atom in (source, out)):
-        return False
-    given, made = np.dtype(source.aval.dtype), np.dtype(out.aval.dtype)
-    if jnp.issubdtype(made, jnp.floating):
-        return jnp.issubdtype(given, jnp.floating) or jnp.issubdtype(given, jnp.signedinteger)
-    return (jnp.issubdtype(given, jnp.signedinteger) and jnp.issubdtype(made, jnp.signedinteger)
-            and made.itemsize >= given.itemsize)
-
-
-def _integer_range(dtype) -> Magnitude:
-    """The power of two bounding every value of the integer `dtype`: a signed one of `bits` bits
-    `2**(bits - 1)`, an unsigned one `2**bits`."""
-    integers = jnp.iinfo(dtype)
-    return integers.bits - (integers.min < 0)
 
 
 def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: list[Magnitude | None],
@@ -1568,39 +1563,6 @@ def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: l
     return _held_apart(made, aval.dtype)
 
 
-def _extremes(name: str, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
-    """`_apart` of a maximum, a minimum or a clamp, XLA's: the minimum of its upper bound and the maximum of
-    its operand and its lower bound (`_extreme`), finite between finite bounds whatever its operand."""
-    if name == "clamp":
-        lower, operand, upper = operands
-        lb, ob, ub = bounds
-        clamped = _extreme(-1, [_extreme(1, [operand, lower], [ob, lb]), upper], [None, ub])
-        # Finite where it is a number between finite bounds, whatever its operand: an infinity clamps to one.
-        return clamped._replace(finite=clamped.number and lower.finite and upper.finite)
-    return _extreme(1 if name == "max" else -1, operands, bounds)
-
-
-def _extreme(side: int, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
-    """`_apart` of a maximum (`side` 1) or a minimum (-1) of `operands`: on the side of an operand on that
-    side (including exact zero `NOTHING`), else of theirs where they share one; at least the largest floor of
-    an operand on that side, else the least of all their floors (it is one of them); a number, and finite,
-    where they all are."""
-    floors = [held.floor for held in operands]
-    known = [floor for floor in floors if floor is not None]
-    if any(_side_matches(h, b, side) for h, b in zip(operands, bounds, strict=True)):
-        sign = side
-    elif all(_side_matches(h, b, 1) for h, b in zip(operands, bounds, strict=True)):
-        sign = 1
-    elif all(_side_matches(h, b, -1) for h, b in zip(operands, bounds, strict=True)):
-        sign = -1
-    else:
-        sign = 0
-    beyond = [held.floor for held in operands if held.sign == side and held.floor is not None]
-    least = min(known) if len(known) == len(floors) else None
-    return Apart(max(beyond) if beyond else least, sign, all(held.number for held in operands),
-                 all(held.finite for held in operands))
-
-
 def _float_apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart],
                  bounds: list[Magnitude | None], dtype: DTypeLike) -> Apart:
     """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
@@ -1636,8 +1598,12 @@ def _float_apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart],
     if name == "select_n":
         cases, case_bounds = operands[1:], bounds[1:]
         kept = [held.floor for held in cases if held.floor is not None]
+        nonzero = [held.floor if held.floor is not None else held.nonzero_floor
+                   for held, bound in zip(cases, case_bounds, strict=True) if bound != NOTHING]
+        found = [floor for floor in nonzero if floor is not None]
         return Apart(min(kept) if len(kept) == len(cases) else None, _shared_sign(cases, case_bounds),
-                     all(held.number for held in cases), all(held.finite for held in cases))
+                     all(held.number for held in cases), all(held.finite for held in cases),
+                     nonzero_floor=min(found, default=None) if len(found) == len(nonzero) else None)
     if name == "neg":
         return first._replace(sign=-first.sign)
     if name == "sign":
@@ -1673,106 +1639,6 @@ def _float_apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart],
         return Apart(first.floor if first.sign else None, first.sign, first.number and first.sign != 0,
                      first.finite)
     return NOWHERE
-
-
-def _transcendental_apart(name: str, first: Apart, bound: Magnitude | None) -> Apart:
-    """`Apart` for elementary unary transcendentals and roots (`_float_apart`)."""
-    if name in ("exp", "exp2"):
-        floor = None
-        if first.finite and bound is not None and bound <= 6:
-            floor = -(math.floor(2 ** bound * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
-        return Apart(floor, 1, first.number, first.finite or (first.number and first.sign < 0))
-    if name == "sqrt":
-        real, above = first.number and first.sign > 0, first.above
-        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
-    if name == "rsqrt":
-        real = first.number and first.sign > 0
-        floor = (-bound) // 2 - 1 if real and first.finite and bound not in (None, NOTHING) else None
-        return Apart(floor, 1 if first.positive else 0, real, first.positive)
-    if name == "logistic":
-        return Apart(None, 1, first.number, first.number)
-    if name in ("log", "log2"):
-        return Apart(None, 0, first.number and first.sign > 0, first.positive and first.finite)
-    nonneg = _side_matches(first, bound, 1)
-    return Apart(None, 1 if nonneg else 0, first.number and nonneg, first.finite and nonneg)
-
-
-def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None,
-                 dtype: DTypeLike) -> Apart:
-    """A square's or an integer power's `Apart`, of `dtype`, before its dtype holds it (`_float_apart`)."""
-    power = 2 if equation.primitive is jax.lax.square_p else equation.params["y"]
-    if power == 0:
-        # JAX lowers a zeroth power to ones.
-        return Apart(0, 1, number=True, finite=True)
-    # An even power is at least 0 (a zero's reciprocal squared is positive infinity); an odd one keeps its
-    # operand's sign, a negative odd one only of an operand that is no zero.
-    sign = 1 if power % 2 == 0 else operand.sign if power > 0 or operand.floor is not None else 0
-    if power >= 1:
-        return Apart(None if operand.floor is None else power * operand.floor, sign, operand.number,
-                     operand.finite)
-    # A negative power is the reciprocal of the positive one, which must be a float for its reciprocal to
-    # be above zero; of a number it is a number (an infinity of a zero), finite of one held away from zero.
-    floor, reach = None, int(jnp.finfo(dtype).maxexp)
-    if operand.finite and bound is not None and bound != NOTHING and -power * bound < reach:
-        floor = power * bound
-    return Apart(floor, sign, operand.number, operand.number and operand.floor is not None)
-
-
-def _apart_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
-                 apart: list[Apart], dtype: DTypeLike) -> Magnitude | None:
-    """`_real_bound`'s bound of an equation of a float `dtype` whose result shrinks with an operand or needs
-    one away from zero, each operand's magnitude read only where it is proven finite (`Apart.finite`: an
-    infinite dividend's quotient is infinite whatever bounds it, and a value that overflowed in a narrower
-    dtype reads small in a wider one) and each held where the equation needs it, None otherwise; a divisor, a
-    reciprocal root's operand and a negative power's base are read by their floor alone, which an infinite one
-    holds too, its result a zero:
-    - a quotient `x / y` of a finite `|x| <= 2**a` and `|y| >= 2**l`: at most `2**(a - l)`, a power the
-      rounded quotient is at most (a division by a reciprocal's product rounds under it as well);
-    - `sqrt` of a finite `0 <= x <= 2**a`: at most `2**ceil(a / 2)`; `rsqrt` of `x >= 2**l`: at most
-      `2**-(l // 2)`, and a power more for a native reciprocal root's rounding;
-    - `log`, `log2` of a finite `2**l <= x <= 2**a`: at most `max(|l|, |a|)` in magnitude (a natural
-      logarithm's is smaller), and a power more for the native function's rounding;
-    - a power `x**y` of a finite `2**l <= x <= 2**a` and a finite `|y| <= 2**b <= 64`: `2**(y log2 x)`, at
-      most `2**(2**b max(|l|, |a|))`, and a power more;
-    - an integer power of `y <= -1` of `|x| >= 2**l`: at most `2**(y l)`, where `2**(-y l)` is a float (the
-      reciprocal of a power that underflows to zero is infinite)."""
-    if not jnp.issubdtype(dtype, jnp.floating):
-        return None
-    upper, held = operands[0], apart[0]
-    above = held.above
-    if name == "div":
-        floor = apart[1].floor
-        if upper is None or not held.finite or floor is None:
-            return None
-        return upper if upper == NOTHING else upper - floor
-    if name == "sqrt":
-        if upper is None or not held.finite or held.sign <= 0:
-            return None
-        return upper if upper == NOTHING else -((-upper) // 2)
-    if name == "rsqrt":
-        return None if above is None else -(above // 2) + 1
-    if name in ("log", "log2"):
-        if above is None or not held.finite or upper is None or upper == NOTHING:
-            return None
-        return _log2(max(abs(above), abs(upper), 1)) + 1
-    if name == "pow":
-        exponent = operands[1]
-        if above is None or not (held.finite and apart[1].finite) or upper is None or upper == NOTHING:
-            return None
-        if exponent is None or exponent > 6:
-            return None
-        return math.ceil(2.0 ** max(exponent, -64) * max(abs(above), abs(upper))) + 1
-    # An integer power of a negative exponent.
-    power = equation.params["y"]
-    if power == 0:
-        return UNIT
-    if held.floor is None or -power * held.floor < int(jnp.finfo(dtype).minexp):
-        return None
-    return power * held.floor
-
-
-APART_BOUNDED = frozenset({"div", "sqrt", "rsqrt", "log", "log2", "pow"})
-"""The operations whose bound `_apart_bound` states, a negative integer power's beside them."""
 
 
 def _bounded(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
@@ -1854,6 +1720,11 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         # its operand is.
         lower, _, upper = operands
         return None if lower is None or upper is None else max(lower, upper)
+    if name == "select_n":
+        # The selector chooses an arm but contributes no value to its bound.
+        cases = operands[1:]
+        known = [bound for bound in cases if bound is not None]
+        return max(known) if len(known) == len(cases) else None
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
@@ -1867,8 +1738,6 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         losing = 1 if name == "min" else -1
         within = [given[1 - at] for at in range(len(given)) if len(given) == 2 and apart[at].sign == losing]
         return min([max(given), *within])
-    if name == "select_n":
-        return max(given[1:])
     if name in ("reduce_max", "reduce_min") and _reduced(equation) < 1:
         # A maximum or a minimum of no element is its identity, an infinity.
         return None

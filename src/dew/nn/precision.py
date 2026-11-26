@@ -1329,6 +1329,15 @@ class Numerics:
             return jnp.dtype(self.dtypes.compute if compute is None else compute) == jnp.float16
         return self.loss_scaling == "dynamic"
 
+    def drawn_dtype(self, drawn: Sequence[DTypeLike] = ()) -> str | None:
+        """The dtype the run stores the parameters it draws fresh in (`dew.state.drawn_in`): its
+        `dtypes.params`, or None where each module it trains draws its own in that already (`drawn`, the
+        modules' `param_dtype`s, Flax's float32 where none is stated), which leaves a parameter a module
+        keeps in a dtype of its own as it is."""
+        held = jnp.dtype(self.dtypes.params)
+        drawn_alike = all(jnp.dtype(dtype) == held for dtype in drawn or (jnp.float32,))
+        return None if drawn_alike else self.dtypes.params
+
 
 ACCURATE = Numerics(DTYPE_PRESETS["32-true"], matmul="highest", forms="accurate")
 """Accurate, scientific work at its cost: float32 throughout, every product that states no precision in

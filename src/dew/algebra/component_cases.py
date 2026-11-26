@@ -13,7 +13,11 @@ from dew.nn import precision
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
 from dew.nn.kernels.templates import attention_algebra
-from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents, derived_from_weights
+from dew.nn.kernels.templates.attention_backward_algebra import (
+    derived_cotangents,
+    derived_from_weights,
+    softmax_gradients,
+)
 from dew.nn.kernels.templates.operands import Parts
 
 
@@ -225,6 +229,119 @@ def _chunk_pullback_inputs(seed, operands):
     return grad, keys, weights, queries, out_grad, local, kept
 
 
+def _value_gradient(logits, dout, peak, total):
+    # The written backward's dV depends on no Q, K, V, score products or score cotangent.
+    rows, keys = logits.shape
+    zeros = jnp.zeros((rows,), logits.dtype)
+    q = jnp.zeros((rows, 1), logits.dtype)
+    k = jnp.zeros((keys, 1), logits.dtype)
+    v = jnp.zeros((keys, dout.shape[-1]), dout.dtype)
+    # This component models the device's float32 sum, not the suite's wider CPU-only reference.
+    with precision.configured_precision(precision.FP32_SUMS):
+        return softmax_gradients(logits, q, k, v, dout, peak, total, zeros, zeros, scale=1.0)[2]
+
+
+def _value_gradient_truth(logits, dout, peak, total):
+    used = jnp.isfinite(logits)
+    exponent = jnp.where(used, logits - peak[:, None], -jnp.inf)
+    weights = jnp.exp(exponent) / jnp.where(total > 0, total, 1)[:, None]
+    return weights.T @ dout
+
+
+def _value_gradient_draw(seed, operands):
+    logits, dout, _, _ = _arrays(seed, operands)
+    logits[0, :] = -np.inf
+    logits[1, ::2] = -np.inf
+    if seed % 2:
+        logits[2, :] = np.float32(2.0 ** 30)
+    peak = np.max(logits, axis=1)
+    if seed % 2 == 0:
+        peak[0] = np.finfo(logits.dtype).min
+    safe = np.where(np.isfinite(peak), peak, np.inf)
+    total = np.exp(logits.astype(np.float64) - safe[:, None]).sum(axis=1).astype(logits.dtype)
+    return logits, dout, peak, total
+
+
+def _chunk_level(system, inverse, level):
+    rows, cols = recurrence_algebra.tile_indices(system.shape)
+    return recurrence_algebra.doubled_level(-system, inverse, rows, cols, level, _carry_product)
+
+
+def _chunk_level_truth(system, inverse, level):
+    width = 1 << level
+    groups = jnp.arange(system.shape[0]) // width
+    join = (groups[:, None] % 2 == 1) & (groups[:, None] == groups[None, :] + 1)
+    return inverse + jnp.where(join, inverse @ -system, 0) @ inverse
+
+
+def _chunk_level_draw(seed, operands):
+    size = operands[0].shape[0]
+    system = _chunk_system(seed, size)
+    level = 1 + seed % (size.bit_length() - 2)
+    group = np.arange(size) // (1 << level)
+    identity = np.eye(size, dtype=np.float64)
+    diagonal = np.where(group[:, None] == group[None, :], system, 0)
+    inverse = np.linalg.solve(diagonal + identity, identity).astype(system.dtype)
+    return system, inverse, np.asarray(level, np.int32)
+
+
+def _inverse_pullback(lower, cotangent):
+    def issue(_, left, right):
+        return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION,
+                          preferred_element_type=jnp.float32)
+
+    return recurrence_algebra.key_system_back(cotangent, lower, lower.dtype, issue)
+
+
+def _inverse_pullback_truth(lower, cotangent):
+    inverse = jnp.eye(lower.shape[0], dtype=lower.dtype) + lower
+    return jnp.tril(-(inverse.T @ jnp.tril(cotangent, -1)) @ inverse.T, -1)
+
+
+def _inverse_pullback_draw(seed, operands):
+    values, cotangent = _arrays(seed, operands)
+    lower = np.tril(values / (2 * values.shape[0]), -1)
+    if seed % 2:
+        cotangent[np.triu_indices(values.shape[0], 1)] = np.nan
+        np.fill_diagonal(cotangent, np.inf)
+    else:
+        lower[:2], lower[2:, :2] = 0, 0
+        cotangent[:2], cotangent[2:, :2] = 0, 0
+        cotangent[1, 0] = 2.0 ** 127
+    return lower, cotangent
+
+
+def _chunk_weighted(lower, values, strengths):
+    return recurrence_algebra.weighted("apply_u", lower, values, strengths, _carry_product)
+
+
+def _chunk_weighted_truth(lower, values, strengths):
+    return (jnp.eye(lower.shape[0], dtype=lower.dtype) + lower) @ (values * strengths[:, None])
+
+
+def _chunk_system(seed, size):
+    rng = np.random.default_rng(seed)
+    system = np.tril(rng.standard_normal((size, size)).astype(np.float32) / (2 * size), -1)
+    # Split at a padded token: neither side may read across the block boundary.
+    middle = system.shape[0] // 2
+    system[middle:, :middle] = 0
+    if seed % 2:
+        # Isolate a top-binade edge: the inverse holds it without a product of two huge edges.
+        system[:2], system[2:, :2] = 0, 0
+        system[1, 0] = 2.0 ** 127
+    return system
+
+
+def _chunk_weighted_draw(seed, operands):
+    lower, values, weights = _arrays(seed, operands)
+    lower = np.tril(lower * 0.25, -1)
+    weights = (np.abs(weights) * 0.25).astype(weights.dtype)
+    weights[1] = 0
+    if seed % 2:
+        lower[1, 0], values[0], weights[0] = 2.0 ** 127, 0.125, 0.5
+    return lower, values, weights
+
+
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 ROUNDED = declare(__name__, "rounded", ComponentForm(
@@ -256,3 +373,19 @@ CHUNK_PULLBACK = declare(__name__, "chunk_pullback", ComponentForm(
     _chunk_pullback, _chunk_pullback_truth, dataclasses.replace(
         _cases(*[((k, v), (c, k), (c, k), (c, k), (c, v), (c, v), (k, 1))
                  for c, k, v in ((16, 32, 32), (64, 64, 32))]), draw=_chunk_pullback_inputs)))
+CHUNK_SOLVE_LEVEL = declare(__name__, "chunk_solve_level", ComponentForm(
+    _chunk_level, _chunk_level_truth, Cases(
+        tuple((jax.ShapeDtypeStruct((c, c), jnp.float32), jax.ShapeDtypeStruct((c, c), jnp.float32),
+               jax.ShapeDtypeStruct((), jnp.int32)) for c in (16, 32, 64)),
+        _chunk_level_draw, seeds=8, policies=("default",))))
+CHUNK_WEIGHTED = declare(__name__, "chunk_weighted", ComponentForm(
+    _chunk_weighted, _chunk_weighted_truth,
+    dataclasses.replace(_cases(*[((c, c), (c, v), (c,)) for c, v in ((16, 32), (32, 32), (64, 64))]),
+                        draw=_chunk_weighted_draw)))
+VALUES_GRADIENT = declare(__name__, "values_gradient", ComponentForm(
+    _value_gradient, _value_gradient_truth, dataclasses.replace(
+        _cases(*[((q, k), (q, v), (q,), (q,)) for q, k, v in ((32, 64, 128), (64, 128, 256))]),
+        draw=_value_gradient_draw)))
+CHUNK_INVERSE_PULLBACK = declare(__name__, "chunk_inverse_pullback", ComponentForm(
+    _inverse_pullback, _inverse_pullback_truth,
+    dataclasses.replace(_cases(*[((c, c), (c, c)) for c in (16, 32, 64)]), draw=_inverse_pullback_draw)))

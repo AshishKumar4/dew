@@ -219,9 +219,10 @@ class AttentionCase:
     does the reference path's, so it takes them where a call or a run names it. None where no rule owns
     them."""
     separable_bias: bool = False
-    """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's), which the
-    template reads as its two terms in O(S) and every other route writes out, `[B, H, S, S]`: not a dense
-    bias (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
+    """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's) or a band of
+    keys about each query (`attention.BandBias`, Inkling 2's relative one), which the template reads as its
+    terms or its band, in O(S) or O(S E), and every other route writes out, `[B, H, S, S]`: not a dense bias
+    (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
     query_sinks: bool = False
     """Whether the call's sinks are each query's own (`[B, S, H]`, projected from its input), not a head's
     (`[H]`): the template's initial state (`template.sinks`) and the portable softmax's column read them,
@@ -229,21 +230,23 @@ class AttentionCase:
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
-        """The call's cell among its selector's declared ones: attention's (`DECLARED`) the target's
-        instruction family and the kind of call (`CallKind`), each its forward and its training alike, as
-        the kernel is chosen before the call is differentiated (`attention_route.attend`'s `custom_vjp`); a
-        decode step's (`DECODE_DECLARED`, `decodes`) the device's generation and its kind, as its kernels'
-        speeds part by generation within a family. A call outside the shapes its family's receipts timed
-        for its kind (`MEASURED`) is a cell of its own, which none declares: a receipt is evidence for the
-        shapes it measured alone, and past them the call takes the template (rows 5283, 5285)."""
+        """The call's cell among its selector's declared ones: the device's generation and the kind of call
+        (`CallKind`), attention's (`DECLARED`) its forward and its training alike, as the kernel is chosen
+        before the call is differentiated (`attention_route.attend`'s `custom_vjp`), a decode step's
+        (`DECODE_DECLARED`, `decodes`) its own. A generation's, never its instruction family's: one family's
+        generations part in speed against their references (kernel-templates.md §7; an A100's receipt
+        declared FlashAttention-2 for every mma.sync GPU, a G4's among them, 2026-11-26 audit). A call
+        outside the shapes its generation's receipts timed for its kind (`MEASURED`) is a cell of its own,
+        which none declares: a receipt is evidence for the shapes it measured alone, and past them the call
+        takes the template (rows 5283, 5285)."""
         if decodes(self):
             return device_generation(), CallKind.of(self.dtype, decode=True)
-        family, kind = generation.family(device_generation()), CallKind.of(self.dtype)
-        # A kind no receipt declares in its family (float64's) has no cell to leave.
-        measured = MEASURED.get((family, kind))
+        where, kind = device_generation(), CallKind.of(self.dtype)
+        # A kind no receipt declares on its generation (float64's) has no cell to leave.
+        measured = MEASURED.get((where, kind))
         if measured is not None and not measured.holds(self):
             kind = kind._replace(measured=False)
-        return family, kind
+        return where, kind
 
 
 class CallKind(NamedTuple):
@@ -281,7 +284,7 @@ def _on_gpu(case: AttentionCase) -> bool:
 
 def _flash_installed(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU on a host without the wheel takes the wheel its target
-    # installs: what the host lacks refuses the program it is traced into (`_unlowered`), not the call.
+    # installs: what the host lacks refuses the program it is traced into (`unlowered`), not the call.
     return flash_architectures() is not None or generation.assumption() is not None
 
 
@@ -705,7 +708,8 @@ class Timed:
     `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
     `causal` or full (any of each where None), windowed where `windows`, else no window; and its calls of
     packed documents `documents`: these same calls (True), none (False), or the calls those receipts timed
-    (a `Timed` of their own)."""
+    (a `Timed` of their own); where a receipt timed one call alone, its `rows`, query and key `heads` and
+    `dtypes` exactly (any where None)."""
 
     shortest: int
     longest: int
@@ -714,6 +718,9 @@ class Timed:
     causal: bool | None = None
     windows: bool = True
     documents: "bool | Timed" = True
+    rows: tuple[int, ...] | None = None
+    heads: tuple[tuple[int, int], ...] | None = None
+    dtypes: tuple[str, ...] | None = None
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls: none holds a separable bias
@@ -728,30 +735,44 @@ class Timed:
                 and (self.groups is None or case.heads // case.kv_heads in self.groups)
                 and (self.causal is None or case.causal == self.causal)
                 and (self.windows or case.window is None)
-                and (case.documents is None or self.documents is True))
+                and (case.documents is None or self.documents is True)
+                and (self.rows is None or case.rows in self.rows)
+                and (self.heads is None or (case.heads, case.kv_heads) in self.heads)
+                and (self.dtypes is None or case.dtype.name in self.dtypes))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
-    **{(family, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for family in ('mma.sync', 'wgmma')},
-    **{(family, CallKind.of(jnp.float32)): Timed(0, 1024) for family in ('mma.sync', 'wgmma')},
-    ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(
+    # Interim, until M-NA-44 times them: up to 32768 tokens, cited from M-ET-51, which holds no sums.
+    **{(where, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for where in ('sm80', 'sm90')},
+    **{(where, CallKind.of(jnp.float32)): Timed(0, 1024) for where in ('sm80', 'sm90')},
+    ('sm100', CallKind.of(jnp.bfloat16)): Timed(
         256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
         documents=Timed(12288, 12288, (256,), (4,), causal=True, windows=False)),
+    # Its one call, exactly: its full training no receipt timed (the template's failed to compile there).
+    ('sm120', CallKind.of(jnp.bfloat16)): Timed(4096, 4096, (64,), (4,), causal=True, windows=False,
+                                                documents=False, rows=(1,), heads=((32, 8),),
+                                                dtypes=("bfloat16",)),
 }
-"""The shapes each instruction family's DECLARED receipts hold for a kind of call; a call outside them is a
-cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 256 to 32768 tokens at widths
-64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), causal and unwindowed, cuDNN against
-the template's forward and training step (`DECLARED`); a full or windowed call none timed; 128 tokens waits
-for the grid's other rounds, its margins 1.09 to 1.60 against five-round receipts' spread of up to 1.33. Its
-calls of packed documents those of 12288 tokens, 16/4 at width 256, causal (Qwen3.5-4B's decision row), the
-one shape their receipt timed.
-Elsewhere a 16-bit call's: up to 32768 tokens at widths 64 and 128, causal and full, its forward and
-training step, an interim placeholder no receipt holds (M-ET-51 meant to time FlashAttention against the
-template from 1024 to 32768 tokens on an A100 and a GH200; its GH200 half timed out unmeasured and neither
-half's sums survive, its record's provenance correction of 2026-11-20), until the cost model prices the
-case (row 4123) or Attention measures it again; and at width 256 on an RTX PRO 6000 (a gated Qwen3.5
-step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). An fp32 call's: a training step's attention
-at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100)."""
+"""The shapes each generation's DECLARED receipts timed for a kind of call, exactly; a call outside them is
+a cell none declares (`AttentionCase.cell`), which takes the template. On a B200 a 16-bit call's: from 256
+to 32768 tokens at widths 64, 128 and 256, four query heads a key head (8/2, 16/4 and 32/8 timed), causal and
+unwindowed, cuDNN against the template's forward and training step (`DECLARED`); a full or windowed call
+none timed; 128 tokens waits for the grid's other rounds, its margins 1.09 to 1.60 against five-round
+receipts' spread of up to 1.33. Its calls of packed documents those of 12288 tokens, 16/4 at width 256,
+causal (Qwen3.5-4B's decision row), the one shape their receipt timed.
+On an H100 and an A100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training
+step, an interim placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
+(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100, CELLS-a100), and M-ET-51, which meant to time
+FlashAttention against the template from 1024 to 32768 tokens there, holds no sums (its GH200 half timed
+out, neither half's survive, its record's provenance correction of 2026-11-20); M-NA-44 times that sweep,
+and its receipt replaces this placeholder. An fp32 call's: up to 1024 tokens, a training step's attention
+at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100).
+On an RTX PRO 6000 a bf16 call's: 1 x 4096 at width 64, 32 query heads over 8, causal, its forward and its
+training step, exactly (M-NA-35-prefill-g4: FlashAttention-2 against the template, causal 271.4 against
+311.0 us, the causal step 935.6 against 1501.1; its full forward 420.9 against 537.5, its full training no
+receipt timing, as a kernel is chosen for both before the call is differentiated); a step at
+width 256 measured faster on FlashAttention-2 (G4-ET-ATT-SCOREBOARD, 2.72 against 4.55 ms) states no shape
+of its call and declares none."""
 
 
 FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS, reverse_only=True)
@@ -763,21 +784,40 @@ INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need
     "densely: the template takes it", row=INHERENT), _FITS))
 """The template for a call no derivative is taken of and xla's attention for one differentiated."""
 
+FLASH_INFERENCE = Kernel[AttentionCase]('flash_inference', (*FLASH_SUPPORTS, *TEMPLATE_SUPPORTS))
+"""FlashAttention for a call no derivative is taken of and the template for one differentiated, its forward
+and derivatives the template's: where FlashAttention's forward holds check 1 and its backward does not (an
+A100's, M-NA-44)."""
+
+
+def primal_alone(kernel: str, dtype, width: int, causal: bool) -> tuple[str, str] | None:
+    """The kernels a split kernel runs (`dew.nn.attention.forward_differentiable`'s `primal_alone`): one for
+    a call no derivative is taken of and one for a differentiated call, its forward and derivatives that
+    one's; None for every other kernel. 'inference' infers on the template where it measured faster
+    (`template_infers`) and trains on xla's attention; 'flash_inference' infers on FlashAttention and trains
+    on the template."""
+    if kernel == INFERENCE.name:
+        return ('template' if template_infers(dtype, width, causal) else 'xla'), 'xla'
+    if kernel == FLASH_INFERENCE.name:
+        return 'flash', 'template'
+    return None
+
+
 DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
-    ('wgmma', CallKind.of(jnp.bfloat16)): (
+    ('sm90', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
                  "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
                  "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
-    ('wgmma', CallKind.of(jnp.float32)): (
+    ('sm90', CallKind.of(jnp.float32)): (
         INFERENCE, "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
                      "training step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms "
                      "causal and 2.19 against 46.21 full (CELLS-h100); the template's fp32 forward as bf16 "
                      "parts faster than xla's for a call no derivative is taken of where `template_infers` "
                      "(M-ET-16, W18-gh200-1)"),
-    ('tcgen05', CallKind.of(jnp.bfloat16)): (
+    ('sm100', CallKind.of(jnp.bfloat16)): (
         CUDNN, "cuDNN's fused attention measured faster than the template on a B200 at every shape timed: "
                  "ET-GRID2-b200 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
                  "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
@@ -802,18 +842,27 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "backward's workspace B·H·S²·4 bytes, 9.59 GiB a row's call (temp 38.35 GiB at four rows, "
                  "plain cuDNN's 2.26), the whole 4B step's peak 95.3 GiB against the template's 61.4 at four "
                  "rows (LF-STEP85-b200); rows 4839 and 5368 retire it"),
-    ('mma.sync', CallKind.of(jnp.bfloat16)): (
-        FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
-                 "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
-                 "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
-    ('mma.sync', CallKind.of(jnp.float32)): (
+    ('sm80', CallKind.of(jnp.bfloat16)): (
+        FLASH_INFERENCE,
+        "FlashAttention-2 measured faster than the template on an A100 (CELLS-a100: a training step's "
+        "attention at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
+        "full, CUPTI, 11 interleaved rounds); at that shape its forward holds check 1 and faster (1.15 to "
+        "1.64 times), its backward does not (dK's RMS 1.74 to 1.78 times the reference's error, causal dV's "
+        "1.537, past 1.5; M-NA-44-a100-s4096), so a differentiated call trains on the template, 1.59 to 2.39 "
+        "times FlashAttention's time (row 13288)"),
+    ('sm80', CallKind.of(jnp.float32)): (
         XLA, "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
                "Qwen3-8B's widths (32/8 heads x 128, CUPTI medians, one warm process, W76-a100, M-ET-28): a "
                "training step's attention 5.94 against 226.4 ms at 1 x 1024 causal and 6.00 against 373.0 "
                "full, 102.3 against 3002.7 at 1 x 4096 causal and 101.6 against 5832.6 full; its forward "
                "3.13 against 8.26 ms at 1 x 1024 causal and 48.9 against 110.3 at 1 x 4096"),
+    ('sm120', CallKind.of(jnp.bfloat16)): (
+        FLASH, "FlashAttention-2 measured faster than the template on an RTX PRO 6000 (G4) at 1 x 4096, 32 "
+                 "query heads over 8 of 64, bf16, CUPTI medians (M-NA-35-prefill-g4): its forward 420.9 "
+                 "against 537.5 us full and 271.4 against 311.0 causal, the causal training step 935.6 "
+                 "against 1501.1"),
 }
-"""Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (instruction family, kind of call)
+"""Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (device generation, kind of call)
 (`AttentionCase.cell`): where an old route measured faster than the template, the old route and its receipt.
 A call's kind is its dtype's, 16-bit or fp32: its kernel is chosen before the call is differentiated
 (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one kernel, and the receipts
@@ -879,7 +928,7 @@ def _attention_preferred(case: AttentionCase) -> str:
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
 
 
-def _unlowered(kernel: str) -> str | None:
+def unlowered(kernel: str) -> str | None:
     """Why this host cannot lower the target's `kernel` for a GPU a step is traced for on it, None where it
     lowers it: FlashAttention where its call lowers for no GPU here (`flash_lowered`: its wheel holds no code
     for the target); cuDNN's where this host loads no cuDNN, without which its call traces nothing ("cuDNN
@@ -926,7 +975,8 @@ ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
     INFERENCE,
-), _attention_preferred, _unlowered, DECLARED)
+    FLASH_INFERENCE,
+), _attention_preferred, unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
 splash, xla and the reference path, the first that takes the call. The old routes take only the fast
@@ -935,7 +985,8 @@ decode call keeps its own kernels whatever the form (`DECODE`). The template com
 reference path, which takes every call, so it runs where the preference names it or a call names it; and
 'inference' after it, the template for a call no derivative is taken of and xla's attention for one
 differentiated (`dew.nn.attention.forward_differentiable`'s `primal_alone`), where a cell declares it or
-a dense bias's preference names it."""
+a dense bias's preference names it; 'flash_inference' last, FlashAttention for a call no derivative is
+taken of and the template for one differentiated, where a cell declares it (`primal_alone`)."""
 
 
 
@@ -985,7 +1036,7 @@ DECODE = Op[AttentionCase](Choice.DECODE, (
     DECODE_XLA,
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
     Kernel[AttentionCase]('reference', (), generic=True),
-), _decode_preferred, _unlowered, DECODE_DECLARED)
+), _decode_preferred, unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
 kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the run's declared products

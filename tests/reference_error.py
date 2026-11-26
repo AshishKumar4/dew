@@ -405,26 +405,31 @@ def _platform_branch(equation, platform: str | None):
     return None if chosen is None else programs.branches(equation)[programs.platform_branch(chosen, platform)]
 
 
-def equations(graph, *, platform: str | None = None, skip=None):
+def equations(graph, *, platform: str | None = None, skip=None, prune=None):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn. With `platform`
     (a lowering platform's name: 'cpu', 'cuda', 'tpu'), a platform-dependent cond
     (`jax.lax.platform_dependent`) gives only the branch that platform runs, as lowering keeps it. With
-    `skip`, an equation it holds and every equation within it are passed over."""
+    `skip`, an equation it holds and every equation within it are passed over; with `prune`, an equation it
+    holds is given and the equations within it passed over (a kernel's launch, its outputs the memory the
+    program reads and writes, never its body's)."""
     if hasattr(graph, "eqns"):
         for equation in graph.eqns:
             if skip is not None and skip(equation):
                 continue
             yield equation
+            if prune is not None and prune(equation):
+                continue
             kept = _platform_branch(equation, platform)
-            yield from equations(equation.params if kept is None else kept, platform=platform, skip=skip)
+            yield from equations(equation.params if kept is None else kept, platform=platform, skip=skip,
+                                 prune=prune)
     elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr, platform=platform, skip=skip)
+        yield from equations(graph.jaxpr, platform=platform, skip=skip, prune=prune)
     elif isinstance(graph, dict):
         for value in graph.values():
-            yield from equations(value, platform=platform, skip=skip)
+            yield from equations(value, platform=platform, skip=skip, prune=prune)
     elif isinstance(graph, (tuple, list)):
         for value in graph:
-            yield from equations(value, platform=platform, skip=skip)
+            yield from equations(value, platform=platform, skip=skip, prune=prune)
 
 
 def _ulp(magnitude: np.ndarray, dtype) -> np.ndarray:

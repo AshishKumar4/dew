@@ -461,8 +461,10 @@ LIGHTNING = {"hidden_size": 512, "num_hidden_layers": 2, "head_dim": 128, "num_a
 FLOWS = (
     Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16",
          {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
+    # A user's attention a native kernel's, the cell's own on each GPU: FlashAttention's, or on an A100
+    # 'flash_inference' (its backward the template's, FlashAttention-2's failing check 1 there, row 13288).
     Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16",
-         {"train": {"attention": "flash"}, "decode": {"attention": "flash", "decode": NATIVE}}, lane=False),
+         {"train": {"attention": NATIVE}, "decode": {"attention": NATIVE, "decode": NATIVE}}, lane=False),
     Flow("dense fp32", "llama-tiny", DENSE, "float32", {"train": {}, "decode": {}}),
     Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16",
          {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
@@ -480,7 +482,7 @@ FLOWS = (
     Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16",
          {"train": TEMPLATE, "decode": {}}),
     Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16",
-         {"train": {"attention": "flash"}, "decode": {}}, lane=False),
+         {"train": {"attention": NATIVE}, "decode": {}}, lane=False),
     Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16",
          {"train": {**TEMPLATE, "gated_delta_rule": NATIVE, "short_conv": NATIVE},
           "decode": {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}},

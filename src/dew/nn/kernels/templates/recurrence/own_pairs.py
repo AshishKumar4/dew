@@ -1,15 +1,18 @@
 """Each sub-chunk's own pairs under a decay a key dimension, launches of their own beside the factored walks
 (`intra._sub_chunk_walk`, `key_backward._key_pairs_back`): the forward's bands (`algebra.key_diagonal_bands`)
-and the backward's transpose (`algebra.key_diagonal_pairs_back`), no products on the tensor cores, as
-fla_kda's token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) and its gradient. In the walks, an
-H100's Kimi Linear intra launch took 1982 us against 492 and its pairs' backward 2268 against 672, each at 248
-registers (M-JS-50d, row 5281)."""
+and the backward's transpose (`algebra.key_diagonal_pairs_back`), each pair its own decay on the CUDA cores,
+as fla_kda's token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) and its gradient; where the call's
+layer bounds its decays (`anchored.anchoring`), the forward's one anchored product a key block on the tensor
+cores instead, as fla_kda's safe-gate diagonal, each key block its guard failing its pairs each its own decay
+(`anchored.step`): the forward's own pairs took 213 of 789 us of a GH200's Kimi Linear forward (M-JS-276). In
+the walks, an H100's Kimi Linear intra launch took 1982 us against 492 and its pairs' backward 2268 against
+672, each at 248 registers (M-JS-50d, row 5281)."""
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +26,7 @@ from jax.extend.mlir.dialects import arith, memref, scf
 from dew.algebra import scan as prefix_scan
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, native, product, resources, scan, swizzling
+from dew.nn.kernels.templates.recurrence import anchored
 from dew.nn.kernels.templates.recurrence.intra import (
     _named,
     copied_by_thread,
@@ -42,6 +46,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     fp32_operand,
     held_tile,
     key_block,
+    key_block_holds,
     launch_kernel,
     limb_blocks,
     limb_tiles,
@@ -304,16 +309,17 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     rounded once, and the system's strict blocks `D` inverted, `(I + D)^-1` by forward substitution in fp32
     (fla_kda's chunk_intra.py, its diagonal blocks), in the form the walk's solve merges them in
     (`own_form`): a launch of their own ahead of the intra walk, which places the scores' blocks on its
-    diagonal and merges the inverses into the chunk's (`intra._sub_chunk_walk`), no products on the tensor
-    cores, as fla_kda's token-parallel diagonal is (chunk_kda_fwd_intra_token_parallel). It walks each
+    diagonal and merges the inverses into the chunk's (`intra._sub_chunk_walk`): each pair its own decay, as
+    fla_kda's token-parallel diagonal is (chunk_kda_fwd_intra_token_parallel), or where the call `anchoring`
+    one anchored product a key block (`anchored.step`). It walks each
     chunk's key blocks, the keys, queries and the stored prefix (`intra._prefix`) a block at a time, summing
     each output's blocks and storing them at its last step. In the walk, they held an H100's Kimi Linear
     intra launch at 248 registers, 1982 us against 492 (M-JS-50d). Written on the walk's sums' diagonal
     blocks after it, they kept the chunk's system for a solve of its own, which read it again (103 us of a
     GH200's Kimi Linear forward of 906, M-JS-263's base, against fla's fused inter-solve 142 for both). It
-    issues by the layout whose programs a multiprocessor holds most (`mainloop.widest_layout`): no products,
-    its walk waits on its loads, beside a producer a GH200 held five programs, 20 consumer warps (its plan,
-    row 5260)."""
+    issues by the layout whose programs a multiprocessor holds most (`mainloop.widest_layout`): its walk
+    waits on its loads, beside a producer a GH200 held five programs, 20 consumer warps (its plan, row
+    5260)."""
     # The forms the walk reads them in, on its own bundle (`intra.placed_form`, `intra.inverse_form`).
     forms = {name: own_form(call, name) for name in products}
     call = dataclasses.replace(call, family=widest_layout(call))
@@ -324,8 +330,9 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     scored = "scores" in products
     # The system's rows the reads where the call erases along them (`intra.intra_rows`), its columns the keys.
     reading = reads is not None and "system" in products
-    keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
-                     functools.partial(_own_staged, call, products=products, reads=reading),
+    anchors = anchored.anchoring(call, reading=reading)
+    keys = key_block(call, functools.partial(_own_held, call, outputs=len(products), anchors=anchors),
+                     functools.partial(_own_staged, call, products=products, reads=reading, anchors=anchors),
                      functools.partial(pair_streams, call, queries=scored, reads=reading), contracted=True)
     steps = width // keys
 
@@ -341,6 +348,8 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                                 if scored else {}),
                              **({"reads": call.given.views(reads_ref, row, chunk, keyed, width)}
                                 if reading else {}))
+        # The anchored products' staged operands last where the call takes them (`_own_staged`).
+        scaled, staging = (staging[-1], staging[:-1]) if anchors else ((), staging)
         shifts, *threaded = staging if not by_thread(call) else ((), *staging)
 
         def step(index, slots, bands, accumulators):
@@ -350,40 +359,32 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
 
             limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
-            if not by_thread(call):
+
+            def exact(bands):
+                """The key block's own pairs each its own decay, by thread natively."""
+                if by_thread(call):
+                    _threaded_bands(call, threaded, operand, limbs, beta_ref.at[h, span], products=products,
+                                    reads=reading)
+                    return bands
                 shifted = shifted_keys(call, shifts, operand("keys"), limbs)
                 found = algebra.key_diagonal_bands(
                     [intra_rows(call, name, operand, beta_ref.at[h, span], reads=reading)
                      for name in products], shifted, unit_pairs=call.unit_pairs)
-                bands = tuple(band + more for band, more in zip(bands, found, strict=True))
-            else:
-                _threaded_bands(call, threaded, operand, limbs, beta_ref.at[h, span], products=products,
-                                reads=reading)
+                return tuple(band + more for band, more in zip(bands, found, strict=True))
 
-            return bands, accumulators
+            if not anchors:
+                return exact(bands), accumulators
+            rows = [functools.partial(intra_rows, call, name, operand, beta_ref.at[h, span])
+                    for name in products]
+            at_token = functools.partial(anchored.prefix_at, call, prefix_refs, row, h * width + index * keys,
+                                         keys)
+            summed = None if not by_thread(call) else threaded[-1]
+            return anchored.step(call, rows, operand("keys"), limbs, at_token, scaled, bands, exact,
+                                 summed), accumulators
 
         def read(bands, totals):
-            """Each output's blocks a sub-chunk, compact (`[C, SUB]` at the head's columns), once the walk is
-            done: inside its last step, Kimi Linear's spilled 256 to 472 bytes on an H100 and a B200."""
             del totals
-            for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
-                form = forms[name]
-                views = tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
-                if name == "system":
-                    if threaded:
-                        # Each thread a column of a sub-chunk's block's inverse, from the summed blocks.
-                        _inverses_written(threaded[-1].at[o], views, parts=form.parts)
-                    else:
-                        _inverses_stored(call, bands[o], views, form)
-                    continue
-                if threaded and form.parts == 1:
-                    # A one-part form copied from the summed blocks straight, scaled and rounded as each
-                    # word is copied: no landing.
-                    copied_by_thread((threaded[-1].at[o],), (views[0],), scale=scale)
-                    continue
-                block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
-                masked = algebra.block_masked(block, strict=False, scale=scale)
-                _blocks_written(call, masked, views, form, landing[name])
+            _own_read(call, products, forms, outs, threaded, bands, landing, row=row, head=h, scale=scale)
 
         def prologue():
             if shifts:
@@ -400,17 +401,42 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     blocks = pair_streams(call, keys, queries=scored, reads=reading)
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
     model = len(products) * 3 * chunk * algebra.SUB * width
-    staging, landing = _own_staged(call, keys, products=products, reads=reading)
+    staging, landing = _own_staged(call, keys, products=products, reads=reading, anchors=anchors)
     inputs = (q, k, *((reads,) if reading else ()), *prefix, beta, taken)
     out_type = tuple(forms[name].shape(call.heads * algebra.SUB) for name in products)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
                          live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
-                         held=_own_held(call, keys, len(products)),
+                         held=_own_held(call, keys, len(products), anchors),
                          staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
-                         issues=False,
+                         issues=anchors, reducing=anchors,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
                                    for name, (_, dtype) in blocks.items()})(*inputs)
+
+
+def _own_read(call: Call, products: tuple[str, ...], forms: dict, outs: Sequence, threaded: list, bands,
+              landing: dict, *, row, head, scale: float) -> None:
+    """`intra_own`'s outputs' blocks a sub-chunk, compact (`[C, SUB]` at the head's columns), once its walk
+    is done (inside its last step, Kimi Linear's spilled 256 to 472 bytes on an H100 and a B200): the
+    system's inverted (`_inverses_written` by thread from the summed blocks, `threaded`'s last; else
+    `_inverses_stored` from `bands`), the scores' masked and scaled, a one-part form copied from the summed
+    blocks straight, scaled and rounded as each word is copied (no landing)."""
+    chunk = call.chunk
+    for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
+        form = forms[name]
+        views = tuple(form.views(ref, row, chunk, head * algebra.SUB, algebra.SUB))
+        if name == "system":
+            if threaded:
+                _inverses_written(threaded[-1].at[o], views, parts=form.parts)
+            else:
+                _inverses_stored(call, bands[o], views, form)
+            continue
+        if threaded and form.parts == 1:
+            copied_by_thread((threaded[-1].at[o],), (views[0],), scale=scale)
+            continue
+        block = call.family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
+        masked = algebra.block_masked(block, strict=False, scale=scale)
+        _blocks_written(call, masked, views, form, landing[name])
 
 
 def _blocks_written(call: Call, blocks, views: tuple, form, landing) -> None:
@@ -512,13 +538,15 @@ def own_form(call: Call, name: str) -> Operand:
     return placed_form(call) if name == "scores" else inverse_form(call)
 
 
-def _own_staged(call: Call, keys: int, *, products: tuple[str, ...], reads: bool = False) -> tuple:
+def _own_staged(call: Call, keys: int, *, products: tuple[str, ...], reads: bool = False,
+                anchors: bool = False) -> tuple:
     """`intra_own`'s staging at key block `keys`: its shifted reads' tile (`own_staging`); or where a thread
     forms its own pairs (`by_thread`) the keys and the tokens' own decays (`_own_rows`), the scores' queries,
     the system's write strengths and the outputs' blocks summed (`own_bands`'), plain, the keys and queries in
     the operands' dtype, the rest fp32, and the system's reads where they are its rows (`reads`, staged as
-    the keys); and each output's blocks' landing. The system's rows staged too held an A100's intra_own at
-    two programs a multiprocessor (541 us against 481 at three, M-JS-160-a100)."""
+    the keys); where its pairs are anchored products (`anchors`), last, `anchored.forward_staging`; and each
+    output's blocks' landing. The system's rows staged too held an
+    A100's intra_own at two programs a multiprocessor (541 us against 481 at three, M-JS-160-a100)."""
     outputs, chunk, given = len(products), call.chunk, call.given.dtype
     if not by_thread(call):
         staging = own_staging(call, keys)
@@ -535,6 +563,8 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...], reads: bool
     # written a thread's column at a time (`_inverses_written`), or interpreted from registers.
     landed = [name for name in products
               if name == "scores" and (not by_thread(call) or own_form(call, name).parts > 1)]
+    if anchors:
+        staging = (*staging, anchored.forward_staging(call, keys, outputs))
     return staging, {name: own_form(call, name).landing(chunk, algebra.SUB) for name in landed}
 
 
@@ -566,7 +596,7 @@ def _threaded(threaded: list, products: tuple[str, ...], *, reads: bool = False)
     return queries, betas, read, next(found)
 
 
-def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
+def _own_held(call: Call, block: int, outputs: int = 1, anchors: bool = False) -> Held:
     """`intra_own`'s consumer thread at key block `block` forming `outputs` outputs' bands, carried across
     the key blocks: as its staged reads are formed (`shifted_keys`), the separated prefix, its rows shifted,
     the tokens' own decays and the keys; at an offset the rows, the keys and decays read from their staged
@@ -574,8 +604,10 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     (ptxas's least spill-free cap at Kimi Linear's training on sm100, sm90 and sm80 104, 96 and 104 where each
     offset read the separated prefix and held the row's, jsf-own-smem2; shifted in registers, each offset's
     sources held across them, 184 on an H100, jsf-ownneed); at the last step one output's bands masked and
-    the lanes' index."""
+    the lanes' index. Where its pairs are anchored products (`anchors`), `anchored.forward_held`'s phases
+    beside the exact ones."""
     chunk = call.chunk
+    scaled = anchored.forward_held(chunk, block, outputs) if anchors else ()
     if by_thread(call):
         # The bands summed in shared memory (`own_bands`): the keys' and decays' forming, then an
         # output's rows formed (its operand, its write strengths and the rows), then a thread's loop over its
@@ -585,11 +617,12 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
         state = run
         words = run * (2 + outputs)
         return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3,
-                            [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2))
+                            [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2,
+                            *scaled))
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
         [f32(chunk, block)] * 6,
         [f32(chunk, block)] * (outputs + 6),
-        [f32(chunk, algebra.SUB)] * 2))
+        [f32(chunk, algebra.SUB)] * 2, *scaled))
 
 
 def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, prefix_refs: tuple, *, reads_ref=None) -> dict:
@@ -651,8 +684,10 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                   call: Call, *, scale: float, clamp=None, reads=None, read_grads: tuple = ()):
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])`: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
-    gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
-    cores, as the forward's (`intra_own`), each key block's offsets reading the pairs' gradients' own
+    gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, as the forward's
+    (`intra_own`; where the call `anchoring`, one anchored product a key block, `anchored.back`, of the
+    squares' own blocks, `d_scores` and `d_system` read there too), each key block's offsets reading the
+    pairs' gradients' own
     bands (`algebra.own_bands`, taken once from the squares, laid an offset a row `[HV * SUB, R]`: each
     offset's strip a row read as a row's vector) and the keys and the tokens' own decays shifted
     (`shifted_keys`). In `_key_pairs_back`'s walk, they held an H100's Kimi Linear launch at 248
@@ -682,12 +717,11 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     # products, so a product's depth steps it (`key_block`'s `contracted`), as the forward's.
     # The finished queries' and keys' form, one binding the block's fit and the launch read.
     summed = finished_form(call, once=call.group == 1)
-    keys = key_block(call, functools.partial(_key_own_held, call, reads=reading),
-                     functools.partial(_key_own_staged, call, summed=summed),
-                     functools.partial(_keypair_streams, call, reads=reading), contracted=True)
+    anchors, keys = _key_own_plan(call, summed, reading=reading)
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+        columns, refs, scaled, staging = anchored.back_refs(refs, staging, anchors, outputs=4 + reading)
         reads_ref, prefix_refs, (beta_ref, ds_ref, da_ref, ending_ref), clamp_ref, adds, outs, db_ref = (
             _own_back_refs(refs, len(prefix), clamped=clamped, reading=reading))
         shifts, *suffix = staging
@@ -703,27 +737,29 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
         def step(index, slots, d_betas, accumulators):
             slots.acquire_all()
             betas = family.rows_of(beta_ref.at[h, span])
-            query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
-            key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
-            limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
             strip = functools.partial(_strip, call, slots)
 
-            # The scores' own pair (offset zero) summed apart (`pairs_back_stored`'s `diagonal`): its strip
-            # scaled to zero there, a scalar's product (a select against a scalar lowers no broadcast).
-            def scores(e):
-                return strip("scores", scale, e) * (e != 0).astype(jnp.float32)
-
-            strips = [scores, functools.partial(strip, "system", 1.0)]
-            zero = jnp.zeros(key.shape, jnp.float32)
             def rows(name):
                 return stream_tile(slots, name, given).value().astype(jnp.float32)
 
-            (d_query, d_keyed), d_key = algebra.key_diagonal_pairs_back(
-                strips,
-                [functools.partial(rows, "queries"),
-                 lambda: algebra.write_gated(rows("reads" if reading else "keys"), betas)],
-                shifted_keys(call, shifts, key, limbs), functools.partial(shifted_up, call),
-                (zero, zero), zero, sheared=reading)
+            def limbs():
+                return tuple(tile.value() for tile in limb_tiles(call, slots))
+
+            # The queries, keys and prefix read from their slots where each part takes them, none held
+            # across the own pairs (held, an anchored backward's branch past ptxas's 255 registers).
+            read_key = functools.partial(rows, "keys")
+            exact = _exact_back(call, strip, rows, shifts, (read_key, limbs, betas), scale=scale,
+                                reading=reading)
+            if anchors:
+                at_token = functools.partial(anchored.prefix_at, call, prefix_refs, row,
+                                             h * width + index * keys, keys)
+                (d_query, d_keyed), d_key = anchored.back(
+                    call, columns, (row, h * algebra.SUB), scale,
+                    (functools.partial(rows, "queries"), lambda: algebra.write_gated(read_key(), betas),
+                     read_key), limbs, at_token, scaled, exact)
+            else:
+                (d_query, d_keyed), d_key = exact()
+            query, key = rows("queries"), read_key()
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
             d_betas = d_betas + _own_finished(
@@ -742,7 +778,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                            prologue=lambda: own_zeroed(call, shifts))
 
     tiles = _keypair_streams(call, keys, reads=reading)
-    staging, landing = _key_own_staged(call, keys, summed=summed)
+    staging, landing = _key_own_staged(call, keys, summed=summed, anchors=anchors)
     fp32_rows, summed_rows = square.shape(call.heads * width), summed.shape(call.heads * width)
     betas = jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32)
     out_type = (summed_rows, summed_rows, *((summed_rows,) if reading else ()), fp32_rows, betas)
@@ -753,12 +789,58 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2),
                          live=chunk_liveness(len(inputs) - 1), steps=steps, model=terms,
-                         held=_key_own_held(call, keys, reads=reading), staging=staging, landing=landing,
-                         name="recurrence_key_pairs_own", issues=False,
+                         held=_key_own_held(call, keys, reads=reading, anchors=anchors), staging=staging,
+                         landing=landing, name="recurrence_key_pairs_own", issues=anchors, reducing=anchors,
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
                                    for p in range(fp32_operand(call).parts)})(
-        *inputs, *factored, *memory, *decays, ending, *(() if clamp is None else (clamp,)), *read_grads)
+        *inputs, *factored, *memory, *decays, ending, *(() if clamp is None else (clamp,)), *read_grads,
+        *(anchored.back_inputs(d_scores, d_system, chunk=chunk) if anchors else ()))
+
+
+def _key_own_plan(call: Call, summed: Operand, *, reading: bool) -> tuple[bool, int]:
+    """`key_pairs_own`'s `(anchors, keys)`: its own pairs anchored products (`anchored.back`) where the call
+    takes them (`anchored.back_anchoring`) and a block of them holds a program, else each pair its own
+    decay (an RTX PRO 6000's 95 KB beside the anchored operands' 18 KB held none); and its key block,
+    anchored the widest holding a program: at 16 keys an A100's and an RTX A6000's anchored launch took
+    ptxas past 255 registers where at 32 they took 244 and 245 (an RTX PRO 6000's 16, its widest held,
+    168); its guard, factors and staging fixed a step, fewer steps take them fewer times."""
+
+    def plan(*, anchors: bool) -> tuple:
+        return (functools.partial(_key_own_held, call, reads=reading, anchors=anchors),
+                functools.partial(_key_own_staged, call, summed=summed, anchors=anchors),
+                functools.partial(_keypair_streams, call, reads=reading))
+
+    anchors = (anchored.back_anchoring(call, reading=reading)
+               and key_block_holds(call, *plan(anchors=True), contracted=True, reducing=1))
+    return anchors, key_block(call, *plan(anchors=anchors), contracted=True, reducing=int(anchors),
+                              widest=anchors)
+
+
+def _exact_back(call: Call, strip: Callable, rows: Callable, shifts, block: tuple, *, scale: float,
+                reading: bool) -> Callable:
+    """`key_pairs_own`'s key block's own pairs each its own decay (`algebra.key_diagonal_pairs_back`), from
+    its strips (`strip`, `_strip`'s), its rows (`rows(name)`) and its keys' and prefix limbs' reads and
+    write strengths (`block`), the keys and tokens' decays staged in `shifts` (`shifted_keys`): a callable,
+    which the anchored products' guard takes where it fails (`anchored.back`). The scores' own pair (offset
+    zero) is summed apart (`pairs_back_stored`'s `diagonal`): its strip scaled to zero there, a scalar's
+    product (a select against a scalar lowers no broadcast)."""
+    key, limbs, betas = block
+
+    def scores(e):
+        return strip("scores", scale, e) * (e != 0).astype(jnp.float32)
+
+    def exact():
+        keyed = key()
+        zero = jnp.zeros(keyed.shape, jnp.float32)
+        return algebra.key_diagonal_pairs_back(
+            [scores, functools.partial(strip, "system", 1.0)],
+            [functools.partial(rows, "queries"),
+             lambda: algebra.write_gated(rows("reads" if reading else "keys"), betas)],
+            shifted_keys(call, shifts, keyed, limbs()), functools.partial(shifted_up, call), (zero, zero),
+            zero, sheared=reading)
+
+    return exact
 
 
 def _own_back_refs(refs: tuple, prefixes: int, *, clamped: bool, reading: bool) -> tuple:
@@ -815,7 +897,7 @@ def _keypair_streams(call: Call, keys: int, *, reads: bool = False) -> dict:
                          **limb_blocks(call, chunk, keys))
 
 
-def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
+def _key_own_staged(call: Call, keys: int, *, summed: Operand, anchors: bool = False) -> tuple:
     """`key_pairs_own`'s staging at key block `keys`: its shifted reads' tile (`own_staging`; its moved
     gradients shifted in registers, `shifted_up`), and a key block's landings: the fp32 one every gradient
     but the finished queries' and keys' lands in, and theirs in their form `summed` where it is narrower
@@ -828,7 +910,9 @@ def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
     # The decay gradient's suffix sums' tile natively, its terms' rows and each column's start
     # (`scan.suffix_columns`).
     suffix = () if call.interpret else (swizzling.plain((call.chunk + 1, keys), jnp.float32),)
-    return (*own_staging(call, keys), *suffix), landing
+    # Where its pairs are anchored products (`anchors`), last, `anchored.back_staging`.
+    scaled = (anchored.back_staging(call, keys),) if anchors else ()
+    return (*own_staging(call, keys), *suffix, *scaled), landing
 
 
 def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> jax.Array:
@@ -853,7 +937,7 @@ def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> 
     return summed if floor is None else clamped_gradient(call.family.tile_of(floor), summed)
 
 
-def _key_own_held(call: Call, keys: int, *, reads: bool = False) -> Held:
+def _key_own_held(call: Call, keys: int, *, reads: bool = False, anchors: bool = False) -> Held:
     """`key_pairs_own`'s consumer thread at key block `keys`, as an sm100's lowered peak counts it (row 5298,
     jsf-sm100-backward): the write gates' terms carried, a row's vector; at an offset's shifted loads the
     three gradients carried, the pair's decay and the decay following it, the two shifted reads
@@ -867,6 +951,8 @@ def _key_own_held(call: Call, keys: int, *, reads: bool = False) -> Held:
     tile, given = f32(chunk, keys), held_tile(call.given, chunk, keys)
     row = f32(chunk, 4)
     banded = masks(chunk, keys)
+    # Where its pairs are anchored products (`anchors`), `anchored.back_held`'s phases.
+    scaled = anchored.back_held(chunk, keys, banded) if anchors else ()
     # Under `reads`, the block's reads in fp32 beside its keys where the system's rows are formed and stored.
     return Held(carried=[row], phases=([tile] * (8 + reads) + given * 2 + banded + [row],
-                                       [tile] * (7 + reads) + given * 2 + banded + [row] * 3))
+                                       [tile] * (7 + reads) + given * 2 + banded + [row] * 3, *scaled))
