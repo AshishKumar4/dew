@@ -1880,8 +1880,9 @@ def test_a_mixed_width_subnormal_read_uses_the_first_multiply_dtype_for_admissio
         return value, pull(cotangent)
 
     with jax.enable_x64():
-        value, (dq, dh) = jax.jit(orders)(np.asarray([0.25], np.float32), np.asarray([[2.0 ** 127]], np.float64),
-                                          np.asarray([2.0 ** 100], np.float64))
+        inputs = (np.asarray([0.25], np.float32), np.asarray([[2.0 ** 127]], np.float64),
+                  np.asarray([2.0 ** 100], np.float64))
+        value, (dq, dh) = jax.jit(orders)(*inputs)
     assert value.dtype == jnp.float64
     np.testing.assert_array_equal(value, [2.0 ** -24])
     np.testing.assert_array_equal(dq, [2.0 ** 78])
