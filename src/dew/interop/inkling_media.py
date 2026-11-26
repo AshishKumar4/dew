@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Unpack
 
 import numpy as np
@@ -40,22 +41,15 @@ rescale factor 1 / 255, fused as the reference fuses them."""
 
 
 def rgb(image: object) -> np.ndarray:
-    """An image as `[height, width, 3]` uint8, as the reference reads one: a path or URL loaded as
-    transformers loads one (`image_utils.load_image`, EXIF-transposed and converted to RGB), encoded bytes
-    opened; a PIL
-    image converted to RGBA where it holds transparency and else to RGB; an RGBA array laid over the
-    checkerboard (`composited`); an RGB array as it is."""
-    import io
-    from pathlib import Path
-
+    """An image as `[height, width, 3]` uint8, as the reference reads one: a path, a URL or encoded bytes
+    decoded in its own mode (`opened`); a PIL image converted to RGBA where it holds transparency and else
+    to RGB; an RGBA array laid over the checkerboard (`composited`); an RGB array as it is. Its alpha rule
+    holds however the image is given: transformers' `load_image` converts a path's or a URL's to RGB, its
+    transparent pixels black, before any processor reads it."""
     from PIL import Image
 
-    if isinstance(image, str | Path):
-        from transformers.image_utils import load_image
-
-        image = load_image(str(image))
-    elif isinstance(image, bytes | bytearray):
-        image = Image.open(io.BytesIO(image))
+    if isinstance(image, str | Path | bytes | bytearray):
+        image = opened(image)
     if isinstance(image, Image.Image):
         image = np.asarray(image.convert("RGBA" if image.has_transparency_data else "RGB"))
     held = np.asarray(image)
@@ -63,6 +57,23 @@ def rgb(image: object) -> np.ndarray:
         raise ValueError(f"an image is [height, width, 3 or 4] uint8 or a PIL image, got {held.dtype} "
                          f"{held.shape}")
     return composited(held) if held.shape[-1] == 4 else held
+
+
+def opened(image: str | Path | bytes | bytearray):
+    """An encoded image decoded as PIL opens it, EXIF-transposed as transformers' `load_image` transposes
+    one, in its own mode: a URL's bytes fetched (`http://`, `https://`), a path's read, bytes as given."""
+    import io
+
+    from PIL import Image, ImageOps
+
+    if isinstance(image, str) and image.startswith(("http://", "https://")):
+        import requests
+
+        response = requests.get(image, timeout=60)
+        response.raise_for_status()
+        image = response.content
+    held = Image.open(io.BytesIO(image) if isinstance(image, bytes | bytearray) else Path(image))
+    return ImageOps.exif_transpose(held)
 
 
 def composited(rgba: np.ndarray) -> np.ndarray:
@@ -139,8 +150,9 @@ class InklingProcessor:
             rows.append(list(self.tokenizer.encode(expanded)))
         if next(remaining, None) is not None:
             raise ValueError(f"the prompts hold fewer image placeholders than their {len(given)} images")
-        side = "left" if self.tokenizer.padding_side == "left" else "right"
-        pad = _records.integer(self.tokenizer.pad_token_id or 0, "pad_token_id")
+        from dew.interop.processors import row_padding
+
+        pad, side = row_padding(self)
         padded, valid = pad_token_rows(rows, pad_id=pad, padding_side=side)
         fields = {"input_ids": padded, **valid}
         if processed:

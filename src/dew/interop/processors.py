@@ -319,7 +319,7 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
     return streams
 
 
-def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
+def row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
     """Return the id and the side to pad text rows with, at the boundary a host
     processor draws: it delegates text to the tokenizer it wraps, a tokenizer
     is its own, and either may state neither field, so both names are read off
@@ -336,7 +336,7 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
 
 def _row_start(reference: HostProcessor) -> int | None:
     """Return the id the tokenizer starts a sequence with, or None, read at the
-    boundary `_row_padding` reads its padding at: off the tokenizer a
+    boundary `row_padding` reads its padding at: off the tokenizer a
     processor wraps, or the tokenizer itself."""
     tokenizer = getattr(reference, "tokenizer", reference)
     bos = getattr(tokenizer, "bos_token_id", None)
@@ -481,7 +481,7 @@ class Processor:
                 grids.append(grid)
         if not per_row and given:
             raise ValueError(f"{len(given)} images are left over the rows' placeholders")
-        pad_id, side = _row_padding(self.reference)
+        pad_id, side = row_padding(self.reference)
         padded, fields = pad_token_rows(tokens, pad_id=pad_id, padding_side=side)
         if pixels:
             fields = {**fields, "pixel_values": np.concatenate(pixels),
@@ -503,7 +503,7 @@ class Processor:
         if images is None and audio is None and videos is None:
             rows = [text] if isinstance(text, str) else list(text)
             values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
-            pad_id, side = _row_padding(self.reference)
+            pad_id, side = row_padding(self.reference)
             ids = values["input_ids"]
             ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
             fields = {name: value if isinstance(value, Sequence) else np.asarray(value)

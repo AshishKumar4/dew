@@ -207,3 +207,31 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
         for name, value in reference.conditioning.items():
             np.testing.assert_array_equal(np.asarray(held.conditioning[name]), np.asarray(value),
                                           err_msg=f'{type(given).__name__} {name}')
+
+
+def test_a_transparent_image_is_laid_over_the_checkerboard_however_it_is_given(tmp_path):
+    """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule) whether the
+    image is given as a PIL image, its encoded bytes or its file's path, each read through the public
+    processor alike: transformers' `load_image` converts a path's image to RGB first, its transparent
+    pixels black (row 13341). A tokenizer padding a side that is neither is refused (row 13342)."""
+    from PIL import Image
+
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    rgba = np.zeros((16, 24, 4), np.uint8)
+    rgba[4:12, 8:16] = (200, 30, 90, 255)
+    stored = tmp_path / 'transparent.png'
+    Image.fromarray(rgba, 'RGBA').save(stored)
+    with Image.open(stored) as opened:
+        opened.load()
+        forms = {'PIL': opened, 'bytes': stored.read_bytes(), 'path': stored}
+        read = {name: loaded.processor._media_reference(text='w1 <|image|>', images=[given])['pixel_values']
+                for name, given in forms.items()}
+    blacked = loaded.processor._media_reference(text='w1 <|image|>', images=[rgba[..., :3]])['pixel_values']
+    assert not np.array_equal(read['PIL'], blacked)
+    for name in ('bytes', 'path'):
+        np.testing.assert_array_equal(read[name], read['PIL'], err_msg=name)
+    loaded.processor._media_reference.tokenizer.padding_side = 'middle'
+    with pytest.raises(ValueError):
+        loaded.processor._media_reference(text='w1 <|image|>', images=[rgba])
