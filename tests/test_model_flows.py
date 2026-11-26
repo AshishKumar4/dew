@@ -435,6 +435,9 @@ def test_a_prepared_sites_needs_are_filed_under_its_unit(tmp_path, monkeypatch):
     assert arms and truths and len(filed) == len(arms) + len(truths)
     state = max(memory["argument"] for memory in arms)
     assert all(program["beside"] >= state for program in filed[len(arms):])
+    # Each program named by its site and its own name, so a unit's needs say which asks for what (row 13580).
+    assert all(program["label"].startswith("a product's arms") and ": " in program["label"]
+               for program in filed), filed
 
 
 def test_a_convolution_sites_truths_and_arms_compile_on_its_gpu_in_its_run(tmp_path, monkeypatch):
