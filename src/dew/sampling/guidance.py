@@ -198,7 +198,8 @@ def _guided_derivative(primals, tangents, value):
     # conditional's direction alone made zero there: 512 of 1024 unit-scale elements of a mixed derivative
     # missed); an unconditional direction that is not finite, which a unit scale weighs nothing of, taken as
     # none there rather than 0 times infinity.
-    unweighed = jnp.where(jnp.isfinite(along_unconditional), along_unconditional, 0)
+    unweighed = jnp.where(jnp.isfinite(along_unconditional), along_unconditional,
+                          jnp.zeros_like(along_unconditional))
     predicted = jnp.where(scale == 1, scale * along_conditional + (1 - scale) * unweighed,
                           along_unconditional + scale * (along_conditional - along_unconditional))
     # The scale's: the predictions' difference, formed `_spread` as the value is.
