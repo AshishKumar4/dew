@@ -37,6 +37,7 @@ from dew.nn.kernels.generation import (
 )
 from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.telemetry import instrumentation
 from dew.training import TrainerAdvanced
 from dew.training._lowering import KernelReport, kernel_report
@@ -747,8 +748,9 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     rows, depth, width, groups = 384, 128, 256, 4
 
     def biased(x, w, sizes, b):
-        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
-                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+        return gemm.gemm(x, w, sizes,
+                         epilogue=Hook(lambda acc, bias: acc + bias, (Side(b, ("groups", "columns")),)),
+                         out_dtype=jnp.bfloat16)
 
     args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),

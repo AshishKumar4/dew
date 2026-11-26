@@ -56,6 +56,7 @@ from dew.nn.kernels.templates import (
     attention_triton,
     mosaic_sm90,
 )
+from dew.nn.kernels.templates.hooks import Hook
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
@@ -1499,7 +1500,7 @@ def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):
     key = jnp.zeros((1, 1, 1, 64), jnp.float16)
     value = jnp.full((1, 1, 1, 64), 1024, jnp.float16)
     spans = template.spans(1, 1, 1)
-    hooks = template.Hooks(output_mod=lambda out: out / 128, rounds=127.5)
+    hooks = template.Hooks(output=Hook(lambda out: out / 128), rounds=127.5)
 
     def ours(query, key, value):
         out = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,

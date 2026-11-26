@@ -36,6 +36,7 @@ from dew.nn.kernels import (
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -310,8 +311,8 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=Fa
 
     def scaled(x, w, weights, dtype=jnp.bfloat16):
         return gemm.gemm(x.astype(dtype), w.astype(dtype), jnp.asarray(group_sizes, jnp.int32),
-                         prologue=lambda rows, s: rows * s.astype(rows.dtype),
-                         prologue_operands=((weights.astype(dtype), ("rows", None)),), out_dtype=dtype)
+                         prologue=Hook(lambda rows, s: rows * s.astype(rows.dtype),
+                                       (Side(weights.astype(dtype), ("rows", None)),)), out_dtype=dtype)
 
     def projection(implementation, dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
@@ -819,7 +820,7 @@ def test_a_mixed_kernel_gradients_prologue_reads_and_rounds_the_rows_in_their_dt
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
               jax.default_matmul_precision("highest")):
             return np.asarray(jax.jit(lambda x, dy: gemm.gemm_t(
-                x, dy, None, prologue=lambda r: r + 2.0 ** -8, out_dtype=jnp.float32,
+                x, dy, None, prologue=Hook(lambda r: r + 2.0 ** -8), out_dtype=jnp.float32,
                 interpret_on_cpu=True))(rows, cotangent))
 
     np.testing.assert_array_equal(gradient("mosaic"), np.full((1, 128, 128), 128.0, np.float32))
@@ -844,9 +845,9 @@ def test_a_row_scales_gradient_reads_the_accumulator_summed_at_its_own_width(ker
 
     def scale_gradient(out_dtype):
         def product(scale):
-            return gemm.gemm(x, w, group_sizes, epilogue=lambda acc, s: acc * s[:, None],
-                             epilogue_operands=((scale, ("rows",)),), out_dtype=out_dtype,
-                             interpret_on_cpu=True)
+            return gemm.gemm(x, w, group_sizes, epilogue=Hook(lambda acc, s: acc * s[:, None],
+                                                              (Side(scale, ("rows",)),)),
+                             out_dtype=out_dtype, interpret_on_cpu=True)
 
         with generation.assumed("sm80"), generation.chosen(grouped_matmul=kernel):
             _, pull = jax.vjp(product, scale)
@@ -1185,7 +1186,7 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         rounded = acc.astype(tokens.dtype)
         return rounded * rounded, rounded
 
-    named = {**options, "epilogue": squared, "named": (None, "rounded")}
+    named = {**options, "epilogue": Hook(squared), "named": (None, "rounded")}
 
     def named_fused(tokens, first):
         return gemm.gemm(tokens, first, sizes, gather=table, scatter=slots, layer=layer, **named)
@@ -1816,7 +1817,7 @@ def test_gemm_named_compute_beside_prologue_and_applied_holds_check_1():
     def dew_fn(gate, up, down, cot):
         def fwd(g, u, w):
             hidden = hook(g, u).astype(jnp.bfloat16)
-            return gemm.gemm(g, w, group_sizes, prologue=hook, prologue_operands=((u, ("rows", "depth")),),
+            return gemm.gemm(g, w, group_sizes, prologue=Hook(hook, (Side(u, ("rows", "depth")),)),
                              applied=hidden, scatter=scatter, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
 
         out, pull = jax.vjp(fwd, gate, up, down)
@@ -1855,7 +1856,7 @@ def test_gemm_named_compute_prologue_preserves_compute_precision_in_vjp():
         return x * s[None, :]
 
     def scaled_gemm(a, s, b, *, compute_dtype):
-        return gemm.gemm(a, b, prologue=scale_pro, prologue_operands=((s, ("depth",)),),
+        return gemm.gemm(a, b, prologue=Hook(scale_pro, (Side(s, ("depth",)),)),
                          compute=compute_dtype, out_dtype=compute_dtype)
 
     # Exact wider-compute witness: bf16 lhs, fp32 rhs = 1 + 2^-9, compute=out_dtype=fp32.
@@ -2005,43 +2006,40 @@ def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
 
     # Unmapped (1, N) and mapped (B, 1, N) ('groups', 'columns') epilogue under batched rhs.
     y_shared = jax.vmap(
-        lambda x, w: gemm.gemm(x, w, epilogue=add_bias,
-                               epilogue_operands=((shared_bias, ("groups", "columns")),),
+        lambda x, w: gemm.gemm(x, w, epilogue=Hook(add_bias, (Side(shared_bias, ("groups", "columns")),)),
                                out_dtype=jnp.bfloat16),
         in_axes=(0, 0))(xs, ws)
     y_mapped = jax.vmap(
-        lambda x, w, bias: gemm.gemm(x, w, epilogue=add_bias,
-                                     epilogue_operands=((bias, ("groups", "columns")),),
+        lambda x, w, bias: gemm.gemm(x, w, epilogue=Hook(add_bias, (Side(bias, ("groups", "columns")),)),
                                      out_dtype=jnp.bfloat16),
         in_axes=(0, 0, 0))(xs, ws, mapped_bias)
     ref_shared = jnp.stack([
-        gemm.gemm(xs[i], ws[i], epilogue=add_bias, epilogue_operands=((shared_bias, ("groups", "columns")),),
+        gemm.gemm(xs[i], ws[i], epilogue=Hook(add_bias, (Side(shared_bias, ("groups", "columns")),)),
                   out_dtype=jnp.bfloat16) for i in range(b)])
     ref_mapped = jnp.stack([
-        gemm.gemm(xs[i], ws[i], epilogue=add_bias,
-                  epilogue_operands=((mapped_bias[i], ("groups", "columns")),),
+        gemm.gemm(xs[i], ws[i], epilogue=Hook(add_bias, (Side(mapped_bias[i], ("groups", "columns")),)),
                   out_dtype=jnp.bfloat16) for i in range(b)])
     np.testing.assert_array_equal(np.asarray(y_shared), np.asarray(ref_shared))
     np.testing.assert_array_equal(np.asarray(y_mapped), np.asarray(ref_mapped))
 
     # Unmapped (1, K) and mapped (B, 1, K) ('groups', 'depth') prologue in vmapped dense gemm_t.
     dw_shared = jax.vmap(
-        lambda x, dy: gemm.gemm_t(x, dy, None, prologue=mul_scale,
-                                  prologue_operands=((shared_scale, ("groups", "depth")),),
+        lambda x, dy: gemm.gemm_t(x, dy, None,
+                                  prologue=Hook(mul_scale, (Side(shared_scale, ("groups", "depth")),)),
                                   out_dtype=jnp.float32),
         in_axes=(0, 0))(xs, dys)
     dw_mapped = jax.vmap(
-        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=mul_scale,
-                                      prologue_operands=((sc, ("groups", "depth")),),
+        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=Hook(mul_scale, (Side(sc, ("groups", "depth")),)),
                                       out_dtype=jnp.float32),
         in_axes=(0, 0, 0))(xs, dys, mapped_scale)
     ref_dw_shared = jnp.stack([
-        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
-                    prologue_operands=((shared_scale, ("groups", "depth")),), out_dtype=jnp.float32)
+        gemm.gemm_t(xs[i], dys[i], None, prologue=Hook(mul_scale, (Side(shared_scale, ("groups", "depth")),)),
+                    out_dtype=jnp.float32)
         for i in range(b)])
     ref_dw_mapped = jnp.stack([
-        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
-                    prologue_operands=((mapped_scale[i], ("groups", "depth")),), out_dtype=jnp.float32)
+        gemm.gemm_t(xs[i], dys[i], None,
+                    prologue=Hook(mul_scale, (Side(mapped_scale[i], ("groups", "depth")),)),
+                    out_dtype=jnp.float32)
         for i in range(b)])
     np.testing.assert_array_equal(np.asarray(dw_shared), np.asarray(ref_dw_shared))
     np.testing.assert_array_equal(np.asarray(dw_mapped), np.asarray(ref_dw_mapped))

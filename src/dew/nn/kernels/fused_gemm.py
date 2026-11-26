@@ -61,6 +61,7 @@ from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.gemm import rows_permuted
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
@@ -326,11 +327,11 @@ def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fu
     return xla(program.work + cost.Work(device_bytes=written)) + program.extra
 
 
-def _indexed_rows(operands: tuple, table: jax.Array) -> tuple:
-    """Each `(side, axes)` side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed
-    as it was (`templates.gemm.rows_permuted`)."""
-    return tuple((rows_permuted(side, table, axes.index('rows')) if 'rows' in axes else side, axes)
-                 for side, axes in operands)
+def _indexed_rows(sides: tuple[Side, ...], table: jax.Array) -> tuple[Side, ...]:
+    """Each side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed as it was
+    (`templates.gemm.rows_permuted`)."""
+    return tuple(Side(rows_permuted(side.value, table, side.axes.index('rows')), side.axes)
+                 if 'rows' in side.axes else side for side in sides)
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gather: bool, has_scatter: bool,
@@ -353,7 +354,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
     # beside a value each device holds its own of is traced as the program wrote it.
     # The routing tables too: a table each device holds its own of routes rows that vary with it.
     acc = computed_from(jax.ShapeDtypeStruct((rows_count, width), out_dtype), lhs, rhs, group_sizes, gather,
-                        scatter, [side for side, _ in prologue.get('prologue_operands', ())])
+                        scatter, [side.value for side in prologue.get('prologue', NO_HOOK).sides])
     operand_bytes = float(rows_count * lhs.shape[-1] * lhs.dtype.itemsize + rhs.size * rhs.dtype.itemsize)
     collected = _PRICED.get()
 
@@ -419,14 +420,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
     # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
     outputs = len(out_leaves) - len(names)
-    epilogue_ops = tuple(zip(leaves, axes, strict=True))
+    sides = tuple(map(Side, leaves, axes))
     if scatter is not None:
         # Epilogue runs before scatter: align post-scatter `'rows'` sides to pre-scatter row order.
-        epilogue_ops = _indexed_rows(epilogue_ops, scatter)
+        sides = _indexed_rows(sides, scatter)
 
     def hooked():
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                         epilogue_operands=epilogue_ops, out_dtype=dtypes[0],
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=Hook(epilogue, sides),
+                         out_dtype=dtypes[0],
                          out_dtypes=dtypes if several else None, precision=precision,
                          gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
                          named=(None,) * outputs + names, **prologue)
@@ -443,8 +444,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
             float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed, forms=forms,
             resident=resident, permuted_bytes=0.0 if scatter is None else float(sum(
-                2 * side.size * side.dtype.itemsize + scatter.size * scatter.dtype.itemsize
-                for side, axes in epilogue_ops if 'rows' in axes))))
+                2 * side.value.size * side.value.dtype.itemsize + scatter.size * scatter.dtype.itemsize
+                for side in sides if 'rows' in side.axes))))
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
@@ -511,8 +512,8 @@ def _prologue(fusion, gathered: bool = False) -> tuple[jax.Array, dict, Formed |
     base, function, sides, axes, jvp, formed = stage
     # Its stage, from the producer's program the algebra pass rewrote (`_split`), the launch takes as it is
     # (`tuning.prepared_as`).
-    return base, {'prologue': tuning.prepared_as(function),
-                  'prologue_operands': tuple(zip(sides, axes, strict=True)), 'prologue_jvp': jvp}, formed
+    return base, {'prologue': Hook(tuning.prepared_as(function), tuple(map(Side, sides, axes))),
+                  'prologue_jvp': jvp}, formed
 
 
 def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:
@@ -598,8 +599,8 @@ def _split(producer, values):
         return producer(jax.tree.unflatten(treedef, list(leaves)))
 
     # The producer as the algebra pass rewrites it, before the fuser stages it (docs/design/algebra.md §2).
-    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(algebra.rewritten(flat))(*leaves)))(
-        *leaves)
+    source = jax.make_jaxpr(algebra.rewritten(flat))(*leaves)
+    closed = jax.make_jaxpr(functools.partial(_inlined, source))(*leaves)
     jaxpr = closed.jaxpr
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
@@ -623,8 +624,9 @@ def _split(producer, values):
     # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
     arrays = jax_core.jaxpr_as_fun(jax_core.Jaxpr(jaxpr.replace(outvars=[base, *sides]),
                                                   closed.consts))(*leaves)
-    whole = functools.partial(_staged, jax_core.Jaxpr(
-        jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
+    debug = jax_core.DebugInfo("gemm_prologue", "prologue tile", None, None)
+    staged = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage, debug_info=debug)
+    whole = functools.partial(_staged, jax_core.Jaxpr(staged, closed.consts))
     axes = _prologue_axes(whole, arrays, shape)
     if isinstance(axes, Refusal):
         return axes
@@ -632,18 +634,53 @@ def _split(producer, values):
                                     if axis is not None))
                 for array, side_axes in zip(arrays[1:], axes, strict=True)]
     named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
-    function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
+    types = tuple(jax.typeof(array) for array in arrays)
+    function = functools.partial(_prologue_tile, whole, types, axes)
     places = tuple(given.get(var) for var in (base, *sides))
-    jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
     # Priced (`Formed`): the element stage the prologue runs, counted as its launch's body is (`priced`), and
     # XLA's programs beside it.
-    staged = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage)
     # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
     # alone); none where every side is an input the stage reads as given.
     computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
+    whole_jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places,
+                                  tuple(array.shape for array in arrays))
+    if computed or any(not jnp.issubdtype(array.dtype, jnp.inexact) for array in arrays):
+        jvp = whole_jvp
+    elif any(programs.own_derivative(eq.primitive) for eq in programs.equations(source.jaxpr)):
+        jvp = _tile_jvp(whole_jvp, arrays, types, axes)
+        if isinstance(jvp, Refusal):
+            return jvp
+    else:
+        jvp = None
     formed = Formed(staged, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
                     closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
+
+
+def _tile_jvp(whole_jvp, arrays: list, types: tuple, axes: tuple):
+    """Prove the producer's own JVP uses the offered primal and tangent tiles. Keep the original
+    derivative on whole arrays, where higher orders must read its nested custom rules."""
+    count = len(arrays)
+
+    def push(*values):
+        return whole_jvp(*values[:count])(*values[count:])
+
+    tangent = functools.partial(_inlined, jax.make_jaxpr(push)(*arrays, *arrays))
+    offered = (*axes, PROLOGUE_AXES, *axes)
+    taken = _prologue_axes(tangent, [*arrays, *arrays], arrays[0].shape)
+    if isinstance(taken, Refusal):
+        return taken
+    if offered != taken:
+        return Refusal("derivative_tiles", "the producer's derivative needs different tiles than its value")
+    return functools.partial(_jvp_on_tile, whole_jvp, tangent, (*types, *types), offered)
+
+
+def _jvp_on_tile(whole_jvp, derivative, types, axes, base, *sides):
+    # Mosaic can stage a proposal on small synthetic tiles before entering a launch context.
+    whole = all(array.shape == aval.shape for array, aval in zip((base, *sides), types, strict=False))
+    if whole and not _on_tiles():
+        return whole_jvp(base, *sides)
+    return functools.partial(_prologue_tile, derivative, types, axes, base, *sides)
 
 
 def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):

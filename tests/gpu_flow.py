@@ -266,12 +266,14 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     return skipped
 
 
-def in_parts(count: int):
-    """A flow's test split into `count` parts by its cells (`part`, its parameter, `[part0]` and on): one
-    long flow is a GPU tier's floor, which cuts a file by test id, and each part still runs its cells in one
-    process. A part runs every `count`-th cell from its own (`parted`), so a check's grid spreads over the
-    parts."""
-    return pytest.mark.parametrize("part", [pytest.param(index, id=f"part{index}") for index in range(count)])
+def in_parts(parts: int | Iterable[str]):
+    """A flow's test split into parts by its cells (`part`, its parameter): one long flow is a GPU tier's
+    floor, which cuts a file by test id, and each part still runs its cells in one process. `parts` a count
+    splits it by turn (`[part0]` and on, `parted`: every `count`-th cell from its own, so a check's grid
+    spreads over the parts); names split it into those groups, each its cells (a family's, by name)."""
+    if isinstance(parts, int):
+        return pytest.mark.parametrize("part", [pytest.param(at, id=f"part{at}") for at in range(parts)])
+    return pytest.mark.parametrize("part", list(parts))
 
 
 def parted(cells: Iterable[Cell], part: int, count: int) -> list[Cell]:

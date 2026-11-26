@@ -298,6 +298,7 @@ def triton_trains_at_large_logits_on_par_with_xla():
                     seeds=LARGE_LOGIT_SEEDS)
 
 
+@pytest.mark.compiles_at_run(reason="compares the two kernels' finiteness on drawn inputs, no check-1 site")
 def triton_at_saturated_large_logits_is_finite_where_xla_is():
     """tokamax's kernel at logits near 1e4 whose rows mostly saturate on one key (`_large_logits`): the
     route is the default form, FlashAttention's math, whose D (rowsum(dO * O), the output rounded to bf16)
@@ -346,9 +347,10 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
-    # Each document's rows as bounds, which a statement of the arms holds (a slice has none, so the arms ran
-    # unprepared: MAINGPU-2b1b88c39 on an A100).
-    documents = [(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
+    # Each document's rows as slices, which no statement of the arms holds (`truths_ahead.arm_role`), so its
+    # run compiles them on its GPU: FlashAttention's wheel traces nothing for a compile-only one ("Unknown
+    # backend: 'gpu' requested", train 1310's prepare at f37f47cdf, where their bounds stated them).
+    documents = [slice(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
     ids = np.repeat(np.arange(1, len(lengths) + 1), lengths)[None]
 
@@ -368,13 +370,13 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
 
     def dense(q, k, v, *s):
         # Each document alone, its rows put back where the packed call holds them.
-        return jnp.concatenate([flash.flash_mha(q[None, b:e], k[None, b:e], v[None, b:e], **options(s))[0]
-                                for b, e in documents])
+        return jnp.concatenate([flash.flash_mha(q[None, at], k[None, at], v[None, at], **options(s))[0]
+                                for at in documents])
 
     def by_document(leaves):
         # Each document's rows a leaf of their own, so a document's error answers to its own budget (a
         # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
-        return (*(leaf[b:e] for leaf in leaves[:4] for b, e in documents), *leaves[4:])
+        return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
 
     # A label a cell's own: a part's store of compiled truths holds one site a label.
     label = f"packed documents {head_dim} {'causal' if causal else 'full'}{' sunk' if sunk else ''}"
@@ -511,9 +513,11 @@ def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
             sinks=s[0] if s else None)
 
     if sinks:
-        q, k, v, s, _ = draw(0)
+        # Refused as it traces, at the draw's shapes: a GPU part's prepare computes nothing (its draw on the
+        # compile-only device raised "'Executable' object has no attribute 'local_devices'", train 1310).
+        q, k, v, s, _ = jax.eval_shape(lambda: draw(0))
         with pytest.raises(KernelRefused):
-            jax.jit(kernel('flash'))(q, k, v, s)
+            jax.jit(kernel('flash')).trace(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                      f"flash at width {width}, window {window}, sinks {sinks}",
                      keep=kept(1024, 1024, causal=causal, sliding_window=window))
@@ -584,6 +588,7 @@ def a_mapped_flash_call_is_each_rows_own(without_deterministic_ops):
                         truth_fn=_mapped("truth", packed), terms=True)
 
 
+@pytest.mark.compiles_at_run(reason="maps flash over no call outside jit, no check-1 site")
 def a_fold_holds_the_kernels_grid_and_its_offsets(without_deterministic_ops):
     """The mapped calls a kernel call folds (`dew_flash_attn._mapped_groups`): as many as keep its rows
     within the 65,535 its grid holds and a packed fold's tokens within its int32 offsets, at least one:
@@ -665,9 +670,11 @@ def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, 
             sinks=s[0] if s else None, segment_ids=jnp.asarray(segments), max_segments=3), 0)
 
     if sinks:
-        q, k, v, s, _ = draw(0)
+        # Refused as it traces, at the draw's shapes: a GPU part's prepare computes nothing (its draw on the
+        # compile-only device raised "'Executable' object has no attribute 'local_devices'", train 1310).
+        q, k, v, s, _ = jax.eval_shape(lambda: draw(0))
         with pytest.raises(KernelRefused):
-            jax.jit(kernel('flash'))(q, k, v, s)
+            jax.jit(kernel('flash')).trace(q, k, v, s)
     attention_on_par(kernel('auto' if sinks else 'flash'), kernel('xla'), draw,
                      f"packed rows on flash, window {window}, sinks {sinks}",
                      keep=kept(1024, 1024, causal=True, sliding_window=window, segment_ids=segments))
@@ -712,6 +719,7 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
     np.testing.assert_array_equal(found[0][queries[0] == 2], 0)
 
 
+@pytest.mark.compiles_at_run(reason="launches flash outside jit over its empty keys, no check-1 site")
 def queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
     """Queries packed by documents over a context of no tokens at all: every query reads nothing,
     its output and gradient exactly zero on flash as on the reference kernel, and the empty keys
