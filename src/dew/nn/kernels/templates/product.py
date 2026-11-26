@@ -381,9 +381,10 @@ class Support:
     left operand's entries may be, `right[k, c]` its right's, `kept[r, c]` the outputs it reads (numpy bool,
     each its operand's shape). Its other terms are zero, so a product issued of its support alone
     (`mosaic.Issuer.products`' `support`) skips each instruction none of whose terms it holds: its kept
-    outputs the whole product's bit for bit where its operands are finite (a skipped zero times an infinity
-    or a NaN was a NaN in the whole), up to the sign of a zero (an accumulator at -0 a skipped +0 left -0),
-    its other outputs anything."""
+    outputs the whole product's bit for bit where every operand an instruction reads is finite as it reads
+    it (staged and converted: a skipped zero times an infinity or a NaN was a NaN in the whole, and an
+    earlier product's overflow is such an operand), up to the sign of a zero (an accumulator at -0 a skipped
+    +0 left -0), its other outputs anything."""
 
     left: np.ndarray
     right: np.ndarray

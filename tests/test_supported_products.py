@@ -136,21 +136,31 @@ def _on_mma_sync() -> bool:
 
 @pytest.mark.skipif(not _on_mma_sync(), reason="a product of a support issues on mma.sync's GPUs alone")
 def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(monkeypatch):
-    """On this GPU (an mma.sync part's), Qwen3.5-27B's gated delta net forward with its solve's merges
-    issued of their supports alone is the same forward with every merge whole, bit for bit up to a zero's
-    sign, over finite draws: each instruction skipped held only zero terms."""
+    """On this GPU (an mma.sync part's), Qwen3.5-27B's gated delta net training step with its solve's merges
+    issued of their supports alone is the same step with every merge whole, its output and every gradient
+    (which read the stored inverse) bit for bit up to a zero's sign, all finite, over draws as its layer
+    gives them (unit keys, write gates a sigmoid's, decays a log sigmoid's): each instruction skipped held
+    only zero terms (head review of 09a5084ee)."""
     from dew import _cache
     from dew.nn.kernels.templates import operands
 
     _, run, shapes = _solve_call(generation.gpu_target().generation)
-    draw = np.random.default_rng(0).standard_normal
-    given = [jnp.asarray(draw(x.shape), x.dtype) for x in shapes]
-    given[3] = -jnp.abs(given[3]) * 0.1
-    with _cache.uncached():
-        supported = np.asarray(jax.jit(run)(*given))
+    q, k, v, g, beta = (np.random.default_rng(index).standard_normal(x.shape)
+                        for index, x in enumerate(shapes))
+    q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
+    given = [jnp.asarray(x, shape.dtype) for x, shape in zip(
+        (q, k, v, np.log(1 / (1 + np.exp(-(g + 3.0)))), 1 / (1 + np.exp(-beta))), shapes, strict=True)]
+
+    def step():
+        with _cache.uncached():
+            out, pull = jax.vjp(run, *given)
+            return [np.asarray(x, np.float32) for x in (out, *pull(jnp.ones_like(out)))]
+
+    supported = step()
     monkeypatch.setattr(operands.Issuer, "supported",
                         lambda self, name, lhs, rhs, support: self(name, lhs, rhs))
-    with _cache.uncached():
-        whole = np.asarray(jax.jit(run)(*given))
-    # Equal values, NaN where NaN, a zero's sign aside (`product.Support`'s contract).
-    np.testing.assert_array_equal(supported.astype(np.float32), whole.astype(np.float32))
+    whole = step()
+    for found, expected in zip(supported, whole, strict=True):
+        assert np.isfinite(expected).all()
+        # Equal values, a zero's sign aside (`product.Support`'s contract).
+        np.testing.assert_array_equal(found, expected)
