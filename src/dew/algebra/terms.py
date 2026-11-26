@@ -1113,7 +1113,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
-    unplaced_full_fp32: set[Hashable] = set()
+    full_fp32_sites: dict[Hashable, bool] = {}
     softmax = _SoftmaxTrack()
     opaque: list[Opaque] = []
     n_invars = len(jaxpr.invars)
@@ -1140,9 +1140,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, term, out, bound)
             if (equation.primitive is jax.lax.dot_general_p
-                    and equation.params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32
-                    and _unplaced_dot(equation)):
-                unplaced_full_fp32.add(key(term))
+                    and equation.params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
+                named = key(term)
+                # If equal terms come from more than one mesh scope, every source must admit the move.
+                full_fp32_sites[named] = full_fp32_sites.get(named, True) and _unplaced_dot(equation)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -1181,7 +1182,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                         if (held := apart.get(var, NOWHERE)).number and held.sign > 0),
                       *(key(forms.literal(index)) for index, value in enumerate(literals)
                         if (held := _constant_apart(value)).number and held.sign > 0),
-                  }), frozenset(unplaced_full_fp32))
+                  }), frozenset(named for named, allowed in full_fp32_sites.items() if allowed))
 
 
 def _unplaced_dot(equation: jcore.JaxprEqn) -> bool:
