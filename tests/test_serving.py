@@ -1953,16 +1953,12 @@ def expert_generation(dispatch: str, params, *, layers: int) -> TextGeneration:
 
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("decode_steps", [1, 4])
-@pytest.mark.parametrize("dispatch", ["global"])
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
 def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode_steps):
-    """A mixture layer on an expert mesh can run its dispatch in a shard_map,
-    and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
-    The server's step runs the model before its draws check anything, each of
-    a call's steps checks its own draws, and a pool smaller than every row's
-    capacity checks nothing on the device, so either dispatch serves what the
-    global one draws alone on one device, one step a call or several.
-    TextGeneration, whose loop carries each draw's checks into the next
-    step's model call, refuses the exchange."""
+    """A mixture layer on an expert mesh runs its dispatch, the exchange in a shard_map, each of a call's
+    steps checking its own draws (`serving_kernel._stepped`): either dispatch serves what the global one
+    draws alone on one device, one step a call or several (a check carried into a later model call is the
+    speculative server's witness)."""
     def generation(dispatch, params):
         return expert_generation(dispatch, params, layers=1)
 
@@ -1978,6 +1974,41 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_draws(ticket.result(), row)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
+def test_a_speculating_server_on_an_expert_mesh_drafts_what_one_device_drafts(dispatch):
+    """Speculative blocks served on an expert mesh: each block's draws are checked before the next block's
+    model call, which runs the mixture's dispatch (the exchange in a shard_map), and every request draws
+    what its lone call draws on one device, several steps a call; a block whose draws leave no distribution
+    is refused by its check through that call."""
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=128, dtype="float32", num_nextn_predict_layers=1,
+                              mixture=Mixture(experts=4, top_k=2, dispatch="global"))
+    params = nn.unbox(jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    sampling = Sampling(temperature=0, eos_token_ids=EOS, strategy=Speculative(block=3))
+    lone = TextGeneration(model, params, RunProcessor(Digits()), sampling=sampling)
+    alone = [lone(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    with boxed(decoder_axes(model)):
+        placed = place(params, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
+    served = TextGeneration(model.clone(mixture=Mixture(experts=4, top_k=2, dispatch=dispatch)), placed,
+                            RunProcessor(Digits()), sampling=sampling)
+    server, tickets = served_alongside(served, slots=8, admission=8, decode_steps=4)
+    assert_sharded(served.variables["params"], server.mesh)
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_draws(ticket.result(), row)
+
+    def undefined(state, scores):
+        return jnp.full_like(scores, -jnp.inf)
+
+    refused = dataclasses.replace(served, sampling=dataclasses.replace(
+        sampling, logits=(jax.tree_util.Partial(undefined),)))
+    failing = Server.from_task(refused, slots=8, capacity=128, decode_steps=4)
+    failing.submit(PROMPTS[0], BUDGETS[0], key=0)
+    with pytest.raises(checkify.JaxRuntimeError):
+        failing.run()
 
 
 def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> TextGeneration:

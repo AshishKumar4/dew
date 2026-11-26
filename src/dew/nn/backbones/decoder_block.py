@@ -339,15 +339,11 @@ class Mixture:
         return resolved_dispatch(self.dispatch, self.experts, shards)
 
     def generation_refusal(self) -> str | None:
-        """Why a generation loop cannot run the layers this mixture builds, or None.
-
-        Its exchange dispatch, named or what `'auto'` resolves to on the mesh in
-        context (`moe.resolved_dispatch`), runs a `shard_map`, and a generation
-        loop carries each draw's device checks into the next step's model call,
-        which jax's checkify cannot carry into one (jax-ml/jax#40907). A
-        `dew.inference.serving.Server` step runs the model before it draws, so
-        it serves the exchange; `dispatch='global'` computes the same layer.
-        This refusal goes once a jax release carries the fix."""
+        """Why a generation loop cannot run the layers this mixture builds, or None: block routing, which
+        a cached decode step cannot reproduce, and the exchange dispatch (named, or what `'auto'` resolves
+        to on the mesh in context), which reads its expert axis off a mesh in context that `generate` does
+        not run under (its rows' keys fold on one device, row 13493). A `dew.inference.serving.Server`
+        serves the exchange; `dispatch='global'` computes the same layer."""
         if self.routing_block is not None:
             return ("block routing chooses each block's experts from every token in it, which a cached "
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
@@ -355,10 +351,9 @@ class Mixture:
                     "or route without blocks")
         if self.dispatch_over(jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)) != 'exchange':
             return None
-        return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
-                "which carries each draw's device checks into the next step's model call, fails on a "
-                "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
-                "generate with the mixture's dispatch='global', the same layer")
+        return ("generate runs no mesh in context, which dispatch='exchange' reads its expert axis off "
+                "(row 13493). Serve the model with dew.inference.serving.Server, or generate with the "
+                "mixture's dispatch='global', the same layer")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
