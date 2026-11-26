@@ -1810,8 +1810,10 @@ def test_the_cap_multiplies_fp32_logits_by_its_reciprocal_and_divides_any_other(
     wide = template.Capped(2.0 ** 128)
     assert wide.reciprocal == 0.0
     with jax.enable_x64(new_val=True):
-        capped = wide(jnp.asarray([2.0 ** 128], jnp.float64), None, None)
-    np.testing.assert_allclose(np.asarray(capped), [2.0 ** 128 * np.tanh(1.0)], rtol=1e-15)
+        at_cap = jnp.asarray([2.0 ** 128], jnp.float64)
+        capped, divided = wide(at_cap, None, None), 2.0 ** 128 * jnp.tanh(at_cap / 2.0 ** 128)
+    assert np.isfinite(capped).all() and capped[0] > 0
+    np.testing.assert_array_equal(np.asarray(capped), np.asarray(divided))
 
 PLAIN_JAX_CERTIFIED = """
 import json, sys
