@@ -284,7 +284,7 @@ def _on_gpu(case: AttentionCase) -> bool:
 
 def _flash_installed(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU on a host without the wheel takes the wheel its target
-    # installs: what the host lacks refuses the program it is traced into (`_unlowered`), not the call.
+    # installs: what the host lacks refuses the program it is traced into (`unlowered`), not the call.
     return flash_architectures() is not None or generation.assumption() is not None
 
 
@@ -928,7 +928,7 @@ def _attention_preferred(case: AttentionCase) -> str:
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
 
 
-def _unlowered(kernel: str) -> str | None:
+def unlowered(kernel: str) -> str | None:
     """Why this host cannot lower the target's `kernel` for a GPU a step is traced for on it, None where it
     lowers it: FlashAttention where its call lowers for no GPU here (`flash_lowered`: its wheel holds no code
     for the target); cuDNN's where this host loads no cuDNN, without which its call traces nothing ("cuDNN
@@ -976,7 +976,7 @@ ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
     INFERENCE,
     FLASH_INFERENCE,
-), _attention_preferred, _unlowered, DECLARED)
+), _attention_preferred, unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
 splash, xla and the reference path, the first that takes the call. The old routes take only the fast
@@ -1036,7 +1036,7 @@ DECODE = Op[AttentionCase](Choice.DECODE, (
     DECODE_XLA,
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
     Kernel[AttentionCase]('reference', (), generic=True),
-), _decode_preferred, _unlowered, DECODE_DECLARED)
+), _decode_preferred, unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
 kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the run's declared products
