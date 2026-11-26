@@ -168,7 +168,8 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
         # any read as none, so the GPU stopped 200 MiB past the target (rows 12913, 12950).
         filler = []
         while (filled := step_room(device)) is not None and filled >= target + (1 << 26):
-            filler.append(jnp.zeros((1 << 24,), jnp.float32, device=device))
+            # Resident before the room is read again: a dispatch may allocate it later (async dispatch).
+            filler.append(jnp.zeros((1 << 24,), jnp.float32, device=device).block_until_ready())
         # Within a 64 MiB chunk of the target: still room for the temporaries beside what the step places,
         # short of the state with them.
         assert filled is not None and target - (1 << 26) < filled < target + (1 << 26), (target, filled)
