@@ -408,11 +408,12 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
 @pytest.mark.parametrize(("generation", "dtype"), ACCUMULATION_CELLS)
 def test_an_accumulating_runs_need_holds_its_window_once(generation, dtype):
     """A run that pools four microbatches into a commit builds its window before its first step
-    (`Trainer._window_of`), compiled ahead beside it and charged beside the run's state less the window's
-    fresh leaves, which the state its need holds keeps (`ahead._results_programs`): its need past a
-    committing run's is no more than the window's gradient sum, the rows it replays and a narrow copy. A
-    builder charged its window's bytes beside the state's own held the sum twice, a parameter's four bytes
-    past that bound, its need then the builder's (row 12400)."""
+    (`Trainer._window_of`, a start of no arguments whose outputs are the window), compiled ahead beside it
+    and charged beside the run's state less the window's fresh leaves, which the state its need holds keeps
+    (`ahead._results_programs`): its need past a committing run's is no more than two windows (the one its
+    state holds and the step's next sum beside it), the rows it replays and a narrow copy. A builder charged
+    its window beside the state's own held it twice over, four windows past a bfloat16 run's need (row
+    12400)."""
     from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
@@ -426,9 +427,9 @@ def test_an_accumulating_runs_need_holds_its_window_once(generation, dtype):
         return compile_ahead(trainer, token_rows(VOCAB, 1, SEQ_LEN + 1))
 
     one, window = ahead(1), ahead(4)
+    (built,) = [window.starts[digest].memory for digest in set(window.starts) - set(one.starts)
+                if window.starts[digest].memory.argument == 0]
     shapes = jax.eval_shape(model.init, jax.random.key(0), jax.numpy.zeros((1, SEQ_LEN), jax.numpy.int32))
-    leaves = jax.tree.leaves(shapes["params"])
-    gradient = sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)
+    narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes["params"]))
     held = 4 * token_rows(VOCAB, 1, SEQ_LEN + 1)["text"].nbytes
-    narrow = 2 * sum(leaf.size for leaf in leaves)
-    assert window.built.memory - one.built.memory <= gradient + held + narrow
+    assert window.built.memory - one.built.memory <= 2 * built.output + held + narrow
