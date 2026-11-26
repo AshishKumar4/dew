@@ -197,3 +197,13 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
     np.testing.assert_array_equal(np.asarray(read.tokens), ids)
     for name, value in reference.conditioning.items():
         np.testing.assert_array_equal(np.asarray(read.conditioning[name]), np.asarray(value), err_msg=name)
+    # The same image as a file's path and as its encoded bytes, loaded as transformers loads them.
+    from PIL import Image
+
+    stored = tmp_path / 'image.png'
+    Image.fromarray(image).save(stored)
+    for given in (stored, stored.read_bytes()):
+        held = loaded.processor('w1 <|image|> w2', images=[given])
+        for name, value in reference.conditioning.items():
+            np.testing.assert_array_equal(np.asarray(held.conditioning[name]), np.asarray(value),
+                                          err_msg=f'{type(given).__name__} {name}')
