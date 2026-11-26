@@ -13,10 +13,9 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
 - the merge: the slices' softmax states combined with the call's initial state (a sink, `Initial`), in
-  a fixed order, deterministic: one launch over the slices where the walk wrote them, the law's own path
-  with an initial state (`merged.merged_split`).
-  A merge in the launch, by the last slice's program to arrive, was never faster in kernel time at any
-  split on an A100 or a GH200, and the step's wall time is its launches' either way (M-ET-46).
+  a fixed order, deterministic: one shared launch over the slices where the walk wrote them, an initial
+  state merged beside them in it (`merged.merged_split`). A merge inside the walk's launch is open to
+  measurement against this one (M-ET-46 timed an earlier one at two B1 geometries).
 
 No arithmetic of its own: the walk, the hooks, the guards and the merge are the template forward's and its
 algebra's.

@@ -831,9 +831,9 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
                  "16/4 and 32/8: cuDNN faster at all 105 cells, by 1.85 times or more from 256 tokens (the "
                  "template's training 9.15 times at 1 x 32768 8/2 d128). Three cells are no timed win: "
-                 "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete, "
-                 "row 5671 (it wedged at the first), cuDNN the one measured route that runs there, re-timed "
-                 "once the stall is fixed. Earlier, five rounds each (ET-CUDNNROWS-b200 "
+                 "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete "
+                 "there (row 5671's barrier race, since fixed): cuDNN the one measured route at them, a "
+                 "paired native re-time pending. Earlier, five rounds each (ET-CUDNNROWS-b200 "
                  "against -rung, -att4b and -20261112-fix): "
                  "Qwen 3.5-4B's full attention, 16 query heads over 4 of 256, causal bf16, at 1 x 12288 its "
                  "forward 0.838 against 5.015 ms and a training step's attention 4.504 against 28.60 (the "
@@ -999,8 +999,9 @@ taken of and the template for one differentiated, where a cell declares it (`pri
 
 
 def _decode_preferred(case: AttentionCase) -> str:
-    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`; the
-    template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
+    """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`, the
+    default by policy: the template's decode measured mixed against it, M-DD-10's 0.540 to 1.750 times over
+    GH200 dense cells, and M-NA-34 times the priced planner's), which hands a call it does not take to the
     next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere; the
     kernel computing a quantized model's rule where the rule owns the call's products, as attention's
     (`AttentionCase.quantized`); the template for a call of each query's own sinks."""
@@ -1051,7 +1052,8 @@ kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the r
 (`decode_attention.PRODUCTS`), the fast form's alone (`_FAST`: a run's accurate numerics, the 2026-11-26
 audit found, ran them anyway); the attention template's decode (`attention_decode.attend`, through
 `attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
-until it measures faster than the decode kernel (rows 4042 to 4045, 4075), and ahead of the reference path,
+the decode kernel the default until a like-for-like receipt ranks them (M-DD-10 mixed, M-NA-34 pending), and
+ahead of the reference path,
 whose scores are whole, where every kernel before it refuses the call."""
 
 
