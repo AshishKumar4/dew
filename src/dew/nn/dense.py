@@ -471,17 +471,18 @@ class _LinearEnvelope(nn.Module):
 class Dense(_LinearEnvelope, nn.Dense):
     """Flax's Dense, its bias added by `biased` (the module docstring). `kernel_axes` are its kernel's
     logical axes, `[inputs, features]`, which its module declares where it builds it, and its bias takes
-    the features' (`declared`); None declares none."""
+    the features' (`declared`); None declares none. A call's `formed` (`projections.Formed`) is read only
+    where its `operand` is the call's `inputs` itself: an interceptor handing the layer other inputs (an
+    input quantizer's) leaves it unread."""
 
     kernel_axes: tuple[str | None, ...] | None = None
 
     @nn.compact
     def __call__(self, inputs: Array, formed: projections.Formed | None = None) -> jax.Array:
         """The layer of `inputs`. `formed`, where given, states `inputs` formed entrywise from other values
-        (`projections.Formed`, its `operand` `inputs` itself: a gated MLP's hidden activation), which the
-        layer's plain product multiplies as the template's formed operand, holding the values it was formed
-        from in place of `inputs` for reverse mode (`_product`); an interceptor that hands the layer other
-        inputs leaves it unread."""
+        (`projections.Formed`: a gated MLP's hidden activation), which the layer's plain product multiplies
+        as the template's formed operand, holding the values it was formed from in place of `inputs` for
+        reverse mode (`_product`), under the class's identity rule."""
         held = formed if formed is not None and formed.operand is inputs else None
         return self._envelope(functools.partial(self._linear, formed=held), inputs)
 

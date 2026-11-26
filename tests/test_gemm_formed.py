@@ -320,3 +320,27 @@ def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
     mine = held(layer)
     assert not holds(mine, product)
     assert holds(mine, gate) and holds(mine, up)
+
+
+def test_a_gated_mlps_down_projection_multiplies_the_inputs_an_interceptor_hands_it():
+    """A gated MLP whose down projection an interceptor hands other inputs (an input quantizer's rounded
+    rows; zeros here): the projection multiplies those, its formed product left unread (`Dense`'s identity
+    rule), so its output is zeros; and a capture of its calls (`capture_intermediates`) keeps the output the
+    layer returns."""
+    layer = GatedMLP(hidden_features=48, out_features=16, dtype=jnp.bfloat16)
+    x = jnp.asarray(np.random.default_rng(1).normal(size=(4, 16)), jnp.bfloat16)
+    variables = layer.init(jax.random.key(0), x)
+
+    def zeroed(next_fun, args, kwargs, context):
+        if context.module.name == "down_proj" and context.method_name == "__call__":
+            args = (jnp.zeros_like(args[0]), *args[1:])
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(zeroed):
+        out = jax.jit(layer.apply)(variables, x)
+    assert not np.any(np.asarray(out, np.float32))
+
+    out, state = layer.apply(variables, x, capture_intermediates=True, mutable=["intermediates"])
+    np.testing.assert_array_equal(np.asarray(state["intermediates"]["down_proj"]["__call__"][0], np.float32),
+                                  np.asarray(out, np.float32))
+    assert np.any(np.asarray(out, np.float32))
