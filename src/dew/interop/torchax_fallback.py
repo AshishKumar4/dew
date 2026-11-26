@@ -1167,7 +1167,7 @@ class TorchGraph:
             try:
                 # The runtime property scoped to this trace whatever it is handed, so a draw inside (a refused
                 # nested layer's) leaves no key of its trace in the environment past it.
-                with (env, env.override_property(prng=env.prng_key if key is None else key),
+                with (env, env.override_property(prng=_unseeded() if key is None else key),
                       draws, attending, _reaching(reach), seam):
                     held = env.prng_key
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
@@ -1245,6 +1245,15 @@ def _keeps_fp32(op) -> tuple[int, str] | None:
     states them, or None where it has none."""
     names = [argument.name for argument in op._schema.arguments]
     return (names.index(_KEEPS_FP32), _KEEPS_FP32) if _KEEPS_FP32 in names else None
+
+
+def _unseeded() -> jax.Array:
+    """The key an unseeded trace runs under (`TorchGraph.traced`), made where no trace stages it: the
+    environment's own is made on its first read in each thread, under whatever trace that read ran in, and
+    a later trace reading it reads that trace's value. An unseeded trace that draws is refused
+    (`_run`), so no draw reads this key's values."""
+    with jax.ensure_compile_time_eval():
+        return jax.random.key(0)
 
 
 @functools.cache
