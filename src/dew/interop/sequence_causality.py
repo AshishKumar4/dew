@@ -33,8 +33,8 @@ import dataclasses
 import functools
 import math
 import weakref
-from dataclasses import dataclass
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp

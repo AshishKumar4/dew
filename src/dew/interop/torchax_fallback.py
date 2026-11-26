@@ -592,7 +592,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
             # A cache being opened: its layer's keys and values give its shape, and nothing is held.
             held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
         out, keys, values = attested(cached, CAUSAL_ATTENTION, inputs=3, outputs=1)(
-            q, k, v, held["cached_key"], held["cached_value"], call.cache.slots, call.cache.filled, sinks, rng)
+            q, k, v, held["cached_key"], held["cached_value"], call.cache.slots, call.cache.filled, sinks,
+            rng)
         call.cache.written[entry] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
