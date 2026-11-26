@@ -80,15 +80,19 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
 def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
-    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, weights near
-    the largest finite) beside rows of small integers: its product on the template's route, each stage
+    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, a group
+    anchored high) beside rows of small integers: its product on the template's route, each stage
     decoded in place (interpreted), and on XLA's, the decoded matrix's, each the float64 product of its
     weights rounded once to fp32 (each product exact, its sums exact in fp32), dense and grouped (two groups
     of 3 and 5 rows); the route each took reported."""
     weights = _drawn((256, 64))
     finite = np.isfinite(np.asarray(weights, np.float32))
-    # Its infinities and NaNs read through their own column, apart, as no finite sum holds them.
+    # Its infinities and NaNs zeroed, and its group near the largest finite lowered by 2**-120 exactly (still
+    # a group anchored high in its window), as no finite sum holds them: the decode of each bit pattern is
+    # `test_a_bf16_window_decodes_every_weight_to_its_bits`' (one `window_bits` either way).
     weights = np.where(finite, weights, np.asarray(0.0, jnp.bfloat16))
+    weights[128:256, 2] = (weights[128:256, 2].astype(np.float32) * np.float32(2.0 ** -120)).astype(
+        jnp.bfloat16)
     window = Bf16Window.of(weights)
     rows = np.random.default_rng(5387).integers(-3, 4, (8, 256)).astype(jnp.bfloat16)
     sizes = np.asarray([3, 5], np.int32)
