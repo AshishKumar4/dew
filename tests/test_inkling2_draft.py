@@ -19,7 +19,7 @@ from reference_error import assert_as_exact, declared_seeds, indexed_recording, 
 from dew.batch import coordinates as laid_out
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.block_draft import BlockDrafter, Context, DraftAttention, MarkovBlockDraft, draft
+from dew.nn.block_draft import BlockDrafter, Context, Draft, DraftAttention, MarkovBlockDraft, draft
 from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.sampling import Sample, Sampling, Speculative, generate
@@ -246,7 +246,9 @@ def test_a_drafts_head_scores_its_states_and_its_correction_apart():
 
     variables = drafter.init(jax.random.key(0), method=drafting)
     scored.clear()
-    logits = drafter.apply(variables, method=drafting).logits
+    drafted_block = drafter.apply(variables, method=drafting)
+    assert isinstance(drafted_block, Draft)
+    logits = drafted_block.logits
     (states, base), *corrections = scored
     places = TINY_DRAFT.block_size - 1
     assert states.shape == (1, places, 2) and len(corrections) == places

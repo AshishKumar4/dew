@@ -1728,6 +1728,8 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
     parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
     the CPU's float32 witness reaches XLA's arithmetic alone."""
+    from jax.core import ShapedArray
+
     from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.programs import equations
 
@@ -1746,7 +1748,7 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     step = jax.jit(jax.grad(loss))
     # The queries', keys' and values' dtypes each call of the delta rule takes in the step's program, as
     # the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`).
-    handed = [tuple(var.aval.dtype for var in eqn.invars[:3])
+    handed = [tuple(var.aval.dtype for var in eqn.invars[:3] if isinstance(var.aval, ShapedArray))
               for eqn in equations(jax.make_jaxpr(jax.grad(loss))(params).jaxpr)
               if eqn.primitive.name == "jit" and eqn.params["name"] == "delta_rule"]
     # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's, the
