@@ -43,7 +43,7 @@ from dew.nn.kernels.gemm import (
 from dew.nn.kernels.templates import axes
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
+from dew.nn.precision import EXACT_FLOAT32, biased, biased_value, effective_precision
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -781,8 +781,10 @@ def _formed_product(formed: FormedInput, matrix: jax.Array, out_dtype, precision
         return each.reshape(-1, depth)
 
     sides = tuple(Side(flat(side), ('rows', 'depth')) for side in formed.sides)
+    # The precision the layer's own product multiplies at: the call's, else the run's configured level (a
+    # run's ACCURATE numerics' "highest"), which `gemm` takes as the call's declaration.
     out = gemm(flat(formed.rows), matrix, prologue=Hook(formed.hook, sides), applied=flat(operand),
-               out_dtype=out_dtype, precision=precision)
+               out_dtype=out_dtype, precision=effective_precision(precision))
     return out.reshape(*operand.shape[:-1], matrix.shape[1])
 
 
