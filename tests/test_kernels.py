@@ -439,11 +439,12 @@ def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
-def flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
+def flash_keeps_the_kernel_contract_on_a_mesh(axis, split):
     """FlashAttention-2 over rows split two ways, or query heads split two ways with the key heads
     they read, runs per shard (`sharded.assert_runs_per_shard`): the output and the three input
     gradients on par with one device's over the site's draws, no operand moved between devices and
-    no copy or transpose at the kernel's edge."""
+    no copy or transpose at the kernel's edge. Its schedule is a user's process's (`users_process`: no
+    deterministic ops nor the suite's matmul precision), as its flow runs it."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 

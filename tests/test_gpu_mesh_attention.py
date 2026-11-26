@@ -4,7 +4,8 @@ two:
 
 - cuDNN's fused attention runs inside either sequence-parallel exchange, full and causal
   (test_sequence_parallel), and sharded across processes compiles once (tests/sharded_attention_cells.py).
-- Flash keeps the kernel contract on a mesh, over data and tensor axes (test_kernels).
+- Flash keeps the kernel contract on a mesh, over data and tensor axes, in a process computing as a user's
+  does (test_kernels; `users_process`).
 """
 
 import functools
@@ -19,19 +20,24 @@ pytestmark = [pytest.mark.gpu(reason="two CUDA devices: sharded cuDNN and Flash 
               pytest.mark.mesh(devices=2)]
 
 
-def test_two_gpus_shard_cudnn_attention(tmp_path_factory, without_deterministic_ops):
-    """The two-GPU cuDNN cells under the lane's deterministic ops, and FlashAttention's mesh cells without
-    them (`without_deterministic_ops`), its default schedule, as a user's process runs it."""
+def test_two_gpus_shard_cudnn_attention(tmp_path_factory):
+    """The two-GPU cuDNN cells, under the lane's deterministic ops."""
     run_cells([
         *(Cell(f"cuDNN runs inside the {exchange} exchange: {'causal' if causal else 'full'}",
                on_two_gpus(functools.partial(sequence_parallel.cudnn_runs_inside_either_exchange, exchange,
                                              causal)))
           for exchange in sorted(sequence_parallel.EXCHANGES) for causal in (False, True)),
-        *(Cell(cell.label, on_two_gpus(cell.run))
-          for cell in cells_of(kernels.flash_keeps_the_kernel_contract_on_a_mesh,
-                               without_deterministic_ops=without_deterministic_ops)),
         Cell("a sharded cuDNN attention compiles once across processes",
              on_two_gpus(isolated(tmp_path_factory)(
                  sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes,
                  "sharded"))),
     ])
+
+
+@pytest.mark.users_process
+def test_two_gpus_shard_flash_attention_as_a_users_process_runs_it():
+    """FlashAttention's mesh cells in a process computing as a user's does (`users_process`: XLA's own
+    schedules, no deterministic ops nor the suite's JAX_DEFAULT_MATMUL_PRECISION=highest), the claim each
+    makes (row 5491: under the lane's precision they held only at the suite's IEEE precision)."""
+    run_cells([Cell(cell.label, on_two_gpus(cell.run))
+               for cell in cells_of(kernels.flash_keeps_the_kernel_contract_on_a_mesh)])
