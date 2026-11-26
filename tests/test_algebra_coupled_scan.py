@@ -99,6 +99,77 @@ def test_a_coupled_chunks_replay_is_its_token_scan():
     np.testing.assert_array_equal(np.asarray(leaving), np.asarray(jnp.stack(pair)))
 
 
+@pytest.mark.parametrize("large", ["reader", "memory"])
+def test_a_coupled_subnormal_reader_keeps_memory_momentum_and_local_updates(large):
+    spec = declaration(np.float32(2.0 ** -128), 2, 1, jnp.float32, reset=False, bound=1.0)
+    forms = scan.derive_scan(spec, saturation=SATURATION)
+    huge = np.float32(2.0 ** 127)
+    q = np.asarray([[0, 0], [huge if large == "reader" else 1, 0]], np.float32)
+    h0 = 1 if large == "reader" else huge
+    pair = np.asarray([[[h0], [0]], [[-0.25], [0]]], np.float32)
+    keys = np.asarray([[1, 0], [0, 0]], np.float32)
+    values = np.asarray([[0.5], [0]], np.float32)
+    ct = np.asarray([[0], [2.0 ** 126]], np.float32)
+
+    @jax.jit
+    def run(q, memory, keys, values, ct):
+        z = jnp.zeros(2, q.dtype)
+        tokens = {"q": q, "k": keys, "v": values, "g": z, "beta": jnp.ones_like(z),
+                  "p": jnp.zeros_like(keys), "mu": z}
+        state = (z, memory)
+        prepared = forms.prepare(tokens)
+        final, kept = forms.step(state, prepared)
+        mapped = forms.mapped(prepared, state, kept)
+        replayed, walked = forms.replay(tokens, memory)
+        d_state, d_tokens = forms.backward(tokens, state, jnp.zeros_like(final[1]), ct)
+        return mapped, replayed, final[1], walked, d_state, d_tokens["q"]
+
+    mapped, replayed, final, walked, d_state, dq = run(q, pair, keys, values, ct)
+    # The initial momentum plus the first write is -0.75, which both updates subtract from h.
+    last = np.float32(np.float64(h0) + 1.5)
+    wanted = np.asarray([[0], [np.float64(q[1, 0]) * float(last) * 2.0 ** -128]], np.float32)
+    np.testing.assert_array_equal(mapped, wanted)
+    np.testing.assert_array_equal(replayed, wanted)
+    np.testing.assert_array_equal(final, [[[last], [0]], [[-0.75], [0]]])
+    np.testing.assert_array_equal(walked, final)
+    np.testing.assert_array_equal(d_state, [[[q[1, 0] * 0.25], [0]], [[-q[1, 0] * 0.5], [0]]])
+    np.testing.assert_array_equal(dq, [[0, 0], [last * 0.25, 0]])
+
+
+@pytest.mark.parametrize("batched", [False, True], ids=["one chunk", "mapped chunks"])
+def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(batched):
+    spec = declaration(1.0, 2, 1, jnp.float32, reset=False, bound=1.0)
+    forms = scan.derive_scan(spec, saturation=SATURATION)
+    q = np.asarray([[0, 0], [2.0 ** 127, 2.0 ** 127]], np.float32)
+    k = np.asarray([[2, -2], [0, 0]], np.float32)
+    v = np.asarray([[0.125], [0]], np.float32)
+    z = np.zeros(2, np.float32)
+
+    def run(q, k, v, z):
+        tokens = {"q": q, "k": k, "v": v, "g": z, "beta": jnp.ones_like(z), "p": jnp.zeros_like(k), "mu": z}
+        state = forms.init({})
+        prepared = forms.prepare(tokens)
+        end, held = forms.step(state, prepared)
+        out = forms.mapped(prepared, state, held)
+        read, _ = forms.replay(tokens, state[1])
+        cotangent = jnp.asarray([[0.], [1.]], out.dtype)
+        _, gradient = forms.backward(tokens, state, jnp.zeros_like(end[1]), cotangent)
+        return out, read, gradient["q"]
+
+    # The same momentum enters both tokens' unit-weight memory updates. The resulting products
+    # are 2^127 times ±0.5, not q times the bare key (±2^128).
+    state = (k[0].astype(np.float64) * (2 * float(v[0, 0])))[:, None]
+    if batched:
+        q = np.stack((q, np.asarray([[0, 0], [3, 1]], q.dtype)))
+        run = jax.vmap(run, in_axes=(0, None, None, None))
+    out, replayed, adjoint = jax.jit(run)(q, k, v, z)
+    expected = q.astype(np.float64) @ state
+    np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(replayed, expected)
+    derivative = np.asarray([[0, 0], [0.5, -0.5]], np.float32)
+    np.testing.assert_array_equal(adjoint, np.broadcast_to(derivative, q.shape))
+
+
 def uncoupled(pair, q, k, v, g, beta, p, mu):
     """A pair whose memory steps along the momentum entering the token, not the one it leaves: no coupled
     form's."""

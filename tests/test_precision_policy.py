@@ -426,6 +426,35 @@ def test_a_constant_factor_splits_on_the_host_outside_its_protected_span():
     np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
 
 
+def test_a_bfloat16_host_factor_leaves_a_bfloat16_product_residual():
+    factor = np.asarray(1 + 2 ** -7, jnp.bfloat16)
+    left = jnp.asarray(1 - 2 ** -7, jnp.bfloat16)
+    high, low = jax.jit(lambda x: two_product(x, factor, bit_split=True))(left)
+    assert high.dtype == low.dtype == left.dtype
+    np.testing.assert_array_equal(np.asarray([high, low], np.float32), [1, -(2 ** -14)])
+
+
+@pytest.mark.parametrize("literal", [False, True], ids=["traced", "host"])
+def test_two_product_splits_a_mixed_operand_in_its_promoted_format(literal):
+    scale, factor = np.float32(2.0 ** -8), np.float16(65504)
+
+    def product(a, b):
+        value = factor if literal else b
+        return two_product(a, value, bit_split=True), two_product(value, a, bit_split=True)
+
+    for high, low in jax.jit(product)(scale, factor):
+        assert high.dtype == low.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray([high, low]), [float(scale) * float(factor), 0.0])
+
+
+def test_two_product_promotes_a_python_literal_without_double_rounding():
+    # The final bit is below the fp32 precision at this fp16 midpoint.
+    factor = 1 + 2.0 ** -11 + 2.0 ** -30
+    x = np.ones((2,), np.float16)
+    high, _ = jax.jit(lambda a: two_product(a, factor))(x)
+    np.testing.assert_array_equal(np.asarray(high), np.full_like(x, 1 + 2.0 ** -10))
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
@@ -2016,3 +2045,21 @@ def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flush
     np.testing.assert_array_equal(binades[nonzero],
                                   np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
     np.testing.assert_array_equal(binades[~nonzero], -1024)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64])
+def test_a_signed_quiet_nan_is_the_formats_own_however_it_is_formed(dtype):
+    """`float_bits.quiet_nan`, the one signed quiet NaN a stored decoder lands (row 13450), is each format's
+    canonical quiet NaN bit for bit, its sign where asked: the bits numpy's NaN casts to, and its
+    negation's; and the E4M3 block scale's two NaN codes decode to float32's, signed as their code
+    (`bits.scales_decoded`, 0x7F and 0xFF)."""
+    from dew.algebra import bits
+    from dew.nn.float_bits import quiet_nan
+
+    with jax.enable_x64(dtype == jnp.float64):
+        formed = np.asarray(quiet_nan(jnp.asarray([False, True]), dtype))
+    word = f"uint{np.dtype(dtype).itemsize * 8}"
+    canonical = np.copysign(np.asarray([np.nan, np.nan]), [1.0, -1.0]).astype(dtype)
+    np.testing.assert_array_equal(formed.view(word), canonical.view(word))
+    scales = np.asarray(bits.scales_decoded(jnp.asarray([0x7F, 0xFF], jnp.uint32)))
+    np.testing.assert_array_equal(scales.view(np.uint32), np.asarray([0x7FC00000, 0xFFC00000], np.uint32))

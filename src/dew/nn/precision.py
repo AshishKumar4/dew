@@ -55,14 +55,13 @@ from dew.nn.derivatives import (
     with_tangents_formed,
 )
 
-# The division's names, which its callers read here as before it had a module of its own.
+# The division's public names, which its callers read here as before it had a module of its own; its
+# lowerings and software form its own module's (`dew.nn.division`).
 from dew.nn.division import (
-    _correctly_rounded_divide as _correctly_rounded_divide,
     correctly_rounded_divide as correctly_rounded_divide,
     correctly_rounded_divide_p as correctly_rounded_divide_p,
     divided as divided,
     lowered_divide as lowered_divide,
-    triton_lowerings as triton_lowerings,
 )
 from dew.nn.float_bits import exact_power2, split_bits, two_factor_reach, whole_power2, widened_exactly
 from dew.nn.nested import nested
@@ -142,6 +141,7 @@ __all__ = [
     "running_total",
     "scaled",
     "scaled_logits",
+    "scaled_partial",
     "span_means",
     "spread",
     "sqrt_or_zero",
@@ -1657,41 +1657,56 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
 def _two_product(left, right, *, bit_split: bool, subtract: bool,
                  rounding: Callable[[jax.Array], jax.Array] | None) -> tuple[jax.Array, jax.Array]:
     """`two_product`'s arithmetic, its steps' roundings each their own (`rounding_alone`, `uncontracted`)."""
-    def rounded(value):
+    def rounded(value: jax.Array) -> jax.Array:
         return value if rounding is None else rounding(value)
 
-    def split(value):
-        if bit_split and isinstance(value, np.generic | np.ndarray):
-            # A constant (a kernel's static factor) splits where it is known, on the host.
-            constant = np.asarray(value, np.float32)
-            unsigned, mask, _ = split_bits(np.float32)
-            high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
-            return jnp.asarray(high), jnp.asarray(constant - high)
-        # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
-        # scaled copy, then `value - high`), which a multiply that made it, contracted into the subtraction,
-        # would read exactly at one and rounded at the other, a spurious low part.
-        (value,) = uncontracted(value)
-        if bit_split:
-            unsigned, mask, low = split_bits(value.dtype)
-            mask = np.array(mask, unsigned)
-            bits = jax.lax.bitcast_convert_type(value, unsigned)
-            if _odd(value.dtype):
-                # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
-                bits = bits + np.array(1 << (low - 1), unsigned)
-            high = jax.lax.bitcast_convert_type(bits & mask, value.dtype)
-        else:
-            splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
-            scaled = value * splitter
-            high = scaled - (scaled - value)
-        return high, rounded(value - high)
+    def masked(bits, dtype, unsigned, mask: int, low: int):
+        if _odd(dtype):
+            # Half the cut's last bit added to the magnitude: the cut rounds to nearest.
+            bits = bits + unsigned(1 << (low - 1))
+        return bits & unsigned(mask)
 
+    def split(value) -> tuple[jax.Array, jax.Array]:
+        if bit_split and isinstance(value, np.generic | np.ndarray):
+            # A known factor still splits on the host, at the product's already promoted dtype.
+            constant = np.asarray(value)
+            unsigned, mask, low = split_bits(constant.dtype)
+            kept = masked(constant.view(unsigned), constant.dtype, unsigned, mask, low)
+            high = kept.view(constant.dtype)
+            return jnp.asarray(high), jnp.asarray(constant - high)
+        operand: jax.Array
+        (operand,) = uncontracted(value)
+        if bit_split:
+            unsigned, mask, low = split_bits(operand.dtype)
+            bits = jax.lax.bitcast_convert_type(operand, unsigned)
+            high = jax.lax.bitcast_convert_type(
+                masked(bits, operand.dtype, unsigned, mask, low), operand.dtype)
+        else:
+            splitter = (1 << 27) + 1 if operand.dtype == jnp.float64 else (1 << 12) + 1
+            scaled = operand * splitter
+            high = scaled - (scaled - operand)
+        return high, rounded(operand - high)
+
+    dtype = jnp.result_type(left, right)
+
+    def promoted(value):
+        stored = getattr(value, "dtype", None)
+        if stored == dtype:
+            return value
+        if isinstance(value, np.generic | np.ndarray):
+            return np.asarray(value, dtype)
+        return value if stored is None and jax.typeof(value).dtype == dtype else jnp.asarray(value, dtype)
+
+    # Split in the same format that rounds the product. Splitting a narrower operand at its top
+    # binade can overflow even when the product (and its split in the wider format) fits.
+    left, right = promoted(left), promoted(right)
     scale = None
-    if bit_split and _odd(jnp.result_type(left, right)):
+    if bit_split and _odd(dtype):
         # A rounded cut of the top binade's last values carries past the largest float, and two cuts
         # rounded up carry a product in the top binade past it ((2 - 2^-52) 2^511 squared, the head inf):
         # such an operand, and the larger of such a product's, is halved first, its product and residual
         # doubled back after (each exact, a power of two; train 1018's review F1).
-        top = 2.0 ** (jnp.finfo(jnp.result_type(left, right)).maxexp - 1)
+        top = 2.0 ** (jnp.finfo(dtype).maxexp - 1)
         large = jnp.abs(left * right) >= top
         larger = jnp.abs(left) >= jnp.abs(right)
         halves = [(jnp.abs(left) >= top) | (large & larger), (jnp.abs(right) >= top) | (large & ~larger)]
@@ -1704,7 +1719,7 @@ def _two_product(left, right, *, bit_split: bool, subtract: bool,
     # compiler that took its multiply into the step reading it (`product - head`, a caller's `n - product`)
     # would read the exact product there and the rounded one elsewhere, the residual then the product's
     # rounding where a caller adds it to the rounded product.
-    (product,) = uncontracted(rounded(left * right))
+    (product,) = uncontracted(rounded(jnp.asarray(left * right)))
     head = rounded(lh * rh)
     lost = rounded(product - head if subtract else head - product)
     cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
@@ -1740,6 +1755,32 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
     kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
     return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+
+
+def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax.Array:
+    """A block-scaled step's `partial` times its `row` and `column` scales, each entry in `twice_scaled`'s
+    order (the row scale first where that intermediate is normal or the partial zero, else the column's),
+    or the scales' own product first where neither intermediate is normal and it is: a subnormal row scale
+    beside a column scale near the largest (2**-128 and 2**127 of a 2.25 partial: 1.125, row 13274), which
+    a recipe's block scales may be, as no NVFP4 tensor scale is. The one rule a blockwise product's every
+    arm scales its own partials by, a kernel's step and XLA's (`mosaic_gpu._step_scaling`,
+    `xla_products.step_scaled`), whatever its codes' format (row 13291): the same partial and scales give
+    the same value in each, though a step's partial itself is each arm's (Hopper's tensor cores align
+    within a step where XLA's fp32 sum does not, docs/design/testing.md). Each order's operands are chosen
+    before they multiply, so no cotangent reaches an unchosen product; its tests are comparisons alone."""
+    tiny = jnp.finfo(partial.dtype).tiny
+
+    def normal(value):  # Not `jnp.isfinite`, which Mosaic GPU lowers none of.
+        magnitude = jnp.abs(value)
+        return (magnitude < np.inf) & (magnitude >= tiny)
+
+    kept = normal(partial * row) | (partial == 0)
+    # The first two orders' first product one multiplication by the scale `kept` chose: a kernel holds one
+    # tile of it, and where `kept` fails, the column-first intermediate whose failure joins the scales.
+    once = partial * jnp.where(kept, row, column)
+    scales = row * column
+    joined = ~normal(once) & (partial != 0) & normal(scales)
+    return jnp.where(joined, partial, once) * jnp.where(joined, scales, jnp.where(kept, column, row))
 
 
 @_protected

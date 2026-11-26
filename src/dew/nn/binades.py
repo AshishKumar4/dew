@@ -15,6 +15,7 @@ import numpy as np
 
 from .derivatives import contracted, surrogate
 from .float_bits import exact_power2, float_bits
+from .programs import holes
 
 
 def stood_in(value: jax.Array, sign: jax.Array, biased: jax.Array, fraction: jax.Array) -> jax.Array:
@@ -127,15 +128,14 @@ def as_plain(plain: Callable[..., jax.Array]) -> Callable:
     from jax.custom_derivatives import SymbolicZero
 
     def derivative(primals, tangents, value):
-        live = tuple(index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero))
-        if not live:
+        # The live tangents' mask formed once; their operands and tangents taken and refilled by it
+        # (`programs.holes`), so the plain arithmetic runs on its own moved operands (row 13279).
+        live = [not isinstance(tangent, SymbolicZero) for tangent in tangents]
+        if not any(live):
             return jnp.zeros_like(value)
-
-        def substituted(*moving):
-            given = dict(zip(live, moving, strict=True))
-            return plain(*(given.get(index, primal) for index, primal in enumerate(primals)))
-        return jax.jvp(substituted, tuple(primals[index] for index in live),
-                       tuple(tangents[index] for index in live))[1]
+        moving, fill = holes(tuple(primals), live)
+        moved, _ = holes(tuple(tangents), live, is_leaf=lambda tangent: isinstance(tangent, SymbolicZero))
+        return jax.jvp(lambda *values: plain(*fill(values)), tuple(moving), tuple(moved))[1]
     return derivative
 
 

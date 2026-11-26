@@ -68,7 +68,8 @@ class Inadmissible(Exception):
 RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power",
                          "log2_floor", "least"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
-ROUNDING_FACTS = frozenset({"plain", "counting_sum", "narrowed", "same_dtype", "int8_values"})
+ROUNDING_FACTS = frozenset({"plain", "counting_sum", "narrowed", "same_dtype", "int8_values",
+                            "exact_roundtrip"})
 """Dtype and exactness conditions, which a real identity reads nothing of."""
 
 
@@ -255,6 +256,9 @@ class Evaluated:
         if name in RANGE_FACTS:
             return MAGNITUDE
         values = [self.value(arg) for arg in args]
+        if name == "dtype":
+            # The symbolic operands are widened for solving; both sides instantiate the float32 law.
+            return "float32"
         if name == "shape":
             return tuple(values[0].shape)
         if name == "along":
@@ -864,7 +868,8 @@ def test_every_dtype_fact_matches_jax_traced_output_dtype():
         sel = jnp.where(cmp, neg, bcast)
         clamped = lax.clamp(jnp.float32(-1.0), sel, jnp.float32(1.0))
         prod = lax.dot_general(x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
-        return clamped, fin, prod
+        bits = lax.bitcast_convert_type(cast_x, jnp.uint32)
+        return clamped, fin, prod, bits
 
     x0 = jax.ShapeDtypeStruct((4, 8), jnp.bfloat16)
     w0 = jax.ShapeDtypeStruct((8, 4), jnp.bfloat16)

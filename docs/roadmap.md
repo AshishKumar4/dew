@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13257]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010, 12426]
 - The kernel challenge's lessons in the templates. [5271, 3611]
@@ -16,7 +16,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Cached and block visibility on the template's spans. [245]
 - Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
-- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
+- The template beats FA2 and FA3, its resources the model's. [1299, 13288, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
 - Convolution repairs above their owner. [5665]
@@ -25,6 +25,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
+- The cold 4B start's search cannot read which remat frees its miss. [13304]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -46,6 +47,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
+- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 
 ## Models and interop
 
@@ -81,6 +83,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [579, 886, 729, 605]
+- A speculative block's replay into a block drafter's cache (strategies.block_step -> DecodeOps.record, sampling/strategies.py:1127-1138) has no witness. [13317]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]

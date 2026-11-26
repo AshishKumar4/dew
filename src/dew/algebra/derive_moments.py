@@ -585,6 +585,9 @@ def _moment_centered(summed, zero) -> list:
              eq(shape(dx)).to(shape(x))).then(masked_centered(dx, x, s, n, mask, a, i64(1))),
         rule(eq(dx).to(mu.binary(String("sub"), x, p)), masked_mean_lifted(mu, s, n, x, mask, a),
              eq(shape(dx)).to(shape(x))).then(masked_centered(dx, x, s, n, mask, a, i64(-1))),
+        rule(eq(t).to(mask.select(z, dx)), eq(pair).to(t.unary(String("square"), p)),
+             boolean(mask), zero(z), masked_centered(dx, x, sx, n, mask, a, sign)).then(
+            masked_weighted_central(pair, sx, sx, n, x, x, mask, z, a, i64(1))),
         rule(eq(pair).to(dx.unary(String("square"), p)), centered(dx, x, sx, n, w, a, sign)).then(
             centered_pair(pair, sx, sx, n, x, x, w, a, i64(1))),
         rule(eq(pair).to(dx.unary(String("integer_pow"), p)), is_square(p),

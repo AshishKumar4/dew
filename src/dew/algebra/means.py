@@ -49,9 +49,19 @@ from jax.interpreters import ad
 
 from dew.algebra import scaled
 from dew.algebra.ratios import Ratio, _ratio_sum, ratio
-from dew.algebra.windows import Units, _arrays, _laid_to, _landed, _quotient, _streamed, _Sum, _without_axis
+from dew.algebra.windows import (
+    Units,
+    _arrays,
+    _laid_to,
+    _landed,
+    _quotient,
+    _streamed,
+    _Sum,
+    _units_scale,
+    _without_axis,
+)
 from dew.nn.derivatives import contracted
-from dew.nn.precision import two_product, two_sum
+from dew.nn.precision import at_least_fp32, power2, two_product, two_sum
 
 
 def _laid(array: jax.Array, like: jax.Array) -> jax.Array:
@@ -76,9 +86,10 @@ def _unsettled(totals, anchors, axis: int) -> jax.Array:
     (anchors common to the states beside totals of a batch, or the other way)."""
     laid = jnp.broadcast_shapes(jnp.shape(totals), jnp.shape(anchors))
     totals, anchors = jnp.broadcast_to(totals, laid), jnp.broadcast_to(anchors, laid)
-    return _joined_anchor(jnp.max(jnp.where(_mass(totals)[0], anchors, -jnp.inf), axis=axis, keepdims=True),
-                          jnp.max(jnp.where(jnp.isfinite(anchors), anchors, -jnp.inf), axis=axis,
-                                  keepdims=True))
+    available = jnp.where(jnp.isfinite(anchors), anchors, -jnp.inf)
+    return _joined_anchor(
+        jnp.max(jnp.where(holding(totals), available, -jnp.inf), axis=axis, keepdims=True),
+        jnp.max(available, axis=axis, keepdims=True))
 
 
 def _joined_anchor(massive: jax.Array, finite: jax.Array) -> jax.Array:
@@ -130,10 +141,9 @@ def _weights(totals, anchors, joined):
     """Each state's weight given the `joined` anchor (`_weighed`'s): where it holds mass, its total and its
     anchor as the law weighs them (a state at a time, so a chunk's are its own, `merged_state_chunked`)."""
     holds, weighed = _mass(totals)
-    placed = holds | jnp.isfinite(anchors)
-    totals = jnp.where(weighed, totals, 0.0)
-    totals = jnp.where(placed, totals, jax.lax.stop_gradient(totals))
-    return holds, totals, jnp.where(placed, anchors, joined), joined
+    present = jnp.isfinite(anchors)
+    return (holds & present, jnp.where(weighed & present, totals, 0.0),
+            jnp.where(present, anchors, joined), joined)
 
 
 
@@ -195,7 +205,7 @@ def merged_total(totals: jax.Array, anchors: jax.Array, units: Units,
     total past the format's least, as no anchor of the format holds it."""
     axis = axis % totals.ndim
     unsettled = _unsettled(totals, anchors, axis)
-    _, totals, anchors, joined = _weighed(totals, anchors, axis)
+    _, totals, anchors, joined = _weights(totals, anchors, _settled(unsettled))
     form = _total_form(axis, units)
     # The masses' sum at the joined anchor as the total sums and lands it (`_ratio_sum`), the one sum the
     # landing reads: a sequential rounded sum lost three masses of 2^102 beside the format's largest the
@@ -241,27 +251,40 @@ def _landing(units: Units, joined: jax.Array, masses, axis: int) -> jax.Array:
     high, low, exponent = masses
     landed = scaled.scaled(high + low)
     binade = jnp.expand_dims(exponent + landed.exponent, axis)
-    largest = scaled.format_of(joined.dtype).largest
-    shift = jnp.maximum(binade - largest, 0).astype(joined.dtype)
+    dtype = at_least_fp32(joined.dtype)
+    limits = jnp.finfo(joined.dtype)
+    largest = limits.maxexp - 1
+    significand = jnp.expand_dims(jnp.abs(landed.significand), axis)
+    shift = jnp.maximum(binade - largest, 0).astype(dtype)
+    if joined.dtype != dtype:
+        # Check the actual destination rounding, including a residual beside the overflow midpoint.
+        overflows = jnp.expand_dims(jnp.isinf(_landed(masses, joined.dtype)), axis)
+        shift = jnp.where((binade == largest) & overflows, 1, shift)
     # The least anchor of the format at or past `joined + move / s`, the joined anchor and the move formed
     # together in the units' own scale (`s` times an anchor) as one exact double float (`two_product`,
     # `two_sum`), its quotient by `s` stepped one place up where an exact product shows it short: formed
     # apart, a move past the format overflowed beside an anchor far beneath it (64 totals of 2^127 at
     # -2^127, a scale of 2^-126: +2^127 holds them; the merge P0's base review 10, F2), and an anchor at 2^30
     # moves one place, 128, as its sum needs (any further, its mass underflowed).
-    scale = np.asarray(units.scale, joined.dtype)
-    split = joined.dtype == jnp.float32
-    start, start_error = two_product(joined, scale, bit_split=split)
-    ln2 = np.asarray(math.log(2), joined.dtype)
-    significand = jnp.expand_dims(jnp.abs(landed.significand), axis)
-    least = (jnp.log(significand) + np.asarray(2.0 ** -16, joined.dtype)
-             - np.asarray(np.log(float(jnp.finfo(joined.dtype).max) / 2.0 ** largest), joined.dtype))
+    coefficient, power = _units_scale(units, dtype)
+    scale = np.asarray(coefficient, dtype)
+    split = dtype == jnp.float32
+
+    def in_units(anchor):
+        work = anchor.astype(dtype)
+        return power2(work, power) if power else work
+
+    start, start_error = two_product(in_units(joined), scale, bit_split=split)
+    ln2 = np.asarray(math.log(2), dtype)
+    least = (jnp.log(significand) + np.asarray(2.0 ** -16, dtype)
+             - np.asarray(np.log(float(limits.max) / 2.0 ** largest), dtype))
 
     def landed_at(move):
         high, low = two_sum(start, move)
         low = low + start_error
-        candidate = (high + low) / scale
-        product, residual = two_product(candidate, scale, bit_split=split)
+        rounded = (high + low) / scale
+        candidate = (power2(rounded, -power) if power else rounded).astype(joined.dtype)
+        product, residual = two_product(in_units(candidate), scale, bit_split=split)
         short = (product - high) + (residual - low) < 0
         return jnp.where(short, jnp.nextafter(candidate, np.asarray(np.inf, joined.dtype)), candidate)
 
@@ -304,9 +327,10 @@ def merged_state_chunked(load, chunks: int, units: Units, axis: int):
     def joining(c, carry):
         joined, finite, least, most, held = carry
         outputs, totals, anchors, valid = load(c)
-        mass_holds = _mass(totals)[0]
-        holds = mass_holds if valid is None else valid & mass_holds
-        finite_anchor = jnp.isfinite(anchors) if valid is None else valid & jnp.isfinite(anchors)
+        finite_anchor = jnp.isfinite(anchors)
+        if valid is not None:
+            finite_anchor = valid & finite_anchor
+        holds = finite_anchor & holding(totals)
         laid = _laid(holds, outputs)
         return (jnp.maximum(joined, jnp.max(jnp.where(holds, anchors, -jnp.inf), axis=axis, keepdims=True)),
                 jnp.maximum(finite, jnp.max(jnp.where(finite_anchor, anchors, -jnp.inf),

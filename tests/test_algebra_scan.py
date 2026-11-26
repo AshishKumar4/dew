@@ -916,6 +916,75 @@ def test_equal_reader_scales_keep_their_own_dtypes_and_query_cotangents():
             np.testing.assert_array_equal(np.asarray(gradient), np.full((1, 1), 0.5, np.float32))
 
 
+@pytest.mark.parametrize("reads", ["before", "after"])
+@pytest.mark.parametrize("large", ["reader", "state"])
+def test_a_prepared_chunk_keeps_a_subnormal_read_scale_until_the_state_contraction(reads, large):
+    def read(h, q, b, v, g):
+        return np.float32(2.0 ** -128) * (q @ h)
+
+    declaration = scan.Scan(scalar_step, read, SCALAR_SSD, walked="time", state=((1, 1), jnp.float32),
+                            reads=reads)
+    forms = scan.derive_scan(declaration, saturation=SATURATION)
+    giant = np.float32(2.0 ** 127)
+    reader = np.full((2, 1), giant if large == "reader" else 1, np.float32)
+    memory = np.full((1, 1), giant if large == "state" else 1, np.float32)
+    cotangent = np.full_like(reader, 2.0 ** 126)
+
+    def run(q, h):
+        chunk = {"q": q, "b": jnp.zeros_like(q), "v": jnp.zeros_like(q), "g": jnp.zeros(2, q.dtype)}
+        state = (jnp.asarray(0, q.dtype), h)
+        prepared = forms.prepare(chunk)
+        _, held = forms.step(state, prepared)
+        mapped = forms.mapped(prepared, state, held)
+        replayed, _ = forms.replay(chunk, h)
+        return mapped, replayed
+
+    @jax.jit
+    def orders(q, h, ct):
+        outputs, pull = jax.vjp(run, q, h)
+        zero = jnp.zeros_like(ct)
+        return outputs, (pull((ct, zero)), pull((zero, ct)))
+
+    outputs, pullbacks = orders(reader, memory, cotangent)
+    for output, (dq, dh) in zip(outputs, pullbacks, strict=True):
+        np.testing.assert_array_equal(output, np.full_like(reader, 0.5))
+        np.testing.assert_array_equal(dq, np.broadcast_to(memory * 0.25, reader.shape))
+        np.testing.assert_array_equal(dh, reader[:1] * 0.5)
+
+
+def test_a_tiny_prepared_reader_leaves_a_steep_decays_factors_on_the_state():
+    def step(h, q, b, v, g):
+        return jax.lax.exp2(g) * h + jnp.outer(b, v)
+
+    def read(h, q, b, v, g):
+        return np.float32(2.0 ** -128) * (q @ h)
+
+    declaration = scan.Scan(step, read, SCALAR_SSD, walked="time", state=((1, 1), jnp.float32))
+    forms = scan.derive_scan(declaration, saturation=SATURATION)
+
+    @jax.jit
+    def run(q, h, g):
+        chunk = {"q": q, "b": jnp.zeros_like(q), "v": jnp.zeros_like(q), "g": g}
+        state = (jnp.zeros((), q.dtype), h)
+        prepared = forms.prepare(chunk)
+        leaving, kept = forms.step(state, prepared)
+        replayed, replayed_state = forms.replay(chunk, h)
+        cotangent = jnp.full_like(replayed, 2.0 ** 126)
+        dh, grads = forms.backward(chunk, state, jnp.zeros_like(h), cotangent)
+        return (forms.mapped(prepared, state, kept), leaving[1], replayed, replayed_state, dh, grads["q"])
+
+    giant = np.float32(2.0 ** 127)
+    rows = np.full((2, 1), giant, np.float32)
+    memory = np.full((1, 1), giant, np.float32)
+    output, leaving, replayed, replayed_state, dh, dq = run(rows, memory, np.asarray([-149.5, 0], np.float32))
+    for values in (output, replayed):
+        np.testing.assert_array_equal(values, np.full((2, 1), np.float32(2.0 ** -23.5)))
+    for state in (leaving, replayed_state):
+        np.testing.assert_array_equal(state, np.full((1, 1), np.float32(2.0 ** -22.5)))
+    np.testing.assert_array_equal(dh, np.full((1, 1), np.float32(2.0 ** -23.5)))
+    np.testing.assert_array_equal(dq, np.full((2, 1), np.float32(2.0 ** -24.5)))
+
+
 def ones_chunk(g, dtype=jnp.float32):
     """A chunk of unit readers, keys and writes at log decays `g`."""
     tokens = g.shape[0]
@@ -1805,6 +1874,104 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
         forms = scan.derive_scan(base2, saturation=SATURATION)
         outputs = forms.mapped(forms.prepare(values), forms.init({}))
     assert float(outputs[reader, 0]) == 2.0 ** 126
+
+
+@pytest.mark.parametrize("crossed", [False, True], ids=["cancelling", "crossed-key"])
+def test_a_portable_per_key_pair_keeps_the_finite_sum_and_left_adjoint(crossed):
+    from dew.nn.precision import FP32_SUMS
+
+    left = np.asarray([[np.inf if crossed else 2.0 ** 127, 1 if crossed else 2.0 ** 127]], np.float32)
+    right = np.asarray([[1, 1] if crossed else [2, -2]], np.float32)
+    decays = np.asarray([[[-0.0 if crossed else 1.0, 1.0]]], np.float32)
+    direction = np.asarray([[0, 1]] if crossed else [[1, 0]], np.float32)
+
+    def orders(a, b, d, da):
+        def pair(x):
+            return scan._paired(x, b, d).sum()
+
+        result, tangent = jax.jvp(pair, (a,), (da,))
+        return result, tangent, jax.grad(pair)(a)
+
+    with jax.default_matmul_precision(FP32_SUMS):
+        result, tangent, adjoint = jax.jit(orders)(left, right, decays, direction)
+    assert float(result) == (1 if crossed else 0)
+    assert float(tangent) == (1 if crossed else 2)
+    np.testing.assert_array_equal(adjoint, [[0, 1]] if crossed else [[2, -2]])
+
+
+def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land():
+    row = np.ones((2, 1), np.float32)
+    keys = np.asarray([[2.0 ** 127], [-2.0 ** 127]], np.float32)
+    decay = np.asarray([[[1.0], [-0.0]], [[1.0], [1.0]]], np.float32)
+    cotangent = np.asarray([[0, 0], [2, 2]], np.float32)
+
+    @jax.jit
+    def pull(q, k, factors, ct):
+        _, back = jax.vjp(lambda x: scan._portable_pairs(x, k, factors, None), q)
+        return back(ct)[0]
+
+    np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
+
+
+@pytest.mark.parametrize("side", ["reader", "state"])
+def test_a_subnormal_read_scale_keeps_the_primal_and_pullback_in_range(side):
+    scale = np.float32(2.0 ** -128)
+    giant = np.float32(2.0 ** 127)
+    reader = np.asarray([giant if side == "reader" else 1], np.float32)
+    state = np.asarray([[giant if side == "state" else 1]], np.float32)
+    cotangent = np.asarray([giant], np.float32)
+
+    def read(q, h):
+        return scan._read(h, q, values_read=False, scale=scale)
+
+    def orders(q, h, ct):
+        out, pull = jax.vjp(read, q, h)
+        moved = jax.jvp(lambda q: read(q, h), (q,), (ct,))[1]
+        mixed = jax.jvp(lambda h: jax.grad(lambda x: (read(x, h) * ct).sum())(q), (h,), (ct[:, None],))[1]
+        return out, pull(ct), moved, mixed
+
+    out, (dq, dh), moved, mixed = jax.jit(orders)(reader, state, cotangent)
+    np.testing.assert_array_equal(out, [0.5])
+    np.testing.assert_array_equal(dq, state[:, 0] * 0.5)
+    np.testing.assert_array_equal(dh, reader[:, None] * 0.5)
+    np.testing.assert_array_equal(moved, state[:, 0] * 0.5)
+    np.testing.assert_array_equal(mixed, [2.0 ** 126])
+
+
+def test_a_mixed_width_subnormal_read_uses_the_first_multiply_dtype_for_admission():
+    scale = np.float32(2.0 ** -149)
+
+    def read(q, h):
+        return scan._read(h, q, values_read=False, scale=scale)
+
+    def orders(q, h, cotangent):
+        value, pull = jax.vjp(read, q, h)
+        return value, pull(cotangent)
+
+    with jax.enable_x64():
+        inputs = (np.asarray([0.25], np.float32), np.asarray([[2.0 ** 127]], np.float64),
+                  np.asarray([2.0 ** 100], np.float64))
+        value, (dq, dh) = jax.jit(orders)(*inputs)
+    assert value.dtype == jnp.float64
+    np.testing.assert_array_equal(value, [2.0 ** -24])
+    np.testing.assert_array_equal(dq, [2.0 ** 78])
+    np.testing.assert_array_equal(dh, [[2.0 ** -51]])
+
+
+def test_a_rank_one_subnormal_read_keeps_the_explicit_value_axis():
+    from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec, use_abstract_mesh
+
+    mesh = AbstractMesh((2,), ("value",), axis_types=(AxisType.Explicit,))
+    whole = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec()))
+    values = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec("value")))
+
+    def read(q, left, right):
+        return scan._read((left, right), q, values_read=False, scale=np.float32(2.0 ** -128))
+
+    with use_abstract_mesh(mesh):
+        out = jax.eval_shape(read, whole, whole, values)
+    assert out.shape == (4,)
+    assert out.sharding == values.sharding
 
 
 DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}

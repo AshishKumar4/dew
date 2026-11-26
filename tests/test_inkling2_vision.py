@@ -140,3 +140,190 @@ def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
     for given in ({**single, 'image_grid_thw': np.asarray([[1]])}, single):
         with pytest.raises(ValueError):
             processor.from_hf(given)
+
+
+def _bundle_with_tokenizer(directory):
+    """The vision bundle beside a word-level tokenizer whose image placeholder is the bundle's
+    (`IMAGE_TOKEN`), as the release's tokenizer holds `<|unused_200054|>`."""
+    import shutil
+
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    for path in BUNDLE.glob('*'):
+        shutil.copy(path, directory / path.name)
+    vocabulary = {'[PAD]': 0, **{f'w{index}': index + 1 for index in range(10)}, '<|image|>': IMAGE_TOKEN}
+    backend = Tokenizer(models.WordLevel(vocabulary, unk_token='[PAD]'))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, pad_token='[PAD]', unk_token='[PAD]',
+                                        additional_special_tokens=['<|image|>'])
+    tokenizer.save_pretrained(directory)
+    return directory
+
+
+def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_them(tmp_path):
+    """Inkling 2's release names `Inkling2Processor`, which no transformers Dew supports ships: Dew's own
+    (`dew.interop.inkling_media`, chosen by its model type whatever processor files the release ships)
+    pads, standardizes and cuts raw images (an RGB one of no whole merged tokens, an RGBA one over its
+    checkerboard, one of whole tokens) into the merged blocks and grids transformers' records, bit for bit;
+    and a public raw-image call (`Pretrained.processor`) lays a prompt around an image out as the model
+    reads the reference's fields (`Processor.from_hf`), each placeholder as many as the image's merged
+    tokens (row 13251)."""
+    from tool_support import run_from
+
+    from dew.interop.inkling_media import InklingProcessor
+
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    processor = loaded.processor._media_reference
+    assert isinstance(processor, InklingProcessor)
+    with np.load(BUNDLE / 'recorded_processor.npz') as recorded:
+        expected = {name: recorded[name] for name in recorded.files if not name.endswith('provenance')}
+    with run_from('inkling2_fixture', 'tools') as module:
+        images = module.processor_draws()
+    for name, image in images.items():
+        fields = processor(text='w1 <|image|>', images=[image])
+        for field in ('pixel_values', 'image_grid_thw'):
+            np.testing.assert_array_equal(fields[field], expected[f'{name}.{field}'],
+                                          err_msg=f'{name} {field}')
+    image = images['rgb']
+    rows, columns = expected['rgb.image_grid_thw'][0, 1:]
+    ids = np.asarray([[2, *[IMAGE_TOKEN] * int(rows * columns), 3]], np.int64)
+    read = loaded.processor('w1 <|image|> w2', images=[image])
+    reference = loaded.processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
+                                          'pixel_values': expected['rgb.pixel_values'],
+                                          'image_grid_thw': expected['rgb.image_grid_thw']})
+    np.testing.assert_array_equal(np.asarray(read.tokens), ids)
+    for name, value in reference.conditioning.items():
+        np.testing.assert_array_equal(np.asarray(read.conditioning[name]), np.asarray(value), err_msg=name)
+    # The same image as a file's path and as its encoded bytes, loaded as transformers loads them.
+    from PIL import Image
+
+    stored = tmp_path / 'image.png'
+    Image.fromarray(image).save(stored)
+    for given in (stored, [stored], stored.read_bytes()):
+        held = loaded.processor('w1 <|image|> w2', images=given)
+        for name, value in reference.conditioning.items():
+            np.testing.assert_array_equal(np.asarray(held.conditioning[name]), np.asarray(value),
+                                          err_msg=f'{type(given).__name__} {name}')
+
+
+def _media_reader(tmp_path):
+    """The public processor of a bundle with a tokenizer and Inkling 2's processor, and its read of one
+    image (each conditioning field as an array), with a transparent RGBA image `[16, 24]` it reads."""
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    rgba = np.zeros((16, 24, 4), np.uint8)
+    rgba[4:12, 8:16] = (200, 30, 90, 255)
+
+    def read(given):
+        return {name: np.asarray(value) for name, value in
+                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
+    return loaded, rgba, read
+
+
+def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
+    """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
+    (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
+    answers 404 and a redirect off HTTP (to FTP, which a read could not hold to its deadline) are each
+    refused by name, and so is a body past the cap a read holds it to (`opened`'s `url_bytes`)."""
+    import http.server
+    import threading
+
+    from PIL import Image
+
+    from dew.interop.inkling_media import opened
+
+    _, rgba, read = _media_reader(tmp_path)
+    served = tmp_path / 'served'
+    served.mkdir()
+    Image.fromarray(rgba).save(served / 'transparent.png')
+
+    class Served(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(served), **kwargs)
+
+        def do_GET(self):
+            if self.path == '/elsewhere.png':
+                self.send_response(302)
+                self.send_header('Location', 'ftp://127.0.0.1/transparent.png')
+                self.end_headers()
+                return
+            super().do_GET()
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Served)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
+        for field, value in fetched.items():
+            np.testing.assert_array_equal(value, stored[field], err_msg=field)
+        for refused, named in (('missing.png', 'HTTP 404'), ('elsewhere.png', 'HTTP 302')):
+            with pytest.raises(ValueError) as refusal:
+                read(f'{url}/{refused}')
+            assert named in str(refusal.value), refusal.value
+        size = (served / 'transparent.png').stat().st_size
+        assert opened(f'{url}/transparent.png', url_bytes=size).size == (24, 16)
+        with pytest.raises(ValueError) as refusal:
+            opened(f'{url}/transparent.png', url_bytes=size - 1)
+        assert f'past {size - 1} bytes' in str(refusal.value), refusal.value
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path):
+    """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule), and a JPEG
+    turned by its EXIF orientation reads upright, whether the image is given through the public processor
+    as a PIL image, its encoded bytes, its file's path, a data URI (one past a path's length too) or
+    line-wrapped base64: transformers' `load_image` converts a
+    path's image to RGB first, its transparent pixels black (row 13341). A tokenizer padding a side that is
+    neither is refused (row 13342)."""
+    import base64
+
+    from PIL import Image
+
+    from dew.interop.inkling_media import InklingProcessor
+
+    loaded, rgba, read = _media_reader(tmp_path)
+    transparent = tmp_path / 'transparent.png'
+    Image.fromarray(rgba).save(transparent)
+    turned = tmp_path / 'turned.jpg'
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation: the stored image turned a quarter, read upright.
+    drawn = np.random.default_rng(13341).integers(0, 256, (16, 40, 3), np.uint8)
+    Image.fromarray(drawn).save(turned, exif=exif)
+
+    for stored, kind in ((transparent, 'png'), (turned, 'jpeg')):
+        encoded = stored.read_bytes()
+        with Image.open(stored) as image:
+            image.load()
+            forms = {'PIL': read(image), 'bytes': read(encoded), 'path': read(stored),
+                     'data URI': read(f'data:image/{kind};base64,{base64.b64encode(encoded).decode()}'),
+                     'wrapped base64': read(base64.encodebytes(encoded).decode())}
+        for name in ('bytes', 'path', 'data URI', 'wrapped base64'):
+            for field, value in forms[name].items():
+                np.testing.assert_array_equal(value, forms['PIL'][field],
+                                              err_msg=f'{stored.name} {name} {field}')
+    # A data URI longer than a path may be (an image of 64x64 noise, its PNG past 4 KiB).
+    large = tmp_path / 'large.png'
+    Image.fromarray(np.random.default_rng(13342).integers(0, 256, (64, 64, 4), np.uint8)).save(large)
+    inline = f'data:image/png;base64,{base64.b64encode(large.read_bytes()).decode()}'
+    assert len(inline) > 4096
+    path_read = read(large)
+    for field, value in read(inline).items():
+        np.testing.assert_array_equal(value, path_read[field], err_msg=f'large data URI {field}')
+    blacked = read(rgba[..., :3])
+    assert any(not np.array_equal(blacked[field], value) for field, value in read(transparent).items())
+    upright = read(np.asarray(Image.open(turned).transpose(Image.Transpose.ROTATE_270)))
+    for field, value in read(turned).items():
+        np.testing.assert_array_equal(value, upright[field], err_msg=field)
+    media = loaded.processor._media_reference
+    assert isinstance(media, InklingProcessor)
+    media.tokenizer.padding_side = 'middle'
+    with pytest.raises(ValueError):
+        loaded.processor('w1 <|image|>', images=[rgba])

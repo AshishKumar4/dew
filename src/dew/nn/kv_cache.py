@@ -581,9 +581,8 @@ def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
     """Refuse a paged pool that cannot give each of `rows` rows its whole `capacity`.
 
     Writing through the default page tables, as generation does, needs a private
-    block of pages per row. checkify cannot carry a device check into a layer's
-    shard_map (jax-ml/jax#40907), so the shapes decide it here, before any
-    write.
+    block of pages per row; the shapes decide it here, before any write, where
+    no device check is spent on it.
     """
     if layout.page_size is None or layout.pages is None:
         return

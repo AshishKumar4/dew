@@ -20,8 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
-from dew.nn.float_bits import raised_exactly
+from dew.nn.float_bits import quiet_nan, raised_exactly, raw_fields
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
@@ -753,13 +754,12 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx_registers`,
     where inline assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed
     2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing
-    lane); E4M3's two
-    NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
-    decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
+    lane). E4M3's two NaN codes, 0x7F and 0xFF, retain their sign with a quiet NaN payload, as the cast
+    does. The linear fields alone would read them as 480 and -480 (the review of 3580, F1)."""
     held = codes.astype(jnp.uint32)
     (pattern,) = E4M3_SCALE_FORM.traced(held)
     value = raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
-    return jnp.where(held & 0x7F == 0x7F, jnp.float32(jnp.nan), value)
+    return jnp.where(held & 0x7F == 0x7F, quiet_nan((held & np.uint32(0x80)) != 0, jnp.float32), value)
 
 
 E8M0_SCALE_FORM = BitForm(
@@ -884,7 +884,8 @@ def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
         if inf_code > minifloat.largest:
             inf = jax.lax.bitcast_convert_type(sign | word(0x7F800000), jnp.float32)
             value = jnp.where(magnitude == word(inf_code), inf, value)
-        value = jnp.where(magnitude > word(max(minifloat.largest, inf_code)), jnp.float32(jnp.nan), value)
+        nan = magnitude > word(max(minifloat.largest, inf_code))
+        value = jnp.where(nan, quiet_nan(sign != 0, jnp.float32), value)
     return value
 
 
@@ -983,6 +984,22 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
+def _encoded_amax(value, magnitude):
+    return jax.lax.bitcast_convert_type(jnp.max(magnitude), value.dtype)
+
+
+def _amax_tangent(primals, tangents):
+    value, magnitude = primals
+    moved, _ = tangents
+    # Only the value needs the raw-word rule. The floating max keeps its original tie pullback.
+    _, tangent = jax.jvp(lambda value: jnp.max(jnp.abs(value)), (value,), (moved,))
+    return _nvfp4_amax(value, magnitude), tangent
+
+
+_nvfp4_amax = contracted("test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative")(
+    declared_tangent(Protected(), _encoded_amax, _amax_tangent))
+
+
 def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
     """NVFP4's tensor scale of a tensor whose largest magnitude is `largest` (`nvfp4_coded`'s rule): it over
     6 * 448, at least fp32's least normal, 1 where it is zero, each quotient IEEE fp32 division's
@@ -991,7 +1008,9 @@ def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
     quotient = correctly_rounded_divide if quotient is None else quotient
     least_normal = np.float32(np.finfo(np.float32).tiny)
     over = quotient(largest, np.float32(E2M1_MAX * E4M3_MAX))
-    return jnp.where(largest > 0, jnp.maximum(over, least_normal), np.float32(1))
+    held, _, _, _ = raw_fields(largest)
+    positive = (held != 0) & (held <= np.asarray(np.inf, largest.dtype).view(held.dtype))
+    return jnp.where(positive, jnp.maximum(over, least_normal), np.float32(1))
 
 
 def nvfp4_given_scale(tensor) -> jax.Array:
@@ -1028,10 +1047,16 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
             return correctly_rounded_divide(numerator, denominator)
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
-    magnitude = jnp.abs(x)
-    tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
-              else nvfp4_given_scale(tensor))
-    blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    # Unsigned IEEE magnitudes are ordered as integers, including subnormals on an FTZ backend.
+    words, sign, _, _ = raw_fields(x)
+    magnitude = words ^ sign
+    if tensor is None:
+        largest = _nvfp4_amax(x, magnitude)
+        tensor = nvfp4_tensor_scale(largest, quotient)
+    else:
+        tensor = nvfp4_given_scale(tensor)
+    block_words = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    blocks = jax.lax.bitcast_convert_type(block_words, x.dtype)
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 

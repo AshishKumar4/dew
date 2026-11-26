@@ -175,17 +175,32 @@ class _Scope(NamedTuple):
 
 
 def _holds_retained_object(value) -> bool:
-    """Whether `value` contains a concrete `jax.Array` or an identity-pinning `_cache.Same` wrapper
-    (checked before storing a trace context in `_STRUCTURAL_CLOSED`)."""
-    if isinstance(value, (jax.Array, _cache.Same)):
-        return True
-    if isinstance(value, (tuple, list, frozenset, set)):
-        return any(_holds_retained_object(part) for part in value)
-    if isinstance(value, Mapping):
-        return any(_holds_retained_object(k) or _holds_retained_object(v) for k, v in value.items())
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return any(_holds_retained_object(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return False
+    """Whether a trace key would keep an array or an identity-pinned object alive."""
+    visited: dict[int, object] = {}
+
+    def contains(part) -> bool:
+        # A scope repeats large trees of immutable option values. Do not ask the ABC and
+        # dataclass machinery about each scalar, or traverse a shared subtree twice.
+        kind = type(part)
+        if kind in (str, int, float, bool, bytes, type(None)):
+            return False
+        if isinstance(part, (jax.Array, _cache.Same)):
+            return True
+        identity = id(part)
+        if identity in visited:
+            return False
+        if isinstance(part, (tuple, list, frozenset, set)):
+            visited[identity] = part
+            return any(map(contains, part))
+        if isinstance(part, Mapping):
+            visited[identity] = part
+            return any(contains(k) or contains(v) for k, v in part.items())
+        if dataclasses.is_dataclass(part) and not isinstance(part, type):
+            visited[identity] = part
+            return any(contains(getattr(part, field.name)) for field in dataclasses.fields(part))
+        return False
+
+    return contains(value)
 
 
 def _scope_for(accurate: bool, saturation: Saturation, kernels: bool) -> _Scope:
@@ -207,8 +222,10 @@ def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     beside the regions' own (`report.record_pass`): where both entries run it, a jit's trace at the compile
     point (`rewritten_program`) and a function's own (`rewritten`'s `rewrite`)."""
     began = time.perf_counter()
-    scope = _scope_for(accurate, saturation, kernels)
-    made = _rewritten(closed, accurate, saturation, kernels, _scope=scope)
+    made = closed
+    if closed.eqns:
+        scope = _scope_for(accurate, saturation, kernels)
+        made = _rewritten(closed, accurate, saturation, kernels, _scope=scope)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
@@ -333,10 +350,10 @@ def structure_of(invars: Sequence[jcore.Var], eqns: Sequence[jcore.JaxprEqn],
     for equation in eqns:
         primitive, params = equation.primitive, equation.params
         signature: Hashable = terms.parameters_key(primitive, params)
-        if (primitive is jax.lax.dot_general_p
-                and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
-            # Empty operand meshes do not imply that the dot was traced outside an explicit scope.
-            signature = (signature, terms.unplaced_dot(equation))
+        if (primitive is jax.lax.convert_element_type_p or (primitive is jax.lax.dot_general_p
+                and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32)):
+            # Empty operand meshes do not imply a site was traced outside an explicit scope.
+            signature = (signature, terms.unplaced_equation(equation))
         equations.append((signature,
                           tuple(map(operand, equation.invars)),
                           tuple(terms.parameter_key(var.aval) for var in equation.outvars)))
@@ -551,14 +568,25 @@ def _window_clusters(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.V
     owners: dict[int, set[int]] = {}
     capped: set[int] = set()
     for head in heads:
-        window, frontier = {id(head): head}, [(head, 0)]
+        window, frontier = {id(head): head}, [(head, WINDOW)]
         while frontier:
-            equation, depth = frontier.pop()
-            for atom in equation.invars:
-                operand = maker(atom)
-                if operand is not None and depth + 1 < WINDOW and id(operand) not in window:
-                    window[id(operand)] = operand
-                    frontier.append((operand, depth + 1))
+            equation, levels = frontier.pop()
+            # A round trip needs both casts and its narrow producer's local witnesses. Do not grow
+            # unrelated windows; the extra look-through applies only along the written pair.
+            if (equation.primitive is jax.lax.convert_element_type_p and len(window) < CLUSTER
+                    and (wide := maker(equation.invars[0])) is not None
+                    and (source := terms.cast_roundtrip_source(equation, wide)) is not None):
+                window.setdefault(id(wide), wide)
+                if (len(window) < CLUSTER and (origin := maker(source)) is not None
+                        and id(origin) not in window):
+                    window[id(origin)] = origin
+                    frontier.append((origin, WINDOW))
+            if levels > 1:
+                for atom in equation.invars:
+                    operand = maker(atom)
+                    if operand is not None and id(operand) not in window and len(window) < CLUSTER:
+                        window[id(operand)] = operand
+                        frontier.append((operand, levels - 1))
         if head.primitive is jax.lax.div_p:
             _pull_reuse_siblings(head, maker, rsqrts, reciprocals, fma_readers, window)
         _merge_cluster(live_clusters, owners, capped, window)
@@ -667,8 +695,8 @@ def _reuse_siblings(
     jaxpr: jcore.Jaxpr, heads: Sequence[jcore.JaxprEqn],
 ) -> tuple[dict[jcore.Var, list[jcore.JaxprEqn]], dict[jcore.Var, list[jcore.JaxprEqn]],
            dict[jcore.Var, list[jcore.JaxprEqn]]]:
-    """Index sibling `rsqrt(v)`, `1 / y`, and immediate FMA-eligible `add`/`sub` consumers in `jaxpr`
-    when any window head is a division."""
+    """Index sibling reciprocal roots, both spellings of reciprocal, and immediate FMA-eligible
+    add/sub consumers in jaxpr when any window head is a division."""
     rsqrts: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
     reciprocals: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
     fma_readers: dict[jcore.Var, list[jcore.JaxprEqn]] = {}
@@ -680,6 +708,9 @@ def _reuse_siblings(
             elif (equation.primitive is jax.lax.div_p and isinstance(equation.invars[1], jcore.Var)
                   and _is_unit_literal(equation.invars[0])):
                 reciprocals.setdefault(equation.invars[1], []).append(equation)
+            elif (equation.primitive is jax.lax.integer_pow_p and equation.params["y"] == -1
+                  and isinstance(equation.invars[0], jcore.Var)):
+                reciprocals.setdefault(equation.invars[0], []).append(equation)
             elif equation.primitive is jax.lax.add_p:
                 for atom in equation.invars:
                     if isinstance(atom, jcore.Var) and atom in div_outs:
@@ -690,7 +721,7 @@ def _reuse_siblings(
     return rsqrts, reciprocals, fma_readers
 
 
-_REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p)
+_REUSE_MAKERS = (jax.lax.max_p, jax.lax.add_p, jax.lax.reduce_sum_p, jax.lax.clamp_p)
 
 
 def _pull_reuse_siblings(head: jcore.JaxprEqn, maker: Callable,
@@ -803,7 +834,7 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
 
 def dtype_parameter(region: terms.Region, index: int, primitive, params):
     """What an equation's parameters say about its result dtype, or None if its constructor decides."""
-    if primitive is jax.lax.convert_element_type_p:
+    if primitive in (jax.lax.convert_element_type_p, jax.lax.bitcast_convert_type_p):
         dtype = params["new_dtype"]
     elif primitive is jax.lax.dot_general_p and (product := region.products.get(index)) is not None:
         dtype = product.made
@@ -846,6 +877,7 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
     facts += _products(region)
     sizes = {size for _, extent in region.shapes for size in extent}
     facts += [set_(rules.log2_of(i64(size))).to(i64(max(size - 1, 0).bit_length())) for size in sorted(sizes)]
+    facts += [rules.exact_roundtrip(narrow, original) for narrow, original in region.exact_roundtrips]
     widened = {np.dtype(narrow): f"convert_{np.dtype(narrow).name}" for narrow in terms.WIDENED}
     seen_terms: set[Hashable] = set()
     for term, _ in region.shapes:

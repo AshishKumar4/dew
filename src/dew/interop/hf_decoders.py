@@ -1590,6 +1590,15 @@ _BUNDLE_MEDIA = ("vision_config", "audio_config")
 """The sections a media bundle's config names its towers in (`bundles`)."""
 
 
+def sidecars(config: Mapping[str, object]) -> Mapping[str, str]:
+    """The files beside a source's weights holding more of its registered family's tensors, each by the
+    prefix its tensors are read under (`DecoderFamily.sidecars`); none for another source."""
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or model_type not in families():
+        return {}
+    return family_entry(model_type).sidecars(config)
+
+
 def bundles(config: Mapping[str, object]) -> bool:
     """Whether a source config is a media bundle its own decoder family reads
     whole (`DecoderFamily.wrapper`): one that names a tower (`_BUNDLE_MEDIA`), a section that states

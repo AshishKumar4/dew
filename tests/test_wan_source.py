@@ -11,19 +11,17 @@ guided at its default scale.
 
 The native transformer takes channels-last latents and Dew's model time,
 which is the timestep the source's pipeline passes, and returns the flow the
-source returns. Dew in float32 is held to tests/reference_error.py's rule,
-within twice the reference's own RMS distance from float64. Observed on CPU
-(Dew's RMS error over the reference's, Diffusers 0.39.0's recording): the
-forward 1.02 published and 1.01 variant; in bfloat16, 1.18 and 1.13 against
-the source's own bfloat16 run. The variant names `qk_norm` None, which
-Diffusers norms across heads from 0.35.0 on as Dew does (`WanTransformer`).
-The truth is float64 throughout:
-Dew run in float64 with a float64 rotary table lands 3e-16 (RMS) from it.
+source returns. Each recorded arm (published and variant, float32 and
+bfloat16) is held to the source's recording by check 1 over its declared
+seeds (`WAN_SEEDS`, `recorded_runs`), its drawn latents, prompt states and
+times recorded with the source's float64 truth. The variant names `qk_norm`
+None, which Diffusers norms across heads from 0.35.0 on as Dew does
+(`WanTransformer`).
 
 The pipeline walk composes the UMT5 encoder, the transformer, UniPC and the
-VAE as the source composes them; like the other pipeline walks it is held to
-the largest difference over the largest value, 1e-5. Observed: prompt states
-3.2e-7, final latents 2.8e-6, decoded frames 2.7e-6.
+VAE as the source composes them, over drawn prompts and starting latents,
+on par with the source pipeline's own call by check 1, the whole pipeline's
+float64 run the truth (`assert_walked_as_the_source`).
 """
 
 import contextlib

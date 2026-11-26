@@ -620,9 +620,9 @@ PAGE_SIZE = 64
 layout names a page size (`Server.from_task`'s 'shared'). A served GRPO batch of 8 prompts x 8 samples at
 Qwen3-0.6B's config on a GH200 (M-IG-11, 64 new tokens, medians of 5 rounds, each arm alone): pages of 64
 took 0.453 s at 512-token prompts and 0.615 s at 2048 against a dense cache's 0.439 and 1.154, and pages of
-16 0.509 and 0.703. Over prompts no two of which share, pages cost what they cannot save: on an A100 at that
-config, 256- and 512-token prompts at 32 to 128 slots, pages of 64 drew 13 to 21% fewer output tokens a
-second than whole rows (M-IG-12), so a server pages only where its caller says its prompts repeat."""
+16 0.509 and 0.703. Over prompts no two of which share, pages of 64 drew 13 to 21% fewer output tokens a
+second than whole rows on an A100 at that config, 256- and 512-token prompts at 32 to 128 slots (M-IG-12);
+a server pages by itself from `SHARED_PAGES_FROM`, or where its caller or the model's layout says so."""
 
 
 @dataclass(frozen=True)
@@ -673,8 +673,10 @@ class PagedKV:
     shared: bool = False
     """Pages only where they pay (`_pages_pay`): where a server over them keeps a prefix cache, its caller's
     requests repeating prompts (a group's samples of one, a session's turns), the model's max_seq_len holds a
-    row in whole pages (`_holds`), and its rows are at least the measured crossover's capacity
-    (`SHARED_PAGES_FROM`); the model's own layout elsewhere (rows 5374, 5375, 7420, `PAGE_SIZE`)."""
+    row in whole pages (`_holds`), and, where the server chooses pages over whole rows, its rows are at least
+    the measured crossover's capacity (`SHARED_PAGES_FROM`): a stated `prefix_cache` or `host_pages`, or
+    pages a layout declares, hold at any capacity (`_measured`, row 13278); the model's own layout elsewhere
+    (rows 5374, 5375, 7420, `PAGE_SIZE`)."""
 
     def __post_init__(self) -> None:
         if self.layout is not None and (self.page_size is not None or self.pages is not None):
@@ -717,12 +719,9 @@ def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None
     *_, strategy = task.controls().components()
     layout = _laid(task.model, cache, capacity, strategy, None)
     own = task.model.kv_cache if isinstance(task.model, Layered) else None
-    # Pages a layout declares, the one a cache names (`PagedKV.layout`) or else the model's own, are kept
-    # wherever a prefix cache over them pays, at any capacity, as `_laid` keeps them; the measured
-    # crossover chooses pages over whole rows (`_pages_pay`).
     base = cache.layout if isinstance(cache, PagedKV) and cache.layout is not None else own
     shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None,
-                                               measured=base is None or base.page_size is None)
+                                               measured=_measured(cache, base))
     return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
@@ -1053,7 +1052,7 @@ class Server:
         kept = cache if isinstance(cache, PagedKV) else PagedKV()
         prefix_cache = (_reuses_prefixes(task.model, layout, strategy, prefill_mesh)
                         if kept.prefix_cache is None else kept.prefix_cache)
-        plan = _served_plan(strategy, mesh, chunk, prefix_cache)
+        plan = _served_plan(strategy, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
         model, layout, rounded = _served_layout(task.model, layout, capacity)
@@ -1933,15 +1932,30 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     paged = dataclasses.replace(base, page_size=size, pages=pages, groups=1)
     if not cache.shared or base.page_size is not None:
         return paged
-    return paged if _pages_pay(model, paged, capacity, strategy, prefill_mesh) else unpaged(base)
+    measured = _measured(cache, base)
+    pays = _pages_pay(model, paged, capacity, strategy, prefill_mesh, measured=measured)
+    return paged if pays else unpaged(base)
+
+
+def _measured(cache: ServedCache | None, base: KVCache | None) -> bool:
+    """Whether shared pages over `base` (`PagedKV.shared`) are chosen over whole rows by the measured
+    crossover (`SHARED_PAGES_FROM`): where pages are the server's own choice, not a layout's (`base`'s own
+    pages, the model's or the cache's) nor a requirement the cache states, a prefix cache it names
+    (`prefix_cache`) or pages it offloads (`host_pages`), which hold at any capacity as before the crossover
+    (row 13278). One policy `_laid` and `served_layout` read."""
+    stated = isinstance(cache, PagedKV) and (cache.prefix_cache is not None or cache.host_pages > 0)
+    return not stated and (base is None or base.page_size is None)
 
 
 SHARED_PAGES_FROM = 2048
-"""The row capacity from which shared pages (`PagedKV.shared`) pay over whole rows, measured: a GH200 serving
-Qwen3-0.6B's groups of 8 samples a prompt took 0.453 s paged against 0.439 s whole at 512-token prompts and
-0.615 s against 1.154 s at 2048 (M-IG-11, row 7420); prompts no two of which share ran paged 13-25% slower
-at 256-512 and 1-8% faster at 2048 on a GH200 and an H100 (M-IG-12). Below it a row's cache stays whole,
-the owner allowing no penalty where pages do not pay."""
+"""The row capacity from which a server pages its rows by itself (`PagedKV.shared`), where neither its
+caller (a stated prefix cache or host pages) nor the model's layout chooses pages (`_measured`): its
+measured workload's crossover. A GH200 serving Qwen3-0.6B's groups of 8 samples a prompt took 0.453 s paged
+against 0.439 s whole at 512-token prompts and 0.615 s against 1.154 s at 2048 (M-IG-11, row 7420); over
+prompts no two of which share (M-IG-12, an A100 and a GH200), pages of 64 drew 13-30% fewer output tokens a
+second at 256-512, and at 2048 the GH200 +1.1/+8.3/-3.2% at 32/64/128 slots, the A100 -11.0/-4.4% at 32/64.
+A heuristic of that workload: matched sweeps by device, concurrency, context and sharing would place it
+better."""
 
 
 def _pages_pay(model: nn.Module, paged: KVCache, capacity: int, strategy: Strategy,
@@ -1963,19 +1977,16 @@ def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:
             and _rounded(capacity, ceiling, page_size) >= capacity)
 
 
-def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
-                 prefix_cache: bool) -> Speculative | None:
+def _served_plan(strategy: Strategy, chunk: int | None, prefix_cache: bool) -> Speculative | None:
     """The speculative blocks a server's rows draw (`Dense.plan`), or None where they sample a token a step
-    (`Sample`); a beam search, and speculation where its rows cannot run it, refused by name."""
+    (`Sample`); a beam search, and speculation where its rows cannot run it, refused by name. Speculative
+    rows serve on a mesh as on one device: each block's device checks reach the next model call through
+    a mixture's `shard_map` (jax-ml/jax#40907, fixed in the pinned jax)."""
     if not isinstance(strategy, Sample | Speculative):
         raise ValueError("a server runs the row-wise sampler or speculative blocks; a beam search is "
                          "batch-wide")
     if isinstance(strategy, Sample):
         return None
-    if mesh is not None:
-        raise ValueError("speculative rows check each block's draws between its model calls, and jax's "
-                         "checkify carries no check into the shard_map a model on a mesh may run "
-                         "(jax-ml/jax#40907); serve speculation on one device")
     if chunk is not None or prefix_cache:
         raise ValueError("speculative rows prefill each prompt whole, its drafting state seeded by its "
                          "own prefill; serve without chunk and prefix_cache")
@@ -1993,10 +2004,11 @@ def _on_mesh(variables: Variables, mesh: Mesh) -> Variables:
 def _moved[T](tree: T, sharding: jax.sharding.Sharding | Callable[[jax.Array], jax.sharding.Sharding], *,
               phase: str) -> T:
     """`tree` placed by `sharding`, one for every leaf or each leaf's: where JAX moves it between the
-    device sets (`jax.device_put`, every array within this process's devices), as it does; between meshes
-    over several processes, each leaf gathered to every process's host (`collective_host`, every process
-    calling it) and each process's shards made of it, as JAX's transfers cannot move a sharded array to
-    another processes' device set."""
+    device sets (`jax.device_put`, every array within this process's devices); between meshes over several
+    processes, each leaf gathered to every process's host (`collective_host`, every process calling it)
+    and each process's shards made of it. JAX moves some such arrays directly (matching shard layouts over
+    a supported transport); this gather serves every placement until a two-slice witness qualifies that
+    arm."""
     leaves, structure = jax.tree.flatten(tree)
     targets = [sharding if isinstance(sharding, jax.sharding.Sharding) else sharding(leaf) for leaf in leaves]
     if all(leaf.is_fully_addressable and target.is_fully_addressable

@@ -128,6 +128,7 @@ _speaks("binary", jax.lax.pow_p)
 _speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
 _speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
         jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
+_speaks("unary", jax.lax.bitcast_convert_type_p)
 _speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
 _speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
         jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p)
@@ -394,6 +395,8 @@ class Region[Node: (Term, Skeleton)]:
     """Keys of terms proven nonnegative numbers (`Apart.number` and `Apart.sign > 0`)."""
     unplaced_full_fp32: frozenset[Hashable] = frozenset()
     """Keys of full-fp32 dots traced without explicit or manual placement."""
+    exact_roundtrips: tuple[tuple[Node, Node], ...] = ()
+    """Proven widening round trips and their original values, at the actual cast sites."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -811,6 +814,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
     opaques: list[Hashable] = []
     ctx_keys: dict[int, Hashable] = {}
     plain_types: dict[int, Hashable] = {}
+    primitive_keys: dict[int, Hashable] = {}
     position: dict[jcore.Var, int] = {}
 
     def feed(part: Hashable) -> None:
@@ -845,6 +849,10 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
             feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
             hasher.update(b"\0")
+        elif in_process:
+            # A binary tag distinct from the literals' leading tuple marker, followed by a fixed
+            # width binder position. No repr or temporary tuple for the dominant atom kind.
+            hasher.update(((position[atom] << 8) | 1).to_bytes(9, "little"))
         else:
             feed(("var", position[atom]))
 
@@ -869,6 +877,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                     str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis,
                     ctx.no_collectives, ctx.cur_abstract_mesh)), opaques)
             ctx_keys[id(ctx)] = ctx_key
+        params_key: Hashable = ()
         if equation.params:
             raw_params = (
                 tuple((name, _in_process_param_key(part, reject_device=reject_device))
@@ -876,11 +885,16 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                 if in_process else parameters_key(equation.primitive, equation.params)[1]
             )
             params_key = _collect_opaque(raw_params, opaques)
-        else:
-            params_key = ()
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
-        prim_key = (_collect_opaque(("object", "primitive", equation.primitive), opaques) if in_process
-                    else (_named(type(equation.primitive)), equation.primitive.name))
+        primitive = equation.primitive
+        if in_process:
+            identity = id(primitive)
+            if (prim_key := primitive_keys.get(identity)) is None:
+                # Like interned equation contexts, the primitive object is held by every equation.
+                prim_key = _collect_opaque(("object", "primitive", primitive), opaques)
+                primitive_keys[identity] = prim_key
+        else:
+            prim_key = (_named(type(primitive)), primitive.name)
         feed((prim_key, params_key, ctx_key, effects_key, len(equation.invars),
               tuple(var_key(var) for var in equation.outvars)))
         for atom in equation.invars:
@@ -1117,8 +1131,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     def magnitude_of(atom) -> Magnitude | None:
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[key(env[atom])]
 
-    def apart_of(atom) -> Apart:
-        return _apart_of(atom, apart)
+    apart_of = functools.partial(_apart_of, apart=apart)
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
@@ -1153,7 +1166,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                     and equation.params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
                 named = key(term)
                 # If equal terms come from more than one mesh scope, every source must admit the move.
-                full_fp32_sites[named] = full_fp32_sites.get(named, True) and unplaced_dot(equation)
+                full_fp32_sites[named] = full_fp32_sites.get(named, True) and unplaced_equation(equation)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -1192,11 +1205,12 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                         if (held := apart.get(var, NOWHERE)).number and held.sign > 0),
                       *(key(forms.literal(index)) for index, value in enumerate(literals)
                         if (held := _constant_apart(value)).number and held.sign > 0),
-                  }), frozenset(named for named, allowed in full_fp32_sites.items() if allowed))
+                  }), frozenset(named for named, allowed in full_fp32_sites.items() if allowed),
+                  _cast_identities(closed, env, read) if forms is Term else ())
 
 
-def unplaced_dot(equation: jcore.JaxprEqn) -> bool:
-    """A dot seen later outside the tracing context may still hold explicit or manual placement."""
+def unplaced_equation(equation: jcore.JaxprEqn) -> bool:
+    """An equation seen later outside its trace may still hold explicit or manual placement."""
     mesh = equation.ctx.cur_abstract_mesh
     if mesh is not None and (mesh.explicit_axes or mesh.manual_axes):
         return False
@@ -1208,6 +1222,86 @@ def unplaced_dot(equation: jcore.JaxprEqn) -> bool:
             if mesh.explicit_axes or mesh.manual_axes:
                 return False
     return True
+
+
+def cast_roundtrip_source(
+    outer: jcore.JaxprEqn, inner: jcore.JaxprEqn | None,
+) -> jcore.Var | jcore.Literal | None:
+    """The original operand of a widening round trip with an unchanged abstract value."""
+    if inner is None or inner.primitive is not jax.lax.convert_element_type_p:
+        return None
+    source, wide, narrow = inner.invars[0], outer.invars[0].aval, outer.outvars[0].aval
+    return (source if isinstance(wide, ShapedArray) and wide.dtype == jnp.float32
+            and isinstance(narrow, ShapedArray) and narrow.dtype in WIDENED and source.aval == narrow
+            else None)
+
+
+def _cast_identities[Node: (Term, Skeleton)](closed: jcore.Jaxpr, env: Mapping[jcore.Var, Node],
+                                            read: Callable) -> tuple[tuple[Node, Node], ...]:
+    """Prove bit identity without assuming the enclosing program's inputs are finite reals."""
+    casts = {}
+    pairs = []
+    for equation in closed.jaxpr.eqns:
+        if equation.primitive is not jax.lax.convert_element_type_p:
+            continue
+        src, out = equation.invars[0], equation.outvars[0]
+        if not (isinstance(src.aval, ShapedArray) and isinstance(out.aval, ShapedArray)):
+            continue
+        if src.aval.dtype in WIDENED and out.aval.dtype == jnp.float32:
+            casts[out] = equation
+        elif (isinstance(src, jcore.Var) and (inner := casts.get(src)) is not None
+              and (original := cast_roundtrip_source(equation, inner)) is not None):
+            pairs.append((equation, inner, original, out))
+    if not pairs:
+        return ()
+
+    jaxpr = closed.jaxpr
+    constants = dict(zip(jaxpr.constvars, closed.consts, strict=True))
+    targets = list({original for _, _, original, _ in pairs if isinstance(original, jcore.Var)})
+    init = {var: (None, NOWHERE) for var in (*jaxpr.invars, *jaxpr.constvars)
+            if isinstance(var.aval, ShapedArray) and jnp.issubdtype(var.aval.dtype, jnp.inexact)
+            and (var not in constants or _host_array(constants[var]) is None)}
+    bounds, proved = _proven_walk(jaxpr, consts=constants, targets=targets, deep=False, init=init)
+    makers = {out: eq for eq in jaxpr.eqns for out in eq.outvars if out in proved}
+
+    def literal_ok(value) -> bool:
+        array = _host_array(value)
+        if array is None:
+            return False
+        exponent = 0x7C00 if array.dtype == jnp.float16 else 0x7F80
+        magnitude = array.view(np.uint16) & 0x7FFF
+        least_normal = exponent & -exponent
+        return bool(((magnitude == 0) | ((magnitude >= least_normal) & (magnitude <= exponent))).all())
+
+    @functools.cache
+    def exact(var: jcore.Var) -> bool:
+        fact = proved.get(var, NOWHERE)
+        if fact.number and (fact.floor is not None or bounds.get(var) == NOTHING):
+            return True
+        if var in constants:
+            return literal_ok(constants[var])
+        if (maker := makers.get(var)) is not None:
+            operation = OPERATIONS.get(maker.primitive)
+            if operation is not None and (operation.kind == "shape" or maker.primitive is jax.lax.neg_p):
+                return safe(maker.invars[0])
+            if maker.primitive is jax.lax.select_n_p:
+                return all(map(safe, maker.invars[1:]))
+        return False
+
+    def safe(atom) -> bool:
+        return literal_ok(atom.val) if isinstance(atom, jcore.Literal) else exact(atom)
+
+    # An e-class shared by written sites must be safe at every one, including placement.
+    accepted = {}
+    refused = set()
+    for outer, inner, original, out in pairs:
+        term = env[out]
+        named = key(term)
+        if unplaced_equation(inner) and unplaced_equation(outer) and safe(original):
+            accepted[named] = (term, read(original))
+        else:
+            refused.add(named)
+    return tuple(pair for named, pair in accepted.items() if named not in refused)
 
 
 def _prove_equation(equation: jcore.JaxprEqn, name: str, magnitude_of: Callable[..., Magnitude | None],
@@ -1248,6 +1342,15 @@ def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
         # variation. Unlike an ordinary add, accumulation demands identical placed input types.
         mesh = made.sharding.mesh
         if mesh.explicit_axes or mesh.manual_axes:
+            return None
+    if equation.primitive is jax.lax.bitcast_convert_type_p:
+        source, unsigned = equation.invars[0].aval, equation.outvars[0].aval
+        # A stored-float predicate is local and has no algebraic facts. Rank-changing bitcasts
+        # stay opaque: the walk cannot infer where a resegmented axis goes.
+        if not (isinstance(source, ShapedArray) and isinstance(unsigned, ShapedArray)
+                and jnp.issubdtype(source.dtype, jnp.floating)
+                and jnp.issubdtype(unsigned.dtype, jnp.unsignedinteger)
+                and jax_core.definitely_equal_shape(source.shape, unsigned.shape)):
             return None
     return operation
 

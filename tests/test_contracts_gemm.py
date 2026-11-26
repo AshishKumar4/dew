@@ -213,6 +213,72 @@ def test_a_biased_sum_holds_every_order(edge):
     assert_contract(precision.biased, primals, direction, cotangent, f"a biased sum {edge}", plain_fn=plain)
 
 
+def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
+    codes = np.ones((2, 32), jnp.float8_e4m3fn)
+    stored = np.asarray([[0], [127]], np.uint8).view(jnp.float8_e8m0fnu)
+    incoming = np.broadcast_to(np.asarray([[2.0 ** 125], [0.5]], np.float32), codes.shape)
+
+    @jax.jit
+    def orders(values, scales, incoming):
+        def decode(codes):
+            return formats.MxFp8(codes, scales).decoded()
+
+        value, tangent = jax.jvp(decode, (values,), (jnp.ones_like(values),))
+        _, pull = jax.vjp(decode, values)
+        return value, tangent, pull(incoming)[0]
+
+    value, tangent, gradient = orders(codes, stored, incoming)
+    expected = np.broadcast_to(np.asarray([[2.0 ** -127], [1]], np.float32), codes.shape)
+    for found in (value, tangent):
+        np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
+    np.testing.assert_array_equal(gradient, np.broadcast_to([[0.25], [0.5]], codes.shape))
+
+    @jax.jit
+    def exact_output(codes):
+        def convert(values):
+            return formats.MxFp8(values, stored).decoded(jnp.int32)
+
+        return jax.jvp(convert, (codes,), (jnp.ones_like(codes),))
+
+    integer, no_tangent = exact_output(codes)
+    np.testing.assert_array_equal(integer, np.broadcast_to([[0], [1]], codes.shape))
+    assert no_tangent.dtype == jax.dtypes.float0
+
+
+def test_decoded_ternary_preserves_its_linear_scale_rule():
+    values = np.tile(np.asarray([[-1, 1], [0, 0], [1, -1], [0, 0]], np.float32), (64, 1))
+    weights = formats.TernaryWeights.of(values, scale=np.ones(2, np.float32))
+    small = np.asarray([2.0 ** -127, -(2.0 ** -127)], np.float32)
+    scale = np.ones_like(small)
+    incoming = np.zeros_like(values)
+    incoming[[0, 2]] = [[1, 2], [4, 8]]
+
+    @jax.jit
+    def orders(scale, direction, incoming):
+        def decoded(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.float32)
+
+        found, moved = jax.jvp(decoded, (scale,), (direction,))
+        _, pull = jax.vjp(decoded, scale)
+        return found, moved, pull(incoming)[0]
+
+    found, tangent, gradient = orders(scale, small, incoming)
+    np.testing.assert_array_equal(found, values)
+    np.testing.assert_array_equal(np.asarray(tangent).view(np.uint32), (values * small).view(np.uint32))
+    np.testing.assert_array_equal(gradient, [3, -6])
+
+    @jax.jit
+    def exact_output(s):
+        def convert(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.int32)
+
+        return jax.jvp(convert, (s,), (jnp.ones_like(s),))
+
+    integer, no_tangent = exact_output(scale)
+    np.testing.assert_array_equal(integer, values.astype(np.int32))
+    assert no_tangent.dtype == jax.dtypes.float0
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):
     """`projections.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared
@@ -1127,3 +1193,39 @@ def _check_ternary_weight_product_contract(edge: str) -> None:
     with generation.assumed("sm90"):
         assert_contract(product, (x,), (dx,), cotangent, f"ternary weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)
+
+
+def test_a_scaled_partial_keeps_the_plain_products_overflow_and_non_finite_values():
+    """`precision.scaled_partial` picks the order of its three products, never the value: a product whose true
+    value overflows still overflows (one rounding past the overflow midpoint whose scales' product first
+    reads fp32's largest among them), a NaN, an infinity and a zero operand give the plain product's value,
+    and its derivative in each operand is the plain product's where every order is normal (rows 13274,
+    13291)."""
+    from dew.nn.precision import scaled_partial
+
+    f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
+    for product, first, second in ((2.0 ** 100, 2.0 ** 20, 2.0 ** 10),
+                                   (21 * 2.0 ** 27, 8388626 * 2.0 ** 25, 12782613 * 2.0 ** 25)):
+        assert float(scaled_partial(f32(product), f32(first), f32(second))) == np.inf
+    for product, first, second in ((np.nan, 1.0, 1.0), (np.inf, 2.0, 0.5), (0.0, 2.0 ** 100, 2.0 ** 100),
+                                   (np.inf, 0.0, 1.0), (1.0, np.inf, 0.5)):
+        got = float(scaled_partial(f32(product), f32(first), f32(second)))
+        want = float(np.float32(product) * np.float32(first) * np.float32(second))
+        assert got == want or (np.isnan(got) and np.isnan(want)), (product, first, second, got, want)
+    grads = jax.grad(lambda *ops: scaled_partial(*ops), argnums=(0, 1, 2))(f32(3.0), f32(0.5), f32(4.0))
+    assert tuple(float(g) for g in grads) == (2.0, 12.0, 1.5)
+
+
+def test_a_scaled_partial_joins_its_scales_where_neither_order_holds_and_differentiates_that_order():
+    """`precision.scaled_partial` in float16 (whose subnormals a CPU keeps, where it flushes fp32's): a
+    subnormal row scale 2^-16 beside a column scale 2^15 of a 2.25 partial, each order's intermediate
+    subnormal or past the largest, is 1.125, the scales' product first (row 13274), and its derivatives are
+    that order's alone, a cotangent of 1/4 giving 1/8, 18432 and 9 2^-20, where a cotangent through the
+    unchosen overflowing order reads NaN (row 13291's review)."""
+    from dew.nn.precision import scaled_partial
+
+    f16 = functools.partial(jnp.asarray, dtype=jnp.float16)
+    operands = (f16(2.25), f16(2.0 ** -16), f16(2.0 ** 15))
+    value, pull = jax.vjp(scaled_partial, *operands)
+    assert float(value) == 1.125
+    assert tuple(float(g) for g in pull(f16(0.25))) == (0.125, 18432.0, 9 * 2.0 ** -20)

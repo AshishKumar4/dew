@@ -546,7 +546,7 @@ class MultimodalTransformer(DecoderWrapper):
                                     block_groups=block_groups, rotary_positions=rotary_positions,
                                     audio_indices=audio_indices, coordinates=coordinates, progress=progress,
                                     loop_passes=loop_passes)
-        if self.is_initializing() and self.language_model.dspark is not None:
+        if self.is_initializing() and self.language_model.drafts_blocks:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
             self.mtp_hidden_states(hidden, tokens, train=train, image_indices=image_indices,
