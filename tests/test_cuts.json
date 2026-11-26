@@ -38,7 +38,10 @@
 "tests/test_algebra_merged_state.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-batched]"
 ],
 "tests/test_algebra_merged_state_derivatives.py": [
-"tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_higher_order_sites_are_on_par_with_its_parts[jitted-along every operand]"
+"tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[on a tpu-two masses]",
+"tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_higher_order_sites_are_on_par_with_its_parts[jitted-along every operand]",
+"tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_higher_order_sites_are_on_par_with_its_parts[jitted-its gradient's derivative]",
+"tests/test_algebra_merged_state_derivatives.py::test_a_merged_states_higher_order_sites_are_on_par_with_its_parts[on a gpu-along every operand]"
 ],
 "tests/test_algebra_recognize.py": [
 "tests/test_algebra_recognize.py::test_a_plain_gated_delta_net_scan_runs_dews_recurrence_kernel_through_dew_jit[natural]",
@@ -48,6 +51,9 @@
 "tests/test_algebra_recognize.py::test_recurrence_recognition_accurate_intra_chunk_and_observed_layout",
 "tests/test_algebra_recognize.py::test_recurrence_recognition_guards_fla_zero_gate_gram_overflow_score_underflow_and_expanded_keys",
 "tests/test_algebra_recognize.py::test_recurrence_recognition_guards_range_tracers_tokens_and_training_vjp"
+],
+"tests/test_algebra_rules_sound.py": [
+"tests/test_algebra_rules_sound.py::test_every_rewrite_is_an_identity_over_the_reals[reuse[27]]"
 ],
 "tests/test_algebra_scaled.py": [
 "tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
@@ -206,8 +212,8 @@
 ],
 "tests/test_attention_derived.py": [
 "tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[128]",
-"tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[64]",
-"tests/test_attention_derived.py::test_the_accurate_backward_declaration_derives_on_par[queries-first-raw]"
+"tests/test_attention_derived.py::test_tcgen05_rows_prices_natural_exp_and_defers_same_residency_column_splits",
+"tests/test_attention_derived.py::test_the_derived_forward_is_on_par_with_xlas[natural-causal-merged]"
 ],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_backward[causal-window-bfloat16]",
@@ -576,25 +582,25 @@
 "tests/test_attention_prologues_b200.py::test_a_prologued_forward_compiles_spill_free_at_its_derived_config_on_a_b200[training-rounded]"
 ],
 "tests/test_attention_route.py": [
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm80-causal-training-fast]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm80-full-inference-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-causal-training-accurate]",
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-full-training-fast]",
-"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-causal-training-fast]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[bias-sm90-full-training-accurate]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-causal-training-accurate]",
+"tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-full-inference-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-128-full-training-fast]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-training-accurate]",
 "tests/test_attention_route.py::test_a_call_named_onto_the_template_lowers_for_a_gpu[fp32-64-full-training-fast]",
 "tests/test_attention_route.py::test_a_call_no_triton_config_fits_lowers_on_another_mainloop[sm120]",
 "tests/test_attention_route.py::test_a_calls_row_arguments_split_as_its_query_rows_do_where_the_heads_contend_for_the_axis",
-"tests/test_attention_route.py::test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean[valid-documents-window-places]",
-"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[lengths-and-starts-two-key-heads]",
-"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-valid-places-one-key-head]",
-"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-valid-places-two-key-heads]",
-"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[cache-call-blocks-starts-bfloat16]",
-"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[cache-call-valid-bfloat16]",
-"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[valid-documents-window-places-bfloat16]",
-"tests/test_attention_route.py::test_a_routes_tangent_of_a_mean_past_the_format_is_its_values_mean",
-"tests/test_attention_route.py::test_a_value_given_as_its_keys_leading_columns_reaches_the_mosaic_forward_on_an_h100",
-"tests/test_attention_route.py::test_key_heads_the_query_heads_do_not_lead_are_gathered_on_a_tensor_and_expert_mesh",
+"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[cross-documents-one-key-head]",
+"tests/test_attention_route.py::test_a_named_template_call_keeps_the_kernel_contract_on_a_data_and_head_mesh[own-documents-blocks-two-key-heads]",
+"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[block-causal-documents-window-float32]",
+"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[cache-call-valid-float32]",
+"tests/test_attention_route.py::test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward[packed-documents-float32]",
+"tests/test_attention_route.py::test_a_routes_score_gradient_past_the_format_has_a_finite_tangent",
+"tests/test_attention_route.py::test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_path[jax-nn-plain]",
+"tests/test_attention_route.py::test_bare_attention_route_supports_jvp_and_higher_order_with_hooks",
+"tests/test_attention_route.py::test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh[eight-key-heads]",
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
 ],
 "tests/test_attention_splash.py": [
@@ -732,7 +738,7 @@
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[cross-documents]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_over_the_core_s_other_call_forms[widest-window]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[all-float32-natural]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[none-float16-natural]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[none-float32-natural]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[softcap-bfloat16-fold]",
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
@@ -1112,20 +1118,20 @@
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[near the least normal-fla_kda-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_gdn-jvp of grad, remat]",
 "tests/test_contracts_recurrence.py::test_the_delta_rule_ports_hold_their_orders[normal-fla_kda-grad of grad]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta-first orders]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta-jvp of grad, remat]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-first orders]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-jvp of grad, nested jit]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-gated_delta-jvp of grad, remat]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta-jvp of grad, nested jit]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[near the least normal-kimi_delta-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-grad of grad]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-gated_delta-jvp of grad]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-first orders]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-grad of grad]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-jvp of grad, nested jit]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-jvp of grad, remat]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-jvp of grad, scanned]",
+"tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-jvp of grad]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rule_chunks_hold_their_orders[normal-kimi_delta-second jvp, remat]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the largest]",
-"tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[near the least normal]",
 "tests/test_contracts_recurrence.py::test_the_derived_delta_rules_chunk_adjoint_holds_its_orders[normal]",
-"tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[near the largest-grad of grad]",
-"tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[near the largest-jvp of grad]",
+"tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[near the largest-jvp of grad, nested jit]",
 "tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[near the least normal-jvp of grad, nested jit]",
 "tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[normal-first orders]",
 "tests/test_contracts_recurrence.py::test_the_diagonal_scan_holds_its_orders[normal-grad of grad]",
@@ -2446,15 +2452,12 @@
 "tests/test_layer_stack.py::test_a_scanned_fixture_scores_as_the_plain_loop[gemma3n-tiny]",
 "tests/test_layer_stack.py::test_a_scanned_gate_at_another_sparsity_fails_check_1",
 "tests/test_layer_stack.py::test_a_scanned_glm5_next_computes_its_unrolled_forward",
-"tests/test_layer_stack.py::test_a_scanned_init_is_the_plain_init[gemma3n]",
+"tests/test_layer_stack.py::test_a_scanned_init_is_the_plain_init[deepseek]",
 "tests/test_layer_stack.py::test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does",
 "tests/test_layer_stack.py::test_runs_of_like_layers_scan_and_the_rest_unroll[deepseek_widths]"
 ],
 "tests/test_layout_validation.py": [
 "tests/test_layout_validation.py::test_a_gpu_step_runs_the_collectives_its_layout_plans[h100_fsdp2_tensor2]"
-],
-"tests/test_level_stacking.py": [
-"tests/test_level_stacking.py::test_a_decoders_own_blocks_step_as_the_literal_chunk_loop[slower-first-layers]"
 ],
 "tests/test_lfm3.py": [
 "tests/test_lfm3.py::test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_way"
@@ -3432,8 +3435,8 @@
 "tests/test_recurrence_properties.py::test_the_portable_math_carried_across_a_split_is_the_whole_recurrence[form23-packed]",
 "tests/test_recurrence_properties.py::test_the_portable_math_carried_across_a_split_is_the_whole_recurrence[form26-packed]",
 "tests/test_recurrence_properties.py::test_the_portable_math_carried_across_a_split_is_the_whole_recurrence[form4-packed]",
-"tests/test_recurrence_properties.py::test_the_portable_math_carried_across_a_split_is_the_whole_recurrence[form8-one sequence]",
-"tests/test_recurrence_properties.py::test_the_portable_math_is_the_same_recurrence_at_any_chunk_size[form1-packed]",
+"tests/test_recurrence_properties.py::test_the_portable_math_carried_across_a_split_is_the_whole_recurrence[form8-packed]",
+"tests/test_recurrence_properties.py::test_the_portable_math_is_the_same_recurrence_at_any_chunk_size[form0-one sequence]",
 "tests/test_recurrence_properties.py::test_the_portable_math_is_the_same_recurrence_at_any_chunk_size[form14-one sequence]",
 "tests/test_recurrence_properties.py::test_the_portable_math_is_the_same_recurrence_at_any_chunk_size[form18-packed]",
 "tests/test_recurrence_properties.py::test_the_portable_math_is_the_same_recurrence_at_any_chunk_size[form21-packed]",
