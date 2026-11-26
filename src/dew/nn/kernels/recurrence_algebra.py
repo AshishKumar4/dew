@@ -41,6 +41,7 @@ from dew.nn.precision import (
     float32_matmul,
     power2,
     renormalized_add,
+    rounding_alone,
     two_product,
     two_sum,
     uncontracted,
@@ -129,12 +130,14 @@ def prefix(g):
     window = tuple(size if dim == axis else 1 for dim in range(g.ndim))
     padding = tuple((size - 1, 0) if dim == axis else (0, 0) for dim in range(g.ndim))
     zero = jnp.zeros((), g.dtype)
-    # Each term's pair fenced once where it is made (`uncontracted`), then summed by the one compensated
-    # pair reduction's combine (`renormalized_add`), where a combine fencing its operands at every step
-    # (`compensated_add`) was a second way of the same sum (row 10722).
-    scaled, error = uncontracted(scaled, error)
-    return jax.lax.reduce_window((scaled, error), (zero, zero), renormalized_add, window, (1,) * g.ndim,
-                                 padding)
+    # As the one compensated pair reduction sums (`precision.summed_pairs`): each term's hi read as one value
+    # where it is made (`uncontracted`), the window's additions marked to round alone, and the pairs combined
+    # by `renormalized_add`, where a combine fencing its operands at every step (`compensated_add`) was a
+    # second way of the same sum (row 10722).
+    with rounding_alone():
+        (scaled,) = uncontracted(scaled)
+        return jax.lax.reduce_window((scaled, error), (zero, zero), renormalized_add, window,
+                                     (1,) * g.ndim, padding)
 
 
 def prefix_terms(g) -> tuple:
