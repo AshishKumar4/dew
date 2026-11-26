@@ -91,7 +91,7 @@ def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
     sizes = np.asarray([128, 128], np.int32)
     if grouped:
         # Finite: XLA's ragged dot reads every group's matrix for every row, so one group's infinity is NaN
-        # in the others' rows (row 13565); the dense case holds the non-finite edges.
+        # in the others' rows (row 13562); the dense case holds the non-finite edges.
         weights = np.where(np.isfinite(weights.astype(np.float32)), weights, np.asarray(0.0, jnp.bfloat16))
         stacked = np.stack([weights, weights[:, ::-1]])
         window = Bf16Window.of(stacked)
