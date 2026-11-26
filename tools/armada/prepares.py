@@ -37,11 +37,11 @@ PREPARE_TARGETS = 4
 PREPARE_WALL = 600.0
 """A dry prepare task's shared budget (`run`), whatever its deadline: its topology, baseline lookups,
 processes and their records' publication draw on it (a baseline unwritten by its end leaving its row stale,
-row 13014); its restorations, local git calls, may run past it. It sits under a train's wall bound, 626 to 696
-s (its 900 s target less its warm-up and plan, its finish and a margin). Its groups are cut to its cap
-(`cap_after`), which holds a group however unevenly its count cut (`prepared_cut`) spreads its work (rows
-12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at their task's 1,680 s, ran 665 to 1,650 s
-and set their trains' walls)."""
+row 13014); its restorations, local git calls, and a red row's revocation of its green epoch may run past it.
+It sits under a train's wall bound, 626 to 696 s (its 900 s target less its warm-up and plan, its finish and a
+margin). Its groups are cut to its cap (`cap_after`), which holds a group however unevenly its count cut
+(`prepared_cut`) spreads its work (rows 12873, 12429-12439, 12643, 12759: groups cut to 480 s, capped only at
+their task's 1,680 s, ran 665 to 1,650 s and set their trains' walls)."""
 CUT_SHORT = 0.75
 """The share of a dry prepare's full cap (`cap_after` of `PREPARE_WALL`) past which a timed row ran out of its
 time (`planned`): what it took is no more than a floor of its work, which counts twice. A tuning heuristic,
@@ -183,7 +183,8 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
-    `PREPARE_HOLDS`), its records published by its task's end (`ends`, `tested`'s `publish_by`), what is
+    `PREPARE_HOLDS`), its records published by its task's end (`ends`, `tested`'s `publish_by`; a red's epoch revoked
+    past it), what is
     `left` read from it as the process starts; a part's never, whose run reads every program it prepares."""
     if ends is not None:
         left = min(left, ends - time.monotonic())
