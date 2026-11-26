@@ -18,22 +18,19 @@ otherwise, as `GatedMLP` ran them.
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.core import meta
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn import activations
-from dew.nn.dense import Dense, _promoted
 from dew.nn.joined import Projections, projection_requirements, projections_of
 from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
-from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
+from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.kernels.templates.gemm import wide
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
 from dew.nn.kernels.templates.hooks import Hook, Side
@@ -74,6 +71,8 @@ class GatedCase:
     gather: jax.ShapeDtypeStruct | None = None
     scatter: jax.ShapeDtypeStruct | None = None
     layer: jax.ShapeDtypeStruct | None = None
+    placement: tuple[jax.sharding.PartitionSpec, dict, jax.ShapeDtypeStruct] | None = dataclasses.field(
+        default=None, compare=False)
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -316,7 +315,7 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[2].shape, dtype)),
         whole=placement is not None or not automatic_axes(),
-        precision=gate.precision, hook=activations.gated_hook(activation, limit))
+        precision=gate.precision, hook=activations.gated_hook(activation, limit), placement=placement)
 
 
 def _placement(x: jax.Array, projections_: Sequence[nn.Module], kernels: tuple[jax.Array, ...]):
@@ -325,17 +324,6 @@ def _placement(x: jax.Array, projections_: Sequence[nn.Module], kernels: tuple[j
     map from where the traced program's layout places it, as a projection's product maps its rows
     (`projections.mapped_shards`); None elsewhere."""
     return projections.shard_placement(x, kernels, tuple(map(projections.kernel_path, projections_)))
-
-
-def fuses(projections_: Sequence[nn.Module], rows: jax.Array, activation: str,
-          limit: float | None = None) -> TypeGuard[Sequence[Dense]]:
-    """Whether a gated MLP's projections (gate, up, down) of `rows`, its gated product `activation`'s clamped
-    at `limit`, run fused (`gated_mlp`), as the fused MLP's selector reports it (`GATED_MLP`), so each a
-    bare `Dense` (its `dense` requirement), which the answer states of them for `gated_mlp`. Initialization
-    creates each projection's parameters through its own call."""
-    if projections_[0].is_initializing():
-        return False
-    return select(GATED_MLP, gated_case(rows, projections_, activation, limit)).kernel in ('fused', 'wide')
 
 
 _GROUPED_PROJECTIONS = Projections(
@@ -406,26 +394,29 @@ def fuses_grouped(rows: jax.Array | jax.ShapeDtypeStruct,
         group_sizes=group_sizes, gather=gather, scatter=scatter, layer=layer)).kernel == 'fused'
 
 
-def gated_mlp(x: jax.Array, projections_: Sequence[nn.Dense], activation: str, *,
-              limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array:
-    """A gated MLP's output of `x` through its projections (gate, up, down), fused (`fused_products` or
-    `wide_products` per `GATED_MLP`), each kernel read and cast as its projection's call casts it."""
-    form = selected(GATED_MLP, gated_case(x, projections_, activation, limit)).name
+def gated_mlp(x: jax.Array, projections_: Sequence[nn.Module], activation: str, *,
+              limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array | None:
+    """Select and run the gated MLP once. None leaves the projections to their own calls; a fused route
+    uses the kernels, dtype and placement already read for its admission."""
+    if projections_[0].is_initializing():
+        return None
+    case = gated_case(x, projections_, activation, limit)
+    form = select(GATED_MLP, case).kernel
+    leaves = case.projections.leaves
+    if form == 'apart' or leaves is None:
+        return None
     runner = wide_products if form == 'wide' else fused_products
-    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
-                for projection in projections_]
-    inputs = promoted[0][0]
-    kernels = tuple(kernel for _, kernel, _ in promoted)
+    # Both kernels admit only the standard uniform promotion. Cast the common input once.
+    inputs = jnp.asarray(x, dtype=case.dtype)
+    kernels = tuple(jnp.asarray(kernel, dtype=case.dtype) for kernel in leaves.kernels)
 
     def products(inputs, gate, up, down):
         out = runner(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
-                     precision=projections_[0].precision, names=names)
+                     precision=case.precision, names=names)
         return out.reshape(*inputs.shape[:-1], out.shape[-1])
 
-    # On a mesh splitting its rows alone, each device's rows are its own products' (`_placement`, as
-    # `fuses` read them), its kernels gathered whole there, so each one's gradient leaves the map
-    # reduce-scattered back to its placement.
-    placement = _placement(x, projections_, kernels)
+    # Each device reads its own rows and gathers the kernels, so gradients are reduce-scattered back.
+    placement = case.placement
     if placement is None:
         return products(inputs, *kernels)
     split, gathered, _ = placement
