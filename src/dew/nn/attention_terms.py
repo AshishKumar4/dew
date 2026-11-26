@@ -7,12 +7,12 @@ relative-position bias (`RelativeBias`), each general and each its own field of 
 from __future__ import annotations
 
 import dataclasses
-import functools
 
 import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
+from .derivatives import Protected, declared_tangent
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -73,8 +73,7 @@ def _scaled(x: jax.Array, factor: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scaled, jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2, 3))
-def _giant(x: jax.Array, factor: jax.Array, threshold: float, eps: float) -> jax.Array:
+def _giant_primal(x: jax.Array, factor: jax.Array, threshold: float, eps: float) -> jax.Array:
     """A giant head's clip (`clipped`): its gain `g = min(threshold s / (|y| + eps s), 1)` over its scaled
     length (`_scaled`) times `x` itself where `g` is normal, so a small component beside a large one is
     kept; where it is subnormal (a head near the largest under a small threshold, which XLA's products
@@ -93,7 +92,6 @@ def _giant(x: jax.Array, factor: jax.Array, threshold: float, eps: float) -> jax
     return jnp.where(gain >= tiny, x * gain, small)
 
 
-@_giant.defjvp
 def _giant_jvp(threshold: float, eps: float, primals, tangents):
     """The clip's derivative, a symmetric map of the tangent (`_moved`, its own transpose, so reverse mode
     evaluates the same expression: `generation.linear_map`): unclipped, the tangent itself; else `g ((dx -
@@ -123,6 +121,11 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
         return jnp.where(ratio > 1, tangent, scaled_down)
 
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)
+
+
+_giant = declared_tangent(Protected(), _giant_primal, _giant_jvp, nondiff_argnums=(2, 3))
+"""A giant head's clip (`_giant_primal`) and its derivative's rule (`_giant_jvp`), as their numerics need
+them written."""
 
 
 def log_ratio_scale(positions, floor: float, scale: float, *, dtype: DTypeLike) -> jax.Array:
