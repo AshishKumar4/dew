@@ -12,7 +12,10 @@ encode and decode of a batch small enough for the quadratic attention path.
 
 Arrays are recorded channel-first; the tests move channels last. Parameter
 gradients are written back into the source layout through the same
-`WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
+`WeightLayout`s an export uses. Each walk's float64 run and its gradients are
+held to the source's recorded float64 truths over drawn operands and probes
+(`dc_ae_<variant>_seeds.npz`, the tool's `seeds`), with no float32 parity
+claimed: no count of draws resolves the walks' float32 errors (row 705).
 """
 
 import shutil
@@ -22,13 +25,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from autoencoder_walks import dc_ae_call, trained
 from interop_support import (
-    assert_autoencoder_vjp,
     assert_layout_tensors,
+    assert_walk_truths_as_recorded,
     channels_last,
     extract_fixture,
     fixture_arrays,
-    scaled_gap,
 )
 from model_support import attending
 from safetensors.numpy import load_file, save_file
@@ -37,8 +40,6 @@ from dew.interop.autoencoders.dc_ae import load_dc_ae
 from dew.nn.autoencoders.dc_ae import DCAE
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
-GRADIENT = 1e-4
 VARIANTS = ("conv", "shuffle", "plain")
 
 
@@ -53,12 +54,6 @@ def variant(request, source):
     return directory, load_dc_ae(directory), fixture_arrays(directory / "reference.npz")
 
 
-def parameters(layouts):
-    """The layouts of the source's parameters: the batch norms' running
-    statistics are buffers in the source, with no gradient."""
-    return [layout for layout in layouts if not layout.name.endswith(("running_mean", "running_var"))]
-
-
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(variant):
     directory, (_, params, layouts, _), _ = variant
     tensors = load_file(directory / "diffusion_pytorch_model.safetensors")
@@ -66,34 +61,21 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(variant):
     assert_layout_tensors(layouts, {"autoencoder": params}, counted, "vae/")
 
 
-def test_the_quadratic_attention_matches_the_source(variant):
-    """At 8x16 pixels the deepest level holds 2x4 = attention_head_dim
-    positions, where the source switches to quadratic attention."""
-    _, (autoencoder, params, _, _), reference = variant
-    model = autoencoder.model
-    latent = model.apply({"params": params}, channels_last(reference["small"]), method=model.encode)
-    pixels = model.apply({"params": params}, channels_last(reference["small_code"]), method=model.decode)
-    gaps = {"encode": scaled_gap(latent, channels_last(reference["small_latent"])),
-            "decode": scaled_gap(pixels, channels_last(reference["small_pixels"]))}
-    print(f"quadratic gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
-
-
-WALKS = {"encode": ("image", "probe_latent", "latent"), "decode": ("code", "probe", "pixels")}
-"""Each walk's operand, output probe and output, by their names in the source's reference."""
-
-
-@pytest.mark.parametrize("method", WALKS)
-def test_gradients_match_the_source(variant, method):
-    """The encoder's or decoder's output and its parameter and input gradients against the source's."""
-    given, probe, output = WALKS[method]
-    _, (autoencoder, params, layouts, _), reference = variant
-    model = autoencoder.model
-    result = assert_autoencoder_vjp(
-        method, lambda params, x: model.apply({"params": params}, x, method=getattr(model, method)), params,
-        channels_last(reference[given]), [channels_last(reference[probe])], parameters(layouts), reference,
-        channels_last(reference[f"{method}.grad_{given}"]), GRADIENT)
-    assert scaled_gap(result, channels_last(reference[output])) < FORWARD
+@attending("reference")
+@pytest.mark.parametrize("walk", ["encode", "decode", "small encode", "small decode"])
+def test_every_walk_and_gradient_computes_the_sources_function(variant, walk):
+    """Each variant's encode of an image and decode of a latent, and against drawn probes the gradients of
+    their probed sum in the operand and in every parameter (its batch norms' running statistics, buffers
+    in the source, take none), each written back into its source tensor's layout as an export writes it:
+    Dew's float64 walk `AutoencoderDC`'s float64 truth per leaf on each recorded draw (the truths
+    recording of tools/diffusers_dc_ae_reference.py `seeds`): a rectangular batch's, and at 8x16 pixels a
+    small one's, whose deepest level holds 2x4 = attention_head_dim positions, where the source switches to
+    quadratic attention. No count of draws resolves the walks' float32 errors (their ReLU attention's tiny
+    normalizers, row 705), so each holds its function."""
+    directory, (autoencoder, params, layouts, _), _ = variant
+    name, model = directory.name, autoencoder.model
+    assert_walk_truths_as_recorded(ROOT / f"tests/fixtures/dc_ae_{name}_seeds.npz", f"{name} {walk}",
+                                   dc_ae_call(model.clone(dtype=jnp.float64), walk), params, trained(layouts))
 
 
 def test_the_autoencoder_scales_as_the_pipeline_does(variant):

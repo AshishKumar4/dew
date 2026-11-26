@@ -138,7 +138,9 @@ class _Decoder(nn.Module):
         tokens = jnp.concatenate(
             [jnp.broadcast_to(cls_token, (batch, 1, self.width)).astype(tokens.dtype), tokens], axis=1
         )
-        positions = sincos_position(self.width, self.grid, base_size=16)
+        # Float64 where the decoder runs in it, as the source's table rebuilt in float64 is.
+        positions = sincos_position(self.width, self.grid, base_size=16,
+                                    dtype=np.float64 if self.dtype == jnp.float64 else np.float32)
         tokens = tokens + jnp.concatenate([jnp.zeros((1, 1, self.width)), positions], axis=1)
         for index in range(self.layers):
             tokens = clip_layer(self.width, self.heads, self.intermediate, self.grid ** 2 + 1,
@@ -198,11 +200,19 @@ class RAE(nn.Module):
         pixels = (images + 1) / 2
         if pixels.shape[1:3] != (self.input_size, self.input_size):
             pixels = torch_bicubic_resize(pixels, self.input_size, self.input_size)
-        return self.encoder((pixels - jnp.asarray(self.pixel_mean)) / jnp.asarray(self.pixel_std))
+        mean, std = self._pixel_statistics()
+        return self.encoder((pixels - mean) / std)
 
     def decode(self, latents):
-        pixels = self.decoder(latents) * jnp.asarray(self.pixel_std) + jnp.asarray(self.pixel_mean)
+        mean, std = self._pixel_statistics()
+        pixels = self.decoder(latents) * std + mean
         return pixels * 2 - 1
+
+    def _pixel_statistics(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """The pixel mean and deviation as the checkpoint stores them, float32 values (its
+        `encoder_mean`/`encoder_std` buffers), whatever dtype the run computes in."""
+        return (jnp.asarray(np.asarray(self.pixel_mean, np.float32)),
+                jnp.asarray(np.asarray(self.pixel_std, np.float32)))
 
     def __call__(self, images):
         return self.decode(self.encode(images))
@@ -242,7 +252,11 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
         record['scaling_factor'] = scaling_factor
         self.normalization = LatentNormalization(
             record, _statistic(latents_mean, model.grid, model.encoder_width, 0.0),
-            scaling_factor / (_statistic(latents_std, model.grid, model.encoder_width, 1.0) + 1e-5))
+            # The deviation as stored (float32), its epsilon and quotient in float64, rounded once to the
+            # dtype a run computes in (`LatentNormalization.affine`): a float64 run's normalization the
+            # source's float64 one.
+            scaling_factor / (np.asarray(_statistic(latents_std, model.grid, model.encoder_width, 1.0),
+                                         np.float64) + 1e-5))
 
     def record_arguments(self) -> dict:
         return dict(self.normalization.record)
