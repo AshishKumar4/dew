@@ -586,7 +586,7 @@ def test_tier_3_leaves_the_mlps_its_swiglu_does_not_compute_as_their_source_writ
     from dew.interop.torchax_kernels import kernel_parts
 
     tiny = {"hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
-            "intermediate_size": 48, "vocab_size": 64}
+            "intermediate_size": 48, "vocab_size": 64, "pad_token_id": 0}
     glm = transformers.Glm4ForCausalLM(transformers.Glm4Config(**tiny))
     lfm = transformers.Lfm2ForCausalLM(transformers.Lfm2Config(**tiny, layer_types=["full_attention"]))
     for model, mlp in ((glm, glm.model.layers[0].mlp), (lfm, lfm.model.layers[0].feed_forward)):
