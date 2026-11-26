@@ -131,6 +131,20 @@ def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse
                              step, cache, cache)
 
 
+def test_a_masked_call_with_a_heads_sinks_picks_its_kernel():
+    """A call that built its mask, naming that it has sinks by a flag (`mask_kernel`'s `sinks`, a sliding
+    layer's of GPT-OSS), picks a kernel that takes them: the flag no query's own sinks, where reading it
+    as an array raised AttributeError in every model with sinks (train 1313's batch-12)."""
+    from dew.nn.attention import mask_kernel
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((1, 4, 8, 64), jnp.bfloat16)
+    key = jnp.zeros((1, 64, 2, 64), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        # cuDNN, which takes a mask as its bias, takes no sinks.
+        assert mask_kernel("auto", query, key, as_bias=True, sinks=True) != "cudnn"
+
+
 @pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
 def test_a_masked_key_weighs_nothing_beside_a_sink_however_low_its_logit(heads, kv_heads, dtype):
