@@ -1185,19 +1185,18 @@ def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
     assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
 
 
-def test_flash_inference_without_its_wheel_trains_a_rematerialized_block_and_refuses_its_inference(
-        monkeypatch):
-    """On a host whose FlashAttention wheel is absent (`attention_kernels.flash_architectures` None), lowering
-    for an A100: a 'flash_inference' call inside a rematerialized block under a named-residual policy
-    (`decoder_block`'s) lowers its training step, the template's alone, though the block stages its primal
-    before it is differentiated (row 13318: the primal arm raised as it staged); the call undifferentiated
-    refuses its program as it lowers, named (`selection.Unlowerable`, its kernel 'flash')."""
+def test_flash_inference_where_flash_lowers_not_trains_a_rematerialized_block_and_refuses_its_inference():
+    """Lowering for a B200, a GPU FlashAttention's wheel holds no code for
+    (`attention_kernels.flash_built_for`, whether or not it is installed): a 'flash_inference' call inside a rematerialized block under a
+    named-residual policy (`decoder_block`'s) lowers its training step, the template's alone, though the
+    block stages its primal before it is differentiated (row 13318: the primal arm raised as it staged);
+    the call undifferentiated refuses its program as it lowers, named (`selection.Unlowerable`, its kernel
+    'flash')."""
     from jax.ad_checkpoint import checkpoint_policies
 
     from dew.nn import attention_kernels
     from dew.nn.kernels import selection
 
-    monkeypatch.setattr(attention_kernels, "flash_architectures", lambda: None)
     query = jax.ShapeDtypeStruct((1, 512, 8, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
 
@@ -1209,7 +1208,7 @@ def test_flash_inference_without_its_wheel_trains_a_rematerialized_block_and_ref
     def loss(query, key, value):
         return jnp.sum(block(query, key, value).astype(jnp.float32))
 
-    with generation.assumed("sm80"):
+    with generation.assumed("sm100"):
         assert not attention_kernels.flash_lowered()
         jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, key, key).lower(lowering_platforms=("cuda",))
         with pytest.raises(selection.Unlowerable) as refused:

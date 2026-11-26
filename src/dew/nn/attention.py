@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import tokamax
 from flax.linen.dtypes import promote_dtype
+from jax._src import core as jax_core
 from jax.ad_checkpoint import checkpoint_name
 from jax.extend import core
 from jax.interpreters import mlir
@@ -1369,13 +1370,14 @@ mlir.register_lowering(_unlowered_p, lambda ctx, *_, avals, choice, kernel, why:
     choice=choice, kernel=kernel, why=why, avals=avals))
 
 
-def unlowered_launch(choice: str, kernel: str, why: str, like) -> object:
+def unlowered_launch[Tree](choice: str, kernel: str, why: str, like: Tree) -> Tree:
     """A launch of `kernel` this host lowers for no GPU of the target (`why`), its output `like`'s tree of
     shapes (`jax.eval_shape` of a kernel computing the same function): staged, a program that keeps it
     refuses it, named, as it lowers, and one whose derivative replaces it (a split kernel's primal under
     `nn.remat`) never lowers it."""
     leaves, tree = jax.tree.flatten(like)
-    avals = tuple(core.ShapedArray(leaf.shape, leaf.dtype) for leaf in leaves)
+    avals = tuple(jax_core.ShapedArray(leaf.shape, leaf.dtype, sharding=jax_core.get_cur_mesh_sharding())
+                  for leaf in leaves)
     outputs = _unlowered_p.bind(avals=avals, choice=str(choice), kernel=kernel, why=why)
     return jax.tree.unflatten(tree, outputs)
 
