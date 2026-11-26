@@ -1332,13 +1332,18 @@ class RowPlan:
         if sharding is None:
             return jax.vmap(lambda row: jax.random.fold_in(key, row))(jax.device_put(indices, key.sharding))
         # Each process's rows fold from its own root (processes may hold different seeds, which a request
-        # does not agree on), so each placed row carries its process's root's words beside its global
-        # index, both laid out as the rows are, and each device folds its own rows.
+        # does not agree on): each device holds its process's root's words for each of its rows, moved from
+        # the root's own device (no host read), beside the rows' global indices laid out as the rows are,
+        # and folds its own rows.
         from dew.nn.kernels.options import program
 
-        local = np.asarray(jax.random.key_data(key.addressable_data(0)))
-        rows_of_roots = np.broadcast_to(local, (self.count, *local.shape))
-        roots = jax.make_array_from_process_local_data(sharding, rows_of_roots)
+        words = jax.random.key_data(key.addressable_data(0))
+        shape = (self.global_rows, *words.shape)
+        held = sharding.addressable_devices_indices_map(shape)
+        roots = jax.make_array_from_single_device_arrays(shape, sharding, [
+            jax.device_put(jnp.broadcast_to(words, (len(range(*rows.indices(shape[0]))), *words.shape)),
+                           device)
+            for device, (rows, *_) in held.items()])
         placed = jax.make_array_from_process_local_data(sharding, indices)
         return program(_row_keys, static_argnames=("impl",), out_shardings=sharding)(
             roots, placed, impl=jax.random.key_impl(key))
