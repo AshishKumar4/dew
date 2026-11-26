@@ -1591,11 +1591,12 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
         width = _records.integer(mixture['expert_features'], 'expert_features')
-        # A router's scores, scaling and correction bias and a block's shared experts, where its parts
-        # state them (DeepSeek's routing, HY-3's).
+        # A router's scores, scaling and correction bias and a block's shared experts and their gate, where
+        # its parts state them (DeepSeek's routing, HY-3's, Qwen3-Next's).
         stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
-                                                'groups', 'groups_per_token', 'weight_sum_epsilon',
-                                                'weight_sum_min', 'router_softcap', 'excluded_group_score')
+                                                'shared_gate', 'groups', 'groups_per_token',
+                                                'weight_sum_epsilon', 'weight_sum_min', 'router_softcap',
+                                                'excluded_group_score')
                   if key in mixture}
         fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
