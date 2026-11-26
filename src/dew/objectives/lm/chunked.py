@@ -258,29 +258,37 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
 
 def _whole_logits(states, matrix, precision: jax.lax.PrecisionLike) -> jax.Array:
     """The whole head's `[tokens, vocab]` product as `_tile_logits` forms it, a bf16 head's held as bf16:
-    its values are bf16's (`bf16_product`), so a GPU's product writes them as bf16 from its fp32 sums, and
-    the fp32 product is never held beside its rounding (a Qwen3.5-4B step at 8 x 4096 tokens on an H100
-    held both at its peak, 30.3 and 15.2 GiB). Its readers widen it where they read it."""
+    its values are bf16's (`bf16_product`), so where no device splits its contraction (`_contracted_whole`)
+    a GPU's product writes them as bf16 from its fp32 sums, and the fp32 product is never held beside its
+    rounding (a Qwen3.5-4B step at 8 x 4096 tokens on one H100 held both at its peak, 30.3 and 15.2 GiB).
+    A split contraction sums its shards' partials in fp32 before it rounds, as XLA's partitioner sums them
+    in the product's own type. Its readers widen it where they read it."""
     if precision is not BF16:
         return _tile_logits(states, matrix, precision)
-    numbers = (((1,), (1,)), ((), ()))
 
     def written(states, matrix):
-        from dew.nn.sharding import contracted_alike
-
-        states, matrix, placed = contracted_alike(states.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16),
-                                                  numbers)
-        product = jax.lax.dot_general(states, matrix, numbers, precision=jax.lax.Precision.DEFAULT,
-                                      preferred_element_type=jnp.float32, out_sharding=placed)
-        # Rounded once its sums are whole: a contraction split over devices sums its shards' fp32 partials
-        # before it rounds (XLA's partitioner makes each local product and its sum in the product's type);
-        # unsplit, the GEMM writes the rounding as its epilogue. Behind a barrier, as `bf16_logits` holds its
-        # rounding: XLA's excess precision would otherwise widen a bf16 value its readers widen.
-        return jax.lax.optimization_barrier(product.astype(jnp.bfloat16))
+        if not _contracted_whole():
+            return _tile_logits(states, matrix, precision).astype(jnp.bfloat16)
+        numbers = (((1,), (1,)), ((), ()))
+        # Behind a barrier, as `bf16_logits` holds its rounding: XLA's excess precision would otherwise widen
+        # a bf16 result its readers widen, skipping the rounding a tiled head's logits take.
+        return jax.lax.optimization_barrier(jax.lax.dot_general(
+            states.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), numbers,
+            precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.bfloat16))
 
     return jax.lax.platform_dependent(
         states, matrix, cuda=written,
         default=lambda states, matrix: _tile_logits(states, matrix, precision).astype(jnp.bfloat16))
+
+
+def _contracted_whole() -> bool:
+    """Whether no device splits a product's contraction as it traces: every axis of the mesh in context
+    that is not manual is one device (a step on one GPU, a `shard_map`'s body over every axis), or, with no
+    mesh in context, the process holds one device."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
+        return jax.device_count() == 1
+    return all(size == 1 for name, size in mesh.shape.items() if name not in mesh.manual_axes)
 
 
 def _widened(raw: jax.Array) -> jax.Array:

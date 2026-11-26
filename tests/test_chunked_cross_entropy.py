@@ -1323,6 +1323,34 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     assert jnp.array_equal(tiled[1], whole[1])
 
 
+@pytest.mark.parametrize("devices", [1, 2], ids=["one device", "contraction split"])
+def test_a_bf16_whole_head_rounds_its_logits_once_its_sums_are_whole(devices):
+    """A bf16 whole head lowered for compile-only H100s (`chunked._whole_logits`): over one device its
+    product writes the logits as bf16 from its fp32 sums, the fp32 product never held beside its rounding;
+    over two whose tensor axis splits the features it contracts, its product is fp32, its shards' partials
+    summed before the rounding, as XLA's partitioner sums them in the product's own type (a bf16 sum of
+    partials 1 and -1 + 2**-9 is 0, not 2**-9)."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    mesh = Mesh(np.array(compile_only_gpus("sm90", devices)), ("tensor",))
+
+    def loss(states, matrix, targets):
+        losses, _, _ = chunked_cross_entropy(states, OutputTable(matrix, vocab_major=False), targets, 4,
+                                             tile=None)
+        return jnp.mean(losses)
+
+    shapes = (jax.ShapeDtypeStruct((16, 32), jnp.bfloat16, sharding=NamedSharding(mesh, P(None, "tensor"))),
+              jax.ShapeDtypeStruct((32, 64), jnp.bfloat16, sharding=NamedSharding(mesh, P("tensor", None))),
+              jax.ShapeDtypeStruct((16,), jnp.int32, sharding=NamedSharding(mesh, P())))
+    with jax.set_mesh(mesh):
+        text = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(*shapes).as_text()
+    products = {line.rsplit("->", 1)[-1].strip() for line in text.splitlines()
+                if "dot_general" in line and "->" in line and "16x64x" in line.rsplit("->", 1)[-1]}
+    assert products == ({"tensor<16x64xbf16>"} if devices == 1 else {"tensor<16x64xf32>"}), products
+
+
 def test_an_fp32_whole_heads_overflowed_state_gradient_stays_infinite():
     """A whole fp32 head's state gradient overflows as one product's does: infinite, never inf - inf.
     One zero state, 2048 columns, the target's at -3e38 and the rest at +3e38: a finite loss, log
