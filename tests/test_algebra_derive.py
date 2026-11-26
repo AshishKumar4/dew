@@ -1411,6 +1411,16 @@ def test_chunked_covariance_preserves_zero_weight_derivatives_and_extreme_anchor
             assert float(mx[0]) == 0.0 and float(my[0]) == 0.0 and float(cov[0]) == float(big)
 
 
+def _moment_weight_jvp(mode, tile):
+    from dew.algebra import moments
+
+    @jax.jit
+    def directed(x, w, dw):
+        return jax.jvp(lambda weights: moments.chunked_moments(x, weights, tile=tile, mode=mode), (w,), (dw,))
+
+    return directed
+
+
 @pytest.mark.parametrize("mode", ["walk", "merge"])
 @pytest.mark.parametrize("tile", [1, 2])
 def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight(mode, tile):
@@ -1419,6 +1429,13 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight(mode,
     min-normal weight (`x=[0]`, `w=[2^-126]`, `dw=[4]`), mixed forward-over-reverse derivatives across weight
     and value binades, uniform shifts, cancelling `cx*cy - cov`, and weight-only VJPs (row 12992)."""
     from dew.algebra import moments
+
+    directed = _moment_weight_jvp(mode, tile)
+
+    @jax.jit
+    def directed_covariance(x, y, w, dw):
+        return jax.jvp(lambda weights: moments.chunked_covariance(x, y, weights, tile=tile, mode=mode),
+                       (w,), (dw,))
 
     x_u = jnp.asarray([[0.0, np.float32(2.0 ** -60)]], jnp.float32)
     w_u = jnp.asarray([[0.0, np.float32(2.0 ** 100)]], jnp.float32)
@@ -1445,19 +1462,14 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight(mode,
     x_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(-(2.0 ** 50))]], jnp.float32)
     w_cn = jnp.asarray([[np.float32(2.0 ** 50), np.float32(2.0 ** 50)]], jnp.float32)
     if tile == 1:
-        (m_z, v_z), (dm_z, dv_z) = jax.jvp(
-            lambda w_, m=mode: moments.chunked_moments(x_z, w_, tile=1, mode=m), (w_z,), (dw_z,))
+        (m_z, v_z), (dm_z, dv_z) = directed(x_z, w_z, dw_z)
         assert float(m_z[0]) == 0.0 and float(v_z[0]) == 0.0
         assert float(dm_z[0]) == 0.0 and float(dv_z[0]) == 0.0
-    (m_u, v_u), (dm_u, dv_u) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_u, w_, tile=t, mode=m),
-        (w_u,), (dw_u,))
+    (m_u, v_u), (dm_u, dv_u) = directed(x_u, w_u, dw_u)
     assert float(m_u[0]) == float(np.float32(2.0 ** -60)) and float(v_u[0]) == 0.0
     assert float(dm_u[0]) == float(np.float32(-(2.0 ** -60)))
     assert float(dv_u[0]) == float(np.float32(2.0 ** -120))
-    _, (dmx_u, dmy_u, dc_u) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_covariance(x_u, x_u, w_, tile=t, mode=m),
-        (w_u,), (dw_u,))
+    _, (dmx_u, dmy_u, dc_u) = directed_covariance(x_u, x_u, w_u, dw_u)
     assert float(dmx_u[0]) == float(np.float32(-(2.0 ** -60)))
     assert float(dmy_u[0]) == float(np.float32(-(2.0 ** -60)))
     assert float(dc_u[0]) == float(np.float32(2.0 ** -120))
@@ -1465,9 +1477,7 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight(mode,
         lambda w_, t=tile, m=mode: moments.chunked_moments(x_u, w_, tile=t, mode=m), w_u)
     (gw_u,) = pb_u((jnp.asarray([np.float32(2.0 ** 100)], jnp.float32), jnp.zeros((1,), jnp.float32)))
     assert float(gw_u[0, 0]) == float(np.float32(-(2.0 ** -60))) and float(gw_u[0, 1]) == 0.0
-    _, (_, dv_q) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_q, w_, tile=t, mode=m),
-        (w_q,), (dw_q,))
+    _, (_, dv_q) = directed(x_q, w_q, dw_q)
     assert float(dv_q[0]) == 1.0
     _, d_gx = jax.jvp(
         lambda w_, t=tile, m=mode: jax.grad(
@@ -1486,21 +1496,13 @@ def test_chunked_moments_preserves_scaled_tangent_under_large_total_weight(mode,
         (x_u,), (dx_gw,))
     np.testing.assert_array_equal(
         np.asarray(d_gw), np.asarray([[np.float32(2.0 ** 10), 0.0]], np.float32))
-    _, (_, dv_ovq) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_ovq, w_, tile=t, mode=m),
-        (w_u,), (dw_ovq,))
+    _, (_, dv_ovq) = directed(x_ovq, w_u, dw_ovq)
     assert float(dv_ovq[0]) == float(np.float32(2.25 * 2.0 ** 54))
-    _, (_, _, dc_ovsub) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_covariance(x_ovq, x_sub, w_, tile=t, mode=m),
-        (w_u,), (dw_u,))
+    _, (_, _, dc_ovsub) = directed_covariance(x_ovq, x_sub, w_u, dw_u)
     assert float(dc_ovsub[0]) == float(np.float32(3.0))
-    _, (dm_sub, _) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_sub, w_, tile=t, mode=m),
-        (w_sub,), (dw_sub,))
+    _, (dm_sub, _) = directed(x_sub, w_sub, dw_sub)
     assert float(dm_sub[0]) == float(np.float32(2.0 / 3.0))
-    _, (_, dv_cn) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_cn, w_, tile=t, mode=m),
-        (w_cn,), (dw_u,))
+    _, (_, dv_cn) = directed(x_cn, w_cn, dw_u)
     assert float(dv_cn[0]) == 0.0
     gw_cov = jax.grad(
         lambda w_, t=tile, m=mode: moments.chunked_covariance(x_u, x_u, w_, tile=t, mode=m)[2].sum()
@@ -1518,6 +1520,18 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp(mode, tile):
     """Balanced quotient factors move monotonically with `|R|` in both JVP and VJP, preventing overshoot
     overflow near `fmax`, subnormal flush of `minexp` numerators, and mixed-AD tangent overflow."""
     from dew.algebra import moments
+
+    directed = _moment_weight_jvp(mode, tile)
+
+    @jax.jit
+    def moving_weight_pullback(x, w, dx):
+        def weights_gradient(x):
+            def mean(weights):
+                return moments.chunked_moments(x, weights, tile=tile, mode=mode)[0].sum()
+
+            return jax.grad(mean)(w)
+
+        return jax.jvp(weights_gradient, (x,), (dx,))[1]
 
     x_vjp = jnp.asarray([[np.float32(1.75), 0.0]], jnp.float32)
     w_hi = jnp.asarray([[0.0, np.float32(2.0 ** 100)]], jnp.float32)
@@ -1565,19 +1579,12 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp(mode, tile):
         lambda w_, t=tile, m=mode: moments.chunked_moments(x_vjp, w_, tile=t, mode=m)[0], w_hi)
     (gw,) = pb(cot_hi)
     assert float(gw[0, 0]) == float(np.float32(2.625 * 2.0 ** 27)) and float(gw[0, 1]) == 0.0
-    _, (dm, _) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_jvp, w_, tile=t, mode=m),
-        (w_lo,), (dw_hi,))
+    _, (dm, _) = directed(x_jvp, w_lo, dw_hi)
     assert float(dm[0]) == float(np.float32((2.0 / 3.0) * 2.0 ** 128))
-    _, (dm_t, _) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_tiny, w_, tile=t, mode=m),
-        (w_mid,), (dw_mid,))
+    _, (dm_t, _) = directed(x_tiny, w_mid, dw_mid)
     assert float(dm_t[0]) == float(np.float32((2.0 / 3.0) * 2.0 ** -116))
     for w_case, expected in ((w_p2, 1.5 * 2.0 ** 117), (w_mid, 2.0 ** 117)):
-        _, d_gw = jax.jvp(
-            lambda x_, w_=w_case, t=tile, m=mode: jax.grad(
-                lambda w__: moments.chunked_moments(x_, w__, tile=t, mode=m)[0].sum())(w_),
-            (x_tiny,), (dx_ov,))
+        d_gw = moving_weight_pullback(x_tiny, w_case, dx_ov)
         np.testing.assert_array_equal(
             np.asarray(d_gw), np.asarray([[np.float32(expected), 0.0]], np.float32))
     _, d_gcov = jax.jvp(
@@ -1586,10 +1593,7 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp(mode, tile):
         (x_qu,), (dx_qu,))
     np.testing.assert_array_equal(
         np.asarray(d_gcov), np.asarray([[np.float32(0.5), 0.0]], np.float32))
-    _, d_gup = jax.jvp(
-        lambda x_, t=tile, m=mode: jax.grad(
-            lambda w__: moments.chunked_moments(x_, w__, tile=t, mode=m)[0].sum())(w_up),
-        (x_qu,), (dx_up,))
+    d_gup = moving_weight_pullback(x_qu, w_up, dx_up)
     np.testing.assert_array_equal(
         np.asarray(d_gup), np.asarray([[np.float32(1.5 * 2.0 ** 127), 0.0]], np.float32))
     _, d_gww = jax.jvp(
@@ -1599,21 +1603,13 @@ def test_chunked_moments_balanced_quotient_direction_jvp_and_vjp(mode, tile):
     np.testing.assert_array_equal(
         np.asarray(d_gww),
         np.asarray([[np.float32(-1.5 * 2.0 ** 80), np.float32(-(2.0 ** 79))]], np.float32))
-    _, (_, dv_st) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_st, w_, tile=t, mode=m),
-        (w_st,), (dw_st,))
+    _, (_, dv_st) = directed(x_st, w_st, dw_st)
     assert float(dv_st[0]) == 0.0
-    _, (_, dv_hi_st) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_hi_st, w_, tile=t, mode=m),
-        (w_st,), (dw_one,))
+    _, (_, dv_hi_st) = directed(x_hi_st, w_st, dw_one)
     assert float(dv_hi_st[0]) == 0.0
-    _, (_, dv_lo_st) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_lo_st, w_, tile=t, mode=m),
-        (w_st,), (dw_st,))
+    _, (_, dv_lo_st) = directed(x_lo_st, w_st, dw_st)
     assert float(dv_lo_st[0]) == 0.0
-    _, (_, dv_unf) = jax.jvp(
-        lambda w_, t=tile, m=mode: moments.chunked_moments(x_unf, w_, tile=t, mode=m),
-        (w_unf,), (dw_unf,))
+    _, (_, dv_unf) = directed(x_unf, w_unf, dw_unf)
     assert float(dv_unf[0]) == 1.0
     _, (_, dv_jt) = jax.jvp(
         lambda x_, w_, t=tile, m=mode: moments.chunked_moments(x_, w_, tile=t, mode=m),
