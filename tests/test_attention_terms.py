@@ -143,3 +143,15 @@ def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_c
         call = MixerCall(AttentionMetadata(pairwise_mask=causal, key_positions=key_positions))
         return np.asarray(attending("reference")(jax.jit(layer.apply))(params, x, call))
     np.testing.assert_array_equal(run(places), run(None))
+
+
+def test_a_bidirectional_layer_holds_no_relative_bias():
+    """A relative bias reads each query's backward distance in the stream's slots, which a bidirectional
+    canvas over a frozen prefix places otherwise: a layer that is not causal refuses it as it is built,
+    where the causal one builds."""
+    x = jnp.zeros((ROWS, LENGTH, FEATURES), jnp.float32)
+    causal = _layer()
+    causal.init(jax.random.key(0), x)
+    canvas = causal.clone(ctx=dataclasses.replace(causal.ctx, causal=False))
+    with pytest.raises(ValueError):
+        canvas.init(jax.random.key(0), x)

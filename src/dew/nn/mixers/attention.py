@@ -597,6 +597,11 @@ class CausalSelfAttention(nn.Module):
                                    kernel_axes=ATTENTION_AXES['gate_proj'])
         if self.short_convs is not None:
             self._short_convs(self.short_convs)
+        if self.relative_bias is not None and not self.ctx.causal:
+            # Its distances are backward ones over the stream's slots, which a bidirectional canvas (and its
+            # frozen prefix, whose keys follow the cache's allocation) places otherwise.
+            raise ValueError("a relative bias reads each query's backward distance to its keys: a causal "
+                             "layer's alone")
         if self.relative_bias is not None:
             bias = self.relative_bias
             self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
