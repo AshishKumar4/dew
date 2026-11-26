@@ -2,10 +2,13 @@
 
 Declarations: dew.algebra.component_cases.chunk_carry, dew.algebra.component_cases.chunk_inverse_pullback,
   dew.algebra.component_cases.chunk_pullback, dew.algebra.component_cases.chunk_solve_level,
-  dew.algebra.component_cases.chunk_weighted, dew.algebra.component_cases.keys_cotangent,
-  dew.algebra.component_cases.online_softmax_step, dew.algebra.component_cases.prefix_difference,
-  dew.algebra.component_cases.queries_cotangent, dew.algebra.component_cases.rounded,
-  dew.algebra.component_cases.rounded_tangent, dew.algebra.component_cases.scores,
+  dew.algebra.component_cases.chunk_weighted, dew.algebra.component_cases.key_dropped_cotangents,
+  dew.algebra.component_cases.key_memory_decay, dew.algebra.component_cases.key_weights,
+  dew.algebra.component_cases.keys_cotangent, dew.algebra.component_cases.online_softmax_step,
+  dew.algebra.component_cases.prefix_difference, dew.algebra.component_cases.queries_cotangent,
+  dew.algebra.component_cases.query_dropped_cotangents, dew.algebra.component_cases.query_weights,
+  dew.algebra.component_cases.rounded, dew.algebra.component_cases.rounded_tangent,
+  dew.algebra.component_cases.scores, dew.algebra.component_cases.selective_decay,
   dew.algebra.component_cases.split_kv_merge, dew.algebra.component_cases.values_gradient.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
 egglog 14.0.0.post1; measured on cpu.
@@ -150,6 +153,92 @@ def _chunk_weighted_0(x1, x2, x3):
     return (v7,)
 
 
+def _key_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
+    v10 = lax.eq_p.bind(x3, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v11 = lax.broadcast_in_dim_p.bind(
+        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],), broadcast_dimensions=(),
+        sharding=None)
+    v12 = lax.select_n_p.bind(v10, x3, v11)
+    v13 = lax.broadcast_in_dim_p.bind(
+        v12, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v14 = lax.sub_p.bind(x1, v13)
+    v15 = lax.exp_p.bind(v14, accuracy=None)
+    v16 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v17 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],),
+        broadcast_dimensions=(), sharding=None)
+    v18 = lax.select_n_p.bind(v16, x4, v17)
+    v19 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v18)
+    v20 = lax.broadcast_in_dim_p.bind(v19, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v21 = lax.mul_p.bind(v15, v20, out_dtype=None)
+    v22 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
+        broadcast_dimensions=(), sharding=None)
+    v23 = lax.mul_p.bind(x2, x7, out_dtype=None)
+    v24, = lax.optimization_barrier_p.bind(v23)
+    v25 = lax.broadcast_in_dim_p.bind(x5, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v26 = lax.sub_p.bind(v24, v25)
+    v27 = lax.select_n_p.bind(x9, v26, v22)
+    v28 = lax.broadcast_in_dim_p.bind(x6, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v29 = lax.sub_p.bind(v27, v28)
+    v30 = lax.mul_p.bind(v29, v20, out_dtype=None)
+    v31 = lax.mul_p.bind(v15, v30, out_dtype=None)
+    v32 = lax.abs_p.bind(v31)
+    v33 = lax.lt_p.bind(v32, np.array(float('inf'), dtype=jnp.dtype('float32')))
+    v34 = lax.mul_p.bind(
+        v24, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v35 = lax.mul_p.bind(
+        x5, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v36 = lax.broadcast_in_dim_p.bind(v35, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v37 = lax.sub_p.bind(v34, v36)
+    v38 = lax.select_n_p.bind(x9, v37, v22)
+    v39 = lax.mul_p.bind(
+        x6, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v40 = lax.broadcast_in_dim_p.bind(v39, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v41 = lax.sub_p.bind(v38, v40)
+    v42 = lax.mul_p.bind(v41, v20, out_dtype=None)
+    v43 = lax.mul_p.bind(v15, v42, out_dtype=None)
+    v44 = lax.mul_p.bind(
+        v43, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v45 = lax.select_n_p.bind(v33, v44, v31)
+    v46 = lax.select_n_p.bind(x8, v22, v45)
+    return (v15, v21, v46)
+
+
+def _key_memory_decay_0(x1, x2):
+    v3 = lax.mul_p.bind(x1, x2, out_dtype=None)
+    v4 = lax.reduce_sum_p.bind(v3, axes=(1,), out_sharding=None)
+    return (v4,)
+
+
+def _key_memory_decay_1(x1, x2):
+    v3 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
+    v4 = lax.mul_p.bind(v3, x2, out_dtype=None)
+    v5 = lax.reduce_sum_p.bind(v4, axes=(1,), out_sharding=None)
+    return (v5,)
+
+
+def _key_weights_0(x1, x2, x3):
+    v4 = lax.eq_p.bind(x2, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v5 = lax.broadcast_in_dim_p.bind(
+        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],), broadcast_dimensions=(),
+        sharding=None)
+    v6 = lax.select_n_p.bind(v4, x2, v5)
+    v7 = lax.broadcast_in_dim_p.bind(
+        v6, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v8 = lax.sub_p.bind(x1, v7)
+    v9 = lax.exp_p.bind(v8, accuracy=None)
+    v10 = lax.eq_p.bind(x3, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v11 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],),
+        broadcast_dimensions=(), sharding=None)
+    v12 = lax.select_n_p.bind(v10, x3, v11)
+    v13 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v12)
+    v14 = lax.broadcast_in_dim_p.bind(v13, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
+    v15 = lax.mul_p.bind(v9, v14, out_dtype=None)
+    return (v9, v15)
+
+
 def _keys_cotangent_0(x1, x2, x3, x4, x5):
     v6 = lax.broadcast_in_dim_p.bind(
         np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
@@ -224,6 +313,79 @@ def _queries_cotangent_0(x1, x2, x3, x4, x5, x6, x7, x8):
     return (v12, v18, v27)
 
 
+def _query_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
+    v10 = lax.eq_p.bind(x3, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v11 = lax.broadcast_in_dim_p.bind(
+        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],), broadcast_dimensions=(),
+        sharding=None)
+    v12 = lax.select_n_p.bind(v10, x3, v11)
+    v13 = lax.broadcast_in_dim_p.bind(
+        v12, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
+    v14 = lax.sub_p.bind(x1, v13)
+    v15 = lax.exp_p.bind(v14, accuracy=None)
+    v16 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v17 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],),
+        broadcast_dimensions=(), sharding=None)
+    v18 = lax.select_n_p.bind(v16, x4, v17)
+    v19 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v18)
+    v20 = lax.broadcast_in_dim_p.bind(v19, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v21 = lax.mul_p.bind(v15, v20, out_dtype=None)
+    v22 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
+        broadcast_dimensions=(), sharding=None)
+    v23 = lax.mul_p.bind(x2, x7, out_dtype=None)
+    v24, = lax.optimization_barrier_p.bind(v23)
+    v25 = lax.broadcast_in_dim_p.bind(x5, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v26 = lax.sub_p.bind(v24, v25)
+    v27 = lax.select_n_p.bind(x9, v26, v22)
+    v28 = lax.broadcast_in_dim_p.bind(x6, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v29 = lax.sub_p.bind(v27, v28)
+    v30 = lax.mul_p.bind(v29, v20, out_dtype=None)
+    v31 = lax.mul_p.bind(v15, v30, out_dtype=None)
+    v32 = lax.abs_p.bind(v31)
+    v33 = lax.lt_p.bind(v32, np.array(float('inf'), dtype=jnp.dtype('float32')))
+    v34 = lax.mul_p.bind(
+        v24, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v35 = lax.mul_p.bind(
+        x5, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v36 = lax.broadcast_in_dim_p.bind(v35, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v37 = lax.sub_p.bind(v34, v36)
+    v38 = lax.select_n_p.bind(x9, v37, v22)
+    v39 = lax.mul_p.bind(
+        x6, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v40 = lax.broadcast_in_dim_p.bind(v39, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v41 = lax.sub_p.bind(v38, v40)
+    v42 = lax.mul_p.bind(v41, v20, out_dtype=None)
+    v43 = lax.mul_p.bind(v15, v42, out_dtype=None)
+    v44 = lax.mul_p.bind(
+        v43, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v45 = lax.select_n_p.bind(v33, v44, v31)
+    v46 = lax.select_n_p.bind(x8, v22, v45)
+    return (v15, v21, v46)
+
+
+def _query_weights_0(x1, x2, x3):
+    v4 = lax.eq_p.bind(x2, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v5 = lax.broadcast_in_dim_p.bind(
+        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],), broadcast_dimensions=(),
+        sharding=None)
+    v6 = lax.select_n_p.bind(v4, x2, v5)
+    v7 = lax.broadcast_in_dim_p.bind(
+        v6, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
+    v8 = lax.sub_p.bind(x1, v7)
+    v9 = lax.exp_p.bind(v8, accuracy=None)
+    v10 = lax.eq_p.bind(x3, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v11 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],),
+        broadcast_dimensions=(), sharding=None)
+    v12 = lax.select_n_p.bind(v10, x3, v11)
+    v13 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v12)
+    v14 = lax.broadcast_in_dim_p.bind(v13, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v15 = lax.mul_p.bind(v9, v14, out_dtype=None)
+    return (v9, v15)
+
+
 def _rounded_0(x1):
     v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('bfloat16'), weak_type=False, sharding=None)
     v3, = lax.optimization_barrier_p.bind(v2)
@@ -250,6 +412,23 @@ def _scores_0(x1, x2, x3):
     v11 = lax.mul_p.bind(v9, v10, out_dtype=None)
     v12 = lax.select_n_p.bind(v7, v8, v11)
     return (v12,)
+
+
+def _selective_decay_0(x1, x2):
+    v3 = lax.mul_p.bind(x1, x2, out_dtype=None)
+    v4 = lax.mul_p.bind(
+        v3, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v5 = lax.exp2_p.bind(v4, accuracy=None)
+    return (v5,)
+
+
+def _selective_decay_1(x1, x2, x3):
+    v4 = lax.mul_p.bind(x1, x2, out_dtype=None)
+    v5 = lax.mul_p.bind(
+        v4, np.array(float.fromhex('0x1.7154760000000p+0'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v6 = lax.exp2_p.bind(v5, accuracy=None)
+    v7 = lax.mul_p.bind(v6, x3, out_dtype=None)
+    return (v7,)
 
 
 def _split_kv_merge_0(x1, x2, x3, x4, x5, x6):
@@ -378,6 +557,51 @@ def chunk_weighted(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_weighted_forms, operands, policy, target, single=True)
 
 
+_key_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (
+        ((64, 32), 'float32'), ((64, 32), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
+        ((32,), 'float32'), ((32,), 'float32'), ((64, 32), 'float32'), ((64, 32), 'bool'),
+        ((64, 32), 'bool'))):
+        _key_dropped_cotangents_0,
+    ('default', 'sm90', (
+        ((128, 64), 'float32'), ((128, 64), 'float32'), ((64,), 'float32'), ((64,), 'float32'),
+        ((64,), 'float32'), ((64,), 'float32'), ((128, 64), 'float32'), ((128, 64), 'bool'),
+        ((128, 64), 'bool'))):
+        _key_dropped_cotangents_0,
+}
+
+
+def key_dropped_cotangents(*operands, policy: str = 'default', target: str = 'sm90'):
+    """key_dropped_cotangents's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_key_dropped_cotangents_forms, operands, policy, target, single=False)
+
+
+_key_memory_decay_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((64, 64), 'float32'), ((64, 64), 'float32'))):
+        _key_memory_decay_0,
+    ('default', 'sm90', (((128, 64), 'bfloat16'), ((128, 64), 'float32'))):
+        _key_memory_decay_1,
+}
+
+
+def key_memory_decay(*operands, policy: str = 'default', target: str = 'sm90'):
+    """key_memory_decay's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_key_memory_decay_forms, operands, policy, target, single=True)
+
+
+_key_weights_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((64, 32), 'float32'), ((32,), 'float32'), ((32,), 'float32'))):
+        _key_weights_0,
+    ('default', 'sm90', (((128, 64), 'float32'), ((64,), 'float32'), ((64,), 'float32'))):
+        _key_weights_0,
+}
+
+
+def key_weights(*operands, policy: str = 'default', target: str = 'sm90'):
+    """key_weights's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_key_weights_forms, operands, policy, target, single=False)
+
+
 _keys_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (
         ((64, 32), 'float32'), ((64, 32), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
@@ -432,6 +656,38 @@ def queries_cotangent(*operands, policy: str = 'accurate', target: str = 'sm90')
     return _generated.call(_queries_cotangent_forms, operands, policy, target, single=False)
 
 
+_query_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (
+        ((32, 64), 'float32'), ((32, 64), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
+        ((32,), 'float32'), ((32,), 'float32'), ((32, 64), 'float32'), ((32, 64), 'bool'),
+        ((32, 64), 'bool'))):
+        _query_dropped_cotangents_0,
+    ('default', 'sm90', (
+        ((64, 128), 'float32'), ((64, 128), 'float32'), ((64,), 'float32'), ((64,), 'float32'),
+        ((64,), 'float32'), ((64,), 'float32'), ((64, 128), 'float32'), ((64, 128), 'bool'),
+        ((64, 128), 'bool'))):
+        _query_dropped_cotangents_0,
+}
+
+
+def query_dropped_cotangents(*operands, policy: str = 'default', target: str = 'sm90'):
+    """query_dropped_cotangents's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_query_dropped_cotangents_forms, operands, policy, target, single=False)
+
+
+_query_weights_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((32, 64), 'float32'), ((32,), 'float32'), ((32,), 'float32'))):
+        _query_weights_0,
+    ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'), ((64,), 'float32'))):
+        _query_weights_0,
+}
+
+
+def query_weights(*operands, policy: str = 'default', target: str = 'sm90'):
+    """query_weights's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_query_weights_forms, operands, policy, target, single=False)
+
+
 _rounded_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 32), 'float32'),)):
         _rounded_0,
@@ -471,6 +727,21 @@ _scores_forms: dict[tuple, Callable[..., tuple]] = {
 def scores(*operands, policy: str = 'default', target: str = 'sm90'):
     """scores's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_scores_forms, operands, policy, target, single=True)
+
+
+_selective_decay_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((128,), 'float32'), ((128,), 'float32'))):
+        _selective_decay_0,
+    ('default', 'sm90', (((128,), 'float32'), ((128,), 'float32'), ((), 'float32'))):
+        _selective_decay_1,
+    ('default', 'sm90', (((256,), 'float32'), ((), 'float32'), ((256,), 'float32'))):
+        _selective_decay_1,
+}
+
+
+def selective_decay(*operands, policy: str = 'default', target: str = 'sm90'):
+    """selective_decay's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_selective_decay_forms, operands, policy, target, single=True)
 
 
 _split_kv_merge_forms: dict[tuple, Callable[..., tuple]] = {
