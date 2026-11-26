@@ -616,7 +616,8 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str] | None = None) ->
 
     params = flatten_dict(dict(variables.get("params", {})))
     kernels = {path[:-1]: leaf for path, leaf in params.items()
-               if path[-1] == "kernel" and jnp.ndim(leaf) == 2 and jnp.result_type(leaf) == jnp.bfloat16}
+               if path[-1] == "kernel" and isinstance(leaf, (jax.Array, np.ndarray)) and jnp.ndim(leaf) == 2
+               and jnp.result_type(leaf) == jnp.bfloat16}
     named = {tuple(site.split("/")) for site in sites} if sites is not None else set(kernels)
     if missing := named - set(kernels):
         raise ValueError(f"no two-axis bfloat16 kernel at {sorted('/'.join(site) for site in missing)}")

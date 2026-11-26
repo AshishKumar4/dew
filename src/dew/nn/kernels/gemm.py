@@ -358,10 +358,10 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,
                  out_dtype, layer, gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
-    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its
-    scale, frozen; `Bf16Window`: its decoded weights' fp32 sums), its epilogue on them in XLA before the one rounding, its rows scattered as any, one
-    output; none of `refused` (a transposed matrix, a prologue, its side operands, a pair, a prologue's JVP,
-    several outputs) given."""
+    """`gemm` of a packed weight matrix (`NvFp4`, `TernaryWeights`: its fp32 sums times its scale, frozen;
+    `Bf16Window`: its decoded weights' fp32 sums), its epilogue on them in XLA before the one rounding, its
+    rows scattered as any, one output; none of `refused` (a transposed matrix, a prologue, its side operands,
+    a pair, a prologue's JVP, several outputs) given."""
     if any(given not in (None, False, ()) for given in refused):
         raise ValueError("a packed matrix's product takes no prologue, pair, transposed matrix or several "
                          "outputs")

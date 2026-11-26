@@ -221,7 +221,7 @@ def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scal
         if (scales is not None) != desc.meta:
             raise ValueError(f"packed({packed_format}) takes {'its meta halves as' if desc.meta else 'no'} "
                              "scales")
-        word_taken(rhs, packed_format, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
+        word_taken(rhs, desc.name, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
                    paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
                    lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
     return k, k2

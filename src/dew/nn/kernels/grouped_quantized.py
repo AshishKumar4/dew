@@ -178,9 +178,9 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
         del trans_rhs
         return kernel.words, True, self._formats(kernel)
 
-    def _formats(self, kernel: TernaryWeights | Bf16Window) -> dict:
+    def _formats(self, kernel: object) -> dict:
         """`gmm`'s keywords for its packed matrix: its format's name, and a window's meta halves."""
-        assert isinstance(kernel, (TernaryWeights, Bf16Window))
+        assert isinstance(kernel, (TernaryWeights, Bf16Window)), type(kernel)
         meta = {'scales': kernel.meta_halves} if isinstance(kernel, Bf16Window) else {}
         return {'packed_format': kernel.fmt, **meta}
 
