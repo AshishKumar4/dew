@@ -51,7 +51,7 @@ def _binade(value: jax.Array) -> jax.Array:
     return jnp.where(finite_nonzero(held), float_bits(held)[4], 0).astype(jnp.int32)
 
 
-def _over_power(value: jax.Array, exponent: jax.Array) -> jax.Array:
+def over_power(value: jax.Array, exponent: jax.Array) -> jax.Array:
     """`value / 2^exponent` for an `exponent` from the least subnormal's binade to the largest's, as two
     correctly rounded divisions by exact normal powers of two, each half the exponent, so a subnormal value
     is raised to its significand and a large one lowered, every step normal and exact."""
@@ -77,7 +77,7 @@ def _scaled_by(value: jax.Array, exponent: jax.Array) -> jax.Array:
 def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
              divisors: Sequence[jax.Array]) -> jax.Array:
     """`value * prod(multipliers) / prod(divisors)` for finite operands, the divisors nonzero, linear in
-    `value`: each operand over its binade's power of two (`_over_power`, its significand in [1, 2)), their
+    `value`: each operand over its binade's power of two (`over_power`, its significand in [1, 2)), their
     product and quotients taken over the significands, in `[2^-len(divisors), 2^(1 + len(multipliers)))`,
     and the binades' sum set back last (`_scaled_by`), so no intermediate leaves the range where the result
     does not (`2^-12 * 2^-149 / 2^-140 / 2^-140` is `2^119`, where `2^-12 / 2^-140` overflows and
@@ -88,15 +88,15 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     of this expression, whose terms may leave the range at its edges (row 13232). A float64 subnormal is its
     value only where the backend keeps one."""
     exponent = _binade(value)
-    result = _over_power(value, exponent)
+    result = over_power(value, exponent)
     for multiplier in multipliers:
         binade = _binade(multiplier)
         exponent = exponent + binade
-        result = result * _over_power(multiplier, binade)
+        result = result * over_power(multiplier, binade)
     for divisor in divisors:
         binade = _binade(divisor)
         exponent = exponent - binade
-        result = divided_in(result, _over_power(divisor, binade))
+        result = divided_in(result, over_power(divisor, binade))
     return _scaled_by(result, exponent)
 
 

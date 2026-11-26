@@ -280,17 +280,35 @@ def test_a_float64_giant_heads_subnormal_gain_tangent_stays_in_float64():
 
 def test_a_large_seed_along_a_giant_head_keeps_its_perpendicular_part_finite():
     """An eight-wide head of four channels `2^62` clipped to `2^62` (gain 1/2): a seed `2^127` on those
-    four channels and on a fifth moves the fifth by `2^126`, bit for bit, both ways, and the four along the
-    head by its radial share, finite, where the projection's sum of four `2^126` overflowed and the fifth
-    met `0 * inf` (row 13169's review)."""
-    from dew.nn.attention_terms import clipped
-
+    four channels and on a fifth moves the fifth by `2^126`, bit for bit, both ways, jitted, and the four
+    along the head by its radial share, finite, where the projection's sum of four `2^126` overflowed and
+    the fifth met `0 * inf` (row 13169's review)."""
     x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
     x[:4], seed[:5] = 2.0 ** 62, 2.0 ** 127
-    _, moved = jax.jvp(lambda x: clipped(x, 2.0 ** 62, 1e-6), (jnp.asarray(x),), (jnp.asarray(seed),))
-    _, pull = jax.vjp(lambda x: clipped(x, 2.0 ** 62, 1e-6), jnp.asarray(x))
-    for derivative in (np.asarray(moved), np.asarray(pull(jnp.asarray(seed))[0])):
+    for derivative in _both_ways(x, seed, 2.0 ** 62):
         assert derivative[4] == 2.0 ** 126 and np.all(np.isfinite(derivative)), derivative
+
+
+def _both_ways(x, seed, threshold):
+    """The clip's tangent and pullback of `seed` at `x`, each jitted (the CPU lowering that flushes)."""
+    from dew.nn.attention_terms import clipped
+
+    def clip(x):
+        return clipped(x, threshold, 1e-6)
+
+    moved = jax.jit(lambda x, seed: jax.jvp(clip, (x,), (seed,))[1])(jnp.asarray(x), jnp.asarray(seed))
+    pulled = jax.jit(lambda x, seed: jax.vjp(clip, x)[1](seed)[0])(jnp.asarray(x), jnp.asarray(seed))
+    return np.asarray(moved), np.asarray(pulled)
+
+
+def test_a_large_seeds_small_perpendicular_component_keeps_its_share():
+    """`[2^62, 0, ...]` clipped to `2^61` (gain 1/2) under a seed `[2^127, 2^-30, 0, ...]`: the second
+    component, perpendicular, moves by `2^-31`, bit for bit, both ways, jitted, where the seed taken over
+    its largest's power first rounded it to zero (row 13169's review)."""
+    x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    x[0], seed[0], seed[1] = 2.0 ** 62, 2.0 ** 127, 2.0 ** -30
+    for derivative in _both_ways(x, seed, 2.0 ** 61):
+        assert derivative[1] == 2.0 ** -31 and np.all(np.isfinite(derivative)), derivative
 
 
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
