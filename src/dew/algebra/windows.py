@@ -632,12 +632,12 @@ def _raised(summed, power: int):
     return made
 
 
-def _narrow_landed(high, low, exponent, dtype):
-    """Land both fp32 words in a narrow format, keeping the tail at a rounding midpoint."""
+def _binary_landed(high, low, exponent, dtype):
+    """Land both fp32 words, keeping the tail at a destination rounding midpoint."""
     a, b = scaled.scaled(high), scaled.scaled(low)
     top = jnp.where(a.significand == 0, b.exponent,
                     jnp.where(b.significand == 0, a.exponent, jnp.maximum(a.exponent, b.exponent)))
-    # A much smaller limb can only settle an exact narrow midpoint. Align it no lower than a
+    # A much smaller limb can only settle an exact destination midpoint. Align it no lower than a
     # normal fp32 power that is still far below half an ulp of the larger limb.
     left, right = (word.significand * exact_power2(jnp.clip(word.exponent - top, -64, 0), jnp.float32)
                    for word in (a, b))
@@ -653,12 +653,12 @@ def _narrow_landed(high, low, exponent, dtype):
     return jnp.where(bits == signed, jnp.zeros_like(out), out)
 
 
-def _landed(summed, dtype) -> jax.Array:
+def _landed(summed, dtype, *, store_subnormal: bool = False) -> jax.Array:
     """A ratio's value before it lands (`_ratio_sum`'s) landed once into `dtype`, its residual with it (a
     quotient's `1 / (1 + 2^-24)`, the review's F3), a zero as +0."""
     high, low, exponent = summed
-    if dtype in (jnp.float16, jnp.bfloat16) and high.dtype == jnp.float32:
-        return _narrow_landed(high, low, exponent, dtype)
+    if high.dtype == jnp.float32 and (dtype in (jnp.float16, jnp.bfloat16) or store_subnormal):
+        return _binary_landed(high, low, exponent, dtype)
     landed = power2(high + low, exponent, reach=_REACH).astype(dtype)
     return jnp.where(landed == 0, jnp.zeros_like(landed), landed)
 
