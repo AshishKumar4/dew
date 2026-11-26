@@ -176,7 +176,10 @@ def _dew_chunk_rule(original: Callable) -> Callable:
     """transformers' chunked delta rule's signature over Dew's (`chunk_gated_delta_rule`): queries and keys
     l2-normalized in float32 where asked (FLA's `l2norm` at 1e-6), the rule over its kernel's operands (the
     source's dtype where its kernel takes them, else float32), its output in the queries' dtype; `original`
-    where it runs outside a trace or packs documents (`cu_seqlens`)."""
+    where it runs outside a trace or packs documents (`cu_seqlens`). Its write gates are at most one
+    (`write_bound`, as Dew's `GatedDeltaNet.declared` states its own) where its keys are l2-normalized: the
+    delta nets `kernel_parts` routes are Qwen3.5's and Qwen3-Next's by their code (`parts.identify`), each
+    gating its writes by `b.sigmoid()`; OLMo Hybrid's, doubling it, is none of them."""
     def rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False,
              use_qk_l2norm_in_kernel=False, **kwargs):
         from torchax.interop import jax_view, torch_view
@@ -196,16 +199,18 @@ def _dew_chunk_rule(original: Callable) -> Callable:
         # delta net): the projections' where the kernel takes them (`kernel_routed`, a bf16 source on a
         # GPU), float32 for the portable arithmetic (row 13280).
         narrow = given[0].dtype
+        declared = {"write_bound": 1.0 if use_qk_l2norm_in_kernel else None,
+                    "unit_queries": use_qk_l2norm_in_kernel}
         rounded_q, rounded_k, rounded_v = (x.astype(narrow) for x in (q, k, v))
         if narrow != jnp.float32 and q.shape[1] > 1 and kernel_routed(
-                rounded_q, rounded_k, rounded_v, decay, write, unit_queries=use_qk_l2norm_in_kernel):
+                rounded_q, rounded_k, rounded_v, decay, write, **declared):
             q, k, v = rounded_q, rounded_k, rounded_v
         state = None if initial_state is None else jax_view(initial_state).astype(jnp.float32)
         # Attested causal over the queries' positions (`sequence_causality.CAUSAL_ATTENTION`): each token's
         # output reads its own and earlier tokens' queries, keys, values, decays and writes and the whole
         # entering memory, the final memory every token.
         out, final = attested(lambda q, k, v, decay, write, state: chunk_gated_delta_rule(
-            q, k, v, decay, write, state, chunk_size, unit_queries=use_qk_l2norm_in_kernel),
+            q, k, v, decay, write, state, chunk_size, **declared),
             CAUSAL_ATTENTION, inputs=5, outputs=1)(q, k, v, decay, write, state)
         return (torch_view(out.astype(jax_view(query).dtype)),
                 torch_view(final) if output_final_state else None)

@@ -1723,6 +1723,7 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     kernels (fla's port, `fla_*`), each launched in its step's program; and its LM loss and every
     parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1, row
     13280), where the CPU's float32 witness reaches XLA's arithmetic alone."""
+    from dew.nn.kernels import generation
     from dew.nn.programs import equations
 
     torch.manual_seed(0)
@@ -1733,13 +1734,17 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     tokens = np.random.default_rng(0x13280).integers(0, QWEN3_NEXT["vocab_size"], (ROWS, SEQ + 1)).astype(
         np.int32)
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    program = jax.make_jaxpr(jax.grad(lambda params: objective_loss(
-        objective, {**loaded.variables, "params": params}, tokens, scalar=True)))(params)
+    with generation.routes() as taken:
+        program = jax.make_jaxpr(jax.grad(lambda params: objective_loss(
+            objective, {**loaded.variables, "params": params}, tokens, scalar=True)))(params)
     names = {str(eqn.params["name"]) for eqn in equations(program.jaxpr)
              if eqn.primitive.name == "pallas_call"}
     for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
         assert kernel in names, (kernel, sorted(names))
-    assert any(name.startswith("fla_") for name in names), sorted(names)
+    # The delta rule's selector gives its call a kernel (the recurrence template's or fla's port), as a
+    # native Qwen3-Next's under its declared write gates (`GatedDeltaNet.declared`).
+    delta = {route.kernel for route in taken if route.choice == generation.Choice.GATED_DELTA_RULE}
+    assert delta - {"xla"}, (delta, sorted(names))
     reference = copy.deepcopy(model).to(torch.bfloat16)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
