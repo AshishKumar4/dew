@@ -1858,14 +1858,26 @@ def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(t
 
 
 def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
-    """A source whose layers draw (attention dropout) refuses recomputing them, and the refusal leaves
-    torchax's key as it was: the same model traces again unrecomputed, unseeded, after it."""
-    torch.manual_seed(0)
+    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) refuses
+    recomputing them and refuses training unseeded, either way leaving torchax's key as it was; the same
+    model traces unrecomputed under a dropout key after it, drawing from that key."""
+    from dew.interop.torchax_fallback import _environment
+
     dropping = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
+    torch.manual_seed(0)
     transformers.LlamaForCausalLM(dropping).save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     tokens = np.zeros((2, 8), np.int32)
+    env = _environment()
+    before = env.prng_key
     recomputed = loaded.model.clone(remat=True)
-    with pytest.raises(ValueError):
-        jax.make_jaxpr(lambda v: recomputed.apply(v, tokens, train=True))(loaded.variables)
-    jax.make_jaxpr(lambda v: loaded.model.apply(v, tokens, train=True))(loaded.variables)
+    for model, rngs in ((recomputed, {"dropout": jax.random.key(1)}), (loaded.model, {})):
+        with pytest.raises(ValueError):
+            jax.make_jaxpr(lambda v, model=model, rngs=rngs: model.apply(v, tokens, train=True, rngs=rngs))(
+                loaded.variables)
+        assert env.prng_key is before
+
+    def train(variables, key):
+        return loaded.model.apply(variables, tokens, train=True, rngs={"dropout": key})
+    first, second = (jax.jit(train)(loaded.variables, jax.random.key(seed)) for seed in (1, 2))
+    assert not np.array_equal(np.asarray(first), np.asarray(second))

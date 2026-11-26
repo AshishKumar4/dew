@@ -1095,7 +1095,8 @@ class TorchGraph:
                 f"tier 3 traces this model's training forward once, and it draws on the host "
                 f"({draws.host} draws, e.g. a layer drop), which tracing would fix for every step; set "
                 f"that rate to 0 in its config, or train a family Dew loads natively")
-        if draws.device and key is None:
+        if (draws.device or draws.keyed) and key is None:
+            # Unseeded, its draws would read the environment's one key, fixed by the trace for every step.
             raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
         return outputs
 
@@ -1153,7 +1154,9 @@ class TorchGraph:
                 # nested layer's) leaves no key of its trace in the environment past it.
                 with (env, env.override_property(prng=env.prng_key if key is None else key),
                       draws, attending, _reaching(reach), seam):
+                    held = env.prng_key
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
+                    draws.keyed = env.prng_key is not held
             finally:
                 self.module.eval()
             return outputs, ({} if cached is None else cached.written)
@@ -1192,6 +1195,9 @@ def _Draws():
 
     class Draws(TorchFunctionMode):
         device = host = 0
+        keyed = False
+        """Whether torchax's key moved over the forward (`TorchGraph.traced`): a draw on its device by
+        whatever dispatch reached it, ATen's dropout among them, which no function above names."""
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             tensor = func(*args, **(kwargs or {}))
