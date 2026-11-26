@@ -207,7 +207,10 @@ class OutputTable:
     Contracting the model's final states with it (`logits`) reproduces the
     model's own logits, scale, bias, softcap and any adapter on the head
     included. Where no matrix does, `output_table` returns None, and the
-    logits come from `logits_from_hidden` or `logits` instead.
+    logits come from `logits_from_hidden` or `logits` instead. A head scoring
+    the first `scored` of the matrix's rows alone (`CausalTransformer.output_vocab`)
+    keeps the matrix whole, the stored parameter itself, and reads those rows
+    of its product; its `scale` and `bias` are theirs.
     """
 
     matrix: jax.Array
@@ -219,6 +222,7 @@ class OutputTable:
     input_quantizer: InputQuantizer | None = None
     scale: jax.Array | None = None
     projection: Projection | None = None
+    scored: int | None = struct.field(pytree_node=False, default=None)
 
     def states(self, hidden: jax.Array) -> jax.Array:
         """`hidden` as the product reads it: through the `projection` where the head has one, then the
@@ -234,6 +238,7 @@ class OutputTable:
         sampler applies to the head's logits."""
         logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
+        logits = logits if self.scored is None else logits[..., :self.scored]
         return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
 
     def columns(self, hidden: jax.Array, ids: Sequence[int] | jax.Array, *, temperature: float = 1.0,
@@ -251,7 +256,7 @@ class OutputTable:
             index: jax.Array | np.ndarray = ids
         else:
             index = np.asarray(ids, np.int64)
-            vocab = self.matrix.shape[0 if self.vocab_major else 1]
+            vocab = self.vocab
             if index.size and (index.min() < 0 or index.max() >= vocab):
                 raise IndexError(f"columns {index.tolist()} reach past a vocabulary of {vocab}")
         matrix = jnp.take(self.matrix, index, axis=0 if self.vocab_major else 1)
@@ -274,8 +279,13 @@ class OutputTable:
         it (`states`) is the token's logit before its bias and softcap, in the
         wider of the two dtypes. A reader
         of tokens' vectors (a decision head's lexical prior) takes these."""
-        rows = self.matrix if self.vocab_major else self.matrix.T
+        rows = (self.matrix if self.vocab_major else self.matrix.T)[:self.vocab]
         return rows if self.scale is None else rows * self.scale[:, None]
+
+    @property
+    def vocab(self) -> int:
+        """The tokens it scores: its `scored` rows, else every row of its matrix."""
+        return self.matrix.shape[0 if self.vocab_major else 1] if self.scored is None else self.scored
 
 
 @runtime_checkable

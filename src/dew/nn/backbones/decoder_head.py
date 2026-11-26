@@ -152,11 +152,12 @@ def quantizer(decoder: CausalTransformer, layer: nn.Module):
 
 def head_table(decoder: CausalTransformer) -> OutputTable:
     """The head's matrix, as `lm_head`'s call multiplies by it (`applied_kernel`) or the tied
-    embeddings, with `logits_from_hidden`'s scale, bias, softcap, precision and compute dtype, a checkpoint's
-    quantizer of its input, and `project_out` before it past an embedding's own width (`Projection`)."""
+    embeddings, whole (`OutputTable.scored` its first `logits_width` rows where it scores fewer), with
+    `logits_from_hidden`'s scale, bias, softcap, precision and compute dtype, a checkpoint's quantizer of its
+    input, and `project_out` before it past an embedding's own width (`Projection`)."""
     width = decoder.logits_width
-    matrix = (decoder.embed_tokens.embedding[:width] if decoder.tie_embeddings
-              else decoder.applied_kernel("lm_head")[:, :width])
+    matrix = decoder.embed_tokens.embedding if decoder.tie_embeddings else decoder.applied_kernel("lm_head")
+    stored = matrix.shape[0 if decoder.tie_embeddings else 1]
     projection = None if decoder.embedding_features is None else Projection(
         decoder.applied_kernel("project_out"), decoder.precision, compute=decoder.dtype,
         input_quantizer=quantizer(decoder, decoder.project_out),
@@ -166,7 +167,8 @@ def head_table(decoder: CausalTransformer) -> OutputTable:
                        decoder.final_logit_softcap, decoder.precision, compute=decoder.dtype,
                        input_quantizer=(None if decoder.tie_embeddings
                                         else quantizer(decoder, decoder.lm_head)),
-                       scale=_scored(token_gains(decoder), width), projection=projection)
+                       scale=_scored(token_gains(decoder), width), projection=projection,
+                       scored=None if width == stored else width)
 
 
 def _scored(per_token: jax.Array | None, width: int) -> jax.Array | None:
