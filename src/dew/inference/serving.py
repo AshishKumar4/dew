@@ -717,12 +717,9 @@ def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None
     *_, strategy = task.controls().components()
     layout = _laid(task.model, cache, capacity, strategy, None)
     own = task.model.kv_cache if isinstance(task.model, Layered) else None
-    # Pages a layout declares, the one a cache names (`PagedKV.layout`) or else the model's own, are kept
-    # wherever a prefix cache over them pays, at any capacity, as `_laid` keeps them; the measured
-    # crossover chooses pages over whole rows (`_pages_pay`).
     base = cache.layout if isinstance(cache, PagedKV) and cache.layout is not None else own
     shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None,
-                                               measured=base is None or base.page_size is None)
+                                               measured=_measured(cache, base))
     return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
@@ -1933,7 +1930,19 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     paged = dataclasses.replace(base, page_size=size, pages=pages, groups=1)
     if not cache.shared or base.page_size is not None:
         return paged
-    return paged if _pages_pay(model, paged, capacity, strategy, prefill_mesh) else unpaged(base)
+    measured = _measured(cache, base)
+    pays = _pages_pay(model, paged, capacity, strategy, prefill_mesh, measured=measured)
+    return paged if pays else unpaged(base)
+
+
+def _measured(cache: ServedCache | None, base: KVCache | None) -> bool:
+    """Whether shared pages over `base` (`PagedKV.shared`) are chosen over whole rows by the measured
+    crossover (`SHARED_PAGES_FROM`): where pages are the server's own choice, not a layout's (`base`'s own
+    pages, the model's or the cache's) nor a requirement the cache states, a prefix cache it names
+    (`prefix_cache`) or pages it offloads (`host_pages`), which hold at any capacity as before the crossover
+    (row 13278). One policy `_laid` and `served_layout` read."""
+    stated = isinstance(cache, PagedKV) and (cache.prefix_cache is not None or cache.host_pages > 0)
+    return not stated and (base is None or base.page_size is None)
 
 
 SHARED_PAGES_FROM = 2048
