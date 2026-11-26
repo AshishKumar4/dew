@@ -75,6 +75,8 @@ class Ratio:
     track_directions: bool = False
     directions: tuple[int, ...] = ()
     ieee_products: bool = False
+    store_subnormal: bool = False
+    """Pack subnormal binary32 values in their stored format even on an FTZ backend."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -411,11 +413,11 @@ def _ratio_value(*operands, form: Ratio):
     rank = max(operand.ndim for operand in operands)
     if form.ieee_products:
         finite = tuple(jnp.where(jnp.isfinite(operand), operand, 0.0) for operand in operands)
-        total = _landed(_ratio_sum(finite, form), operands[0].dtype)
+        total = _landed(_ratio_sum(finite, form), operands[0].dtype, store_subnormal=form.store_subnormal)
         special = _exceptional_products(operands, form, rank)
         landed = jnp.where(jnp.isfinite(special), total, special)
     else:
-        landed = _landed(_ratio_sum(operands, form), operands[0].dtype)
+        landed = _landed(_ratio_sum(operands, form), operands[0].dtype, store_subnormal=form.store_subnormal)
     shape = np.broadcast_shapes(*(_laid_to(operand, rank).shape for operand in operands))
     whole = tuple(1 if place in (*form.over, *form.across) else size for place, size in enumerate(shape)
                   if not (form.reduced and place == form.axis))

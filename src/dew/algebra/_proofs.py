@@ -52,6 +52,8 @@ class Apart(NamedTuple):
     unit_norm: bool = False
     dyadic_scale: bool = False
     """A float32 positive power of two from 2**-100 through 2**100, at every element."""
+    nonzero_floor: int | None = None
+    """A magnitude floor only for nonzero elements; unlike `floor` it does not exclude zero."""
 
     @property
     def above(self) -> int | None:
@@ -163,10 +165,14 @@ def _held_apart(apart: Apart, dtype) -> Apart:
     unit = apart.unit_norm and jnp.dtype(dtype).itemsize >= 2
     floor = (apart.floor if apart.floor is not None and int(floats.minexp) <= apart.floor < int(floats.maxexp)
              else None)
+    nonzero = apart.nonzero_floor
+    if nonzero is not None and not int(floats.minexp) <= nonzero < int(floats.maxexp):
+        nonzero = None
     dyadic = apart.dyadic_scale and dtype == jnp.float32
-    if floor == apart.floor and unit == apart.unit_norm and dyadic == apart.dyadic_scale:
+    if (floor == apart.floor and unit == apart.unit_norm and dyadic == apart.dyadic_scale
+            and nonzero == apart.nonzero_floor):
         return apart
-    return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic)
+    return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic, nonzero_floor=nonzero)
 
 
 def _constant_apart(value) -> Apart:

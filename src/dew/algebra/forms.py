@@ -6,6 +6,7 @@ the one switch the templates take their derived forms behind (`derived`)."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
@@ -18,7 +19,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import program, terms
 from dew.nn import programs
-from dew.nn.derivatives import stated_operation
+from dew.nn.derivatives import Protected, marked_call_p, stated_operation
 from dew.nn.kernels.templates.layout import PLACEMENTS
 from dew.nn.precision import float32_dot_general
 
@@ -187,16 +188,42 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
                             backward=through(derived.backward), prepare=through(derived.prepare))
 
 
-def inlined(function: Callable) -> Callable:
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class WalkLaw(Protected):
+    """A protected floating implementation whose walk uses a law under a proved weight domain.
+
+    Only monoid derivation may substitute it, and only when the weight operand cannot be subnormal.
+    It does not assert bit equivalence for ordinary rewrite or canonical recognition.
+    """
+    law: Callable
+    weight: int
+
+
+def _walk_law(equation) -> WalkLaw | None:
+    if equation.primitive is marked_call_p and isinstance(kind := equation.params["kind"], WalkLaw):
+        return kind
+    return None
+
+
+def inlined(
+    function: Callable, *, ranges: Mapping[int, float | tuple[float, float]] | None = None,
+) -> Callable:
     """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
     a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, each call of a
     jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
     product enters the e-graph as one whatever the platform, and each placement on a mesh as its operand
     (a sharding constraint in a declaration traced under a mesh: a tile is placed already); a form
-    evaluates products as Dew's (`evaluated`)."""
+    evaluates products as Dew's (`evaluated`). Only a monoid walk may request a named `WalkLaw`."""
     def run(*values):
         closed = jax.make_jaxpr(function)(*values)
-        outputs = evaluated_inline(closed.jaxpr, closed.consts, values)
+        given = None
+        if ranges is not None and any(_walk_law(eq) is not None for eq in programs.equations(closed.jaxpr)):
+            given = {}
+            for index, value in ranges.items():
+                var = closed.jaxpr.invars[index]
+                if isinstance(aval := var.aval, ShapedArray):
+                    given[var] = terms.input_proof(value, aval.dtype)
+        outputs = evaluated_inline(closed.jaxpr, closed.consts, values, given=given)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     return run
@@ -225,7 +252,7 @@ def _platform_default(equation: jcore.JaxprEqn,
     return programs.branches(equation)[platforms.index(None)] if None in platforms else None
 
 
-def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
+def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values, *, given=None) -> list:
     """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`) and each
     placement its operand (`PLACEMENTS`)."""
     env: dict = {}
@@ -233,20 +260,42 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
 
+    proofs = None
+
+    def proof(atom):
+        nonlocal proofs
+        if isinstance(atom, jcore.Literal):
+            return terms.literal_proof(atom)
+        if proofs is None:
+            proofs = terms.proven(jaxpr, consts=dict(zip(jaxpr.constvars, consts, strict=True)), given=given,
+                                  deep=True)
+        return proofs[0].get(atom), proofs[1].get(atom, terms.NOWHERE)
+
+    def call(body, inputs):
+        passed = (None if given is None else
+                  dict(zip(body.jaxpr.invars, map(proof, inputs), strict=True))
+                  if any(_walk_law(eq) is not None for eq in programs.equations(body.jaxpr)) else {})
+        return evaluated_inline(body.jaxpr, body.consts, [read(atom) for atom in inputs], given=passed)
+
     env.update(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
     producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
     for equation in jaxpr.eqns:
         if (default := _platform_default(equation, producers)) is not None:
-            operands = [read(atom) for atom in equation.invars[1:]]
-            outs = evaluated_inline(default.jaxpr, default.consts, operands)
+            outs = call(default, equation.invars[1:])
+        elif given is not None and (kind := _walk_law(equation)) is not None:
+            weight = equation.invars[kind.weight]
+            if (not isinstance(aval := weight.aval, ShapedArray)
+                    or not terms.normal_or_zero(aval.dtype, *proof(weight))):
+                raise Refused("weighted moment walk requires weights proved zero or normal")
+            outs = kind.law(*(read(atom) for atom in equation.invars))
         elif stated_operation(equation) is not None:
             # A span stating the operation it computes, bound as itself: its values Dew's arithmetic, which
             # the normal form reads as that operation (`normal_form.canonical`).
             outs = bound(equation, [read(atom) for atom in equation.invars])
         elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
-            outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
+            outs = call(called, equation.invars)
         elif equation.primitive in PLACEMENTS:
             # Its values its operands': a tile a walk reads is placed already.
             outs = [read(atom) for atom in equation.invars]

@@ -29,15 +29,14 @@ traces each surrogate's written bodies, not its pilot's generated functions.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate` | stable forms and flat component pilots | search and sample stable forms; check components as written (§1.5) | checked-in modules with a shared accuracy and regeneration suite |
-| Dev time (planned) | the same generator, as a declaration changes | template reduction and scan declarations, and the two bodies of a declared surrogate | dev-time rules with the family's independent accuracy and performance gates | checked-in Python and its Check 1, Check 2 and regeneration coverage (§6.11) |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
-- **Dev time** generates stable forms and checked component pilots registered with `declare`. The
-  generator writes `*_derived.py` beside the declaring module. `tests/test_algebra_generate.py` checks
-  each function against independent truth and regenerates on the recorded platform. The recurrence score
-  tile and rounded-operand bodies do not replace production forms. Forward and backward template tiles,
-  online step and combine, and surrogate cutover remain measured work (rows 3272, 6109).
+- **Dev time** searches and checks stable numeric forms. It emits flat template and surrogate component
+  pilots as written, without searching them for alternatives. Both write checked-in `*_derived.py`
+  alongside their declarations. Production cutover (rows 3272, 6109) remains open: representative
+  live launches need Check 1 and Check 2, and matched native step time, peak memory, and first-start
+  trace/lower cost against current trace-time derivation. Until then the production default stays.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -169,9 +168,9 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     written until preservation is known for every lowering; a bfloat16 subnormal is subnormal in float32
     too. A reciprocal square root's form and a magnitude's magnitude remain XLA's simplifier's.
   - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
-    dev-only until a changed default-route executable has a native receipt (row 9777). M-DC-14's
-    compile-only survey forcing XLA attention found a changed 4B step; the subsequent default-route
-    survey fired no match and did not time it. An equal term is one e-class and extraction prices a shared
+    dev-only until a changed default-route executable has a native receipt (row 9777; M-AL-2). The
+    compile-only default-route SimpleDiT-B comparison changes the optimized HLO; it is not a timing
+    or native accuracy receipt. An equal term is one e-class and extraction prices a shared
     one once, so a value written twice is read once without a rule. The rules relate a new value to another
     the program holds or hoist a division past a broadcast or square root: a quotient by a value whose
     reciprocal the program holds, `a / y` as `a (1/y)`, also for a held `integer_pow(y, -1)` and
@@ -1556,6 +1555,13 @@ chunks and reduces the signed products before dividing and landing. This preserv
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
 directions. A finite observation at zero weight retains its one-sided weight derivative.
+For a finite row with a nonzero stored subnormal weight, weighted moments keep the mass and its
+weighted products unlanded in the same ratios used for their derivatives. Other rows keep their
+ordinary path. The float-mass monoid requires zero or normal weights. A generic declaration may
+substitute the protected weighted law only after proving that domain, not as a bitwise rewrite or
+canonical recognition. A selection can prove every weight zero or normal even when its zero arm
+prevents any strict positive bound.
+
 Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
 or missing observations. Its covariance term centers and differentiates only pairs that are present.
 
