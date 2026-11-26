@@ -434,6 +434,27 @@ def test_a_bfloat16_host_factor_leaves_a_bfloat16_product_residual():
     np.testing.assert_array_equal(np.asarray([high, low], np.float32), [1, -(2 ** -14)])
 
 
+@pytest.mark.parametrize("literal", [False, True], ids=["traced", "host"])
+def test_two_product_splits_a_mixed_operand_in_its_promoted_format(literal):
+    scale, factor = np.float32(2.0 ** -8), np.float16(65504)
+
+    def product(a, b):
+        value = factor if literal else b
+        return two_product(a, value, bit_split=True), two_product(value, a, bit_split=True)
+
+    for high, low in jax.jit(product)(scale, factor):
+        assert high.dtype == low.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray([high, low]), [float(scale) * float(factor), 0.0])
+
+
+def test_two_product_promotes_a_python_literal_without_double_rounding():
+    # The final bit is below the fp32 precision at this fp16 midpoint.
+    factor = 1 + 2.0 ** -11 + 2.0 ** -30
+    x = np.ones((2,), np.float16)
+    high, _ = jax.jit(lambda a: two_product(a, factor))(x)
+    np.testing.assert_array_equal(np.asarray(high), np.full_like(x, 1 + 2.0 ** -10))
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a
