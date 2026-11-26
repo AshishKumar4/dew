@@ -43,7 +43,7 @@ from dew.nn.kernels.gemm import (
 from dew.nn.kernels.templates import axes
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import EXACT_FLOAT32, biased, biased_value, effective_precision
+from dew.nn.precision import EXACT_FLOAT32, asks_default_precision, biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -706,9 +706,10 @@ def dot_general(xla, path: tuple | None = None):
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         # A formed input's hook reads its rows and sides as `lhs` is read: of its shape, its dtype; a dot
-        # algorithm the call or the run states is the layer's own product's (`xla`'s) to run.
+        # algorithm or a precision above the default the call or the run states is the layer's own
+        # product's (`xla`'s) to run, as it states it.
         formed = (formed if formed is not None and formed.operand is lhs and plain
-                  and not _algorithm(precision)
+                  and asks_default_precision(precision, configured=True)
                   and all((each.shape, each.dtype) == (lhs.shape, lhs.dtype)
                           for each in (formed.rows, *formed.sides)) else None)
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
@@ -749,18 +750,6 @@ def dot_general(xla, path: tuple | None = None):
     return product
 
 
-def _algorithm(precision: PrecisionLike) -> bool:
-    """Whether a product's precision, the call's or else the run's (`jax_default_matmul_precision`), names a
-    dot algorithm (`jax.lax.DotAlgorithm`, `DotAlgorithmPreset`, or a preset's name), which the layer's own
-    product runs as stated (`float32_dot_general`'s BF16_BF16_F32 and its backends' workarounds) and no formed
-    product takes."""
-    stated = precision if precision is not None else jax.config.jax_default_matmul_precision
-    if isinstance(stated, (tuple, list)):
-        return any(_algorithm(each) for each in stated)
-    return (isinstance(stated, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))
-            or (isinstance(stated, str) and stated in jax.lax.DotAlgorithmPreset.__members__))
-
-
 def _whole(*operands: jax.Array) -> bool:
     """Whether a product's `operands` are whole where it runs: no automatic mesh axis splits them
     (`automatic_axes`; a device's own rows inside a per-shard map) and no Explicit axis places any of them
@@ -781,10 +770,8 @@ def _formed_product(formed: FormedInput, matrix: jax.Array, out_dtype, precision
         return each.reshape(-1, depth)
 
     sides = tuple(Side(flat(side), ('rows', 'depth')) for side in formed.sides)
-    # The precision the layer's own product multiplies at: the call's, else the run's configured level (a
-    # run's ACCURATE numerics' "highest"), which `gemm` takes as the call's declaration.
     out = gemm(flat(formed.rows), matrix, prologue=Hook(formed.hook, sides), applied=flat(operand),
-               out_dtype=out_dtype, precision=effective_precision(precision))
+               out_dtype=out_dtype, precision=precision)
     return out.reshape(*operand.shape[:-1], matrix.shape[1])
 
 
