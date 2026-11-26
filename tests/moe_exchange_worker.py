@@ -55,35 +55,31 @@ def main() -> None:
         maxima = []
         (value, out), (d_parameters, d_x, d_weights) = actual
         (value_, out_), (d_parameters_, d_x_, d_weights_) = expected
-        for ours, theirs in zip(jax.tree.leaves((value, out, d_parameters, d_weights)),
-                                jax.tree.leaves((value_, out_, d_parameters_, d_weights_)), strict=True):
-            maxima += _held(ours, np.asarray(theirs).astype(np.float64), 3e-5, 3e-5)
-        if jnp.finfo(dtype).bits < 32:
-            with jax.default_device(jax.local_devices()[0]):
-                routes = route_cotangents(model, parameters_, x_, weights_, ids_, out_)
-            bound = routes_rounded_bound(routes, jnp.finfo(dtype).eps / 2)
-            whole = np.asarray(d_x_).astype(np.float64)
-            for shard in d_x.addressable_shards:
-                error = np.abs(np.asarray(shard.data).astype(np.float64) - whole[shard.index])
-                assert np.all(error <= bound[shard.index]), (error, bound[shard.index])
-                # Each error as its share of its entry's bound (`assert_exchange_across_processes`).
-                maxima.append(float(np.max(error / np.maximum(bound[shard.index], np.finfo(np.float64).tiny),
-                                           initial=0)))
-        else:
-            maxima += _held(d_x, np.asarray(d_x_).astype(np.float64), 3e-5, 3e-5)
+        compared = list(zip(jax.tree.leaves((value, out, d_parameters, d_weights, d_x)),
+                            jax.tree.leaves((value_, out_, d_parameters_, d_weights_, d_x_)), strict=True))
+        for at, (ours, theirs) in enumerate(compared):
+            whole = np.asarray(theirs).astype(np.float64)
+            allowed = 3e-5 + 3e-5 * np.abs(whole)
+            if at == len(compared) - 1 and jnp.finfo(dtype).bits < 32:
+                # The input's narrow cotangent, its routes rounded on the wire (`routes_rounded_bound`).
+                with jax.default_device(jax.local_devices()[0]):
+                    routes = route_cotangents(model, parameters_, x_, weights_, ids_, out_)
+                allowed = routes_rounded_bound(routes, jnp.finfo(dtype).eps / 2)
+            maxima += _held(ours, whole, allowed)
         errors[f'{jnp.dtype(dtype).name}/{activation}/{skewed}'] = maxima
     output.write_text(json.dumps({'processes': jax.process_count(), 'errors': errors}))
     jax.distributed.shutdown()
 
 
-def _held(ours: jax.Array, whole: np.ndarray, atol: float, rtol: float) -> list[float]:
-    """Each local shard of `ours` within `atol` and `rtol` of the whole reference's entries, each error as
-    its share of that tolerance."""
+def _held(ours: jax.Array, whole: np.ndarray, allowed: np.ndarray) -> list[float]:
+    """Each local shard of `ours` within `allowed` of the whole reference, entry by entry, each shard's
+    largest error as its share of what its entry allows."""
     shares = []
     for shard in ours.addressable_shards:
-        a, b = np.asarray(shard.data).astype(np.float64), whole[shard.index]
-        np.testing.assert_allclose(a, b, atol=atol, rtol=rtol)
-        shares.append(float(np.max(np.abs(a - b) / (atol + rtol * np.abs(b)), initial=0)))
+        error = np.abs(np.asarray(shard.data).astype(np.float64) - whole[shard.index])
+        bound = np.broadcast_to(allowed, whole.shape)[shard.index]
+        assert np.all(error <= bound), (error, bound)
+        shares.append(float(np.max(error / np.maximum(bound, np.finfo(np.float64).tiny), initial=0)))
     return shares
 
 

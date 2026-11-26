@@ -377,7 +377,7 @@ def test_the_exchanges_route_bound_refuses_a_route_two_ulps_off():
     route = 1.0 + 2.0 ** -7
     bound = routes_rounded_bound(np.asarray([[route], [0.0]]), 2.0 ** -8)
     assert 2.0 ** -8 * route <= bound[0]
-    assert 2 * 2.0 ** -7 > bound[0]
+    assert bound[0] < 2 * 2.0 ** -7
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
