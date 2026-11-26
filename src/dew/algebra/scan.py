@@ -1166,9 +1166,9 @@ def _paired(left, right, between, issue: Callable | None = None, role: str = "sc
 
 
 def _pair_sum(factors: tuple[jax.Array, ...]) -> jax.Array:
-    """Contract the leading key axis without landing a product before it meets the other factors."""
-    form = ratios.Ratio(((1.0, tuple(("v", i) for i in range(len(factors)))),), (), 0,
-                        reduced=True, units=windows.Units(), ieee_products=True)
+    """Contract the leading key axis, keeping the crossed mask as a held last factor."""
+    term = (*(("v", i) for i in range(len(factors) - 1)), ("m", len(factors) - 1))
+    form = ratios.Ratio(((1.0, term),), (), 0, reduced=True, units=windows.Units(), ieee_products=True)
     return ratios.ratio(list(factors), form)
 
 
@@ -1181,11 +1181,16 @@ def _tiny_factor(operand, decay, product):
 
 
 def _pair_factors(left, right, decay, after):
-    """Broadcast pair operands along query and key rows, with the contracted channel first."""
+    """Contract channels first; a crossed key contributes neither a value nor a tangent."""
     left, right = (jnp.moveaxis(part, -1, 0) for part in (left, right))
-    first = left[..., :, None], right[..., None, :], jnp.moveaxis(decay, -1, 0)
-    return first if after is None else (*first[:2], first[2][..., :, None],
-                                       jnp.moveaxis(after, -1, 0)[..., None, :])
+    first, second = jnp.moveaxis(decay, -1, 0), None if after is None else jnp.moveaxis(after, -1, 0)
+    if second is None:
+        active, factors = ~_crossed(first), (first,)
+    else:
+        factors = (first[..., :, None], second[..., None, :])
+        active = ~(_crossed(factors[0]) | _crossed(factors[1]))
+    # Keep the broadcast axes on the numeric inputs: the ratio's transpose reduces them before landing.
+    return left[..., :, None], right[..., None, :], *factors, active.astype(left.dtype)
 
 
 def _portable_pair_jvp(primals, tangents):
@@ -1208,16 +1213,16 @@ def _pair_dispatch(left, right, decay, after):
         decayed = right[..., None, :, :] * decay
         tiny = jnp.any(_tiny_factor(right[..., None, :, :], decay, decayed))
 
-        def ordinary():
-            return _portable_einsum("...ik,...ijk->...ij", left, decayed)
+        ordinary = _portable_einsum("...ik,...ijk->...ij", left, decayed)
     else:
         leading, trailing = left * decay, right * after
         tiny = jnp.any(_tiny_factor(left, decay, leading)) | jnp.any(_tiny_factor(right, after, trailing))
+        ordinary = _portable_einsum("...ik,...jk->...ij", leading, trailing)
 
-        def ordinary():
-            return _portable_einsum("...ik,...jk->...ij", leading, trailing)
-
-    return lax.cond(tiny, lambda: _pair_sum(_pair_factors(left, right, decay, after)), ordinary)
+    # A dot can overflow one channel before another cancels it. Keep the ordinary finite path,
+    # but let the existing scaled sum decide any nonfinite result or flushed pre-product.
+    repair = tiny | jnp.any(~jnp.isfinite(ordinary))
+    return lax.cond(repair, lambda: _pair_sum(_pair_factors(left, right, decay, after)), lambda: ordinary)
 
 
 @_pair_dispatch.def_vmap

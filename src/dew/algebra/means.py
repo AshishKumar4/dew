@@ -49,9 +49,19 @@ from jax.interpreters import ad
 
 from dew.algebra import scaled
 from dew.algebra.ratios import Ratio, _ratio_sum, ratio
-from dew.algebra.windows import Units, _arrays, _laid_to, _landed, _quotient, _streamed, _Sum, _without_axis
+from dew.algebra.windows import (
+    Units,
+    _arrays,
+    _laid_to,
+    _landed,
+    _quotient,
+    _streamed,
+    _Sum,
+    _units_scale,
+    _without_axis,
+)
 from dew.nn.derivatives import contracted
-from dew.nn.precision import two_product, two_sum
+from dew.nn.precision import at_least_fp32, power2, two_product, two_sum
 
 
 def _laid(array: jax.Array, like: jax.Array) -> jax.Array:
@@ -241,27 +251,40 @@ def _landing(units: Units, joined: jax.Array, masses, axis: int) -> jax.Array:
     high, low, exponent = masses
     landed = scaled.scaled(high + low)
     binade = jnp.expand_dims(exponent + landed.exponent, axis)
-    largest = scaled.format_of(joined.dtype).largest
-    shift = jnp.maximum(binade - largest, 0).astype(joined.dtype)
+    dtype = at_least_fp32(joined.dtype)
+    limits = jnp.finfo(joined.dtype)
+    largest = limits.maxexp - 1
+    significand = jnp.expand_dims(jnp.abs(landed.significand), axis)
+    shift = jnp.maximum(binade - largest, 0).astype(dtype)
+    if joined.dtype != dtype:
+        # A wide word in the last narrow binade can round to infinity before its binade changes.
+        midpoint = 2 - 2.0 ** -(limits.nmant + 1)
+        shift = jnp.where((binade == largest) & (significand >= midpoint), 1, shift)
     # The least anchor of the format at or past `joined + move / s`, the joined anchor and the move formed
     # together in the units' own scale (`s` times an anchor) as one exact double float (`two_product`,
     # `two_sum`), its quotient by `s` stepped one place up where an exact product shows it short: formed
     # apart, a move past the format overflowed beside an anchor far beneath it (64 totals of 2^127 at
     # -2^127, a scale of 2^-126: +2^127 holds them; the merge P0's base review 10, F2), and an anchor at 2^30
     # moves one place, 128, as its sum needs (any further, its mass underflowed).
-    scale = np.asarray(units.scale, joined.dtype)
-    split = joined.dtype == jnp.float32
-    start, start_error = two_product(joined, scale, bit_split=split)
-    ln2 = np.asarray(math.log(2), joined.dtype)
-    significand = jnp.expand_dims(jnp.abs(landed.significand), axis)
-    least = (jnp.log(significand) + np.asarray(2.0 ** -16, joined.dtype)
-             - np.asarray(np.log(float(jnp.finfo(joined.dtype).max) / 2.0 ** largest), joined.dtype))
+    coefficient, power = _units_scale(units, dtype)
+    scale = np.asarray(coefficient, dtype)
+    split = dtype == jnp.float32
+
+    def in_units(anchor):
+        work = anchor.astype(dtype)
+        return power2(work, power) if power else work
+
+    start, start_error = two_product(in_units(joined), scale, bit_split=split)
+    ln2 = np.asarray(math.log(2), dtype)
+    least = (jnp.log(significand) + np.asarray(2.0 ** -16, dtype)
+             - np.asarray(np.log(float(limits.max) / 2.0 ** largest), dtype))
 
     def landed_at(move):
         high, low = two_sum(start, move)
         low = low + start_error
-        candidate = (high + low) / scale
-        product, residual = two_product(candidate, scale, bit_split=split)
+        rounded = (high + low) / scale
+        candidate = (power2(rounded, -power) if power else rounded).astype(joined.dtype)
+        product, residual = two_product(in_units(candidate), scale, bit_split=split)
         short = (product - high) + (residual - low) < 0
         return jnp.where(short, jnp.nextafter(candidate, np.asarray(np.inf, joined.dtype)), candidate)
 
