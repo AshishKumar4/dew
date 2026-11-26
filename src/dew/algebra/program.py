@@ -801,7 +801,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation,
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()
-    saturated = saturate(graph, region, firing, saturation)
+    saturated = saturate(graph, region, firing, saturation, facts_settled=True)
     nodes = node_count(graph)
     # Cross-root sharing (`reuse`: `a / sqrt(v)` sharing a sibling `rsqrt(v)`) ties greedy per-class
     # extraction (`sqrt` and `rsqrt` price alike per class); exact DAG extraction sees the shared node.
@@ -1015,11 +1015,13 @@ class Saturated:
 
 
 def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, ...],
-             saturation: Saturation, facts: Schedule | None = None) -> Saturated:
-    """`graph` run under the `admitted` rule sets to their fixpoint or `region`'s limits (`Saturation`), its
-    facts saturated after each set: the engine's (`rules.FACTS`), or `facts` where a caller's rules read
-    facts of their own (the derivation's, `dew.algebra.derive`)."""
-    facts = rules.FACTS.saturate() if facts is None else facts
+             saturation: Saturation, facts: Schedule | None = None, *, facts_settled: bool = False) -> Saturated:
+    """Run the rule sets to their fixpoint or limits. Reuse the regular fact closure from `graphed` or
+    from a preceding run that changed nothing. A derivation's composite schedules keep their original
+    call order: a later schedule can feed facts back into an earlier one."""
+    regular = facts is None
+    if facts is None:
+        facts = rules.FACTS.saturate()
     fired = dict.fromkeys((admitted_rules.name for admitted_rules in admitted), 0)
     nodes, steps = saturation.limits(region)
     iterations, limited = 0, False
@@ -1029,14 +1031,17 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
             break
         updated = False
         for admitted_rules in admitted:
-            graph.run(facts)
+            if not regular or not facts_settled:
+                graph.run(facts)
             ran = graph.run(admitted_rules.ruleset)
             fired[admitted_rules.name] += sum(ran.num_matches_per_rule.values())
             updated = updated or ran.updated
+            facts_settled = not ran.updated
         iterations += 1
         if not updated:
             break
-    graph.run(facts)
+    if not regular or not facts_settled:
+        graph.run(facts)
     return Saturated(fired, (nodes, steps), iterations, limited)
 
 
