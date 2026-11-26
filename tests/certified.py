@@ -541,7 +541,8 @@ def _one_minus_square(params, operands, result, fmt):
     their product's roundings within γ_3 of the exact 1 - x² relative to it (Higham §3.1), with 2^-50 for
     its float64 evaluation, and each rounding's underflow; an infinity of its sign where the product of the
     two factors as the format rounds them (exact in float64) reaches the format's overflow, and a finite
-    value nowhere else; a non-finite value as its program makes it; of integers, wrapped."""
+    value nowhere else; at x = ±1, where a factor is exactly zero, the product's own +0, no underflow
+    allowed it (row 13502); a non-finite value as its program makes it; of integers, wrapped."""
     (x,) = operands
     if fmt is None:
         x = np.asarray(x)
@@ -559,7 +560,8 @@ def _one_minus_square(params, operands, result, fmt):
         product = factors[0] * factors[1]
         close = np.isfinite(native) & (np.abs(native - exact) <= np.nextafter(slack, np.inf))
         overflowed = _same(native, np.copysign(np.inf, product))
-    return np.where(np.isfinite(exact), np.where(np.abs(product) >= fmt.overflow, overflowed, close),
+    bounded = np.where(product == 0, _same(native, product), close)
+    return np.where(np.isfinite(exact), np.where(np.abs(product) >= fmt.overflow, overflowed, bounded),
                     _same(native, exact))
 
 
