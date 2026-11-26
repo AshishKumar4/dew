@@ -308,8 +308,7 @@ def operations(lowered: jax.stages.Lowered) -> list[str]:
 def typed(values) -> tuple[Typed, ...]:
     """Each ranked tensor of `values`, a lowered operation's operands or results, in order, as its shape and
     element type (MLIR's spelling, `bf16`): every reader of a lowered call's arrays reads them here."""
-    ranked = [ir.RankedTensorType(value.type) for value in values
-              if isinstance(value.type, ir.RankedTensorType)]
+    ranked = [kind for kind in (value.type for value in values) if isinstance(kind, ir.RankedTensorType)]
     return tuple((tuple(kind.shape), str(kind.element_type)) for kind in ranked)
 
 
