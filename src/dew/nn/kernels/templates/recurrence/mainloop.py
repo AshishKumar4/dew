@@ -1521,8 +1521,12 @@ def _weighted_held(call: Call, block: int) -> Held:
     # H100's ptxas asked 58 registers of the 48 its residency left with the gated copy unstated,
     # jsf-kdaintra6).
     vb = call.value_block
+    # The key block's last-token prefix, a column's vector a limb, read before the step's wait and held
+    # through its value block's product (`_weighted`): a column vector's lanes hold its columns as a
+    # 32-row tile's (`f32(32, n)`, the output's and the states' column vectors).
     valued = ([held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
-               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))]
+               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))
+               + [f32(32, block)] * call.prefix_limbs]
               if call.per_key and call.delta else [])
     return Held(phases=(
         *valued,
@@ -1535,6 +1539,14 @@ def _weighted_held(call: Call, block: int) -> Held:
             product_fragments(call, (held, chunk, chunk),
                               (held, chunk, block if call.per_key else call.block)))
            if call.delta else []),))
+
+
+def _last_prefix(call: Call, prefix_refs: tuple, row, column, keyed: int) -> tuple:
+    """`_weighted`'s key block's last token's prefix, a column's vector a limb from `column` on, read from
+    global memory ahead of its step's slots' wait, its latency the wait's: read after the values' weights,
+    the next instruction waited on it, 3% of a GH200's Kimi Linear weighted launch's samples (M-JS-272)."""
+    ends = pl.ds(column, keyed)
+    return tuple(call.family.columns_of(ref.at[row + call.chunk - 1, ends]) for ref in prefix_refs)
 
 
 @building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
@@ -1590,6 +1602,8 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         def step(index, slots, carry, accumulators, loaded=None, *, keys: bool = True, values: bool = True):
             """A step: under a decay a key dimension its value block (where `values`) and its key block
             (where `keys`), else every block of both."""
+            key_step = call.per_key and keys
+            last = _last_prefix(call, prefix_refs, row, h * width + index * keyed, keyed) if key_step else ()
             # Every slot waited for each step, the values' too, which the first step alone reads: a load no
             # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
             slots.acquire_all()
@@ -1620,8 +1634,6 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                 if call.per_key:
                     limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
                     decay = algebra.raised(*limbs)
-                    ends = pl.ds(h * width + c * keyed, keyed)
-                    last = tuple(family.columns_of(ref.at[row + chunk - 1, ends]) for ref in prefix_refs)
                     written = algebra.key_decayed_write(tile, limbs, last)
                     held.store(outs[-1], written, row, chunk, h * width + c * keyed, keyed,
                                family=family, smem=landing["keyed"])
