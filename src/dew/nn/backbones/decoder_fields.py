@@ -38,10 +38,10 @@ def _lm_engine(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
     dense and routed blocks."""
     root = model.embedding_multiplier != 1.0 or model.logits_scaling != 1.0
     block = model.residual_multiplier != 1.0 or model.initializer_range is not None
-    if (root or block) and (model.num_nextn_predict_layers or model.dspark is not None):
+    if (root or block) and (model.num_nextn_predict_layers or model.drafts_blocks):
         raise ValueError(
             "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
-            "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
+            "are lm-engine's; prediction depths and the block drafters do not carry them")
     if block and (model.hyper_connections is not None
                   or (model.mixture is not None and model.mixture.parallel)
                   or model.mlp == 'swigluoai' or model.laurel_rank is not None
@@ -143,9 +143,9 @@ def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
     compute without them, are refused."""
     if model.ngpt is None:
         return
-    if model.mixture is not None or model.num_nextn_predict_layers or model.dspark is not None:
+    if model.mixture is not None or model.num_nextn_predict_layers or model.drafts_blocks:
         raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
-                         "parallel experts (mixture), prediction depths and the DSpark drafter take "
+                         "parallel experts (mixture), prediction depths and the block drafters take "
                          "none of it")
     for layer_type, kind in sorted(kinds.items()):
         mixer = kind.mixer or model.mixer
@@ -388,6 +388,8 @@ def _streams(model: CausalTransformer):
             raise ValueError(f"DSpark target layers {outside} are outside the {model.num_layers} layers")
         if model.num_nextn_predict_layers:
             raise ValueError("a model drafts with DSpark or with MTP depths, not both")
+    if model.block_draft is not None:
+        _check_block_draft(model)
     if hc is not None and hc.single_pass and model.mtp_hyper_connections:
         raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
                          "streams, which no stream prediction depth reads")
@@ -443,3 +445,20 @@ def settle_fields(model: CausalTransformer) -> None:
         raise ValueError("a continuum level reads the final norm's states, which a normalized "
                          "transformer (ngpt) does not have")
     object.__setattr__(model, "remat", remat_policy(model.remat))
+
+
+def _check_block_draft(model: CausalTransformer) -> None:
+    """Raise `ValueError` for a Markov block drafter its trunk cannot feed: beside another drafter, over a
+    loop whose passes exit (each exit's coda a visit of its own), or tapping visits past its forward's,
+    the last tap standing for its final states (`MarkovBlockDraft.taps`)."""
+    spec = model.block_draft
+    assert spec is not None
+    if model.dspark is not None or model.num_nextn_predict_layers:
+        raise ValueError("a model drafts with one drafter: a Markov block drafter, DSpark or MTP depths")
+    if model.loop is not None and model.loop.exiting:
+        raise ValueError("a Markov block drafter reads its target's visits in a forward's order, which a "
+                         "loop whose passes exit runs apart")
+    visits = len(model.visits())
+    if spec.taps[-1] != visits:
+        raise ValueError(f"a Markov block drafter's last tap is its target's {visits} visits, standing for "
+                         f"its final states, got {spec.taps[-1]}")

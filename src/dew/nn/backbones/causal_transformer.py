@@ -59,6 +59,7 @@ from dew.quantization import LinearProducts
 
 from ..activations import GatedActivation
 from ..attention_residuals import AttentionResiduals, DepthAttention
+from ..block_draft import BlockDrafter, MarkovBlockDraft
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..cross_pass import CrossPass
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
@@ -396,6 +397,10 @@ class CausalTransformer(LinearProducts):
     through a `DSparkAttention` built from the V4 attention of its
     `layer_type` kind. Its target layers sow the stream means that the
     drafter reads (`draft_context`)."""
+    block_draft: MarkovBlockDraft | None = None
+    """A Markov block drafter (`dew.nn.block_draft`, Inkling 2's multi-token prediction draft), or None: its
+    layers read the residual the tapped visits of the trunk's layers are handed and its final norm's output
+    (`draft_context`), and draft with the trunk's embedding and head. A model has one drafter at most."""
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
     """Gemma 3n's gaussian top-k activation sparsity, one fraction per layer."""
@@ -818,6 +823,10 @@ class CausalTransformer(LinearProducts):
         if self.dspark is not None:
             assert routed is not None
             self.dspark_stages = decoder_drafts.drafting_stages(self, kinds, mixer_spec, routed, wiring)
+        if self.block_draft is not None:
+            self.block_drafter = BlockDrafter(self.block_draft, self.emb_features, self.vocab_size,
+                                              self.kv_cache, self.max_seq_len, dtype=self.dtype,
+                                              precision=self.precision)
         if self.altup is not None:
             # The copies past the first enter through their own projections
             # and leave through their own (modeling_gemma3n.py,
@@ -891,7 +900,7 @@ class CausalTransformer(LinearProducts):
                 cross=((self.cross_attention.layer_key(self, index),)
                        if self.cross_attention is not None and index in self.cross_attention.layer_ids
                        else None),
-                prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
+                prediction_target=(index if self.drafts_blocks and index in decoder_drafts.tap_layers(self)
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm,
                 dex=None if self.dex is None else self.dex.layer(index),
@@ -946,7 +955,8 @@ class CausalTransformer(LinearProducts):
             cross=(self.cross_attention.block(self, index)
                    if spec.cross is not None and self.cross_attention is not None else None),
             prediction_target=spec.prediction_target is not None,
-            prediction_site='input' if self.dspark is None else self.dspark.reads,
+            prediction_site=('visits' if self.block_draft is not None
+                             else 'input' if self.dspark is None else self.dspark.reads),
             attention_norm=spec.attention_norm,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
@@ -1082,7 +1092,7 @@ class CausalTransformer(LinearProducts):
             attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
             coordinates=coordinates, conditioning=conditioning,
             progress=progress, routed_experts=routed_experts, routed=routed, loop_passes=loop_passes)
-        if self.is_initializing() and self.dspark is not None:
+        if self.is_initializing() and self.drafts_blocks:
             decoder_drafts.reach(self, tokens, x.dtype)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
@@ -1213,24 +1223,46 @@ class CausalTransformer(LinearProducts):
 
     def draft(self, context, tokens, *, decode: bool = True, coordinates: Coordinates | None = None,
               choose=None):
-        """Draft a DSpark block after each row's last context position (`decoder_drafts.draft`)."""
+        """Draft a block after each row's last context position (`decoder_drafts.draft`)."""
         return decoder_drafts.draft(self, context, tokens, decode=decode, coordinates=coordinates,
                                     choose=choose)
 
     def reach_drafter(self, tokens, dtype):
-        """Create the DSpark drafter's parameters, which no forward pass reaches (`decoder_drafts.reach`)."""
+        """Create the block drafter's parameters, which no forward pass reaches (`decoder_drafts.reach`)."""
         return decoder_drafts.reach(self, tokens, dtype)
 
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
-        """DSpark's context `[B, S, targets * D]` from `prediction_inputs`
+        """The block drafter's context `[B, S, targets * D]` from `prediction_inputs`
         (`decoder_drafts.draft_context`)."""
         return decoder_drafts.draft_context(self, prediction_inputs)
 
     def init_draft_cache(self, batch_size: int):
-        """Open the drafter's window caches for `batch_size` rows, apart from the trunk's, as its stages
-        state them (`decoder_cache.named_caches`), tracing no forward."""
+        """Open the block drafter's caches for `batch_size` rows, apart from the trunk's, as its stages (or
+        its Markov drafter) state them (`decoder_cache.named_caches`), tracing no forward."""
+        if self.block_draft is not None:
+            put_opened(self, named_caches([self.block_drafter], batch_size))
+            return
         assert self.dspark is not None
         put_opened(self, named_caches(self.dspark_stages, batch_size))
+
+    @property
+    def drafts_blocks(self) -> bool:
+        """Whether the model carries a block drafter (`dspark` or `block_draft`; `BlockDrafting`)."""
+        return self.dspark is not None or self.block_draft is not None
+
+    @nn.nowrap
+    def visits(self) -> tuple[int, ...]:
+        """The layer each run of a forward runs, in order: a looped block's once a pass (`Loop.steps`), the
+        layers before and after it once; what a Markov block drafter's taps index (`MarkovBlockDraft`)."""
+        if self.loop is None:
+            return tuple(range(self.num_layers))
+        first, end = self.loop.layers or (0, self.num_layers)
+        return (*range(first), *range(first, end) * self.loop.steps, *range(end, self.num_layers))
+
+    def anchor_embeddings(self, tokens):
+        """`tokens` `[B]` embedded as the first layer reads them (`token_embeddings`, `scaled_embeddings`):
+        a Markov block drafter's anchors (vLLM's `Inkling2DSparkDecoder.embed_block`)."""
+        return self.scaled_embeddings(self.token_embeddings(tokens))
 
     def init_mtp_cache(self, batch_size: int):
         """Open the prediction depths' caches for `batch_size` rows, apart from the trunk's, as the depths
@@ -1420,7 +1452,13 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = self.head_states(self.exit_states(x))
+        normed = self.exit_states(x)
+        if (self.block_draft is not None and not self.is_initializing()
+                and self.is_mutable_collection('prediction_inputs')):
+            # A Markov block drafter's last tap (`decoder_drafts.draft_context`).
+            self.sow('prediction_inputs', decoder_drafts.FINAL_STATES, normed,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: None)
+        hidden = self.head_states(normed)
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
