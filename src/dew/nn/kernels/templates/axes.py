@@ -24,6 +24,12 @@ def named[T](axes: Sequence[str], by_axis: Mapping[str, T]) -> tuple[T, ...]:
     return tuple(by_axis[axis] for axis in axes)
 
 
+def whole(count: int, block: int) -> int:
+    """`count` rounded up to whole `block`s: the extent a launch's tiles of `block` cover, or an extent
+    aligned to a unit of `block` (an allocation's, a step's depth)."""
+    return -(-count // block) * block
+
+
 def laid(array: jax.Array, subscript: Sequence[str], letters: Sequence[str]) -> jax.Array:
     """`array`, whose axes `subscript` names letter by letter (an einsum operand's), laid over `letters`: its
     axes in their order, an axis of extent one at a letter it lacks, so it broadcasts against any other

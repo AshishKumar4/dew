@@ -30,6 +30,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import generation, launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import Forked, zero_padded
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan, swizzling
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.recurrence import mainloop
 
 RESET_WIDTH = 32
@@ -419,7 +420,7 @@ def block_positions(length: int, positions: int) -> int:
     """The tokens a backward block of a scan `length` tokens long takes: its threads' `positions` each where
     the length is long enough, else the fewest whole tokens a thread covering it."""
     threads = block_scan.THREADS
-    return min(threads * positions, -(-length // threads) * threads)
+    return min(threads * positions, whole(length, threads))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -784,7 +785,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
                          f"{block_scan.THREADS * positions}: its blocks start at no kept state")
     rows, length, channels = x.shape
     states = A.shape[-1]
-    padded = -(-length // chunk) * chunk
+    padded = whole(length, chunk)
     table, count, held = (), 0, 0
     if forked is not None:
         # The given states `[B, S', D, N]` as the walk reads a slot, `[N, D]`, rows leading; each token's
@@ -842,7 +843,7 @@ def _scan_backward(scan: Scan, residuals, grads):
     # A forked call's table as the backward reads it: given, stored (one slot of zeros where none is held),
     # then its documents' firsts, slots and stored slots, and each block's documents (`DocumentsBack`).
     positions = block_positions(scan.length, scan.positions)
-    padded = -(-scan.length // positions) * positions
+    padded = whole(scan.length, positions)
     tabled = ()
     if table:
         given, _, _, firsts, loads, stores = table
@@ -936,7 +937,7 @@ class Selective(base.Template[Tiles]):
         facts, forked = self._facts(ba, target), ba.arguments.get("forked") is not None
         plans = backward_plans(facts, forked=forked)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
-        padded = -(-length // CHUNK) * CHUNK
+        padded = whole(length, CHUNK)
         while (2 * chunk <= block_scan.THREADS and padded % (2 * chunk) == 0 and self.staged_bytes(
                 ba, Tiles(2 * chunk, *plans[0]), facts) <= generation.shared_budget(facts)):
             chunk *= 2

@@ -121,6 +121,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     value_columns,
 )
 from dew.nn.kernels.templates.attention_mosaic_registers import ForwardRegisters
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.hooks import NO_HOOK, Side
 from dew.nn.kernels.templates.rings import Ref
@@ -791,7 +792,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         # As long as the call's padded keys (a paged call's slots), which every walk's tiles lie within.
         keys = (call.key.shape[1] if call.table is None or call.page is None
                 else call.table.shape[1] * call.page)
-        keys = max(keys, -(-scales[0].shape[-1] // tiles.block_k) * tiles.block_k)
+        keys = max(keys, whole(scales[0].shape[-1], tiles.block_k))
         hooked = hooked._replace(scales=tuple(
             jnp.pad(array.astype(jnp.float32), ((0, 0), (0, 0), (0, keys - array.shape[-1])))
             for array in scales))

@@ -61,7 +61,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
-from dew.nn.kernels.templates import bundles, cost, mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import axes, bundles, cost, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
@@ -133,7 +133,7 @@ def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, ke
     if tiles is not None:
         unit = math.lcm(unit, tiles.block_v * tiles.walkers, tiles.block_o or tiles.block_v)
     block = block_of(family)
-    return -(-key_width // block) * block, -(-value_width // unit) * unit
+    return axes.whole(key_width, block), axes.whole(value_width, unit)
 
 
 def block_of(family: mosaic.Family) -> int:

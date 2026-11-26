@@ -1181,7 +1181,7 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
     tabled = gather is not None or scatter is not None
-    extent = (m if bounded and not tabled else -(-m // row_tile) * row_tile if dense
+    extent = (m if bounded and not tabled else axes.whole(m, row_tile) if dense
               else row_tiles.row_extent(m, row_tile, unit))
     walked = rows_extended(walked, axis, extent)
     if scatter is not None:
@@ -1957,7 +1957,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         None if table is None else rows_padded(_normalized_gather(table, operand.shape[row_axis]),
                                                0, math.lcm(8, block_k))
         for operand, table in zip((lhs, rhs), tables, strict=True))
-    k = -(-k // multiple) * multiple
+    k = axes.whole(k, multiple)
     prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
     bounded = family_of(tiles, lhs.dtype).bounded_loads and not interpret and tables[0] is None
     if ragged and not bounded:
