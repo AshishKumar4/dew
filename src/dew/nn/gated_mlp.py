@@ -35,6 +35,7 @@ from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.sharding import automatic_axes, on_shards
 
 FUSION_ROW = 'ledger 1958'
@@ -371,11 +372,11 @@ def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Arr
     dtype = rows.dtype
     hook = activations.gated_hook(activation, limit)
     gate, up, hidden = gemm.gemm(rows, kernels[0], paired=kernels[1],
-                                 epilogue=activations.rounded_gated(hook, dtype), out_dtype=dtype,
+                                 epilogue=Hook(activations.rounded_gated(hook, dtype)), out_dtype=dtype,
                                  out_dtypes=(dtype,) * 3, precision=precision,
                                  interpret_on_cpu=interpret_on_cpu)
     if names is not None:
         gate, up = checkpoint_name(gate, names[0]), checkpoint_name(up, names[1])
-    out = gemm.gemm(gate, kernels[2], prologue=hook, prologue_operands=((up, ('rows', 'depth')),),
+    out = gemm.gemm(gate, kernels[2], prologue=Hook(hook, (Side(up, ('rows', 'depth')),)),
                     applied=hidden, out_dtype=dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
     return out if names is None else checkpoint_name(out, names[2])

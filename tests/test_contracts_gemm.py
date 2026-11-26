@@ -19,6 +19,7 @@ from dew.nn import precision
 from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
 from dew.nn.kernels import formats, gemm, generation, low_rank, projections
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -1038,8 +1039,8 @@ def test_a_compute_prologued_gemm_holds_every_order(edge):
 
     def fused(g, u, w):
         hidden = hook(g.astype(jnp.bfloat16), u.astype(jnp.bfloat16)).astype(jnp.bfloat16)
-        return gemm.gemm(g.astype(jnp.bfloat16), w, group_sizes, prologue=hook,
-                         prologue_operands=((u.astype(jnp.bfloat16), ("rows", "depth")),),
+        return gemm.gemm(g.astype(jnp.bfloat16), w, group_sizes,
+                         prologue=Hook(hook, (Side(u.astype(jnp.bfloat16), ("rows", "depth")),)),
                          applied=hidden, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
 
     def plain(g, u, w):

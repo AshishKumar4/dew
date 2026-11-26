@@ -31,7 +31,7 @@ import pytest
 import recurrence_witness as rw
 import tier_wire
 from attention_witness import assert_faults_refused, assert_witnessed
-from gpu_flow import RUNNING, Cell, run_cells
+from gpu_flow import RUNNING, Cell, in_parts, run_cells
 from interval_certificates import Lane, exp2_reach
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -812,10 +812,10 @@ flow's cells in one batch, and a prepare's compile of one flow is a task of its 
 outlasting a prepare's task timeout (Train 1247's P01b, 27 minutes on sm90)."""
 
 
-@pytest.mark.parametrize("flow", FLOWS)
-def test_the_native_kernels_certify_on_this_gpu(flow):
-    """Check 2's native certificates of the template kernels on this GPU, a flow a family (`gpu_flow`, the
-    owner's rule: no unit tests on GPUs): every cell of `flow` on each generation this device runs, its
-    products admitted, its exact sums a depth step at a time, and each injected fault refused, each
-    cell's failure kept and all raised together."""
-    run_cells(FLOWS[flow]())
+@in_parts(FLOWS)
+def test_the_native_kernels_certify_on_this_gpu(part):
+    """Check 2's native certificates of the template kernels on this GPU, a part a family (`gpu_flow`, the
+    owner's rule: no unit tests on GPUs; `in_parts` by name): every cell of `part` on each generation this
+    device runs, its products admitted, its exact sums a depth step at a time, and each injected fault
+    refused, each cell's failure kept and all raised together (row 12845: the flow's one way to split)."""
+    run_cells(FLOWS[part]())

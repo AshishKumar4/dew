@@ -54,8 +54,8 @@ class Template[Config: Hashable](tuning.KernelOp):
     that fits is its heuristic. `staged_bytes` and
     `registers` say whether a config fits a block of the device (`legal`, `fitting`), which a pin of any
     legal config is checked by. An implementation that does not run a call on a target says so in
-    `eligible`. A hook is a plain JAX callable the kernel's body traces, and the ops beside the launch
-    fuse into it through `jax.experimental.pallas.fuser`: neither is the base's."""
+    `eligible`. A hook is a plain JAX callable the kernel's body traces (`templates.hooks.Hook`), and the ops
+    beside the launch fuse into it through `jax.experimental.pallas.fuser`: neither is the base's."""
 
     name: ClassVar[str] = "template"
     """The implementation's name, as a route reports it and `generation.chosen` may name it."""
