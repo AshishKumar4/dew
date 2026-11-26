@@ -45,6 +45,7 @@ from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import scaled_contraction
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
+from dew.nn.nested import nested
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
@@ -567,10 +568,7 @@ def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
     return 0, tiles
 
 
-# Traced once per spans geometry and tile (a jit's cache): a step's every launch over equal spans reads one
-# map's program, its 188 traces 35 s of a block-sparse step's 124 s compile (row 6766).
-@functools.partial(jax.jit, static_argnames=("block_q", "block_k"))
-def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
+def _block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
     the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
@@ -611,6 +609,13 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     q_lo, q_hi = _readers(ranges, key_blocks)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
+
+
+# A nested program (`dew.nn.nested.nested`): traced once per spans geometry and tile within a staged step, a
+# step's every launch over equal spans reading one map's program (row 6766: 188 traces, 35 s of a
+# block-sparse step's 124 s compile).
+block_map = nested(_block_map, static_argnames=("block_q", "block_k"))
+
 
 
 def _readers(ranges: jax.Array, key_blocks: int) -> tuple[jax.Array, jax.Array]:
