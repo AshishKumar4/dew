@@ -12,7 +12,9 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
+from .binades import scaled_quotient
 from .derivatives import Protected, contracted, declared_tangent
+from .float_bits import binade_of
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -98,7 +100,8 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     u (u . dx)) + u (u . dx) ((1 - c) + c eps s / (|y| + eps s)))` of the head's direction `u = y / |y|`, the
     share `c` of the ratio's derivative `min` takes (JAX's: all where it clips, half at a tie), the radial
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
-    whole where it is normal, else as `((v threshold) / (|y| + eps s)) s`. The scale is constant (no
+    whole where it is normal, else as `v threshold / (|y| + eps s) s` with each factor's binade apart
+    (`binades.scaled_quotient`). The scale is constant (no
     tangent). Exact to fp32's normal range: a component or a product of terms below it relative to the head
     (`2^-126` of its largest) flushes, as any fp32 norm of a scaled head does."""
     from .kernels.generation import linear_map
@@ -116,8 +119,10 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
         radial = direction * jnp.sum(direction * tangent, axis=-1, keepdims=True)
         kept = (tangent - radial) + radial * radial_share
         gain = jnp.minimum(ratio, 1)
+        # A subnormal gain's product with the binades apart (`scaled_quotient`): `kept threshold` overflows
+        # where the result is near one (four channels of 2^127 under 2, a tangent 2^127 across: row 13169).
         scaled_down = jnp.where(gain >= jnp.finfo(tangent.dtype).tiny, kept * gain,
-                                ((kept * threshold) / denominator) * factor)
+                                scaled_quotient(kept, threshold, denominator, binade_of(factor)))
         return jnp.where(ratio > 1, tangent, scaled_down)
 
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)

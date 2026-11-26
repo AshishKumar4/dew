@@ -45,6 +45,7 @@ from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
+from dew.nn.binades import over_denominator, stood_in
 from dew.nn.derivatives import (
     Protected,
     bound_span,
@@ -1730,9 +1731,8 @@ def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
     normalized from its bits first (`float_bits`), so its quotient is its value's.
     Every step is a bit operation or a float32 operation on normal values, about 140
     operations a quotient where frexp's and nextafter's own special cases took 210
-    (row 6312). It is the lowering of a
-    primitive of its own (`correctly_rounded_divide`), so no pass sees its
-    error-free steps to reassociate them.
+    (row 6312). It is the lowering of a primitive of its own
+    (`correctly_rounded_divide`), so no pass sees its error-free steps to reassociate them.
     """
     return _divided(numerator, denominator)
 
@@ -1751,22 +1751,20 @@ def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
     (`_correctly_rounded_divide`); a special operand's division lowered in integers (`lowered_rounded`)."""
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
-    plain = numerator / denominator
+    # Raw fields class a special operand; normalized ones divide a subnormal as its value, which XLA's
+    # division flushed (2^-149 / 2^-126 is 2^-23, not 0; the 2026-11-26 audit).
+    (top_sign, top_biased, top_raw, top_fraction, top_exponent), (
+        bottom_sign, bottom_biased, bottom_raw, bottom_fraction, bottom_exponent) = (
+        float_bits(value) for value in (numerator, denominator))
+    special = (((top_biased == 0) & (top_raw == 0)) | (top_biased == 255)
+               | ((bottom_biased == 0) & (bottom_raw == 0)) | (bottom_biased == 255))
+    # A special lane's subnormal a one of its sign (-0 / 2^-149 is -0, not a flushed 0 / 0: `stood_in`).
+    plain = stood_in(numerator, top_sign, top_biased, top_raw) / stood_in(
+        denominator, bottom_sign, bottom_biased, bottom_raw)
     if not (isinstance(lowered, int) and lowered == 0):
         plain = lowered_rounded(plain, jnp.broadcast_to(jnp.asarray(lowered, jnp.int32), plain.shape))
-    (_, top_sign, top_field, top_fraction), (_, bottom_sign, bottom_field, bottom_fraction) = (
-        raw_fields(value) for value in (numerator, denominator))
-    top_field, bottom_field = top_field.astype(jnp.int32), bottom_field.astype(jnp.int32)
-    special = (((top_field == 0) & (top_fraction == 0)) | (top_field == 255)
-               | ((bottom_field == 0) & (bottom_fraction == 0)) | (bottom_field == 255))
-    # A subnormal operand normalized in its bits, its leading bit moved to the significand's and its field
-    # lowered by as many (to 0 or below): the quotient of its value, where XLA's division flushed it to zero
-    # (2^-149 / 2^-126 is 2^-23, not 0; the 2026-11-26 audit).
-    (*_, top_normalized, top_exponent), (*_, bottom_normalized, bottom_exponent) = (
-        float_bits(value) for value in (numerator, denominator))
     top_field, bottom_field = top_exponent + 127, bottom_exponent + 127
-    top_fraction, bottom_fraction = (jax.lax.bitcast_convert_type(normalized, jnp.uint32)
-                                     for normalized in (top_normalized, bottom_normalized))
+    top_fraction, bottom_fraction = top_fraction.astype(jnp.uint32), bottom_fraction.astype(jnp.uint32)
     negative = top_sign != bottom_sign
     # A normal operand's significand, exact in [1, 2); any bits give one in that range, so a special
     # lane's steps stay normal too, and its result is the division's.
@@ -1904,21 +1902,9 @@ def _divide_transpose(cotangent, numerator, denominator):
     return [jnp.reshape(jnp.sum(quotient, axis=widened), shape) if widened else quotient, None]
 
 
-def _over_denominator(tangent, quotient, denominator):
-    """The size of the division's tangent in its denominator, `t n / d^2`: `t ((n / d) / d)` as PyTorch's
-    backward divides, each quotient rounded once, where `(n / d) / d` is finite; else `(t / d) (n / d)`, as
-    `n d^-2` alone overflows where the product does not (2^20 / 2^-60 under a tangent of 2^-60 is 2^80; the
-    2026-11-26 audit)."""
-    twice = correctly_rounded_divide(quotient, denominator)
-    finite = jnp.isfinite(twice)
-    reordered = correctly_rounded_divide(tangent, denominator) * quotient
-    # The unused branch's factor zero, so its transpose meets no infinity.
-    return jnp.where(finite, tangent * jnp.where(finite, twice, 0), reordered)
-
-
 ad.defjvp2(correctly_rounded_divide_p,
            lambda tangent, quotient, numerator, denominator: correctly_rounded_divide(tangent, denominator),
-           lambda tangent, quotient, numerator, denominator: -_over_denominator(
+           lambda tangent, quotient, numerator, denominator: -over_denominator(
                tangent, quotient, denominator))
 ad.primitive_transposes[correctly_rounded_divide_p] = _divide_transpose
 

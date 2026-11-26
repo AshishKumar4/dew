@@ -12,6 +12,7 @@ logits it reads are the raw likelihoods'. What is one computation, or a token,
 is held exactly.
 """
 
+import dataclasses
 import functools
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -779,8 +780,8 @@ def test_an_episodes_rollout_owes_its_objective_what_a_sampled_one_does():
         params = nn.unbox(objective.init(jax.random.key(0)))
         state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
         # The policy moved off the frozen reference it starts at, so the penalty it pays is not zero.
-        state = state.replace(variables={**state.variables,
-                                         "params": moved(state.variables["params"], jax.random.key(2), 0.3)})
+        state = dataclasses.replace(state, variables={
+            **state.variables, "params": moved(state.variables["params"], jax.random.key(2), 0.3)})
         episodes = RolloutScheduler.episodes(
             TextGeneration(model, params), answered,
             lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),

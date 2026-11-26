@@ -808,16 +808,42 @@ def test_a_correctly_rounded_division_of_subnormal_operands_is_their_values_quot
                                   np.float32([2.0 ** -23, 2.0 ** 23, 1.5]))
 
 
-def test_a_correctly_rounded_divisions_denominator_tangent_overflows_where_its_value_does():
-    """The tangent of `2^20 / d` in `d` at `2^-60`, under a tangent `2^-60`, is `-2^80`, both ways, where the
-    rule formed `(n / d) / d`, `2^140`, first and gave an infinity (row 13163)."""
+@pytest.mark.parametrize(("numerator", "denominator", "tangent", "cotangent", "moved", "pulled"), [
+    (2.0 ** 20, 2.0 ** -60, 2.0 ** -60, 2.0 ** -60, -(2.0 ** 80), -(2.0 ** 80)),
+    (2.0 ** -149, 2.0 ** -140, 2.0 ** -12, 2.0 ** -145, -(2.0 ** 119), -(2.0 ** -14)),
+], ids=["its-twice-quotient-overflows", "a-subnormal-numerator-either-order-overflows"])
+def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_its_value_is(
+        numerator, denominator, tangent, cotangent, moved, pulled):
+    """The derivative of `n / d` in `d`, `-t n / d^2`, where `(n / d) / d` overflows: a tangent and a
+    cotangent are moved and pulled back to their exact values, `-2^80` (`2^20 / 2^-60` under `2^-60`) and,
+    for `2^-149 / 2^-140`, `-2^119` under `2^-12` and `-2^-14` under `2^-145`, where `t / d` overflowed one
+    way and `t q` flushed the other (row 13163)."""
     from dew.nn.precision import divided
 
-    numerator, denominator = np.float32(2.0 ** 20), np.float32(2.0 ** -60)
-    _, moved = jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(2.0 ** -60),))
-    assert float(moved) == -(2.0 ** 80)
+    numerator, denominator = np.float32(numerator), np.float32(denominator)
+    _, forward = jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(tangent),))
+    assert float(forward) == moved
     _, pull = jax.vjp(lambda d: divided(numerator, d), denominator)
-    assert float(pull(np.float32(2.0 ** -60))[0]) == -(2.0 ** 80)
+    assert float(pull(np.float32(cotangent))[0]) == pulled
+
+
+@pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])
+def test_a_subnormal_beside_a_special_divides_as_ieee_division(lowered):
+    """A subnormal operand beside a zero, an infinity or a NaN gives IEEE division's result, either order
+    and sign, lowered or not: `-0 / 2^-149` is -0, `2^-149 / -0` is -inf, `-2^-149 / inf` is -0, `inf /
+    -2^-149` is -inf, a NaN's is NaN, where a flushing division read the subnormal as zero, 0 / 0 (row
+    13163's review)."""
+    from dew.nn.precision import lowered_divide
+
+    tiny = np.float32(2.0 ** -149)
+    numerator = np.float32([-0.0, tiny, -tiny, np.inf, np.nan, tiny])
+    denominator = np.float32([tiny, -0.0, np.inf, -tiny, tiny, np.nan])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected = numerator / denominator
+    got = np.asarray(jax.jit(lowered_divide)(numerator, denominator, np.int32(lowered)))
+    np.testing.assert_array_equal(got, expected)
+    signed = ~np.isnan(expected)
+    np.testing.assert_array_equal(np.signbit(got[signed]), np.signbit(expected[signed]))
 
 
 @pytest.mark.mesh(devices=2)
