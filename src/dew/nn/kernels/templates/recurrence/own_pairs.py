@@ -800,8 +800,8 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
 
 def _key_own_plan(call: Call, summed: Operand, *, reading: bool) -> tuple[bool, int]:
     """`key_pairs_own`'s `(anchors, keys)`: its own pairs anchored products (`anchored.back`) where the call
-    takes them (`anchored.back_anchoring`) and a block of them holds a program, else each pair its own
-    decay (an RTX PRO 6000's 95 KB beside the anchored operands' 18 KB held none); and its key block,
+    takes them (`anchored.back_anchoring`) and a block of them holds a program (its reduction scratch and
+    the device's block budget counted), else each pair its own decay; and its key block,
     anchored the widest holding a program: at 16 keys an A100's and an RTX A6000's anchored launch took
     ptxas past 255 registers where at 32 they took 244 and 245 (an RTX PRO 6000's 16, its widest held,
     168); its guard, factors and staging fixed a step, fewer steps take them fewer times."""
