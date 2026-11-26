@@ -408,7 +408,7 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 """The product groups committed under one predicate alone, none within it (`issued_one_of`'s cases'
 own)."""
 
-_HERE = _cache.untraced(contextvars.ContextVar("here", default=()))
+_HERE = _cache.untraced(contextvars.ContextVar[tuple[list, ...]]("here", default=()))
 """The blocks counting the product groups committed in their own trace (`committed_here`), each its trace
 and its count so far."""
 
