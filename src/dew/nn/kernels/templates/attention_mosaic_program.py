@@ -1064,7 +1064,7 @@ def riding(family: mosaic.Family, kinds: Iterable[Kind], along: str) -> tuple[in
     # A band rides a walk along the keys, its block at the column its program's query tile's origin decides
     # (`score_views`); along the queries each step's tile has its own origin, read where its step reads it.
     return tuple(index for index, kind in enumerate(kinds)
-                 if along in kind or (kind is Kind.BAND and along == "keys"))
+                 if (along == "keys" if kind is Kind.BAND else along in kind))
 
 
 def score_streams(family: mosaic.Family, params: tuple, along: str, held: int, step: int) -> dict:
