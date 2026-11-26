@@ -79,15 +79,15 @@ def top_k_selection(scores, keep, top_k: int, *, forced=None):
         keep = keep & ~jnp.any(jnp.arange(total)[:, None] == forced[..., None, :], axis=-1)
     # Every allowed key ranks above every forbidden one, its score however low (fp32's least, -inf), and
     # the allowed among themselves by their scores, ties by index (row 13536): the keys laid allowed
-    # first, each side in its own order (a stable partition by the mask, its places counted, no sort),
-    # the forbidden at -inf, and the stable top-k taken over that order.
+    # first, each side in its own order (a stable partition by the mask, no sort: a forbidden key's place
+    # past every allowed key, its index less the allowed before it), the forbidden at -inf, and the stable
+    # top-k taken over that order.
     wide = at_least_fp32(scores.dtype)
     ranked = jnp.where(keep, scores.astype(wide), -jnp.inf)
     allowed = jnp.cumsum(keep, axis=-1, dtype=jnp.int32)
-    place = jnp.where(keep, allowed - 1,
-                      allowed[..., -1:] + jnp.cumsum(~keep, axis=-1, dtype=jnp.int32) - 1)
-    order = jnp.put_along_axis(jnp.zeros_like(place), place, jnp.broadcast_to(
-        jnp.arange(total, dtype=place.dtype), place.shape), axis=-1, inplace=False)
+    index = jnp.broadcast_to(jnp.arange(total, dtype=allowed.dtype), allowed.shape)
+    place = jnp.where(keep, allowed - 1, allowed[..., -1:] + index - allowed)
+    order = jnp.put_along_axis(jnp.zeros_like(place), place, index, axis=-1, inplace=False)
     picked = jax.lax.top_k(jnp.take_along_axis(ranked, order, axis=-1), min(top_k, total), is_stable=True)[1]
     chosen = jnp.take_along_axis(order, picked, axis=-1)
     chosen = jnp.where(jnp.take_along_axis(keep, chosen, axis=-1), chosen, -1)
