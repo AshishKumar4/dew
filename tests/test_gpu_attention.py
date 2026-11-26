@@ -249,6 +249,9 @@ def mosaic_cells() -> list[Cell]:
         *cells_of(_mma_sync_fused_32x32_backward_is_on_par_on_an_a100, "sm80",
                   fault=lambda: "row 5272 / 11964: 32x32 mma.sync fused backward native qualification at "
                                 "width 128"),
+        *cells_of(_flash_inference_forward_is_on_par_on_an_a100, "sm80",
+                  fault=lambda: "rows 13288 / 13319: FlashAttention-2's forward, flash_inference's "
+                                "undifferentiated arm, native at the A100 cell's shape"),
     ]
 
 
@@ -259,6 +262,46 @@ def _mma_sync_fused_32x32_backward_is_on_par_on_an_a100():
 
     pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family="mma.sync")
     mosaic._check_backward("causal", (1, 128, 4, 2), width=128, form=None, config=pin, interpret=False)
+
+
+def _flash_inference_forward_is_on_par_on_an_a100():
+    """Rows 13288, 13319: 'flash_inference' undifferentiated at the A100 bf16 cell's shape (2 x 4096, 32
+    query heads over 8, width 128, causal), native: it launches FlashAttention-2's forward, and its output is
+    on par with the reference path's from float64 (check 1). Its training, the template's, is the kernel
+    matrix's cell (attention_kernels_matrix)."""
+    import tier_wire
+    from attention_matrix import SEEDS
+    from attention_oracle import attention_terms, kept
+    from reference_error import assert_as_exact, equations
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    rows, length, heads, kv_heads, width = 2, 4096, 32, 8, 128
+    keep = kept(length, length, causal=True)
+
+    def attended(implementation):
+        return lambda query, key, value: scaled_dot_product_attention(query, key, value, causal=True,
+                                                                      implementation=implementation)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (rows, length, heads, width), jnp.bfloat16),
+                *(jax.random.normal(stream, (rows, length, kv_heads, width), jnp.bfloat16)
+                  for stream in streams[1:]))
+
+    def terms(query, key, value):
+        return attention_terms(query, key, value, np.zeros(np.shape(query)), keep)[0]
+
+    if not tier_wire.preparing():
+        # The call's launch, traced at the draw's shapes alone, in the GPU's run: a prepare's compile-only
+        # device runs no draw, and its arms' refusals are `assert_as_exact`'s to defer (row 13352).
+        shapes = jax.eval_shape(lambda: draw(0))
+        launched = {str(equation.params.get("target_name")) for equation in equations(
+            jax.make_jaxpr(attended("flash_inference"))(*shapes).jaxpr)
+            if equation.primitive.name == "ffi_call"}
+        assert any("flash" in name for name in launched), launched
+    assert_as_exact(jax.jit(attended("flash_inference")), jax.jit(attended("reference")), draw,
+                    "flash_inference's forward on an A100 at 2 x 4096", seeds=SEEDS, terms=terms)
 
 
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,

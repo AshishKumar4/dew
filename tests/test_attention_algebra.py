@@ -1792,3 +1792,79 @@ def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_ta
         lambda u: algebra.output_of(u, d, guarded=False), (a,), (a,)))(big[:, None], big)
     np.testing.assert_array_equal(np.asarray(val), np.ones((1, 1), np.float32))
     np.testing.assert_array_equal(np.asarray(tan), np.ones((1, 1), np.float32))
+
+
+
+
+def test_the_cap_multiplies_fp32_logits_by_its_reciprocal_and_divides_any_other():
+    """Gemma 2's cap (`template.Capped`) multiplies fp32 logits by the cap's fp32 reciprocal, its arithmetic
+    on every backend; bf16 logits, and logits of a cap whose fp32 reciprocal is no finite nonzero number
+    (2^128, past fp32's range, at float64), are divided by the cap in their own dtype."""
+    cap = template.Capped(5.0)
+    logits = jnp.asarray([1.8436161, -0.13113005, 30.0], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(cap(logits, None, None)),
+                                  np.asarray(5.0 * jnp.tanh(logits * np.float32(0.2))))
+    narrow = logits.astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(cap(narrow, None, None)),
+                                  np.asarray(5.0 * jnp.tanh(narrow / 5.0)))
+    wide = template.Capped(2.0 ** 128)
+    assert wide.reciprocal == 0.0
+    with jax.enable_x64(new_val=True):
+        at_cap = jnp.asarray([2.0 ** 128], jnp.float64)
+        capped = np.asarray(wide(at_cap, None, None))
+        divided = np.asarray(2.0 ** 128 * jnp.tanh(at_cap / 2.0 ** 128))
+    assert np.isfinite(capped).all() and capped[0] > 0
+    np.testing.assert_array_equal(capped, divided)
+
+PLAIN_JAX_CERTIFIED = """
+import json, sys
+import jax.numpy as jnp
+import numpy as np
+from certified import certified
+
+from dew.nn.kernels.templates import attention as template, attention_portable
+from dew.nn.kernels.templates.hooks import Hook
+
+dtype, form = getattr(jnp, sys.argv[1]), sys.argv[2]
+forms = {"full": {}, "causal": {"causal": True}, "window": {"causal": True, "sliding_window": 8},
+         "documents": {"causal": True, "segment_ids": np.asarray([[0] * 10 + [1] * 14])}}
+tiles = attention_portable.Tiles(8, 8, 8)
+spans = template.spans(24, 24, 1, **forms[form])
+findings = {}
+capped = template.Hooks(score=Hook(template.Capped(5.0)))
+for hooks, hook in ((template.Hooks(), "plain"), (capped, "capped")):
+    parts = {"forward": lambda q, k, v, do: attention_portable.xla_mainloop(tiles, q, k, v, spans, hooks,
+                                                                            residuals=True),
+             "backward": lambda q, k, v, do: attention_portable.backward(tiles, q, k, v, spans, hooks, do)}
+    for part, fn in parts.items():
+        for seed in range(2):
+            rng = np.random.default_rng([6130, seed])
+            drawn = [jnp.asarray(rng.standard_normal((1, 24, 2, 16)), dtype) for _ in range(4)]
+            if found := certified(fn, *drawn)[1]:
+                findings[f"{part}, {hook}, seed {seed}"] = found[:8]
+print(json.dumps(findings))
+"""
+"""Attention's plain-JAX mainloop certified in a process of its own (argv: its dtype and form), its forward
+with residuals and its backward, plain and under Gemma 2's cap, over two draws: each finding by its case."""
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("form", ["full", "causal", "window", "documents"])
+def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form):
+    """Attention's plain-JAX mainloop, the path every CPU and TPU call runs (`attention_portable`): its
+    forward with residuals (`xla_mainloop`) and its backward from them (`backward`), a 24-token call under
+    `form` (its keys whole, causal, in a causal window of 8, in two packed documents), plain and under Gemma
+    2's cap (`template.Capped`), run one primitive at a time, every element of every operation within its
+    own operation's certified contract (check 2, tests/certified.py), over drawn queries, keys, values and
+    output cotangents, its tiles cutting the call into three of each. The library's own program as its users
+    run it: in a process of its own at JAX's default matmul precision without the test lane's wide CPU
+    arithmetic (the lane's `highest` takes fp32 products through float64 programs a check-2 bind of one
+    primitive at a time does not run), so no program the suite traced is taken in its place."""
+    import process_support
+
+    from dew.nn import precision
+
+    findings = process_support.fresh(PLAIN_JAX_CERTIFIED, dtype, form, platforms="cpu",
+                                     variables={precision.WIDE_CPU_ARITHMETIC: "0",
+                                                "JAX_DEFAULT_MATMUL_PRECISION": "default"})
+    assert findings == {}, findings

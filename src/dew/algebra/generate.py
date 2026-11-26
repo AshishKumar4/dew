@@ -30,7 +30,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import parity
-from dew.algebra import error, printed, rules
+from dew.algebra import _component_sharing, error, printed, rules
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -239,15 +239,20 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     # and case that chose it reads it by that name (`named`).
     named: dict[_Chosen, str] = {}
     printed_by: dict[tuple[str, str], str] = {}
+    emitted: dict[str, str] = {}
     for found in chosen:
         text = found.body
         if (found.name, text) not in printed_by:
             function = f"_{found.name}_{sum(name == found.name for name, _ in printed_by)}"
             printed_by[found.name, text] = function
-            emitted = text.replace("def form(", f"def {function}(", 1)
-            body += ["", "", *emitted.rstrip("\n").split("\n")]
+            emitted[function] = text.replace("def form(", f"def {function}(", 1)
         named[found] = printed_by[found.name, text]
-    for name in sorted({found.name for found in chosen}):
+    declared = sorted({found.name for found in chosen})
+    if all(isinstance(DECLARATIONS[name], ComponentForm) for name in names):
+        emitted = _component_sharing.shared(emitted, reserved=declared)
+    for source in emitted.values():
+        body += ["", "", *source.splitlines()]
+    for name in declared:
         own = [found for found in chosen if found.name == name]
         single = own[0].single
         policy, target = own[0].policy, own[0].target

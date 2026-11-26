@@ -47,6 +47,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
+from dew.nn.kernels.templates import axes
 from dew.nn.precision import compensated_add, compensated_difference, compensated_sum, two_sum
 
 
@@ -326,7 +327,7 @@ class ChunkCumsum(_Cumsum):
     def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
         batch, length, heads = dt.shape
-        padded = -(-length // chunk) * chunk
+        padded = axes.whole(length, chunk)
         bh = config.bm
         out = pl.BlockSpec((None, bh, padded), lambda b, c, h: (b, h, 0))
         step, da = launches.pallas_call(

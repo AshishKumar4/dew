@@ -17,6 +17,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.algebra import scaled
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, outputs, scan
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.recurrence import conv
 
 TURN = conv.UNROLLED
@@ -57,7 +58,7 @@ def walk(rows: int, length: int, channels: int, lanes: int, most: int, family: m
     `most` (what a backward keeps of its turns), whole turns."""
     target = generation.interpreted_target() if interpret else generation.gpu_target()
     span = min(conv.span(length, rows, channels // lanes, target), most)
-    return Walk(rows, length, channels, -(-span // TURN) * TURN, lanes, family, interpret)
+    return Walk(rows, length, channels, whole(span, TURN), lanes, family, interpret)
 
 
 class Program:

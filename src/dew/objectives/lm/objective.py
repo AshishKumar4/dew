@@ -1392,14 +1392,15 @@ class LMObjective(TokenScorer):
     `head_tile` is the head's backward tile (`chunked_cross_entropy`'s
     `tile`), or 'whole' or 'tiled'. None, the default, is 'whole' on an
     objective that keeps the whole logits (`keeps_whole_logits`) and
-    the generation's tile on one that does not. Whole logits are the
-    fastest head where they fit: on one A100, a Qwen3-0.6B step at 4 x 1024
-    tokens took 142 ms against 163 ms tiled, at the cost of 5.3 GiB more
-    peak memory. A trainer whose compiled step does not fit the devices
-    moves it to the generation's tile (`chunked.chunked_tile`) before it
-    recomputes any block. A pass with no backward (evaluation, scoring)
-    runs the tiled forward either way, so it never holds the logits
-    whole.
+    the generation's tile on one that does not. Whole logits save the
+    backward's recomputation at the cost of their memory: on one A100, a
+    Qwen3-0.6B step at 4 x 1024 tokens took 142 ms against 163 ms tiled, at
+    5.3 GiB more peak memory, where an RTX 4080's step at 4096 tokens ran
+    faster tiled under XLA's Triton GEMM fusions (`chunked_cross_entropy`).
+    A trainer whose compiled step does not fit the devices moves it to the
+    generation's tile (`chunked.chunked_tile`) before it recomputes any block.
+    A pass with no backward (evaluation, scoring) runs the tiled forward
+    either way, so it never holds the logits whole.
 
     `head_chunks` is the number of vocabulary slices a tiled head scores in.
     Four slices cost 2.2% of the step and save 1.2 GiB of peak memory at

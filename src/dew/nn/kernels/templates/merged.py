@@ -1,13 +1,15 @@
-"""A split walk's slices merged where its launch wrote them: one Mosaic GPU launch on NVIDIA sm80+ CUDA GPUs
-(row 9795), one Pallas Triton launch on pre-Ampere CUDA GPUs (`platform="cuda"`), and the law's own XLA path
-elsewhere and under differentiation.
+"""A split walk's slices merged where its launch wrote them, beside an initial state where a call resumes one:
+on a CUDA GPU one shared Pallas launch (`_kernel`), its lowering the merge choice's (`_uses_mosaic`:
+Pallas Triton an unhooked merge's on sm80 and sm90, where M-NA-4 timed it faster at B1, Mosaic GPU a hooked
+merge's and sm100's; `generation.chosen(merge=...)` names one), and the law's own XLA path elsewhere and
+under differentiation.
 
 A decode step's walk splits a row's keys across programs (`attention_decode`), each slice's output, maximum
 and denominator padded to its launch's tile of rows. The law merges them (`attention_algebra.merged_state`:
 `slice_state` of each, then `finished_merged`), which in XLA took the padded arrays' slices, their selects and
 the law's total and output as separate launches around it. `merged_padded` takes the launch's padded arrays as
-they are; on a CUDA GPU it lowers as one Pallas launch (Mosaic GPU on sm80+, `merged_mosaic`'s; Pallas Triton
-on pre-Ampere CUDA GPUs) that reads them in place and runs the law's own functions on each row (`slice_state`,
+they are; on a CUDA GPU it lowers as one Pallas launch (`_uses_mosaic`'s choice: `merged_mosaic`'s Mosaic GPU
+or Pallas Triton) that reads them in place and runs the law's own functions on each row (`slice_state`,
 `finished_merged`), and on non-CUDA platforms and under differentiation as the law's path on their slices
 (`_value`), which its derivative always is (a `jax.custom_jvp` whose rule is `jax.jvp` of `_value`): a step
 faster than main's merge at every decode cell measured, its outputs bit for bit the law's (M-ET-87i).
@@ -39,7 +41,7 @@ from dew import _cache
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import generation, launches, tuning
+from dew.nn.kernels import generation, launches, selection, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     cost,
@@ -56,6 +58,7 @@ from dew.nn.kernels.templates.attention import (
     output_hooked,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
@@ -231,13 +234,13 @@ def _normalized(initial: Initial | None) -> bool:
 def _launched(units, queries, width, raw_scale, out_dtype, out_heads, output_mod, output_kinds, normalized,
               *operands):
     """`merged_padded_p`'s value: one launch on a GPU (`_kernel`), the law's path elsewhere, its lowering
-    the one `generation.chosen(merge=...)` names as it traces (`_named_merge`), held in its parameters so a
-    lowering past the block takes it (row 13170: one lowered outside `dew.kernels.use(merge='mosaic')`
+    the one `generation.chosen(merge=...)` names as it traces (`selection.forced`), held in its parameters
+    so a lowering past the block takes it (row 13170: one lowered outside `dew.kernels.use(merge='mosaic')`
     took Pallas Triton's)."""
     return tuple(merged_padded_p.bind(*operands, units=units, queries=queries, width=width,
                                       raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads,
                                       output_mod=output_mod, output_kinds=output_kinds,
-                                      merge=_named_merge(), normalized=normalized))
+                                      merge=selection.forced(generation.Choice.MERGE), normalized=normalized))
 
 
 def _tangent(units, queries, width, raw_scale, out_dtype, out_heads, output_mod, output_kinds, normalized,
@@ -484,7 +487,7 @@ def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtyp
     a row's whole channels left a decode step's few rows on a few multiprocessors (B1: 32 rows of a GH200's
     132, merged_padded 19.2 us at 4096 keys, row 8439)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
-                          raw_scale, out_dtype, out_heads, merge=_named_merge())[0]
+                          raw_scale, out_dtype, out_heads, merge=selection.forced(generation.Choice.MERGE))[0]
 
 
 def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
@@ -498,10 +501,10 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
     row 8779): common-path arithmetic across the grid, valid device traffic with row-stat stores counted once
     per row (row 8809), span `3 * chunks`, one kernel; its initial state its output where `normalized`
     (`template.Initial.normalized`); on the lowering `merge` names where `traced` (a traced merge's own,
-    `merged_padded_p`'s `merge`), else the one named here (`_named_merge`)."""
+    `merged_padded_p`'s `merge`), else the one named here (`selection.forced`)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
                           raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs,
-                          normalized, merge=merge if traced else _named_merge())[1]
+                          normalized, merge=merge if traced else selection.forced(generation.Choice.MERGE))[1]
 
 
 MOSAIC_SLOWER = frozenset({"sm80", "sm90"})
@@ -513,22 +516,15 @@ against 14.5 us, fp16 K32768 d128 84.0 against 21.8), an A100's 1.4 to 3.9 times
 `generation.chosen(merge=...)` overrides (`_uses_mosaic`)."""
 
 
-def _named_merge() -> str | None:
-    """The lowering `generation.chosen(merge=...)` names where a merge traces, None where none names one."""
-    from dew import _cache
-
-    return dict(_cache.KERNEL_CHOICES.value).get(generation.Choice.MERGE)
-
-
 def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None, merge: str | None = None
                  ) -> bool:
     """Whether `target` lowers `merged_padded` on Mosaic GPU (NVIDIA sm80+ instruction families) rather than
     the Pallas Triton launch, kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795) and, by default,
     for an unhooked merge on the generations where Mosaic's measured slower (`MOSAIC_SLOWER`, a merge of no
     output hook); `merge`, the lowering `generation.chosen(merge=...)` named where the merge traced
-    (`_named_merge`, held in its parameters), names either on a Mosaic GPU family, as an A/B of the two does
-    (row 12480: a held config's pin flipped it unseen; row 13170: the choice read as it lowered, past the
-    block it was named in)."""
+    (`selection.forced`, held in its parameters), names either on a Mosaic GPU family, as an A/B of the two
+    does (row 12480: a held config's pin flipped it unseen; row 13170: the choice read as it lowered, past
+    the block it was named in)."""
     family = generation.family(target.generation)
     if family is None or family == "tpu":
         return False
@@ -690,7 +686,7 @@ def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: 
     has_initial = bool(init_args)
     total_slices = slices + int(has_initial)
     chunk = windows.chunk_width(total_slices)
-    tile = 1 << (-(-total_slices // chunk) * chunk - 1).bit_length()
+    tile = 1 << (whole(total_slices, chunk) - 1).bit_length()
     channels = 1 << (width - 1).bit_length()
     n_init = len(init_args)
     n_params = len(output_kinds)

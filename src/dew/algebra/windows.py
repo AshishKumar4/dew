@@ -18,7 +18,7 @@ from jax.sharding import PartitionSpec
 
 from dew.algebra import scaled
 from dew.algebra.scaled import Scaled
-from dew.nn.float_bits import exact_power2
+from dew.nn.float_bits import exact_power2, raw_fields, rounded_binary
 from dew.nn.precision import at_least_fp32, correctly_rounded_divide, power2, two_product, two_sum
 
 
@@ -632,10 +632,33 @@ def _raised(summed, power: int):
     return made
 
 
-def _landed(summed, dtype) -> jax.Array:
+def _binary_landed(high, low, exponent, dtype):
+    """Land both fp32 words, keeping the tail at a destination rounding midpoint."""
+    a, b = scaled.scaled(high), scaled.scaled(low)
+    top = jnp.where(a.significand == 0, b.exponent,
+                    jnp.where(b.significand == 0, a.exponent, jnp.maximum(a.exponent, b.exponent)))
+    # A much smaller limb can only settle an exact destination midpoint. Align it no lower than a
+    # normal fp32 power that is still far below half an ulp of the larger limb.
+    left, right = (word.significand * exact_power2(jnp.clip(word.exponent - top, -64, 0), jnp.float32)
+                   for word in (a, b))
+    head, tail = two_sum(left, right)
+    _, sign, biased, fraction = raw_fields(head)
+    significand = fraction | jnp.where(biased != 0, np.uint32(1 << 23), np.uint32(0))
+    power = exponent + top + jnp.maximum(biased.astype(jnp.int32), 1) - 150
+    direction = jnp.where(sign == 0, tail, -tail)
+    last = power + 23 - jnp.finfo(dtype).nmant
+    out = rounded_binary(sign, significand, power, dtype, tail=direction, last=last,
+                         infinite=jnp.isinf(head), nan=jnp.isnan(head))
+    bits, signed, _, _ = raw_fields(out)
+    return jnp.where(bits == signed, jnp.zeros_like(out), out)
+
+
+def _landed(summed, dtype, *, store_subnormal: bool = False) -> jax.Array:
     """A ratio's value before it lands (`_ratio_sum`'s) landed once into `dtype`, its residual with it (a
     quotient's `1 / (1 + 2^-24)`, the review's F3), a zero as +0."""
     high, low, exponent = summed
+    if high.dtype == jnp.float32 and (dtype in (jnp.float16, jnp.bfloat16) or store_subnormal):
+        return _binary_landed(high, low, exponent, dtype)
     landed = power2(high + low, exponent, reach=_REACH).astype(dtype)
     return jnp.where(landed == 0, jnp.zeros_like(landed), landed)
 

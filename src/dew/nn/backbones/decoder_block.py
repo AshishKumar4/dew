@@ -339,15 +339,11 @@ class Mixture:
         return resolved_dispatch(self.dispatch, self.experts, shards)
 
     def generation_refusal(self) -> str | None:
-        """Why a generation loop cannot run the layers this mixture builds, or None.
-
-        Its exchange dispatch, named or what `'auto'` resolves to on the mesh in
-        context (`moe.resolved_dispatch`), runs a `shard_map`, and a generation
-        loop carries each draw's device checks into the next step's model call,
-        which jax's checkify cannot carry into one (jax-ml/jax#40907). A
-        `dew.inference.serving.Server` step runs the model before it draws, so
-        it serves the exchange; `dispatch='global'` computes the same layer.
-        This refusal goes once a jax release carries the fix."""
+        """Why a generation loop cannot run the layers this mixture builds, or None: block routing, which
+        a cached decode step cannot reproduce, and the exchange dispatch (named, or what `'auto'` resolves
+        to on the mesh in context), which reads its expert axis off a mesh in context that `generate` does
+        not run under (its rows' keys fold on one device, row 13493). A `dew.inference.serving.Server`
+        serves the exchange; `dispatch='global'` computes the same layer."""
         if self.routing_block is not None:
             return ("block routing chooses each block's experts from every token in it, which a cached "
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
@@ -355,10 +351,9 @@ class Mixture:
                     "or route without blocks")
         if self.dispatch_over(jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)) != 'exchange':
             return None
-        return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
-                "which carries each draw's device checks into the next step's model call, fails on a "
-                "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
-                "generate with the mixture's dispatch='global', the same layer")
+        return ("generate runs no mesh in context, which dispatch='exchange' reads its expert axis off "
+                "(row 13493). Serve the model with dew.inference.serving.Server, or generate with the "
+                "mixture's dispatch='global', the same layer")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
@@ -737,7 +732,10 @@ class DecoderBlock(nn.Module):
     reads it. A DSpark target layer
     (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
-    `prediction_inputs/draft_context`.
+    `prediction_inputs/draft_context`; under 'visits' a block drafter's target
+    layer (`dew.nn.block_draft`) appends the residual it receives at each of its
+    runs, a looped layer's once a pass (`prediction_inputs/visits`): the mean of
+    its streams, or under depth residuals the partial block it is handed.
     """
     # Upstream references. Mamba-2's mixer-only block: modeling_mamba2.py:608-632.
     # AltUp: Gemma3nTextDecoderLayer.forward. mHC's residuals:
@@ -783,8 +781,8 @@ class DecoderBlock(nn.Module):
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     cross: Callable[..., nn.Module] | None = None  # the layer's GatedCrossAttention factory
-    prediction_target: bool = False  # records its streams' mean for DSpark
-    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
+    prediction_target: bool = False  # records its streams' mean for DSpark or a block drafter
+    prediction_site: Literal['input', 'output', 'visits'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
@@ -1363,16 +1361,20 @@ class DecoderBlock(nn.Module):
                 # layer reading the call's rows as it masks them (`EngramLayer`, `PLELayer`).
                 streams = self.engram_layer(streams, attention_metadata.engram_ids[:, :, self.engram_index],
                                             MixerCall(attention_metadata, decode))
-            if self.prediction_site == 'input':
+            if self.prediction_site in ('input', 'visits'):
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
                 self._record_prediction(streams)
             return _Streams(constrain(streams, STREAMS), pre)
         if self.residual_site is not None:
+            if self.prediction_site == 'visits':
+                # The partial block the layer is handed, as Inkling 2's drafter reads a visit (vLLM's
+                # Inkling2LoopModel.forward `stack[num_blocks]`, `dew.nn.block_draft`).
+                self._record_prediction(residual[:, :, -1:])
             return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
         predictions = None if self.altup is None else self.altup_layer.predict(residual, train=train)
         x = residual if self.altup is None or predictions is None else predictions[self.altup.active_idx]
-        if self.prediction_site == 'input':
+        if self.prediction_site in ('input', 'visits'):
             self._record_prediction(x[:, :, None])
         # The residual stream sits where the batch does, before and after
         # each sublayer: fsdp gathers weights rather than sum partial
@@ -1506,15 +1508,18 @@ class DecoderBlock(nn.Module):
         return x
 
     def _record_prediction(self, streams):
-        """Sow a DSpark target layer's streams averaged over the copies, when
-        the caller collects `prediction_inputs`: a layer outside streams over a
-        range of layers (`HyperConnections.hc_layers`) its residual, the mean of
-        its one copy."""
+        """Sow a target layer's streams averaged over the copies, when the caller collects
+        `prediction_inputs`: a layer outside streams over a range of layers (`HyperConnections.hc_layers`)
+        its residual, the mean of its one copy. DSpark's (`draft_context`) holds the layer's last; a block
+        drafter's (`visits`) appends each run's, a looped layer's in pass order (`sows_appended`)."""
         if (self.prediction_target and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             mean = jnp.mean(streams, axis=2)
-            self.sow('prediction_inputs', 'draft_context', mean,
-                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+            if self.prediction_site == 'visits':
+                self.sow('prediction_inputs', 'visits', mean)
+            else:
+                self.sow('prediction_inputs', 'draft_context', mean,
+                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
              train: bool, routes: dict, depth=None, site_inputs=None):

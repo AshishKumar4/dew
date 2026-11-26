@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from jax.core import ShapedArray
 from model_support import attending
 from reference_error import assert_as_exact
 
@@ -367,6 +368,74 @@ def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_c
     np.testing.assert_array_equal(run(places), run(None))
 
 
+BANDED = 1536
+"""A call's length past its relative band's width (`band.band_width(5)`, 1280 columns), where a layer scored
+at its indices biases its attention through the band."""
+
+
+def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_out():
+    """A layer scored over more keys than its band holds, with no places given (its places its indices) and
+    no QK-Clip maxima sown, biases its attention by the band about each query (`relative_band`, row 13138):
+    on the attention template, which reads the band a tile at a time, its program stages no `[B, H, Q, K]`
+    bias or score, where the same call with its places stated (`positions`, which takes the bias written
+    out, `relative_logits`) stages it; a route that writes the bias out (a forced reference) stages
+    no band, only the bias written out (row 13503); and its output and every
+    gradient are on par with that call's on the template (check 1, the written-out call in float64 the
+    truth)."""
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+    from dew.nn.kernels import generation
+    from dew.nn.programs import equations
+
+    layer = CausalSelfAttention(MixerContext(
+        emb_features=FEATURES, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=WIDTH, max_seq_len=BANDED,
+        qk_norm=False, dtype=jnp.float32), nope=True, **TERMS)
+    stated = MixerCall(AttentionMetadata(coordinates=coordinates(
+        (1, BANDED), positions=jnp.arange(BANDED)[None])))
+
+    def draw(seed):
+        rng = np.random.default_rng([0xBA4D, seed])
+        x = rng.normal(size=(1, BANDED, FEATURES)).astype(np.float32)
+        params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(scale=0.5, size=leaf.shape), leaf.dtype),
+                              nn.unbox(layer.init(jax.random.key(seed), x)))
+        return params, x
+
+    def stepped(net, call):
+        def summed(params, x):
+            out = net.apply(params, x, call)
+            return jnp.sum(out ** 2), out
+        step = jax.jit(jax.value_and_grad(summed, argnums=(0, 1), has_aux=True))
+
+        def run(params, x):
+            (_, out), grads = step(params, x)
+            return {"out": out, "grads": grads}
+        return run
+
+    def staged(call) -> set:
+        params, x = draw(0)
+        program = jax.make_jaxpr(lambda params, x: layer.apply(params, x, call))(params, x)
+        return {var.aval.shape for eqn in equations(program.jaxpr) for var in eqn.outvars
+                if isinstance(var.aval, ShapedArray) and jnp.issubdtype(var.aval.dtype, jnp.floating)}
+
+    quadratic = (1, HEADS, BANDED, BANDED)
+    with generation.chosen(attention="template"):
+        assert quadratic not in staged(MixerCall()) and quadratic in staged(stated)
+    # A route that writes the bias out (a forced reference: this layer's sinks hand XLA's to it too) stages
+    # no band, only the bias written out (row 13503).
+    from dew.nn.kernels.templates import band
+
+    spec = TERMS["relative_bias"]
+    assert isinstance(spec, RelativeBias)
+    banded = (1, HEADS, BANDED, band.band_width(spec.extent))
+    with generation.chosen(attention="reference"):
+        assert banded not in staged(MixerCall()) and quadratic in staged(MixerCall())
+    # The truth over the draw the harness widens (`assert_as_exact`).
+    wide = stepped(layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64)), stated)
+    assert_as_exact(attending("template")(stepped(layer, MixerCall())),
+                    attending("template")(stepped(layer, stated)), draw, "a relative bias as a band",
+                    seeds=SEEDS["terms"], truth_fn=attending("reference")(wide))
+
+
 def test_a_bidirectional_layer_holds_no_relative_bias():
     """A relative bias reads each query's backward distance in the stream's slots, which a bidirectional
     canvas over a frozen prefix places otherwise: a layer that is not causal refuses it as it is built,
@@ -393,7 +462,7 @@ def test_a_relative_band_holds_the_relative_bias_it_writes_out(extent, offset):
     `extent - 1` before a query's place through its place lies in the query's band."""
     from dew.nn.attention import BandBias
     from dew.nn.attention_terms import relative_band, relative_logits
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     rng = np.random.default_rng([0x13138, extent])
     rows, heads, rank = 2, 2, 3
@@ -420,13 +489,13 @@ def test_a_relative_band_holds_a_groups_products_at_a_time():
 
     from dew.nn import programs
     from dew.nn.attention_terms import relative_band
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     extent = 64
     states = jax.ShapeDtypeStruct((1, BAND_QUERIES, 2, 3), jnp.float32)
     bank = jax.ShapeDtypeStruct((3, extent), jnp.float32)
     traced = jax.make_jaxpr(lambda s, b: relative_band(s, b, jnp.int32(0)).values)(states, bank).jaxpr
-    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, skip=programs.opaque)
+    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, prune=programs.opaque)
              for var in equation.outvars]
     assert any(shape[-2:] == (template.BAND_GROUP, extent) for shape in found), found
     assert not any(shape[-2:] == (BAND_QUERIES, extent) for shape in found)
@@ -437,7 +506,7 @@ def test_a_relative_band_of_no_queries_or_rows_is_empty():
     (`BandBias.dense`), are empty as `relative_logits`' bias over them is, its other axes theirs."""
     from dew.nn.attention import BandBias
     from dew.nn.attention_terms import relative_band, relative_logits
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     extent, keys = 5, 16
     states = jnp.zeros((2, 0, 3, 4), jnp.float32)

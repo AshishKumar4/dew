@@ -10,12 +10,13 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
-from typing import Any
+from typing import Protocol, runtime_checkable
 
 import jax
 import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PreTrainedModel
+from transformers.generation.utils import GenerateDecoderOnlyOutput
 
 from dew._accuracy import distance
 from dew.interop import PretrainedDecoder
@@ -24,6 +25,13 @@ from dew.sampling.text import Sampling
 
 CONTINUATION = 3
 """Greedy tokens each batch continues by, Dew's and the reference's."""
+
+
+@runtime_checkable
+class _Generating(Protocol):
+    """The generation this tool asks of its reference: a greedy continuation and its logits."""
+
+    def generate(self, **kwargs: object) -> GenerateDecoderOnlyOutput: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,9 +105,12 @@ class Runs:
     def continued(self, batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dew's greedy continuation of `batch` by CONTINUATION tokens, the reference's, and the reference's
         logits at each of its steps."""
-        # transformers types `generate`'s model as a protocol its own models meet only at runtime (their
-        # quantizer, set as they load), so it is called as the loaded model holds it.
-        model: Any = self.reference_model
+        # A transformers 5 model generates where its class mixes generation in, which `PreTrainedModel` no
+        # longer does: narrowed to the call this tool makes (`_Generating`), as a checker reads it (rows 8266,
+        # 8484), transformers' own protocol of `generate`'s host asking more than a checker can see.
+        model = self.reference_model
+        if not isinstance(model, _Generating):
+            raise TypeError(f"{type(model).__name__} generates no continuation")
         with torch.no_grad():
             generated = model.generate(
                 **tensors(batch), max_new_tokens=CONTINUATION, do_sample=False, eos_token_id=None,
@@ -107,6 +118,8 @@ class Runs:
         inputs = self.host.from_hf(dict(batch))
         mine = self.loaded.text_generation()(inputs, CONTINUATION, key=jax.random.key(0),
                                              sampling=Sampling(temperature=0))
+        if generated.logits is None:
+            raise ValueError("the reference's generation returned no logits (`output_logits`)")
         return (np.asarray(mine.tokens)[:, -CONTINUATION:], generated.sequences.numpy()[:, -CONTINUATION:],
                 np.stack([step.numpy() for step in generated.logits], axis=1))
 

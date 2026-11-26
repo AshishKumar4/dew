@@ -298,7 +298,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
         # stored layers as `stored` gives a stage-local state's.
         start = jax.tree.map(np.asarray, initial.variables["params"])
         opt_state = jax.tree.map(np.asarray, initial.opt_state)
-        held = train.staged(initial)
+        held = train._as_step(initial)
         run = train.compile(held, first)
         # A QK-Clip given built reads the maxima its forward reports, so a pipelined run keeps every layer
         # whole on every stage and says so (`whole_reading`, row 4035); a named Muon-Clip keeps them local.
@@ -745,7 +745,7 @@ def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
     trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0),
                       advanced=TrainerAdvanced(skip_nonfinite=True))
-    trainer.scheduled(1)
+    trainer._horizon(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())
     advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)

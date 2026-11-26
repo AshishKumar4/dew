@@ -1,7 +1,9 @@
 """What a GPU lane (tools/armada/ci.py `gpu-lane`) needs to run each test file as measured: the most any
 GPU class's last run of it held with its children (`ci.gpu_needs`), whole or a group's, in bytes, as JSON by
-file; a file no class measured is absent. A GPU tier sizes each part's job by it, so the lane admits every
-file at its need (2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file measured at 5.9 GiB).
+file, or what a lane filed one of its units as needing by its prepared programs where it could not hold it
+(ci.py's `filed_needs`), whichever is more; a file neither names is absent. A GPU tier sizes each part's job
+by it, so the lane admits every file at its need (2026-11-10: a part given a default 8 GiB had a 4 GiB lane
+for a file measured at 5.9 GiB; rows 12893 and after: a unit no lane held, never measured, sized none).
 
     DEW_XLA_CACHE_URL=... DEW_XLA_CACHE_TOKEN=... python3 tools/armada/gpu_holds.py --tests "FILE..."
 
@@ -9,10 +11,12 @@ A group (`<file>#G/N`) is its file's: a tier cuts a file's groups anew, so one's
 of its file held, which is what its lane admits it at."""
 
 import argparse
+import concurrent.futures
 import importlib.util
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 
@@ -31,8 +35,28 @@ def holds(tests: list[str]) -> dict[str, float]:
     # its file does.
     found = ci.borrowed_records(sorted({ci.grading.owning(name) for name in files}), ci.PYTHONS[0], "", token,
                                 strict=True)
-    return {name: ci.gpu_needs(found[whole], math.inf)[1] for name in files
-            if (whole := ci.grading.owning(name)) in found}
+    measured = {name: ci.gpu_needs(found[whole], math.inf)[1] for name in files
+                if (whole := ci.grading.owning(name)) in found}
+    needs = filed(ci, files, token)
+    return {name: max(measured.get(name, 0.0), needs.get(name, 0.0)) for name in files
+            if name in measured or name in needs}
+
+
+def filed(ci, files: list[str], token: str) -> dict[str, float]:
+    """Each of `files` by the most a lane filed one of its units as needing, on any class, within
+    `NEED_DAYS` (records.py's `need_key`); read whole or not at all, as the measures are, each record at once
+    (`largest`'s reads)."""
+    prefix = f"{ci.CACHE_PREFIX}-need/{ci.PYTHONS[0]}/"
+    keys = [(key, file) for key in ci.listed(prefix, token)
+            if (file := ci.grading.owning(ci.key_parts(key)[1])) in files]
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        found = list(pool.map(lambda key: ci.store(token).get(prefix + key), [key for key, _ in keys]))
+    most: dict[str, float] = {}
+    for (_, file), body in zip(keys, found, strict=True):
+        need = None if body is None else json.loads(body)
+        if need is not None and time.time() - need["at"] <= ci.records.NEED_DAYS * 86400:
+            most[file] = max(most.get(file, 0.0), float(need["need"]))
+    return most
 
 
 def main() -> int:

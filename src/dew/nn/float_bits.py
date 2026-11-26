@@ -71,6 +71,17 @@ TWO_FACTOR_REACH = two_factor_reach(jnp.float32)
 """`two_factor_reach` of float32, 252: a caller whose `k` stays within it states it for two factors."""
 
 
+def _raw_word(x: jax.Array) -> jax.Array:
+    return jax.lax.bitcast_convert_type(x, jnp.dtype(f"uint{jnp.finfo(x.dtype).bits}"))
+
+
+def stored_zero(x: jax.Array) -> jax.Array:
+    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush."""
+    words = _raw_word(x)
+    magnitude = (1 << (jnp.finfo(x.dtype).bits - 1)) - 1
+    return (words & words.dtype.type(magnitude)) == 0
+
+
 def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """A float `x`'s bits as the unsigned integer of its width (a format a byte or wider), and its raw fields
     in that type: its sign bit in place (0 in a format with none, E8M0), its biased exponent shifted down
@@ -78,8 +89,8 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
     normalization (`float_bits`) and a result's rounding (`lowered_rounded`, `precision`'s division) are
     their callers'."""
     limits = jnp.finfo(x.dtype)
-    word = jnp.dtype(f"uint{limits.bits}")
-    bits = jax.lax.bitcast_convert_type(x, word)
+    bits = _raw_word(x)
+    word = bits.dtype
     signed = limits.bits - limits.nexp - limits.nmant
     # The exponent's field by its width (`nexp`): a format with no infinity (E4M3) holds finite values in
     # its top binade, past IEEE's `maxexp`.
@@ -157,9 +168,26 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     found (`_bit_length`). An exponent past float32's every place, either way, holds as one at its edge
     (`EXPONENT_REACH`: no int32 sum of it wraps). The one rounding of an exact value into float32
     (`lowered_rounded`'s, `dew.quantization.packed_values`'s, row 11807)."""
+    return rounded_binary(sign, significand, exponent, jnp.float32, last=last, infinite=infinite, nan=nan)
+
+
+def rounded_binary(sign: jax.Array, significand: jax.Array, exponent: jax.Array, dtype: DTypeLike, *,
+                   tail: jax.Array | int = 0, last: jax.Array | None = None,
+                   infinite: jax.Array | bool = False, nan: jax.Array | bool = False) -> jax.Array:
+    """Round a uint32 significand at a binary exponent to an IEEE format at most 32 bits wide.
+
+    The input sign is bit 31. Where more than one bit is discarded, a tail of less than half an
+    input significand unit can only affect a half-way tie; its sign is in magnitude units.
+    """
+    limits = jnp.finfo(dtype)
+    mantissa = limits.nmant
+    bias = 1 - limits.minexp
+    least = limits.minexp - mantissa
+    special = 2 * bias + 1
+    infinity = np.uint32(special << mantissa)
     exponent = jnp.clip(exponent, -EXPONENT_REACH, EXPONENT_REACH)
-    last = (jnp.maximum(exponent + _bit_length(significand) - 24, -149) if last is None
-            else jnp.clip(last, -149, EXPONENT_REACH))
+    last = (jnp.maximum(exponent + _bit_length(significand) - (mantissa + 1), least) if last is None
+            else jnp.clip(last, least, EXPONENT_REACH))
     drop = last - exponent
     shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
     kept = jnp.where(drop <= 0, significand << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
@@ -167,19 +195,40 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     rest = significand & ((np.uint32(1) << shift) - np.uint32(1))
     half = np.uint32(1) << (shift - np.uint32(1))
     odd = (kept & np.uint32(1)) == np.uint32(1)
-    up = (((drop >= 1) & (drop <= 31) & ((rest > half) | ((rest == half) & odd)))
-          | ((drop == 32) & (significand > np.uint32(1 << 31))))
+    midpoint = (tail > 0) | ((tail == 0) & odd)
+    far_half = np.uint32(1 << 31)
+    up = (((drop >= 1) & (drop <= 31) & ((rest > half) | ((rest == half) & midpoint)))
+          | ((drop == 32) & ((significand > far_half) | ((significand == far_half) & (tail > 0)))))
     kept = kept + up.astype(jnp.uint32)
-    # `kept` at its last place: a normal's 24 bits (its leading one carried into the exponent where rounding
-    # filled it, the largest binade's carry the infinity), a subnormal's fewer at the least normal's
-    # exponent, whose biased field the sum's carry sets; a last place past the largest binade's, infinity.
-    biased = last + 150
-    magnitude = jnp.where(biased >= 255, np.uint32(0x7F800000),
-                          (jnp.clip(biased, 1, 254).astype(jnp.uint32) << np.uint32(23)) + kept
-                          - np.uint32(1 << 23))
+    # A rounded significand's carry becomes the next binade, including from subnormal to normal,
+    # or from the last finite binade to infinity.
+    biased = last + bias + mantissa
+    magnitude = jnp.where(biased >= special, infinity,
+                          (jnp.clip(biased, 1, special - 1).astype(jnp.uint32) << np.uint32(mantissa)) + kept
+                          - np.uint32(1 << mantissa))
+    if limits.bits != 32:
+        sign = sign >> np.uint32(32 - limits.bits)
     bits = sign | jnp.where(significand == 0, np.uint32(0), magnitude)
-    bits = jnp.where(nan, np.uint32(0x7FC00000), jnp.where(infinite, sign | np.uint32(0x7F800000), bits))
-    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+    bits = jnp.where(nan, np.uint32(quiet_nan_bits(dtype)), jnp.where(infinite, sign | infinity, bits))
+    return jax.lax.bitcast_convert_type(bits.astype(f"uint{limits.bits}"), dtype)
+
+
+def quiet_nan_bits(dtype: DTypeLike) -> int:
+    """The bits of `dtype`'s positive quiet NaN, an IEEE binary format: its exponent all ones and its
+    mantissa's leading bit alone (`0x7FC00000` for float32), the NaN a cast of one gives."""
+    limits = jnp.finfo(dtype)
+    return (((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1))
+
+
+def quiet_nan(negative: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`dtype`'s quiet NaN (`quiet_nan_bits`) signed where `negative` holds, for each of its entries: the one
+    constructor of a signed NaN a stored decoder lands (a minifloat's NaN codes, a scale's, an MXFP8
+    block's); which NaN carries a sign is its caller's policy."""
+    limits = jnp.finfo(dtype)
+    word = jnp.dtype(f"uint{limits.bits}")
+    signs = jnp.asarray(negative).astype(word) << word.type(limits.bits - 1)
+    bits = word.type(quiet_nan_bits(dtype)) | signs
+    return jax.lax.bitcast_convert_type(bits, dtype)
 
 
 EXPONENT_REACH = 1 << 16

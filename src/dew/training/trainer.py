@@ -70,6 +70,7 @@ from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
+from dew.nn.precision import Numerics
 from dew.nn.sharding import Link, Schedule, boxed, explicit_placement, tracing
 from dew.objectives.base import (
     Aux,
@@ -151,6 +152,7 @@ from dew.training.distributed import (
     check_stream,
     marked,
     microbatch_shapes,
+    numbered,
     placed_start,
     ruled,
     stage_microbatches,
@@ -188,6 +190,7 @@ from dew.training.transaction import (
     Transaction,
     checked,
     loss_scale,
+    numerics_read,
     refuse_unpassed_progress,
     traced_loss,
 )
@@ -293,6 +296,13 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """A looped model's count of passes a phase of the run's data (`dew.training.phase_passes`)."""
     sampled_passes: SampledPasses | None = None
     """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
+    numerics: Numerics | None = None
+    """The run's numerics (`dew.nn.precision.Numerics`), a run config's `trainer.precision`: every program
+    the trainer traces runs under its products, forms, low-precision recipe and outputs
+    (`generation.run_precision`), its entry points' and a step compiled ahead's (`under_numerics`), the
+    parameters it draws fresh are stored in its `dtypes.params` and its `loss_scaling` scales the loss
+    (`numerics_read`); a model it trains computing in another dtype than its `dtypes.compute` is refused.
+    It states what `param_dtype` and `dynamic_scale` state, so it is set without them."""
 
 
 def _objective_axes(objective: Objective[Loss, Effects]) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
@@ -314,7 +324,7 @@ class Trainer(Generic[Loss, Effects]):
     start."""
 
     _counting = False
-    """Whether its read counts its passes on the host for a cadence of them (`reading`), set as it reads."""
+    """Whether its read counts its passes on the host for a cadence of them (`_reading`), set as it reads."""
 
     def __init__(
         self,
@@ -364,6 +374,12 @@ class Trainer(Generic[Loss, Effects]):
         layout, rollout, step, record = advanced.layout, advanced.rollout, advanced.step, advanced.record
         inspection, diloco, sampled_passes = advanced.inspection, advanced.diloco, advanced.sampled_passes
         dynamic_scale, links, data_resume = advanced.dynamic_scale, advanced.links, advanced.data_resume
+        param_dtype, self.numerics = advanced.param_dtype, advanced.numerics
+        if self.numerics is not None:
+            if param_dtype is not None or dynamic_scale is not False:
+                raise ValueError("a run's numerics name its parameter dtype and loss scaling: set "
+                                 "TrainerAdvanced's numerics, or its param_dtype and dynamic_scale")
+            dynamic_scale, param_dtype = numerics_read(objective, self.numerics)
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
@@ -394,7 +410,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = advanced.profile
         self.lower_for, self.tune_kernels = advanced.lower_for, advanced.tune_kernels
-        self.inspection, self.param_dtype, self.diloco = inspection, advanced.param_dtype, diloco
+        self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         self.phase_passes = PhasePasses.of(objective, advanced.phase_passes, sampled_passes)
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
@@ -439,6 +455,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
 
+    @numbered
     def initial_state(self, initializer: Initializer | None = None,
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`),
@@ -508,7 +525,7 @@ class Trainer(Generic[Loss, Effects]):
             deferred=waiting(opt_state))
         return state if not self.diloco else self.diloco.started(state, self.device_mesh)
 
-    def staged(self, state: TrainState) -> TrainState:
+    def _as_step(self, state: TrainState) -> TrainState:
         """`state` (`initial_state`'s, `stored`'s) held and placed as the step holds it, as `fit` starts."""
         return self._staging.supplied(self._staging.received(self.objective, state), self.shardings)[0]
 
@@ -524,7 +541,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _staged_start(self, initializer: Initializer | None = None, key: int | jax.Array | None = None
                       ) -> TrainState:
-        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`staged`): the
+        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`_as_step`): the
         state built first, so the layout reads the shapes its draw recorded (`Objective.drawn_shapes`)."""
         state = self.initial_state(initializer, key)
         return self._staging.state(state, self._staging.staged)
@@ -541,7 +558,7 @@ class Trainer(Generic[Loss, Effects]):
                 self._key = request_key(self._given_key)
         return self._key
 
-    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
+    def _reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
         """Take `loader`'s device steps, prefetch and clock (`clocked`), and the batches its steps read, each
         phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
         do."""
@@ -714,6 +731,7 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
+    @numbered
     @ruled
     def validate(self, batch: Batch | None = None, *, steps: int | None = None) -> Validation:
         """What `fit` checks of the state before it places it (`Layout.validate`), read without
@@ -733,7 +751,7 @@ class Trainer(Generic[Loss, Effects]):
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the
         mesh lacks.
         """
-        self.scheduled(None if steps is None else steps // self.accumulation)
+        self._horizon(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state)[1]
@@ -776,6 +794,7 @@ class Trainer(Generic[Loss, Effects]):
             return agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed))
 
+    @numbered
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
@@ -892,7 +911,7 @@ class Trainer(Generic[Loss, Effects]):
         _refuse_lost_waiting(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
-        self._compiler.resume_rung(checkpoints.rung(resume))
+        self._compiler.resume_rung(checkpoints._rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
         differs = computation_differs(self, checkpoints, resume)
         if differs:
@@ -1070,11 +1089,12 @@ class Trainer(Generic[Loss, Effects]):
 
     def _update_known(self) -> None:
         """Refuse a state or a step of an update of tokens before a loader states the token batches it pools
-        (`reading`, which `fit` calls): its window would hold one batch, its step commit every batch."""
+        (`_reading`, which `fit` calls): its window would hold one batch, its step commit every batch."""
         if not self._update_read:
             raise ValueError(f"an update of {self.update.tokens} tokens pools the data's token batches, "
-                             "which no loader has stated yet: read one first (Trainer.reading), as fit does")
+                             "which no loader has stated yet: fit it with a loader, which states one")
 
+    @numbered
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
         """Compile a transaction over the state and one produced global batch (`StepCompiler.compile`).
@@ -1176,6 +1196,7 @@ class Trainer(Generic[Loss, Effects]):
             return state
         return dropped(state)
 
+    @numbered
     @ruled
     def fit(
         self,
@@ -1316,7 +1337,7 @@ class Trainer(Generic[Loss, Effects]):
         cooldowns: Cooldowns | None = None,
     ) -> FitPlan:
         """What `fit` over these arguments (`FitArguments`) runs, before it places anything: its data compiled
-        and read (`run_data`, `reading`), its optimizer built for its updates (`scheduled`), and its
+        and read (`run_data`, `_reading`), its optimizer built for its updates (`_horizon`), and its
         cadences, scores and policies (`FitPlan`). Its defaults are `fit`'s, stated here alone, which a run
         compiled ahead plans its evaluations by too (`dew.training.ahead.fit_plan`)."""
         startup = Startup()
@@ -1326,8 +1347,8 @@ class Trainer(Generic[Loss, Effects]):
                             max_tokens=max_tokens),
             update=self.update,
             startup=startup, resume=self.data_resume)
-        self.reading(loader, device_prefetch, examples=examples, steps=steps)
-        self.scheduled(None if steps is None else steps // self.accumulation)
+        self._reading(loader, device_prefetch, examples=examples, steps=steps)
+        self._horizon(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
         # and its refusals made before anything is placed (`_preflight`).
         logged, evaluated, saved, local, suites = FitPlan.cadences(
@@ -1349,7 +1370,7 @@ class Trainer(Generic[Loss, Effects]):
             summaries=tuple(summaries), startup=startup, declared=declared, branches=() if cooldowns is None
             else cooldowns.branches(steps, tokens, self.accumulation, self._shape.examples))
 
-    def scheduled(self, updates: int | None) -> None:
+    def _horizon(self, updates: int | None) -> None:
         """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
         `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
         transformation keeps it."""

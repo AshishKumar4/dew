@@ -123,7 +123,7 @@ class DataExport:
     tokenizer: str | None = None
     eos: bool = True
     """End each document's tokens with the tokenizer's EOS, as `dew.data.text.export_tokens` does; `--no-eos`
-    writes them as they are."""
+    writes them as they are, a token export's alone: a record export holds no tokens to end."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a chain's record may import (its own steps')."""
 
@@ -134,6 +134,8 @@ class DataExport:
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
+        if self.tokenizer is None and not self.eos:
+            raise ValueError("--no-eos writes a token export's documents unended; name its --tokenizer")
         pipeline = chain_of(self.data, self.branch, self.trust)
         if self.tokenizer is not None:
             from dew.data.text import export_tokens

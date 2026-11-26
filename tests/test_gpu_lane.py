@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -632,7 +633,14 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
     interpreter(tmp_path, "3.12")
     dry_checkout(tmp_path)
     name = "tests/test_gpu_flows_x.py"
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=6))
+
+    def flows(count: int) -> None:
+        (tmp_path / name).write_text(FLOWS_FILE.format(flows=count))
+        # Its bytecode cached by the last run goes: a file rewritten at its size within its second passes
+        # pytest's check of it, and its run would collect the flows it held before.
+        shutil.rmtree(tmp_path / "tests" / "__pycache__", ignore_errors=True)
+
+    flows(6)
     nodes = [f"{name}::test_cpu", *(f"{name}::test_flow[{index}]" for index in range(6))]
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {node: [0.002 if node.endswith("[1]") else 0.0, None, 0] for node in nodes}))
@@ -659,11 +667,11 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
     # Its row's tests unchanged, it is reused.
     assert ran("1/3")[0] == []
     # A flow collected since, which no record names: its group runs it, its record keeps no key.
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=7))
+    flows(7)
     assert ran("3/3")[0] == ["test_flow[4]", "test_flow[5]", "test_flow[6]"]
     assert record("3/3")["key"] is None
     # A flow gone since, which the record still names: its groups run as collected, keyed by none.
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=5))
+    flows(5)
     assert ran("1/3")[0] == ["test_cpu", "test_flow[0]"]
     assert record("1/3")["key"] is None
     # Cut finer than it has tests, a group holds none: green at no seconds.
@@ -1586,7 +1594,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         7 * gib, 14 * gib)
     # Programs past the lane's share: none runs, none with a verdict, its row naming its need and the GPU,
     # and saying a lane of the whole GPU holds it only where that lane's (JAX's 75%) does.
-    for temporaries in (12 * gib, 70 * gib):
+    for temporaries in (70 * gib, 12 * gib):
         filed((gib, gib, temporaries))
         need = admitted((gib, gib, temporaries))
         runs = len(lane_runs(tmp_path, "test_flow"))
@@ -1596,6 +1604,29 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         assert row["kind"] == ci.grading.STALE and f"{need / gib:.2f} GiB" in row["output"]
         held = ci.run_keys.device_class()
         assert held in row["output"] and ("holds it" in row["output"]) == (need <= whole)
+        # Its need filed where the tier sizes its next part (gpu_holds.py), which no run measured: that part
+        # holds it (rows 12893 and after: sized by its measured peak alone, each part refused it again).
+        key = "/" + ci.records.need_key("3.12", "3.12:tests/test_flow.py", held)
+        assert json.loads(stored[key])["need"] == need
+        holds = load("gpu_holds", "tools/armada").holds
+        assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
+    # A need filed past NEED_DAYS sizes nothing: its file may have been cut otherwise since.
+    old = "/" + ci.records.need_key("3.12", "3.12:tests/test_old.py", "NVIDIA-A10-x86")
+    past = time.time() - (ci.records.NEED_DAYS + 1) * 86400
+    stored[old] = json.dumps({"need": 50 * gib, "at": past}).encode()
+    assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
+    # Held by a lane given more of its GPU, its programs unchanged (the 12 GiB refused last), its need stands,
+    # filed again then: its run's measured peak is no admission's need; the part after is sized by it still.
+    stored[key] = json.dumps({"need": need, "at": past + 86400}).encode()
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    assert need <= 0.5 * total and lane()[1]["exitCode"] == 0
+    refiled = json.loads(stored[key])
+    assert refiled["need"] == need and refiled["at"] > past + 86400
+    assert holds(["tests/test_flow.py"]) == {"tests/test_flow.py": need}
+    # Its programs shrunk, it is filed at what they need now.
+    filed((gib, gib // 2, gib // 4))
+    assert lane()[1]["exitCode"] == 0
+    assert json.loads(stored[key])["need"] == admitted((gib, gib // 2, gib // 4))
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(

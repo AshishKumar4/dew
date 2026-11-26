@@ -60,7 +60,9 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
     (jax.lax.mul_p, jnp.multiply, 2), (jax.lax.div_p, jnp.divide, 2), (jax.lax.sqrt_p, jnp.sqrt, 1),
     (jax.lax.rsqrt_p, jax.lax.rsqrt, 1), (jax.lax.log_p, jnp.log, 1), (jax.lax.exp_p, jnp.exp, 1),
     (jax.lax.logistic_p, jax.lax.logistic, 1), (jax.lax.log1p_p, jnp.log1p, 1),
-    (jax.lax.expm1_p, jnp.expm1, 1), (jax.lax.sin_p, jnp.sin, 1), (jax.lax.cos_p, jnp.cos, 1)], ids=_named)
+    (jax.lax.expm1_p, jnp.expm1, 1), (jax.lax.sin_p, jnp.sin, 1), (jax.lax.cos_p, jnp.cos, 1),
+    (jax.lax.log2_p, jax.lax.log2, 1), (jax.lax.tanh_p, jnp.tanh, 1)],
+    ids=_named)
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(primitive, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
@@ -750,11 +752,18 @@ def _off_by_one_element(result):
       np.float32(-np.arange(9).reshape(3, 3))]),
     (jax.lax.scatter_p, lambda a, i, u: a.at[i[:, 0]].set(u),
      [np.zeros((4, 2), bool), np.int32([[3], [1]]), np.ones((2, 2), bool)]),
+    (jax.lax.ceil_p, jnp.ceil, [np.float32([-0.5, 0.5, 2.0, -2.25, 1e10, -0.0, np.inf])]),
+    (jax.lax.clz_p, jax.lax.clz, [np.int32([0, 1, -1, 2 ** 30, 255])]),
+    (jax.lax.argmax_p, lambda a: jnp.argmax(a, axis=1),
+     [np.float32([[1, 3, 3, 2], [-0.0, 0.0, -1, -2], [-np.inf, -np.inf, -np.inf, -np.inf]])]),
+    (jax.lax.dynamic_update_slice_p, lambda a, u, i: jax.lax.dynamic_update_slice(a, u, (i, 1)),
+     [np.float32(np.arange(12).reshape(4, 3)), np.float32(-np.ones((2, 2))), np.int32(3)]),
 ], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
         "gather bf16", "stack", "barrier", "rev", "split", "name", "dynamic slice clamped", "sort",
         "sort keyed", "sort keyed zeros and nans", "top_k", "unstack",
         "tile", "stop_gradient", "xor", "shift", "rem", "rem float", "sign", "sign int", "round even",
-        "round away", "reduce to bf16", "reduce to e4m3", "scatter", "scatter bool"])
+        "round away", "reduce to bf16", "reduce to e4m3", "scatter", "scatter bool", "ceil", "clz",
+        "argmax", "dynamic update slice clamped"])
 def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
     interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
@@ -777,6 +786,93 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive
                     else given)
         assert np.all(contract(params, operands, native, None)), primitive
         assert not np.all(contract(params, operands, _off_by_one_element(native), None)), primitive
+
+
+def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_roundings_breaks_it():
+    """lax.one_minus_square (tanh's derivative) certifies as the program JAX lowers it to, (1 + x)(1 - x):
+    the lane's own result within its three roundings of the exact 1 - x², its overflow past fp32's range,
+    its NaN and its infinities as that program makes them, and at x = ±1 its exact +0; a result four steps
+    off is refused, as are a -0 or a subnormal at x = ±1 and a zero at either one's inner neighbour (row
+    13502)."""
+    # Past fp32's range the product overflows (2^64 and 2^100 to -inf) where 1 - x² itself is finite; just
+    # below 2^64 its rounded factors' product, 2^128 - 2^105 + 2^80, is finite and so is its result.
+    below = np.nextafter(np.float32(2.0 ** 64), np.float32(0))
+    values = np.float32([0.0, 0.5, -0.999, 1.0, 3.0, 1e-20, 2.0 ** -70, np.inf, np.nan, 1.8e19, 2.0 ** 64,
+                         2.0 ** 100, below])
+    assert ct.certified(jax.lax.one_minus_square, values)[1] == []
+    native = np.asarray(jax.lax.one_minus_square(values))
+    contract = ct.CONTRACTS[jax.lax.one_minus_square_p]
+    assert np.all(contract({}, [values], native, oc.FLOAT32))
+    stepped = native.copy()
+    for _ in range(4):
+        stepped[1] = np.nextafter(stepped[1], np.float32(np.inf))
+    assert list(np.flatnonzero(~contract({}, [values], stepped, oc.FLOAT32))) == [1]
+    # An infinity where the product is finite, and a finite value where it overflows, are refused.
+    mutant = native.copy()
+    mutant[-1], mutant[-2] = -np.inf, np.float32(-3e38)
+    assert list(np.flatnonzero(~contract({}, [values], mutant, oc.FLOAT32))) == [len(values) - 2,
+                                                                                 len(values) - 1]
+    # At x = ±1 a factor is exactly zero and so is the product, +0, which no rounding moves.
+    inside = np.nextafter(np.float32(1), np.float32(0))
+    ends = np.float32([1.0, -1.0, inside, -inside])
+    native = np.asarray(jax.lax.one_minus_square(ends))
+    assert np.all(contract({}, [ends], native, oc.FLOAT32)) and not np.signbit(native[:2]).any()
+    for wrong in (np.float32(-0.0), np.float32(1e-45)):
+        mutant = native.copy()
+        mutant[:2] = wrong
+        assert list(np.flatnonzero(~contract({}, [ends], mutant, oc.FLOAT32))) == [0, 1]
+    mutant = native.copy()
+    mutant[2:] = 0.0
+    assert list(np.flatnonzero(~contract({}, [ends], mutant, oc.FLOAT32))) == [2, 3]
+
+
+def test_clz_holds_a_scalar_as_an_array():
+    """lax.clz's contract holds a rank-zero operand's leading zeros, and refuses one off."""
+    contract = ct.CONTRACTS[jax.lax.clz_p]
+    assert ct.certified(jax.lax.clz, np.int32(5))[1] == []
+    assert contract({}, [np.int32(5)], np.int32(29), None)
+    assert not contract({}, [np.int32(5)], np.int32(28), None)
+
+
+def test_an_arg_extremum_takes_a_nan_where_its_row_holds_one_and_its_first_extreme_elsewhere():
+    """argmax and argmin certify as XLA's reduction finds them: a row holding a NaN at the index of one of
+    its NaNs, any other at the first index of its extreme, -0 and +0 alike; an index of a number in a row
+    holding a NaN, or a later tie's, is refused."""
+    rows = np.float32([[1, np.nan, 3, np.nan], [2, 2, 1, 0], [0.0, -0.0, 1, 1]])
+    for fn in (lambda a: jnp.argmax(a, axis=1), lambda a: jnp.argmin(a, axis=1)):
+        assert ct.certified(fn, rows)[1] == []
+    params, given, (native,) = _first_equation(lambda a: jnp.argmax(a, axis=1), [rows], jax.lax.argmax_p)
+    contract = ct.CONTRACTS[jax.lax.argmax_p]
+    assert np.all(contract(params, given, np.asarray(native), None))
+    assert not np.any(contract(params, given, np.int32([2, 1, 3]), None))
+
+
+@pytest.mark.parametrize("fn, primitive", [(lambda a, i, u: a.at[i[:, 0]].min(u), jax.lax.scatter_min_p),
+                                           (lambda a, i, u: a.at[i[:, 0]].max(u), jax.lax.scatter_max_p)],
+                         ids=["min", "max"])
+def test_a_scatter_extremum_folds_its_updates_by_the_lanes_order_of_zeros_and_nan(fn, primitive):
+    """A scatter-min or scatter-max certifies as each element folded with every update landing on it by the
+    lane's own min or max: two updates of one element, a zero of each sign, a NaN in the operand and in an
+    update; an element left at its operand's value past its updates, or a number where a NaN propagates, is
+    refused."""
+    # The last elements no update lands on, a subnormal and a NaN of its own payload: moved as they are,
+    # whether the lane flushes or not.
+    payload = np.uint32(0x7FC00123).view(np.float32)
+    operands = [np.float32([1, 0.0, np.nan, 5, 1e-40, payload]), np.int32([[0], [1], [2], [0], [3]]),
+                np.float32([2, -0.0, 3, -1, np.nan])]
+    assert ct.certified(fn, *operands)[1] == []
+    params, given, (native,) = _first_equation(fn, operands, primitive)
+    contract = ct.CONTRACTS[primitive]
+    native = np.asarray(native)
+    assert np.all(contract(params, given, native, oc.FLOAT32))
+    wrong = native.copy()
+    wrong[0], wrong[3], wrong[5] = 1.0, 5.0, np.uint32(0x7FC00456).view(np.float32)
+    assert list(contract(params, given, wrong, oc.FLOAT32)) == [False, True, True, False, True, False]
+    # A rank-zero scatter: a scalar operand, an empty index vector, every update landing on it.
+    numbers = jax.lax.ScatterDimensionNumbers((), (), ())
+    scattered = (jax.lax.scatter_min if primitive is jax.lax.scatter_min_p else jax.lax.scatter_max)
+    assert ct.certified(lambda a, u: scattered(a, np.zeros((0,), np.int32), u, numbers),
+                        np.float32(1.5), np.float32(-2.0))[1] == []
 
 
 def test_a_move_of_keys_holds_their_data_and_a_word_off_breaks_it():

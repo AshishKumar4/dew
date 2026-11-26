@@ -1,19 +1,15 @@
 """The pallas splash kernel behind the attention kernel 'tpu': what it computes and
 which calls it takes.
 
-Splash is a TPU kernel, but pallas can run a Mosaic kernel under its own
-interpreter, and the splash kernel works there forward and backward, so
-`tpu_attention` asks for the interpreter off a TPU backend and every parity
-assertion in this file runs on CPU. On a TPU the same file runs against
-Mosaic instead, because the interpreter is exactly what `jax.default_backend()
-!= 'tpu'` turns off, and the one `on_tpu` case adds a length the interpreter
-is not worth running; `tools/qualify_splash.py` is that run plus a timing.
+Splash is a TPU kernel that pallas also runs under its Mosaic interpreter,
+forward and backward: off a TPU `tpu_attention` asks for the interpreter, and
+the CPU runs this file's functional cases there. The TPU tier runs the same
+file compiled, forward and backward, including its 2048-token training shapes
+and its VMEM-sensitive cases (the `on_tpu` ones); `tools/qualify_splash.py`
+times the TPU path besides.
 
-The reference is the 'reference' attention kernel, the einsum and softmax path,
-run in fp32 at HIGHEST precision on the same inputs. Off a TPU fp32 holds to
-a few parts in a million; bf16, and fp32 on a TPU, hold to two ulps of the
-output scale, which is the distance the cudnn parity in tests/test_kernels.py
-pins between two correct kernels.
+Parity is check 1: each case's output and gradients against the 'reference'
+attention kernel (the einsum and softmax path) from a float64 truth.
 """
 
 import functools
@@ -115,9 +111,9 @@ def _on_par_on_a_tpu(q_shape, kv_shape, dtype, structure, label: str, *, sunk: b
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("call", ["causal", "softcap", "sinks", "packed_window"])
 def test_the_mosaic_kernel_is_on_par_at_a_length_only_a_tpu_affords(dtype, call):
-    """Splash at a decoder's training shape, 2048 keys and a 128-wide head over grouped keys, far past what
-    the interpreter is worth running, for each argument the kernel takes (`_on_par_on_a_tpu`): Mosaic
-    compiles its tiling, lane padding and block skipping for real."""
+    """Splash at a decoder's training shape, 2048 keys and a 128-wide head over grouped keys, compiled on a
+    TPU for each argument the kernel takes (`_on_par_on_a_tpu`): Mosaic compiles its tiling, lane padding
+    and block skipping for real, which the interpreter does not exercise."""
     structure: dict = {"causal": True}
     if call == "softcap":
         structure["softcap"] = 1.0

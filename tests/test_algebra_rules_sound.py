@@ -868,7 +868,8 @@ def test_every_dtype_fact_matches_jax_traced_output_dtype():
         sel = jnp.where(cmp, neg, bcast)
         clamped = lax.clamp(jnp.float32(-1.0), sel, jnp.float32(1.0))
         prod = lax.dot_general(x, w, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
-        return clamped, fin, prod
+        bits = lax.bitcast_convert_type(cast_x, jnp.uint32)
+        return clamped, fin, prod, bits
 
     x0 = jax.ShapeDtypeStruct((4, 8), jnp.bfloat16)
     w0 = jax.ShapeDtypeStruct((8, 4), jnp.bfloat16)

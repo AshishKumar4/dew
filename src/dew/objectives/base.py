@@ -1376,7 +1376,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         `drawn.traced_draw`, `parameter_axes`, row 12090), so every objective's passes through it once, its
         own `init` whole: a critic's, an encoder and predictor's, a feature probe's (Train 1205's review
         F2)."""
-        with drawing():
+        from dew.algebra import passes
+
+        # Its forward's bodies are not rewritten either (`dew.objectives.drawn.drawing`): none of its values
+        # reaches the variables.
+        with drawing(), passes(on=False):
             # An override may take its variables by keyword alone, as the base names them.
             return self.init(key) if variables is None else self.init(key, variables=variables)
 

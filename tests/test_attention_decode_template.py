@@ -9,13 +9,14 @@ covering each row's keys.
 
 import dataclasses
 import itertools
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
@@ -1021,9 +1022,11 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     """A decode step's walk whose launch a compile refused (its kernel spilled, `report.refuse_launch`) plans
     that walk again at a config its own launch pins: each walk's plan is its launched op's (`WALKS`), so the
     refusal of the scaled walk's launch steps it down, never pinning it to the config refused (row 5420)."""
-    query = jnp.zeros((8, 1, 16, 64), dtype)
-    key = value = jnp.zeros((8, KEYS, 8, 64), dtype)
-    spans = template.spans(1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32))
+    # 24 rows of 8 key heads, a step's 192 programs (each a key head's packed query rows), past an H100's
+    # 132: one slice whatever its dtype.
+    query = jnp.zeros((24, 1, 16, 64), dtype)
+    key = value = jnp.zeros((24, KEYS, 8, 64), dtype)
+    spans = template.spans(1, KEYS, 24, lengths=jnp.full((24,), KEYS, jnp.int32))
     with generation.assumed("sm90"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
@@ -1320,6 +1323,48 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
             jnp.zeros(q8.shape, q8.dtype), k8, k8, template.spans(1, 4096, 8, causal=False),
             template.Hooks())
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
+
+
+@INTERPRETS
+def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted():
+    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100: at an
+    explicit tile its planner's programs a slice (`attention_decode.launch_programs`, a row's key head's
+    packed query rows each, its parts stacked within their rows) times its slices are its walk's launch
+    grid, 64 a slice, short of the device's 132, where counted with its parts the step filled it on paper
+    (2026-11-26 audit); and the step as it plans itself is on par with the reference path (check 1)."""
+    keys, heads, kv_heads = 4096, 16, 8
+    spans = template.spans(1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32))
+    query = jnp.zeros((8, 1, heads, 64), jnp.float32)
+    key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
+    # The walk's columns its launch splits the value's 64 into (an fp32 step's parts' launch's).
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma", columns=32)
+    with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+        work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
+        traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
+            query, key, key).jaxpr
+    # Each walk launch's programs, its mesh's grid (a Mosaic GPU launch's `mpmd_map`, `mesh.shape`'s grid
+    # axes, its threads apart).
+    walks = [math.prod(size for axis, size in equation.params["meshes"][0].shape.items()
+                       if axis not in ("wg", "warp", "lane"))
+             for equation in equations(traced) if "attention_forward" in str(equation.params.get("name"))]
+    # One launch a column block of the values (`Tiles.columns`), each the same grid.
+    assert walks and set(walks) == {attention_decode.launch_programs(rows, tiles) * work["plain"].slices}, (
+        walks, work)
+    assert attention_decode.launch_programs(rows, tiles) == 64
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (8, 1, heads, 64), jnp.float32),
+                *(jax.random.normal(stream, (8, keys, kv_heads, 64), jnp.float32) for stream in streams[1:]))
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 4096 keys", seeds=SEEDS)
 
 
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():

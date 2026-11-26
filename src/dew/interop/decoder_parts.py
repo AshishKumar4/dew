@@ -2020,6 +2020,11 @@ class DecoderFamily:
     which the release's code loads beside the model (MiMo-V2.6's `audio_tokenizer`): a load reads each
     folder's config into the source's under `<folder>/config.json` and its tensors as `<folder>/<name>`
     (`folder_config`, `folder_name`), and a save writes them back into the folder."""
+    sidecars: Callable[[Mapping[str, object]], Mapping[str, str]] = lambda config: {}
+    """The files beside a source's weights that hold more of the family's tensors, which its config states
+    (Inkling 2's `mtp.safetensors` under its `mtp_config`), each by the prefix its tensors are read under:
+    a load reads each the source holds beside its weights (`Pretrained.load`), its tensors named
+    `<prefix><name>`."""
     wrapper_media_suffixes: tuple[str, ...] = ()
     """Suffixes of a bundle's decoder tensors that serve its media alone, which its language model read
     as its text checkpoint drops (`hf_decoders.language_model_names`): V4.1's routers' image-span bias."""

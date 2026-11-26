@@ -1121,20 +1121,26 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
-    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
-    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm100", 4096, 256, True),
+    ("sm80", 8192, 128, True), ("sm90", 32768, 64, True), ("sm80", 4096, 128, False),
+    ("sm80", 8192, 256, False),
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm120", 4096, 64, True),
+    ("sm120", 4096, 128, False), ("sm86", 4096, 128, False), ("sm100", 4096, 256, True),
     ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
     ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
-    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "b200-measured",
-         "b200-longest", "b200-shortest", "b200-shorter", "b200-narrower", "b200-longer"])
-def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(generation_name, tokens, width,
-                                                                             declared):
-    """A bf16 causal call over 8 key heads on an A100 or an H100, whose declared cell names FlashAttention
-    (`attention_kernels.DECLARED`), its receipts holding up to 32768 tokens (`MEASURED`: their lead growing
-    as the calls shorten): a call within them, a shorter or a wider one among them, is in that cell; a
-    longer one is a cell none declares, which takes the template (row 5285). On a B200, whose cell names
-    cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64, 128 and 256, four query heads a key
-    head."""
+    ids=["a100-measured", "h100-longest", "a100-off-pair", "wider", "longer", "longer-narrower",
+         "g4-measured",
+         "g4-wider", "a10-unmeasured", "b200-measured", "b200-longest", "b200-shortest", "b200-shorter",
+         "b200-narrower", "b200-longer"])
+def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts_shapes(
+        generation_name, tokens, width, declared):
+    """A bf16 causal call of one row over 8 key heads: on an A100, whose declared cell names FlashAttention's
+    forward (`attention_kernels.DECLARED`), M-NA-44's sweep exactly (its (rows, tokens) pairs, 1 x 8192 among
+    them and 1 x 4096 not, widths 64 and 128, 32/8); on an
+    H100 up to 32768 tokens (`MEASURED`'s interim placeholder until M-NA-44's GH200 rows); on a G4 at 4096
+    tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
+    timed, in none (an A100's receipt declared its FlashAttention-2 for every mma.sync GPU, 2026-11-26
+    audit); on a B200, whose cell names cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64,
+    128 and 256, four query heads a key head. A call none declares takes the template (row 5285)."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
 
@@ -1142,6 +1148,123 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(gene
     key = jax.ShapeDtypeStruct((1, tokens, 8, width), jnp.bfloat16)
     with generation.assumed(generation_name):
         cell = attention_case(query, key, causal=True).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
+def test_an_a100_call_off_its_receipts_heads_takes_no_declared_cell():
+    """An A100 bf16 causal call at a pair M-NA-44 timed (1 x 8192, width 128) but over 8 query heads of 2,
+    a layout no receipt timed (its sweep's 32/8 alone), is a cell none declares: it takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, 8192, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 8192, 2, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        cell = attention_case(query, key, causal=True).cell
+    assert cell not in attention_kernels.DECLARED
+
+
+def _launches(fn, *operands) -> set[str]:
+    """The kernels `fn`'s program launches, by the launches themselves: FlashAttention's FFI targets
+    ('flash'), the template's Pallas launches ('template', `report.named`'s `attention_` kernels), and any
+    other native launch by its name."""
+    from reference_error import equations
+
+    from dew.nn import programs
+
+    found = set()
+    for equation in equations(jax.make_jaxpr(fn)(*operands).jaxpr, prune=programs.opaque):
+        if equation.primitive.name == "ffi_call" and "flash" in str(equation.params.get("target_name")):
+            found.add("flash")
+        elif programs.opaque(equation):
+            name = str(equation.params.get("name") or equation.params.get("name_and_src_info"))
+            found.add("template" if name.startswith("attention_") else name)
+    return found
+
+
+def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
+    """A bf16 causal call named onto 'flash_inference' on an A100: undifferentiated, it launches
+    FlashAttention's forward alone where this host lowers it for the target
+    (`attention_kernels.flash_lowered`); differentiated, the template's kernels alone, forward and
+    derivatives, which lower for the target on any host (row 13288)."""
+    from dew.nn import attention_kernels
+
+    query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+
+    def call(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="flash_inference")
+
+    with generation.assumed("sm80"):
+        inferred = _launches(call, query, key, key) if attention_kernels.flash_lowered() else {"flash"}
+        trained = _launches(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
+                            query, key, key)
+    assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
+
+
+def test_flash_inference_where_flash_lowers_not_trains_a_rematerialized_block_and_refuses_its_inference():
+    """Lowering for a B200, a GPU FlashAttention's wheel holds no code for
+    (`attention_kernels.flash_built_for`, whether or not it is installed): a 'flash_inference' call inside
+    a rematerialized block under a named-residual policy (`decoder_block`'s) lowers its training step, the
+    template's alone, though the block stages its primal before it is differentiated (row 13318: the primal
+    arm raised as it staged); the call undifferentiated refuses its program as it lowers, named
+    (`selection.Unlowerable`, its kernel 'flash')."""
+    from jax.ad_checkpoint import checkpoint_policies
+
+    from dew.nn import attention_kernels
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((1, 512, 8, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
+
+    def call(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="flash_inference")
+
+    block = jax.checkpoint(call, policy=checkpoint_policies.save_only_these_names("attention_output"))
+
+    def loss(query, key, value):
+        return jnp.sum(block(query, key, value).astype(jnp.float32))
+
+    with generation.assumed("sm100"):
+        assert not attention_kernels.flash_lowered()
+        jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        with pytest.raises(selection.Unlowerable) as refused:
+            jax.jit(call).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    assert refused.value.kernel == "flash"
+
+
+def test_an_a100s_declared_16_bit_cell_is_flash_inference():
+    """The A100's 16-bit cell declares 'flash_inference' (`attention_kernels.DECLARED`: FlashAttention-2's
+    backward fails check 1 at its receipt's shape, M-NA-44), its receipt's call in that cell."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        cell = attention_case(query, key, causal=True).cell
+    assert attention_kernels.DECLARED[cell][0] is attention_kernels.FLASH_INFERENCE
+
+
+@pytest.mark.parametrize(("rows", "heads", "kv_heads", "dtype", "causal", "declared"), [
+    (1, 32, 8, jnp.bfloat16, True, True), (2, 32, 8, jnp.bfloat16, True, False),
+    (1, 8, 2, jnp.bfloat16, True, False), (1, 32, 8, jnp.float16, True, False),
+    (1, 32, 8, jnp.bfloat16, False, False)],
+    ids=["measured", "two-rows", "8/2", "float16", "full"])
+def test_a_g4s_declared_cell_holds_only_the_call_its_receipt_timed(rows, heads, kv_heads, dtype, causal,
+                                                                    declared):
+    """A call of 4096 tokens, 64 wide, on an RTX PRO 6000, whose cell names FlashAttention-2 for the one
+    call its receipt timed (`attention_kernels.MEASURED`, M-NA-35-prefill-g4: one row, 32 query heads over
+    8, bf16, causal, its forward and its training step): that call is in that cell; another row count,
+    head layout or 16-bit dtype, or a full call (its training untimed), is a cell none declares, which
+    takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((rows, 4096, heads, 64), dtype)
+    key = jax.ShapeDtypeStruct((rows, 4096, kv_heads, 64), dtype)
+    with generation.assumed("sm120"):
+        cell = attention_case(query, key, causal=causal).cell
     assert (cell in attention_kernels.DECLARED) == declared
 
 

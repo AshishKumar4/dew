@@ -31,7 +31,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "attention_kernels": {
         "generation": ("sm90", "sm80", "v5e"),
-        "kernel": ("flash", "triton", "cudnn", "template", "inference", "tpu"),
+        "kernel": ("flash", "triton", "cudnn", "template", "inference", "flash_inference", "tpu"),
         "width": ("64", "128", "256"),
         "heads": ("mha", "gqa-8-2"),
         "mask": ("causal", "full", "documents"),

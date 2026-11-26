@@ -29,7 +29,7 @@ import enum
 import functools
 import math
 import operator
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import ClassVar, NamedTuple, overload
 
 import jax
@@ -43,8 +43,10 @@ from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import scaled_contraction
+from dew.nn.kernels.templates import band, scaled_contraction
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
+from dew.nn.nested import nested
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
@@ -349,7 +351,7 @@ def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
     from dew.nn.visibility import block_ends, block_starts
 
     floor, bound = document
-    for groups, whole in ((block_groups, True), (image_groups, False)):
+    for groups, from_start in ((block_groups, True), (image_groups, False)):
         if groups is None:
             continue
         groups = jnp.asarray(groups)
@@ -357,7 +359,7 @@ def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
         inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
         ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
         end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
-        if whole:
+        if from_start:
             begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
             start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
     return start, end
@@ -567,7 +569,7 @@ def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
     return 0, tiles
 
 
-def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
+def _block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
     the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
@@ -608,6 +610,13 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     q_lo, q_hi = _readers(ranges, key_blocks)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
+
+
+# A nested program (`dew.nn.nested.nested`): traced once per spans geometry and tile within a staged step, a
+# step's every launch over equal spans reading one map's program (row 6766: 188 traces, 35 s of a
+# block-sparse step's 124 s compile).
+block_map = nested(_block_map, static_argnames=("block_q", "block_k"))
+
 
 
 def _readers(ranges: jax.Array, key_blocks: int) -> tuple[jax.Array, jax.Array]:
@@ -695,6 +704,11 @@ class Kind(tuple, enum.Enum):
     """`[B, H, K]`: one value a key, the tile's keys' `[block_k]`."""
     TILE = ("batch", "heads", "queries", "keys")
     """`[B, H, Q, K]`: one value an entry, the tile's `[block_q, block_k]` (a dense bias)."""
+    BAND = ("batch", "heads", "queries", "band")
+    """`[B, H, Q, Kb]`: one value an entry within a band of keys about each query (`band_width`), the tile's
+    `[block_q, block_k]` at its key tile's column of the band (`band_tile`), zeros where the tile lies past
+    the band. Its origins, the key each query's column 0 holds (`band_origins`, `[B, 1, Q]` int32), are the
+    side after it, a QUERY one (`band_origins_of`), which its hook takes and leaves (`band_hook`)."""
     OUTPUT = ("batch", "queries", "heads", "width")
     """`[B, Q, H, Dv]`: one value an output entry, the output tile's `[block_q, Dv]` (a gate)."""
     WIDTH = ("heads", "width")
@@ -716,54 +730,36 @@ def kinds_of(sides: tuple[Side, ...]) -> tuple[Kind, ...]:
     return tuple(map(kind_of, sides))
 
 
-BAND_GROUP = 768
-"""The queries one band origin serves (`band_origins`): a multiple of every program's query rows a launch
-of the template holds (64 to 256: one to three 64-row consumers, two 128-row ones), so a tile of a band
-reads one rectangle whatever launch reads it."""
-
-BAND_ALIGN = 256
-"""What a band's origins are whole multiples of (`band_origins`): every key tile the template's launches
-walk (16 to 256 keys), so a band's column of a key tile is a whole tile of it."""
+TILED = (Kind.TILE, Kind.BAND)
+"""The side kinds a score tile holds an entry of each (`tiled`): a dense tile's and a band's."""
 
 
-def band_width(extent: int) -> int:
-    """The columns a band of `extent` holds a query (`band_origins`): every key within `extent` of each query
-    of a `BAND_GROUP`, from the group's origin, in whole `BAND_ALIGN`s."""
-    return -(-(BAND_GROUP + extent + BAND_ALIGN - 2) // BAND_ALIGN) * BAND_ALIGN
-
-
-def band_origins(offset: jax.Array, queries: int, extent: int) -> jax.Array:
-    """The key each query's band column 0 holds, `[B or 1, Q]` int32: of query `q` in group `g` (`q //
-    BAND_GROUP`), the last whole `BAND_ALIGN` at or before `offset + g BAND_GROUP - (extent - 1)`, where
-    `offset` (`[]` or `[B]`) is a query's place less its index, the key it is at (0 for a prefill from the
-    first key, a chunk's first place for a chunked one). Column `c` of query `q`'s band is key `origin + c`;
-    every key from `extent - 1` before the query's place through its place is within its `band_width`."""
-    groups = (jnp.arange(queries, dtype=jnp.int32) // BAND_GROUP) * BAND_GROUP
-    start = jnp.reshape(jnp.asarray(offset, jnp.int32), (-1, 1)) + groups[None, :] - (extent - 1)
-    return jnp.floor_divide(start, BAND_ALIGN) * BAND_ALIGN
-
-
-def band_dense(values: jax.Array, offset: jax.Array, extent: int, keys: int) -> jax.Array:
-    """A band's `values` `[B or 1, H or 1, Q, band_width(extent)]` (`band_origins`) written out over `keys`,
-    `[B or 1, H or 1, Q, K]`: each key in a query's band its column's value, every other key's zero."""
-    rows, heads, queries, width = values.shape
-    origins = band_origins(offset, queries, extent)
-    column = jnp.arange(keys, dtype=jnp.int32)[None, None, :] - origins[:, :, None]
-    inside = (column >= 0) & (column < width)
-    # The rows the values and the origins broadcast to: a row of either broadcasts, none of either is none.
-    batch = jnp.broadcast_shapes((rows,), (origins.shape[0],))[0]
-    index = jnp.broadcast_to(jnp.clip(column, 0, width - 1)[:, None], (batch, heads, queries, keys))
-    read = jnp.take_along_axis(jnp.broadcast_to(values, (batch, heads, queries, width)), index, axis=-1)
-    return jnp.where(inside[:, None], read, jnp.zeros((), values.dtype))
+def tiled(kind: Kind) -> Kind:
+    """A side operand's kind as a score tile holds its values: a band's a tile's (`band_tile`), every
+    other its own."""
+    return Kind.TILE if kind is Kind.BAND else kind
 
 
 def scored(tile: jax.Array, kind: Kind) -> jax.Array:
     """A score side operand's values over its own tile axes (its kind's queries and keys, as a launch loads
     them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on (`hooks.laid`
-    over `SCORE_TILE`)."""
+    over `SCORE_TILE`), a band's its tile's (`tiled`)."""
+    kind = tiled(kind)
     if "queries" not in kind:
         return tile[None, :]
     return tile if "keys" in kind else tile[:, None]
+
+
+def band_origins_of(kinds: Sequence[Kind]) -> dict[int, int]:
+    """Each band side's place among a hook's `kinds` and its origins' (the QUERY side after it,
+    `Kind.BAND`); raises where a band's next side is no QUERY one."""
+    pairs = {}
+    for index, kind in enumerate(kinds):
+        if kind is Kind.BAND:
+            if index + 1 >= len(kinds) or kinds[index + 1] is not Kind.QUERY:
+                raise ValueError("a band side is followed by its origins, a QUERY side (`Kind.BAND`)")
+            pairs[index] = index + 1
+    return pairs
 
 
 @jax.tree_util.register_dataclass
@@ -826,12 +822,26 @@ class Capped(tuning.FieldHook):
     """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
     `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
     its static facts serves every layer of one cap (`tuning.lowered_once`), and its call reads its cap
-    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`)."""
+    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`). Of fp32 logits the quotient
+    is the logits times the cap's fp32 reciprocal (`reciprocal`), the arithmetic every backend runs alike
+    and its gradient's too: a division by a constant is XLA:CPU's multiply by its reciprocal, not correctly
+    rounded (ledger 1402), and a kernel's division has no correctly rounded form every body lowers. Of any
+    other dtype, or a cap whose fp32 reciprocal is no finite nonzero number (a cap past fp32's range), the
+    logits are divided by the cap in their own dtype."""
 
     softcap: float
 
+    @property
+    def reciprocal(self) -> float:
+        """The fp32 cap's reciprocal, an fp32 division's (rounded once, where a float64 quotient rounded to
+        fp32 rounds twice), which its logits are multiplied by, the forward's fold
+        (`attention_algebra.folds`) reading the same."""
+        return float(np.float32(1) / np.float32(self.softcap))
+
     def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
         del q_pos, k_pos
+        if logits.dtype == jnp.float32 and 0 < abs(self.reciprocal) < math.inf:
+            return self.softcap * jnp.tanh(logits * self.reciprocal)
         return self.softcap * jnp.tanh(logits / self.softcap)
 
 
@@ -850,6 +860,20 @@ class Biased(tuning.FieldHook):
     def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, *terms: jax.Array) -> jax.Array:
         capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
         return capped + functools.reduce(operator.add, terms)
+
+
+@dataclasses.dataclass(frozen=True)
+class Banded(tuning.FieldHook):
+    """A score hook `score_mod(s, q, k, band)` of one band side (`Kind.BAND`) as the template calls it, the
+    band's origins the side after it: `score_mod` of the band's tile alone, the origins its launch's, which
+    it reads the band by (`band.band_tile`). Its call reads its inner hook alone (`tuning.FieldHook`)."""
+
+    score_mod: Callable
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, band: jax.Array,
+                 origins: jax.Array) -> jax.Array:
+        del origins
+        return self.score_mod(logits, q_pos, k_pos, band)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1199,11 +1223,20 @@ def shared_place(shape: tuple[int, ...], row, head) -> tuple:
     return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
 
 
-def _per_head(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
-    """`param` as the reference reads it for one batch row and query head, over every query and key."""
+def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = None,
+              origins: Side | None = None) -> jax.Array:
+    """`param` as the reference reads it for one batch row and query head, over every query and `keys`
+    keys: a band's written out over them from its `origins` (`band_dense`)."""
     value = param.value
-    if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    # A band's origins' row the call's own (its values' and its origins' rows each shared apart).
+    origin_row = None if origins is None else shared_place(origins.value.shape, row, 0)[0]
+    if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE, Kind.BAND):
         row, head = shared_place(value.shape, row, head)
+    if kind_of(param) is Kind.BAND:
+        assert origins is not None and origin_row is not None, "a band is read by its origins, after it"
+        # Its origins whole keys whatever dtype a truth's draw widened them to (`band_read`'s).
+        return band.band_read(value[row, head], origins.value[origin_row, 0],
+                              jnp.arange(keys, dtype=jnp.int32))
     match kind_of(param):
         case Kind.HEAD:
             return value[head]
@@ -1217,6 +1250,7 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
             return value[row, :, head]
         case Kind.WIDTH:
             raise ValueError("a width's parameter is a prologue's (`prologued`), no score or output hook's")
+    raise ValueError(f"no score or output hook takes a side of kind {kind_of(param)!r} as its tile")
 
 
 def logit_scale(width: int, scale: float | None) -> float:
@@ -1314,8 +1348,12 @@ def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
     batch, heads, queries, keys = products.shape
     q_pos, k_pos = jnp.arange(queries)[:, None], jnp.arange(keys)[None, :]
 
+    sides = hooks.score.sides
+    pairs = band_origins_of(kinds_of(sides))
+
     def one(row, head):
-        params = (_per_head(p, row, head) for p in hooks.score.sides)
+        params = (_per_head(p, row, head, keys, sides[pairs[index]] if index in pairs else None)
+                  for index, p in enumerate(sides))
         return score_mod(products[row, head], q_pos, k_pos, *params)
 
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
@@ -1699,11 +1737,6 @@ def power_of_two(width: int) -> int:
     return max(16, 1 << (width - 1).bit_length())
 
 
-def whole(count: int, block: int) -> int:
-    """`count` rounded up to whole `block`s."""
-    return -(-count // block) * block
-
-
 WIDEST_POWER = 256
 """The widest head a TMA family's launch pads to a power of two (`head_width`): past it, a power of two
 pads an absorbed MLA key's 576 columns to 1024."""
@@ -1735,6 +1768,9 @@ def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: 
             return jnp.pad(value, ((0, 0), (0, 0), (0, keys - value.shape[2])))
         case Kind.TILE:
             return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2]), (0, keys - value.shape[3])))
+        case Kind.BAND:
+            # Its band columns whole whatever the call's keys (`band_width`, whole `BAND_ALIGN`s).
+            return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2]), (0, 0)))
         case Kind.OUTPUT:
             return jnp.pad(value, ((0, 0), (0, queries - value.shape[1]), (0, 0),
                                    (0, value_width - value.shape[3])))
@@ -1883,7 +1919,7 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     tile = TRACED_TILE
     prologue = name in ("query_mod", "key_mod")
     extents = {"queries": tile, "keys": tile, "width": width}
-    params = [jax.ShapeDtypeStruct(laid(SITES[name], kind, extents), dtype)
+    params = [jax.ShapeDtypeStruct(laid(SITES[name], tiled(kind), extents), dtype)
               for kind, dtype in zip(kinds, dtypes, strict=True)]
     square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
     if name == "output_mod":
@@ -2013,9 +2049,9 @@ DQ_GRADS = (Kind.HEAD, Kind.QUERY)
 """The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries and
 its queries' own."""
 
-DKV_GRADS = (Kind.KEY, Kind.TILE)
+DKV_GRADS = (Kind.KEY, Kind.TILE, Kind.BAND)
 """The parameter kinds whose gradients the dK/dV program writes, under the refined D: its keys' and its
-tiles' entries."""
+tiles' entries, a band's at its tiles' columns."""
 
 
 @jax.tree_util.register_dataclass
@@ -2357,6 +2393,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
                 grads.append(hook_gradient(dq_grads.pop(0)[:, :, :queries], shift, param))
             case Kind.TILE:
                 grads.append(hook_gradient(key_grads.pop(0)[:, :, :queries, :keys], shift, param))
+            case Kind.BAND:
+                grads.append(hook_gradient(key_grads.pop(0)[:, :, :queries], shift, param))
             case Kind.KEY:
                 grads.append(hook_gradient(key_grads.pop(0)[:, :, :keys], shift, param))
             case Kind.OUTPUT:

@@ -4,29 +4,12 @@ Training runs in bf16, and until this file every decoder, the routed and MLA
 families and the diffusion denoiser were held to their reference at fp32
 only, where Dew's orderings (the scale after the norm's cast, rotary in
 fp32, the softmax in fp32) coincide with the reference's. In bf16 they do
-not have to, so each family runs three ways on its committed fixture:
-transformers in float64 (the truth), transformers in bf16 and Dew in bf16
-with fp32 parameter masters, the configuration training uses
-(tools/numerics_reference.py writes the first two). Dew's root-mean-square
-logit error may be at most twice the reference's (tests/reference_error.py
-derives the factor). The fp32 forwards are held to the same rule, which
-replaces a fixed 1e-4 with a bound read off the reference's own rounding.
-
-Observed RMS |logit - float64|, Dew / transformers:
-
-| fixture                  | fp32                | bf16              |
-| ------------------------ | ------------------- | ----------------- |
-| llama-tiny               | 1.3e-06 / 1.2e-06   | 3.8e-02 / 3.3e-02 |
-| qwen3-tiny               | 1.2e-06 / 1.0e-06   | 3.0e-02 / 2.9e-02 |
-| gemma3-tiny              | 6.8e-07 / 6.3e-07   | 1.3e-02 / 1.4e-02 |
-| mixtral-tiny             | 5.8e-07 / 4.8e-07   | 1.7e-02 / 1.7e-02 |
-| deepseek-v3-tiny         | 6.1e-07 / 5.1e-07   | 2.1e-02 / 2.0e-02 |
-| mamba2-tiny              | 1.6e-07 / 1.1e-07   | 3.6e-03 / 4.5e-03 |
-| workflow bare            |                     | 1.1e-02 / 1.8e-02 |
-| workflow conditioned     |                     | 1.3e-02 / 1.8e-02 |
-| workflow image           |                     | 1.1e-02 / 1.3e-02 |
-
-The workflow's fp32 rows are tests/test_block_diffusion.py's.
+not have to, so each decoder runs three ways on drawn ids over its committed
+fixture's weights: transformers in float64 (the truth), transformers in the
+run's dtype and Dew in it, bf16 over fp32 parameter masters as training runs,
+Dew's logits on par with transformers' by check 1 (`assert_as_exact`) over
+each one's declared seeds (`DECODER_SEEDS`); the diffusion denoiser's drawn
+routes are held alike.
 """
 
 import contextlib

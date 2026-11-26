@@ -13,10 +13,9 @@ tile's keys with the algebra's online softmax; two builders shape the step for i
   config's resident programs a multiprocessor, from its registers and its shared memory, times the
   multiprocessors; no fitted table), so one row's long cache fills the GPU. No query or span is copied.
 - the merge: the slices' softmax states combined with the call's initial state (a sink, `Initial`), in
-  a fixed order, deterministic: one launch over the slices where the walk wrote them, the law's own path
-  with an initial state (`merged.merged_split`).
-  A merge in the launch, by the last slice's program to arrive, was never faster in kernel time at any
-  split on an A100 or a GH200, and the step's wall time is its launches' either way (M-ET-46).
+  a fixed order, deterministic: one shared launch over the slices where the walk wrote them, an initial
+  state merged beside them in it (`merged.merged_split`). A merge inside the walk's launch is open to
+  measurement against this one (M-ET-46 timed an earlier one at two B1 geometries).
 
 No arithmetic of its own: the walk, the hooks, the guards and the merge are the template forward's and its
 algebra's.
@@ -227,10 +226,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         return None if certified is None else planned(certified, op, ba, 1)
 
     processors = target.multiprocessors or 1
-    tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
-    # Its launch's programs: a float32 call's operands as their parts stack along the rows
-    # (`MosaicForward.parts`), as many programs again each (a merging launch's every one resident).
-    programs = op.parts * query.shape[0] * query.shape[2] * tiles
+    programs = launch_programs(query, config)
     if programs >= processors:
         return single()
 
@@ -348,6 +344,15 @@ def _bound(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: fl
     none (`_stream_op`)."""
     return _stream_op(query, key, value, spans, hooks, scale=scale, table=table, sources=sources,
                       out_dtype=jnp.float32, scales=scales, splits=splits, chosen=chosen, in_key=in_key)
+
+
+def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
+    """A walk's programs a slice, its launch's grid (`attention_mosaic_forward._launched`): a row's key
+    heads' tiles of their packed query rows `rows` `[B, T, Hk, D]` (`_rows`). A float32 call's parts stack
+    within its programs' rows (`MosaicForward.parts`, `_extents`' batch its rows less their parts), no
+    program of their own (counted as one each, an fp32 step of 8 rows of 8 key heads, 64 programs, filled
+    an H100's 132 on paper and walked its keys whole, 2026-11-26 audit)."""
+    return rows.shape[0] * rows.shape[2] * math.ceil(rows.shape[1] / (config.consumers * config.block_q))
 
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,

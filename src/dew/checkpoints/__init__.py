@@ -1925,7 +1925,7 @@ class Checkpoints:
         held = (snapshot.custom_metadata or {}).get("environment")
         return None if held is None else record(held, "a step's environment")
 
-    def rung(self, step: int) -> JSON:
+    def _rung(self, step: int) -> JSON:
         """Return the rung of `fit`'s ladder that the state at `step` trained on.
 
         The value is what `save` recorded, read from the directory `restore`
@@ -1935,7 +1935,7 @@ class Checkpoints:
         snapshot = self._step_metadata(step, local=step == self._local_latest())
         return json_value((snapshot.custom_metadata or {}).get('rung'), 'rung')
 
-    def boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]:
+    def _boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]:
         """The axes the model at `step` boxed on its own parameters, as `save`
         recorded them; a checkpoint saved without them has none."""
         resolved = self.pinned(step)
@@ -2002,7 +2002,7 @@ class Checkpoints:
         frozen = template["variables"].get(FROZEN)
         rows = template if frozen is None else {
             **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_rows)}}
-        with sharding.boxed(self.boxed(step)):
+        with sharding.boxed(self._boxed(step)):
             placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in rows.items()}
             chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
         if frozen is not None:

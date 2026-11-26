@@ -64,6 +64,61 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                         seeds=form.cases.seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",
+                                  "key_dropped_cotangents", "selective_decay", "key_memory_decay"])
+@pytest.mark.parametrize("arm", ["written", "generated"])
+def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
+    from certified import assert_certified
+
+    qualified = f"{component_cases.__name__}.{name}"
+    declaration = generate.DECLARATIONS[qualified]
+    for policy in declaration.cases.policies:
+        function = (declaration.function if arm == "written" else
+                    functools.partial(_derived(qualified), policy=policy))
+        for index, operands in enumerate(declaration.cases.operands):
+            assert_certified(function, functools.partial(declaration.cases.draw, operands=operands),
+                             f"{name} ({arm}, {policy}, {index})", seeds=declaration.cases.seeds)
+
+
+def test_shared_component_preserves_layouts_constants_and_live_results():
+    from dew.algebra import _component_sharing, terms
+
+    def tile(value, row, *, axis, keep_product, bias):
+        extended = jax.lax.broadcast_in_dim(row + bias, value.shape, (axis,))
+        product = value * extended
+        base = jnp.abs(product + value)
+        root = jnp.sqrt(base)
+        shifted = root + extended
+        result = jax.lax.logistic(shifted)
+        return (result, product) if keep_product else (result,)
+
+    layouts = {"row_first": ((7, 13), 0, False, -0.5), "key_first": ((13, 7), 1, True, 0.5)}
+    arguments, separate = {}, {}
+    for name, (shape, axis, keep_product, shift) in layouts.items():
+        arguments[name] = (jax.ShapeDtypeStruct(shape, jnp.bfloat16),
+                           jax.ShapeDtypeStruct((shape[axis],), jnp.bfloat16))
+        bias = (np.arange(shape[axis]) * 0.25 + shift).astype(jnp.bfloat16)
+        fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
+        separate[name] = printed.source(jax.make_jaxpr(fn)(*arguments[name]), name, borrow_shapes=True)[0]
+    # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
+    occupied = "_shared_component_0"
+    arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
+    separate[occupied] = printed.source(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
+                                        occupied, borrow_shapes=True)[0]
+    reserved = "_shared_component_1"
+    shared = _component_sharing.shared(separate, reserved=(reserved,))
+    assert len(shared) == len(separate) + 1 and reserved not in shared
+    for name, operands in arguments.items():
+        before = printed.loaded(separate[name], name)
+        after = printed.loaded("\n\n".join(shared.values()), name)
+        original = jax.make_jaxpr(before)(*operands)
+        composed = jax.make_jaxpr(after)(*operands)
+        values = tuple(np.full(operand.shape, 0.75, operand.dtype) for operand in operands)
+        for actual, expected in zip(jax.jit(after)(*values), jax.jit(before)(*values), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
+
+
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
     (example,) = component_cases.ROUNDED.cases.operands[0]
@@ -140,6 +195,105 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
     with jax.default_matmul_precision("highest"):
         assert_as_exact(jax.jit(generated), jax.jit(split), draw, "generated split-KV tile composition",
                         seeds=8, truth_fn=whole)
+
+
+def _generated_inverse(system):
+    from dew.algebra.component_cases_derived import chunk_solve_level
+
+    size = system.shape[0]
+    place = jnp.arange(size)
+    identity = jnp.eye(size, dtype=system.dtype)
+    paired = (place[:, None] % 2 == 1) & (place[None, :] == place[:, None] - 1)
+    inverse = identity - jnp.where(paired, system, 0)
+    for level in range(1, size.bit_length() - 1):
+        inverse = chunk_solve_level(system, inverse, jnp.asarray(level, jnp.int32))
+    return inverse - identity
+
+
+@pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
+def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
+    from dew.algebra.component_cases_derived import chunk_weighted
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, values, strengths):
+        return chunk_weighted(_generated_inverse(system), values, strengths)
+
+    def written(system, values, strengths):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
+
+    def truth(system, values, strengths):
+        rhs = values * strengths[:, None]
+        return jax.lax.linalg.triangular_solve(system, rhs, left_side=True, lower=True, unit_diagonal=True)
+
+    def draw(seed):
+        system = component_cases._chunk_system(seed, size)
+        rng = np.random.default_rng(seed)
+        rhs = rng.uniform(-0.25, 0.25, (size, columns)).astype(np.float32)
+        strength = rng.uniform(0.125, 0.5, size).astype(np.float32)
+        strength[1] = 0
+        return system, rhs, strength
+
+    assert_as_exact(generated, written, draw, "generated recurrence solve and value application",
+                    seeds=8, truth_fn=truth)
+
+
+@pytest.mark.parametrize("size", [16, 32, 64])
+def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
+    from dew.algebra.component_cases_derived import chunk_inverse_pullback
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, cotangent):
+        return chunk_inverse_pullback(_generated_inverse(system), cotangent)
+
+    def written(system, cotangent):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
+
+    def truth(system, cotangent):
+        identity = jnp.eye(size, dtype=system.dtype)
+
+        def solve(a):
+            return jax.lax.linalg.triangular_solve(
+                a, identity, left_side=True, lower=True, unit_diagonal=True)
+
+        _, pull = jax.vjp(solve, system)
+        return pull(jnp.tril(cotangent, -1))[0]
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        # Same-shape adversarial draws can also use the system as the cotangent. Keep the closed
+        # solve and its transpose representable together; the component gate covers the isolated edge.
+        system = np.tril(rng.uniform(-0.125 / size, 0.125 / size, (size, size)).astype(np.float32), -1)
+        cotangent = rng.normal(size=system.shape).astype(np.float32)
+        return system, cotangent
+
+    assert_as_exact(generated, written, draw, "generated inverse VJP of a triangular solve",
+                    seeds=8, truth_fn=truth)
+
+
+def test_generated_value_gradient_accumulates_two_query_tiles():
+    from dew.algebra.component_cases_derived import values_gradient
+
+    def generated(scores, cotangent, peak, total):
+        return (values_gradient(scores[:32], cotangent[:32], peak[:32], total[:32])
+                + values_gradient(scores[32:], cotangent[32:], peak[32:], total[32:]))
+
+    def written(scores, cotangent, peak, total):
+        return component_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
+
+    def truth(scores, cotangent, peak, total):
+        keep = jnp.isfinite(peak)
+        weights = jnp.exp(jnp.where(keep[:, None], scores - peak[:, None], -jnp.inf))
+        return weights.T @ (cotangent / jnp.where(total > 0, total, 1)[:, None])
+
+    def draw(seed):
+        case = component_cases.VALUES_GRADIENT.cases
+        left = case.draw(seed, case.operands[0])
+        right = case.draw(seed + 19, case.operands[0])
+        return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
+
+    assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
 
 
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():

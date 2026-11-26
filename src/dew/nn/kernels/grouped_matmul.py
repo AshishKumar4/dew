@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.templates import axes
+
 from . import generation, selection
 from .formats import TernaryWeights
 from .generation import INHERENT
@@ -507,16 +509,20 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     def neighbours(self, ba, config: tiling.Tiles) -> tuple[tiling.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
         # band halved or doubled, the columns or the rows the next block either side (a column unit, a
-        # role of rows).
+        # role of rows). A TPU core's (the MXU's) its columns, rows and depth alone, each the next block
+        # either side, the depth's the next of the MXU's doublings (`Mxu.depths`): it stages a fixed ring
+        # (`mosaic_tpu.STAGES`) and walks no band.
         from .templates.gemm import pricing
 
-        family = pricing.family_of(config, ba.arguments['tokens'].dtype, self.launch_target())
+        target = self.launch_target()
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
         unit = family.column_unit(ba.arguments['tokens'].dtype)
         role = family.role_rows * config.sharing
         band = config.grid_block_n
-        moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
-                 {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
-                 {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
+        steps = ([{'block_k': config.block_k // 2}, {'block_k': config.block_k * 2}] if generation.tpu(target)
+                 else [{'stages': config.stages - 1}, {'stages': config.stages + 1},
+                       {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2}])
+        moves = [*steps, {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
                  {'block_m': config.block_m - role}, {'block_m': config.block_m + role}]
         found = []
         for move in moves:
@@ -742,7 +748,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         width_unit = math.lcm(family.column_unit(dtype), self._vector_units(ba, family)[1])
         units = {'depth': self._depth_unit(ba, family, dtype), 'width': width_unit}
         extents = self._padded_extents(ba)
-        return extents, {axis: -(-extent // units[axis]) * units[axis] for axis, extent in extents.items()}
+        return extents, {axis: axes.whole(extent, units[axis]) for axis, extent in extents.items()}
 
     def _partial_axes(self, ba, family: mosaic.Family, target) -> tuple[bool, bool]:
         """Whether the call's depth, and its width, run their last step and column tile partial on `family`
@@ -1102,7 +1108,7 @@ class MosaicGmm(_Mosaic):
             tile, target, rows=rows, groups=ba.arguments['sizes'].shape[0], depth=depth, width=width,
             columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
-            held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
+            held=axes.whole(rows, row_tiles.TMA_ROWS),
             operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
             multiprocessors=_multiprocessors(target), issued=ba.arguments['tokens'].dtype,
             partial_bytes=self._slice_bytes(ba, tile, target))
@@ -1133,10 +1139,10 @@ class MosaicGmm(_Mosaic):
         least = config.block_m * config.cluster if family.copies_tiled_rows else 0
 
         def walked(count: int) -> int:
-            return max(-(-count // unit) * unit, least)
+            return max(axes.whole(count, unit), least)
 
         if config.swapped:
-            return walked(width) * -(-rows // config.block_n) * config.block_n * 4
+            return walked(width) * axes.whole(rows, config.block_n) * 4
         return walked(rows) * width * 4
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
@@ -1205,7 +1211,7 @@ class MosaicGmm(_Mosaic):
         swapped = self.SWAPPED_OPTIONS
         options = {name: value for name, value in ba.arguments.items()
                    if name not in ('tokens', 'kernel', 'sizes', 'trans_rhs', *swapped)}
-        return self.bind(abstract((width, depth)), abstract((1, -(-tokens.shape[0] // unit) * unit, depth)),
+        return self.bind(abstract((width, depth)), abstract((1, axes.whole(tokens.shape[0], unit), depth)),
                          ba.arguments['sizes'], **options, trans_rhs=True, **swapped)
 
     SWAPPED_OPTIONS: ClassVar[dict] = {}

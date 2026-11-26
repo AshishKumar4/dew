@@ -583,7 +583,7 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
                                                        layout=Layout(min_shard=1, tolerance=1.0)),
                           accumulation=2,
                           **sampling)
-        trainer.scheduled(1)
+        trainer._horizon(1)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         if isinstance(step, DrawingStep):

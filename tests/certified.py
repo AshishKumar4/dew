@@ -232,6 +232,15 @@ def _exp_interval(values, bits):
     return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
+def _log2_interval(values, bits):
+    """log2's outward enclosure at each finite positive value; at a power of two its exact exponent, which
+    no interval of `log(x) / log(2)` narrows to."""
+    low, high = _interval(lambda iv, x: iv.log(x) / iv.log(2))(values, bits)
+    mantissa, exponent = np.frexp(values)
+    power = mantissa == 0.5
+    return np.where(power, exponent - 1.0, low), np.where(power, exponent - 1.0, high)
+
+
 def _near_zero_interval(function):
     """An outward float64 enclosure of an mpmath interval `function` of `1 + x` (log1p's) or of `exp(x) - 1`
     (expm1's) at each finite value, its precision raised by the value's own exponent below one, so `1 + x`
@@ -253,6 +262,16 @@ def _expm1_interval(values, bits):
     (`_exp_interval`): past its upper end the same two neighbours bound every expm1, and past its lower end
     every expm1 lies within a format's last step of -1."""
     return _near_zero_interval(lambda iv, x: iv.exp(x) - 1)(np.clip(values, *EXP_RANGE), bits)
+
+
+def _tanh_interval(values, bits):
+    """tanh's outward enclosure, (exp(2x) - 1) / (exp(2x) + 1), at each finite value, its precision raised
+    near zero as expm1's (`_near_zero_interval`), taken at ±20 beyond them: past them every tanh is within
+    exp(-40) of ±1, between ±1 and the value next to it of a format no wider than fp32."""
+    def tanh(iv, x):
+        doubled = iv.exp(2 * x)
+        return (doubled - 1) / (doubled + 1)
+    return _near_zero_interval(tanh)(np.clip(values, -20.0, 20.0), bits)
 
 
 def _erfinv_enclosed(values, bits):
@@ -310,6 +329,12 @@ def _erfinv_special(value):
     """erfinv's poles at ±1 and its zero, exactly ±0 (it is odd), named; NaN outside (-1, 1)."""
     expected = np.where(np.abs(value) == 1, np.copysign(np.inf, value), np.where(value == 0, value, np.nan))
     return expected, ~(np.abs(value) < 1) | (value == 0)
+
+
+def _tanh_special(value):
+    """tanh's limits at the infinities, ±1, and its exact values at ±0 (tanh(±0) = ±0), named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.where(value == 0, value, np.where(np.isnan(value), np.nan, np.sign(value))), named
 
 
 def _sin_special(value):
@@ -376,6 +401,25 @@ def _transcendental(enclose, special):
             raise ArithmeticError(f"undecided at 768 bits at {rest[:4]}")
         return found
     return levels
+
+
+_base_two_levels = _transcendental(_interval(lambda iv, x: iv.power(2, x)), _exp_special)
+
+
+def _exp2_levels(operands, result, fmt, flushes):
+    # Outside this interval the exact result is below both formats' subnormal grids, or past
+    # overflow. Clipping the oracle input keeps huge exponents out of the interval arithmetic.
+    (value,) = _floats(operands, flushes)
+    native = np.asarray(result, np.float64)
+    safe = np.clip(value, -160.0, 132.0)
+    levels = _base_two_levels((safe,), native, fmt, flushes)
+    # The least normal is not a flushable result. An exponent at or above emax+1 cannot
+    # return a finite value, even though the grid places fmax one step below infinity.
+    impossible = (((value >= fmt.emin) & (native < 2.0 ** fmt.emin))
+                  | ((value >= fmt.emax + 1) & (native != np.inf)) | (native < 0))
+    named, known = _exp_special(value)
+    return np.where(known, np.where(_same(native, named), 0, UNREACHED),
+                    np.where(impossible, UNREACHED, levels))
 
 
 def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.ndarray:
@@ -485,9 +529,40 @@ def _rounding(primitive, integral):
         divisor = np.shape(operands[-1])
         broadcast = (primitive is jax.lax.div_p and len(divisor) == np.ndim(result)
                      and divisor != np.shape(result))
-        reach = measured.reach[(primitive, BROADCAST) if broadcast else primitive, fmt.name]
-        return LEVELS[primitive](operands, result, fmt, measured.flushes_in(primitive, fmt)) <= reach
+        reach = (_exp2_reach(fmt) if primitive is jax.lax.exp2_p
+                 else measured.reach[(primitive, BROADCAST) if broadcast else primitive, fmt.name])
+        levels = _exp2_levels if primitive is jax.lax.exp2_p else LEVELS[primitive]
+        return levels(operands, result, fmt, measured.flushes_in(primitive, fmt)) <= reach
     return contract
+
+
+def _one_minus_square(params, operands, result, fmt):
+    """lax.one_minus_square's result, the program JAX lowers it to, (1 + x)(1 - x): its two factors' and
+    their product's roundings within γ_3 of the exact 1 - x² relative to it (Higham §3.1), with 2^-50 for
+    its float64 evaluation, and each rounding's underflow; an infinity of its sign where the product of the
+    two factors as the format rounds them (exact in float64) reaches the format's overflow, and a finite
+    value nowhere else; at x = ±1, where a factor is exactly zero, the product's own +0, no underflow
+    allowed it (row 13502); a non-finite value as its program makes it; of integers, wrapped."""
+    (x,) = operands
+    if fmt is None:
+        x = np.asarray(x)
+        with np.errstate(over="ignore"):
+            return _bits(result) == _bits(((1 + x) * (1 - x)).astype(np.asarray(result).dtype))
+    flushes = lane().flushes
+    (value,) = _floats(operands, flushes)
+    with np.errstate(over="ignore", invalid="ignore"):
+        exact = (1 + value) * (1 - value)
+    native = np.asarray(result, np.float64)
+    slack = (gamma(3, fmt) + 2.0 ** -50) * np.abs(exact) + 3 * underflow(fmt, flushes)
+    with np.errstate(invalid="ignore", over="ignore"):
+        ones = np.ones_like(value)
+        factors = [rounded(*two_sum(ones, sign * value), fmt) for sign in (1, -1)]
+        product = factors[0] * factors[1]
+        close = np.isfinite(native) & (np.abs(native - exact) <= np.nextafter(slack, np.inf))
+        overflowed = _same(native, np.copysign(np.inf, product))
+    bounded = np.where(product == 0, _same(native, product), close)
+    return np.where(np.isfinite(exact), np.where(np.abs(product) >= fmt.overflow, overflowed, bounded),
+                    _same(native, exact))
 
 
 def _correctly_divided(params, operands, result, fmt):
@@ -1371,6 +1446,62 @@ def _extremum(choose, integral):
     return contract
 
 
+def _arg_extremum(pick):
+    """argmax or argmin along its axis (`pick`, NumPy's) of the operand as the lane's arithmetic reads it
+    (`_read`), as XLA's reduction finds it (lax's `_ArgMinMaxReducer`): the first index of the extreme, zeros
+    of either sign alike; where a row holds a NaN, the index of a NaN, which of them the reduction's order
+    decides."""
+    def contract(params, operands, result, fmt):
+        (axis,) = params["axes"]
+        value = np.moveaxis(_read(operands[0], lane().flushes), axis, -1)
+        found = np.asarray(result).astype(np.int64)
+        expected = pick(value, axis=-1)
+        if not np.issubdtype(value.dtype, np.floating):
+            return found == expected
+        nan = np.isnan(value)
+        landed = np.take_along_axis(value, np.clip(found, 0, value.shape[-1] - 1)[..., None], -1)[..., 0]
+        return np.where(nan.any(-1), (found >= 0) & (found < value.shape[-1]) & np.isnan(landed),
+                        found == expected)
+    return contract
+
+
+def _scatter_extremum(choose, integral):
+    """A scatter-min or scatter-max's result: each operand element folded with every update that lands on it
+    (`_scatter_targets`) by the lane's min or max (`choose`, its order of zeros and NaN, which no order of
+    folding changes), those values read as the lane's arithmetic reads them; an element no update lands on
+    moved, its bits kept; of integers, `integral`."""
+    def contract(params, operands, result, fmt):
+        operand, indices, updates = (np.asarray(value) for value in operands)
+        targets = _scatter_targets(params, operand, indices, updates)
+        if fmt is None:
+            folded, fold, read, updates = operand.copy(), integral, operand, updates
+        else:
+            flushes = lane().flushes
+            folded, fold = np.asarray(operand, np.float64).copy(), choose
+            read, updates = _read(operand, flushes), _read(updates, flushes)
+        touched = np.zeros(operand.shape, bool)
+        # A rank-zero operand's targets hold no coordinate, and no update of it is dropped.
+        for update, target in zip(updates.ravel(), targets, strict=True):
+            if (target >= 0).all():
+                at = tuple(target)
+                folded[at] = fold(folded[at] if touched[at] else read[at], update)
+                touched[at] = True
+        if fmt is None:
+            return np.asarray(result) == folded
+        # An element no update landed on is moved: its bits, a NaN's payload among them.
+        return np.where(touched, _same(result, folded), _bits(result) == _bits(operand))
+    return contract
+
+
+def _leading_zeros(params, value):
+    """lax.clz's result: each integer's zero bits above its highest set bit, at its width (all of them at
+    zero)."""
+    value = np.asarray(value)
+    unsigned = value.view(np.dtype(f"u{value.dtype.itemsize}")).astype(np.uint64)
+    lengths = np.asarray(np.frompyfunc(int.bit_length, 1, 1)(unsigned.astype(object)), np.int64)
+    return np.asarray(8 * value.dtype.itemsize - lengths, value.dtype)
+
+
 def _integral_extremum(reduce, extreme: str):
     """An integer or boolean extremum reduction from its type's identity: the least value for a max,
     the greatest for a min (False and True for booleans)."""
@@ -1386,6 +1517,17 @@ def _integral_extremum(reduce, extreme: str):
 
 def _selected(params, which, *cases):
     return np.choose(np.asarray(which).astype(np.int64), cases)
+
+
+def _dynamic_updated(params, operand, update, *starts):
+    """lax.dynamic_update_slice's result: `operand` with `update` written at `starts`, each start clamped so
+    the update fits in the operand, as XLA clamps it."""
+    at = [min(max(int(start), 0), extent - size)
+          for start, extent, size in zip(starts, np.shape(operand), np.shape(update), strict=True)]
+    result = np.array(operand)
+    window = tuple(slice(begin, begin + size) for begin, size in zip(at, np.shape(update), strict=True))
+    result[window] = update
+    return result
 
 
 def _dynamic_sliced(params, operand, *starts):
@@ -1650,6 +1792,8 @@ LEVELS = {
     jax.lax.sqrt_p: _arithmetic(_root),
     jax.lax.log_p: _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     jax.lax.exp_p: _transcendental(_exp_interval, _exp_special),
+    # Base 2's: log's limits and exact value (log2(1) = +0) alike; exp2 is calibrated apart (`_exp2_reach`).
+    jax.lax.log2_p: _transcendental(_log2_interval, _log_special),
     jax.lax.log1p_p: _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
     jax.lax.expm1_p: _transcendental(_expm1_interval, _expm1_special),
     jax.lax.erf_inv_p: _transcendental(_erfinv_enclosed, _erfinv_special),
@@ -1657,6 +1801,7 @@ LEVELS = {
     jax.lax.logistic_p: _transcendental(_logistic_interval, _logistic_special),
     # mpmath's interval sine and cosine reduce their argument at the enclosure's own precision, rigorously:
     # an argument too large for it leaves the enclosure wide, undecided, and its precision is raised.
+    jax.lax.tanh_p: _transcendental(_tanh_interval, _tanh_special),
     jax.lax.sin_p: _transcendental(_interval(lambda iv, x: iv.sin(x)), _sin_special),
     jax.lax.cos_p: _transcendental(_interval(lambda iv, x: iv.cos(x)), _cos_special),
 }
@@ -1704,7 +1849,7 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
         drawn = [scaled(-70, 63), scaled(-63, 70)]
     elif primitive is jax.lax.sqrt_p:
         drawn = [np.abs(scaled(-149, 127))]
-    elif primitive is jax.lax.log_p:
+    elif primitive in (jax.lax.log_p, jax.lax.log2_p):
         value = np.abs(scaled(-126, 127))
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         # A quarter where a logsumexp's sums of exponentials sit, and XLA:CPU's float32 log a step past
@@ -1718,6 +1863,15 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
+        drawn = [value]
+    elif primitive is jax.lax.exp2_p:
+        value = rng.uniform(fmt.emin - fmt.precision - 2, fmt.emax + 2, PROBES)
+        value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        dtype = DTYPES[fmt.name]
+        endpoints = np.asarray([fmt.emin - fmt.precision, fmt.emin, fmt.emax + 1], dtype)
+        value[:12] = np.concatenate((
+            endpoints, np.nextafter(endpoints, np.asarray(-np.inf, dtype)),
+            np.nextafter(endpoints, np.asarray(np.inf, dtype)), [0, -np.inf, np.inf]))
         drawn = [value]
     elif primitive in (jax.lax.log1p_p, jax.lax.expm1_p):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
@@ -1736,6 +1890,13 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
     elif primitive is jax.lax.rsqrt_p:
         value = np.abs(scaled(-149, 127))
         value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
+        drawn = [value]
+    elif primitive is jax.lax.tanh_p:
+        # Across (-20, 20), past which it is ±1 within exp(-40), and a quarter at every binade near zero,
+        # where it is its argument to within a last bit.
+        value = rng.uniform(-20, 20, PROBES)
+        value[:quarter] = scaled(fmt.emin - fmt.precision + 1, 0)[:quarter]
+        value[0] = 0.0
         drawn = [value]
     elif primitive in (jax.lax.sin_p, jax.lax.cos_p):
         # Every binade from 2^-30 to 2^20, the angles a rotary table reaches, and a quarter across a few
@@ -1757,9 +1918,11 @@ SUBNORMAL_OPERANDS = {
     jax.lax.add_p: lambda tiny: (tiny, tiny), jax.lax.sub_p: lambda tiny: (tiny, -tiny),
     jax.lax.mul_p: lambda tiny: (tiny, 2.0 ** 100), jax.lax.div_p: lambda tiny: (tiny, 2.0 ** -100),
     jax.lax.sqrt_p: lambda tiny: (tiny,), jax.lax.rsqrt_p: lambda tiny: (tiny,),
-    jax.lax.log_p: lambda tiny: (tiny,), jax.lax.log1p_p: lambda tiny: (tiny,),
+    jax.lax.log_p: lambda tiny: (tiny,), jax.lax.log2_p: lambda tiny: (tiny,),
+    jax.lax.log1p_p: lambda tiny: (tiny,),
     jax.lax.expm1_p: lambda tiny: (-tiny,),
     jax.lax.erf_inv_p: lambda tiny: (tiny,), jax.lax.sin_p: lambda tiny: (tiny,),
+    jax.lax.tanh_p: lambda tiny: (tiny,),
 }
 """Each rounding primitive's operands at a subnormal `tiny` whose result tells a subnormal read as it is from
 one read as zero (`lane`'s `kept`); exp, logistic, square and cos return the same result either way, so a
@@ -1784,6 +1947,23 @@ def _keeps_subnormals(primitive, fmt: Format) -> bool:
     return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
 
 
+def _probe_levels(primitive, fmt, levels, measured):
+    operands = _probes(primitive, fmt)
+    result = np.asarray(_function(primitive)(*operands))
+    return operands, levels(operands, result, fmt, measured.flushes_in(primitive, fmt))
+
+
+@functools.cache
+def _exp2_reach(fmt: Format) -> int:
+    # Calibrate this operation only when it is checked. In particular, CPU's exp2(-126) in
+    # fp32 and exp2(128) in bf16 break exact range cases. No allowance can admit those results.
+    _, levels = _probe_levels(jax.lax.exp2_p, fmt, _exp2_levels, lane())
+    held = levels[levels != UNREACHED]
+    if not held.size:
+        raise ArithmeticError(f"the lane's exp2 in {fmt.name} has no admissible probe")
+    return int(np.max(held))
+
+
 @functools.cache
 def lane() -> Lane:
     """The lane check 2 runs on (the process's default backend), measured once: whether it reads a
@@ -1799,9 +1979,7 @@ def lane() -> Lane:
     reach = measured.reach
     for primitive, levels in LEVELS.items():
         for fmt in FORMATS.values():
-            operands = _probes(primitive, fmt)
-            found = levels(operands, np.asarray(_function(primitive)(*operands)), fmt,
-                           measured.flushes_in(primitive, fmt))
+            operands, found = _probe_levels(primitive, fmt, levels, measured)
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
                 raise ArithmeticError(f"the lane's {primitive.name} in {fmt.name} breaks an exact case at "
@@ -1838,6 +2016,7 @@ CONTRACTS = {
     jax.lax.rem_p: _moved(lambda params, a, b: _remainder(a, b)),
     jax.lax.sign_p: _moved(lambda params, a: np.where(a == 0, a, np.sign(a))),
     jax.lax.sqrt_p: _rounding(jax.lax.sqrt_p, None),
+    jax.lax.one_minus_square_p: _one_minus_square,
     jax.lax.neg_p: _moved(lambda params, a: -a),
     jax.lax.abs_p: _moved(lambda params, a: np.abs(a)),
     jax.lax.max_p: _extreme(_signed_max, np.maximum),
@@ -1845,11 +2024,14 @@ CONTRACTS = {
     jax.lax.convert_element_type_p: _converted,
     jax.lax.log_p: _rounding(jax.lax.log_p, None),
     jax.lax.exp_p: _rounding(jax.lax.exp_p, None),
+    jax.lax.log2_p: _rounding(jax.lax.log2_p, None),
+    jax.lax.exp2_p: _rounding(jax.lax.exp2_p, None),
     jax.lax.log1p_p: _rounding(jax.lax.log1p_p, None),
     jax.lax.expm1_p: _rounding(jax.lax.expm1_p, None),
     jax.lax.erf_inv_p: _rounding(jax.lax.erf_inv_p, None),
     jax.lax.rsqrt_p: _rounding(jax.lax.rsqrt_p, None),
     jax.lax.logistic_p: _rounding(jax.lax.logistic_p, None),
+    jax.lax.tanh_p: _rounding(jax.lax.tanh_p, None),
     jax.lax.sin_p: _rounding(jax.lax.sin_p, None),
     jax.lax.cos_p: _rounding(jax.lax.cos_p, None),
     jax.lax.reduce_sum_p: _reduced_sum,
@@ -1871,6 +2053,8 @@ CONTRACTS = {
     jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
     jax.lax.reduce_min_p: _extremum(_signed_min, _integral_extremum(np.min, "min")),
+    jax.lax.argmax_p: _arg_extremum(np.argmax),
+    jax.lax.argmin_p: _arg_extremum(np.argmin),
     jax.lax.select_n_p: _moved(_selected),
     jax.lax.broadcast_in_dim_p: _moved(_broadcast),
     jax.lax.reshape_p: _moved(_reshaped),
@@ -1889,11 +2073,16 @@ CONTRACTS = {
     jax.lax.gather_p: _moved(_gathered),
     jax.lax.stack_p: _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
     jax.lax.dynamic_slice_p: _moved(_dynamic_sliced),
+    jax.lax.dynamic_update_slice_p: _moved(_dynamic_updated),
     # Exact functions of a value as the lane's arithmetic reads it (a flushed subnormal a zero).
     jax.lax.floor_p: _moved(lambda params, a: np.floor(_read(a, lane().flushes)).astype(a.dtype)),
+    jax.lax.ceil_p: _moved(lambda params, a: np.ceil(_read(a, lane().flushes)).astype(a.dtype)),
+    jax.lax.clz_p: _moved(_leading_zeros),
     jax.lax.nextafter_p: _moved(lambda params, a, b: np.nextafter(a, b)),
     jax.lax.scatter_p: _moved(_scattered),
     jax.lax.scatter_add_p: _scatter_added,
+    jax.lax.scatter_min_p: _scatter_extremum(_signed_min, np.minimum),
+    jax.lax.scatter_max_p: _scatter_extremum(_signed_max, np.maximum),
     primitives.ragged_dot_general_p: _ragged_dot,
     jax.lax.integer_pow_p: _integer_power,
     jax.lax.sort_p: _moved(lambda params, part: part),
