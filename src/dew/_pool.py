@@ -105,6 +105,14 @@ class GpuListing:
             return int(entry) < len(self.gpus)
         return sum(uuid.startswith(entry) for uuid in (*self.gpus, *self.migs)) == 1
 
+    def gpu(self, entry: str) -> int | None:
+        """The index of the whole GPU an entry it names (`names`) is, by index or UUID; None for a MIG
+        device, which CUDA enumerates by its own rules (at most one compute instance a GPU instance)."""
+        if entry.isdigit():
+            return int(entry)
+        found = [index for index, uuid in enumerate(self.gpus) if uuid.startswith(entry)]
+        return found[0] if found else None
+
 
 def visible_list(visible: str, listing: GpuListing | None = None) -> list[str]:
     """The GPUs a CUDA_VISIBLE_DEVICES value makes visible, in order: its entries up to the first that names
@@ -121,9 +129,17 @@ def visible_list(visible: str, listing: GpuListing | None = None) -> list[str]:
 
 
 def verified_visible(visible: str, listing: GpuListing | None) -> list[str] | None:
-    """The GPUs `visible` makes visible on a host whose GPUs `listing` lists (`visible_list`), each known to
-    be one of them; None where they are not listed."""
-    return None if listing is None else visible_list(visible, listing)
+    """The GPUs `visible` makes visible on a host whose GPUs `listing` lists (`visible_list`), where CUDA's
+    enumeration of them is known: each a whole GPU, named once (an index and its UUID name one GPU twice).
+    None where it is not: the host lists none, a MIG device is among them (CUDA shows at most one compute
+    instance a GPU instance, whichever it picks), or a GPU is named twice."""
+    if listing is None:
+        return None
+    shown = visible_list(visible, listing)
+    gpus = [listing.gpu(entry) for entry in shown]
+    if any(gpu is None for gpu in gpus) or len(set(gpus)) < len(gpus):
+        return None
+    return shown
 
 
 def cuda_driver() -> ctypes.CDLL | None:
