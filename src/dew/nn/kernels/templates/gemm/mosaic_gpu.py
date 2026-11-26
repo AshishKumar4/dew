@@ -391,7 +391,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     can_balance = dense and tiles.splits == 1 and not (beside or packed_format) and paired is scales is None
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=balanced if can_balance else False)
+                       balanced=balanced if can_balance else False,
+                       stored=sum(jnp.dtype(typed).itemsize for typed in dtypes))
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
     walk = functools.partial(
         _gmm_mainloop, lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
@@ -457,14 +458,16 @@ def _joined_refused(joined, lhs, paired, *, parts: tuple, transpose_lhs: bool, p
 
 
 def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiprocessors: int, *,
-                balanced: bool | tail_of.Tail):
+                balanced: bool | tail_of.Tail, stored: float):
     """Dew: a dense `gmm` or `tgmm` launch's last wave balanced over the programs (`pricing.dense_tail`),
-    reusing the planner's `Tail` when passed so planner and emitter make one decision (row 11945)."""
+    reusing the planner's `Tail` when passed so planner and emitter make one decision (row 11945); else
+    `stored` its outputs' bytes an element (an unplanned call's, its dtypes' whole)."""
     if isinstance(balanced, tail_of.Tail):
         return balanced
     if not balanced:
         return None
-    return dense_tail(tiles, dtype, extents, itemsizes, generation.gpu_target(), multiprocessors, dense=True)
+    return dense_tail(tiles, dtype, extents, itemsizes, generation.gpu_target(), multiprocessors,
+                      stored=stored, dense=True)
 
 
 def split_runs(steps: int, splits: int) -> bool:
@@ -1893,7 +1896,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
     # A tile summed across programs adds their exact partials by IEEE adds (`Family.fixed_up`), as a split's.
     tail = _dense_tail(tiles, lhs.dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=balanced if dense else False)
+                       balanced=balanced if dense else False, stored=jnp.dtype(out_dtype).itemsize)
     walked = g * -(-m // tile_rows(tiles, family)) * (n // tile_columns(tiles, family))
     programs = launched(family, multiprocessors, walked, tail)
     return _tgmm_streamed(

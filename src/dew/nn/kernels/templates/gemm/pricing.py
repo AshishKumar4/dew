@@ -162,9 +162,10 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
 
 
 def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: tuple[int, int],
-               target, programs: int, *, dense: bool = True) -> tail_of.Tail | None:
+               target, programs: int, *, stored: float, dense: bool = True) -> tail_of.Tail | None:
     """The one balanced-tail decision for a dense GEMM over `(m, n, k)` `extents` at `tiles` on `target`:
-    shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945)."""
+    shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945); `stored`,
+    the bytes its outputs store an element of its `(m, n)` output, as its launch declares them (padded)."""
     if not merges(tiles, dtype, dense=dense, target=target):
         return None
     family = family_of(tiles, dtype, target)
@@ -184,9 +185,7 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     # GH200's 128 x 256 tiles' 33 MiB tail reaches (M-NG-29: 14.4% and 11.7% slower held to cuBLAS's).
     tail = balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
     held = None if tail is None else math.prod(tail_workspace(tiles, family, programs, tail)) * 4
-    written = (grid[0] * tile_rows(tiles, family) * grid[1] * tile_columns(tiles, family)
-               * jnp.dtype(dtype).itemsize)
-    if held is None or not within_budget(target, held, written):
+    if held is None or not within_budget(target, held, m * n * stored):
         return None
     return tail
 
@@ -207,9 +206,9 @@ def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
 def within_budget(target: generation.GpuTarget | None, held: float, written: float) -> bool:
     """Whether a launch's `held` bytes beside its operands and outputs (a split's fp32 partials, a balanced
     tail's) are within its scratch budget on `target`: the CUDA libraries' nominal ceiling for one GEMM's
-    workspace (`GpuTarget.reference_workspace`) or the `written` bytes of its output as its launch stores
-    it, whichever is more. Its scratch lives within the launch, so a step's peak grows by no more than an
-    output's (kernel-templates.md §7; peak-memory parity, §1, measured apart). None off a CUDA GPU."""
+    workspace (`GpuTarget.reference_workspace`) or the `written` bytes of its outputs as its launch stores
+    them, whichever is more: a bound on the one buffer, not on a step's peak, whose parity with the
+    reference is measured apart (kernel-templates.md §1, §7). None off a CUDA GPU."""
     bound = None if target is None else target.reference_workspace
     return bound is None or held <= max(bound, written)
 

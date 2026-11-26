@@ -183,7 +183,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         assert k is not None
         itemsizes = (jnp.dtype(tokens.dtype).itemsize, jnp.dtype(rhs.dtype).itemsize)
         return pricing.dense_tail(config, dtype, (m, n, k), itemsizes, target,
-                                  self._tail_programs(ran, config, target), dense=dense)
+                                  self._tail_programs(ran, config, target), stored=_stored_bytes(ran, m, n),
+                                  dense=dense)
 
     def _holds(self, ba, config: tiling.Tiles, registers: int | None, target=None) -> bool:
         """Whether a consumer thread's `registers` hold at `config`, the call as it runs (`_ran`), as its

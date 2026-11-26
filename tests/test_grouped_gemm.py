@@ -1469,7 +1469,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                            interpret=False, dense=True)
         tile_64x256 = tiling.Tiles(64, 256, 32, 4, 16, warpgroups=1, family="mma.sync", programs=2)
         tail_deep = mosaic_gpu._dense_tail(tile_64x256, jnp.bfloat16, (8192, 4096, 28672), (2, 2), 216,
-                                           balanced=True)
+                                           balanced=True, stored=2)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
         # A whole A100's 216 programs' partials (14 MiB) exceed the 4 MiB cuBLAS's workspace is, so no
@@ -1486,7 +1486,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         stated_few = tgmm._stated(ba_few, tile_1w, few)
         tail_few = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (512, 1024, 4096), (2, 2), 40,
-                                          balanced=stated_few["balanced"])
+                                          balanced=stated_few["balanced"], stored=2)
         assert tail_few is stated_few["balanced"] and tail_few is not None
         assert tgmm.balanced(ba_few, tile_1w, few)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
@@ -1519,7 +1519,8 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         # whole waves' drift refuses it, as dense_tail does.
         assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=False, partial_bytes=0)
         assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=True, partial_bytes=0) is None
-        assert pricing.dense_tail(tile_mw, jnp.bfloat16, (320, 128, 128), (2, 2), small_sm80, 4) is None
+        assert pricing.dense_tail(tile_mw, jnp.bfloat16, (320, 128, 128), (2, 2), small_sm80, 4,
+                                  stored=2) is None
         assert_as_exact(native, jax.jit(plain), draw, "sm80 multi-wave nonzero-tail dense dX", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
@@ -1576,7 +1577,8 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
 
     tile = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, cluster=2, family="wgmma")
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=mp, measured={})
-    assert pricing.dense_tail(tile, jnp.bfloat16, (rows, 256, depth), (2, 2), target, mp) is not None
+    assert pricing.dense_tail(tile, jnp.bfloat16, (rows, 256, depth), (2, 2), target, mp,
+                              stored=2) is not None
 
     def draw_fwd(seed):
         rng = np.random.default_rng(seed)
@@ -1610,7 +1612,8 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
             return jnp.dot(x.T.astype(wide), dy.astype(wide), preferred_element_type=wide).astype(out)
 
         with generation.assumed(target):
-            assert pricing.dense_tail(tile, jnp.bfloat16, (768, 256, depth), (2, 2), target, mp) is not None
+            assert pricing.dense_tail(tile, jnp.bfloat16, (768, 256, depth), (2, 2), target, mp,
+                                      stored=2) is not None
             assert_as_exact(dw_native, jax.jit(dw_plain), draw_dw, f"cluster2 tail dw 768x256x{depth}",
                             seeds=SEEDS,
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
@@ -1637,9 +1640,12 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132,
+                                  stored=2) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132,
+                                  stored=2) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132,
+                                  stored=2) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)
