@@ -174,3 +174,58 @@ print(json.dumps({"unstacks": len(digests), "carried": [digest in ahead.starts f
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""}, flags=untuned)
     assert result["unstacks"] >= 2 and all(result["carried"]), result
+
+
+def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_options(tmp_path):
+    """A step compiled ahead is held to the XLA options it compiled under beside its program (the options a
+    run's step compiles under, its scoped `compiled_with` ones among them, a compile's limit aside): a run of
+    the same program handed it, on its own target and tuned (as a GPU host's prepare compiles one; here this
+    CPU's), under an option the ahead compile took none of refuses it before it trains, as its own compile
+    would have sent XLA that option (row 13553: it loaded it, the option dropped)."""
+    import dataclasses
+
+    import jax
+    import pytest
+    from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus
+    from token_support import token_rows
+
+    from dew._records import record
+    from dew.nn.kernels.generation import assumed
+    from dew.nn.kernels.options import compiled_with
+    from dew.training import MeshSpec
+    from dew.training.ahead import AheadOfTime, BuildTarget, NotTheStepCompiledAhead, compile_ahead
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    ahead = compile_ahead(fine_tune(MeshSpec().build(gpus("sm80"))), batch)
+    here = jax.devices()[:1]
+    own = dataclasses.replace(ahead, built=BuildTarget.of(here),
+                              plan={**record(ahead.plan, "plan"), "autotuned": True})
+    own.save(tmp_path / "step.dew-aot")
+    run = fine_tune(MeshSpec().build(here), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
+    with (assumed(own.target), compiled_with({"xla_gpu_enable_command_buffer": ""}),
+          pytest.raises(NotTheStepCompiledAhead)):
+        run.fit(batch, steps=1, log_every=1)
+
+
+def test_a_lowerings_program_is_rendered_once_for_its_key_and_every_fingerprint(monkeypatch):
+    """A lowering's program is rendered once for as long as it lives: its process-local key
+    (`program_key`) and its fingerprints a file of programs holds it by, under any options
+    (`program_digest`), read the one rendering (row 13555: a step handed an executable compiled ahead
+    rendered and hashed its whole program twice as it started)."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels.options import program_digest, program_key
+
+    rendered = []
+    render = jax.stages.Lowered.as_text
+
+    def counted(lowered, *args, **kwargs):
+        rendered.append(lowered)
+        return render(lowered, *args, **kwargs)
+
+    monkeypatch.setattr(jax.stages.Lowered, "as_text", counted)
+    lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
+    program_key(lowered)
+    plain, optioned = program_digest(lowered), program_digest(lowered, {"xla_gpu_enable_command_buffer": ""})
+    assert plain != optioned and len(rendered) == 1

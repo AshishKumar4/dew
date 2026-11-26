@@ -1270,7 +1270,7 @@ class FitSearch[LossT, EffectsT]:
             kept = self.executables.get(looked)
             kept = kept if all(self.gather(kept is not None)) else None
             if ahead is not None:
-                executable, self.ahead = admitted_or_missed(lambda: ahead.taken(candidate.lowered),
+                executable, self.ahead = admitted_or_missed(lambda: ahead.taken(candidate.lowered, options),
                                                             self.refusals), None
             elif candidate.sampled is None and kept is not None:
                 executable, taken = kept, True
@@ -1311,8 +1311,8 @@ class FitSearch[LossT, EffectsT]:
                     with handed(ahead):
                         sampled = candidate.sampled()
                     sampled_ahead = ahead.sampled
-                    loaded = admitted_or_missed(lambda: sampled_ahead.taken(sampled, jax.devices()),
-                                                self.refusals)
+                    loaded = admitted_or_missed(
+                        lambda: sampled_ahead.taken(sampled, jax.devices(), options), self.refusals)
                     self.sampled = None if loaded is None else SampledStep(sampled, loaded)
                 else:
                     # The one compiled beside the step's, but where the step was lowered afresh past a spill,
