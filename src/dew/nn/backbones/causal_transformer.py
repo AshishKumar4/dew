@@ -1457,7 +1457,7 @@ class CausalTransformer(LinearProducts):
                 and self.is_mutable_collection('prediction_inputs')):
             # A Markov block drafter's last tap (`decoder_drafts.draft_context`).
             self.sow('prediction_inputs', decoder_drafts.FINAL_STATES, normed,
-                     reduce_fn=lambda _, value: value, init_fn=lambda: None)
+                     reduce_fn=lambda _, value: value, init_fn=lambda: normed)
         hidden = self.head_states(normed)
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams

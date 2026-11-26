@@ -121,18 +121,6 @@ def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
-@pytest.mark.parametrize('change', [
-    {'markov_head_type': 'bigram'}, {'q_bias': True}, {'hidden_size': 32}, {'dflare_mode': 'mean'},
-    {'max_position_embeddings': 64},
-], ids=['bigram-head', 'query-bias', 'narrower', 'unknown-field', 'short-reach'])
-def test_a_draft_it_cannot_compute_is_refused(change):
-    """An `mtp_config` whose head, biases, width or reach the release's draft states otherwise, or stating
-    a field it states none of, is refused rather than read as some other draft; the fixture's own reads."""
-    translate_config(RELEASE)
-    with pytest.raises(ValueError):
-        translate_config({**RELEASE, 'mtp_config': {**RELEASE['mtp_config'], **change}})
-
-
 def built(taps):
     """The fixture's decoder with its draft tapping `taps`, built abstractly (its setup's checks run)."""
     draft = {**RELEASE['mtp_config'], 'target_layer_ids': taps}

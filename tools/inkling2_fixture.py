@@ -473,15 +473,9 @@ def write_draft_recording() -> None:
     from recorded_references import provenance, record_case, save
     from safetensors.torch import load_file
 
-    from _dew_torch.precision import float64, float64_twin
+    from _dew_torch.precision import float64
 
-    configuration, modeling = _modeling()
-    config = configuration.Inkling2LoopTextConfig(**TEXT)
-    model = modeling.Inkling2LoopForCausalLM.from_pretrained(
-        TINY, config=config, dtype=torch.float32, attn_implementation='eager').eval()
-    model.config._experts_implementation = 'eager'
-    wide = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
-    wide.config._experts_implementation = 'eager'
+    model, wide = text_pair(TINY)
     stored = load_file(TINY / 'mtp.safetensors')
     visits = DRAFT['target_layer_ids'][:-1]
 
@@ -517,12 +511,9 @@ def draw(seed: int) -> dict[str, np.ndarray]:
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
 
 
-def write_recording(directory: Path) -> None:
+def text_pair(directory: Path):
     """The fixture at `directory` as transformers reads it, its experts dequantized where stored quantized,
-    fp32 on eager attention, and its float64 twin, recorded over check 1's seeds, whole and stepped."""
-    import transformers
-    from recorded_references import record_logits
-
+    fp32 on eager attention, and its float64 twin."""
     from _dew_torch.precision import float64_twin
 
     configuration, modeling = _modeling()
@@ -534,6 +525,15 @@ def write_recording(directory: Path) -> None:
     model.config._experts_implementation = 'eager'
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
     truth.config._experts_implementation = 'eager'
+    return model, truth
+
+
+def write_recording(directory: Path) -> None:
+    """The fixture at `directory` (`text_pair`) recorded over check 1's seeds, whole and stepped."""
+    import transformers
+    from recorded_references import record_logits
+
+    model, truth = text_pair(directory)
     flag = ' --quantized' if directory == QUANTIZED else ''
     command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py'
                f'{flag} --recording')

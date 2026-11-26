@@ -30,6 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import prefix_sum
+from dew.nn.activations import logistic, silu
 from dew.nn.attention import reference_attention
 from dew.nn.dense import Dense
 from dew.nn.kv_cache import (
@@ -128,13 +129,13 @@ def fused_taps(taps, weights, norm: nn.Module):
 
 class Context(NamedTuple):
     """A draft layer's context: its keys and values `[B, M, kv_heads, head_dim]`, each slot's place and
-    whether it holds a token `[B, M]`, and each row's count of context tokens `[B]`, the anchor's place."""
+    whether it holds a token `[B, M]`, and each row's anchor's place `[B]`, its count of context tokens."""
 
     keys: jax.Array
     values: jax.Array
     places: jax.Array
     real: jax.Array
-    count: jax.Array
+    anchor: jax.Array
 
 
 class ContextStore(nn.Module):
@@ -147,23 +148,24 @@ class ContextStore(nn.Module):
     head_dim: int
 
     @nn.nowrap
-    def spec(self, rows: int, dtype: Dtype) -> KVSpec:
+    def spec(self, rows: int, dtype: jnp.dtype) -> KVSpec:
         return KVSpec(self.kv_cache, rows, self.capacity, self.kv_heads, self.head_dim, dtype)
 
     @nn.nowrap
-    def cache_spec(self, rows: int, dtype: Dtype) -> CacheSpec:
+    def cache_spec(self, rows: int, dtype: jnp.dtype) -> CacheSpec:
         """The store for `rows` rows of `dtype`, with its cursor."""
         return {**self.spec(rows, dtype).leaves(), **cursor(rows)}
 
     @nn.compact
-    def __call__(self, mixed, valid, rows: int, dtype: Dtype, project: Callable) -> Context:
+    def __call__(self, mixed, valid, rows: int, dtype: jnp.dtype, project: Callable) -> Context:
         """The context of `rows` rows (of `dtype`, the drafter's) after writing `mixed`'s real tokens
         (`valid`, every one where None) after those the store holds, each projected at its count
         (`project(mixed, places)`, its keys and values); `mixed` None writes none."""
         store = KVStore.open(self, self.spec(rows, dtype))
         if mixed is not None:
             slots = cache_positions(self, rows, mixed.shape[1], valid)
-            store.write(*project(mixed, jnp.maximum(slots, 0)), slots)
+            keys, values = project(mixed, jnp.maximum(slots, 0))
+            store.write(keys, values, slots)
         else:
             cache_variables(self, cursor(rows))
         keys, values = store.read()
@@ -179,11 +181,11 @@ class Carried(nn.Module):
     features: int
 
     @nn.nowrap
-    def cache_spec(self, rows: int, dtype: Dtype) -> CacheSpec:
+    def cache_spec(self, rows: int, dtype: jnp.dtype) -> CacheSpec:
         return {CARRIED: Opened((rows, self.features), dtype)}
 
     @nn.compact
-    def __call__(self, fresh, real, rows: int, dtype: Dtype) -> jax.Array:
+    def __call__(self, fresh, real, rows: int, dtype: jnp.dtype) -> jax.Array:
         """The carried taps (of `dtype`, the drafter's) after writing `fresh` `[B, D]` where `real` `[B]`
         holds (a row with no real token keeps what it carried); `fresh` None writes none."""
         held = cache_variables(self, self.cache_spec(rows, dtype))[CARRIED]
@@ -233,7 +235,7 @@ class DraftAttention(nn.Module):
         keys = self._rotated(self.k_norm_ctx(self._heads(self.k_proj_ctx(mixed), heads)), places)
         return keys, self._heads(self.v_proj_ctx(mixed), heads)
 
-    def held(self, mixed, valid, rows: int, dtype: Dtype) -> Context:
+    def held(self, mixed, valid, rows: int, dtype: jnp.dtype) -> Context:
         """The cached context of `rows` rows of `dtype` after writing `mixed`'s real tokens (`valid`, every
         one where None) after those the store holds, each at its count (`ContextStore`); `mixed` None writes
         none."""
@@ -252,7 +254,7 @@ class DraftAttention(nn.Module):
         """The block `x` `[B, K, D]` at the places after `context`'s, read both ways beside it."""
         spec = self.spec
         rows, length = x.shape[:2]
-        anchor = context.count[:, None]
+        anchor = context.anchor[:, None]
         places = anchor + jnp.arange(length)[None]
         query = self._rotated(self.q_norm(self._heads(self.q_proj(x), spec.num_heads)), places)
         keys = self._rotated(self.k_norm(self._heads(self.k_proj(x), spec.num_kv_heads)), places)
@@ -271,7 +273,7 @@ class DraftAttention(nn.Module):
 
 class DraftMLP(nn.Module):
     """A draft layer's gated MLP: `down(silu(gate(x)) * up(x))`, its product in at least fp32 rounded once
-    (vLLM's `silu_and_mul`, its sigmoid `gate / (1 + exp(-gate))`)."""
+    (vLLM's `silu_and_mul`), through Dew's one logistic (`silu`)."""
 
     features: int
     emb_features: int
@@ -286,8 +288,7 @@ class DraftMLP(nn.Module):
     def __call__(self, x):
         gate, up = self.gate_proj(x), self.up_proj(x)
         wide = at_least_fp32(gate.dtype)
-        gated = gate.astype(wide) / (1.0 + jnp.exp(-gate.astype(wide)))
-        return self.down_proj((gated * up.astype(wide)).astype(gate.dtype))
+        return self.down_proj((silu(gate.astype(wide)) * up.astype(wide)).astype(gate.dtype))
 
 
 class DraftLayer(nn.Module):
@@ -365,7 +366,7 @@ class MarkovHead(nn.Module):
         embedded = jnp.take(self.markov_w1, previous, axis=0).astype(narrow)
         raw = context + self.rnn_step(jnp.concatenate([state, embedded], axis=-1))
         gate, candidate, out = jnp.split(rounded(raw), 3, axis=-1)
-        gate, candidate = rounded(jax.nn.sigmoid(gate)), rounded(jnp.tanh(candidate))
+        gate, candidate = rounded(logistic(gate)), rounded(jnp.tanh(candidate))
         kept_state = rounded(gate * state.astype(wide))
         update = rounded(rounded(1.0 - gate) * candidate)
         return (kept_state + update).astype(narrow), self.hidden_out(jnp.tanh(out).astype(narrow))

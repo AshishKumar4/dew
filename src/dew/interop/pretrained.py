@@ -1830,28 +1830,6 @@ def _with_folder_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[s
     return held
 
 
-def _with_sidecar_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
-                          source: sources.SourceReference, root: Path, *, weights: bool
-                          ) -> Mapping[str, unread.Stored]:
-    """`tensors` with each file its family keeps more of its tensors in beside them (`DecoderFamily.sidecars`)
-    that the source holds, each tensor under the file's prefix, read whole or by its header alone without its
-    weights."""
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str) or model_type not in decoders.families():
-        return tensors
-    held = None
-    for filename, prefix in decoders.family_entry(model_type).sidecars(config).items():
-        if weights:
-            path = source.optional_file(root, filename)
-            stored = None if path is None else sources.tensor_file(path)
-        else:
-            stored = source.stored_file(root, filename, optional=True)
-        if stored is not None:
-            held = dict(tensors) if held is None else held
-            held.update({prefix + name: tensor for name, tensor in stored.items()})
-    return tensors if held is None else held
-
-
 def _folder_part(tensors: Mapping[str, np.ndarray], prefix: str) -> Mapping[str, np.ndarray]:
     """The tensors named under `prefix`, the prefix off, each built as `tensors` builds it; the empty
     prefix with no folder's name (`_folders`) keeps the rest, the root's."""
@@ -2472,7 +2450,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    tensors = _with_sidecar_tensors(tensors, config, configured, root, weights=weights)
+    tensors = sources.with_sidecars(tensors, decoders.sidecars(config), configured, root, weights=weights)
     if language is None and (isinstance(route, WrapperRoute) or decoders.bundles(config)):
         # A bundle's folders' tensors, read whole or, its language model alone, retained by name.
         tensors = _with_folder_tensors(tensors, config, configured, root, weights=weights)
