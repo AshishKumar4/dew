@@ -26,7 +26,7 @@ class _Fragment(ast.NodeTransformer):
         return ast.Name(id=slot, ctx=ast.Load())
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        if node.id not in self.scope:
+        if node.id == "_" or node.id not in self.scope:
             return node
         if isinstance(node.ctx, ast.Store):
             self.bound[node.id] = f"v{len(self.bound)}"
@@ -35,7 +35,7 @@ class _Fragment(ast.NodeTransformer):
         return self._input(node.id)
 
     def visit_keyword(self, node: ast.keyword) -> ast.AST:
-        if node.arg in ("shape", "broadcast_dimensions") and _extent(node.value, self.bound):
+        if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):
             return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
         return self.generic_visit(node)
 
@@ -71,9 +71,13 @@ class _Copy:
     written: tuple[str, ...]
 
 
-def _assigns(node: ast.stmt) -> bool:
-    return (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "bind")
+def _assigns(node: ast.stmt, fragments: set[str]) -> bool:
+    if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value.func
+    return (isinstance(call, ast.Name) and call.id in fragments
+            or isinstance(call, ast.Attribute) and (call.attr == "bind"
+                or (call.attr == "array" and isinstance(call.value, ast.Name) and call.value.id == "np")))
 
 
 def _copy(name: str, first: int, nodes: list[ast.stmt], scope: set[str]) -> _Copy:
@@ -109,11 +113,12 @@ def _bodies(source: dict[str, str]) -> dict[str, _Body]:
     return bodies
 
 
-def _largest(bodies: dict[str, _Body]) -> tuple[_Copy, ...]:
-    """Find the shared region which saves the most source; only original primitive binds are eligible."""
+def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]:
+    """Find the shared region which saves the most source, including earlier emitted fragments."""
     candidates = []
     for name, body in bodies.items():
-        runs = itertools.groupby(enumerate(map(_assigns, body.statements)), key=lambda pair: pair[1])
+        eligible = (_assigns(node, fragments) for node in body.statements)
+        runs = itertools.groupby(enumerate(eligible), key=lambda pair: pair[1])
         for accepted, group in runs:
             if accepted:
                 indices = [index for index, _ in group]
@@ -154,9 +159,10 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
     forms = dict(source)
     occupied = set(source).union(reserved)
     numbers = itertools.count()
+    fragments: set[str] = set()
     while True:
         bodies = _bodies(forms)
-        copies = _largest(bodies)
+        copies = _largest(bodies, fragments)
         if not copies:
             return forms
         first = copies[0]
@@ -167,6 +173,7 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
         while (name := f"_shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
+        fragments.add(name)
         fragment_lines = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
         fragment_lines += [line for statement in first.statements for line in statement.printed()]
         if kept:

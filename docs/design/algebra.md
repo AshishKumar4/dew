@@ -1410,7 +1410,8 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
-primitive sequences share a generated helper, with shapes and broadcast axes passed as static arguments.
+sequences of primitive binds, literal construction and emitted calls share a generated helper, with
+shape and axis arguments bound statically.
 Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
 to the component's program.
 
