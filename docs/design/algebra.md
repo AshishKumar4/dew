@@ -1495,6 +1495,8 @@ quotient's residual carried, and landed once. The mean is held to the hull of th
 that anchor read off the same ratio's sum at the joined anchor, as it would land there (one sum: a sequential
 rounded one lost masses the ratio keeps and landed it past the format), a walk's own finish `o = acc / l` and a
 resumed state's `acc = o l` ratios of one state each.
+An empty walk has a nonfinite anchor; its stored total, output and all derivative directions are ignored.
+A finite anchor with zero weight still has its own derivative along that weight.
 
 **The law's domain.** A merge's mass at its joined anchor lies within the format at that anchor's resolution:
 where the masses' sum passes the format's largest, the anchor moves to land it (`_landing`), and an anchor's
