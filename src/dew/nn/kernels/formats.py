@@ -471,6 +471,7 @@ class TernaryWeights:
                 safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
                 absmean = peak * jnp.mean(abs_w / safe_peak, axis=(-2, -1), keepdims=(source.ndim == 3))
                 scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
+                cls._scale_admitted(scale_arr)  # a nonfinite weight's NaN or infinite absmean
         else:
             # A given scale checked as given, before JAX stages it (a closed-over host value under `jit`).
             cls._scale_admitted(scale)
@@ -488,20 +489,30 @@ class TernaryWeights:
     def _scale_admitted(scale) -> None:
         """Refuse an fp32 `scale` holding an entry neither zero nor a finite normal (a subnormal, an
         infinity, a NaN), read on the host: its products then normal wherever their values are, as a
-        process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). A traced scale is
-        checked where it is concrete; one spanning processes where every rank agrees on its refusal (a
-        restore's `checkpoints._packed_checked`), none raising alone."""
-        if isinstance(scale, Tracer) or (isinstance(scale, jax.Array) and not scale.is_fully_addressable):
+        process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). Each rank reads its own
+        shards; a scale spanning processes is refused on every rank where one refuses it (`agreed`: each
+        rank holds it, so each calls this), none raising alone. A traced scale is checked where concrete."""
+        if isinstance(scale, Tracer):
             return
+        spans = isinstance(scale, jax.Array) and not scale.is_fully_addressable
         pieces = ([shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array)
                   else [scale])
-        for piece in pieces:
-            held = np.abs(np.asarray(piece, np.float32))
-            refused = ~((held == 0) | (np.isfinite(held) & (held >= np.finfo(np.float32).tiny)))
-            if refused.any():
-                raise ValueError(f"TernaryWeights scale {held[refused].flat[0]!r} is neither zero nor a "
-                                 "finite normal fp32 (row 13340): serve these weights unpacked, or pack them "
-                                 "at a normal scale (`TernaryWeights.of`)")
+
+        def scanned() -> None:
+            for piece in pieces:
+                held = np.abs(np.asarray(piece, np.float32))
+                refused = ~((held == 0) | (np.isfinite(held) & (held >= np.finfo(np.float32).tiny)))
+                if refused.any():
+                    raise ValueError(f"TernaryWeights scale {held[refused].flat[0]!r} is neither zero nor a "
+                                     "finite normal fp32 (row 13340): serve these weights unpacked, or pack "
+                                     "them at a normal scale (`TernaryWeights.of`)")
+
+        if spans:
+            from dew._coordination import agreed
+
+            agreed("ternary scale", scanned)
+        else:
+            scanned()
 
     @property
     def dtype(self) -> jnp.dtype:

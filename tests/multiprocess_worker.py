@@ -861,6 +861,34 @@ def mode_fp8_sites(args) -> dict:
     return {"unsupported": unsupported, "missing": missing, "after": after}
 
 
+def mode_ternary_scale(args) -> dict:
+    """A packed ternary matrix whose per-column scale spans both processes (each its half of the columns)
+    and holds a subnormal on process 1's half alone: each rank's `checked` outcome (the error's type), and
+    every process then passes one more agreement, which a rank left refusing alone would block (row 13340)."""
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew import _coordination
+    from dew.nn.kernels.formats import TernaryWeights
+
+    width = jax.device_count()  # a column a device, the last process's devices last
+    weights = np.zeros((256, width), np.float32)
+    weights[0] = 1.0
+    packed = TernaryWeights.of(weights, scale=np.ones(width, np.float32))
+    mesh = Mesh(np.asarray(jax.devices()), ("columns",))
+    host = np.ones(width, np.float32)
+    host[-1] = 2.0 ** -130
+    scale = jax.make_array_from_callback((width,), NamedSharding(mesh, PartitionSpec("columns")),
+                                         lambda index: host[index])
+    try:
+        TernaryWeights(packed.words, scale, packed.form).checked()
+        outcome = "admitted"
+    except (ValueError, _coordination.PeerFailure) as error:
+        outcome = type(error).__name__
+    after = _coordination.agreed("after the scale check", lambda: True)
+    return {"outcome": outcome, "after": after}
+
+
 def mode_profile_failure(args) -> dict:
     """A scheduled profile window whose directory is a file on rank 0 only.
 
@@ -2417,7 +2445,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "local_made": mode_local_made, "local_made_lost": functools.partial(mode_local_made, lost=True),
-         "fp8_sites": mode_fp8_sites}
+         "fp8_sites": mode_fp8_sites, "ternary_scale": mode_ternary_scale}
 
 
 def parse_args(argv=None):

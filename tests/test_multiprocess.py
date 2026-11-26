@@ -1877,6 +1877,16 @@ def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_ternary_scale_spanning_processes_is_refused_on_every_rank_where_one_holds_a_subnormal(tmp_path):
+    """A packed ternary matrix's per-column scale sharded over both processes, a subnormal on process 1's
+    columns alone: process 1 refuses it and process 0 hears of it (`PeerFailure`), neither admitting it nor
+    left at its next collective (row 13340's review)."""
+    reports = run_pool("ternary_scale", tmp_path / "pool", 2, timeout=180)
+    assert [report["outcome"] for report in reports] == ["PeerFailure", "ValueError"]
+    assert [report["after"] for report in reports] == [True, True]
+
+
+@pytest.mark.distributed
 def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
     """The frozen FP8 sites decide which kernels a rank's train state holds
     packed, so process 0 decides them for the pool: on CPUs it refuses for
