@@ -319,24 +319,37 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
     return streams
 
 
-def row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
+class Padding(Protocol):
+    """A tokenizer's padding as transformers' `PreTrainedTokenizerBase` states it."""
+
+    @property
+    def pad_token_id(self) -> int | None: ...
+
+    @property
+    def padding_side(self) -> str: ...
+
+
+def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
     """Return the id and the side to pad text rows with, at the boundary a host
     processor draws: it delegates text to the tokenizer it wraps, a tokenizer
-    is its own, and either may state neither field, so both names are read off
-    the object here and narrowed once for the rows.
-    """
-    tokenizer = getattr(reference, "tokenizer", reference)
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    side = getattr(tokenizer, "padding_side", "right")
+    is its own (`tokenizer_padding`)."""
+    return tokenizer_padding(getattr(reference, "tokenizer", reference))
+
+
+def tokenizer_padding(tokenizer: Padding) -> tuple[int, Literal["left", "right"]]:
+    """The id and the side a tokenizer pads text rows with, narrowed once for the rows: its pad id 0 where
+    it states none, its side refused unless left or right."""
+    side = tokenizer.padding_side
     if side not in ("left", "right"):
         raise ValueError("the tokenizer padding_side must be left or right")
+    pad_id = tokenizer.pad_token_id
     return (0 if pad_id is None else _records.integer(pad_id, "pad_token_id"),
             "left" if side == "left" else "right")
 
 
 def _row_start(reference: HostProcessor) -> int | None:
     """Return the id the tokenizer starts a sequence with, or None, read at the
-    boundary `row_padding` reads its padding at: off the tokenizer a
+    boundary `_row_padding` reads its padding at: off the tokenizer a
     processor wraps, or the tokenizer itself."""
     tokenizer = getattr(reference, "tokenizer", reference)
     bos = getattr(tokenizer, "bos_token_id", None)
@@ -481,7 +494,7 @@ class Processor:
                 grids.append(grid)
         if not per_row and given:
             raise ValueError(f"{len(given)} images are left over the rows' placeholders")
-        pad_id, side = row_padding(self.reference)
+        pad_id, side = _row_padding(self.reference)
         padded, fields = pad_token_rows(tokens, pad_id=pad_id, padding_side=side)
         if pixels:
             fields = {**fields, "pixel_values": np.concatenate(pixels),
@@ -503,7 +516,7 @@ class Processor:
         if images is None and audio is None and videos is None:
             rows = [text] if isinstance(text, str) else list(text)
             values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
-            pad_id, side = row_padding(self.reference)
+            pad_id, side = _row_padding(self.reference)
             ids = values["input_ids"]
             ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
             fields = {name: value if isinstance(value, Sequence) else np.asarray(value)

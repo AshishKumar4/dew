@@ -226,7 +226,7 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
     rgba = np.zeros((16, 24, 4), np.uint8)
     rgba[4:12, 8:16] = (200, 30, 90, 255)
     transparent = tmp_path / 'transparent.png'
-    Image.fromarray(rgba, 'RGBA').save(transparent)
+    Image.fromarray(rgba).save(transparent)
     turned = tmp_path / 'turned.jpg'
     exif = Image.Exif()
     exif[0x0112] = 6  # Orientation: the stored image turned a quarter, read upright.
@@ -250,11 +250,12 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
                                               err_msg=f'{stored.name} {name} {field}')
     # A data URI longer than a path may be (an image of 64x64 noise, its PNG past 4 KiB).
     large = tmp_path / 'large.png'
-    Image.fromarray(np.random.default_rng(13342).integers(0, 256, (64, 64, 4), np.uint8), 'RGBA').save(large)
+    Image.fromarray(np.random.default_rng(13342).integers(0, 256, (64, 64, 4), np.uint8)).save(large)
     inline = f'data:image/png;base64,{base64.b64encode(large.read_bytes()).decode()}'
     assert len(inline) > 4096
+    path_read = read(large)
     for field, value in read(inline).items():
-        np.testing.assert_array_equal(value, read(large)[field], err_msg=f'large data URI {field}')
+        np.testing.assert_array_equal(value, path_read[field], err_msg=f'large data URI {field}')
     blacked = read(rgba[..., :3])
     assert any(not np.array_equal(blacked[field], value) for field, value in read(transparent).items())
     upright = read(np.asarray(Image.open(turned).transpose(Image.Transpose.ROTATE_270)))
