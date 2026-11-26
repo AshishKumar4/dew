@@ -173,7 +173,7 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
             parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
             split = parts[0] + parts[1] + parts[2]
             finite = jnp.all(jnp.abs(split) < jnp.inf)
-            d_a = jax.lax.cond(finite, lambda: split, lambda: factor(lhs, scaled, wide, kept, a))
+            d_a = jax.lax.cond(finite, lambda: split, lambda: factor(lhs, scaled, wide, kept, a, summed=wide))
         else:
             d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:
