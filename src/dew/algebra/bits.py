@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
-from dew.nn.float_bits import raised_exactly
+from dew.nn.float_bits import raised_exactly, raw_fields
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
@@ -991,7 +991,9 @@ def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
     quotient = correctly_rounded_divide if quotient is None else quotient
     least_normal = np.float32(np.finfo(np.float32).tiny)
     over = quotient(largest, np.float32(E2M1_MAX * E4M3_MAX))
-    return jnp.where(largest > 0, jnp.maximum(over, least_normal), np.float32(1))
+    held, _, _, _ = raw_fields(largest)
+    positive = (held != 0) & (held <= np.asarray(np.inf, largest.dtype).view(held.dtype))
+    return jnp.where(positive, jnp.maximum(over, least_normal), np.float32(1))
 
 
 def nvfp4_given_scale(tensor) -> jax.Array:
@@ -1028,10 +1030,16 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
             return correctly_rounded_divide(numerator, denominator)
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
-    magnitude = jnp.abs(x)
-    tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
-              else nvfp4_given_scale(tensor))
-    blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    # Unsigned IEEE magnitudes are ordered as integers, including subnormals on an FTZ backend.
+    words, sign, _, _ = raw_fields(x)
+    magnitude = words ^ sign
+    if tensor is None:
+        largest = jax.lax.bitcast_convert_type(jnp.max(magnitude), x.dtype)
+        tensor = nvfp4_tensor_scale(largest, quotient)
+    else:
+        tensor = nvfp4_given_scale(tensor)
+    block_words = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
+    blocks = jax.lax.bitcast_convert_type(block_words, x.dtype)
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 

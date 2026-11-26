@@ -578,6 +578,18 @@ def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
         assert np.all(np.sign(values) == np.sign(x))
 
 
+def test_nvfp4_does_not_classify_a_subnormal_tile_as_zero():
+    x = np.zeros((16, 2), np.float32)
+    x[:2, 0] = [2.0 ** -130, -(2.0 ** -132)]
+    codes, scales, tensor = jax.jit(bits.nvfp4_coded)(x)
+    # 2^-130 / 2^-126 / 6 = 1/96, whose e4m3 ceiling is 6/512; the other block is empty.
+    expected = np.zeros_like(x, dtype=np.uint32)
+    expected[:2, 0] = [7, 11]  # e2m1's +6 and -1.5
+    np.testing.assert_array_equal(codes, expected)
+    np.testing.assert_array_equal(np.asarray(scales).view(np.uint8), [[6, 0]])
+    np.testing.assert_array_equal(tensor, np.float32(2.0 ** -126))
+
+
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
     """A truth table over one value and the immediate (`BitOp.LOGIC` with one operand) runs as PTX writes it
     and the synthesizer proves it, `lop3.b32 d, a, imm, imm`, under every table (row 4647): each result
