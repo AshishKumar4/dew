@@ -864,7 +864,8 @@ def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     it, and the loss would be scaled for a compute the model may not run."""
     stated = stated_compute(objective)
     compute = jnp.dtype(numerics.dtypes.compute).name
-    if stated is None or (other := [dtype for dtype in stated if dtype != compute]):
+    other = [] if stated is None else [dtype for dtype in stated if dtype != compute]
+    if stated is None or other:
         computes = "infers its compute dtype" if stated is None else f"computes in {' and '.join(other)}"
         raise ValueError(f"the model {computes} and the run's numerics name {compute}: build it with "
                          f"dtype={compute}, or name its dtype in the numerics (Dtypes.compute)")
