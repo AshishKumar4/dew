@@ -162,6 +162,23 @@ def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
+def test_a_draft_layer_norms_its_stream_before_rounding_it():
+    """A draft layer's add and norm (`added_norm`, FlashInfer's `fused_add_rmsnorm`, as vLLM's draft runs
+    it) norms the stream's sum before it rounds: a bf16 stream `[1, 1]` plus `[2^-8, -2^-9]` rounds to `[1,
+    1]`, whose norm is `[1, 1]`, where the unrounded sum's second part normalizes below one by more than a
+    bf16 step's half."""
+    from dew.nn.block_draft import added_norm
+    from dew.nn.norms import RMSNorm
+
+    norm = RMSNorm(epsilon=1e-6, dtype=jnp.bfloat16)
+    residual = jnp.ones((1, 2), jnp.bfloat16)
+    x = jnp.asarray([[2.0 ** -8, -2.0 ** -9]], jnp.bfloat16)
+    params = norm.init(jax.random.key(0), residual)
+    stream, normed = norm.apply(params, x, method=lambda module, x: added_norm(module, x, residual))
+    np.testing.assert_array_equal(np.asarray(stream, np.float32), [[1.0, 1.0]])
+    assert float(normed[0, 1]) == 1.0 - 2.0 ** -8 and float(normed[0, 0]) == 1.0, normed
+
+
 def built(taps):
     """The fixture's decoder with its draft tapping `taps`, built abstractly (its setup's checks run)."""
     draft = {**RELEASE['mtp_config'], 'target_layer_ids': taps}
