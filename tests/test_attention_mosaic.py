@@ -1789,7 +1789,7 @@ def test_a_block_mask_prefill_over_fp8_keys_and_values_is_on_par_interpreted():
         query = jax.random.normal(streams[0], (1, tokens, heads, width), jnp.bfloat16)
         key, value = (jax.random.normal(stream, (1, tokens, kv_heads, width), jnp.bfloat16)
                       for stream in streams[1:])
-        return query, *quantize(key, jnp.float8_e4m3fn), *quantize(value, jnp.float8_e4m3fn)
+        return query, *quantize(key, "float8_e4m3fn"), *quantize(value, "float8_e4m3fn")
 
     def ours(query, k_codes, k_scale, v_codes, v_scale):
         scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
