@@ -893,6 +893,31 @@ def test_a_dry_prepares_records_publish_within_its_budget_a_stalled_baseline_lea
     assert not [key for key in stored if "-main/" in key]
 
 
+def test_a_dry_prepares_red_row_revokes_its_green_epoch_past_its_publication_budget(
+        ci, monkeypatch, tmp_path, cache_worker):
+    """A dry prepare's red row begins its row's next epoch however late (row 13014's review): its publication
+    budget (`publish_by`) spent, the green run recorded before it stands no more."""
+    import time
+
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    (tmp_path / "tests/test_gpu_a.py").write_text("def test_a():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    commit(tmp_path, "the commit")
+    out = tmp_path / "rows.json"
+    variant = ci.prepares.variant("sm90", users=False)
+
+    def run(code: int, publish_by: float | None) -> str | None:
+        ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "off", 5.0, "common", {}, variant=variant,
+                  publish_by=publish_by,
+                  judged=lambda rows: [{**each, "exitCode": code, "unprepared": ["a @ x"]} for each in rows])
+        [row] = json.loads(out.read_text())["rows"]
+        return ci.run_keys.epoch("3.12", row["name"], ci.run_keys.device_class(False), "common", "token")[0]
+    green = run(0, None)
+    red = run(1, time.monotonic() - 1.0)
+    assert green is not None and red is not None and red != green
+
+
 @pytest.mark.parametrize(("exit_code", "taken"), [(0, True), (1, True), (0, False)])
 def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci, monkeypatch, tmp_path,
                                                                           cache_worker, exit_code, taken):

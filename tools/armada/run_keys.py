@@ -402,8 +402,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
     (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's). A green
     row is written only within the epoch it began in (`began_in`, `epochs_of`): one a red run rotated while
-    it ran is an older verdict, and is kept nowhere (row 12180). Every read and write within `until` where
-    one is given (a dry prepare's task's shared budget, row 13014), a write past it not made. Returns the
+    it ran is an older verdict, and is kept nowhere (row 12180). Every green row's read and write within
+    `until` where one is given (a dry prepare's task's shared budget, row 13014), a write past it not made; a
+    red row's epoch revoked whatever the time. Returns the
     green rows whose baseline the store did not take (`baselined`), which stand stale (`unbaselined`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
@@ -456,13 +457,15 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # A red run begins the row's next epoch first, so every green run recorded before it stands no
         # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
         # neither was read or written.
+        # A red run's revocation is never cut off by `until`: a red not rotating its row's epoch would leave
+        # an earlier green standing, reused as if no red had run.
+        bound = until if row_["exitCode"] == 0 else None
         try:
-            current, tag = epoch(python, row_["name"], held, common, token, until)
+            current, tag = epoch(python, row_["name"], held, common, token, bound)
         except Unread:
             current, tag = UNREAD, None
         if row_["exitCode"] != 0:
-            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag,
-                                          until=until) == UNREAD:
+            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag) == UNREAD:
                 continue
             current = None
         elif began_in is not None and (began_in.get(row_["name"], UNREAD) == UNREAD
