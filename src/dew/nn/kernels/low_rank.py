@@ -164,16 +164,23 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
             # product of three times the rank's columns, every product exact and each block's fp32 sum
             # added: the fp32 operands' product the narrow arithmetic computes in one pass of the rows
             # (row 1304's review: `scaled` rounded once lost a cancellation the fp32 sum keeps).
-            # Each block's sum fp32 until they are combined; a split's term or product past fp32's range
-            # (a scaled cotangent near its largest) is the wide product's to form, its result finite
-            # wherever that product's is.
-            blocks = factor(lhs, jnp.concatenate(_bf16_terms(scaled), axis=-1), work, precision, a,
-                            summed=wide)
-            width = scaled.shape[-1]
-            parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
-            split = parts[0] + parts[1] + parts[2]
-            finite = jnp.all(jnp.abs(split) < jnp.inf)
-            d_a = jax.lax.cond(finite, lambda: split, lambda: factor(lhs, scaled, wide, kept, a, summed=wide))
+            # Each block's sum fp32 until they are combined. The split is taken where it is `scaled` whole
+            # (its terms' sum `scaled` again: no term past bf16's range or below its least subnormal) and
+            # its products finite; else the wide product, the same value wherever no product underflows.
+            terms = _bf16_terms(scaled)
+            exact = jnp.all(sum(term.astype(wide) for term in terms) == scaled)
+
+            def split():
+                blocks = factor(lhs, jnp.concatenate(terms, axis=-1), work, precision, a, summed=wide)
+                width = scaled.shape[-1]
+                parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
+                return parts[0] + parts[1] + parts[2]
+
+            def whole():
+                return factor(lhs, scaled, wide, kept, a, summed=wide)
+
+            d_a = jax.lax.cond(exact, split, whole)
+            d_a = jax.lax.cond(jnp.all(jnp.abs(d_a) < jnp.inf), lambda: d_a, whole)
         else:
             d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:

@@ -64,6 +64,14 @@ def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
     return make()
 
 
+def packed_ternary(module: nn.Module, name: str = "kernel") -> bool:
+    """Whether `module`'s matrix `name` is a packed BitNet b1.58 matrix (`packed_matrix`'s, row 1464): its
+    layer quantizes its input a token at a time, so no matrix alone is its product, whatever its `params`
+    hold (`quantization.LinearProducts.nonlinear_input`, `decoder_head.output_table`)."""
+    return module.has_variable(QUANTIZATION, name) and isinstance(module.get_variable(QUANTIZATION, name),
+                                                                   TernaryWeights)
+
+
 def watched_or_owned(module: nn.Module) -> bool:
     """Whether `module`'s calls must run as Flax and a wrapper see them, no rule of Dew's standing in for its
     computation (`dew.nn.derivatives.portable_formed`, which differentiates a function of arrays apart from

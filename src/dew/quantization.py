@@ -75,7 +75,7 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix
+from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix, packed_ternary
 from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
@@ -396,11 +396,7 @@ class LinearProducts(nn.Module):
         quantization, read where `input_scales`, and frozen FP8 products, `dew.lora`'s dropout on a
         training forward). A packed BitNet b1.58 kernel's layer quantizes its input a token at a time, always
         (`dense.Dense._packed`, row 1464)."""
-        from dew.nn.kernels.formats import TernaryWeights
-
-        module = getattr(self, name)
-        if module.has_variable(QUANTIZATION, "kernel") and isinstance(
-                module.get_variable(QUANTIZATION, "kernel"), TernaryWeights):
+        if packed_ternary(getattr(self, name)):
             return True
         return qwix and quantized_products(self, name).inputs
 

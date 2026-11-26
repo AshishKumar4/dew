@@ -1679,33 +1679,35 @@ def test_a_bf16_adapted_products_factor_gradient_keeps_a_cancellation_of_its_wid
 
 
 
-@pytest.mark.parametrize(("x_value", "a_dtype"), [(0.25, jnp.bfloat16), (2.0 ** 64, jnp.float32)],
-                         ids=["scale near fp32's largest", "high term's product past fp32's largest"])
-def test_a_bf16_adapted_products_factor_gradient_stays_finite_where_the_wide_product_is(x_value, a_dtype):
-    """A bf16 adapted product's rank factor gradient at fp32's range edges: a scale near fp32's largest
-    (`scaled` rounding to bf16's infinity) and a cotangent whose bf16 high term's product with the rows
-    passes fp32's largest though the whole product does not; each the wide product's finite value, the
-    three-term split's overflow sent back to it (row 1304's review)."""
+@pytest.mark.parametrize("case", ["scale near fp32's largest", "high term's product past fp32's largest",
+                                  "residual below bf16's least"])
+def test_a_bf16_adapted_products_factor_gradient_is_the_wide_products_where_the_split_is_not(case):
+    """A bf16 adapted product's rank factor gradient, bf16 rows, cotangent and output, where its three-term
+    split of the wide cotangent fails: a scale near fp32's largest (`scaled` rounding to bf16's infinity), a
+    high term's product with the rows past fp32's largest though the whole product is finite (an fp32
+    factor), and a residual below bf16's least subnormal (a cotangent 2^-125 + 2^-137 against -2^-125): each
+    the wide product's value, the split sent back to it (row 1304's review)."""
     from dew.nn.kernels import low_rank
 
     bf16 = jnp.bfloat16
-    if a_dtype == jnp.bfloat16:
-        scale, through = float(jnp.finfo(jnp.float32).max), 1.0
+    if case == "scale near fp32's largest":
+        x, b, dy = jnp.full((1, 1), 0.25, bf16), jnp.ones((1, 1), bf16), jnp.ones((1, 1), bf16)
+        scale, a_dtype = float(jnp.finfo(jnp.float32).max), bf16
+        want = np.float64(np.float32(scale)) / 4
+    elif case == "high term's product past fp32's largest":
+        x, b, dy = jnp.full((1, 1), 2.0 ** 64, bf16), jnp.ones((1, 1), bf16), jnp.ones((1, 1), bf16)
+        scale, a_dtype = (1 - 2.0 ** -9) * 2.0 ** 64, jnp.float32
+        want = (1 - 2.0 ** -9) * 2.0 ** 128
     else:
-        scale, through = 1.0, (1 - 2.0 ** -9) * 2.0 ** 64
-    x = jnp.full((1, 1), x_value, bf16)
-    w = jnp.zeros((1, 1), bf16)
-    b = jnp.ones((1, 1), bf16)
-    dy = jnp.full((1, 1), through, jnp.float32)
-
-    def adapted(a):
-        return low_rank.low_rank(x, w, a, b, scale, out_dtype=jnp.float32)
-
-    _, pull = jax.vjp(adapted, jnp.zeros((1, 1), a_dtype))
+        x, b = jnp.full((2, 1), 2.0 ** 20, bf16), jnp.ones((1, 2), bf16)
+        dy = jnp.asarray([[1.0, 2.0 ** -12], [-1.0, 0.0]], bf16)
+        scale, a_dtype = 2.0 ** -125, bf16
+        want = 2.0 ** -117
+    w = jnp.zeros((1, b.shape[1]), bf16)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, scale, out_dtype=bf16),
+                      jnp.zeros((1, 1), a_dtype))
     (d_a,) = pull(dy)
-    want = np.float64(x_value) * np.float64(scale) * np.float64(np.float32(through))
-    assert np.isfinite(np.asarray(d_a, np.float64)).all()
-    assert float(np.asarray(d_a, np.float64)[0, 0]) == float(np.asarray(want, a_dtype))
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == float(np.asarray(want, a_dtype)), (case, d_a)
 
 
 def test_a_grouped_bf16_adapted_products_factor_gradient_rounds_its_terms_once():
