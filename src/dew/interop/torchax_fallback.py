@@ -1445,19 +1445,18 @@ class _Seam:
         leaves, structure = _pytree.tree_flatten((args, kwargs))
         tensors = [index for index, leaf in enumerate(leaves) if _is_tensor(leaf)]
 
-        def run(*values):
+        def run(key, *values):
+            # The layer's draws (its dropout) from the key it is handed, and its successor handed back: the
+            # program's own input and output, so a recompute draws what the forward drew (row 13147).
+            env.prng_key = key
             given = list(leaves)
             for index, value in zip(tensors, values, strict=True):
                 given[index] = env.j2t_iso(value)
             args, kwargs = _pytree.tree_unflatten(given, structure)
-            return env.t2j_iso(forward(*args, **kwargs))
-        # A draw inside advances torchax's key (`env.param.prng`), which would carry the program's key past
-        # it, through whatever torch dispatch reached the draw.
-        key = env.prng_key
-        out = nested(run, traced=programs.append)(*(env.t2j_iso(leaves[index]) for index in tensors))
-        if env.prng_key is not key:
-            raise ValueError("tier 3 recomputes each decoder layer from its inputs, and this source's layers "
-                             "draw (dropout): set its rates to 0, or train it unrecomputed")
+            return env.t2j_iso(forward(*args, **kwargs)), env.prng_key
+
+        out, env.prng_key = nested(run, traced=programs.append)(
+            env.prng_key, *(env.t2j_iso(leaves[index]) for index in tensors))
         return env.j2t_iso(out)
 
     def replayed(self, output, loop: Loop):
@@ -1503,14 +1502,13 @@ def _layer_seam(model, env, *, layers: list | None, loop: Loop | None) -> Iterat
     """Each of `model`'s decoder layers called through this trace's seam (`_Seam`), its dispatcher
     (`_dispatched`, installed once) reading it from this context alone (`_SEAM`), so traces of variants
     sharing the layers, nested or in other threads, keep their own. Under `layers`, each call traced as a
-    program of its own over its tensor arguments (`dew.nn.nested.nested`), each program `layers` takes:
-    what `_accumulating` recomputes in a step's backward (`TorchCausalLM.remat`); a layer that draws (its
-    dropout) is refused, as its program would hold the draw's key, which torchax carries past it (its key
-    moved, whatever dispatch drew). Under `loop`, the block `loop.layers` runs `loop.steps` times: past its
-    last layer's first call, its later passes, each layer called with the arguments its own first pass took
-    (the call's masks and rotary tables, which differ by layer kind), its hidden input the pass before's
-    output, the decoder's `norm` between passes under `step_norm`, each pass's attention dropout its own
-    (`_PASS`)."""
+    program of its own over its tensor arguments and torchax's key (`dew.nn.nested.nested`), returning its
+    outputs and the key's successor, each program `layers` takes: what `_accumulating` recomputes in a step's
+    backward (`TorchCausalLM.remat`), its draws (its dropout) the forward's, from the same key. Under
+    `loop`, the block `loop.layers` runs `loop.steps` times: past its last layer's first call, its later
+    passes, each layer called with the arguments its own first pass took (the call's masks and rotary
+    tables, which differ by layer kind), its hidden input the pass before's output, the decoder's `norm`
+    between passes under `step_norm`, each pass's attention dropout its own (`_PASS`)."""
     held, stack = model.get_decoder(), _layer_list(model)
     if stack is None:
         raise ValueError(f"tier 3 runs a source's decoder layers apart, and {type(held).__name__} holds no "

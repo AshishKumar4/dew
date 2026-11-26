@@ -230,33 +230,44 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
-def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(loaded, tokens):
-    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs
-    (one `jax.checkpoint` a layer in the step's program), and its gradients are, bit for bit, the step's
-    without it; its record names its rung, and the ladder climbs no further."""
+@attending("reference")
+def test_a_recomputed_step_is_as_exact_as_transformers_and_keeps_less(source, loaded, tokens):
+    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs, and
+    holds less: its compiled step's temporaries below the unrecomputed step's. Its LM loss and every
+    parameter's gradient are as exact as transformers' own step over the same weights (check 1, torch's
+    float64 twin the truth, row 13147). Its record names its rung, and the ladder climbs no further."""
+    _, model = source
     recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
     assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
     assert loaded.model.recompute_record() is None
     assert loaded.model.restore_recompute(recomputed.model.recompute_record()) == recomputed.model
-    objective = LMObjective(recomputed, seq_len=SEQ, ema_decay=None)
     params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
 
-    def loss(params):
-        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
-    program = jax.make_jaxpr(jax.grad(loss))(params)
-    (checkpoint,) = (eqn.primitive for eqn in jax.make_jaxpr(jax.checkpoint(lambda x: x))(1.0).eqns)
-    checkpoints = [eqn for eqn in equations(program) if eqn.primitive is checkpoint]
-    assert len(checkpoints) == TINY["num_hidden_layers"], len(checkpoints)
-    # Recomputing a layer evaluates its program again: the same gradients, bit for bit, as the step that
-    # keeps its residuals, whose gradients are transformers' (`test_the_gradients_are_transformers`).
-    plain = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    def temporaries(held):
+        objective = LMObjective(held, seq_len=SEQ, ema_decay=None)
+        step = jax.jit(jax.grad(lambda params: objective_loss(
+            objective, {**held.variables, "params": params}, tokens, scalar=True)))
+        return step.lower(params).compile().memory_analysis().temp_size_in_bytes
 
-    def kept(params):
-        return objective_loss(plain, {**loaded.variables, "params": params}, tokens, scalar=True)
-    recomputed_gradients, kept_gradients = jax.jit(jax.grad(loss))(params), jax.jit(jax.grad(kept))(params)
-    for name, gradient in kept_gradients.items():
-        np.testing.assert_array_equal(np.asarray(recomputed_gradients[name]), np.asarray(gradient),
-                                      err_msg=name)
+    kept, recomputing = temporaries(loaded), temporaries(recomputed)
+    assert recomputing < kept, (recomputing, kept)
+    reference_model = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent)
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(loss_and_gradients(recomputed, model, params), reference_fn, token_draws(tokens),
+                    "torchax recomputed LM step", seeds=8, truth_fn=truth_fn)
 
 
 @pytest.mark.mesh
@@ -1854,30 +1865,34 @@ def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(t
     LMObjective(native_looped(), 16, pass_weights="mean")
 
 
-def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
-    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) refuses
-    recomputing them and refuses training unseeded, either way leaving torchax's key as it was; the same
-    model traces unrecomputed under a dropout key after it, drawing from that key."""
+def test_a_recomputed_layer_that_drops_draws_its_forwards_draws(tmp_path):
+    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) trains
+    recomputed under a dropout key: each recomputed layer draws from the key its forward handed it, so its
+    step's gradients are, bit for bit, the unrecomputed step's under the same key (row 13147), and another
+    key draws otherwise. Unseeded, training is refused, leaving torchax's key as it was."""
     from dew.interop.torchax_fallback import _environment
 
     dropping = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
     torch.manual_seed(0)
     transformers.LlamaForCausalLM(dropping).save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
-    tokens = np.zeros((2, 8), np.int32)
+    tokens = np.random.default_rng(0x13147).integers(0, LLAMA["vocab_size"], (2, 8)).astype(np.int32)
     env = _environment()
     before = env.prng_key
     recomputed = loaded.model.clone(remat=True)
-    for model, rngs in ((recomputed, {"dropout": jax.random.key(1)}), (loaded.model, {})):
-        with pytest.raises(ValueError):
-            jax.make_jaxpr(lambda v, model=model, rngs=rngs: model.apply(v, tokens, train=True, rngs=rngs))(
-                loaded.variables)
-        assert env.prng_key is before
+    with pytest.raises(ValueError):
+        jax.make_jaxpr(lambda v: loaded.model.apply(v, tokens, train=True))(loaded.variables)
+    assert env.prng_key is before
 
-    def train(variables, key):
-        return loaded.model.apply(variables, tokens, train=True, rngs={"dropout": key})
-    first, second = (jax.jit(train)(loaded.variables, jax.random.key(seed)) for seed in (1, 2))
-    assert not np.array_equal(np.asarray(first), np.asarray(second))
+    def gradient(model, seed):
+        return jax.jit(jax.grad(lambda variables: jnp.sum(model.apply(
+            variables, tokens, train=True, rngs={"dropout": jax.random.key(seed)}))))(loaded.variables)
+
+    unrecomputed = jax.tree.leaves(gradient(loaded.model, 1))
+    for got, wanted in zip(jax.tree.leaves(gradient(recomputed, 1)), unrecomputed, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+    assert any(not np.array_equal(np.asarray(one), np.asarray(two)) for one, two in zip(
+        jax.tree.leaves(gradient(recomputed, 1)), jax.tree.leaves(gradient(recomputed, 2)), strict=True))
 
 
 def test_two_variants_of_one_source_trace_side_by_side_as_each_does_alone(tmp_path):
