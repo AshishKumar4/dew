@@ -21,7 +21,7 @@ from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.block_draft import BlockDrafter, Context, Draft, DraftAttention, MarkovBlockDraft, draft
 from dew.nn.inputs import ModelInputs
-from dew.nn.kv_cache import KVCache
+from dew.nn.kv_cache import CURSOR, KVCache
 from dew.sampling import Sample, Sampling, Speculative, generate
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'inkling2-tiny'
@@ -131,6 +131,21 @@ def test_a_cached_draft_after_a_partly_accepted_block_is_on_par_with_its_whole_c
     truth = jax.jit(lambda _, inputs: drafted(wide, held, inputs, accepted())['logits'])
     assert_as_exact(jax.jit(lambda variables, inputs: cached(model, variables, inputs)), whole,
                     lambda seed: (variables, draw(seed)), 'Inkling 2 cached draft', seeds=8, truth_fn=truth)
+
+
+def test_a_local_draft_layer_caches_its_window_alone(source):
+    """A local draft layer's cached context holds its window's places alone (row 13541): its stores are
+    `window` slots long where a global layer's hold the decoder's capacity, as the cached draft after a
+    context longer than its window matches the uncached one (`cached`, 40 places over a window of 16)."""
+    model, variables = source.model, source.variables
+    _, opened = model.apply(variables, SHAPE[0], method='init_draft_cache', mutable=['cache'])
+    drafter = opened['cache']['block_drafter']
+    spec = RELEASE['mtp_config']
+    for index in range(spec['num_hidden_layers']):
+        held = drafter[f'layers_{index}']['self_attn']['held_context']
+        lengths = {leaf.shape[1] for name, leaf in held.items() if name != CURSOR}
+        expected = spec['sliding_window_size'] if index in spec['local_layer_ids'] else model.max_seq_len
+        assert lengths == {expected}, (index, {name: leaf.shape for name, leaf in held.items()})
 
 
 def test_a_count_of_passes_is_refused_where_the_taps_are_recorded(source):
