@@ -55,15 +55,15 @@ def apart(refs: list, scaled: bool) -> tuple:
     return (tuple(refs[:2]), refs[2:]) if scaled else (None, refs)
 
 
-def column_scales(column_scales: jax.Array, width: int, block_n: int) -> tuple[jax.Array, int]:
+def column_scales(scales: jax.Array, width: int, block_n: int) -> tuple[jax.Array, int]:
     """A step-scaled `gmm`'s column scales (`[groups, depth / 128, width / per]`) as its stream reads
     them (`blocks`), and the columns `per` a scale covers: as they are where each covers a column;
     else each step's row of them padded to whole `block_n`s, a block of which holds a tile's scale
     (`column_block`)."""
-    per = width // column_scales.shape[-1]
+    per = width // scales.shape[-1]
     if per == 1:
-        return column_scales, per
-    return jnp.pad(column_scales, ((0, 0), (0, 0), (0, -column_scales.shape[-1] % block_n))), per
+        return scales, per
+    return jnp.pad(scales, ((0, 0), (0, 0), (0, -scales.shape[-1] % block_n))), per
 
 
 def column_block(column_tile, block_n: int, per: int) -> tuple:
