@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import functools
 import math
 import re
 from collections.abc import Callable
@@ -51,6 +52,134 @@ class Unprintable(ValueError):
     a primitive JAX does not export, a parameter of no literal form)."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Ref:
+    name: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Extent:
+    operand: Ref
+    axis: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Layout:
+    dimensions: tuple[int | Extent, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class Literal:
+    dtype: str
+    shape: tuple[int, ...]
+    data: bytes
+    integer: int | Ref | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Primitive:
+    value: jcore.Primitive
+
+
+@dataclasses.dataclass(frozen=True)
+class Call:
+    callee: str | Ref | Primitive
+    operands: tuple[Operand, ...]
+    keywords: tuple[tuple[str, Operand], ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class ScalarParameter:
+    """Boolean or float static parameter; equality preserves its original spelling, including -0."""
+
+    value: bool | str
+
+
+
+type Operand = (Ref | Extent | Layout | Literal | Primitive | Call | ScalarParameter | int | str
+                | bool | float | tuple | np.dtype | enum.Enum | None)
+
+
+@dataclasses.dataclass(frozen=True)
+class Binding:
+    targets: tuple[str, ...]
+    value: Operand
+    unpack: bool = False
+    constant: bool = False
+
+    def lines(self) -> list[str]:
+        names = ", ".join(self.targets)
+        if self.unpack and len(self.targets) == 1:
+            names += ","
+        head = f"    {names} = " if names else "    "
+        if isinstance(self.value, Call):
+            return wrapped(head + _callee(self.value.callee) + "(", _arguments(self.value), ")")
+        if self.constant and isinstance(self.value, Literal):
+            held = np.frombuffer(self.value.data, np.dtype(self.value.dtype)).reshape(self.value.shape)
+            return _constant(names, held)
+        return [head + expression(self.value)]
+
+
+@dataclasses.dataclass(frozen=True)
+class Body:
+    inputs: tuple[str, ...]
+    statements: tuple[Binding | str, ...]
+    outputs: tuple[Operand, ...]
+
+    def render(self, name: str) -> str:
+        lines = wrapped(f"def {name}(", list(self.inputs), "):")
+        for statement in self.statements:
+            lines.extend([statement] if isinstance(statement, str) else statement.lines())
+        if self.outputs:
+            lines.extend(wrapped("    return (", list(map(expression, self.outputs)),
+                                 ",)" if len(self.outputs) == 1 else ")"))
+        return "\n".join(lines) + "\n"
+
+
+def _callee(callee: str | Ref | Primitive) -> str:
+    return callee if isinstance(callee, str) else expression(callee) + (".bind")
+
+
+def _arguments(call: Call) -> list[str]:
+    return [*map(expression, call.operands),
+            *(f"{name}={expression(value)}" for name, value in call.keywords)]
+
+
+def expression(value: Operand) -> str:
+    if isinstance(value, Ref):
+        return value.name
+    if isinstance(value, Extent):
+        return f"{value.operand.name}.shape[{value.axis}]"
+    if isinstance(value, ScalarParameter):
+        return repr(value.value) if isinstance(value.value, bool) else _float(float.fromhex(value.value))
+    if isinstance(value, Primitive):
+        return f"lax.{value.value.name}_p"
+    if isinstance(value, Call):
+        return f"{_callee(value.callee)}({', '.join(_arguments(value))})"
+    if isinstance(value, Layout):
+        return _tuple(map(expression, value.dimensions))
+    if isinstance(value, Literal):
+    if isinstance(value, tuple):
+        return _tuple(map(expression, value))
+        dtype = np.dtype(value.dtype)
+        if isinstance(value.integer, Ref):
+            return f"np.array({value.integer.name}, dtype=jnp.dtype({value.dtype!r}))"
+        held = np.frombuffer(value.data, dtype).reshape(value.shape)
+        return _value(held, dtype)
+    return _param(value)
+
+
+def _tuple(parts) -> str:
+    parts = tuple(parts)
+    return f"({', '.join(parts)}{',' if len(parts) == 1 else ''})"
+
+
+def _literal(value, dtype=None) -> Literal:
+    held = np.asarray(value, dtype=dtype)
+    scalar = int(held) if not held.ndim and jnp.issubdtype(held.dtype, jnp.integer) else None
+    return Literal(held.dtype.name, tuple(held.shape), held.tobytes(), scalar)
+
+
 @dataclasses.dataclass
 class _Printer:
     """One function's text as it is printed: its lines, each value's name, each platform choice's index
@@ -58,12 +187,12 @@ class _Printer:
     by the value it computes and the values already read from one."""
 
     compensated: bool
-    lines: list[str] = dataclasses.field(default_factory=list)
+    lines: list[Binding | str] = dataclasses.field(default_factory=list)
     names: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
     platforms: dict[jcore.Var, tuple] = dataclasses.field(default_factory=dict)
     pairs: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
     read: set[jcore.Var] = dataclasses.field(default_factory=set)
-    dimensions: dict[int, str] = dataclasses.field(default_factory=dict)
+    dimensions: dict[int, Extent] = dataclasses.field(default_factory=dict)
     count: int = 0
     used: bool = False
 
@@ -74,14 +203,16 @@ class _Printer:
     def emit(self, target: str, call: str, arguments: list[str]) -> None:
         self.lines.extend(wrapped(f"    {target} = {call}(", arguments, ")"))
 
-    def atom(self, atom) -> str:
-        """An operand's text: a literal's value, or a value's name, a double word read as its high word."""
+    def operand(self, atom) -> Operand:
         if isinstance(atom, jcore.Literal):
-            return _value(atom.val, _dtype(atom))
+            return _literal(atom.val, _dtype(atom))
         if atom in self.pairs and atom not in self.read:
             self.read.add(atom)
             self.lines.append(f"    {self.names[atom]} = {self.pairs[atom]}[0]")
-        return self.names[atom]
+        return Ref(self.names[atom])
+
+    def atom(self, atom) -> str:
+        return expression(self.operand(atom))
 
     def pair(self, atom, negated: bool = False) -> str:
         """An operand as a double word (its own, or the value beside a zero), negated where `negated`."""
@@ -97,6 +228,15 @@ def source(closed: core.Jaxpr, name: str, *, compensated: bool = False,
     """`closed` printed as a function `name` over its inputs returning its outputs as a tuple, and whether a
     sum was compensated (`compensated`: always False where it is not asked). Raises `Unprintable` for an
     equation no plain call writes."""
+    body, used = formed(closed, compensated=compensated, borrow_shapes=borrow_shapes)
+    text = body.render(name)
+    held(loaded(text, name), closed)
+    return text, used
+
+
+def formed(closed: core.Jaxpr, *, compensated: bool = False,
+           borrow_shapes: bool = False) -> tuple[Body, bool]:
+    """Collect bindings and their typed operands before rendering any component source."""
     printer = _Printer(compensated)
     inputs = [printer.fresh("x") for _ in closed.jaxpr.invars]
     printer.names.update(zip(closed.jaxpr.invars, inputs, strict=True))
@@ -104,16 +244,13 @@ def source(closed: core.Jaxpr, name: str, *, compensated: bool = False,
         for var, arg in zip(closed.jaxpr.invars, inputs, strict=True):
             for axis, extent in enumerate(_shaped(var).shape):
                 if isinstance(extent, int) and extent > 1:
-                    printer.dimensions.setdefault(extent, f"{arg}.shape[{axis}]")
+                    printer.dimensions.setdefault(extent, Extent(Ref(arg), axis))
     for var, value in zip(closed.jaxpr.constvars, closed.consts, strict=True):
         printer.names[var] = printer.fresh("c")
-        printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
+        printer.lines.append(Binding((printer.names[var],), _literal(value), constant=True))
     _body(printer, closed.jaxpr)
-    outputs = [printer.atom(atom) for atom in closed.jaxpr.outvars]
-    returned = wrapped("    return (", outputs, ",)" if len(outputs) == 1 else ")")
-    text = "\n".join([f"def {name}({', '.join(inputs)}):", *printer.lines, *returned]) + "\n"
-    _held(text, name, closed)
-    return text, printer.used
+    outputs = tuple(printer.operand(atom) for atom in closed.jaxpr.outvars)
+    return Body(tuple(inputs), tuple(printer.lines), outputs), printer.used
 
 
 def _typed(aval: ShapedArray | jax.ShapeDtypeStruct) -> tuple:
@@ -127,11 +264,11 @@ def _shaped(atom) -> ShapedArray:
     return atom.aval
 
 
-def _held(text: str, name: str, closed: core.Jaxpr) -> None:
+def held(function: Callable, closed: core.Jaxpr) -> None:
     """Refuses a printed text whose outputs are not the program's in shape, dtype and weak type (a literal
     the program holds weak, printed strong, that reaches an output): what a plain call cannot write as the
     jaxpr holds it."""
-    shaped = jax.eval_shape(loaded(text, name), *(
+    shaped = jax.eval_shape(function, *(
         jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
         for aval in map(_shaped, closed.jaxpr.invars)))
     found = [_typed(leaf) for leaf in shaped]
@@ -157,7 +294,7 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
             _forget(printer, body)
             for var, value in zip(body.constvars, consts, strict=True):
                 printer.names[var] = printer.fresh("c")
-                printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
+                printer.lines.append(Binding((printer.names[var],), _literal(value), constant=True))
             for var, atom in zip(body.invars, operands, strict=True):
                 _alias(printer, var, atom)
             _body(printer, body)
@@ -172,21 +309,32 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
         outputs = [printer.fresh() for _ in equation.outvars]
         for var, named in zip(equation.outvars, outputs, strict=True):
             printer.names[var] = named
-        arguments = [printer.atom(atom) for atom in equation.invars]
-        arguments += [f"{key}={_layout(printer, value) if key == 'shape' else _param(value)}"
-                      for key, value in equation.params.items()]
-        # A primitive of several results binds a sequence, unpacked even where it holds one.
-        target = (", ".join(outputs) + ("," if len(outputs) == 1 else "") if primitive.multiple_results
-                  else outputs[0])
-        printer.emit(target, f"lax.{primitive.name}_p.bind", arguments)
+        operands = tuple(printer.operand(atom) for atom in equation.invars)
+        keywords = tuple((key, _layout(printer, value) if key == "shape" else _parameter(value))
+                         for key, value in equation.params.items())
+        printer.lines.append(Binding(tuple(outputs), Call(Primitive(primitive), operands, keywords),
+                                     unpack=primitive.multiple_results))
 
 
-def _layout(printer: _Printer, value) -> str:
+def _layout(printer: _Printer, value) -> Operand:
     """Identical emitted bodies may share extents read from their declared input shapes."""
     if not printer.dimensions or not isinstance(value, tuple) or not all(isinstance(n, int) for n in value):
-        return _param(value)
-    sizes = [printer.dimensions.get(n, repr(n)) for n in value]
-    return f"({', '.join(sizes)}{',' if len(sizes) == 1 else ''})"
+        return _parameter(value)
+    return Layout(tuple(printer.dimensions[n] if n in printer.dimensions else n for n in value))
+
+
+def _parameter(value) -> Operand:
+    if isinstance(value, tuple | list):
+        return tuple(map(_parameter, value))
+    if isinstance(value, type) and issubclass(value, np.generic):
+        return np.dtype(value)
+    if isinstance(value, bool):
+        return ScalarParameter(value)
+    if isinstance(value, float):
+        return ScalarParameter(value.hex())
+    if value is None or isinstance(value, int | str | np.dtype | enum.Enum):
+        return value
+    raise Unprintable(f"no literal form of a {type(value).__name__} parameter")
 
 
 def _inlined(printer: _Printer, equation: jcore.JaxprEqn) -> tuple:
@@ -216,7 +364,7 @@ def _alias(printer: _Printer, var: jcore.Var, atom) -> None:
     """`var` named as `atom` is: a call's input as its operand, its output as its body's."""
     if isinstance(atom, jcore.Literal):
         printer.names[var] = printer.fresh()
-        printer.lines.append(f"    {printer.names[var]} = {_value(atom.val, _dtype(atom))}")
+        printer.lines.append(Binding((printer.names[var],), _literal(atom.val, _dtype(atom))))
         return
     printer.names[var] = printer.names[atom]
     if atom in printer.pairs:
@@ -307,14 +455,20 @@ def reprinted(function: Callable, operands, tree) -> Callable | None:
     return lambda *values: jax.tree.unflatten(tree, list(flat(*values)))
 
 
-def loaded(text: str, name: str) -> Callable:
-    """The function `name` a printed text defines (`source`), over the imports a printed module reads."""
+def loaded_module(text: str, name: str) -> dict[str, object]:
+    """Compile the rendered module once, so every case runs its actual dispatch entrypoint."""
+    from dew.algebra import _generated
     from dew.nn import precision
 
     namespace: dict[str, object] = {"Callable": Callable, "jax": jax, "jnp": jnp, "np": np, "lax": lax,
-                                    "precision": precision}
+                                    "precision": precision, "functools": functools, "_generated": _generated}
     exec(compile(text, f"<printed {name}>", "exec"), namespace)
-    function = namespace[name]
+    return namespace
+
+
+def loaded(text: str, name: str) -> Callable:
+    """The function a rendered program defines, over the imports a printed module reads."""
+    function = loaded_module(text, name)[name]
     if not callable(function):
         raise TypeError(f"the printed text defines no function {name!r}")
     return function

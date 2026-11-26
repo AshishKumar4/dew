@@ -2240,7 +2240,7 @@ def _held(eqn, operands, results, findings, at) -> None:
     if primitive is jax.lax.reduce_p:
         # A variadic reduction's results are held together, by the reduction its combine is.
         try:
-            held = _reduced(eqn, hosted, [_host(result) for result in results])
+            held = _reduced(eqn, hosted, hosted_results)
         except TypeError:
             findings.append(f"{at}: uncertifiable, no contract for this reduce's combine")
             return
@@ -2248,20 +2248,19 @@ def _held(eqn, operands, results, findings, at) -> None:
             if not np.all(ok):
                 findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract")
         return
-    for index, result in enumerate(results):
-        fmt = _format(getattr(_host(result), "dtype", np.float32))
+    for index, hosted_result in enumerate(hosted_results):
+        fmt = _format(getattr(hosted_result, "dtype", np.float32))
         # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
         given = (RESULT_OPERANDS[primitive](eqn.params, hosted, index) if primitive in RESULT_OPERANDS
                  else hosted)
         try:
-            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, hosted_result, fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return
         if not np.all(ok):
-            hosted_result = _host(result)
             keyed = not isinstance(hosted_result, np.ndarray)
-            shown = np.asarray(jax.random.key_data(result)) if keyed else hosted_result
+            shown = np.asarray(jax.random.key_data(hosted_result)) if keyed else hosted_result
             first = np.unravel_index(int(np.argmin(ok.ravel())), ok.shape) if ok.ndim else ()
             findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract, "
                             f"first at {first}: {shown[first]!r}")

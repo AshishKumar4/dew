@@ -105,18 +105,18 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
                            jax.ShapeDtypeStruct((shape[axis],), jnp.bfloat16))
         bias = (np.arange(shape[axis]) * 0.25 + shift).astype(jnp.bfloat16)
         fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
-        separate[name] = printed.source(jax.make_jaxpr(fn)(*arguments[name]), name, borrow_shapes=True)[0]
+        separate[name] = printed.formed(jax.make_jaxpr(fn)(*arguments[name]), borrow_shapes=True)[0]
     # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
     occupied = "_shared_component_0"
     arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
-    separate[occupied] = printed.source(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
-                                        occupied, borrow_shapes=True)[0]
+    separate[occupied] = printed.formed(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
+                                        borrow_shapes=True)[0]
     reserved = "_shared_component_1"
     shared = _component_sharing.shared(separate, reserved=(reserved,))
     assert len(shared) == len(separate) + 1 and reserved not in shared
     for name, operands in arguments.items():
-        before = printed.loaded(separate[name], name)
-        after = printed.loaded("\n\n".join(shared.values()), name)
+        before = printed.loaded(separate[name].render(name), name)
+        after = printed.loaded("\n\n".join(body.render(key) for key, body in shared.items()), name)
         original = jax.make_jaxpr(before)(*operands)
         composed = jax.make_jaxpr(after)(*operands)
         values = tuple(np.full(operand.shape, 0.75, operand.dtype) for operand in operands)
@@ -142,10 +142,10 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
     shape = jax.ShapeDtypeStruct((8,), jnp.uint32)
     written = jax.make_jaxpr(twice)(shape)
-    source, _ = printed.source(written, "twice", borrow_shapes=True)
+    source, _ = printed.formed(written, borrow_shapes=True)
     factored = _component_sharing.shared({"twice": source})
     assert len(factored) == 2
-    loaded = printed.loaded("\n\n".join(factored.values()), "twice")
+    loaded = printed.loaded("\n\n".join(body.render(key) for key, body in factored.items()), "twice")
     rebuilt = jax.make_jaxpr(loaded)(shape)
     assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(written, in_process=True)
     value = np.arange(shape.size, dtype=np.uint32)
@@ -338,7 +338,7 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
     composed = component_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
 
     def rounded(value):
-        return composed(value, dtype)
+        return composed(value, dtype=dtype)
 
     for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
         x = np.full(shape, 1.003, np.float32)
@@ -377,8 +377,8 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     declared = generate.SurrogateBodies(value, tangent, (), True, {(): case})
     reachable = {}
     for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
-        _, text = generate._component(component, component.cases.operands[0], "default", "sm90", name)
-        reachable[name] = printed.loaded(text, "form")
+        _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)
+        reachable[name] = printed.loaded(body.render("form"), "form")
 
     called = set()
 

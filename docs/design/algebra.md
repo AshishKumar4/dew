@@ -1412,10 +1412,10 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
-sequences of primitive binds, literal construction and emitted calls share a generated helper, with
-geometry, integer literals and logical shift direction bound statically.
-Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
-to the component's program.
+typed primitive bindings share a helper before source is rendered. Geometry, integer literals and
+logical shift direction are static arguments; callers keep their own layout and live results. The
+generator admits the final emitted entrypoint, including its case dispatch and shared helpers, against
+the written trace and independent truth. Sharing and case selection add no run-time branch to the program.
 
 - **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
