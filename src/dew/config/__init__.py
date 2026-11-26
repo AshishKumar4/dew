@@ -599,18 +599,39 @@ def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstanc
     return None if stated else kinds[0]()
 
 
-def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]:
+def _placed(config: "RunConfig", path: str, record: Mapping[str, JSON] | None = None
+            ) -> tuple[list[str], dict[str, JSON]]:
     """The keys of `path`'s value in `config`'s record, and the record of the default each unset optional
-    record along it takes (`_unset_default`), by its key."""
+    record along it takes (`_unset_default`), by its key: each group stepped through the run where it holds
+    it; where it holds a section unset that `record` (the record an override writes) sets, a shallower path
+    of the same point, that section read off `record` by the one dataclass its field declares beside None,
+    building no run (row 12908); KeyError for a path naming no field, or a section of no one such class."""
     *groups, field = path.split(".")
     held: object = config
+    kind: type = type(config)
+    node: object = record
     unset: dict[str, JSON] = {}
     for group in groups:
-        if not (dataclasses.is_dataclass(held) and group in _names(held)):
+        known = (group in _names(kind) if isinstance(held, Mapping)
+                 else dataclasses.is_dataclass(held) and group in _names(held))
+        if not known:
             raise KeyError(f"{path} names no group of the run record")
-        owner, held = held, getattr(held, group)
-        if held is None and (default := _unset_default(owner, group)) is not None:
+        owner = kind if isinstance(held, Mapping) else held
+        value = held.get(group) if isinstance(held, Mapping) else getattr(held, group)
+        stated = node.get(group) if isinstance(node, Mapping) else None
+        if value is None and isinstance(stated, Mapping):
+            declared = registry.declared_type(kind, group)
+            kinds = [member for member in (declared, *typing.get_args(declared))
+                     if isinstance(member, type) and dataclasses.is_dataclass(member)]
+            if len(kinds) != 1:
+                raise KeyError(f"{path} names no group of the run record")
+            held, kind = stated, kinds[0]
+        elif value is None and (default := _unset_default(owner, group)) is not None:
             held, unset[group] = default, registry.to_record(default, type(default))
+            kind = type(default)
+        else:
+            held, kind = value, type(value)
+        node = stated
     if isinstance(held, Registered):
         # A command line's subcommand (`registry.record_flags`) is the record it makes: its plain flags are
         # that record's `fields` entries.
@@ -619,31 +640,8 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]
         if field not in parameters(held.member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], unset
-    if not (dataclasses.is_dataclass(held) and field in _names(held)):
-        raise KeyError(f"{path} names no field of the run record")
-    return [*groups, field], unset
-
-
-def _declared_path(kind: type, record: Mapping[str, JSON], path: str) -> tuple[list[str], dict[str, JSON]]:
-    """`_placed` read off a record of the run class `kind` (`record`, a section of which a shallower path of
-    an override's point set) and the classes its fields declare, building no run: the keys of `path`'s
-    value, each section by the one dataclass its field declares beside None, and the record of the default
-    each section the record holds unset takes (`_unset_default`), by its key; KeyError for any other."""
-    *groups, field = path.split(".")
-    node: object = record
-    unset: dict[str, JSON] = {}
-    for group in groups:
-        declared = registry.declared_type(kind, group)
-        kinds = [member for member in (declared, *typing.get_args(declared))
-                 if isinstance(member, type) and dataclasses.is_dataclass(member)]
-        held = node.get(group) if isinstance(node, Mapping) else None
-        if held is None and (default := _unset_default(kind, group)) is not None:
-            held = unset[group] = registry.to_record(default, type(default))
-            kinds = [type(default)]
-        if len(kinds) != 1 or not isinstance(held, Mapping):
-            raise KeyError(f"{path} names no group of the run record")
-        kind, node = kinds[0], held
-    if not (dataclasses.is_dataclass(kind) and field in _names(kind)):
+    owner = kind if isinstance(held, Mapping) else held
+    if not (dataclasses.is_dataclass(owner) and field in _names(owner)):
         raise KeyError(f"{path} names no field of the run record")
     return [*groups, field], unset
 
@@ -844,12 +842,9 @@ class RunConfig:
             value = point[path]
             if path in chained:
                 continue
-            try:
-                keys, unset = _placed(self, path)
-            except KeyError:
-                # A section the run holds unset that a shallower path of the point set: placed by its
-                # declared class, the run built once, from the completed record.
-                keys, unset = _declared_path(type(self), record, path)
+            # A section the run holds unset that a shallower path of the point set is placed by its declared
+            # class, the run built once, from the completed record (`_placed`'s `record`).
+            keys, unset = _placed(self, path, record)
             *groups, field = keys
             node = record
             for group in groups:
