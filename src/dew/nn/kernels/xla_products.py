@@ -300,8 +300,8 @@ def exponent_scaled(lhs_codes: jax.Array, lhs_exponents: jax.Array, kernel_codes
     def start(zeros):
         # Placed as the sum is (`_block_walk`'s zeros), each part of the carry alike.
         none = jnp.full_like(zeros, _NO_EXPONENT, dtype=jnp.int32)
-        flag = jnp.zeros_like(zeros, dtype=bool)
-        return zeros, zeros, none, flag, none, flag
+        clean = jnp.zeros_like(zeros, dtype=bool)
+        return zeros, zeros, none, clean, none, clean
 
     def added(index, partial, owner, carry):
         high, low, exponent, poisoned, peak, dropped = carry
