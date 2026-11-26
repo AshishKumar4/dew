@@ -20,7 +20,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.dense import Dense
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kv_cache import Opened, cache_variables, compute_dtype, kept
-from dew.nn.linear import DepthwiseConv1d, held_conv1d
+from dew.nn.linear import DepthwiseConv1d, conv_windows, held_conv1d
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
 
@@ -100,22 +100,16 @@ class ShortConvSite(nn.Module):
     def _dynamic(self, x, taps, projected, tokens, history):
         """`x` convolved by `taps` `[features, kernel]` plus each token's own (`projected`, the `dynamic`
         projection of the dynamic input, a head's shared by its channels), in at least fp32, and the history
-        the next call holds. The windows are the static convolution's of one-hot taps (`held_conv1d`, once
-        over a copy of the input a window position), so they read padding, gaps, packed documents and the
-        held history by the static route's own rules, and its history is the one that route keeps."""
+        the next call holds. Its windows are the static convolution's (`conv_windows`, `held_conv1d`'s
+        stream), so they read padding, gaps, packed documents and the held history by its rules, and its
+        history is the one that route keeps."""
         batch, length, features = x.shape
         heads, k = self.dynamic_heads, self.kernel
         assert heads is not None, "dynamic taps are a dynamic site's"
         wide = at_least_fp32(x.dtype)
-        # Every window position at once, one convolution over the input repeated a copy a position, copy j's
-        # one tap its j-th: window position j of token t reads input t - (k - 1) + j, the token itself last.
-        units = jnp.repeat(jnp.eye(k, dtype=wide), features, axis=0)
-        repeated = None if history is None else jnp.tile(history, (1, 1, k))
-        windows, held = held_conv1d(jnp.tile(x, (1, 1, k)), units, tokens.valid, repeated,
-                                    segments=tokens.segments, right_padded=tokens.right_padded, dtype=wide,
-                                    activation=False)
-        held = held[..., :features]
-        windows = jnp.moveaxis(jnp.asarray(windows, wide).reshape(batch, length, k, features), 2, -1)
+        windows, held = conv_windows(x, k, tokens.valid, history, segments=tokens.segments,
+                                     right_padded=tokens.right_padded)
+        windows = windows.astype(wide)
         stacked = windows.reshape(batch, length, heads, features // heads, k)
         own = projected.astype(wide).reshape(batch, length, heads, 1, k)
         weights = taps.astype(wide).reshape(heads, features // heads, k)[None, None] + own

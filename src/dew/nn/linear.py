@@ -301,23 +301,83 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_
     if valid is not None and not right_padded:
         return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments, parts=parts, dtype=dtype,
                               activation=activation)
-    batch, length, channels = x.shape
-    empty = jnp.zeros((batch, width, channels), x.dtype)
-    stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
     valid = None if valid is None else jnp.asarray(valid, bool)
-    # The K-1 stream rows that end at the row's last real token.
-    ends = (rows_like(jnp.full((batch,), length, jnp.int32), x) if valid is None
-            else jnp.sum(valid, axis=1, dtype=jnp.int32))
-    rows = ends[:, None] + jnp.arange(width)[None, :]
-    history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
-    if segments is not None:
-        # The next call continues the last real token's document, so the history keeps only its tokens,
-        # the held ones counting as the first document's, as `_masked_conv1d`'s does.
+    history = _stream(x, width, valid, held, segments, right_padded=True).history
+    return _behind(x, kernel=kernel, held=held, bias=bias, valid=valid, segments=segments, parts=parts,
+                   dtype=dtype, activation=activation), history
+
+
+class _Stream(NamedTuple):
+    """What a held convolution reads (`_stream`): the held inputs then the call's (`stream`, its real tokens
+    gathered in order where `rank` is given), each stream entry's document (`owners`, None unpacked), each
+    slot's index among its row's real tokens (`rank`, None where every real token stands in its slot), and
+    the history the next call holds."""
+
+    stream: jax.Array
+    owners: jax.Array | None
+    rank: jax.Array | None
+    history: jax.Array
+
+
+def _stream(x, width: int, valid, held, segments, *, right_padded: bool) -> _Stream:
+    """The stream `held_conv1d` convolves behind `held` (zeros where None) and the history it leaves, the K-1
+    entries ending at the row's last real token: a row whose real slots come first (`right_padded`, or no
+    `valid`) as it stands, any other's real tokens gathered in order (`_stream_order`), a padding slot read
+    and advanced by none. Of packed `segments` the held entries count as the first real token's document,
+    and the history keeps the last real token's document alone, an earlier one's entries zero, as the next
+    call continues it."""
+    batch, length, channels = x.shape
+    if right_padded or valid is None:
+        empty = jnp.zeros((batch, width, channels), x.dtype)
+        stream = jnp.concatenate([rows_like(empty, x) if held is None else held, x], axis=1)
+        # The K-1 stream rows that end at the row's last real token.
+        ends = (rows_like(jnp.full((batch,), length, jnp.int32), x) if valid is None
+                else jnp.sum(valid, axis=1, dtype=jnp.int32))
+        rows = ends[:, None] + jnp.arange(width)[None, :]
+        history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
+        if segments is None:
+            return _Stream(stream, None, None, history)
         owners = _held_first(segments, width)
         last = jnp.take_along_axis(owners, ends[:, None] + width - 1, axis=1)
         history = jnp.where((jnp.take_along_axis(owners, rows, axis=1) == last)[:, :, None], history, 0)
-    return _behind(x, kernel=kernel, held=held, bias=bias, valid=valid, segments=segments, parts=parts,
-                   dtype=dtype, activation=activation), history
+        return _Stream(stream, owners, None, history)
+    state = rows_like(jnp.zeros((batch, width, channels), x.dtype), x) if held is None else held
+    rank, source = _stream_order(valid)
+    compact = jnp.take_along_axis(x, source[:, :, None], axis=1, mode='fill', fill_value=0)
+    stream = jnp.concatenate([state, compact], axis=1)
+    # The K-1 stream rows from the row's token count on are the history it leaves.
+    rows = (rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :]
+    history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
+    if segments is None:
+        return _Stream(stream, None, rank, history)
+    # The stream's documents, the history in front counting as the first real token's.
+    ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
+    owners = _held_first(ordered, width)
+    # The next call continues the last real token's document, so the history keeps only its tokens; an
+    # earlier document's, where the last is shorter than K-1, read as its start's zeros.
+    kept = jnp.take_along_axis(owners, rows, axis=1)
+    last = jnp.take_along_axis(ordered, jnp.maximum(rank[:, -1:], 0), axis=1)
+    history = jnp.where(((kept == last) | (rank[:, -1:] < 0))[:, :, None], history, 0)
+    return _Stream(stream, owners, rank, history)
+
+
+def conv_windows(x, kernel_size: int, valid, held=None, *, segments=None, right_padded: bool = False):
+    """The `kernel_size` inputs each token of `x` `[B, S, D]` reads under a causal depthwise convolution
+    behind `held`, oldest first, the token itself last (`[B, S, D, K]`), and the history the next call holds:
+    `held_conv1d`'s stream (`_stream`), so a padding slot, a gap, another packed document's input and the
+    held history read as its convolution reads them, a padding slot's window zero."""
+    width = kernel_size - 1
+    length = x.shape[1]
+    read = _stream(x, width, valid, held, segments, right_padded=right_padded)
+    windows = jnp.stack([read.stream[:, place:place + length] for place in range(kernel_size)], axis=-1)
+    if read.owners is not None:
+        same = jnp.stack([read.owners[:, place:place + length] for place in range(kernel_size)], axis=-1)
+        windows = jnp.where((same == read.owners[:, width:, None])[:, :, None, :], windows, 0)
+    if read.rank is not None:
+        windows = jnp.take_along_axis(windows, jnp.maximum(read.rank, 0)[:, :, None, None], axis=1)
+    if valid is not None:
+        windows = jnp.where(jnp.asarray(valid, bool)[:, :, None, None], windows, 0)
+    return windows, read.history
 
 
 def _held_first(segments, width: int):
@@ -773,30 +833,14 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
     test_the_masked_conv_reads_across_a_gap). `parts` and `dtype` are
     `causal_conv1d`'s, applied to the real tokens' outputs.
     """
-    batch, _, channels = x.shape
     width = kernel.shape[1] - 1
-    if state is None:
-        state = rows_like(jnp.zeros((batch, width, channels), x.dtype), x)
     valid = jnp.asarray(valid, bool)
-    rank, source = _stream_order(valid)
-    compact = jnp.take_along_axis(x, source[:, :, None], axis=1, mode='fill', fill_value=0)
-    stream = jnp.concatenate([state, compact], axis=1)
-    # The K-1 stream rows from the row's token count on are the history it leaves.
-    rows = (rank[:, -1] + 1)[:, None] + jnp.arange(width)[None, :]
-    history = jnp.take_along_axis(stream, rows[:, :, None], axis=1)
-    owners = None
-    if segments is not None:
-        # The stream's documents, the history in front counting as the first real token's.
-        ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
-        owners = _held_first(ordered, width)
-        # The next call continues the last real token's document, so the history keeps only its
-        # tokens; an earlier document's, where the last is shorter than K-1, read as its start's zeros.
-        kept = jnp.take_along_axis(owners, rows, axis=1)
-        last = jnp.take_along_axis(ordered, jnp.maximum(rank[:, -1:], 0), axis=1)
-        history = jnp.where(((kept == last) | (rank[:, -1:] < 0))[:, :, None], history, 0)
+    read = _stream(x, width, valid, state, segments, right_padded=False)
+    rank, history = read.rank, read.history
+    assert rank is not None, "a gapped row's stream gathers its real tokens"
     # The history in front carries the K-1 taps the first real token reads, so row width + j of the
     # convolution is the output of real token j.
-    convolved = causal_conv1d(stream, kernel, activation, bias=bias, segments=owners,
+    convolved = causal_conv1d(read.stream, kernel, activation, bias=bias, segments=read.owners,
                               dtype=at_least_fp32(x.dtype))[:, width:]
     output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, :, None], axis=1)
     output = jnp.where(valid[:, :, None], output, 0)
