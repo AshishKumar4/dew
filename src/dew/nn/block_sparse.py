@@ -32,10 +32,17 @@ from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
-from dew.nn.mla import SELECTIONS, indexer_kl
-from dew.nn.precision import float32_einsum
+from dew.nn.mla import SELECTIONS, indexer_target
+from dew.nn.precision import compensated_sum, float32_einsum
 from dew.nn.residuals import Residual
-from dew.nn.sparse_selection import SELECTING, block_maxima, block_runs, selected_attention, top_k_selection
+from dew.nn.sparse_selection import (
+    SELECTING,
+    block_maxima,
+    block_runs,
+    selected_attention,
+    selection_mask,
+    top_k_selection,
+)
 
 if TYPE_CHECKING:
     from dew.nn.protocols import IndexedMixer
@@ -271,26 +278,41 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
 
 def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
     """`[B, G, Q, K]`: whether a query's selection (`selected` `[B, G, Q, S]`, blocks of `block`, -1 none)
-    names a key's block and the key is no later than the query."""
-    place = jnp.arange(keys)
-    chosen = jnp.any(selected[..., None] == (place // block), axis=-2)
-    return chosen & (place[None, :] <= jnp.arange(selected.shape[2])[:, None])
+    names a key's block and the key is no later than the query: the blocks' mask
+    (`sparse_selection.selection_mask`, the groups folded into the batch) widened to their keys."""
+    batch, groups, queries, _ = selected.shape
+    blocks = selection_mask(selected.reshape(batch * groups, queries, -1), -(-keys // block))
+    chosen = jnp.repeat(blocks, block, axis=-1)[..., :keys].reshape(batch, groups, queries, keys)
+    return chosen & (jnp.arange(keys)[None, :] <= jnp.arange(queries)[:, None])
 
 
 def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, selected: jax.Array, *,
                   block: int, scale: float) -> jax.Array:
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
-    objective takes it (`mla.indexer_kl`, the objective's `IndexerTraining`): each group's KL of the index
-    branch's softmax over the query's selected tokens from its heads' detached attention there (their
-    softmaxes summed and normalized, each head's at `scale`), averaged over the groups. `query`
+    objective takes it (the objective's `IndexerTraining`): each group's KL of the index branch's softmax over
+    the query's selected tokens from its heads' detached attention there (`mla.indexer_target`: their
+    softmaxes summed, normalized), averaged over the groups. The index branch's log-softmax is taken whole,
+    no epsilon (MaxText's, `mla.indexer_kl`'s, caps a token the branch scores far below the attention's at
+    -log(1e-8) and stills its gradient), a token the teacher gives no mass adding nothing. `query`
     `[B, Q, G * h, D]`, `key` `[B, K, G, D]`, `index_scores` `[B, G, Q, K]`."""
     groups, keys = index_scores.shape[1], index_scores.shape[3]
     per = query.shape[2] // groups
     tokens = _selected_tokens(selected, keys, block)
-    kls = [indexer_kl(index_scores[:, group], query[:, :, group * per:(group + 1) * per],
-                      jnp.repeat(key[:, :, group:group + 1], per, axis=2), tokens[:, group], scale)
-           for group in range(groups)]
-    return jnp.mean(jnp.stack(kls), axis=0)
+
+    def kl(group: int) -> jax.Array:
+        keep = tokens[:, group]
+        summed = indexer_target(query[:, :, group * per:(group + 1) * per],
+                                jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep, scale,
+                                dtype=jnp.result_type(index_scores, query, key))
+        total = compensated_sum(summed, (summed.ndim - 1,))[..., None]
+        target = jnp.where(total > 0, summed / jnp.where(total > 0, total, 1), 0)
+        wide = summed.dtype
+        scores = jnp.where(keep, index_scores[:, group].astype(wide), jnp.finfo(wide).min)
+        student = jax.nn.log_softmax(scores, axis=-1)
+        divergence = jnp.where(target > 0, target * (jnp.log(jnp.where(target > 0, target, 1)) - student), 0)
+        return compensated_sum(divergence, (divergence.ndim - 1,))
+
+    return jnp.mean(jnp.stack([kl(group) for group in range(groups)]), axis=0)
 
 
 INFLLM_STRIDE = 16
