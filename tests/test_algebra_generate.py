@@ -123,6 +123,33 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
         assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
 
 
+def test_shared_component_preserves_two_ordered_spans_in_one_body():
+    from dew.algebra import _component_sharing, terms
+
+    def phase(value):
+        offset = value + 1
+        square = offset * offset
+        limit = jnp.sqrt(square)
+        exponent = jax.lax.logistic(limit + value)
+        return jnp.maximum(exponent, value)
+
+    def twice(value):
+        first = phase(value)
+        return first, phase(first)
+
+    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    written = jax.make_jaxpr(twice)(shape)
+    source, _ = printed.source(written, "twice", borrow_shapes=True)
+    factored = _component_sharing.shared({"twice": source})
+    assert len(factored) == 2
+    loaded = printed.loaded("\n\n".join(factored.values()), "twice")
+    rebuilt = jax.make_jaxpr(loaded)(shape)
+    assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(written, in_process=True)
+    value = np.linspace(-2, 2, shape.size, dtype=np.float32)
+    for actual, expected in zip(jax.jit(loaded)(value), jax.jit(twice)(value), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
     (example,) = component_cases.ROUNDED.cases.operands[0]

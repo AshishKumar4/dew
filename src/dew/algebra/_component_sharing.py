@@ -148,13 +148,20 @@ def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]
                 by_body[signature].append(span)
         candidates = []
         for entries in by_body.values():
-            copies = {span.name: span for span in reversed(entries)}
+            # Every group's starts remain in source order. Earliest disjoint spans leave the
+            # most room for the next one of the same width in the same function.
+            stops: dict[str, int] = {}
+            copies = []
+            for span in entries:
+                if span.first >= stops.get(span.name, 0):
+                    copies.append(span)
+                    stops[span.name] = span.first + width
             if len(copies) < 2:
                 continue
             candidates.extend(entries)
             avoided = width * (len(copies) - 1)
             if avoided > saved:
-                best, saved = tuple(span.snapshot() for span in reversed(tuple(copies.values()))), avoided
+                best, saved = tuple(span.snapshot() for span in copies), avoided
         if not candidates:
             return best
     return best
@@ -193,7 +200,8 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
             tail = ",)" if len(kept) == 1 else ")"
             fragment_lines += printed.wrapped("    return (", [f"v{i}" for i in kept], tail)
         forms[name] = "\n".join(fragment_lines)
-        for found, reads in zip(copies, suffixes, strict=True):
+        # Later replacements cannot slide an earlier source range in the same function.
+        for found, reads in reversed(tuple(zip(copies, suffixes, strict=True))):
             nodes = bodies[found.name].statements
             begin, end = nodes[found.first].lineno - 1, nodes[found.first + width - 1].end_lineno
             outputs = ", ".join(found.written[index] if found.written[index] in reads else "_"
