@@ -411,10 +411,7 @@ def _read_unrotated_latent_attention(view: PartView) -> Mapping[str, object]:
     """Kimi Linear's latent attention: DeepSeek V3's (`_latent_attention`), its shared key's slice and
     each head's rope slice left unrotated (`MultiHeadLatentAttention.rotary=False`; its model holds no
     rotary), as Kimi K3's MLA."""
-    fields = dict(_latent_attention(view, interleave=False))
-    mixer = dict(_records.record(fields['mixer'], 'mixer'))
-    mixer['fields'] = {**_records.record(mixer['fields'], 'fields'), 'rotary': False}
-    return {**fields, 'mixer': mixer}
+    return _latent_attention(view, interleave=False, rotary=False)
 
 
 def _read_grid_rotary(view: PartView) -> Mapping[str, object]:
@@ -837,9 +834,9 @@ def _read_optionally_grouped_router(view: PartView) -> Mapping[str, object]:
                      'scaling': float(view.routed_scaling_factor), 'bias': True}}
 
 
-def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, object]:
+def _latent_attention(view: PartView, *, interleave: bool, rotary: bool = True) -> Mapping[str, object]:
     """A DeepSeek V3 latent attention's fields (`_read_latent_attention`), its rope heads rotated in
-    interleaved pairs or halves."""
+    interleaved pairs or halves, or left unrotated (`rotary=False`, its model holding no rotary)."""
     if not view.is_causal:
         raise Ambiguous("the attention is not causal")
     nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
@@ -849,14 +846,15 @@ def _latent_attention(view: PartView, *, interleave: bool) -> Mapping[str, objec
     if any(float(norm.variance_epsilon) != epsilon for norm in norms):
         raise Ambiguous(f"the latents are normed at an epsilon other than {epsilon}")
     heads = int(view.num_heads)
-    return {**_rope(view.config), 'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
+    return {**(_rope(view.config) if rotary else {}), 'num_heads': heads,
+            'num_kv_heads': heads // int(view.num_key_value_groups),
             'head_dim': nope + rope, 'qk_norm': False,
             'attention_bias': view.kv_a_proj_with_mqa.bias is not None,
             'attention_dropout_rate': float(view.attention_dropout),
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': interleave,
+                'rope_interleave': interleave, 'rotary': rotary,
                 # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
                 'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
