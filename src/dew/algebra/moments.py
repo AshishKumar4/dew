@@ -90,18 +90,12 @@ def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
     exposing total weight `n` as the final declared output (reusing the same reduction contract)."""
     axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
     if kind == "weighted":
-        def weighted(x, w):
-            return _weighted_moments_with_total(x, w)[:2]
-
-        fn = _weighted_moments_with_total if with_total else weighted
+        fn = _weighted_moments_with_total if with_total else weighted_moments
         return derive.Reduction(fn, {"x": axes, "w": axes}, walked="walked", ranges={"w": (0.0, math.inf)})
     if kind == "masked":
         return derive.Reduction(masked_moments, {"x": axes, "mask": axes}, walked="walked")
     if kind == "covariance":
-        def covariance(x, y, w):
-            return _weighted_cov_with_total(x, y, w)[:3]
-
-        fn = _weighted_cov_with_total if with_total else covariance
+        fn = _weighted_cov_with_total if with_total else weighted_covariance
         return derive.Reduction(fn, {"x": axes, "y": axes, "w": axes}, walked="walked",
                                 ranges={"w": (0.0, math.inf)})
     raise ValueError(f"unknown central-moment declaration kind: {kind!r}")
