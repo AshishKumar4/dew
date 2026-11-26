@@ -89,13 +89,7 @@ from dew.nn.kernels.templates.gemm.hooks import (
 )
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import (
-    accumulated,
-    asks_default_precision,
-    at_least_fp32,
-    exact_products,
-    twice_scaled,
-)
+from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
