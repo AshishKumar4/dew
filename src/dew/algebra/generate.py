@@ -178,7 +178,7 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
                     closed = jax.make_jaxpr(candidate.form or candidate.function)(*operands)
                     text, _ = printed.source(closed, "form", compensated=candidate.compensated)
                 if found and found[0].single != single:
-                    raise ValueError(f"{label}: the same declaration must keep its array or tuple result convention")
+                    raise ValueError(f"{label}: a declaration must keep its array or tuple result convention")
                 found.append(_Chosen(name, policy, target, case, operands, text, single))
     return found
 
