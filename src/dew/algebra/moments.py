@@ -17,7 +17,7 @@ from jax.custom_derivatives import SymbolicZero
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.float_bits import raw_fields
+from dew.nn.float_bits import stored_zero
 from dew.nn.programs import holes
 
 SATURATION = program.Saturation(growth=64, depth=4)
@@ -26,11 +26,7 @@ SATURATION = program.Saturation(growth=64, depth=4)
 
 def _observed(w: jax.Array, *values: jax.Array) -> tuple[jax.Array, ...]:
     """Ignore a missing observation, but not an ordinary finite observation of weight zero."""
-    if jnp.issubdtype(w.dtype, jnp.floating):
-        bits, sign, _, _ = raw_fields(w)
-        zero = bits == sign  # The backend must not treat a positive subnormal as empty.
-    else:
-        zero = w == 0
+    zero = stored_zero(w) if jnp.issubdtype(w.dtype, jnp.floating) else w == 0
     nonfinite = functools.reduce(jnp.logical_or, (~jnp.isfinite(value) for value in values))
     absent = zero & nonfinite
     return tuple(jnp.where(absent, jnp.zeros_like(value), value) for value in (*values, w))

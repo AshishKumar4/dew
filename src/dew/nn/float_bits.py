@@ -71,6 +71,17 @@ TWO_FACTOR_REACH = two_factor_reach(jnp.float32)
 """`two_factor_reach` of float32, 252: a caller whose `k` stays within it states it for two factors."""
 
 
+def _raw_word(x: jax.Array) -> jax.Array:
+    return jax.lax.bitcast_convert_type(x, jnp.dtype(f"uint{jnp.finfo(x.dtype).bits}"))
+
+
+def stored_zero(x: jax.Array) -> jax.Array:
+    """Whether an IEEE value stores either zero, rather than a subnormal a comparison may flush."""
+    words = _raw_word(x)
+    magnitude = (1 << (jnp.finfo(x.dtype).bits - 1)) - 1
+    return (words & words.dtype.type(magnitude)) == 0
+
+
 def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """A float `x`'s bits as the unsigned integer of its width (a format a byte or wider), and its raw fields
     in that type: its sign bit in place (0 in a format with none, E8M0), its biased exponent shifted down
@@ -78,8 +89,8 @@ def raw_fields(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array
     normalization (`float_bits`) and a result's rounding (`lowered_rounded`, `precision`'s division) are
     their callers'."""
     limits = jnp.finfo(x.dtype)
-    word = jnp.dtype(f"uint{limits.bits}")
-    bits = jax.lax.bitcast_convert_type(x, word)
+    bits = _raw_word(x)
+    word = bits.dtype
     signed = limits.bits - limits.nexp - limits.nmant
     # The exponent's field by its width (`nexp`): a format with no infinity (E4M3) holds finite values in
     # its top binade, past IEEE's `maxexp`.
