@@ -249,7 +249,6 @@ NARROW = frozenset(map(jnp.dtype, (jnp.bfloat16, jnp.float16)))
 """The narrow formats whose elementwise arithmetic is formed in float32."""
 
 
-
 ROUNDED_ONCE = frozenset({jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p,
     jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p, jax.lax.sqrt_p})
 """The elementwise primitives whose narrow-float equation is its float32 one rounded once (`_normal`): IEEE's
@@ -294,9 +293,8 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
     rounded once to the narrow dtype; a checkpoint's name its operand (`VALUE_IDENTITIES`); a value widened
     exactly and rounded back to its own dtype that value itself (`widened`, each exact widening's result by
     its source); a value less a constant zero that value; a reshape that only adds unit axes the broadcast
-    it is; a transpose pushed into
-    broadcasts where each source keeps its own axis order,
-    broadcasts where each source keeps its own axis order; and an elementwise equation over values one layout
+    it is; a transpose pushed into broadcasts where each source keeps its own axis order; and an
+    elementwise equation over values one layout
     made from equal shapes, beside scalars, that equation before the layout (`laid`). Every other equation as
     it is."""
     primitive = equation.primitive
