@@ -1560,7 +1560,7 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], FORMED[9]], ids=str)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], *FORMED[9:12]], ids=str)
 def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
     """80 draws, 8 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
     inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b); the gate holds a draw's
@@ -1569,9 +1569,9 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
     memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
     each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
-    entered twice sums both documents' gradients. RWKV6's readout of the memory entering its token
-    (`Hooks.reads`) among them: a window refused it, its document's memory entering mid-chunk (base review
-    80b5b68ad F1)."""
+    entered twice sums both documents' gradients. The readouts reaching a document's entering memory at its
+    first token among them (RWKV6's, the delta rule's read before its update, a write gate's own write
+    weighed): a window refused RWKV6's, its memory entering mid-chunk (base review 80b5b68ad F1)."""
     assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
                          f'xla {hooks} a forked call\'s documents', seeds=80)
 
