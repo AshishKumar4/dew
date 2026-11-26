@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax._src import core as jax_core
+from jax._src import config as jax_config, core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
@@ -346,6 +346,45 @@ def _decode_gated(index: Index, joined: int, rows: int) -> Region | None:
     outputs = tuple(equations[down].outvars)
     at = min((reader for out in outputs for reader in index.readers[out]), default=len(equations))
     return Region(places, region_inputs(index.jaxpr, places), outputs, at)
+
+
+def lower_decode(jaxpr: jcore.Jaxpr, *, rows: int, enabled: bool = False) -> jcore.Jaxpr:
+    """Experimental A/B arm: lower a contiguous gated region as one nested program.
+
+    This is not a GPU kernel. XLA owns all three written dots, their rounding, the original
+    activation, and any fusion it can do. Placed or interleaved regions stay as written.
+    """
+    from dew.algebra.terms import body_key, provenance_key
+
+    if not enabled or jax_config.disable_jit.value or not jax.sharding.get_abstract_mesh().empty:
+        return jaxpr
+    written = []
+    for region in decode_regions(jaxpr, rows=rows):
+        first, down = region.places[0], region.places[-1]
+        if down - first + 1 != len(region.places):
+            continue
+        equations = list(jaxpr.eqns[first:down + 1])
+        atoms = (atom for eqn in equations for atom in (*eqn.invars, *eqn.outvars))
+        if any(not isinstance(aval := atom.aval, ShapedArray) or aval.weak_type
+               or not aval.sharding.mesh.empty for atom in atoms):
+            continue
+        if any(eqn.ctx.cur_abstract_mesh is not None and not eqn.ctx.cur_abstract_mesh.empty
+               for eqn in equations):
+            continue
+        debug = jcore.DebugInfo("algebra_decode", "gated decode region", None, None)
+        body = jcore.Jaxpr([], list(region.inputs), list(region.outputs), equations, debug_info=debug)
+        closed = jcore.Jaxpr(body, [])
+        if (key := body_key(closed)) is not None:
+            written.append(Written(region.places, region.inputs, region.outputs, down, _decode_call(body),
+                                   ("decode", key, provenance_key(closed))))
+    return _spliced(jaxpr, written) if written else jaxpr
+
+
+def _decode_call(body: jcore.Jaxpr) -> Callable:
+    def gated_decode(*operands):
+        return tuple(jax_core.eval_jaxpr(body, (), *operands))
+
+    return gated_decode
 
 
 def _decode_product(equation: jcore.JaxprEqn) -> bool:
