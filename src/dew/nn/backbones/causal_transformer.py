@@ -71,12 +71,19 @@ from ..inputs import LayerInputs, PredictionPhase, coordinates_of
 from ..kernels import generation
 from ..kv_cache import CacheSpec, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
-from ..mla import MLAMixer
 from ..ngpt import NGPT
 from ..norms import NormSite
 from ..precision import at_least_fp32, float32_dot_general, l2norm
 from ..progress import Progress
-from ..protocols import EXITS, ExitPasses, OutputTable, ProjectionGroup, RecomputeStatement, declared_groups
+from ..protocols import (
+    EXITS,
+    ExitPasses,
+    IndexedMixer,
+    OutputTable,
+    ProjectionGroup,
+    RecomputeStatement,
+    declared_groups,
+)
 from ..rope import Scaling
 from ..sharding import RESIDUAL, constrain
 from ..value_experts import ValueExperts
@@ -1960,7 +1967,7 @@ class CausalTransformer(LinearProducts):
                      if mixer is not None)
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]:
         return tuple(indexed for mixer in self.declared_mixers for indexed in mixer.indexed_mixers)
 
     @property

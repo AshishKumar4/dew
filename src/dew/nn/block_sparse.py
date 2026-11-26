@@ -16,7 +16,7 @@ its keys. A selection takes no gradient."""
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import ClassVar, Literal, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +36,9 @@ from dew.nn.mla import SELECTIONS, indexer_kl
 from dew.nn.precision import float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import SELECTING, block_maxima, block_runs, selected_attention, top_k_selection
+
+if TYPE_CHECKING:
+    from dew.nn.protocols import IndexedMixer
 
 
 def _earlier_blocks(queries: int, blocks: int, block: int) -> jax.Array:
@@ -519,7 +522,7 @@ class BlockSparseAttentionMixer(AttentionMixer):
                 "lays none of")
 
     @property
-    def indexed_mixers(self) -> tuple["BlockSparseAttentionMixer", ...]:
+    def indexed_mixers(self) -> tuple["IndexedMixer", ...]:
         # MSA's index branch, which an objective trains (`IndexerTraining`), selecting the keys its queries
         # attend (`sparse`).
         return (self,) if self.selection == "msa" else ()

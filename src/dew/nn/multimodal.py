@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from dew.nn.cross_pass import CrossPass
     from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
-    from dew.nn.mla import MLAMixer
+    from dew.nn.protocols import IndexedMixer
 
 
 @runtime_checkable
@@ -695,7 +695,7 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.mtp_hyper_connections
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]:
         return self.language_model.indexed_mixers
 
 

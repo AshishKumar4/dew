@@ -70,7 +70,6 @@ if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.inputs import DenoisingCondition
     from dew.nn.kv_cache import KVCache
-    from dew.nn.mla import MLAMixer
     from dew.nn.norms import NormBounds
     from dew.quantization import InputQuantizer
 
@@ -1399,13 +1398,22 @@ class DecoderTraining(Predicting, Protocol):
     depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
     and `'mtp_logits'`, `Predicting`), which with `mtp_hyper_connections` set
     read the residual streams a forward sows under `prediction_inputs/states`,
-    and the MLA mixers it declares with DeepSeek's lightning indexer."""
+    and the mixers it declares with an indexer an objective trains (`IndexedMixer`)."""
 
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None: ...
 
     @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+    def indexed_mixers(self) -> tuple[IndexedMixer, ...]: ...
+
+
+class IndexedMixer(Protocol):
+    """A mixer kind carrying an indexer an objective trains (`MixerBase.indexed_mixers`): DeepSeek's lightning
+    indexer (`MLAMixer`), MSA's index branch (`BlockSparseAttentionMixer`); `sparse` where its selection
+    picks the keys each query attends, its indexer trained beside dense attention where not."""
+
+    @property
+    def sparse(self) -> bool: ...
 
 
 @runtime_checkable

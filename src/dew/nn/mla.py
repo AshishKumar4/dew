@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -89,6 +89,9 @@ from dew.nn.sparse_selection import (
     top_k_selection,
 )
 from dew.quantization import LinearProducts
+
+if TYPE_CHECKING:
+    from dew.nn.protocols import IndexedMixer
 
 INDEX_KEYS = "cached_index"
 """A sparse latent attention's cached indexer keys, one compact row a token beside its keys."""
@@ -1175,7 +1178,7 @@ class MLAMixer(MixerBase):
         return self.index_n_heads is not None
 
     @property
-    def indexed_mixers(self) -> tuple["MLAMixer", ...]:
+    def indexed_mixers(self) -> tuple["IndexedMixer", ...]:
         return (self,) if self.indexed else ()
 
     @property
