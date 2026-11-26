@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from lane_environment import outside_any_cluster
 from process_support import coordinator_port, output, owned
 
@@ -123,27 +124,54 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
 
 
 
-def test_dew_launch_shows_each_process_its_own_gpus_alone():
-    """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`, the
-    ordinals the pool may use, in order), numbered from 0 for JAX, so a process of one GPU opens no
-    neighbour's whatever pool it joins and keeps XLA's CUDA graphs (row 12761: every rank counted the host's
-    eight)."""
+LISTING = """GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-0a11)
+GPU 1: NVIDIA H100 80GB HBM3 (UUID: GPU-1b22)
+GPU 2: NVIDIA H100 80GB HBM3 (UUID: GPU-2c33)
+GPU 3: NVIDIA H100 80GB HBM3 (UUID: GPU-3d44)
+  MIG 1g.10gb     Device  0: (UUID: MIG-5e55)
+  MIG 1g.10gb     Device  1: (UUID: MIG-6f66)
+"""
+"""A host's four GPUs as `nvidia-smi -L` lists them, the last split into two MIG devices."""
+
+
+def test_dew_launch_shows_each_process_its_own_gpus_alone(monkeypatch):
+    """`dew launch`'s processes on a host each see only the GPUs they take (`CUDA_VISIBLE_DEVICES`), numbered
+    from 0 for JAX, so a process of one GPU opens no neighbour's whether or not it joins them and keeps
+    XLA's CUDA graphs (row 12761: every rank counted the host's eight): the host's own ordinals where the pool
+    states none; else its places among the GPUs the pool's list shows as CUDA enumerates it on the host's
+    `nvidia-smi -L` listing, by index or UUID, up to an entry naming none of them (row 13104: `0,2,-1,1`
+    shows 0 and 2); refused before any process starts where the list shows too few, or CUDA's enumeration
+    of it is not known (the host lists none of its GPUs, one GPU named twice, MIG devices). A pool kept off
+    its GPUs takes its devices by their places. The host answers through
+    `subprocess`, whatever machine runs this."""
+    import subprocess
+
+    from dew._cli import launch as launching
     from dew._cli.launch import Launch
     from dew.clusters import LOCAL_DEVICES
 
-    launch = Launch(command=("python", "train.py"), processes_per_host=2,
-                    env=("CUDA_VISIBLE_DEVICES=4,5,6,7", "JAX_PLATFORMS=cuda"))
-    pool = launch.pool(["localhost"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in pool] == [
-        ("4,5", "0,1"), ("6,7", "0,1")]
-    # A host no one counted the GPUs of (a remote one whose nvidia-smi does not answer) and whose pool lists
-    # none: each process its host's own ordinals from its first, as JAX_LOCAL_DEVICE_IDS named them.
-    uncounted = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1, port=8476,
-                       env=("JAX_PLATFORMS=cuda",)).pool(["gpu-host.invalid"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in uncounted] == [
-        ("0", "0"), ("1", "0")]
-    # A pool kept off its GPUs takes its devices by their places, its GPUs left as it hid them.
-    on_cpu = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
-                    env=("JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=")).pool(["localhost"])
-    assert [(process.env["CUDA_VISIBLE_DEVICES"], process.env[LOCAL_DEVICES]) for process in on_cpu] == [
-        ("", "0"), ("", "1")]
+    def pool(listing: str | None, *env: str) -> list[tuple[str, str]]:
+        def run(argv, **_):
+            if listing is None or "nvidia-smi -L" not in " ".join(argv):
+                raise OSError("no answer")
+            return subprocess.CompletedProcess(argv, 0, stdout=listing, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        launching.listed_on.cache_clear()
+        launch = Launch(command=("python", "train.py"), processes_per_host=2, devices_per_process=1,
+                        port=8476, env=env)
+        return [(process.env.get("CUDA_VISIBLE_DEVICES", ""), process.env[LOCAL_DEVICES])
+                for process in launch.pool(["gpu-host.invalid"])]
+
+    assert pool(None, "JAX_PLATFORMS=cuda") == [("0", "0"), ("1", "0")]
+    assert pool(LISTING, "JAX_PLATFORMS=cuda", "CUDA_VISIBLE_DEVICES=0,2,-1,1") == [("0", "0"), ("2", "0")]
+    by_uuid = pool(LISTING, "JAX_PLATFORMS=cuda", "CUDA_VISIBLE_DEVICES=GPU-3d44,GPU-1b")
+    assert by_uuid == [("GPU-3d44", "0"), ("GPU-1b", "0")]
+    # Refused: a list showing too few (`0,99,1` shows 0 alone), none checked (no listing), one naming no GPU,
+    # one GPU named twice (by index and UUID), and MIG devices, whose enumeration CUDA decides.
+    refused = ((LISTING, "0,99,1"), (None, "0,1"), (LISTING, "GPU-9f,0"), (LISTING, "0,GPU-0a11"),
+               (LISTING, "MIG-5e55,MIG-6f66"))
+    for listing, visible in refused:
+        with pytest.raises(ValueError):
+            pool(listing, "JAX_PLATFORMS=cuda", f"CUDA_VISIBLE_DEVICES={visible}")
+    assert pool(None, "JAX_PLATFORMS=cpu", "CUDA_VISIBLE_DEVICES=") == [("", "0"), ("", "1")]

@@ -6,6 +6,7 @@ built around it."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import ahead_on_the_host
 from float64_replay import float64_replay
 from model_support import attending
 from reference_error import as_given, assert_as_exact, widened
@@ -136,13 +137,15 @@ def meanflow_case(kernel: str):
     float32 step 0.4 to 0.8% from the truth in its worst leaf and a bf16 step 1.2 to 1.9%."""
     model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1, interval=True,
                       dtype="bfloat16")
-    inputs = InputSpec(Field("image", (16, 16, 3)),
-                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
-    xla = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
     # Each a program of its own (row 6857): run op by op, the model's initializer, and check 1's one call
     # of each arm on a draw holding NumPy arrays (`reference_error._refuse_numpy_arms`), compiled over a
-    # thousand small programs on the GPU a cell holds.
-    template = attending("xla")(jax.jit(xla.init))(jax.random.PRNGKey(0))
+    # thousand small programs on the GPU a cell holds. Its inputs' table and its initial weights on the
+    # host, before its site, as a GPU tier part's prepare runs it (row 8028).
+    with ahead_on_the_host():
+        inputs = InputSpec(Field("image", (16, 16, 3)),
+                           {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+        xla = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
+        template = attending("xla")(jax.jit(xla.init))(jax.random.PRNGKey(0))
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
     @attending("xla")
