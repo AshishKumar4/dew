@@ -63,7 +63,7 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
         row, head = shared_place(value.shape, row, head)
     if kind is Kind.BAND:
         origin_row, _ = shared_place(origins.shape, row, 0)
-        column = keys[None, :] - origins[origin_row, 0, rows][:, None]
+        column = keys[None, :] - origins[origin_row, 0, rows][:, None].astype(jnp.int32)
         inside = (column >= 0) & (column < value.shape[-1])
         read = jnp.take_along_axis(value[row, head, rows], jnp.clip(column, 0, value.shape[-1] - 1), axis=-1)
         return jnp.where(inside, read, jnp.zeros((), read.dtype))

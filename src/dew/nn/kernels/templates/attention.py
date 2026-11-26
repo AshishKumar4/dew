@@ -1210,7 +1210,9 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int,
     if kind_of(param) is Kind.BAND:
         origin_row, _ = shared_place(origins.value.shape, row, 0)
         bands = value[row, head]
-        column = jnp.arange(keys, dtype=jnp.int32)[None, :] - origins.value[origin_row, 0][:, None]
+        # Its origins whole keys whatever dtype a truth's draw widened them to.
+        origin = origins.value[origin_row, 0][:, None].astype(jnp.int32)
+        column = jnp.arange(keys, dtype=jnp.int32)[None, :] - origin
         inside = (column >= 0) & (column < bands.shape[-1])
         read = jnp.take_along_axis(bands, jnp.clip(column, 0, bands.shape[-1] - 1), axis=-1)
         return jnp.where(inside, read, jnp.zeros((), bands.dtype))
