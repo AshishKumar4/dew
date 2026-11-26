@@ -1347,7 +1347,8 @@ def test_a_bf16_whole_head_rounds_its_logits_once_its_sums_are_whole(devices):
     shapes = (jax.ShapeDtypeStruct((15, 32), jnp.bfloat16, sharding=NamedSharding(mesh, P(None, "tensor"))),
               jax.ShapeDtypeStruct((32, 64), jnp.bfloat16, sharding=NamedSharding(mesh, P("tensor", None))),
               jax.ShapeDtypeStruct((15,), jnp.int32, sharding=NamedSharding(mesh, P())))
-    with generation.assumed("sm90"), jax.set_mesh(mesh):
+    # Traced as an H100's run traces it, at JAX's default precision, which multiplies a bf16 head as bf16.
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"), jax.set_mesh(mesh):
         module = jax.jit(jax.grad(loss, argnums=(0, 1))).trace(*shapes).lower(
             lowering_platforms=("cuda",)).compiler_ir("stablehlo")
     products = set()
