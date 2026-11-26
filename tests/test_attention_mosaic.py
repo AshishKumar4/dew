@@ -1759,19 +1759,6 @@ def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpre
 
 
 @INTERPRETS
-@pytest.mark.parametrize("call", ["causal", "full"])
-def test_an_a100_backward_parking_its_dv_sums_is_on_par_interpreted(call):
-    """An A100's bf16 backward at width 128 on 64 x 64 tiles of one consumer whose dK/dV launch parks its dV
-    sums in a shared tile across a step's score, dP and dK products and stages its transposed streams at 64
-    bytes (`BackwardTiles.parked`), as an A100 runs it under the interpreter: on par with the reference
-    (check 1)."""
-    spans = template.spans(128, 128, 1, causal=call == "causal")
-    parked = attention_mosaic.BackwardTiles(64, 64, 2, 1, family="mma.sync", fused=False, parked=True)
-    _check_spans(f"{call} parked dV", spans, (1, 128, 4, 2), interpret=True, backward=True, width=128,
-                 pins=(None, parked), target=generation.gpu_target("sm80"))
-
-
-@INTERPRETS
 def test_a_block_mask_prefill_over_fp8_keys_and_values_is_on_par_interpreted():
     """A block-mask sparse prefill whose keys and values are FP8 codes with a token's fp32 scale
     (kernel-templates.md §A row 64, FlagAttention's Hy3): a caller's block mask (`block_selected`'s, each

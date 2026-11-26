@@ -800,13 +800,11 @@ def test_the_walked_backward_states_each_product_its_issuers_walk(form):
     pytest.param(attention_mosaic.BackwardTiles(64, 128, 2, 2, fused=True, family="tcgen05.keys"),
                  id="keys-as-the-one-launch"),
     pytest.param(dataclasses.replace(KEYS_TILES["fused"], dkv_blocks=(32, 128)), id="fused-dq-of-32-rows"),
-    pytest.param(dataclasses.replace(KEYS_TILES["two launches"], parked=True), id="parked-in-tensor-memory"),
 ])
 def test_a_walked_placement_takes_only_the_launch_it_is_written_for(pin):
-    """A backward config naming a walked placement on a launch it is not written for, a fused walk whose dQ
-    products would be 32 rows (tcgen05 issues 64 and 128), or a placed walk parking its dV sums, which it
-    holds in tensor memory (`BackwardTiles.parked`, a register-operand walk's): the B200's legality refuses
-    it (`legal`), where the two launches' placements as written are taken."""
+    """A backward config naming a walked placement on a launch it is not written for, or a fused walk whose
+    dQ products would be 32 rows (tcgen05 issues 64 and 128): the B200's legality refuses it (`legal`), where
+    the two launches' placements as written are taken."""
     shape, spans = (1, 256, 4, 64), template.spans(256, 256, 1, causal=True)
     query = jnp.zeros(shape, jnp.bfloat16)
     key = jnp.zeros((1, 256, 2, 64), jnp.bfloat16)

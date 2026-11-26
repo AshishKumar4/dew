@@ -31,7 +31,6 @@ from dew.nn.kernels.templates import (
 from dew.nn.kernels.templates.attention import DKV_GRADS, TILED, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
-    Parked,
     TileWalk,
     _coords,
     _Spans,
@@ -84,8 +83,7 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     where its logits' queries are staged (`BackwardTiles.staged_logits`) one slot's of them and their two
     turns; where a score hook's tile parameter is `tiled`, each consumer's stage for its tile gradients'
     stores (`Family.stored`); each consumer's relay tile where its weights and score cotangents reach dV's
-    and dK's products through shared memory (`Family.relay_bytes`, `_relayed`); each consumer's tile of its
-    parked dV sums where it parks them (`BackwardTiles.parked`); and its query and
+    and dK's products through shared memory (`Family.relay_bytes`, `_relayed`); and its query and
     output-cotangent streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On
     a layout whose
     consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
@@ -144,9 +142,6 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     if tiled:
         scoped.append(family.staged_memory((consumers, block_k, rows), jnp.float32))
     scoped += _relay_tiles(family, consumers, block_k, rows, dtype)
-    if config.parked:
-        # Each consumer's parked dV sums (`BackwardTiles.parked`, `_parked`), its share of the columns, last.
-        scoped.append(family.staged_memory((consumers, block_k, value_width // columns), jnp.float32))
     # Keys first, the logits' and dP's products read their queries (the stream of them by the power where it
     # has one, its stage where staged) and the output cotangents transposed; a launch's own swizzle every
     # stream's.
@@ -750,9 +745,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
-        park, relay, tile_stage, fused_stages, logits_stages = _held_stages(
+        relay, tile_stage, fused_stages, logits_stages = _held_stages(
             rest, relayed=family.relay_bytes(block_k, count) > 0, tiled=tiled,
-            fused=(4 if placing else 2) if walk.fused else 0, parked=program.tiles.parked)
+            fused=(4 if placing else 2) if walk.fused else 0)
         row, head = family.program_index("batch"), family.program_index("heads")
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
         views, streams = _query_streams(family, streams, named, (score_refs, kinds), row, head, heads=heads)
@@ -780,8 +775,6 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                                   refs=((tile_refs, banded), tile_stage, spans_of, drop_of, score_refs,
                                         k_smem, v_smem, dq_ref, fused_stages),
                                   statistics=rows_of)
-            if park is not None:
-                step = functools.partial(_parked, step, family, park.at[index], walk.interpret)
             # Each consumer's walk over the key block's readers (`Family.walk_own`).
             run = program.whole_run(k_first, q_steps, spans_of)
             key_sums, (dk, dv) = family.walk_own(
@@ -832,15 +825,13 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     swapped = 3 if walk.fused else 2
     return (*(head_unlayout(family, grad, heads) for grad in grads[:swapped]), *grads[swapped:])
 
-def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int, parked: bool = False) -> tuple:
+def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
     """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:
-    its consumers' parked dV tiles where `parked` (the last), their relay tiles where `relayed` and its tile
-    gradients' stage where `tiled`, a fused launch's `fused` stages and barriers (its placed walk's dQ ring,
-    `_PlacedDq`), then its logits'."""
-    park, rest = (rest[-1], rest[:-1]) if parked else (None, rest)
+    its consumers' relay tiles where `relayed` and its tile gradients' stage where `tiled` (the last), a
+    fused launch's `fused` stages and barriers (its placed walk's dQ ring, `_PlacedDq`), then its logits'."""
     relay, rest = (rest[-1:], rest[:-1]) if relayed else ([], rest)
     tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-    return park, relay, tile_stage, rest[:fused], rest[fused:]
+    return relay, tile_stage, rest[:fused], rest[fused:]
 
 
 def _block_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple, place: tuple,
@@ -917,17 +908,6 @@ def _consumer_step(walk: _Backward, place: tuple, k_first, index: int, holder: i
     adds = _fused_adds(walk, dq_ref, fused_stages, place, index, k_smem, holder)
     return functools.partial(_dkv_step, walk, (k_smem.at[holder], v_smem.at[holder]), statistics, coords_of,
                              params_of, store_tiles, shares, part, stage, adds)
-
-
-def _parked(step: Callable, family: mosaic.Family, smem, interpret: bool, index, slots, carry, accumulators,
-            *, masked: bool = True):
-    """A dK/dV consumer's `step` with its dV sums parked in its shared tile `smem` across the step's score,
-    dP and dK products (`BackwardTiles.parked`), dV's product reading them back (`issued_into`): a step's
-    registers beside dK's sums alone until then."""
-    dk, dv = accumulators
-    family.written(smem, dv)
-    mosaic.synced(interpret)
-    return step(index, slots, carry, (dk, Parked(smem)), masked=masked)
 
 
 def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first, rows: int) -> tuple:

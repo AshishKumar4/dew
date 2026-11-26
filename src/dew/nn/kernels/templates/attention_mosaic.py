@@ -1779,12 +1779,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # mainloop's legality refuses it (`_Mainloop.legal`).
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
             return False
-        # Parked dV sums (`BackwardTiles.parked`) are the two launches' keys-first dK/dV walk's on a family
-        # holding its sums and operands in registers, each consumer its own key block: none on a fused or
-        # shared-keys launch, a placed walk's tensor memory or consumers sharing a block (`split_queries`).
-        if config.parked and (config.fused or config.shared_keys or not dkv_family.operands_in_registers
-                              or dkv_family.places_on_role or split_queries(dkv_family)):
-            return False
         # A placement takes the launch it is written for (`placed.walked_launch`): keys first the dK/dV
         # launch's, queries first the dQ launch's; the one launch's keys first apart from its config's own.
         dq_named = found.get(config.family)
@@ -2239,44 +2233,21 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         residing = [] if dq.products_overlap or (not dq.budgets_registers and dq.programs(1) < 2) else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
-        # Whole columns of a key block whose dK and dV sums pass a consumer's registers beside a step's
-        # products, dV's parked in shared memory across them (`BackwardTiles.parked`), before smaller tiles
-        # at more programs: on a family reading its operands from registers, its consumers each their own key
-        # block (an A100's bf16 at width 128, 2 x 4096 causal: 64 x 64 on one consumer parked 10.50 ms,
-        # spill-free, where it spilled unparked at 9.70, and the 32 x 32 derived at two programs 12.39,
-        # M-NA-45, M-NA-49); where the unparked tile holds, it. Its values wider than 64 columns alone: at 64
-        # dK's and dV's sums held beside a 64 x 64 step unparked.
-        wide = ba.arguments["value"].shape[-1] > 64
-
-        def first(wanted, *, parked: bool) -> BackwardTiles | None:
+        for wanted in (*residing, fits):
             for columns in (1, 2, 4):
                 fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, dq) else ()
                 for rows in (None, *fewer):
                     walks = _query_walk(rows)
                     for staged in (False, True):
-                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged,
-                                  parked=parked) -> BackwardTiles:
+                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
+                                  ) -> BackwardTiles:
                             return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
-                                                 columns=columns, staged_logits=staged, parked=parked, **dkv)
+                                                 columns=columns, staged_logits=staged, **dkv)
 
                         if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
                                               overlapped=False, walks=walks, rows=rows):
                             return config
-            return None
-
-        plain = next((config for wanted in (*residing, fits) if (config := first(wanted, parked=False))),
-                     None)
-        if not (wide and dq.operands_in_registers) or split_queries(dq) or dkv:
-            return plain
-        # A parked tile only where it is larger than the tile held unparked: parking a tile the unparked
-        # derivation holds a peer of costs its dV sums' round trips for nothing (an A100's d128 derived
-        # 32 x 32 parked and its logits staged, 16.31 ms, against 32 x 32 unparked 12.39, M-NA-49).
-        parked = first(lambda config: (config.parked and fits(config)
-                                       and not fits(dataclasses.replace(config, parked=False))), parked=True)
-        if parked is not None and (plain is None or parked.block_q * parked.block_k
-                                   > plain.block_q * plain.block_k):
-            return parked
-        return plain
+        return None
 
     def _scopes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                 target: generation.GpuTarget) -> list[tuple[mosaic.Family, int, resources.Scope]]:
