@@ -2251,21 +2251,23 @@ def _one_bound[Entry](readers: Mapping[str, Reader | Entry], chains: Mapping[str
     # split of another shape compiles apart whatever bound it declares, and a bound past its windows' own
     # makes its sequence kernels launch for documents none of its windows holds (row 12846: a pack(512)
     # split beside a pack(2048) one declared 2048 documents a 512-token row).
+    # Each split's windows' lengths, read once (`_declared`), as its bound was.
+    widths = {name: _declared(chains[name]).widths if name in chains else {} for name in compiled}
     most: dict[tuple[str, int | None, int], int] = {}
     for name, entry in compiled.items():
         for step in _packed_steps(entry):
             if step.max_segments is not None:
-                shape = _shape_of(entry, chains.get(name), step.fields[0])
+                shape = _shape_of(entry, widths[name], step.fields[0])
                 most[shape] = max(most.get(shape, 0), step.max_segments)
-    return {name: _held_bounded(compiled[name], chains.get(name), most) if name in compiled else entry
+    return {name: _held_bounded(compiled[name], widths[name], most) if name in compiled else entry
             for name, entry in readers.items()}
 
 
-def _shape_of(reader: functools.partial, chain: Pipeline | None, ids: str) -> tuple[str, int | None, int]:
+def _shape_of(reader: functools.partial, widths: Mapping[str, int], ids: str) -> tuple[str, int | None, int]:
     """The shape a held reader's packed field `ids` batches in: the field, its windows' length (the longest
-    window its `chain` as written declares, as its bound was read, `_declared`; None where none shows) and
-    the reader's batch."""
-    return ids, None if chain is None else _declared(chain).widths.get(ids), reader.keywords["build"].batch
+    window its chain as written declares, as its bound was read, `widths` of `_declared`; None where none
+    shows) and the reader's batch."""
+    return ids, widths.get(ids), reader.keywords["build"].batch
 
 
 def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
@@ -2273,11 +2275,11 @@ def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
     return tuple(step for step in reader.keywords["host"] if isinstance(step, Coordinated))
 
 
-def _held_bounded(reader: functools.partial, chain: Pipeline | None,
+def _held_bounded(reader: functools.partial, widths: Mapping[str, int],
                   most: Mapping[tuple[str, int | None, int], int]) -> functools.partial:
     """`reader` with each packed field's step whose bound it knows declaring `most`'s for its shape
-    (`_shape_of`, by its `chain` as written)."""
-    host = tuple(Coordinated.laid(step.fields, most[_shape_of(reader, chain, step.fields[0])], step.laid_out)
+    (`_shape_of`, by its chain's window `widths`)."""
+    host = tuple(Coordinated.laid(step.fields, most[_shape_of(reader, widths, step.fields[0])], step.laid_out)
                  if isinstance(step, Coordinated) and step.max_segments is not None else step
                  for step in reader.keywords["host"])
     return functools.partial(reader.func, *reader.args, **{**reader.keywords, "host": host})
