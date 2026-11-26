@@ -285,19 +285,24 @@ def normalized(significand: jax.Array, exponent: jax.Array, reach: int) -> Scale
 
 
 def base2(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x log2(e)`, a natural exponent's base-2 one, as its rounded value and its residual, exact together:
-    the constant split into two floats of `x`'s format, the larger normalized first so a tiny `x`'s
-    residual stays normal, and its product with `x` split exactly (`two_product`: float32's over truncated
-    halves, which no contraction into a fused multiply-add changes and no large `x` overflows; float64's by
-    Dekker's splitter, past which no float32 value's difference reaches). The residual's product is rounded
-    apart from its sum (`lax.optimization_barrier`), so no compiler's contraction into a fused multiply-add
-    moves it with the fusion it lands in."""
-    factor, power = np.frexp(math.log2(math.e))
-    x = x * np.asarray(2.0 ** int(power), x.dtype)
+    """Convert a natural exponent to base two with a separate rounding residual.
+
+    Split half of log2(e) into two words and apply the factor of two to the input, unless it is in
+    the top binade. In that binade apply it to the two output words instead: doubling the input
+    there can overflow even when the product fits. A nonfinite leading word has no residual.
+    """
+    factor = math.log2(math.e) / 2
     high = np.asarray(factor, x.dtype)
     low = np.asarray(factor - float(high), x.dtype)
-    rounded, error = two_product(x, high, bit_split=x.dtype == jnp.float32)
-    return rounded, error + lax.optimization_barrier(x * low)
+    magnitude = jnp.abs(x)
+    finite = magnitude < np.inf
+    top = magnitude >= 2.0 ** (jnp.finfo(x.dtype).maxexp - 1)
+    scale = jnp.where(top, np.asarray(2, x.dtype), np.asarray(1, x.dtype))
+    operand = jnp.where(finite, x, 0) * jnp.where(top, np.asarray(1, x.dtype), np.asarray(2, x.dtype))
+    rounded, error = two_product(operand, high, bit_split=x.dtype in (jnp.float32, jnp.float64))
+    residual = error + lax.optimization_barrier(operand * low)
+    head = jnp.where(finite, rounded * scale, x)
+    return head, jnp.where(jnp.abs(head) < np.inf, residual * scale, 0)
 
 
 def one_like(x: jax.Array) -> Scaled:

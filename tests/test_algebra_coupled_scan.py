@@ -99,6 +99,40 @@ def test_a_coupled_chunks_replay_is_its_token_scan():
     np.testing.assert_array_equal(np.asarray(leaving), np.asarray(jnp.stack(pair)))
 
 
+@pytest.mark.parametrize("batched", [False, True], ids=["one chunk", "mapped chunks"])
+def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(batched):
+    spec = declaration(1.0, 2, 1, jnp.float32, reset=False, bound=1.0)
+    forms = scan.derive_scan(spec, saturation=SATURATION)
+    q = np.asarray([[0, 0], [2.0 ** 127, 2.0 ** 127]], np.float32)
+    k = np.asarray([[2, -2], [0, 0]], np.float32)
+    v = np.asarray([[0.125], [0]], np.float32)
+    z = np.zeros(2, np.float32)
+
+    def run(q, k, v, z):
+        tokens = {"q": q, "k": k, "v": v, "g": z, "beta": jnp.ones_like(z), "p": jnp.zeros_like(k), "mu": z}
+        state = forms.init({})
+        prepared = forms.prepare(tokens)
+        end, held = forms.step(state, prepared)
+        out = forms.mapped(prepared, state, held)
+        read, _ = forms.replay(tokens, state[1])
+        cotangent = jnp.asarray([[0.], [1.]], out.dtype)
+        _, gradient = forms.backward(tokens, state, jnp.zeros_like(end[1]), cotangent)
+        return out, read, gradient["q"]
+
+    # The same momentum enters both tokens' unit-weight memory updates. The resulting products
+    # are 2^127 times ±0.5, not q times the bare key (±2^128).
+    state = (k[0].astype(np.float64) * (2 * float(v[0, 0])))[:, None]
+    if batched:
+        q = np.stack((q, np.asarray([[0, 0], [3, 1]], q.dtype)))
+        run = jax.vmap(run, in_axes=(0, None, None, None))
+    out, replayed, adjoint = jax.jit(run)(q, k, v, z)
+    expected = q.astype(np.float64) @ state
+    np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(replayed, expected)
+    derivative = np.asarray([[0, 0], [0.5, -0.5]], np.float32)
+    np.testing.assert_array_equal(adjoint, np.broadcast_to(derivative, q.shape))
+
+
 def uncoupled(pair, q, k, v, g, beta, p, mu):
     """A pair whose memory steps along the momentum entering the token, not the one it leaves: no coupled
     form's."""

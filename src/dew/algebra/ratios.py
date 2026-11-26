@@ -14,6 +14,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.lax import lax as lax_internal
 from jax.interpreters import ad, batching
 from jax.sharding import PartitionSpec
 
@@ -33,6 +34,7 @@ from dew.algebra.windows import (
     chunk_width,
 )
 from dew.nn.float_bits import raw_fields
+from dew.nn.precision import at_least_fp32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,7 +42,8 @@ class Ratio:
     """A ratio of sums of products of float operands (`ratio_p`): `sum numerator / sum denominator`, each a
     tuple of terms `(coefficient, factors)`, a factor `("v", i)` operand `i`, `("e", i, j)` the factor
     `exp(s (operand_i - operand_j))` of `units` (`_factors_value`) or `("s",)` the units' scale `s` in the
-    operands' format. The numerator is summed over the operands' `axis` where `reduced` (the result without
+    operands' format, or `("m", i)` a held zero/one term mask. The numerator is summed over the operands'
+    `axis` where `reduced` (the result without
     it), else taken a state at a time; the denominator is always summed over it (none: one). The numerator
     is summed too over `over`, further axes of the operands' domain, each term over its own extent there (a
     term of none counted once), the result one along them: a transpose's cotangent summed over the axes its
@@ -334,7 +337,7 @@ def _products_summed(operands, form: Ratio):
     if not form.reduced:
         values = {each: tuple(jnp.expand_dims(part, form.axis) for part in value) if each.reduced else value
                   for each, value in values.items()}
-    dtype = laid[0].dtype
+    dtype = at_least_fp32(laid[0].dtype)
     if expanded:
         values_by_band = _banded_sums(expanded, arrays, count, rank, form, dtype)
         if not form.reduced:
@@ -390,10 +393,13 @@ def _exceptional_products(operands, form: Ratio, rank: int):
     axes = (*form.over, form.axis) if form.reduced else form.over
     terms = []
     for coefficient, factors in form.numerator:
-        values = [held[index] for _, index in factors]
-        finite = functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        values = [held[index] for kind, index in factors if kind != "m"]
+        exceptional = ~functools.reduce(jnp.logical_and, (keep for keep, _ in values))
+        for kind, index in factors:
+            if kind == "m":
+                exceptional = exceptional & (_laid_to(operands[index], rank) != 0)
         sign = functools.reduce(jnp.multiply, (value for _, value in values), coefficient)
-        terms.append(jnp.sum(jnp.where(finite, 0.0, sign), axis=axes, keepdims=True))
+        terms.append(jnp.sum(jnp.where(exceptional, sign, 0.0), axis=axes, keepdims=True))
     total = functools.reduce(jnp.add, terms)
     total = jnp.sum(total, axis=form.across, keepdims=True)
     return jnp.squeeze(total, form.axis) if form.reduced else total
@@ -417,14 +423,16 @@ def _ratio_value(*operands, form: Ratio):
 
 
 def _ratio_abstract(*operands, form: Ratio):
-    """A ratio's result type: its operands' broadcast (each laid along the trailing axes, `_laid_to`), its
-    sharding the full operand's, without the reduced axis (`_without_axis`), varying along every manual axis
-    an operand varies along (`scaled.varying`), weak where every operand is."""
+    """A ratio's broadcast type over the operands laid along trailing axes, without the reduced axis;
+    varying along every manual axis an input varies along and weak where every operand is."""
     rank = max(operand.ndim for operand in operands)
     shape = np.broadcast_shapes(*(operand.shape + (1,) * (rank - operand.ndim) for operand in operands))
     full = next((operand for operand in operands if operand.shape == shape), None)
-    typed = scaled.varying((full if full is not None else operands[0].update(shape=shape)).update(
-        weak_type=all(operand.weak_type for operand in operands)), *operands)
+    base = full if full is not None else operands[0].update(shape=shape)
+    if full is None and any(operand.sharding.mesh.explicit_axes for operand in operands):
+        laid = [operand.update(shape=operand.shape + (1,) * (rank - operand.ndim)) for operand in operands]
+        base = base.update(sharding=lax_internal.broadcasting_sharding_rule("algebra_ratio", *laid))
+    typed = scaled.varying(base.update(weak_type=all(operand.weak_type for operand in operands)), *operands)
     summed = (*form.over, *form.across)
     if summed:
         spec = (*typed.sharding.spec, *(None,) * (typed.ndim - len(typed.sharding.spec)))
@@ -463,7 +471,7 @@ def _derived(term, tangent_of: dict[int, int]) -> list:
     coefficient, factors = term
     made = []
     for place, factor in enumerate(factors):
-        if factor[0] == "s":
+        if factor[0] in ("s", "m"):
             continue
         if factor[0] == "v":
             if factor[1] in tangent_of:

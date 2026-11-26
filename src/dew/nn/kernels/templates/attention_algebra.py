@@ -588,12 +588,10 @@ def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arra
     normalized (`finish`'s), its maximum (in `spec`'s units, `finished_rows`', raw products where its fold
     keeps them) and its denominator its mass, kept apart: folded into the maximum (`m + log(total)`) it
     rounded away at a large one (row 4646: at 2^30, fp32's spacing 128, slices of denominators 128 and 64
-    merged half and half). Its maximum as given where finite, the walk's start (`LEAST`) where not, and its
-    mass as given, 0 where not a number: a slice of zero total keeps the maximum its keys had and its total
-    itself, so the merge's derivative along that total is its weight's, where the walk's start in its place
-    weighed it at the floor and a select of 0 at a zero total held that derivative at 0 (row 7124). A slice
-    of no key holds the walk's start already. A row or a launch's block of rows alike."""
-    return Partial(out, jnp.where(jnp.isfinite(maximum), maximum, LEAST), jnp.where(total >= 0, total, 0.0))
+    merged half and half). Keep a nonfinite maximum as the merge's empty sentinel. A finite maximum with
+    zero total still holds its own weight derivative (row 7124); negative or NaN totals weigh zero.
+    A row or a launch's block of rows alike."""
+    return Partial(out, maximum, jnp.where(total >= 0, total, 0.0))
 
 
 def initial_state(spec: Forward | windows.Units, initial: Partial, *,
