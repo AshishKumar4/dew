@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention import (
     output_hooked,
     ungrouped_rows,
 )
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
@@ -685,7 +686,7 @@ def _launch(padded, stacked, *extra, units: windows.Units, queries: int, width: 
     has_initial = bool(init_args)
     total_slices = slices + int(has_initial)
     chunk = windows.chunk_width(total_slices)
-    tile = 1 << (-(-total_slices // chunk) * chunk - 1).bit_length()
+    tile = 1 << (whole(total_slices, chunk) - 1).bit_length()
     channels = 1 << (width - 1).bit_length()
     n_init = len(init_args)
     n_params = len(output_kinds)

@@ -306,7 +306,7 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
     # Where the rows run per shard (`_placement`), the products are each shard's, of its rows and the
     # kernels gathered whole in the map.
     placement = None if kernels is None else _placement(x, projections_, kernels)
-    rows = (x.size // x.shape[-1], x.shape[-1]) if placement is None else placement[2].shape
+    rows = (math.prod(x.shape[:-1]), x.shape[-1]) if placement is None else placement[2].shape
     return GatedCase(
         projections=found,
         uniform=uniform,
@@ -397,8 +397,9 @@ def fuses_grouped(rows: jax.Array | jax.ShapeDtypeStruct,
 def gated_mlp(x: jax.Array, projections_: Sequence[nn.Module], activation: str, *,
               limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array | None:
     """Select and run the gated MLP once. None leaves the projections to their own calls; a fused route
-    uses the kernels, dtype and placement already read for its admission."""
-    if projections_[0].is_initializing():
+    uses the kernels, dtype and placement already read for its admission. Empty contractions belong
+    to the projections themselves; the templates don't flatten or launch them."""
+    if not x.size or projections_[0].is_initializing():
         return None
     case = gated_case(x, projections_, activation, limit)
     form = select(GATED_MLP, case).kernel

@@ -192,7 +192,8 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   - **decoupled reductions** (declared forms and dev-time rules): dependent nonlinear reductions broken
     with correction terms. Stateful softmax and log-sum-exp merges use their own rescale; weighted or
     masked variance and bilinear covariance use the declared Chan–Golub–LeVeque merge in `moments.py`
-    (row 9036), with independently ranged directional sums carried as described in §6.12;
+    (row 9036), with independently ranged directional sums carried as described in §6.12. A Boolean
+    mask excludes a sample before the centered square, including in its derivative;
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of
@@ -1291,6 +1292,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
+    A subnormal static readout scale participates in the unlanded product of all factors, including in
+    transpose: multiplying it into one operand first can erase an otherwise normal read.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
@@ -1501,9 +1504,10 @@ rounded one lost masses the ratio keeps and landed it past the format), a walk's
 resumed state's `acc = o l` ratios of one state each.
 An empty walk has a nonfinite anchor; its stored total, output and all derivative directions are ignored.
 A finite anchor with zero weight still has its own derivative along that weight.
-The window's working words are at least float32, even when the outputs and anchor land in a narrower
-format. A subnormal static unit scale applies its power of two to the anchors before the normalized
-significand participates in the difference or anchor relocation.
+The window's working words are at least float32. A half or bfloat16 result rounds its two words
+directly to its declared format, including a tail at a tie or overflow midpoint; it does not first
+round the sum to float32. A subnormal static unit scale applies its power of two to the anchors before
+the normalized significand participates in the difference or anchor relocation.
 
 **The law's domain.** A merge's mass at its joined anchor lies within the format at that anchor's resolution:
 where the masses' sum passes the format's largest, the anchor moves to land it (`_landing`), and an anchor's

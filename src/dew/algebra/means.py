@@ -257,9 +257,9 @@ def _landing(units: Units, joined: jax.Array, masses, axis: int) -> jax.Array:
     significand = jnp.expand_dims(jnp.abs(landed.significand), axis)
     shift = jnp.maximum(binade - largest, 0).astype(dtype)
     if joined.dtype != dtype:
-        # A wide word in the last narrow binade can round to infinity before its binade changes.
-        midpoint = 2 - 2.0 ** -(limits.nmant + 1)
-        shift = jnp.where((binade == largest) & (significand >= midpoint), 1, shift)
+        # Check the actual destination rounding, including a residual beside the overflow midpoint.
+        overflows = jnp.expand_dims(jnp.isinf(_landed(masses, joined.dtype)), axis)
+        shift = jnp.where((binade == largest) & overflows, 1, shift)
     # The least anchor of the format at or past `joined + move / s`, the joined anchor and the move formed
     # together in the units' own scale (`s` times an anchor) as one exact double float (`two_product`,
     # `two_sum`), its quotient by `s` stepped one place up where an exact product shows it short: formed

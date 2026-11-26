@@ -56,7 +56,6 @@ from dew.nn.kernels.templates.attention import (
     key_tiles,
     kind_of,
     shared_place,
-    whole,
 )
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.hooks import Side
@@ -70,7 +69,7 @@ def few_rows(family: mosaic.Family, rows: int | None) -> bool:
     issuer's rows (`query_rows`)."""
     if rows is None or rows >= family.role_rows:
         return False
-    padded = -(-rows // family.rows) * family.rows
+    padded = axes.whole(rows, family.rows)
     return family.specialized(padded, family.role_rows) != family
 
 
@@ -212,7 +211,7 @@ def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
     """The least query tile a launch of `rows` rows takes on `family`: a role's whole swizzled rows
     (`extents`), or the issuer's rows where the launch's rows are fewer than a role's (`few_rows`)."""
     if few_rows(family, rows):
-        return -(-rows // family.rows) * family.rows
+        return axes.whole(rows, family.rows)
     return extents(family, dtype, rows)[-1]
 
 
@@ -401,7 +400,7 @@ class BackwardTiles:
 def _width(width: int, family: mosaic.Family, dtype) -> int:
     """A head width as a launch stages it: as `padded_call` pads it (`head_width`: a power of two to 256,
     whole groups of 64 columns past it) in whole swizzled rows (`Family.column_unit`)."""
-    return whole(head_width(width), family.column_unit(dtype))
+    return axes.whole(head_width(width), family.column_unit(dtype))
 
 
 def _products(family: mosaic.Family, dtype, *products: resources.Product, narrow: bool = False,
@@ -497,7 +496,7 @@ def dkv_holders(config: BackwardTiles) -> int:
 def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int, int]:
     """A call's queries and keys as a launch at `config` pads them (`padded_call`, `_block`)."""
     block = _block(config)
-    return whole(max(queries, 1), block), whole(max(keys, 1), block)
+    return axes.whole(max(queries, 1), block), axes.whole(max(keys, 1), block)
 
 
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,

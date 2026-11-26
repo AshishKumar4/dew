@@ -67,6 +67,51 @@ def test_the_fused_mlp_holds_check_1_with_its_gradients(form, generation_name, a
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
 
 
+@pytest.mark.parametrize("limit", [None, 1.0], ids=["recipe-eligible", "clamped"])
+def test_an_empty_gated_projection_keeps_its_value_and_pullback(limit):
+    from dew.nn.mlp import GatedMLP
+
+    layer = GatedMLP(hidden_features=4, out_features=3, dtype=jnp.float32, swiglu_limit=limit)
+    kernels = {name: {"kernel": np.zeros((0, 4), np.float32)} for name in ("gate_proj", "up_proj")}
+    kernels["down_proj"] = {"kernel": np.ones((4, 3), np.float32)}
+    variables = {"params": kernels}
+    x = np.zeros((2, 3, 0), np.float32)
+
+    @jax.jit
+    def apply_and_pull(params, rows):
+        value, pull = jax.vjp(jax.jit(layer.apply), params, rows)
+        return value, pull(jnp.ones_like(value))
+
+    output, (dw, dx) = apply_and_pull(variables, x)
+    np.testing.assert_array_equal(output, np.zeros((2, 3, 3), np.float32))
+    np.testing.assert_array_equal(dx, x)
+    for gradient, param in zip(jax.tree.leaves(dw), jax.tree.leaves(variables), strict=True):
+        np.testing.assert_array_equal(gradient, np.zeros_like(param))
+
+
+def test_an_empty_projection_adds_bias_without_a_contraction_pullback():
+    from dew.nn.dense import Dense
+
+    layer = Dense(features=3, use_bias=True, dtype=jnp.float32)
+    rows = np.zeros((2, 3, 0), np.float32)
+    kernel = np.zeros((0, 3), np.float32)
+    bias = np.asarray([0.25, -2.0, 4.0], np.float32)
+
+    @jax.jit
+    def evaluate(x, w, b):
+        def apply(x, w, b):
+            return layer.apply({"params": {"kernel": w, "bias": b}}, x)
+
+        found, pull = jax.vjp(apply, x, w, b)
+        return found, pull(jnp.ones_like(found))
+
+    found, (dx, dw, db) = evaluate(rows, kernel, bias)
+    np.testing.assert_array_equal(found, np.broadcast_to(bias, (2, 3, 3)))
+    np.testing.assert_array_equal(dx, rows)
+    np.testing.assert_array_equal(dw, kernel)
+    np.testing.assert_array_equal(db, [6, 6, 6])
+
+
 def test_a_gated_hook_rounds_nowhere_at_fp32_and_wider():
     """The fused MLP's hook (`activations.gated_hook`) computes a float64 or fp32 gated product as the
     portable product does, `activate(gate) * up` in the operands' own dtype with no rounding (only a 16-bit

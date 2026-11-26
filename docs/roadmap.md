@@ -26,6 +26,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873]
 - Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
+- The cold 4B start's search cannot read which remat frees its miss. [13304]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -82,6 +83,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [579, 886, 729, 605]
+- A speculative block's replay into a block drafter's cache (strategies.block_step -> DecodeOps.record, sampling/strategies.py:1127-1138) has no witness. [13317]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
@@ -89,6 +91,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
+- A 16x1 FP32 NVFP4 tile containing 2^-130 and 2^-132 and zeros quantizes to an all-zero block and tensor scale one on CPU. [13305]
+- A real two-token derived SSD with static scale 2^-128 applies it to the reader before the prepared chunk, flushing it to zero. [13320]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
