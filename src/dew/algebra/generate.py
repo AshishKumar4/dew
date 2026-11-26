@@ -21,6 +21,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import itertools
+import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -36,6 +37,8 @@ from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
+
+_log = logging.getLogger(__name__)
 
 POLICIES = ("default", "accurate")
 """The precision policies a declaration is generated for (§1.5): under default numerics a candidate is
@@ -126,6 +129,7 @@ class SurrogateBodies:
         try:
             return self.cases.get(fixed)
         except TypeError:
+            _log.debug("a surrogate's unhashable static arguments use its written body")
             return None
 
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
