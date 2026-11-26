@@ -14,10 +14,9 @@ template algebra. Dew instead holds every equivalent form of a computation in an
 until no new form appears (equality saturation), and extracts the cheapest form whose error meets the precision
 policy. (Today: saturation also stops at limits derived from the region's size, §6.6; extraction is egglog's
 greedy DAG extractor under Dew's model, held to Dew's exact extractor where the oracle is on, §6.5; and the
-error a form meets at compile time is its rules' static rounding class, the sampled error-aware choice being
-the parked generator's, §1.5.) The engine runs in two modes. At dev time a generator derives Dew's own math once, and its output is
-ordinary checked-in, reviewed code. At compile time a small, fast pass rewrites the one thing Dew cannot know in
-advance: the autodiff output of the program a user composed. Nothing runs at runtime.
+compile-time admission uses its rules' static rounding class. For declared stable forms, the dev-time
+generator measures candidates' error (§1.5) and emits reviewed Python. The compile-time pass rewrites
+the program a user composed, including its autodiff output. Nothing runs at runtime.
 
 ## 1. The engine: `dew.algebra`
 
@@ -30,18 +29,15 @@ they are declared: neither is generated yet.
 
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
-| Dev time | `python -m dew.algebra.generate`, run by a developer when a declaration or a rule changes | declarations: template algebra (attention's reduction, a recurrence's update), stable numeric forms, surrogate gradients' bodies | every set, with sampled error estimates (§1.5) | Python modules and their tests, checked in and reviewed like hand-written code |
+| Dev time | `python -m dew.algebra.generate` | registered `StableForm` declarations and cases | dev-time rules, with sampled error (§1.5) | checked-in Python modules with a shared accuracy and regeneration suite |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
-- **Dev time** covers everything whose code Dew knows in advance: a template's forward and backward tiled forms,
-  online and combine forms; numerically stable forms of Dew's own functions; and the internals of declared
-  surrogate gradients (§1.3). The generator writes ordinary modules (`*_derived.py` beside the module that
-  declares them) with a header naming the declaration, the rule sets and the egglog version. Each generated module
-  is held by one suite, `tests/test_algebra_generate.py`: the accuracy gate's site for each of its forms, against
-  the declaration at float64 (§3), and its regeneration (`generate(check=True)`), which fails when the
-  checked-in output differs, so a rule change shows up as a reviewed diff of generated code, never as a silent
-  change in behavior; a train runs it as it runs every test, with no step of the lint lane's own.
+- **Dev time** generates stable forms registered with `declare`. The generator writes `*_derived.py`
+  beside the declaring module, with a header naming the declarations, rule sets and egglog version.
+  `tests/test_algebra_generate.py` checks each generated function against the declaration in float64 and
+  runs `generate(check=True)` on the recorded platform. Changes to a rule or declaration show up as a
+  reviewed diff. The generator does not yet write template algebra or surrogate gradients (rows 3272, 6109).
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -500,6 +496,8 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 | `dew.algebra.scaled` | The scaled value (§6.12): a float32 as its significand in [1, 2) and its int32 exponent, its products, quotients, sums, landing and compensated sum, each bound proven as it is formed |
 | `dew.algebra.means` | The convex mean (§6.12): finished states' merge, finish and resumption over scaled values, and its derivative |
+| `dew.algebra.moments` | Declared walks and merges for variance and covariance, with range-safe directional derivatives (§6.12) |
+| `dew.algebra.ratios`, `dew.algebra.windows`, `dew.algebra.bands` | Scaled products of sums: closed JVP and transpose rules, windowed reduction, and the occupied dyadic bins of independent directions (§6.12) |
 
 ### 6.2 Terms
 
@@ -795,12 +793,14 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   numerics against every other candidate, which may admit none, and then nothing is chosen. A candidate is
   measured where it is reached in that order, the form as written never against itself; candidates are
   ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
-  rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
-- One choice of this kind is built: a product's dot algorithm for the accuracy its site asks
-  (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
-  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), of them
-  those the site's kernel runs as named where it states them (`stated`), priced by `cost.product_work` in the
-  mode and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
+  rate prices is the compile-time splice's). The stable-form generator calls `choose` for each registered
+  case, precision policy and target (§6.11).
+- A product's dot algorithm for the accuracy its site asks (`dew.algebra.error.product_precision`, row 5473)
+  is chosen from JAX's presets for the operands as stored (`dew.nn.programs.dot_algorithms`). Filter for
+  the site's lowering before pricing: `stated` is the admitted set, or a mapping to what that lowering
+  runs; absent `stated`, use the XLA target's algorithms, including its TPU restrictions (row 11738).
+  `cost.product_work` prices the actual lowering; legal unpriced work sorts after priced work. The
+  chooser takes the cheapest algorithm the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
   refused. A gate stated as an algorithm (`error.at_least`) admits one at least as exact: as many significand
   digits of each operand (`DotArithmetic.digits`, its parts times the narrower side's), as wide an
@@ -809,12 +809,12 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   11878): a split whose part's format tops out beneath the operand's rounds an operand near its largest to an
   infinity. So a gate at least IEEE fp32's refuses BF16x6 and x9, whose digits match, by their bfloat16
   parts' range, and TF32x3 on both counts: its digits (two parts of 11) and its range, TF32's largest
-  `(2 - 2^-10) 2^127` beneath float32's `(2 - 2^-23) 2^127` for all their exponents' width. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
-  least its upstream's via `error.at_least` (`programs.triton_dot_precision`), and Mosaic TPU fp32 products
-  (`programs.mosaic_tpu_fp32_precision`, its precisions named back). A product XLA compiles states a `Precision` instead
-  (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
-  CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, M-JS-159), where
-  HIGHEST is one every routing takes.
+  `(2 - 2^-10) 2^127` beneath float32's `(2 - 2^-23) 2^127` for all their exponents' width. Consumers
+  include Triton ports (`programs.triton_dot_precision`), Mosaic TPU fp32 products
+  (`programs.mosaic_tpu_fp32_precision`), and the GEMM template's fp32 split count
+  (`templates.product.bf16_part_count`). An XLA recurrence state dot still states `Precision.HIGHEST`:
+  XLA routes by shape and its CPU elemental emitter took no named algorithm at a `[1, 1]` dot
+  (F64 and BF16x6 alike, M-JS-159).
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
   relative gap of zero within the solver's feasibility tolerance, each price level held at its least within
@@ -1340,10 +1340,9 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-Built for stable forms (`StableForm`, rows 9035 and 9037; §1.1): the first declarations are §1.5's
-acceptance cases (`dew.algebra.acceptance`). A template's `Declaration` (a `Reduction` or a `Scan`) and a
-surrogate's `SurrogateBodies` are derived at trace time where they are declared and carry no `cases` yet;
-each joins `DECLARATIONS` when one of its forms is generated rather than traced.
+The registry covers stable forms (`StableForm`, rows 9035 and 9037), including §1.5's acceptance cases
+(`dew.algebra.acceptance`). Template reductions and scans still derive their forms at trace time;
+surrogate bodies trace at their declaration. Generating those families remains parked (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1367,13 +1366,7 @@ class StableForm:                     # a numeric function of Dew's own
     function: Callable                # its math as written: the form as written and, at float64, the truth
     cases: Cases
 
-@dataclass(frozen=True)
-class SurrogateBodies:                # a surrogate's two bodies (row 3271), each optimized, neither replaced
-    forward: Callable
-    derivative: Callable
-    cases: Cases
-
-DECLARATIONS: Mapping[str, Declaration | StableForm | SurrogateBodies]   # registered by the declaring modules
+DECLARATIONS: dict[str, StableForm]  # each key is the declaring module and function name
 
 def declare(module: str, name: str, form: StableForm) -> StableForm: ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
