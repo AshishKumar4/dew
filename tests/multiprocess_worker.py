@@ -880,13 +880,21 @@ def mode_ternary_scale(args) -> dict:
     host[-1] = 2.0 ** -130
     scale = jax.make_array_from_callback((width,), NamedSharding(mesh, PartitionSpec("columns")),
                                          lambda index: host[index])
-    try:
-        TernaryWeights(packed.words, scale, packed.form).checked()
-        outcome = "admitted"
-    except (ValueError, _coordination.PeerFailure) as error:
-        outcome = type(error).__name__
-    after = _coordination.agreed("after the scale check", lambda: True)
-    return {"outcome": outcome, "after": after}
+    def outcome(held) -> str:
+        try:
+            TernaryWeights(packed.words, held, packed.form).checked()
+        except (ValueError, _coordination.PeerFailure) as error:
+            return type(error).__name__
+        return "admitted"
+
+    spanning = outcome(scale)
+    # A normal scale on process 0's devices alone: its owner scans it, the other holds none, neither waits.
+    first = [device for device in jax.devices() if device.process_index == 0]
+    alone_on = NamedSharding(Mesh(np.asarray(first), ("columns",)), PartitionSpec())
+    owned = jax.make_array_from_callback((width,), alone_on, lambda index: np.ones(width, np.float32)[index])
+    alone = outcome(owned)
+    after = _coordination.agreed("after the scale checks", lambda: True)
+    return {"outcome": spanning, "alone": alone, "after": after}
 
 
 def mode_profile_failure(args) -> dict:

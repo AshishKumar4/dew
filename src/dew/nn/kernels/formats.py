@@ -490,11 +490,18 @@ class TernaryWeights:
         """Refuse an fp32 `scale` holding an entry neither zero nor a finite normal (a subnormal, an
         infinity, a NaN), read on the host: its products then normal wherever their values are, as a
         process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). Each rank reads its own
-        shards; a scale spanning processes is refused on every rank where one refuses it (`agreed`: each
-        rank holds it, so each calls this), none raising alone. A traced scale is checked where concrete."""
+        shards; a scale spanning every process is refused on every rank where one refuses it (`agreed`:
+        each rank holds it, so each calls this), none raising alone, and one on some processes but not all
+        refused on each. A traced scale is checked where concrete."""
         if isinstance(scale, Tracer):
             return
-        spans = isinstance(scale, jax.Array) and not scale.is_fully_addressable
+        # The processes holding it, the same set on every rank (its sharding's): several of them agree.
+        owners = ({device.process_index for device in scale.sharding.device_set}
+                  if isinstance(scale, jax.Array) else set())
+        if 1 < len(owners) < jax.process_count():
+            raise ValueError(f"a TernaryWeights scale on {len(owners)} of {jax.process_count()} processes: "
+                             "its admission agrees across the whole pool: place it on one process or all")
+        spans = len(owners) > 1
         pieces = ([shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array)
                   else [scale])
 
