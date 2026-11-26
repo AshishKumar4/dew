@@ -353,8 +353,10 @@ fitted to them, and a rule set ships only with measured receipts.
   does not replace the dots, cross a rematerialization name, or choose a launch. The measurement arm
   `fusion.lower_decode(..., enabled=True)` takes a contiguous, unplaced region into one nested JAX
   program. It preserves the written dot and activation equations and keys replay by the recorded
-  equation contexts and provenance. Interleaved, placed or unshareable bodies stay as written. XLA may
-  inline the call: this is not a new GPU kernel or a launch-count promise. Compare with the command-buffer
+  equation contexts and provenance. Interleaved, placed or unshareable bodies stay as written. The
+  packed `GatedMLP` names the packed pair before activation for rematerialization policies; neither a
+  packed reshape by itself nor crossing those names gives an equivalent experiment. XLA may inline
+  the nested call: this is not a new kernel or a launch-count promise. Compare with the command-buffer
   control in M-AL-3 before pursuing a native form.
 - **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
   attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is
@@ -1370,16 +1372,14 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 ### 6.11 The generator
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). The generated components cover the online-softmax step and pairwise
-split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents, its
-key-first weight consumer and value-gradient tile, recurrence scores, compensated prefix differences,
-chunk carries and reverse carries with gated keys and queries, the strict-lower solver's shared doubling
-stage, weighted value application, and whole-tile inverse adjoint. Recurrence cases include padded tokens
-and top-binade values; the checked stages compose a complete solve and a strict-lower pullback.
-Attention's forward cases include a wholly masked tile, empty slices, and a large shared maximum
-with separate masses. The same writer checks rounded-operand
-forward and tangent bodies and holds every generated case against its own reference.
-Production still uses the trace-time derivations and original surrogates (row 3272).
+(`ComponentForm`, rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV
+merge, the backward's overlapped weight and dropped anchored cotangent phases in both tile orientations,
+the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
+pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
+solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
+the selective scan's packed and unpacked decay. The same writer checks rounded-operand forward and
+tangent bodies. Every case holds its own independent reference. The backward weight, dropout and decay
+pilots also exercise each primitive on the CPU. Production still uses the written bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1410,9 +1410,10 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 ```
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
-its independent reference and its cases. The shared registry emits it without substituting an autodiff or
-lower-price implementation. Larger template and surrogate declarations will group such components and
-their trees and flags. The pilots add no run-time dispatch to the algebra engine.
+its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
+primitive sequences share a generated helper, with shapes and broadcast axes passed as static arguments.
+Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
+to the component's program.
 
 - **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their

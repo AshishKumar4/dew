@@ -64,6 +64,61 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                         seeds=form.cases.seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",
+                                  "key_dropped_cotangents", "selective_decay", "key_memory_decay"])
+@pytest.mark.parametrize("arm", ["written", "generated"])
+def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
+    from certified import assert_certified
+
+    qualified = f"{component_cases.__name__}.{name}"
+    declaration = generate.DECLARATIONS[qualified]
+    for policy in declaration.cases.policies:
+        function = (declaration.function if arm == "written" else
+                    functools.partial(_derived(qualified), policy=policy))
+        for index, operands in enumerate(declaration.cases.operands):
+            assert_certified(function, functools.partial(declaration.cases.draw, operands=operands),
+                             f"{name} ({arm}, {policy}, {index})", seeds=declaration.cases.seeds)
+
+
+def test_shared_component_preserves_layouts_constants_and_live_results():
+    from dew.algebra import _component_sharing, terms
+
+    def tile(value, row, *, axis, keep_product, bias):
+        extended = jax.lax.broadcast_in_dim(row + bias, value.shape, (axis,))
+        product = value * extended
+        base = jnp.abs(product + value)
+        root = jnp.sqrt(base)
+        shifted = root + extended
+        result = jax.lax.logistic(shifted)
+        return (result, product) if keep_product else (result,)
+
+    layouts = {"row_first": ((7, 13), 0, False, -0.5), "key_first": ((13, 7), 1, True, 0.5)}
+    arguments, separate = {}, {}
+    for name, (shape, axis, keep_product, shift) in layouts.items():
+        arguments[name] = (jax.ShapeDtypeStruct(shape, jnp.bfloat16),
+                           jax.ShapeDtypeStruct((shape[axis],), jnp.bfloat16))
+        bias = (np.arange(shape[axis]) * 0.25 + shift).astype(jnp.bfloat16)
+        fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
+        separate[name] = printed.source(jax.make_jaxpr(fn)(*arguments[name]), name, borrow_shapes=True)[0]
+    # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
+    occupied = "_shared_component_0"
+    arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
+    separate[occupied] = printed.source(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
+                                        occupied, borrow_shapes=True)[0]
+    reserved = "_shared_component_1"
+    shared = _component_sharing.shared(separate, reserved=(reserved,))
+    assert len(shared) == len(separate) + 1 and reserved not in shared
+    for name, operands in arguments.items():
+        before = printed.loaded(separate[name], name)
+        after = printed.loaded("\n\n".join(shared.values()), name)
+        original = jax.make_jaxpr(before)(*operands)
+        composed = jax.make_jaxpr(after)(*operands)
+        values = tuple(np.full(operand.shape, 0.75, operand.dtype) for operand in operands)
+        for actual, expected in zip(jax.jit(after)(*values), jax.jit(before)(*values), strict=True):
+            np.testing.assert_array_equal(actual, expected)
+        assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
+
+
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
     (example,) = component_cases.ROUNDED.cases.operands[0]
