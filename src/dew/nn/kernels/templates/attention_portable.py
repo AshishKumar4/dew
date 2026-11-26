@@ -62,6 +62,7 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
     if kind is not Kind.HEAD:
         row, head = shared_place(value.shape, row, head)
     if kind is Kind.BAND:
+        assert origins is not None, "a band is read by its origins, the side after it"
         origin_row, _ = shared_place(origins.shape, row, 0)
         column = keys[None, :] - origins[origin_row, 0, rows][:, None].astype(jnp.int32)
         inside = (column >= 0) & (column < value.shape[-1])

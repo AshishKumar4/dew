@@ -221,6 +221,7 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None
     if kind is Kind.HEAD:
         return ref[head]
     if kind is Kind.BAND:
+        assert keys is not None and origins is not None, "a band's tile is read at its keys by its origins"
         column, inside = band.band_column(origins[0], keys.start, keys.size, ref.shape[-1])
         return jnp.where(inside, ref[:, pl.ds(column, keys.size)], 0.0)
     tile = ref[axes.placed(_held(kind), {} if keys is None else {"keys": keys})]
@@ -775,6 +776,7 @@ def _key_param(ref, kind: Kind, head, rows, keys: pl.Slice | None = None, origin
     if kind is Kind.HEAD:
         return ref[head]
     if kind is Kind.BAND:
+        assert keys is not None and origins is not None, "a band's tile is read at its keys by its origins"
         column, inside = band.band_column(origins[rows.start], keys.start, keys.size, ref.shape[-1])
         return jnp.where(inside, ref[rows, pl.ds(column, keys.size)], 0.0)
     return scored(ref[axes.placed(_held(kind), {"queries": rows})], kind)

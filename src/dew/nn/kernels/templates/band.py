@@ -46,7 +46,7 @@ def band_dense(values: jax.Array, offset: jax.Array, extent: int, keys: int) -> 
     return jnp.where(inside[:, None], read, jnp.zeros((), values.dtype))
 
 
-def band_column(origin: jax.Array, k_first, keys: int, width: int) -> tuple[jax.Array, jax.Array]:
+def band_column(origin: jax.Array, k_first, keys: int | jax.Array, width: int) -> tuple[jax.Array, jax.Array]:
     """A key tile of `keys` keys from `k_first`'s column in a band of `width` columns whose column 0 is key
     `origin` (`band_origins`), clamped within the band, and whether the tile lies within it: origins and
     widths whole `BAND_ALIGN`s, and every key tile's keys dividing one, a tile lies wholly within the band or

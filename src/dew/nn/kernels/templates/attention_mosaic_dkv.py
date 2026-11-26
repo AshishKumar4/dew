@@ -549,9 +549,9 @@ def _grad_buffers(graded: list[Kind], batch: int, heads: int, queries: int, keys
     taken beneath, `template.value_shift`) and `template.gradients` sums the shared rows after, each at its
     own (`template.hook_gradient`), then its keys, and for a tile its queries; a band's its columns (each of
     `widths` in turn) and its queries."""
-    widths = iter(widths)
+    columns = iter(widths)
     return [(batch, heads, keys_padded) if kind == Kind.KEY
-            else (batch, heads, next(widths), queries) if kind is Kind.BAND
+            else (batch, heads, next(columns), queries) if kind is Kind.BAND
             else (batch, heads, keys_padded, queries) for kind in graded]
 
 def _graded(kinds: tuple, shares: tuple, shape: tuple, keys_padded: int, params: tuple = ()

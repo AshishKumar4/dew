@@ -1336,7 +1336,8 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
     spans = template.spans(1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32))
     query = jnp.zeros((8, 1, heads, 64), jnp.float32)
     key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
-    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
+    # The walk's columns its launch splits the value's 64 into (an fp32 step's parts' launch's).
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma", columns=32)
     with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
         work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
         traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
