@@ -16,8 +16,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, error, generate, printed
-from dew.algebra import component_cases as component_cases
+from dew.algebra import acceptance, component_cases, error, generate, printed
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 
@@ -67,15 +66,16 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    example = jax.ShapeDtypeStruct((8,), jnp.float32)
+    (example,) = component_cases.ROUNDED.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
         sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
-        operands = ((jax.ShapeDtypeStruct((8,), jnp.float32, sharding=sharding),),)
+        operands = ((jax.ShapeDtypeStruct(example.shape, example.dtype, sharding=sharding),),)
     else:
         operands = ((example,), (example,))
-    cases = generate.Cases(operands, lambda seed, shapes: (np.ones((8,), np.float32),), seeds=1)
-    form = generate.ComponentForm(jnp.abs, jnp.abs, cases)
+    form = component_cases.ROUNDED
+    cases = generate.Cases(operands, form.cases.draw, seeds=form.cases.seeds)
+    form = generate.ComponentForm(form.function, form.truth, cases)
     with pytest.raises(ValueError):
         generate._chosen("bad.components", form)
 
