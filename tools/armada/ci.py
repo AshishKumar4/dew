@@ -1527,21 +1527,19 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
            publish_by: float | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
-    Hub open, recorded on the network lane's class (`device_class`). A check-1
-    site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
-    reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
-    process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
-    same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first.
-    `written`: each earlier process's checkout writes, read by none of its records; it adds its own.
-    `publish_by`: the instant (`time.monotonic`) its records' reads and writes end by, a dry prepare's shared
-    budget's (prepares.py's `process`; row 13014), a baseline not written by then leaving its row stale."""
+    Hub open, recorded on the network lane's class (`device_class`). A check-1 site's map task
+    (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge reads. A run that is
+    no test of its files (a GPU lane's prepare, `recorded` false) records no row. A process of the files under
+    other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the same cut of them, its rows and
+    their records named apart (`varied`); `judged` grades its rows first. `written`: each earlier process's
+    checkout writes; `publish_by`: when its records' writes end by (a dry prepare's shared budget, row 13014).
     began = time.monotonic()
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
     recycle_at = None if site is not None else recycle_at  # A site's task: one test, its draws its artifacts.
-    rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline,
-                        publish_by=publish_by)
+    rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline, None, True,
+                        publish_by)
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0

@@ -183,9 +183,9 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     caller's deadline. What its own end may take past its deadline is kept back (its grace, its group's
     settling, its reader's last ten seconds); with none left, it is not started, its row saying so. A dry
     prepare's (`capped`) runs under its time cap and its memory's (tests/tier_wire.py's `PREPARE_BY` and
-    `PREPARE_HOLDS`), its records published by its task's end (`ends`, `tested`'s `publish_by`; a red's epoch revoked
-    past it), what is
-    `left` read from it as the process starts; a part's never, whose run reads every program it prepares."""
+    `PREPARE_HOLDS`), its records published by its task's end (`ends`, `tested`'s `publish_by`; a red's epoch
+    revoked past it), what is `left` read from it as the process starts; a part's never, whose run reads every
+    program it prepares."""
     if ends is not None:
         left = min(left, ends - time.monotonic())
     if (mine := left - ci.session.GRACE - ci.SETTLE - 10.0) <= 0:

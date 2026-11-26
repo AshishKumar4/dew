@@ -912,7 +912,8 @@ def test_a_dry_prepares_red_row_revokes_its_green_epoch_past_its_publication_bud
                   publish_by=publish_by,
                   judged=lambda rows: [{**each, "exitCode": code, "unprepared": ["a @ x"]} for each in rows])
         [row] = json.loads(out.read_text())["rows"]
-        return ci.run_keys.epoch("3.12", row["name"], ci.run_keys.device_class(False), "common", "token")[0]
+        held = ci.run_keys.device_class(network=False)
+        return ci.run_keys.epoch("3.12", row["name"], held, "common", "token")[0]
     green = run(0, None)
     red = run(1, time.monotonic() - 1.0)
     assert green is not None and red is not None and red != green
