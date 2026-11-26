@@ -721,7 +721,7 @@ def dot_general(xla, path: tuple | None = None):
             return added(on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
                                                             preferred_element_type), split, (lhs, rhs),
                                    gathered=gathered))
-        if formed is not None and _whole():
+        if formed is not None and _whole(lhs, rhs, formed.rows, *formed.sides):
             return added(_formed_product(formed, rhs, out_dtype, precision))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
@@ -746,12 +746,11 @@ def dot_general(xla, path: tuple | None = None):
     return product
 
 
-def _whole() -> bool:
-    """Whether a product's operands are whole where it runs: no automatic mesh axis splits them
-    (`automatic_axes`; a device's own rows inside a per-shard map) and no Explicit axis of more than one
-    device places them, whose placement the operands' types carry for XLA's own product."""
-    mesh = jax.sharding.get_abstract_mesh()
-    return not automatic_axes() and not any(mesh.shape[name] > 1 for name in mesh.explicit_axes)
+def _whole(*operands: jax.Array) -> bool:
+    """Whether a product's `operands` are whole where it runs: no automatic mesh axis splits them
+    (`automatic_axes`; a device's own rows inside a per-shard map) and no Explicit axis places any of them
+    (`explicit_spec`: a placement their types carry, which XLA's own product contracts, `contracted_alike`)."""
+    return not automatic_axes() and all(explicit_spec(operand) is None for operand in operands)
 
 
 def _formed_product(formed: Formed, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> jax.Array:
