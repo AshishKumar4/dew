@@ -131,7 +131,9 @@ def test_a_plain_task_runs_its_tests_past_its_recycle_bound_in_fresh_processes(c
     a group's compiles held 10 GiB of a 10 GiB container in one process, each green alone)."""
     monkeypatch.setattr(ci, "PLAIN_RECYCLE_AT", 1)
     monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
-    written(tmp_path, {"test_plain.py": "import os\ndef ran():\n    with open('pids', 'a') as pids:\n"
+    # Outside the checkout, which each later process finds as the commit holds it (`restored`).
+    pids = tmp_path.parent / f"{tmp_path.name}-pids"
+    written(tmp_path, {"test_plain.py": f"import os\ndef ran():\n    with open({str(pids)!r}, 'a') as pids:\n"
                                         "        pids.write(f'{os.getpid()} ')\n"
                                         "def test_a():\n    ran()\ndef test_b():\n    ran()\n"})
     commit(tmp_path, "the commit")
@@ -142,7 +144,7 @@ def test_a_plain_task_runs_its_tests_past_its_recycle_bound_in_fresh_processes(c
     ci.task("3.12", ["tests/test_plain.py"], "", out, 600.0, "off")
     [row] = json.loads(out.read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
-    assert len(set((tmp_path / "pids").read_text().split())) == 2
+    assert len(set(pids.read_text().split())) == 2
 
 
 def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path, monkeypatch):
