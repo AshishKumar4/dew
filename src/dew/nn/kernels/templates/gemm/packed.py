@@ -17,7 +17,7 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels.templates import inline_forms, product as product_formats, resources
+from dew.nn.kernels.templates import inline_forms, mosaic, product as product_formats, resources
 
 NVFP4_GROUP = 128
 """Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
@@ -200,16 +200,17 @@ class Decoding:
     """Dew: a consumer's decode of a packed matrix's stages (`_gmm_step`'s): its `buffers` (`[stages,
     columns, depth]` bfloat16), and with `consumers` sharing them, its own share of the columns (`wg`'s),
     after which they meet (`met`). Decodes NVFP4 when `weight_fmt` is None, or a word-packed format
-    (`weight_format`: BitNet b1.58 ternary) when set."""
+    (`weight_format`: BitNet b1.58 ternary) when set; a stage of 8-bit codes (`gmm`'s FP8 matrix beside
+    16-bit rows, row 8548) it converts exactly (`mosaic.Family.converted`)."""
 
     buffers: Any
     wg: Any
     consumers: int
     weight_fmt: str | None = None
 
-    def decode(self, index, slots, interpret: bool, *, layout=None):
-        """Step `index`'s stage of words (and NVFP4 scales) (`slots`'), this consumer's share of it, decoded
-        into its buffer, which it returns."""
+    def decode(self, index, slots, interpret: bool, *, layout=None, family=None):
+        """Step `index`'s stage of words (and NVFP4 scales) or of 8-bit codes (`slots`'), this consumer's
+        share of it, decoded into its buffer, which it returns."""
         if self.consumers > 1:
             # A tile's first step restarts the buffers' rotation (`index` is the tile's own): every consumer
             # has drained its last tile's products, which read them, before any decodes into them.
@@ -217,7 +218,13 @@ class Decoding:
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])
-        if self.weight_fmt is not None:
+        if 'matrix' in slots:
+            # Codes (`gmm_allocations`' `converted`): the warpgroup met where it converts alone, its threads
+            # reading each other's writes (`mosaic.synced`); consumers sharing them meet (`met`).
+            family.converted(slots['matrix'].at[mine], buffer.at[mine], interpret)
+            if self.consumers == 1:
+                mosaic.synced(interpret)
+        elif self.weight_fmt is not None:
             desc = weight_format(self.weight_fmt)
             words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // desc.group_depth)]
             stage_decoded_words(words, buffer.at[mine], desc, interpret, layout=layout)

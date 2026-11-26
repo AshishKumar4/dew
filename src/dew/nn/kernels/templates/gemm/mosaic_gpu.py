@@ -172,7 +172,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     NVFP4 one's, `scales`' in `gmm`, or a word-packed matrix's, `packed_format`) streams each group's
     sixteen uint32 words (`words_{q}`, a 64-byte row, which cp.async's two-dimensional copies take and a
     register tile loads whole) and (for NVFP4) its block scales K-major, decoded a stage at a time into
-    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_words`). Its outputs stored as `forms`
+    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_words`), as a matrix of 8-bit codes
+    beside 16-bit rows is converted (`converted`). Its outputs stored as `forms`
     states each (`quantized.outputs`: a tile, or one value a row each `divisor` columns, row 8547)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     # A consumer's accumulators: its share of the rows by the tile's columns, a pair's both where its products
@@ -191,6 +192,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                 'scales': ((across, block_k // 16), jnp.float8_e4m3fn)}
 
     is_packed = packed or packed_format is not None
+    # A matrix of 8-bit codes beside 16-bit rows, each stage converted exactly into them (row 8548).
+    converted = mosaic.converts(rhs_dtype) and jnp.dtype(rhs_dtype).itemsize < jnp.dtype(dtype).itemsize == 2
     matrix = words(block_n) if is_packed and not packed_rows else {'matrix': (rhs_block, rhs_dtype)}
     blocks = {**(words(block_m) if packed_rows else {'rows': (lhs_block, dtype)}), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
@@ -207,7 +210,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     held = family.staging('fixed', [(axes.named(axes.held(prologue_axes[i]), extent),
                                      _typed(prologue_dtypes[i])) for i in fixed])
     shared = packing.shared_decode(tiles, interpret=interpret)
-    decoded = ([] if not is_packed or packed_rows
+    decoded = ([] if not (is_packed or converted) or packed_rows
                else [plgpu.SMEM((family.in_flight + 2, block_n, block_k), jnp.bfloat16)]
                if shared else [plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, block_n, block_k),
                                           jnp.bfloat16)])
@@ -324,6 +327,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     (`[width, depth / 8]` words, `scales` `[width, depth / 16]`), the products' rows, and `rhs` the call's
     rows (`[1, rows, depth]`, read transposed): a decode-sized product swapped (row 5387), each step's rows
     decoded in registers into the products' left operand (`packed.rows_decoded`, `packed.rows_taken`). With
+    `rhs` 8-bit codes beside 16-bit rows (FP8 on a family of no FP8 products, row 8548), each stage of it is
+    converted exactly into the rows' dtype before its products read it (`packed.Decoding`). With
     `step_scales` (`row_scales` `[depth / 128, rows]`, `column_scales` `[groups, depth / 128, width / c]`,
     fp32), each 128-deep step's exactly summed partial is multiplied by its rows' scales and its group's
     scales of its columns, `c` columns a scale, before it is added (`xla_products.step_scaled`: DeepSeek-V3's
@@ -1421,18 +1426,10 @@ def _column_block(column_tile, block_n: int, per: int) -> tuple:
     return scale // block_n, scale % block_n
 
 
-def _tgmm_scaling(scaled: bool, mine_depth) -> Callable | None:
-    """Dew: a step-scaled `tgmm` tile's `_step_scaling` (`tgmm`'s `step_scales`), its depth rows' and its
-    columns' scales streamed, a scale a column; none where the call has no step scales."""
-    if not scaled:
-        return None
-    return functools.partial(_step_scaling, per=1, offset=0, mine_rows=mine_depth)
-
-
 def _gmm_scaling(scaled: bool, per: int, block_n: int, column_tile, mine_rows) -> Callable | None:
     """Dew: a step-scaled `gmm` tile's `_step_scaling` for a consumer's share of the rows (`mine_rows`), its
-    matrix's column scales a scale every `per` columns (`_column_block`); none where the call has no step
-    scales."""
+    matrix's column scales a scale every `per` columns (`_column_block`), or a `tgmm` tile's for its depth
+    rows, a scale a column; none where the call has no step scales."""
     if not scaled:
         return None
     return functools.partial(_step_scaling, per=per, offset=_column_block(column_tile, block_n, per)[1],
@@ -1644,7 +1641,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     read = {name: slots[name] for name in matrices if decoded is None}
     if decoded is not None:
         decode_layout = None if interpret or not family.budgets_registers else family.layout
-        read['matrix'] = decoded.decode(index, slots, interpret, layout=decode_layout)
+        read['matrix'] = decoded.decode(index, slots, interpret, layout=decode_layout, family=family)
         family.published()
         decoded.met()
     oriented = _oriented(read, matrices, transpose_rhs)
@@ -2198,7 +2195,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
                                           (mine_depth, mine_columns), hook, halves)
 
-                scaling = _tgmm_scaling(step_scales is not None, mine_depth)
+                scaling = _gmm_scaling(step_scales is not None, 1, block_n, 0, mine_depth)
                 return _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret), scaling,
                                         family.summed_window(tiles.block_k))
 

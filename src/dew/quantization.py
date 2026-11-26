@@ -713,16 +713,16 @@ def decoded_stored(variables: Variables) -> Variables:
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`' rows cast by the FP8 block cast
-    and multiplied by `rows` as the GEMM template multiplies FP8 (`gemm.gemm`): on
+    and multiplied by `rows` as the GEMM template multiplies FP8 (`gemm.fp8_codes_product`): on
     Hopper's FP8 tensor cores, each 128-deep step's product promoted into the fp32 sum apart, within the
     FP8 contract (testing.md, FP8 products: 2.8 to 12.8 times closer to float64 than cuBLASLt's FP8 GEMM, 1.36
     times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
-    fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625). Both rows' scales apply
-    after (`_scaled`)."""
+    fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625), the matrix's converted in the
+    template's stages where its selector takes them (row 8548). Both rows' scales apply after (`_scaled`)."""
     from dew.nn.kernels import gemm
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = gemm.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
+    product = gemm.fp8_codes_product(codes, rows, out_dtype=jnp.float32)
     return twice_scaled(product, scales, row_scales.T)
 
 

@@ -871,6 +871,15 @@ def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Ar
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
     from .templates.gemm import ternary
     return ternary.ternary_weight_product(lhs, weights, group_sizes, **kw)
+
+
+def fp8_codes_product(lhs: jax.Array, rhs: jax.Array, **kw) -> jax.Array:
+    """`converted.fp8_codes_product`: FP8 codes' product, converted in the template's stages where no tensor
+    core multiplies FP8 (row 8548)."""
+    from .templates.gemm import converted
+    return converted.fp8_codes_product(lhs, rhs, **kw)
+
+
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue: Hook = NO_HOOK,
            out_dtype, precision: PrecisionLike = None, interpret_on_cpu: bool = False,
            gather: tuple | None = None) -> jax.Array:
