@@ -406,17 +406,19 @@ class AmbiguousCapture(NoKernels):
 def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple[KernelTime, ...]:
     """The ops one call of the program `module` names ran on the TPU `devices` (their ids), as the newest
     capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
-    (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`), and the ops of that run's program within
-    it (`XLA Ops`, its program_id), each its device milliseconds; another program's ops, a host transfer and
-    another device's left out. A call of one program always runs its module (`_module_of`), so a run of
-    another executable of the same name beside it is a second run, refused with the rest of a capture where
-    it ran twice on one device or states no program (`AmbiguousCapture`). The call ran on every one of
-    `devices`, so a capture holding no run of it, or no op of its run, on any one of them holds part of the
-    call and is refused (`NoKernels`), never read as the whole."""
+    (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`, a TPU's run naming its program so), and
+    every op within that run's span on the device's `XLA Ops` line, each its device milliseconds. A TPU core
+    runs one program at a time, so the ops inside a run's span are its own: a TPU's ops state no program
+    (a v5e's XProf, M-FS-90), and a capture where another program's run overlaps the call's on a device, or
+    an op inside it states another program, is refused (`AmbiguousCapture`). A call of one program always
+    runs its module (`_module_of`), so a run of another executable of the same name beside it is a second
+    run, refused with the rest of a capture where it ran twice on one device (`AmbiguousCapture`). The call
+    ran on every one of `devices`, so a capture holding no run of it, or no op of its run, on any one of
+    them holds part of the call and is refused (`NoKernels`), never read as the whole."""
     from dew.telemetry import trace
 
     modules, _ = trace.device_events(directory, tpu_line="XLA Modules")
-    own = re.compile(re.escape(module) + r"(\.\d+)?(\(\d+\))?")
+    own = re.compile(re.escape(module) + r"(\.\d+)?(\((\d+)\))?")
     runs = {device: [run for run in modules.get(f"/device:TPU:{device}", []) if own.fullmatch(run.name)]
             for device in sorted(set(devices))}
     if not runs:
@@ -430,15 +432,21 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     planes, _ = trace.device_events(directory)
     timed = []
     for device, (run,) in runs.items():
-        if (program := trace.program_of(run)) is None:
-            raise AmbiguousCapture(f"{module}'s run under {directory} states no program, so its ops are not "
-                                   "told apart from another program's beside it")
-        ran = [KernelTime(op.name, op.duration_ns / 1e6) for op in planes.get(f"/device:TPU:{device}", [])
-               if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns and trace.program_of(op) == program]
-        if not ran:
+        plane = f"/device:TPU:{device}"
+        if beside := [other.name for other in modules[plane]
+                      if other is not run and other.start_ns < run.end_ns and run.start_ns < other.end_ns]:
+            raise AmbiguousCapture(f"{module}'s run under {directory} overlaps {beside} on TPU {device}, so "
+                                   "the ops within it are not told apart")
+        program = trace.program_of(run) or own.fullmatch(run.name).group(3)
+        inside = [op for op in planes.get(plane, [])
+                  if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns]
+        if foreign := [op.name for op in inside if trace.program_of(op) not in (None, program)]:
+            raise AmbiguousCapture(f"{module}'s run under {directory} holds ops {foreign} of another program "
+                                   f"on TPU {device}")
+        if not inside:
             raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
                             f"{sorted(runs)}")
-        timed += ran
+        timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in inside]
     return tuple(timed)
 
 

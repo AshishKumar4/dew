@@ -436,9 +436,10 @@ def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkey
 
 def _tpu_capture(directory, ops, runs):
     """A capture under `directory` as JAX writes a TPU's (plugins/profile/<run>/<host>.xplane.pb): `ops`, each
-    (device, name, start ms, end ms, program id or None for a host transfer), on each TPU's `XLA Ops` line,
-    and `runs`, each (device, module name, start ms, end ms, program id), on its `XLA Modules` line, every
-    event carrying XLA's program_id stat."""
+    (device, name, start ms, end ms, program id), on each TPU's `XLA Ops` line, and `runs`, each (device,
+    module name, start ms, end ms, program id), on its `XLA Modules` line, an event of a program id carrying
+    it as XLA's program_id stat and one of None no stat, as a v5e's XProf writes both (M-FS-90: a run's
+    program the id its name carries, its ops none)."""
     from jax.profiler import ProfileData
 
     names = sorted({name for _, name, *_ in [*ops, *runs]})
@@ -498,15 +499,40 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
     with pytest.raises(AmbiguousCapture):
         tpu_ops(twice, {0}, "jit_run")
-    # Another program's run overlapping the call's, and its op inside the call's window: left out by program.
+    # Another program's run overlapping the call's on its core: the ops within it not told apart, refused.
     overlapped = tmp_path / "overlapped"
     _tpu_capture(overlapped, [*ops, (0, "fusion.5", 0.5, 0.75, 9)], [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
-    assert [op.name for op in tpu_ops(overlapped, {0}, "jit_run")] == ["fusion.1", "custom-call.2"]
-    # A run stating no program: its ops are not told apart from another's.
-    unnamed = tmp_path / "unnamed"
-    _tpu_capture(unnamed, ops, [(0, "jit_run", 0.0, 1.0, None)])
     with pytest.raises(AmbiguousCapture):
-        tpu_ops(unnamed, {0}, "jit_run")
+        tpu_ops(overlapped, {0}, "jit_run")
+    # An op inside the call's run stating another program, or one where the run states none: refused.
+    for listed, ran in (([*ops, (0, "fusion.5", 0.5, 0.75, 9)], runs),
+                        (ops, [(0, "jit_run", 0.0, 1.0, None)])):
+        stray = tmp_path / f"stray{len(listed)}"
+        _tpu_capture(stray, listed, ran)
+        with pytest.raises(AmbiguousCapture):
+            tpu_ops(stray, {0}, "jit_run")
+
+
+def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
+    """A v5e's XProf (M-FS-90's capture of a bf16 8192x4096 by 4096x4096 GEMM): its run on the `XLA Modules`
+    line names its program in its name, `jit_gemm(370734272565018276)`, with no program_id stat, and its ops
+    on `XLA Ops`, named by their HLO text, state no program at all; the call is the ops inside its run's span
+    on its core (one program running there at a time), another program's run before or after it and its ops
+    left out."""
+    from dew.telemetry.benchmark import tpu_ops
+
+    copied = "%copy-start = (bf16[4096,4096]{1,0:T(8,128)(2,1)}) copy-start(%param.1)"
+    fused = "%fusion = bf16[8192,4096]{1,0:T(8,128)(2,1)} fusion(%param.0, %copy-done)"
+    other = "%fusion.2 = f32[8] fusion(%param.0)"
+    ops = [(0, other, 0.0, 0.5, None), (0, copied, 7.198531, 7.198556, None),
+           (0, fused, 7.198568, 8.624394, None), (0, other, 8.625, 8.626, None)]
+    runs = [(0, "jit_init(11)", 0.0, 0.6, None), (0, "jit_init(11)", 8.6249, 8.6265, None),
+            (0, "jit_gemm(370734272565018276)", 7.198516, 8.624395, None)]
+    v5e = tmp_path / "v5e"
+    _tpu_capture(v5e, ops, runs)
+    read = tpu_ops(v5e, {0}, "jit_gemm")
+    # Each op's milliseconds its own picoseconds, as the capture states them.
+    assert [(op.name, round(op.milliseconds * 1e9)) for op in read] == [(copied, 25000), (fused, 1425826000)]
 
 
 def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():
