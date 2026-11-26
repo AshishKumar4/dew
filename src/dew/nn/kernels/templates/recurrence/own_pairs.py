@@ -330,10 +330,14 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     scored = "scores" in products
     # The system's rows the reads where the call erases along them (`intra.intra_rows`), its columns the keys.
     reading = reads is not None and "system" in products
-    anchors = anchored.anchoring(call, reading=reading)
-    keys = key_block(call, functools.partial(_own_held, call, outputs=len(products), anchors=anchors),
-                     functools.partial(_own_staged, call, products=products, reads=reading, anchors=anchors),
-                     functools.partial(pair_streams, call, queries=scored, reads=reading), contracted=True)
+    def plan(*, anchors: bool) -> tuple:
+        return (functools.partial(_own_held, call, outputs=len(products), anchors=anchors),
+                functools.partial(_own_staged, call, products=products, reads=reading, anchors=anchors),
+                functools.partial(pair_streams, call, queries=scored, reads=reading))
+
+    # Fitted with the anchored products' reduction scratch it launches with, so a device whose block budget
+    # holds no anchored block keeps its pairs each their own decay (train 1337's review, row 13495).
+    anchors, keys = anchored_plan(call, anchored.anchoring(call, reading=reading), plan, widest=False)
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
@@ -799,22 +803,28 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
 
 
 def _key_own_plan(call: Call, summed: Operand, *, reading: bool) -> tuple[bool, int]:
-    """`key_pairs_own`'s `(anchors, keys)`: its own pairs anchored products (`anchored.back`) where the call
-    takes them (`anchored.back_anchoring`) and a block of them holds a program (its reduction scratch and
-    the device's block budget counted), else each pair its own decay; and its key block,
-    anchored the widest holding a program: at 16 keys an A100's and an RTX A6000's anchored launch took
-    ptxas past 255 registers where at 32 they took 244 and 245 (an RTX PRO 6000's 16, its widest held,
-    168); its guard, factors and staging fixed a step, fewer steps take them fewer times."""
+    """`key_pairs_own`'s `(anchors, keys)` (`anchored_plan`, anchored the widest block holding a program)."""
 
     def plan(*, anchors: bool) -> tuple:
         return (functools.partial(_key_own_held, call, reads=reading, anchors=anchors),
                 functools.partial(_key_own_staged, call, summed=summed, anchors=anchors),
                 functools.partial(_keypair_streams, call, reads=reading))
 
-    anchors = (anchored.back_anchoring(call, reading=reading)
-               and key_block_holds(call, *plan(anchors=True), contracted=True, reducing=1))
+    return anchored_plan(call, anchored.back_anchoring(call, reading=reading), plan, widest=True)
+
+
+def anchored_plan(call: Call, wanted: bool, plan: Callable[..., tuple], *, widest: bool) -> tuple[bool, int]:
+    """An own pairs launch's `(anchors, keys)`, one fit for its plan and its launch: its own pairs anchored
+    products (`anchored.step`, `anchored.back`) where the call takes them (`wanted`) and a block of them,
+    `plan(anchors=True)`'s held, staged and streamed, holds a program with its one warpgroup's reduction
+    scratch and within the device's block budget (`key_block_holds`), else each pair its own decay; its key
+    block the one its plan holds at that same scratch (`key_block`), anchored the widest holding a program
+    where `widest` (the backward's: its guard, factors and staging fixed a step, fewer steps take them fewer
+    times; at 16 keys an A100's and an RTX A6000's anchored launch took ptxas past 255 registers where at 32
+    they took 244 and 245)."""
+    anchors = wanted and key_block_holds(call, *plan(anchors=True), contracted=True, reducing=1)
     return anchors, key_block(call, *plan(anchors=anchors), contracted=True, reducing=int(anchors),
-                              widest=anchors)
+                              widest=widest and anchors)
 
 
 def _exact_back(call: Call, strip: Callable, rows: Callable, shifts, block: tuple, *, scale: float,
