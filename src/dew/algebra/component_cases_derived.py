@@ -313,12 +313,14 @@ def _nvfp4_scale_0(x1):
     v63 = lax.and_p.bind(v2, np.array(127, dtype=jnp.dtype('uint32')))
     v64 = lax.eq_p.bind(v63, np.array(127, dtype=jnp.dtype('uint32')))
     v65 = lax.and_p.bind(v2, np.array(128, dtype=jnp.dtype('uint32')))
-    v66 = lax.shift_left_p.bind(v65, np.array(24, dtype=jnp.dtype('uint32')))
-    v67 = lax.or_p.bind(v66, np.array(2143289344, dtype=jnp.dtype('uint32')))
-    v68 = lax.bitcast_convert_type_p.bind(v67, new_dtype=jnp.dtype('float32'))
-    v69 = lax.select_n_p.bind(v64, v62, v68)
-    v70 = lax.bitcast_convert_type_p.bind(v69, new_dtype=jnp.dtype('uint32'))
-    return (v70,)
+    v66 = lax.ne_p.bind(v65, np.array(0, dtype=jnp.dtype('uint32')))
+    v67 = lax.convert_element_type_p.bind(v66, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
+    v68 = lax.shift_left_p.bind(v67, np.array(31, dtype=jnp.dtype('uint32')))
+    v69 = lax.or_p.bind(np.array(2143289344, dtype=jnp.dtype('uint32')), v68)
+    v70 = lax.bitcast_convert_type_p.bind(v69, new_dtype=jnp.dtype('float32'))
+    v71 = lax.select_n_p.bind(v64, v62, v70)
+    v72 = lax.bitcast_convert_type_p.bind(v71, new_dtype=jnp.dtype('uint32'))
+    return (v72,)
 
 
 def _online_softmax_step_0(x1, x2, x3, x4, x5):
