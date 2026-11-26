@@ -796,6 +796,30 @@ def test_a_correctly_rounded_divisions_derivatives_divide_as_ieee_division():
     np.testing.assert_array_equal(np.asarray(over_both), np.float32(1) / first + np.float32(1) / second)
 
 
+def test_a_correctly_rounded_division_of_subnormal_operands_is_their_values_quotient():
+    """A subnormal operand divides as its value, which XLA's division on a flushing CPU reads as zero:
+    `2^-149 / 2^-126` is `2^-23` and `2^-126 / 2^-149` is `2^23`, `3 * 2^-149 / 2^-148` is `1.5`, bit for bit,
+    where the division gave 0, an infinity and 0 (row 13163)."""
+    from dew.nn.precision import correctly_rounded_divide
+
+    numerator = np.float32([2.0 ** -149, 2.0 ** -126, 3 * 2.0 ** -149])
+    denominator = np.float32([2.0 ** -126, 2.0 ** -149, 2.0 ** -148])
+    np.testing.assert_array_equal(np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator)),
+                                  np.float32([2.0 ** -23, 2.0 ** 23, 1.5]))
+
+
+def test_a_correctly_rounded_divisions_denominator_tangent_overflows_where_its_value_does():
+    """The tangent of `2^20 / d` in `d` at `2^-60`, under a tangent `2^-60`, is `-2^80`, both ways, where the
+    rule formed `(n / d) / d`, `2^140`, first and gave an infinity (row 13163)."""
+    from dew.nn.precision import divided
+
+    numerator, denominator = np.float32(2.0 ** 20), np.float32(2.0 ** -60)
+    _, moved = jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(2.0 ** -60),))
+    assert float(moved) == -(2.0 ** 80)
+    _, pull = jax.vjp(lambda d: divided(numerator, d), denominator)
+    assert float(pull(np.float32(2.0 ** -60))[0]) == -(2.0 ** 80)
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_correctly_rounded_division_keeps_an_explicit_axis_through_its_gradient():
     """A correctly rounded division of rows a mesh's Explicit data axis splits is typed as JAX's own division
