@@ -61,6 +61,7 @@ from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.gemm import rows_permuted
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
@@ -326,11 +327,11 @@ def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fu
     return xla(program.work + cost.Work(device_bytes=written)) + program.extra
 
 
-def _indexed_rows(operands: tuple, table: jax.Array) -> tuple:
-    """Each `(side, axes)` side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed
-    as it was (`templates.gemm.rows_permuted`)."""
-    return tuple((rows_permuted(side, table, axes.index('rows')) if 'rows' in axes else side, axes)
-                 for side, axes in operands)
+def _indexed_rows(sides: tuple[Side, ...], table: jax.Array) -> tuple[Side, ...]:
+    """Each side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed as it was
+    (`templates.gemm.rows_permuted`)."""
+    return tuple(Side(rows_permuted(side.value, table, side.axes.index('rows')), side.axes)
+                 if 'rows' in side.axes else side for side in sides)
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gather: bool, has_scatter: bool,
@@ -353,7 +354,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
     # beside a value each device holds its own of is traced as the program wrote it.
     # The routing tables too: a table each device holds its own of routes rows that vary with it.
     acc = computed_from(jax.ShapeDtypeStruct((rows_count, width), out_dtype), lhs, rhs, group_sizes, gather,
-                        scatter, [side for side, _ in prologue.get('prologue_operands', ())])
+                        scatter, [side.value for side in prologue.get('prologue', NO_HOOK).sides])
     operand_bytes = float(rows_count * lhs.shape[-1] * lhs.dtype.itemsize + rhs.size * rhs.dtype.itemsize)
     collected = _PRICED.get()
 
@@ -419,14 +420,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
     # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
     outputs = len(out_leaves) - len(names)
-    epilogue_ops = tuple(zip(leaves, axes, strict=True))
+    sides = tuple(map(Side, leaves, axes))
     if scatter is not None:
         # Epilogue runs before scatter: align post-scatter `'rows'` sides to pre-scatter row order.
-        epilogue_ops = _indexed_rows(epilogue_ops, scatter)
+        sides = _indexed_rows(sides, scatter)
 
     def hooked():
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                         epilogue_operands=epilogue_ops, out_dtype=dtypes[0],
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=Hook(epilogue, sides),
+                         out_dtype=dtypes[0],
                          out_dtypes=dtypes if several else None, precision=precision,
                          gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
                          named=(None,) * outputs + names, **prologue)
@@ -443,8 +444,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
             float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed, forms=forms,
             resident=resident, permuted_bytes=0.0 if scatter is None else float(sum(
-                2 * side.size * side.dtype.itemsize + scatter.size * scatter.dtype.itemsize
-                for side, axes in epilogue_ops if 'rows' in axes))))
+                2 * side.value.size * side.value.dtype.itemsize + scatter.size * scatter.dtype.itemsize
+                for side in sides if 'rows' in side.axes))))
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
@@ -511,8 +512,8 @@ def _prologue(fusion, gathered: bool = False) -> tuple[jax.Array, dict, Formed |
     base, function, sides, axes, jvp, formed = stage
     # Its stage, from the producer's program the algebra pass rewrote (`_split`), the launch takes as it is
     # (`tuning.prepared_as`).
-    return base, {'prologue': tuning.prepared_as(function),
-                  'prologue_operands': tuple(zip(sides, axes, strict=True)), 'prologue_jvp': jvp}, formed
+    return base, {'prologue': Hook(tuning.prepared_as(function), tuple(map(Side, sides, axes))),
+                  'prologue_jvp': jvp}, formed
 
 
 def _rewritten_consumer(consumer, values, acc) -> tuple[Callable, Callable]:

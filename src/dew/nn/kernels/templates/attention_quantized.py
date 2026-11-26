@@ -22,7 +22,8 @@ from dew._facts import traced_fact
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_route
-from dew.nn.kernels.templates.attention import Hooks, KeySpans, Kind, Param, dense, score_modded
+from dew.nn.kernels.templates.attention import Hooks, KeySpans, Kind, dense, score_modded
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum, products_quantized
 
 
@@ -128,8 +129,8 @@ def _attending(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpa
     """The forward: the codes on the template's anchored walk (`attention_route.rounded`), the weights
     rounded at each row's maximum, the output taken by the values' columns' scales."""
     query_codes, key_codes, value_codes, query_scale, key_scale, columns = _operands(query, key, value)
-    coded = Hooks(Scaled(hooks.score_mod),
-                  (Param(query_scale, Kind.QUERY), Param(key_scale, Kind.KEY), *hooks.score_params),
+    sides = (Side(query_scale, Kind.QUERY), Side(key_scale, Kind.KEY), *hooks.score.sides)
+    coded = Hooks(score=Hook(Scaled(hooks.score.fn), sides),
                   rounds=BOUND)
     out = attention_route.rounded(query_codes, key_codes, value_codes, spans, coded)
     return (out.astype(jnp.float32) * columns).astype(query.dtype)

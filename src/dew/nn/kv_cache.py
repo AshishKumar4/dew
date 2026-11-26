@@ -55,6 +55,7 @@ from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
+from dew.nn.kernels.templates.hooks import Hook
 from dew.nn.precision import EXACT_FLOAT32, at_least_fp32, declares_fp32_products, divided, float32_einsum
 from dew.nn.protocols import computes_in
 from dew.nn.scatter import DROPPED
@@ -1057,7 +1058,8 @@ class KVStore:
 
         initial = None if sinks is None else template.sinks(sinks, query.shape[0], query.shape[1],
                                                              self._value_width())
-        hooks = template.Hooks(None if softcap is None else template.Capped(softcap), initial=initial)
+        hooks = template.Hooks(score=Hook(None if softcap is None else template.Capped(softcap)),
+                               initial=initial)
         interpret = generation.placed_platform() != "gpu"
         pools = [self._get(name) for name, _ in self.payloads]
         # A quantized cache's codes read as they lie, dequantized in the walk by their scales (`scale_shape`):
@@ -1324,7 +1326,7 @@ def _template_tiles(case: PagedCase) -> bool:
         spans = template.spans(case.queries, keys, rows, lengths=jnp.full((rows,), keys, jnp.int32))
         initial = None if sinks is None else template.sinks(sinks, rows, case.queries, case.value_dim)
         capped = None if case.softcap is None else template.Capped(case.softcap)
-        hooks = template.Hooks(capped, initial=initial)
+        hooks = template.Hooks(score=Hook(capped), initial=initial)
         derived.append(attention_decode.planned(query, key, value, spans, hooks, table=table,
                                                 scales=scales)[0])
         return query
@@ -1508,7 +1510,7 @@ def _template_forward(query, key, value, table, lengths, starts=None, sinks=None
     rows = query.shape[0]
     keys = key.shape[1] if table is None else table.shape[1] * key.shape[2]
     spans = template.spans(1, keys, rows, lengths=jnp.maximum(lengths, 1), starts=starts)
-    hooks = template.Hooks(None if softcap is None else template.Capped(softcap),
+    hooks = template.Hooks(score=Hook(None if softcap is None else template.Capped(softcap)),
                            initial=None if sinks is None else template.sinks(sinks, rows, 1, value.shape[-1]))
     # Interpreted where the arrays lie off a GPU (Mosaic GPU compiles on one alone), whatever GPU the step
     # is chosen for (`generation.assumed`).
