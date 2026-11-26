@@ -1208,6 +1208,7 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = N
     if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE, Kind.BAND):
         row, head = shared_place(value.shape, row, head)
     if kind_of(param) is Kind.BAND:
+        assert origins is not None, "a band is read by its origins, the side after it"
         origin_row, _ = shared_place(origins.value.shape, row, 0)
         bands = value[row, head]
         # Its origins whole keys whatever dtype a truth's draw widened them to.
@@ -1229,6 +1230,7 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = N
             return value[row, :, head]
         case Kind.WIDTH:
             raise ValueError("a width's parameter is a prologue's (`prologued`), no score or output hook's")
+    raise ValueError(f"no score or output hook takes a side of kind {kind_of(param)!r} as its tile")
 
 
 def logit_scale(width: int, scale: float | None) -> float:

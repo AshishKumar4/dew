@@ -479,7 +479,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if rows_bias is not None and columns_bias is not None:
             params = (Side(rows_bias, template.Kind.QUERY),
                       Side(columns_bias, template.Kind.KEY))
-        elif band_values is not None:
+        elif band_values is not None and band_origins is not None:
             # A band read a tile at a time at its key tile's column (`band.band_tile`), its origins the
             # side after it (`template.Kind.BAND`).
             params = (Side(band_values, template.Kind.BAND),
@@ -491,7 +491,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         else:
             params = (Side(bias, template.Kind.TILE),)
         score_mod = (capped if not params else template.Banded(template.Biased(capped))
-                     if band_values is not None else template.Biased(capped))
+                     if band_values is not None and band_origins is not None else template.Biased(capped))
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)

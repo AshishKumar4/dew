@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
@@ -1342,10 +1342,14 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
         work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
         traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
             query, key, key).jaxpr
-    walks = [math.prod(equation.params["grid_mapping"].grid) for equation in programs.equations(traced)
-             if equation.primitive.name == "pallas_call"
-             and "forward" in str(equation.params.get("name_and_src_info", ""))]
-    assert walks == [attention_decode.launch_programs(rows, tiles) * work["plain"].slices], (walks, work)
+    # Each walk launch's programs, its mesh's grid (a Mosaic GPU launch's `mpmd_map`, `mesh.shape`'s grid
+    # axes, its threads apart).
+    walks = [math.prod(size for axis, size in equation.params["meshes"][0].shape.items()
+                       if axis not in ("wg", "warp", "lane"))
+             for equation in equations(traced) if "attention_forward" in str(equation.params.get("name"))]
+    # One launch a column block of the values (`Tiles.columns`), each the same grid.
+    assert walks and set(walks) == {attention_decode.launch_programs(rows, tiles) * work["plain"].slices}, (
+        walks, work)
     assert attention_decode.launch_programs(rows, tiles) == 64
 
     def draw(seed: int):
