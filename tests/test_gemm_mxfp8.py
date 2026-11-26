@@ -231,3 +231,27 @@ def test_an_mxfp8_product_keeps_its_matrices_explicit_column_placement():
             out = jax.jit(run)(jax.device_put(x, NamedSharding(mesh, PartitionSpec())), split)
     assert out.sharding.spec[1] == "data", out.sharding
     np.testing.assert_array_equal(np.asarray(out), np.asarray(whole))
+
+
+def test_a_nan_block_takes_the_nan_scale_and_poisons_only_the_sums_it_reaches():
+    """A block holding a NaN takes the NaN scale (`0xFF`, `formats.MxFp8.quantized`), the row's other block
+    its own; in a product, a NaN-scaled block of the rows makes that row's sums NaN and one of a matrix's
+    columns that column's, every other sum finite and the rows past the groups zero (row 13164)."""
+    x = jnp.ones((2, 64), jnp.float32).at[0, 5].set(jnp.nan)
+    held = np.asarray(jax.lax.bitcast_convert_type(formats.MxFp8.quantized(x).scales, jnp.uint8))
+    assert held[0, 0] == 0xFF and held[0, 1] != 0xFF and (held[1] != 0xFF).all()
+    nan_byte = jnp.uint8(0xFF)
+    one = jnp.uint8(127)
+    row_scales = jnp.full((256, 2), one).at[3, 1].set(nan_byte)
+    column_scales = jnp.full((1, 128, 2), one).at[0, 7, 0].set(nan_byte)
+    rows = formats.MxFp8(jnp.ones((256, 64), jnp.float8_e4m3fn),
+                         jax.lax.bitcast_convert_type(row_scales, jnp.float8_e8m0fnu))
+    matrices = formats.MxFp8(jnp.ones((1, 128, 64), jnp.float8_e4m3fn),
+                             jax.lax.bitcast_convert_type(column_scales, jnp.float8_e8m0fnu))
+    with generation.chosen(mxfp8="xla"):
+        out = np.asarray(jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.asarray([1], jnp.int32),
+                                                                 out_dtype=jnp.float32))(rows, matrices))
+    nan = np.isnan(out)
+    assert nan[3].all() and nan[:128, 7].all() and nan.sum() == 128 + 128 - 1
+    np.testing.assert_array_equal(out[128:], np.zeros((128, 128), np.float32))
+    assert (out[:128][~nan[:128]] == 64.0).all()
