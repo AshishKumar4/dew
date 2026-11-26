@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pickle
+import shutil
 import tarfile
 import tempfile
 import threading
@@ -397,6 +398,10 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
 
         def _open(self, path, mode="rb", **options):
             return open(self._local(path), mode)
+
+        def get_file(self, rpath, lpath, **options):
+            # A transport cache fetches a file whole (`simplecache`), which the Hub's own fetches over HTTP.
+            shutil.copyfile(self._local(rpath), lpath)
 
     monkeypatch.setattr(HfApi, "repo_info", lambda self, repo_id, repo_type=None, revision=None, **options:
                         SimpleNamespace(sha=branch.get(revision or "main", revision)))
