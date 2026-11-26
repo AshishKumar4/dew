@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.kernels import gemm, generation, grouped_matmul, grouped_quantized, selection, xla_products
+from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.precision import EXACT_FLOAT32

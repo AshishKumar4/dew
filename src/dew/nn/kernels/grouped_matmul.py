@@ -56,7 +56,7 @@ from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import base, copies
-from .templates.gemm import packed, tiling
+from .templates.gemm import tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import Product, eight
 
