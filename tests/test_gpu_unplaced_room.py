@@ -1,23 +1,28 @@
 """A fresh start's step compiled, before its state is placed, in the room its admission reads (row 12882):
 the arguments in use already, which its admission counts once, are given back to the compile's limit."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
-from test_plan import free_until_placed, lm
+from test_frozen_tree import adapted
+from test_plan import free_until_placed
 
-ROWS, SEQ = 512, 512
-TEXT = (np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64
-"""Rows enough that the batch, an argument of the step, outweighs the bytes XLA rounds a limit by."""
+from dew.training import MeshSpec, Trainer
+
+ROWS = 64
+TEXT = np.random.default_rng(0).integers(0, 256, (ROWS, 9))
 
 
 @pytest.mark.gpu(reason="a compile's memory limit applies on a GPU alone (`memory.compile_limit`)")
-def test_a_fresh_step_admitted_before_its_state_is_placed_compiles_in_that_room(monkeypatch, tmp_path):
-    """A fresh start whose devices read room for its step by a few bytes, as its admission before the state
-    is placed counts it (each argument once, its batch among them): its first compile fits that room, the
-    limit XLA is given its admission's, where it held back the arguments already in use a second time and
-    stopped the compile its admission admitted (row 12882: 25 MiB of a 2xH100 decision batch, 4 GiB a
-    device of a LoRA base kept as it is)."""
+def test_a_lora_start_keeping_its_base_compiles_in_the_room_its_admission_reads(monkeypatch, tmp_path):
+    """A LoRA run's fresh start whose base its devices hold already, kept as it is through the start
+    (`Start._kept_through`), on devices reading room for its step by a few bytes as its admission before
+    the state is placed counts it (each argument once, the base among them): its first compile fits that
+    room, the limit XLA is given its admission's, where it held back the base in use a second time and
+    stopped the compile its admission admitted (row 12882: 4.1 GiB short on 2xH100 with 4 GiB a device of
+    a LoRA base kept)."""
     from affine_run import Replaying
 
     from dew.data.dataset import Loader
@@ -28,13 +33,15 @@ def test_a_fresh_step_admitted_before_its_state_is_placed_compiles_in_that_room(
         # Each fit's rung its own (`DEW_RUNG_RECORDS`): the second starts where the first did.
         monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / str(room)))
         free_until_placed(monkeypatch, room)
-        trainer = lm(split=1, seq=SEQ)
+        # Loaded once the devices read room: the base is in use beside the start, as a loaded run's is.
+        trainer = Trainer(adapted(placed=True), optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(),
+                          split=1)
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
         return trainer.plan["probes"][0]
 
     roomy = 1 << 36
     measured = first_probe(roomy)
     assert measured["fits"] is True and isinstance(measured["headroom"], int), measured
-    # The room its admission reads as the step's exactly, and 64 KiB beside it.
+    # The room its admission reads as the step's exactly, and 64 KiB beside it: less than the base's bytes.
     probe = first_probe(roomy - measured["headroom"] + (1 << 16))
     assert probe["fits"] is True and 0 <= probe["headroom"] <= 1 << 16, probe
