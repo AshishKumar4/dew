@@ -11,12 +11,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from jax.core import Tracer
 
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
+from dew.nn.kernels.formats import TernaryWeights, scale_factor
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.sharding import automatic_axes
 
@@ -75,10 +74,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     `precision.twice_scaled`, and rounds once to `out_dtype`. Its scale is zero or normal
     (`TernaryWeights.checked`: a subnormal one refused, row 13340), so its products are normal wherever their
     values are, a process that flushes a subnormal operand forming them as a GPU does."""
-    if not isinstance(weights.form, Tracer):
-        weights.checked()
-    else:
-        scale_checked(jnp.shape(weights.scale), weights.shape)
+    weights.checked()
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")

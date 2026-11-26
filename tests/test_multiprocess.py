@@ -83,6 +83,8 @@ SEARCHED_AGAIN = Path(__file__).with_name("searched_again_worker.py")
 again once placed."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
+TERNARY_SCALE = Path(__file__).with_name("ternary_scale_worker.py")
+"""The worker of the pool whose packed ternary scale lies across, or on one of, its processes."""
 REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
 """The worker of the pool that recovers a lost key from a replica."""
 CLOCKED = 17
@@ -1874,6 +1876,20 @@ def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
     assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
     assert reports[0]["update_scale"] > 0
+
+
+@pytest.mark.distributed
+def test_a_ternary_scale_spanning_processes_is_refused_on_every_rank_where_one_holds_a_subnormal(tmp_path):
+    """A packed ternary matrix's per-column scale sharded over both processes, a subnormal on process 1's
+    columns alone: process 1 refuses it and process 0 hears of it (`PeerFailure`), neither admitting it nor
+    left at its next collective; a normal scale on process 0's devices alone is admitted on each, neither
+    waiting on the other, and a subnormal one there refused on both at a restore's pool-wide check (row
+    13340's review)."""
+    reports = run_pool("ternary_scale", tmp_path / "pool", 2, script=TERNARY_SCALE, timeout=180)
+    assert [report["outcome"] for report in reports] == ["PeerFailure", "ValueError"]
+    assert [report["alone"] for report in reports] == ["admitted", "admitted"]
+    assert [report["restored"] for report in reports] == ["ValueError", "PeerFailure"]
+    assert [report["after"] for report in reports] == [True, True]
 
 
 @pytest.mark.distributed
