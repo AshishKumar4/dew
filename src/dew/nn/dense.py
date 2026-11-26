@@ -187,7 +187,7 @@ def _ruled() -> bool:
 
 def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions,
              bias: Array | None = None, tensor_scale: Array | None = None,
-             formed: projections.Formed | None = None) -> jax.Array:
+             formed: projections.FormedInput | None = None) -> jax.Array:
     """The layer's product of `inputs` and `kernel` over `dimensions`, plus `bias` where given, shaped to
     broadcast over it (`biased`). The product is its `dot_general_cls` (an interceptor's: a quantized
     product), as flax picks it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the
@@ -200,8 +200,8 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
     template reads no policy from a callable, and the bias is added past it. `tensor_scale`, the rows' under
     a delayed-scaling NVFP4 recipe that takes the product (`history_scale`), which the template's product
     hands its recipe (`projections.recipe_general`). `formed`, `inputs` formed entrywise from other values
-    (`projections.Formed`), which the plain product multiplies as the template's formed operand; every other
-    product multiplies `inputs` as any."""
+    (`projections.FormedInput`), which the plain product multiplies as the template's formed operand; every
+    other product multiplies `inputs` as any."""
     extents = projections.extents(inputs.shape, kernel.shape, dimensions)
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     if layer.dot_general_cls is not None:
@@ -243,7 +243,7 @@ def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, prefer
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
             shaped, stored: Array | None = None, *, taken: Callable | None = None,
-            tensor_scale: Array | None = None, formed: projections.Formed | None = None):
+            tensor_scale: Array | None = None, formed: projections.FormedInput | None = None):
     """The layer's product of `inputs` and `kernel` over `dimensions` as flax takes it, plus `bias`
     reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
     at fp32, in float64 on a CPU under Dew's tests); where the layer computes in a 16-bit dtype and its
@@ -471,27 +471,32 @@ class _LinearEnvelope(nn.Module):
 class Dense(_LinearEnvelope, nn.Dense):
     """Flax's Dense, its bias added by `biased` (the module docstring). `kernel_axes` are its kernel's
     logical axes, `[inputs, features]`, which its module declares where it builds it, and its bias takes
-    the features' (`declared`); None declares none. A call's `formed` (`projections.Formed`) is read only
-    where its `operand` is the call's `inputs` itself: an interceptor handing the layer other inputs (an
-    input quantizer's) leaves it unread."""
+    the features' (`declared`); None declares none. A call's `formed` (`projections.FormedInput`) is read
+    only where its `operand` is the call's `inputs` itself: an interceptor handing the layer other inputs
+    (an input quantizer's) leaves it unread."""
 
     kernel_axes: tuple[str | None, ...] | None = None
 
     @nn.compact
-    def __call__(self, inputs: Array, formed: projections.Formed | None = None) -> jax.Array:
+    def __call__(self, inputs: Array, formed: projections.FormedInput | None = None) -> jax.Array:
         """The layer of `inputs`. `formed`, where given, states `inputs` formed entrywise from other values
-        (`projections.Formed`: a gated MLP's hidden activation), which the layer's plain product multiplies
-        as the template's formed operand, holding the values it was formed from in place of `inputs` for
-        reverse mode (`_product`), under the class's identity rule."""
+        (`projections.FormedInput`: a gated MLP's hidden activation), which the layer's plain product
+        multiplies as the template's formed operand, holding the values it was formed from in place of
+        `inputs` for reverse mode (`_product`), under the class's identity rule."""
         held = formed if formed is not None and formed.operand is inputs else None
         return self._envelope(functools.partial(self._linear, formed=held), inputs)
+
+    @property
+    def reads_formed(self) -> bool:
+        """Whether its call takes `formed` (`protocols.ReadsFormed`): a plain Dense's does."""
+        return True
 
     def product_owned(self) -> bool:
         """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
         Qwix rule over its module path answers: what a parent joining it with others reads (`joined`)."""
         return intercepted()
 
-    def _linear(self, inputs: Array, formed: projections.Formed | None = None) -> jax.Array:
+    def _linear(self, inputs: Array, formed: projections.FormedInput | None = None) -> jax.Array:
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(

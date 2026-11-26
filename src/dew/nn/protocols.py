@@ -339,6 +339,17 @@ class ReadsTrain(Protocol):
 
 
 @runtime_checkable
+class ReadsFormed(Protocol):
+    """A linear layer whose call takes `formed` (`dew.nn.kernels.projections.FormedInput`: its input formed
+    entrywise from other values, a gated MLP's hidden activation from its gate and up projections), which its
+    product multiplies holding those values for reverse mode in place of the input: its owner hands them where
+    `reads_formed` says the call reads them, whatever the layer's class."""
+
+    @property
+    def reads_formed(self) -> bool: ...
+
+
+@runtime_checkable
 class ReadsClips(Protocol):
     """An encoder that says whether it reads a clip's frames, (B, T, H, W, C), or an image: a run over
     clips takes one that does, and a run over images one that doesn't."""

@@ -649,7 +649,7 @@ _recipe_chain = contracted("test_a_recipe_chain_holds_every_reverse_order")(
 
 
 @dataclasses.dataclass(frozen=True)
-class Formed:
+class FormedInput:
     """A projection's input formed entrywise from other values: `operand`, the input itself, is
     `hook(rows, *sides)` rounded to its dtype (a gated MLP's hidden activation, the gated product of its gate
     and up projections, `dew.nn.mlp.GatedMLP`), each side of the rows' shape. A plain product of it
@@ -683,12 +683,12 @@ def dot_general(xla, path: tuple | None = None):
     it; XLA's own product takes it inside its rule, the input's cotangent returned only with the kernel's
     and the bias's gradients formed, one barrier for both where the bias's own rule would add two (row
     6740). A `tensor_scale`, the rows' tensor scale under the run's delayed NVFP4 scaling, goes to the
-    recipe's product (`recipe_general`); a product the recipe leaves reads none. A `formed` input (`Formed`,
-    its `operand` `lhs` itself) is multiplied as `gemm`'s formed operand where the plain product sees its
+    recipe's product (`recipe_general`); a product the recipe leaves reads none. A `formed` input
+    (`FormedInput`, its `operand` `lhs` itself) is multiplied as `gemm`'s formed operand where the plain product sees its
     rows whole (`_formed_product`), each device's own rows where the call maps them per shard; every other
     product of it (a recipe's, XLA's under a mesh the partitioner places) multiplies `lhs` as any."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, bias=None,
-                tensor_scale=None, formed: Formed | None = None, **kwargs):
+                tensor_scale=None, formed: FormedInput | None = None, **kwargs):
         def added(out):
             # A product another rule takes, the bias added past it by its own (`precision.biased`).
             return out if bias is None else biased(out, bias)
@@ -713,7 +713,7 @@ def dot_general(xla, path: tuple | None = None):
             split, gathered = shards
             if formed is not None:
                 def shard(lhs, rhs, rows, *sides):
-                    held = Formed(lhs, rows, sides, formed.hook)
+                    held = FormedInput(lhs, rows, sides, formed.hook)
                     return product(lhs, rhs, dimension_numbers, precision, preferred_element_type,
                                    formed=held)
                 return added(on_shards(shard, split, (lhs, rhs, formed.rows, *formed.sides),
@@ -754,12 +754,12 @@ def _whole(*operands: jax.Array) -> bool:
     return not automatic_axes() and all(explicit_spec(operand) is None for operand in operands)
 
 
-def _formed_product(formed: Formed, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> jax.Array:
+def _formed_product(formed: FormedInput, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> jax.Array:
     """`formed.operand @ matrix` as the template's product of a formed operand (`gemm`'s `applied`, its
     prologue `formed.hook` over its rows and sides), on whichever route `gemm` takes each product (a launch,
     or XLA's program): the forward multiplies the operand as it is, and reverse mode pulls its cotangent
     back through the hook and forms the operand again for the kernel gradient from the rows and sides
-    alone, never holding it (`Formed`)."""
+    alone, never holding it (`FormedInput`)."""
     operand, depth = formed.operand, formed.operand.shape[-1]
 
     def flat(each):

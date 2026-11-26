@@ -40,10 +40,10 @@ from .flops import projection_flops
 from .gated_mlp import gated_mlp
 from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
-from .kernels.projections import Formed, recipe_chain
+from .kernels.projections import FormedInput, recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
-from .protocols import ProjectionGroup
+from .protocols import ProjectionGroup, ReadsFormed
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
@@ -379,16 +379,16 @@ class GatedMLP(nn.Module):
     def _down(self, hidden, train: bool, halves: tuple | None = None):
         """The down projection of `hidden`, its units dropped while training. `halves`, where given, the
         gate's and the up projection's values `hidden` is the gated product of, and its activation's name:
-        undropped, the projection reads `hidden` as formed from them (`projections.Formed`, the product's
+        undropped, the projection reads `hidden` as formed from them (`projections.FormedInput`, the product's
         hook `gated_hook`'s), so its reverse mode holds them, which the projections' own hold already, and
         never `hidden`, a `[tokens, hidden]` value a layer less."""
         if self.dropout_rate:
             hidden, halves = self.dropout(hidden, deterministic=not train), None
-        if halves is None or not isinstance(self.down_proj, Dense):
+        if halves is None or not (isinstance(self.down_proj, ReadsFormed) and self.down_proj.reads_formed):
             out = self.down_proj(hidden)
         else:
             gate, up, activation = halves
-            out = self.down_proj(hidden, formed=Formed(hidden, gate, (up,), gated_hook(activation)))
+            out = self.down_proj(hidden, formed=FormedInput(hidden, gate, (up,), gated_hook(activation)))
         return scaled(checkpoint_name(out, Residual.DOWN_PROJ), self.down_multiplier)
 
     def _gate_up(self, x):
