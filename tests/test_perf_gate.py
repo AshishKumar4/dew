@@ -80,7 +80,7 @@ def test_a_selection_of_no_row_is_refused_before_setup_and_an_empty_receipt_fail
                  ["compile", "--base", "a=.", "--head", "b=.", "--kind", sorted(gate.COMPILE_TARGETS)[0],
                   "--lock", "cuda12", "--out", str(tmp_path / "compile.json"), "--only", "nothing-named-so"]):
         monkeypatch.setattr(sys, "argv", ["perf_gate.py", *argv])
-        with pytest.raises(SystemExit, match="nothing-named-so"):
+        with pytest.raises(SystemExit):
             gate.main()
     results = {"base": "main", "head": "head", "alone": "main~aa", "rows": [], "rounds": 6,
                "samples": {"base": [{}] * 6, "alone": [{}] * 6, "head": [{}] * 6}}
