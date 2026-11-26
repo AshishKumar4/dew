@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from .derivatives import Protected, declared_tangent
+from .derivatives import Protected, contracted, declared_tangent
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -123,7 +123,8 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)
 
 
-_giant = declared_tangent(Protected(), _giant_primal, _giant_jvp, nondiff_argnums=(2, 3))
+_giant = contracted("test_a_giant_heads_clip_holds_every_order")(
+    declared_tangent(Protected(), _giant_primal, _giant_jvp, nondiff_argnums=(2, 3)))
 """A giant head's clip (`_giant_primal`) and its derivative's rule (`_giant_jvp`), as their numerics need
 them written."""
 

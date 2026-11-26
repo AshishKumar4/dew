@@ -291,3 +291,22 @@ def test_a_sink_softmax_holds_every_order(edge):
     assert_drawn_contract(sink_softmax, inputs, EDGES[edge], f"a sink softmax {edge}",
                           plain_fn=lambda logits, sinks: _weights(logits, sinks, None))
 
+
+@pytest.mark.parametrize("taken", ORDER_SETS)
+def test_a_giant_heads_clip_holds_every_order(taken):
+    """A head's clip (`attention_terms.clipped`, its giant heads' declared tangent rule `_giant`) holds every
+    derivative order finite against float64 truth and the plain formula `x * min(t / (|x| + eps), 1)`
+    across float32's exponent edges (`EDGES`), heads past the bound where the plain formula's squares
+    overflow among them (row 13137)."""
+    from contract_support import assert_contract
+
+    from dew.nn.attention_terms import clipped
+
+    def plain(x):
+        return x * jnp.minimum(8.0 / (jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True)) + 1e-6), 1)
+
+    x, direction, cotangent = normal_draw(13137, (4, 8), (4, 8), (4, 8))
+    for edge, scale in {**EDGES, "past the bound": 2.0 ** 64}.items():
+        assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), (cotangent,),
+                        f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
+
