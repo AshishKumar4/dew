@@ -40,11 +40,22 @@ rescale factor 1 / 255, fused as the reference fuses them."""
 
 
 def rgb(image: object) -> np.ndarray:
-    """An image as `[height, width, 3]` uint8, as the reference reads one: a PIL image converted to RGBA where
-    it holds transparency and else to RGB; an RGBA array laid over the checkerboard (`composited`); an RGB
-    array as it is."""
+    """An image as `[height, width, 3]` uint8, as the reference reads one: a path or URL loaded as
+    transformers loads one (`image_utils.load_image`, EXIF-transposed and converted to RGB), encoded bytes
+    opened; a PIL
+    image converted to RGBA where it holds transparency and else to RGB; an RGBA array laid over the
+    checkerboard (`composited`); an RGB array as it is."""
+    import io
+    from pathlib import Path
+
     from PIL import Image
 
+    if isinstance(image, str | Path):
+        from transformers.image_utils import load_image
+
+        image = load_image(str(image))
+    elif isinstance(image, bytes | bytearray):
+        image = Image.open(io.BytesIO(image))
     if isinstance(image, Image.Image):
         image = np.asarray(image.convert("RGBA" if image.has_transparency_data else "RGB"))
     held = np.asarray(image)

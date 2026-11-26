@@ -25,7 +25,6 @@ from dew.nn.attention import (
     AttentionImpl,
     attention_case,
     chosen_attention,
-    dense_bias,
     mask_kernel,
     reference_only,
     scaled_dot_product_attention,
@@ -40,14 +39,7 @@ from dew.nn.attention_masks import (
     repeat_kv_heads,
     visibility_mask,
 )
-from dew.nn.attention_terms import (
-    QKClip,
-    RelativeBias,
-    clipped,
-    log_ratio_scale,
-    relative_band,
-    relative_logits,
-)
+from dew.nn.attention_terms import QKClip, RelativeBias, clipped, log_ratio_scale, relative_logits
 from dew.nn.blocks import normal_kernel
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
@@ -920,12 +912,10 @@ class CausalSelfAttention(nn.Module):
         form = temperature_scale if self.temperature_form == 'floored' else log_ratio_scale
         return form(places, *self.temperature_tuning, dtype=dtype)
 
-    def _relative_bias(self, x, places, query_slots, key_slots, *, banded: bool = False):
-        """`relative_bias`'s bias of the queries' input `x` (its states tuned by the queries' `places` under
-        `temperature`) at `query_slots` against the keys at `key_slots`: `[B, H, Q, K]` (`relative_logits`),
-        or, where `banded` (a call's places its indices, the only bias: row 13138), the band about each
-        query (`relative_band`, `attention.BandBias`), which holds `Q band_width` entries a head where the
-        dense one holds `Q K`."""
+    def _relative_bias(self, x, places, query_slots, key_slots) -> jax.Array:
+        """`relative_bias`'s `[B, H, Q, K]` bias of the queries' input `x` (its states tuned by the queries'
+        `places` under `temperature`) at `query_slots` against the keys at `key_slots`
+        (`relative_logits`)."""
         spec = self.relative_bias
         assert spec is not None, "a relative bias is read where the layer computes one"
         B, S, _ = x.shape
@@ -936,8 +926,6 @@ class CausalSelfAttention(nn.Module):
             scale = self._temperature(places, at_least_fp32(states.dtype))
             states = states * (scale[..., None, None] if scale.ndim == 2
                                else scale[None, :, None, None]).astype(states.dtype)
-        if banded:
-            return relative_band(states, self.relative_bank, jnp.zeros((), jnp.int32))
         return relative_logits(states, self.relative_bank, query_slots, key_slots)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
@@ -1122,9 +1110,6 @@ class CausalSelfAttention(nn.Module):
             key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs, call)
 
         kv_len = key.shape[-3]
-        # A whole call whose places are its indices (none given, none counted): its relative bias a band
-        # (`relative_band`), its places its keys' indices.
-        indexed = not decode and positions is None and logical_positions is None and not self.ctx.kv_shared
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
                                                          decode, S)
         # The tokens' logical places (`Coordinates.positions`): the caller's, else the slots a cache
@@ -1200,7 +1185,7 @@ class CausalSelfAttention(nn.Module):
             else:
                 raise ValueError(f"{self.name}: a relative bias scores a call's own keys, and this call's "
                                  f"{masking.key.shape[-3]} keys are not its {S} tokens")
-            relative = self._relative_bias(x, places, query_slots, key_slots, banded=indexed and bias is None)
+            relative = self._relative_bias(x, places, query_slots, key_slots)
             bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
@@ -1720,8 +1705,7 @@ class CausalSelfAttention(nn.Module):
                                    image_groups=images, key_valid=valid, key_runs=runs, places=held,
                                    query_slots=query_slots)
             # Beside a context this call read through the same projections first (`attend_context`).
-            found = with_context_logits(self, max_attention_logits(query, key, mask=seen,
-                                                                   bias=dense_bias(bias, key.shape[-3])))
+            found = with_context_logits(self, max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow(QK, "max_logits", found)
             self.sow(QK, "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow(QK, "head_dim", jnp.asarray(query.shape[-1]))

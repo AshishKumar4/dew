@@ -1590,10 +1590,12 @@ class _Right:
 
 @dataclasses.dataclass
 class _Sections:
-    """A record whose section `one` declares one dataclass beside None and `either` two."""
+    """A record whose section `one` declares one dataclass beside None, `either` two, and `table` a
+    mapping."""
 
     one: _Left | None = None
     either: _Left | _Right | None = None
+    table: dict[str, int] = dataclasses.field(default_factory=lambda: {"a": 1})
 
 
 def test_an_override_path_through_a_section_its_point_sets_is_placed_by_its_one_declared_class():
@@ -1609,3 +1611,7 @@ def test_an_override_path_through_a_section_its_point_sets_is_placed_by_its_one_
         _placed(_Sections(), "one.y", record)
     with pytest.raises(KeyError):
         _placed(_Sections(), "either.x", record)
+    # A mapping field (a run's `TrainerConfig.links`) holds no record section a path steps into: refused as a
+    # path naming none, not read as a dataclass's record.
+    with pytest.raises(KeyError):
+        _placed(_Sections(), "table.a.value", record)

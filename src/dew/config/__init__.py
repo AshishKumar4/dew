@@ -612,7 +612,9 @@ def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[
     node: object = record
     unset: dict[str, JSON] = {}
     for group in groups:
-        known = (group in _names(kind) if isinstance(held, Mapping)
+        # A record section read off `record` steps by its declared dataclass; any other mapping (a run's
+        # `TrainerConfig.links`) holds no group a path names.
+        known = (dataclasses.is_dataclass(kind) and group in _names(kind) if isinstance(held, Mapping)
                  else dataclasses.is_dataclass(held) and group in _names(held))
         if not known:
             raise KeyError(f"{path} names no group of the run record")
