@@ -478,7 +478,8 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     units rather than multiplying its peak by `resident`, while overlapping their dependent paths (rows
     6216, 10809, 10810). Its issue slots take a warp's issue interval (`Multiprocessor.issue_interval`) over
     the warps each scheduler holds, where fewer warps than that interval leave it idle between a warp's
-    instructions (`latency_bound`: rows 5274, 4123)."""
+    instructions (`latency_bound`: rows 5274, 4123): every resident program's warps where the multiprocessor's
+    programs hide each other's intervals (`Multiprocessor.programs_hide_issue`), else one program's."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
@@ -487,10 +488,14 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     at = rates(target, device=False)
     throughput = max(units(per_program, at)[0])
 
+    multiprocessor = target.architecture.multiprocessor
+    hiding = multiprocessor is None or multiprocessor.programs_hide_issue
+
     def resident_wave(held: int) -> float:
         # `held` programs at once on a multiprocessor: their units shared, their warps hiding each other's
-        # issue intervals.
-        return held * max(throughput, latency_bound(per_program, at, target, held=held * warps))
+        # issue intervals where its programs' warps do.
+        return held * max(throughput, latency_bound(per_program, at, target,
+                                                    held=(held if hiding else 1) * warps))
 
     # Its full waves at the residency it holds, then its last at the programs left (the review of
     # lane/toolkit 61dd3c7d2: three programs at two resident are a wave of two and one of one).

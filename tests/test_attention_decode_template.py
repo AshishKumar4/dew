@@ -1206,6 +1206,38 @@ def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
         assert op.price_config(ba, tiles, target) is not None
 
 
+@pytest.mark.parametrize("rows, keys, width", [(1, 32768, 128), (8, 4096, 64)])
+def test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller(rows, keys, width):
+    """A decode walk on an A100, bf16, 32 heads over 8, a cache full to its length, priced at each slice count
+    the planner weighs (`MosaicForward.price_config`'s `issued`, `attention_decode._priced_slices`'s walk):
+    its larger key tile at or below its smaller at every count both stream at. Its smaller tile's programs
+    are two a multiprocessor, whose warps an A100's walks did not see hide each other's issue intervals, so
+    each is priced at one program's (`Multiprocessor.programs_hide_issue`); priced over both programs' warps,
+    the smaller tile ranked below and walked slower at every one of these cells (M-NA-27c-a100: +20.5% and
+    +40.5%, row 5274)."""
+    target = generation.gpu_target("sm80")
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, keys, rows)
+    compared = 0
+    with generation.assumed(target):
+        for count in (2, 4, 8, 16, 32):
+            op, ba = attention_decode._bound(query, key, key, spans, None, scale=None, table=None,
+                                             sources=None, scales=None, splits=count,
+                                             chosen=attention_decode.WALKS["plain"], in_key=False)
+            derived = op.derived(ba, target)
+            if derived is None:
+                continue
+            prices = {tile.block_k: op.price_config(ba, tile, target, issued=True)
+                      for tile in op.streamings(ba, derived, target)}
+            if len(prices) < 2:
+                continue
+            ranked = [prices[block] for block in sorted(prices)]
+            assert None not in ranked and ranked[-1] <= ranked[0], (count, prices)
+            compared += 1
+    assert compared, "no slice count streams at two key tiles"
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
