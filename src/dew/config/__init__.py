@@ -1699,9 +1699,9 @@ class RunConfig:
         states in their place, which the model then draws them in itself."""
         precision = self.trainer.precision
         stated = self.model.fields.get("param_dtype")
-        params = precision.dtypes.params if stated is None else jax.numpy.dtype(stated).name
+        params = precision.dtypes.params if stated is None else str(stated)
         return dataclasses.replace(precision, dtypes=dataclasses.replace(
-            precision.dtypes, compute=jax.numpy.dtype(self.compute_dtype()).name, params=params))
+            precision.dtypes, compute=self.compute_dtype(), params=params))
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,
