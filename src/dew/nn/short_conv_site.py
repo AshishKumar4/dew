@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +49,10 @@ class ShortConvSite(nn.Module):
     is in convolution order, the last the token itself (`causal_conv1d`'s), the dynamic projection's too;
     a source holding them by lag, the first the token itself (Inkling 2's dynamic sites), reverses them on
     import."""
+
+    # It reads a call's forks and a server's admitted rows to refuse them (`decoder_refusals` refuses them
+    # first, before routing picks either path).
+    reads: ClassVar[frozenset[str]] = frozenset({"forks", "admitted"})
 
     features: int
     kernel: int = 4
