@@ -2108,9 +2108,9 @@ def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path
     batch = {"text": jnp.asarray(ids)}
     step = trainer.compile(state, batch)
     assert isinstance(step, DrawingStep)
-    counts = []
+    counts, interval = [], Interval(0.0, None, microbatches=0)
     for index in range(6):
-        step.drawn(Interval(0.0, None, microbatches=0), index)
+        step.drawn(interval, index)
         counts.extend(step.counts)
         state, loss, *_ = step(state, batch)
         assert np.isfinite(float(loss)), (index, counts)
