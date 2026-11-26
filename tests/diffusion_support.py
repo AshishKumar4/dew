@@ -227,6 +227,25 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     return task, state, batch
 
 
+def saved_unstepped(config, directory):
+    """`config`'s task at the state its run starts from (`Trainer.place`), its trained weights each moved
+    by a draw so its zero-initialized layers hold weights too (`moved`), saved as a run in `directory` with
+    the record its inference reads: a saved run that compiles no step. Returns the task and that state."""
+    import optax
+
+    from dew.training import Checkpoints, Trainer
+
+    task = config.build()
+    state, _, _ = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3)).place()
+    state = state.replace(variables={**state.variables,
+                                     "params": moved(state.variables["params"], jax.random.key(3), 0.02)})
+    checkpoints = Checkpoints(str(directory))
+    checkpoints.save(0, state, None, artifact=task.inference_record())
+    checkpoints.wait()
+    config.save(str(directory))
+    return task, state
+
+
 def moved_weights(variables):
     """Check 1's `draw(seed)` over a trainer's `variables`: each trained leaf moved by the seed's draw,
     so zero-initialized layers take a gradient too. A draw's weights stay where `variables` are, so the
