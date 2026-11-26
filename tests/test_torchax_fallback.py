@@ -1775,8 +1775,9 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
     """A source taken to tier 3 looping a block of its layers (`TorchCausalLM.loop`, no step norm): its logits
     over drawn ids hold check 1 against transformers' own decoder of those layers repeated in `order`, each
     the source's, its float64 twin the truth; each repeated layer reads its own masks and rotary tables (a
-    Gemma 3 block of a sliding and a full layer). A run sets the loop as a run's loop does
-    (`Pretrained.with_model`), the source's parameters its own; a loop stating an exit gate runs nowhere."""
+    Gemma 3 block of a sliding and a full layer). A run's configuration sets the loop
+    (`DecoderRunConfig.looped`), the source's parameters its own; a count alone over no loop, a loop stating
+    an exit gate, and a release of the looped source (whose config records no loop) are refused."""
     config = LLAMA if family == "llama" else GEMMA3
     torch.manual_seed(0)
     model = transformers.AutoModelForCausalLM.from_config(
@@ -1784,10 +1785,18 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
     model.save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert isinstance(loaded, PretrainedFallback)
-    # A run's loop (`DecoderRunConfig.looped`): the source's own parameters, none drawn.
-    held = loaded.with_model(loaded.model.with_loop(loop), key=0)
+    # A run's loop (`DecoderRunConfig.looped`): the source's own parameters, none drawn; a run's pass count
+    # restates it, and alone, over a source with no loop, is refused.
+    from dew.config import DecoderRunConfig
+
+    held = DecoderRunConfig(loop=dataclasses.replace(loop, steps=loop.steps + 1),
+                            passes=loop.steps).looped(loaded)
     looped = held.model
-    assert held.variables is loaded.variables and not held.fresh
+    assert looped.loop == loop and held.variables is loaded.variables and not held.fresh
+    with pytest.raises(ValueError):
+        DecoderRunConfig(passes=2).looped(loaded)
+    with pytest.raises(ValueError):
+        held.export()
     draw = token_draw(0x13046, config["vocab_size"], (2, 12))
     with pytest.raises(ValueError):
         loaded.model.clone(loop=dataclasses.replace(loop, exit_gate=True)).apply(loaded.variables, *draw(0))
@@ -1843,4 +1852,20 @@ def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(t
         looped.apply(loaded.variables, np.zeros((2, 1), np.int32), decode=True, mutable=["cache"])
     with pytest.raises(ValueError):
         LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights="mean")
+    # Weights on the last pass alone are its own loss, which reads no earlier exit.
+    LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights=(0.0, 1.0))
     LMObjective(native_looped(), 16, pass_weights="mean")
+
+
+def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
+    """A source whose layers draw (attention dropout) refuses recomputing them, and the refusal leaves
+    torchax's key as it was: the same model traces again unrecomputed, unseeded, after it."""
+    torch.manual_seed(0)
+    dropping = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
+    transformers.LlamaForCausalLM(dropping).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    tokens = np.zeros((2, 8), np.int32)
+    recomputed = loaded.model.clone(remat=True)
+    with pytest.raises(ValueError):
+        jax.make_jaxpr(lambda v: recomputed.apply(v, tokens, train=True))(loaded.variables)
+    jax.make_jaxpr(lambda v: loaded.model.apply(v, tokens, train=True))(loaded.variables)

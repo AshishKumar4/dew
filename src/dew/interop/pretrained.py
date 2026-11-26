@@ -1237,6 +1237,16 @@ class PretrainedFallback(Pretrained):
             return replace(self, model=model)
         return super().with_model(model, key=key)
 
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """The source's tensors under its own names (`Pretrained.export`), refused for a looped model: its
+        release would reload the source's one pass, no field of its config recording the loop."""
+        from dew.interop.torchax_fallback import TorchCausalLM
+
+        if isinstance(self.model, TorchCausalLM) and self.model.loop is not None:
+            raise ValueError("a tier-3 source's release is its source's config and tensors, which hold no "
+                             "loop: export it unlooped, or keep the run's checkpoint")
+        return super().export(variables)
+
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
         (`PretrainedDecoder.text_generation`)."""

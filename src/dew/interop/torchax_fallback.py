@@ -1149,7 +1149,9 @@ class TorchGraph:
             seam = (contextlib.nullcontext() if layers is None and loop is None
                     else _layer_seam(self.module._model, env, draws, layers=layers, loop=loop))
             try:
-                with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
+                # The runtime property scoped to this trace whatever it is handed, so a draw inside (a refused
+                # nested layer's) leaves no key of its trace in the environment past it.
+                with (env, env.override_property(prng=env.prng_key if key is None else key),
                       draws, attending, _reaching(reach), seam):
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
@@ -1565,18 +1567,22 @@ class TorchCausalLM(nn.Module):
                     implicit: bool | None = None, exit_gate: bool | None = None,
                     exit_threshold: float | None = None, exits: bool | None = None,
                     theta_passes: int | None = None, messages=None) -> Self | None:
-        """The source at `steps` passes of its block `layers` (`Looping.with_passes`), None where the loop
-        asks what a tier-3 source cannot run (`runnable_loop`) or states no steps it has none of. Its
+        """The source at `steps` passes of its block `layers` (`Looping.with_passes`): its loop's counts
+        restated, or a new loop of both, without a step norm (a count alone over no loop is None, as a
+        native decoder's); None where it asks what a tier-3 source cannot run (`runnable_loop`). Its
         parameters are the source's own: a run's loop (`DecoderRunConfig.looped`) keeps them, drawing none
-        (`Pretrained.with_model`)."""
+        (`PretrainedFallback.with_model`)."""
         if any(value not in (None, False) for value in (backprop_steps, remat, implicit, exit_gate,
                                                          exit_threshold, exits, theta_passes, messages)):
             return None
-        if self.loop is None and steps is None:
-            return None
-        held = self.loop or Loop(steps=steps)
-        return self.with_loop(replace(held, steps=held.steps if steps is None else steps,
-                                      layers=held.layers if layers is None else layers))
+        if self.loop is None:
+            # A new loop names its passes and its block, and starts without a step norm, as a native
+            # decoder's does (`CausalTransformer.with_passes`).
+            if steps is None or layers is None:
+                return None
+            return self.with_loop(Loop(steps=steps, layers=layers, step_norm=False))
+        return self.with_loop(replace(self.loop, steps=self.loop.steps if steps is None else steps,
+                                      layers=self.loop.layers if layers is None else layers))
 
     @nn.nowrap
     def with_loop(self, loop: Loop) -> Self:
