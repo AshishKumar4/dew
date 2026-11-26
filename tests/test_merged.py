@@ -1022,10 +1022,11 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
                                                              template.Kind.KEY),))
 
 
-def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context(monkeypatch):
     """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
     batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
-    and `launch_work` keys hook pricing on the active JAX trace context."""
+    and `launch_work` keys hook pricing on the active JAX trace context, its plan held by what its hook
+    computes."""
     spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
     queries, out_heads = tokens * group, kv_heads * group
@@ -1103,17 +1104,22 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     finally:
         _CTX_HOOK_MODE.reset(token)
     assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
+    # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
+    # array is planned once for its program, as one that holds none is.
+    planned = []
+    compute = merged._compute_planned_block
+    monkeypatch.setattr(merged, "_compute_planned_block",
+                        lambda *args: planned.append(args) or compute(*args))
     captured = jnp.ones((), jnp.float32)
 
-    def unholdable(o, g):
+    def closing(o, g):
         return o + g + captured
 
-    assert not tuning.holdable(unholdable)
-    cached_before = merged._planned_block_cached.cache_info().currsize
-    merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
-                       output_mod=unholdable, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
-    assert merged._planned_block_cached.cache_info().currsize == cached_before
-    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; pricing must still cache-hit.
+    for _ in range(2):
+        merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                           output_mod=closing, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
+    assert len(planned) == 1
+    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; its pricing reads the held plan.
     op_prep = merged.MergedPadded(
         units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
         output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
@@ -1121,9 +1127,9 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     with generation.assumed("sm100"):
         ba_prep = op_prep.bind(p_s, s_s, (g_s,))
         op_prep._get_heuristics_config(ba_prep)
-        hits_before = merged._planned_block_cached.cache_info().hits
+        made = len(planned)
         op_prep._get_heuristics_config(ba_prep)
-    assert merged._planned_block_cached.cache_info().hits > hits_before
+    assert len(planned) == made
 
 
 @COMPILES_ON_CPU
