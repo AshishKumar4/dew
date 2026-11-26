@@ -233,7 +233,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                                       affine.erase is not None)
         corrected = affine.correction is not None
         if unlanded:
-            split = _unlanded_split(extents, corrected=corrected, base2=affine.base2, scale=affine.reader_scale)
+            split = _unlanded_split(extents, corrected=corrected, base2=affine.base2,
+                                    scale=affine.reader_scale)
             given, entering = (tokens, decays, entering), None
         else:
             form = _form(extents, corrected, saturation)
@@ -244,8 +245,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             key = (derive.context(), affine.base2, corrected, affine.values_read, apart, extents.across,
                    extents.before, extents.erased, *((value.shape, str(value.dtype)) for value in given))
             split = _cache.holding(splits, key, lambda: _split(
-                declaration, names, chunk, affine, form, tuple(held), given, jax.ShapeDtypeStruct(shape, carried),
-                extents.tokens, saturation), splits_held)
+                declaration, names, chunk, affine, form, tuple(held), given,
+                jax.ShapeDtypeStruct(shape, carried), extents.tokens, saturation), splits_held)
         across = _walked(tokens["E"], affine.base2) if extents.across else None
         prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected,
                             entering=entering, values_read=affine.values_read, across=across)
