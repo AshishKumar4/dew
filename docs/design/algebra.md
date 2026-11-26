@@ -334,6 +334,11 @@ fitted to them, and a rule set ships only with measured receipts.
   without its epilogue, alone), the stage left as the program wrote it, so a refused consumer leaves no
   product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
   match (row 3450). A
+  For the decode launch-control experiment (row 6107), `decode_regions` reports a dense gate/up/down
+  region around a gated activation when the two projections share their row input and the intermediate
+  values have no other reader. It rejects mixed equation contexts and any intervening effects. The report
+  does not replace the dots, cross a rematerialization name, or choose a launch. Compare it with the
+  command-buffer baseline in M-AL-3 before using it to select a generated decode kernel.
   region's written program, Dew's call traced over its inputs' types, is traced once a process for the region's
   identity in the context a kernel is chosen in (`fusion.choice_context`: the state a trace reads,
   `dew.nn.kernels.options.trace_context`, XLA's deterministic-ops flag among it, complete by default: a value it leaves

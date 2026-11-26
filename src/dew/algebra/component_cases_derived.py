@@ -87,5 +87,7 @@ def scores(*operands, policy: str = 'default', target: str = 'sm90'):
             _scores_0,
         ('default', 'sm90', (((32, 32), 'float32'), ((32, 32), 'float32'), ((32,), 'float32'))):
             _scores_0,
+        ('default', 'sm90', (((64, 64), 'float32'), ((64, 64), 'float32'), ((64,), 'float32'))):
+            _scores_0,
     }
     return forms[(policy, target, case)](*operands)[0]
