@@ -176,35 +176,29 @@ print(json.dumps({"unstacks": len(digests), "carried": [digest in ahead.starts f
     assert result["unstacks"] >= 2 and all(result["carried"]), result
 
 
-def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_options(tmp_path):
-    """A step compiled ahead is held to the XLA options it compiled under beside its program (the options a
-    run's step compiles under, its scoped `compiled_with` ones among them, a compile's limit aside): a run of
-    the same program handed it, on its own target and tuned (as a GPU host's prepare compiles one; here this
-    CPU's), under an option the ahead compile took none of refuses it before it trains, as its own compile
-    would have sent XLA that option (row 13553: it loaded it, the option dropped)."""
-    import dataclasses
-
+def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_options():
+    """A step compiled ahead is held to the XLA options it compiled under (`AheadOfTime.options`, a
+    compile's limit aside) beside its program: a run of its program that compiles under an option it took
+    none of, a scoped `compiled_with` one, refuses it, as its own compile would have sent XLA that option
+    (row 13553: it loaded it, the option dropped); under its own options, a compile's limit beside them,
+    the run goes on to load it (here refused as no process's to load, `built` None)."""
     import jax
+    import jax.numpy as jnp
     import pytest
-    from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus
-    from token_support import token_rows
 
-    from dew._records import record
-    from dew.nn.kernels.generation import assumed
-    from dew.nn.kernels.options import compiled_with
-    from dew.training import MeshSpec
-    from dew.training.ahead import AheadOfTime, BuildTarget, NotTheStepCompiledAhead, compile_ahead
+    from dew.nn.kernels.options import program_digest
+    from dew.training.ahead import AheadOfTime, Executable, NotTheStepCompiledAhead
+    from dew.training.memory import LIMIT_EXIT
 
-    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    ahead = compile_ahead(fine_tune(MeshSpec().build(gpus("sm80"))), batch)
-    here = jax.devices()[:1]
-    own = dataclasses.replace(ahead, built=BuildTarget.of(here),
-                              plan={**record(ahead.plan, "plan"), "autotuned": True})
-    own.save(tmp_path / "step.dew-aot")
-    run = fine_tune(MeshSpec().build(here), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
-    with (assumed(own.target), compiled_with({"xla_gpu_enable_command_buffer": ""}),
-          pytest.raises(NotTheStepCompiledAhead)):
-        run.fit(batch, steps=1, log_every=1)
+    lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
+    options = {"xla_gpu_enable_triton_gemm": False}
+    ahead = AheadOfTime("sm90", 1, {}, program_digest(lowered), Executable(b"", ()), None, 0, 0, 0, 0, 0, {},
+                        options=options)
+    with pytest.raises(NotTheStepCompiledAhead):
+        ahead.taken(lowered, {**options, "xla_gpu_enable_command_buffer": ""})
+    with pytest.raises(ValueError) as loading:
+        ahead.taken(lowered, {**options, LIMIT_EXIT: 1 << 30})
+    assert not isinstance(loading.value, NotTheStepCompiledAhead), loading.value
 
 
 def test_a_lowerings_program_is_rendered_once_for_its_key_and_every_fingerprint(monkeypatch):
