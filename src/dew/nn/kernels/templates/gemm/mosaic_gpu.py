@@ -391,8 +391,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     can_balance = dense and tiles.splits == 1 and not (beside or packed_format) and paired is scales is None
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=balanced if can_balance else False,
-                       stored=quantized.stored_bytes(dtypes, forms))
+                       balanced=can_balance and balanced, stored=quantized.stored_bytes(dtypes, forms))
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
     walk = functools.partial(
         _gmm_mainloop, lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,

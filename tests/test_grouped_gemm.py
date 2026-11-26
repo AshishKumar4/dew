@@ -34,7 +34,7 @@ from dew.nn.kernels import (
     grouped_triton,
     tuning,
 )
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tail as tail_of, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.moe import expert_projection
@@ -1462,7 +1462,8 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_1w = tiling.Tiles(128, 64, 32, 4, 8, warpgroups=1, family="mma.sync", programs=2)
-        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is False
+        # Its 216 programs' tail within its fp32 output's budget (`pricing.within_budget`), balanced.
+        assert isinstance(tgmm._stated(ba_1w, tile_1w, sm80)["balanced"], tail_of.Tail)
         few = dataclasses.replace(sm80, multiprocessors=20)
         x_few = jax.ShapeDtypeStruct((4096, 512), jnp.bfloat16)
         ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)

@@ -75,24 +75,14 @@ def _stored_dtypes(ba) -> tuple:
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
-    (`pricing.split_walk`'s `stored`): each output's dtype's over the tile columns a stored value holds (its
-    form's divisor, `Hooks.out_forms`: a packed output's two codes a byte, a reduced one's a value a block, a
-    narrowed one's half the tile), and its epilogue operands' bytes over the output's elements (an [rows,
-    columns] operand's an element, a column vector's a row's share)."""
+    (`pricing.split_walk`'s `stored`): its outputs' as stored (`quantized.output_bytes`), and its epilogue
+    operands' bytes over the output's elements (an [rows, columns] operand's an element, a column vector's
+    a row's share)."""
     from .templates import cost
-
-    return (_output_bytes(ba) + cost.stored(*ba.arguments.get('epilogue_operands', ()))
-            / max(rows * width, 1))
-
-
-def _output_bytes(ba) -> float:
-    """The bytes a product's outputs store an element of its output, each output's dtype's over its form's
-    divisor (`Hooks.out_forms`), its epilogue's operands none: its scratch budget's (`pricing.dense_tail`)."""
     from .templates.gemm import quantized
 
-    dtypes = _stored_dtypes(ba)
-    forms = quantized.forms_of(ba.arguments['hooks'].out_forms, dtypes) or (None,) * len(dtypes)
-    return quantized.stored_bytes(dtypes, forms)
+    return (quantized.output_bytes(_stored_dtypes(ba), ba.arguments['hooks'].out_forms)
+            + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1))
 
 def _matrix_extents(ba) -> tuple[int, int]:
     """A bound product call's depth and width as its matrix lies (`trans_rhs`'s `[width, depth]`), its width
@@ -174,7 +164,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 else self._launched(config, bool(ba.arguments['interpret']), target))
 
     def _tail_plan(self, ran, config: tiling.Tiles, target):
-        from .templates.gemm import mosaic_gpu, pricing
+        from .templates.gemm import mosaic_gpu, pricing, quantized
 
         call = ran.arguments
         dense = (bool(call.get('dense')) and call.get('paired') is None
@@ -188,11 +178,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         k = tokens.shape[0] if self.STAGED_ROWS else depth
         assert k is not None
         itemsizes = (jnp.dtype(tokens.dtype).itemsize, jnp.dtype(rhs.dtype).itemsize)
-        # Its output's rows as its launch declares them (`mosaic_gpu.row_unit`'s), its bytes its outputs'.
-        unit = mosaic_gpu.row_unit(pricing.family_of(config, dtype, target), dtype)
+        unit = mosaic_gpu.row_unit(pricing.family_of(config, dtype, target), dtype)  # its declared rows'
+        stored = quantized.output_bytes(_stored_dtypes(ran), ran.arguments['hooks'].out_forms)
         return pricing.dense_tail(config, dtype, (-(-m // unit) * unit, n, k), itemsizes, target,
-                                  self._tail_programs(ran, config, target), stored=_output_bytes(ran),
-                                  dense=dense)
+                                  self._tail_programs(ran, config, target), dense=dense, stored=stored)
 
     def _holds(self, ba, config: tiling.Tiles, registers: int | None, target=None) -> bool:
         """Whether a consumer thread's `registers` hold at `config`, the call as it runs (`_ran`), as its
