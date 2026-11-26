@@ -176,11 +176,11 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
+        assert isinstance(kernel, (TernaryWeights, Bf16Window)), type(kernel)
         return kernel.words, True, self._formats(kernel)
 
-    def _formats(self, kernel: object) -> dict:
+    def _formats(self, kernel: TernaryWeights | Bf16Window) -> dict:
         """`gmm`'s keywords for its packed matrix: its format's name, and a window's meta halves."""
-        assert isinstance(kernel, (TernaryWeights, Bf16Window)), type(kernel)
         meta = {'scales': kernel.meta_halves} if isinstance(kernel, Bf16Window) else {}
         return {'packed_format': kernel.fmt, **meta}
 
@@ -189,6 +189,7 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
         return packed.weight_format(self.DEFAULT_FMT).meta is False and super()._swaps_on(family, dtype)
 
     def _swapped_extra(self, kernel, formats: dict) -> dict:
+        assert isinstance(kernel, (TernaryWeights, Bf16Window)), type(kernel)
         return {**self._formats(kernel), **formats}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu
