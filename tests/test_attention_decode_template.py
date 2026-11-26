@@ -490,8 +490,8 @@ def test_a_resumed_decode_state_is_no_walks_initial_state():
 
 def test_a_resumed_decode_state_is_no_backwards_initial_state():
     """A resumed decode state (`Initial.normalized`) is refused by every standalone backward given the
-    forward's residuals, as by every walk: the route's, the Triton mainloop's, the portable one's and Mosaic
-    GPU's binding. Taken, the state's gradient divided its output by its total a second time (an output of 6
+    forward's residuals, as by every walk: the route's, the Triton mainloop's and its certified fitting, the
+    portable one's and Mosaic GPU's binding. Taken, the state's gradient divided its output by its total a second time (an output of 6
     over a total of 3 weighed as 2, train 1318's review)."""
     from dew.nn.kernels.templates import (
         attention_mosaic,
@@ -509,8 +509,11 @@ def test_a_resumed_decode_state_is_no_backwards_initial_state():
     tiles = attention_portable.Tiles(16, 16, 16)
     backwards = (
         lambda: attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals),
-        lambda: attention_triton.backward(query, key, value, spans, hooks, dout, residuals),
-        lambda: attention_portable.backward(tiles, query, key, value, spans, hooks, dout, residuals),
+        lambda: attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals),
+        lambda: attention_portable.backward(tiles, query, key, value, spans, hooks, dout,
+                                            residuals=residuals),
+        lambda: attention_triton.backward_unfitted(query, key, value, spans, hooks, dout, residuals=residuals,
+                                                   certified=True),
         lambda: attention_mosaic._backward_call(query, key, value, spans, hooks, dout, residuals, scale=None,
                                                 natural=False, accurate=False))
     with generation.assumed("sm90"):

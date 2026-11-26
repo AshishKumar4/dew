@@ -1324,6 +1324,7 @@ def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans:
     fits the GPU (`Template.fits`), and where `certified` holds as its assembler builds it (`_holding`), or
     None: the route then takes another mainloop (`attention_route`)."""
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     dout = launch_cotangent(dout, query.dtype, hooks, residuals[1])
     arrays, params, _ = launch_arguments(query, key, value, spans, hooks, dout, residuals, block=BLOCK,
                                          scale=scale)
