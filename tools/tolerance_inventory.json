@@ -5,10 +5,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/interop_support.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/kimi_support.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -94,7 +90,7 @@
    "lane": "Training"
   },
   "tests/test_dc_ae.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_decision_joint_checkpoint.py": {
@@ -454,7 +450,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_qualification.py": {
@@ -462,7 +458,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_rae.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rcm.py": {

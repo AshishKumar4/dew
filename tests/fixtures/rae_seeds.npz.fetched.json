@@ -1,0 +1,10 @@
+{
+ "bytes": 4711370,
+ "license": "Apache-2.0",
+ "origin": "github",
+ "path": "5809d8c53e33cff817e48bc046dba74d117a41fab049af298277fda73a24a2e7.npz",
+ "reference": "AutoencoderRAE (diffusers 0.40.0, transformers 4.57.1)",
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "5809d8c53e33cff817e48bc046dba74d117a41fab049af298277fda73a24a2e7"
+}

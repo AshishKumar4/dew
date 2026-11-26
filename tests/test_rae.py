@@ -5,16 +5,20 @@ frozen encoder (DINOv2 with registers, SigLIP, ViT-MAE), saves each with
 `save_pretrained`, and records in float32 the latent of a batch with the
 gradient of a probe against the pixels, and the decode of a fixed latent
 with the gradients of a probe against the latent and every decoder
-parameter. Each resizes its image and its position table, as the published
-checkpoints do; DINOv2's shrinks both, SigLIP's and MAE's enlarge the image.
+parameter, and over drawn seeds each walk's recording for check 1. Each
+resizes its image and its position table, as the published checkpoints do;
+DINOv2's shrinks both, SigLIP's and MAE's enlarge the image.
 
 It also records what the published checkpoints compute in float64 on
 inputs numpy builds (`tests/fixtures/rae_published.npz`), which the
 `network` test holds the port to after downloading the weights.
 
 Arrays are recorded `[B, C, H, W]` with pixels in [0, 1]; the tests move
-channels last and hand the autoencoder pixels in [-1, 1]. Every gap is
-scaled by max(1, |reference|).
+channels last and hand the autoencoder pixels in [-1, 1]. The tiny walks are
+held to the source's by check 1 over drawn operands and probes, recorded with
+their float64 truth (`rae_seeds.npz`, the tool's `seeds`); the published
+checkpoints' one draw, to twice the source's own float32 distance from its
+float64 result (`scaled_gap`).
 """
 
 from pathlib import Path
@@ -23,15 +27,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from autoencoder_walks import RAE, key_biases, rae_call, wide_rae
 from interop_support import (
-    assert_autoencoder_vjp,
     assert_layout_tensors,
+    assert_walk_as_recorded,
     channels_last,
     dtype_arms,
     extract_fixture,
     fixture_arrays,
     scaled_gap,
 )
+from model_support import attending
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from tool_support import load
 
@@ -40,7 +46,6 @@ from dew.interop.diffusion import component_tensors
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
-GRADIENT = 1e-4
 VARIANTS = ("dinov2", "siglip2", "mae")
 
 
@@ -81,50 +86,33 @@ def test_every_computed_tensor_exports_and_reloads_after_an_encoder_update(varia
     np.testing.assert_array_equal(restored.encode(variables, image), expected)
 
 
-def test_the_latent_matches_the_source(variant):
-    """The normalized latent: the encoder's patch tokens as a grid, less the
-    checkpoint's mean and over its deviation, per position where it gives
-    one per position. The DINOv2 and MAE checkpoints omit encoder_norm_mean
-    and encoder_norm_std, so their latents hold the encoder input's default
-    ImageNet statistics (`dew.nn.blocks.IMAGENET_MEAN`) to the source's."""
-    _, (autoencoder, params, _, config), reference = variant
+@attending("reference")
+@pytest.mark.parametrize("walk", ["encode", "decode"])
+def test_every_walk_and_gradient_matches_the_source(variant, walk):
+    """The normalized latent of an image in [0, 1], against a drawn probe its pixels' gradient through the
+    frozen encoder, and the decode of a latent, against a drawn probe its gradients in the latent and in
+    every decoder parameter (the encoder is frozen), each written back into its source tensor's layout,
+    on par with `AutoencoderRAE`'s from float64 over drawn operands and probes (check 1, the recording of
+    tools/diffusers_rae_reference.py `seeds`). The latent is the encoder's patch tokens as a grid, less
+    the checkpoint's mean and over its deviation, per position where it gives one per position; the
+    DINOv2 and MAE checkpoints omit encoder_norm_mean and encoder_norm_std, so their latents hold the
+    encoder input's default ImageNet statistics (`dew.nn.blocks.IMAGENET_MEAN`) to the source's."""
+    directory, (autoencoder, params, layouts, _), _ = variant
+    name = directory.name
+    decoder = [layout for layout in layouts if layout.name.startswith("vae/decoder.")]
+    assert_walk_as_recorded(ROOT / "tests/fixtures/rae_seeds.npz", f"{name} {walk}", RAE[name][walk],
+                            rae_call(autoencoder, walk), params, decoder if walk == "decode" else [],
+                            wide=rae_call(wide_rae(autoencoder), walk),
+                            cancelled=key_biases([layout.name.removeprefix("vae/") for layout in decoder]))
+
+
+def test_the_latent_takes_the_grid_and_an_empty_batch(variant):
+    _, (autoencoder, params, _, _), reference = variant
     image = channels_last(reference["image"])
     latent = autoencoder.encode(params, 2 * image - 1)
-    expected = channels_last(reference["latent"])
-    assert latent.shape == expected.shape == (image.shape[0], *autoencoder.latent_shape(image.shape[1:]))
-    gap = scaled_gap(latent, expected)
-    print(f"{config['encoder_type']} latent gap {gap:.3g}")
-    assert gap < FORWARD
+    assert latent.shape == (image.shape[0], *autoencoder.latent_shape(image.shape[1:]))
     empty = autoencoder.encode(params, 2 * image[:0] - 1)
-    assert empty.shape == expected[:0].shape
-
-
-def test_the_decode_matches_the_source(variant):
-    _, (autoencoder, params, _, config), reference = variant
-    decoded = autoencoder.decode(params, channels_last(reference["code"]))
-    gap = scaled_gap((decoded + 1) / 2, channels_last(reference["pixels"]))
-    print(f"{config['encoder_type']} decode gap {gap:.3g}")
-    assert gap < FORWARD
-
-
-def test_the_pixel_gradient_through_the_frozen_encoder_matches_the_source(variant):
-    _, (autoencoder, params, _, config), reference = variant
-    probe = channels_last(reference["probe_latent"])
-    grad = jax.grad(lambda image: jnp.sum(autoencoder.encode(params, 2 * image - 1) * probe))(
-        channels_last(reference["image"]))
-    gap = scaled_gap(grad, channels_last(reference["encode.grad_image"]))
-    print(f"{config['encoder_type']} pixel gradient gap {gap:.3g}")
-    assert gap < GRADIENT
-
-
-def test_decoder_gradients_match_the_source(variant):
-    """The decoder's parameters; the encoder is frozen."""
-    _, (autoencoder, params, layouts, _), reference = variant
-    assert_autoencoder_vjp(
-        "decode", lambda params, code: (autoencoder.decode(params, code) + 1) / 2, params,
-        channels_last(reference["code"]), [channels_last(reference["probe"])],
-        [layout for layout in layouts if layout.name.startswith("vae/decoder.")], reference,
-        channels_last(reference["decode.grad_code"]), GRADIENT)
+    assert empty.shape == latent[:0].shape
 
 
 @pytest.mark.network

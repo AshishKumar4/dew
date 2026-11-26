@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
@@ -45,21 +46,23 @@ if TYPE_CHECKING:
     from dew.nn.inputs import DenoisingCondition
 
 
-def sincos_position(channels: int, grid: int, *, base_size: int):
+def sincos_position(channels: int, grid: int, *, base_size: int, dtype: DTypeLike = np.float32):
     """Return `get_2d_sincos_pos_embed` at the grid the source builds its buffer on.
 
     The leading half of the channels encodes the column and the trailing half
     the row, each as sines then cosines over 10000^-(2i/half), with both axes
     divided by `grid / base_size`. This only initializes the buffer; a loaded
     checkpoint brings its stored buffer. Diffusers builds it as here: the steps in float32, the
-    frequencies and the sinusoids in float64, rounded once to float32.
+    frequencies and the sinusoids in float64, rounded once to float32; a float64 `dtype` takes its steps
+    and its table in float64, as a float64 build of the source widens its `.float()` (an RAE decoder's
+    rebuilt table, row 705).
     """
-    steps = np.arange(grid, dtype=np.float32) / np.float32(grid / base_size)
+    steps = np.arange(grid, dtype=dtype) / np.asarray(grid / base_size, dtype)
     columns, rows = np.meshgrid(steps, steps, indexing="xy")  # width goes first
     # `1 / 10000 ** (i / (half / 2))` over half the channels an axis (an odd half divides by a
     # half-integer, as the reference does).
     frequencies = sinusoid_frequencies(channels // 4, channels / 4, dtype=np.float64)
-    return jnp.asarray(sincos_grid(frequencies, columns, rows, dtype=np.float32)[None])
+    return jnp.asarray(sincos_grid(frequencies, columns, rows, dtype=dtype)[None])
 
 
 class SD3Transformer(TextStream, nn.Module):

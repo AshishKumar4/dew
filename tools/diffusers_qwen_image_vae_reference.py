@@ -99,10 +99,51 @@ def main(destination: str) -> None:
     print(f"{root}: {size / 1e6:.2f} MB")
 
 
+def posterior_walk(model, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The posterior's mean and standard deviation of `image`, one frame, as `QwenImage21Pipeline` encodes."""
+    posterior = model.encode(image[:, :, None]).latent_dist
+    return posterior.mean[:, :, 0], posterior.std[:, :, 0]
+
+
+def decode_walk(model, latent: torch.Tensor) -> tuple[torch.Tensor]:
+    """The pixels of `latent`, one frame, as `QwenImage21Pipeline` decodes."""
+    return (model.decode(latent[:, :, None], return_dict=False)[0][:, :, 0],)
+
+
+def seeds() -> None:
+    """Check 1's recordings over seeds (`record_walk`): tests/fixtures/qwen_image_vae.tar.xz's saved model
+    reloaded, its posterior's and its decode's walks (tests/autoencoder_walks.py `QWEN_IMAGE_VAE`), every
+    parameter's gradient kept, as tests/fixtures/qwen_image_vae_seeds.npz."""
+    import diffusers
+    import jax.numpy as jnp
+    from autoencoder_walks import QWEN_IMAGE_VAE, dew_walk, qwen_image_vae_call
+    from diffusers.models.autoencoders.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
+    from reference_vjp import FIXTURES, record_walk, save_walks, unpacked
+
+    from dew.interop.autoencoders.qwen_image import load_qwen_image_vae
+
+    torch.set_num_threads(2)
+    walks = {"encode": posterior_walk, "decode": decode_walk}
+    with unpacked(FIXTURES / "qwen_image_vae.tar.xz") as root:
+        model = AutoencoderKLQwenImage21.from_pretrained(root / "vae").eval()
+        names = [key for key, _ in model.named_parameters()]
+        autoencoder, params, layouts, _ = load_qwen_image_vae(root, jnp.float32)
+        arrays = {}
+        for walk, draw in QWEN_IMAGE_VAE.items():
+            dew = dew_walk(qwen_image_vae_call(autoencoder.model, walk), params, layouts, dtype=jnp.float32)
+            arrays.update(record_walk(walk, model, walks[walk], draw, names, dew))
+    save_walks("qwen_image_vae_seeds.npz", arrays, list(QWEN_IMAGE_VAE),
+               reference=f"AutoencoderKLQwenImage21 (diffusers {diffusers.__version__})",
+               revision=f"huggingface/diffusers@{DIFFUSERS_COMMIT}",
+               command="DEW_WIDE_CPU_ARITHMETIC=1 python tools/diffusers_qwen_image_vae_reference.py seeds")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         from diffusers_dc_ae_reference import bundle
 
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 1 and sys.argv[1] == "seeds":
+        seeds()
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-qwen-image-vae-reference")

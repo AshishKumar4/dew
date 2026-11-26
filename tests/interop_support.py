@@ -5,16 +5,25 @@ checkpoint's transformers reference run in the test over check 1's draws; and a
 Hub cache an offline process resolves a repo from."""
 
 import contextlib
-import functools
 import json
 import shutil
 import tarfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+)
 
 
 def allocated_bytes(monkeypatch, operation):
@@ -510,27 +519,6 @@ def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
     return mean, jnp.exp(0.5 * log_variance)
 
 
-def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:
-    """A source KL autoencoder's recorded encode and decode vector-Jacobian products
-    (`assert_autoencoder_vjp`) for its `loaded` (autoencoder, parameters, layouts, config):
-    `posterior(model, params, x)`'s mean and standard deviation against the source's `probe_mean`
-    and `probe_std` from its `operand` (`image`, `video`), and the decode against its `probe` from
-    its `latent`, each array channels last."""
-    autoencoder, params, layouts, _ = loaded
-    model = autoencoder.model
-
-    def decode(params, latent):
-        return model.apply({"params": params}, latent, method=model.decode)
-
-    assert_autoencoder_vjp(
-        "encode", functools.partial(posterior, model), params, channels_last(reference[operand]),
-        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
-        channels_last(reference[f"encode.grad_{operand}"]), bound)
-    assert_autoencoder_vjp(
-        "decode", decode, params, channels_last(reference["latent"]), [channels_last(reference["probe"])],
-        layouts, reference, channels_last(reference["decode.grad_latent"]), bound)
-
-
 def recorded_gradients(part, precision: str, inputs, names) -> np.ndarray:
     """A source's recorded gradients at `precision` (`fp32`, `fp64`), raveled in one order: its
     `inputs`' (`{precision}.grad_<input>`) then its parameters' (`{precision}.grad_param.<name>`),
@@ -541,36 +529,50 @@ def recorded_gradients(part, precision: str, inputs, names) -> np.ndarray:
 
 
 def scaled_gap(actual, expected) -> float:
-    """Maximum float64 error, scaled by max(1, the reference's magnitude)."""
+    """Maximum float64 error, scaled by max(1, the reference's magnitude): the one-draw parity the source
+    comparisons check 1 has not yet replaced still read (row 13335: the published RAEs', SD3's flow, prompt
+    and pipeline walks, the samplers' and schedulers' Diffusers walks)."""
     expected = np.asarray(expected, np.float64)
     difference = np.abs(np.asarray(actual, np.float64) - expected).max()
     return float(difference / max(1.0, float(np.abs(expected).max())))
 
 
-def assert_autoencoder_vjp(walk: str, call, params, operand, probes, layouts, reference, operand_gradient,
-                           bound: float):
-    """A source autoencoder's recorded vector-Jacobian product of one `walk`: `call(params, operand)`'s
-    outputs dotted with `probes`, differentiated for the operand and the parameters. The operand's
-    gradient is held to the source's `operand_gradient`, and each of `layouts`' parameters' gradient,
-    written into its source tensor's layout as an export writes it, to the source's
-    `{walk}.grad.<tensor>`, each within `bound` (`scaled_gap`). Returns the outputs."""
-    def objective(params, operand):
-        outputs = call(params, operand)
-        return sum(jnp.sum(output * probe) for output, probe in
-                   zip(jax.tree.leaves(outputs), probes, strict=True)), outputs
+def assert_walk_as_recorded(path: Path, label: str, draw, call, params, layouts, *, wide,
+                            collection: str = "autoencoder", prefix: str = "vae/",
+                            cancelled: Sequence[str] = ()) -> None:
+    """Check 1 of an autoencoder walk against its source's recording of `label` at `path` over its declared
+    seeds (tools/reference_vjp.py `record_walk`): Dew's walk of `call(params, x)` over each draw (`draw`,
+    `autoencoder_walks.walk_draw`; `autoencoder_walks.dew_walk`, its gradients in the operand and in each
+    of `layouts`' parameters), Dew's own float64 walk the truth (`wide(params, x)` over the parameters
+    widened), held to the recording's sketch (`indexed_recording`); the gradients of the parameters
+    `cancelled` names, which cancel exactly, their truth zero as the recording's is."""
+    from autoencoder_walks import dew_walk
 
-    (_, outputs), (grad_params, grad_operand) = jax.value_and_grad(objective, argnums=(0, 1), has_aux=True)(
-        params, operand)
-    operand_gap = scaled_gap(grad_operand, operand_gradient)
-    gaps = {layout.name: scaled_gap(layout.export({"autoencoder": grad_params}),
-                                    reference[f"{walk}.grad.{layout.name.removeprefix('vae/')}"])
-            for layout in layouts}
-    worst = max(gaps, key=lambda name: gaps[name])
-    print(f"{walk}: input gradient gap {operand_gap:.3g}; worst parameter {worst} {gaps[worst]:.3g}")
-    assert operand_gap < bound
-    assert gaps[worst] < bound, worst
-    return outputs
+    dew = dew_walk(call, params, layouts, dtype=jnp.float32, collection=collection, prefix=prefix)
+    wide_walk = dew_walk(wide, widened(params), layouts, dtype=jnp.float64, collection=collection,
+                         prefix=prefix)
 
+    def truth(inputs):
+        return {name: jnp.zeros_like(value) if name.removeprefix("grad_param.") in cancelled else value
+                for name, value in wide_walk(inputs).items()}
+    seeds = declared_seeds(path)[label]
+    drawn, reference, held = indexed_recording(recording(path), label, seeds, inputs_of=draw, truth_fn=truth)
+    assert_as_exact(as_given(lambda index, inputs: dew(inputs)), reference, drawn, label, seeds=seeds,
+                    truth_fn=held)
+
+
+def assert_walk_truths_as_recorded(path: Path, label: str, wide, params, layouts, *,
+                                   collection: str = "autoencoder", prefix: str = "vae/") -> None:
+    """An autoencoder walk held to its function alone (tools/reference_vjp.py `record_walk_truths`): Dew's
+    float64 walk of `wide(params, x)` (`autoencoder_walks.dew_walk`) the source's float64 truth per leaf on
+    each recorded draw, within float64's rounding (`recorded_truths.assert_truths_as_recorded`)."""
+    from autoencoder_walks import dew_walk
+    from recorded_truths import assert_truths_as_recorded
+
+    with jax.enable_x64(new_val=True):
+        truth = dew_walk(wide, widened(params), layouts, dtype=jnp.float64, collection=collection,
+                         prefix=prefix)
+        assert_truths_as_recorded(recording(path), label, truth)
 
 
 def gemma_features(model_type, config, waveforms):
