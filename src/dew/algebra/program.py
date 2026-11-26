@@ -847,6 +847,11 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             continue
         seen_terms.add(named)
         bound = region.magnitudes.get(named)
+        dtype = region.dtypes.get(named)
+        cast = get_callable_args(term, terms.Term.convert) if dtype == jnp.float32 else None
+        if cast is not None and region.dtypes.get(terms.key(cast[0])) in (jnp.int8, jnp.uint8):
+            facts.append(rules.int8_values(term))
+            bound = 8 if bound is None else min(8, bound)
         if bound is not None:
             facts += rules.made(term, i64(bound))
         held = region.floors.get(named)
@@ -854,7 +859,6 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
             facts.append(set_(rules.log2_floor(term)).to(i64(held.floor)))
             if held.positive:
                 facts.append(rules.positive(term))
-        dtype = region.dtypes.get(named)
         if dtype is not None:
             if terms._extended_dtype(dtype) is None and dtype != jax.dtypes.float0:
                 facts.append(set_(rules.dtype(term)).to(String(np.dtype(dtype).name)))
@@ -901,7 +905,7 @@ def _products(region: terms.Region) -> list:
     accumulation wider than their operands they round back from), which of those are matrix products
     (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
     each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
-    plain_numbers = (((1,), (0,)), ((), ()))
+    mesh = jax.sharding.get_abstract_mesh()
     facts: list = []
     for term, extent in region.shapes:
         if len(extent) == 2:
@@ -929,8 +933,16 @@ def _products(region: terms.Region) -> list:
         # rule may move (base review 3232beb7c).
         if len(operands) == 1 and (wanted is None or operands == {jnp.dtype(wanted)}):
             facts.append(rules.plain(i64(index)))
-            if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:
-                facts.append(rules.matrix_product(i64(index)))
+            if len(extent) == 2 and len(region.shape(args[0])) == len(region.shape(args[1])) == 2:
+                (left_axes, right_axes), batches = jax.tree.map(int, params["dimension_numbers"])
+                if left_axes == (1,) and right_axes in ((0,), (1,)) and batches == ((), ()):
+                    facts.append(set_(rules.matrix_product(i64(index))).to(i64(1 - right_axes[0])))
+                    # Each |byte| < 256: K <= 256 keeps arbitrary integer partial sums below 2**24.
+                    if (right_axes == (1,) and 0 < length <= 256 and operands == {np.dtype(jnp.float32)}
+                            and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32
+                            and params.get("out_sharding") is None
+                            and not (mesh.explicit_axes or mesh.manual_axes)):
+                        facts.append(rules.exact_int8_product(i64(index)))
     matrices = {extent for _, extent in region.shapes if len(extent) == 2}
     for extent in sorted(matrices):
         for axis in (0, 1):

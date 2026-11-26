@@ -154,6 +154,40 @@ def test_a_product_whose_mode_states_no_rounding_is_factored_by_no_rule():
     assert not cheaper_spliced(scaled(jax.lax.DotAlgorithm(np.float32, np.float32, np.float32)), x, y, s)
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accumulation(side):
+    dims = (((1,), (1,)), ((), ()))
+    full = jax.lax.DotAlgorithmPreset.F32_F32_F32
+
+    def scaled(x, y, scale, precision):
+        s = jax.lax.clamp(0.125, scale, 4.0)
+        x, y = x.astype(scale.dtype), y.astype(scale.dtype)
+        if side == "left":
+            x = x * s[:, None]
+        else:
+            y = y * s[:, None]
+        return jax.lax.dot_general(x, y, dims, precision=precision)
+
+    def draw(seed, length=128):
+        rng = np.random.default_rng(seed)
+        scales = 8 if side == "left" else 16
+        return (jnp.asarray(rng.integers(-128, 128, (8, length), dtype=np.int8)),
+                jnp.asarray(rng.integers(0, 256, (16, length), dtype=np.uint8)),
+                jnp.asarray(rng.uniform(0.125, 4.0, scales), jnp.float32))
+
+    def plain(x, y, s):
+        return scaled(x, y, s, full)
+
+    def truth(x, y, s):
+        return scaled(x, y, s, None)
+
+    assert cheaper_spliced(plain, *draw(0))
+    assert not cheaper_spliced(plain, *draw(0, length=257))
+    assert not cheaper_spliced(truth, *draw(0))  # an unspecified dot mode is not an integer proof
+    assert_as_exact(jax.jit(algebra.rewritten(plain)), jax.jit(plain), draw,
+                    f"transposed byte {side} dequantization", seeds=8, truth_fn=truth)
+
+
 def test_a_saturation_of_no_growth_or_depth_is_refused():
     """A saturation's limits are each at least one (docs/design/algebra.md 6.6): one of none would stop
     every region before its first iteration and report it saturated."""

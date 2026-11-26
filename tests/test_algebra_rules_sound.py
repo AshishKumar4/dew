@@ -37,7 +37,8 @@ SHAPES = ((), (2,), (3,), (2, 3), (3, 2), (2, 2), (2, 3, 2), (2, 2, 3))
 
 DOTS = ({"dimension_numbers": (((1,), (0,)), ((), ()))},
         {"dimension_numbers": (((0,), (0,)), ((), ()))},
-        {"dimension_numbers": (((2,), (1,)), ((0,), (0,)))})
+        {"dimension_numbers": (((2,), (1,)), ((0,), (0,)))},
+        {"dimension_numbers": (((1,), (1,)), ((), ()))})
 """The products' parameters each product of a rule takes: a plain one, its left operand's first axis
 contracted (`x^T @ y`), and a batched one."""
 
@@ -67,7 +68,7 @@ class Inadmissible(Exception):
 RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power",
                          "log2_floor", "least"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
-ROUNDING_FACTS = frozenset({"plain", "counting_sum", "narrowed", "same_dtype"})
+ROUNDING_FACTS = frozenset({"plain", "counting_sum", "narrowed", "same_dtype", "int8_values"})
 """Dtype and exactness conditions, which a real identity reads nothing of."""
 
 
@@ -264,7 +265,12 @@ class Evaluated:
             extent, axis = values
             return {"shape": tuple(extent), "broadcast_dimensions": (axis,)}
         if name == "matrix_product":
-            return values[0]["dimension_numbers"] == PLAIN
+            (left, right), batches = values[0]["dimension_numbers"]
+            if left != (1,) or right not in ((0,), (1,)) or batches != ((), ()):
+                raise Inadmissible("not a nonbatched matrix product over the left columns")
+            return 1 - right[0]
+        if name == "exact_int8_product":
+            return values[0]["dimension_numbers"] == DOTS[-1]["dimension_numbers"]
         if name == "matrix":
             return values[0].ndim == 2
         if name in ("plain_of", "swap_of"):
@@ -574,6 +580,8 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
     _logged(matched[1], logged)
     positive = _named(conditions, "positive_scale") | _named(conditions, "positive") | set(logged)
     counted = _named(conditions, "counting_sum")
+    exact = _named(conditions, "exact_scale")
+    integers = _named(conditions, "int8_values")
     drawn = sorted(operand for operand in admitted.arrays if operand not in units)
 
     def draw(seed):
@@ -581,7 +589,11 @@ def test_every_rewrites_right_side_is_on_par_with_its_left_side(name, index, rul
         operands = []
         for operand in drawn:
             shape = np.shape(admitted.arrays[operand])
-            value = rng.integers(0, 2, shape) if operand in counted else rng.standard_normal(shape)
+            value = 2.0 ** rng.integers(-3, 4, shape) if operand in exact else rng.standard_normal(shape)
+            if operand in counted:
+                value = rng.integers(0, 2, shape)
+            if operand in integers:
+                value = rng.integers(-128, 128, shape)
             operands.append(jnp.asarray(np.abs(value) + 0.5 if operand in positive else value, jnp.float32))
         return tuple(operands)
 
