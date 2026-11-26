@@ -725,3 +725,38 @@ def test_a_prepared_hook_pickles_as_its_source_and_is_rebuilt_by_the_constructor
     assert loaded_rewritten.run is not loaded_rewritten.source and loaded_taken.run is loaded_taken.source
     for loaded, made in ((loaded_rewritten, rewritten), (loaded_taken, taken)):
         assert jnp.array_equal(loaded(scores), made(scores))
+
+
+def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_compiler():
+    """A TPU step none of whose kernel launches is Dew's, another library's Pallas TPU kernel alone (JAX's
+    Splash attention's kind), lowered for a TPU here: a measuring tuning run of it would measure nothing it
+    asked for, so its kernels are named by their compiler (`tuning._foreign_kernels`, which `tune` refuses
+    with as `Untunable`), never passed by as a GPU's Triton kernels alone were (row 13534). A step of Dew's
+    own Mosaic GPU launches (the attention template's, lowered for an H100) names none: each call carries
+    the launch that traced it (`KernelCall.launched`), whatever its kernel's name reads."""
+    from jax.experimental import pallas as pl
+    from kernel_compile import lowered_for
+
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels.lowered import kernel_calls
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    def step(x):
+        return pl.pallas_call(doubled, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+    rows = jax.ShapeDtypeStruct((8, 128), jnp.float32)
+    lowered = jax.jit(step).trace(rows).lower(lowering_platforms=("tpu",))
+    foreign = tuning._foreign_kernels(lowered)
+    assert foreign and all(name.startswith("mosaic_tpu: ") for name in foreign), foreign
+    assert "mosaic_tpu: " in str(tuning.Untunable(foreign))
+
+    def attended(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+
+    shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((1, 512, 4, 64), (1, 512, 2, 64),
+                                                                       (1, 512, 2, 64))]
+    owned = lowered_for(attended, shapes, "sm90")
+    assert any(call.kind == "mosaic_gpu" for call in kernel_calls(owned, unrun=True))
+    assert tuning._foreign_kernels(owned) == ()

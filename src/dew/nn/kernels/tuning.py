@@ -135,16 +135,16 @@ class Unpinnable(ValueError):
 
 class Untunable(ValueError):
     """A tuning run (`tune`'s `measure`) of a step none of whose kernel launches is Dew's (`KernelOp`), the
-    Triton kernels it launches another library's (tokamax's), which keep their heuristic: the run asked to
-    measure configs and could measure none (row 2661)."""
+    kernels it launches another library's (tokamax's Triton, JAX's Splash attention's Mosaic TPU), which keep
+    their heuristic: the run asked to measure configs and could measure none (rows 2661, 13534)."""
 
     def __init__(self, kernels: tuple[str, ...]):
         named = ", ".join(kernels[:4]) + (", ..." if len(kernels) > 4 else "")
         super().__init__(
-            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
-            f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
-            "Dew's template (dew.kernels.use(attention='template'), a run's diagnostics.kernels) to "
-            "measure it, or run without tune_kernels.")
+            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its kernels "
+            f"({named}, each named by its compiler) are another library's, which keep their heuristic. Route "
+            "its attention to Dew's template (dew.kernels.use(attention='template'), a run's "
+            "diagnostics.kernels) to measure it, or run without tune_kernels.")
         self.kernels = kernels
 
     def __reduce__(self):
@@ -1691,13 +1691,19 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     return lowered
 
 
+TUNED_COMPILERS = ("triton", "mosaic_gpu", "mosaic_tpu")
+"""The kernel compilers whose launches the tuner times (`tune`): a GPU's Triton and Mosaic GPU, a TPU's
+Mosaic TPU."""
+
+
 def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
-    """The Triton kernels `lowered` launches that no launch of Dew's traced (their names carry no launch's
-    digest, `assembled.kernel_of`): another library's, outside the tuner."""
+    """The kernels of a compiler the tuner times (`TUNED_COMPILERS`) that `lowered` launches and no launch of
+    Dew's traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler:
+    another library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
     from dew.nn.kernels.lowered import kernel_calls
 
-    return tuple(dict.fromkeys(call.name for call in kernel_calls(lowered, unrun=True)
-                               if call.kind == "triton" and assembled.kernel_of(call.name)[1] is None))
+    return tuple(dict.fromkeys(f"{call.kind}: {call.name}" for call in kernel_calls(lowered, unrun=True)
+                               if call.kind in TUNED_COMPILERS and call.launched is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:

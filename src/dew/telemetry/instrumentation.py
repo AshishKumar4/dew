@@ -338,7 +338,7 @@ class _Computation:
     constants: dict[str, int] = field(default_factory=dict)
 
 
-def _module(source: str | Iterable[str] | jax.stages.Compiled):
+def hlo_module(source: str | Iterable[str] | jax.stages.Compiled):
     """The HLO module `source` holds: a compiled executable's optimized one (its first, as JAX's own
     `Compiled.as_text` prints it), or one written as text (an XLA dump, whole or as its lines; a module a
     test writes), read by XLA's own parser (`jax.extend.xla.module_from_text`). None for an executable
@@ -365,13 +365,13 @@ def _integer(literal, element: str) -> int | None:
 
 
 def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, _Computation], str | None]:
-    """The module's computations, and the name of its entry computation (`_module`), each instruction
+    """The module's computations, and the name of its entry computation (`hlo_module`), each instruction
     read through XLA's own schema (`jax.extend.xla.instructions`), keeping the facts the counts read: of
     its metadata, which is most of a module, only its traced name. No computations for an executable that
     holds no module."""
     from jax.extend import xla
 
-    module = _module(source)
+    module = hlo_module(source)
     computations: dict[str, _Computation] = {}
     entry = None
     if module is None:
@@ -635,7 +635,7 @@ def reported_instruction(expression: str) -> Reported | None:
 
 
 def hlo_instructions(source: str | Iterable[str] | jax.stages.Compiled) -> dict[str, HloInstruction]:
-    """Every instruction of the module `source` holds (`_module`: a compiled executable's, or an XLA dump's
+    """Every instruction of the module `source` holds (`hlo_module`: a compiled executable's, or an XLA dump's
     after-optimizations HLO, whole or as its lines) by name, read as the FLOP count reads it
     (`hlo_flops`). Each computation's body is gathered once, so the fusions that call one share its
     sets."""
@@ -1157,7 +1157,7 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
 
 
 def hlo_flops(source: str | jax.stages.Compiled) -> StepFlops | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module (`_module`: a compiled
+    """Matmul and convolution FLOPs of one call of an optimized HLO module (`hlo_module`: a compiled
     executable's, or one written as text), read and weighted once: the forward a remat recomputes counted
     once in `model` and each time it runs in `hardware`, each Pallas kernel at the cost
     it states, the model's share of it where it declares one (`MODEL_FLOPS`),

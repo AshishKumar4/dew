@@ -448,8 +448,13 @@ class TpuTime:
     (`tpu_ops`, through Dew's one reading of a capture), each its duration on the device, which no host
     dispatch enters. The call runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and
     stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is a compiled
-    program called with its dynamic operands (`_program_of`), whose module names its runs; a call of another
-    kind, or whose devices its arrays do not name, is refused (`AmbiguousCapture`)."""
+    program called with its dynamic operands (`_program_of`), whose module names its runs, read once for a
+    program read again in turn (the tuner's repeats of one config); a call of another kind, or whose devices
+    its arrays do not name, is refused (`AmbiguousCapture`)."""
+
+    def __init__(self):
+        # The last program read and its module's name: no earlier program held past its reads.
+        self._named: tuple[jax.stages.Compiled, str] | None = None
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
@@ -476,7 +481,9 @@ class TpuTime:
         from dew.telemetry.profile import CaptureOptions, Profiler
 
         program = _program_of(fn)
-        module = _module_of(program)
+        if self._named is None or self._named[0] is not program:
+            self._named = (program, _module_of(program))
+        module = self._named[1]
         warm = jax.block_until_ready(program(*args))
         devices = (_devices_of(warm) or _devices_of(args))
         if not devices:
@@ -518,12 +525,14 @@ def _program_of(fn: Callable) -> jax.stages.Compiled:
 
 
 def _module_of(program: jax.stages.Compiled) -> str:
-    """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its HLO's own."""
-    text = program.as_text()
-    found = None if text is None else re.match(r"\s*HloModule\s+([\w.]+)", text)
-    if found is None:
-        raise AmbiguousCapture(f"{program} states no module name")
-    return found.group(1)
+    """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its executable's module's own
+    (`instrumentation.hlo_module`, read typed, never printed)."""
+    from dew.telemetry.instrumentation import hlo_module
+
+    module = hlo_module(program)
+    if module is None:
+        raise AmbiguousCapture(f"{program} holds no module")
+    return module.name
 
 
 @contextlib.contextmanager
