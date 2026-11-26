@@ -16,7 +16,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, error, generate, printed
+from dew.algebra import acceptance, component_cases, error, generate, printed
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 
@@ -57,10 +57,11 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
     """Each generated form at each of its declaration's cases is on par with the declaration as written
     against its float64 truth (check 1), on the declaration's own draws."""
     form = generate.DECLARATIONS[name]
+    truth = form.truth if isinstance(form, generate.ComponentForm) else form.function
     for operands in form.cases.operands:
         assert_as_exact(jax.jit(functools.partial(_derived(name), policy=policy)), jax.jit(form.function),
                         lambda seed, operands=operands: form.cases.draw(seed, operands), f"{name} ({policy})",
-                        seeds=form.cases.seeds, truth_fn=form.function)
+                        seeds=form.cases.seeds, truth_fn=truth)
 
 
 def nested(x, y):

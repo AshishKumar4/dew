@@ -37,8 +37,8 @@ TESTS = "tests/test_algebra_generate.py"
 """The suite every generated module is held by: its forms on par with their declarations (check 1) and the
 written module what generation writes (`--check`)."""
 
-DECLARING = ("dew.algebra.acceptance",)
-"""The modules that declare stable forms (`declare`), imported before generation reads `DECLARATIONS`."""
+DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases")
+"""Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +65,16 @@ class StableForm:
 
 
 @dataclasses.dataclass(frozen=True)
+class ComponentForm:
+    """A flat template or surrogate component. The surrounding wrapper, static arguments and initializer
+    stay with their owner. A separate fixture is required for each bound static form."""
+
+    function: Callable
+    truth: Callable
+    cases: Cases
+
+
+@dataclasses.dataclass(frozen=True)
 class Generated:
     """A generated module: the declarations it holds, its path, the suite that holds it (`TESTS`), the rule
     sets and their receipts it was saturated with, and the egglog version."""
@@ -76,11 +86,11 @@ class Generated:
     egglog: str
 
 
-DECLARATIONS: dict[str, StableForm] = {}
-"""Every declared stable form, by its declaring module and name (`declare`)."""
+DECLARATIONS: dict[str, StableForm | ComponentForm] = {}
+"""Generated functions by their declaring module and name (`declare`)."""
 
 
-def declare(module: str, name: str, form: StableForm) -> StableForm:
+def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: Form) -> Form:
     """`form` registered under its declaring `module` and `name`, generated into `<module>_derived.py` as a
     function of that name."""
     DECLARATIONS[f"{module}.{name}"] = form
@@ -141,8 +151,8 @@ class _Chosen:
     """Whether the declaration returns one array (its form's one output), else a tuple of them."""
 
 
-def _chosen(qualified: str, form: StableForm) -> list[_Chosen]:
-    """Each policy's choice for `form` at each of its cases and targets (`error.choose`)."""
+def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
+    """Stable forms are selected by error and price; components preserve the traced arithmetic."""
     from dew import algebra
 
     name = qualified.rsplit(".", 1)[1]
@@ -151,12 +161,25 @@ def _chosen(qualified: str, form: StableForm) -> list[_Chosen]:
         for case, operands in enumerate(form.cases.operands):
             for policy in form.cases.policies:
                 label = f"{qualified} ({policy}, {target}, {case})"
-                gate = admits(form.function, operands, form.cases, label)
-                with algebra.passes(target=target):
-                    choice = error.choose(form.function, operands, accurate=policy == "accurate",
-                                          saturation=algebra.SATURATION, admits=gate)
-                found.append(_Chosen(name, policy, target, case, operands, choice.chosen,
-                                     _single(form.function, operands)))
+                source = form.function
+                if isinstance(form, ComponentForm):
+                    # Run the candidate as printed; never silently skip a refused component.
+                    closed = jax.make_jaxpr(source)(*operands)
+                    if closed.jaxpr.effects:
+                        raise printed.Unprintable(f"{label}: a component has effects")
+                    single = _single(source, operands)
+                    flat = printed.loaded(printed.source(closed, "component")[0], "component")
+                    written = (lambda *values, flat=flat: flat(*values)[0]) if single else flat
+                    if not admits(form.truth, operands, form.cases, label)(written, source):
+                        raise ValueError(f"{label}: the printed component did not pass Check 1")
+                    candidate = error.Candidate("as written", 0.0, source)
+                else:
+                    gate = admits(source, operands, form.cases, label)
+                    with algebra.passes(target=target):
+                        choice = error.choose(source, operands, accurate=policy == "accurate",
+                                              saturation=algebra.SATURATION, admits=gate)
+                    candidate, single = choice.chosen, _single(source, operands)
+                found.append(_Chosen(name, policy, target, case, operands, candidate, single))
     return found
 
 
