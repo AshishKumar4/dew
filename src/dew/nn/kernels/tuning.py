@@ -135,16 +135,16 @@ class Unpinnable(ValueError):
 
 class Untunable(ValueError):
     """A tuning run (`tune`'s `measure`) of a step none of whose kernel launches is Dew's (`KernelOp`), the
-    Triton kernels it launches another library's (tokamax's), which keep their heuristic: the run asked to
-    measure configs and could measure none (row 2661)."""
+    kernels it launches another library's (tokamax's Triton, JAX's Splash attention's Mosaic TPU), which keep
+    their heuristic: the run asked to measure configs and could measure none (rows 2661, 13534)."""
 
     def __init__(self, kernels: tuple[str, ...]):
         named = ", ".join(kernels[:4]) + (", ..." if len(kernels) > 4 else "")
         super().__init__(
-            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
-            f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
-            "Dew's template (dew.kernels.use(attention='template'), a run's diagnostics.kernels) to "
-            "measure it, or run without tune_kernels.")
+            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its kernels "
+            f"({named}, each named by its compiler) are another library's, which keep their heuristic. Route "
+            "its attention to Dew's template (dew.kernels.use(attention='template'), a run's "
+            "diagnostics.kernels) to measure it, or run without tune_kernels.")
         self.kernels = kernels
 
     def __reduce__(self):
@@ -1323,8 +1323,9 @@ def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every candidate config of `ba`'s launch (`_candidates`), each compiled on a thread and timed alone: the
-    device time CUPTI reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`), each run
-    behind an eviction, so every config starts with its operands out of cache."""
+    device time its device reads for the launch's own kernels (`dew.telemetry.benchmark.device_time`: CUPTI's
+    on a GPU, a profiler capture's ops on a TPU), each run behind an eviction, so every config starts with its
+    operands out of a GPU's cache (`benchmark.eviction`, none on a TPU)."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -1349,9 +1350,10 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is, never
         # refused and lowered afresh (`OuterProgram.compiled`). The launch runs behind the flush, which reads
-        # the whole buffer through the cache.
-        # Without command buffers, which CUPTI does not read whole (`benchmark.Ungraphed`).
-        lowered = owned_program(behind(launched), step=UNGRAPHED_OPTIONS).lower(flush, (arrays,))
+        # the whole buffer through the cache. A GPU's without command buffers, which CUPTI does not read whole
+        # (`benchmark.Ungraphed`); a TPU runs none.
+        ungraphed = UNGRAPHED_OPTIONS if jax.default_backend() == "gpu" else None
+        lowered = owned_program(behind(launched), step=ungraphed).lower(flush, (arrays,))
         # Through Dew's one call of XLA's compile (`report.xla_compiled`): in one of this process's compile
         # slots, a step's launch waiting on its measurement, under the options its target takes (`targeted`).
         middle = time.perf_counter()
@@ -1364,7 +1366,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     # As many as the process's compile slots, whose compiles they wait on (`report.compile_threads`).
     with concurrent.futures.ThreadPoolExecutor(report.compile_threads()) as pool:
         futures = {config: pool.submit(compiled, config) for config in configs}
-    # CUPTI reads every run, the flush's own first. It takes one subscriber, so
+    # The device reads every run, the flush's own first. CUPTI takes one subscriber, a TPU one capture, so
     # where a profile capture holds it, from the first run or any later one,
     # the launch keeps its heuristic until a later compile.
     try:
@@ -1379,7 +1381,8 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
                     timings[config] = error
                     continue
                 except NoKernels as error:
-                    # CUPTI read none of the config's own kernels: its time would read as zero, so no pick.
+                    # The device read none of the config's own kernels: its time would read as zero, so no
+                    # pick.
                     timings[config] = error
                     continue
                 read[config] = runs, lowering, compiling
@@ -1648,18 +1651,32 @@ def noted(found: Seen) -> None:
         collected.found.taken.extend(found.taken)
 
 
+def _on_its_tpu() -> bool:
+    """Whether a trace here targets the TPU a measurement here runs on: the default device
+    (`get_default_device`, where `_measured` makes its operands), the process's default backend's own (whose
+    options, eviction and device time a measurement takes, `dew.telemetry.benchmark`) and a TPU, its
+    generation the trace's (`generation.backend`, `generation.device_target`), so a measurement times the
+    launches it traced on the device they target."""
+    device = get_default_device()
+    return (generation.backend() == device.platform == jax.default_backend() == "tpu"
+            and generation.device_target(device).generation == generation.gpu_target().generation)
+
+
 def tune(lower: Callable[[], jax.stages.Lowered], *,
          measure: bool = False) -> jax.stages.Lowered:
     """An opt-in tuning run's program (bible §6: off by default): what `lower()`
     lowers with every launch's config settled across the pool. The
     lowering records its launches as it traces them (`seen`); process 0 takes
     its stored pick for each, with `measure` measuring and storing one for a
-    launch without where it has its GPU to itself, and every process takes
+    launch without where it has its device to itself, and every process takes
     exactly process 0's configs (`_settle`). Where that changes a config the
     lowering traced, it lowers again. A launch without a pick takes its heuristic. A measuring run of a step
     with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
-    refused (`Untunable`)."""
-    if not generation.triton_runs():
+    refused (`Untunable`). A GPU that runs Dew's Pallas kernels (`generation.triton_runs`) and a TPU core are
+    tuned alike, each timed as its device reads it (`dew.telemetry.benchmark.device_time`), a TPU's where the
+    trace targets the TPU the process runs on (`_on_its_tpu`); anywhere else (a compile-only TPU's trace on
+    another host) the program is lowered as it is."""
+    if not (generation.triton_runs() or _on_its_tpu()):
         return lower()
     with reading():
         tuned = _cache.KERNEL_TUNES.get_global()
@@ -1674,13 +1691,19 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     return lowered
 
 
+TUNED_COMPILERS = ("triton", "mosaic_gpu", "mosaic_tpu")
+"""The kernel compilers whose launches the tuner times (`tune`): a GPU's Triton and Mosaic GPU, a TPU's
+Mosaic TPU."""
+
+
 def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
-    """The Triton kernels `lowered` launches that no launch of Dew's traced (their names carry no launch's
-    digest, `assembled.kernel_of`): another library's, outside the tuner."""
+    """The kernels of a compiler the tuner times (`TUNED_COMPILERS`) that `lowered` launches and no launch of
+    Dew's traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler:
+    another library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
     from dew.nn.kernels.lowered import kernel_calls
 
-    return tuple(dict.fromkeys(call.name for call in kernel_calls(lowered, unrun=True)
-                               if call.kind == "triton" and assembled.kernel_of(call.name)[1] is None))
+    return tuple(dict.fromkeys(f"{call.kind}: {call.name}" for call in kernel_calls(lowered, unrun=True)
+                               if call.kind in TUNED_COMPILERS and call.launched is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:

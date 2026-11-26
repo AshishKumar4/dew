@@ -870,7 +870,9 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive
 def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_roundings_breaks_it():
     """lax.one_minus_square (tanh's derivative) certifies as the program JAX lowers it to, (1 + x)(1 - x):
     the lane's own result within its three roundings of the exact 1 - x², its overflow past fp32's range,
-    its NaN and its infinities as that program makes them; a result four steps off is refused."""
+    its NaN and its infinities as that program makes them, and at x = ±1 its exact +0; a result four steps
+    off is refused, as are a -0 or a subnormal at x = ±1 and a zero at either one's inner neighbour (row
+    13502)."""
     # Past fp32's range the product overflows (2^64 and 2^100 to -inf) where 1 - x² itself is finite; just
     # below 2^64 its rounded factors' product, 2^128 - 2^105 + 2^80, is finite and so is its result.
     below = np.nextafter(np.float32(2.0 ** 64), np.float32(0))
@@ -889,6 +891,18 @@ def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_ro
     mutant[-1], mutant[-2] = -np.inf, np.float32(-3e38)
     assert list(np.flatnonzero(~contract({}, [values], mutant, oc.FLOAT32))) == [len(values) - 2,
                                                                                  len(values) - 1]
+    # At x = ±1 a factor is exactly zero and so is the product, +0, which no rounding moves.
+    inside = np.nextafter(np.float32(1), np.float32(0))
+    ends = np.float32([1.0, -1.0, inside, -inside])
+    native = np.asarray(jax.lax.one_minus_square(ends))
+    assert np.all(contract({}, [ends], native, oc.FLOAT32)) and not np.signbit(native[:2]).any()
+    for wrong in (np.float32(-0.0), np.float32(1e-45)):
+        mutant = native.copy()
+        mutant[:2] = wrong
+        assert list(np.flatnonzero(~contract({}, [ends], mutant, oc.FLOAT32))) == [0, 1]
+    mutant = native.copy()
+    mutant[2:] = 0.0
+    assert list(np.flatnonzero(~contract({}, [ends], mutant, oc.FLOAT32))) == [2, 3]
 
 
 def test_clz_holds_a_scalar_as_an_array():
@@ -1612,10 +1626,10 @@ def test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_th
 def test_the_recurrence_step_witness_holds_the_fast_backward(form):
     """The step witness (row 2084 (e)) of the fast backward in one of its forms
     (`rw.assert_backward_form_witnessed`): every record each of its launches keeps, for a call of three
-    chunks, inside its step's enclosure. A form a cell, each under the group target (together 179 s, row
+    chunks, inside its step's enclosure; a form the template stops training on the interpreted target fails,
+    never skips (`rw.UNTRAINED`, row 13550). A form a cell, each under the group target (together 179 s, row
     5543)."""
-    if not rw.assert_backward_form_witnessed(rw.interpreted_lane(), form):
-        pytest.skip(f"the template trains no {form} call on this device")
+    rw.assert_backward_form_witnessed(rw.interpreted_lane(), form)
 
 
 @INTERPRETS

@@ -23,7 +23,7 @@ from collections.abc import Callable
 
 from jax import numpy as jnp
 
-from dew.nn.kernels.templates import mosaic, resources, stores, swizzling
+from dew.nn.kernels.templates import axes, mosaic, resources, stores, swizzling
 from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS, Tiles
 
@@ -31,7 +31,8 @@ from dew.nn.kernels.templates.gemm.tiling import ACCUMULATOR_COLUMNS, CONSUMERS,
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
-            programs: int | None = None, outputs: tuple = (), hooked: bool = False) -> Tiles | None:
+            programs: int | None = None, outputs: tuple = (), hooked: bool = False,
+            operands: Callable | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -47,7 +48,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`;
     `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
     `hooked`, whether a column-local epilogue's hook computes them, its tile read out a chunk at a time
-    (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring).
+    (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring); `operands(tile)`, the
+    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s.
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -72,11 +74,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       stages the balanced tile busy (`tiled`'s balanced pass); where no count does, the most whose share
       holds a tile, one at least; a wave is all of them. Fewer programs before a smaller tile: programs
       share the multiprocessor's tensor rate (`pricing.SplitWalk.walk`), so a second one adds overlap, never a
-      product's rate, where a halved share halves the tile and doubles its reads a FLOP: an RTX PRO
-      6000's two programs a multiprocessor held 64 x 64 tiles at two stages in their 49 KB shares, its
-      dense products 1.99x (forward), 3.00x (input gradient) and 1.72x (kernel gradient) cuBLASLt's time,
-      geomean of 13 projections at 8192 tokens (M-FS-9, receipts dew-g4-measure2), where the balanced
-      128 x 64 tile stages busy in that share at 32-deep steps (`MmaIssuer.depths`).
+      product's rate, where a halved share halves the tile and doubles its reads a FLOP (M-FS-9: an RTX
+      PRO 6000's 64 x 64 tiles at two programs ran 1.72-3.00x cuBLASLt's time, where 128 x 64 stages busy).
     - Rows: no more than the call's rows rounded up to a role's or, where grouped, half a group's in
       whole roles, at least one role (each group takes a partial tile more, so at half its rows that tile
       adds at most a third of its work).
@@ -110,12 +109,12 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         """The tile `consumers` take at `programs` a multiprocessor, and whether it is the balanced one
         staged busy: at the widest width its registers hold, its rows at their balance."""
         role = math.lcm(family.role_rows * consumers, units[0])
-        most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        most_rows = max(role, rows // 2 // role * role if grouped else axes.whole(rows, role))
         padded = grouped and not dense
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
                                    multiprocessors=multiprocessors, grouped=padded)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
-                                     width=width, padded=padded)
+                                     width=width, padded=padded, operands=operands)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs, price_of=price_of,
@@ -123,7 +122,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
-        side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps, padded=padded)
+        side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps, padded=padded,
+                     operands=operands)
         widths = _held_widths(layouts, consumers, columns, role, most_rows, side)
         return _best_width(widths, held_tile, side, price_of=price_of)
     # whose groups average fewer rows than one role (a decode step's experts, a few routed rows each), whose
@@ -182,19 +182,21 @@ def _derived_columns(family: mosaic.Family, width: int, dtype, unit_of_call: int
 
 
 def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, width: int,
-               padded: bool) -> tuple[float, float] | None:
+               padded: bool, operands: Callable | None = None) -> tuple[float, float] | None:
     """One tile's seconds per useful output element-step (`pricing.step_seconds`, weighted by tile padding as
     `_padded_side` weighs grouped rows, tie-broken by operand reads per FLOP `1/M + 1/N`): the single cost
     model every family's derivation reads (docs/design/kernel-templates.md §7, rows 11944, 11983); None
     where `target` states no tensor rate. Leaving out the call's constant `rows` factor lets even `rows == 0`
-    rank its tiles alike."""
+    rank its tiles alike. `operands(tile)`, where given, the launch's operands' bytes and decoded forms
+    (`grouped_matmul.MosaicGmm._operand_bytes`: a packed or converted matrix's, row 5387), else `dtype`'s."""
     itemsize = jnp.dtype(dtype).itemsize
-    seconds = pricing.step_seconds(tile, target, (itemsize, itemsize), issued=dtype)
+    itemsizes, decoded = ((itemsize, itemsize), (None, None)) if operands is None else operands(tile)
+    seconds = pricing.step_seconds(tile, target, itemsizes, decoded, issued=dtype)
     if seconds is None:
         return None
     row_tile, columns = pricing.tile_rows(tile, family), pricing.tile_columns(tile, family)
-    row_work = (rows + row_tile / 2) if padded else (-(-rows // row_tile) * row_tile)
-    col_pad = (-(-width // columns) * columns) / max(width, 1)
+    row_work = (rows + row_tile / 2) if padded else (axes.whole(rows, row_tile))
+    col_pad = (axes.whole(width, columns)) / max(width, 1)
     return (seconds * row_work * col_pad / (tile.block_m * columns * tile.block_k),
             1.0 / tile.block_m + 1.0 / columns)
 
@@ -347,11 +349,12 @@ def _steps(family: mosaic.Family, depths: tuple[int, ...] | None, depth: int | N
 
 
 def _side(layouts: tuple, consumers: int, role: int, most_rows: int, columns: list[int], rows: int, target,
-          dtype, steps: list[int], *, padded: bool) -> int:
+          dtype, steps: list[int], *, padded: bool, operands: Callable | None = None) -> int:
     """`derived`'s rows at `consumers`: a grouped call's weighing its groups' padding (`_padded_side`), every
     other call's balancing its reads (`_balanced_side`)."""
     if padded:
-        return _padded_side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps)
+        return _padded_side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps,
+                            operands)
     return _balanced_side(layouts, consumers, role, most_rows)
 
 
@@ -364,7 +367,7 @@ def _balanced_side(layouts: tuple, consumers: int, role: int, most_rows: int) ->
 
 
 def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, columns: list[int], rows: int,
-                 target, dtype, steps: list[int]) -> int:
+                 target, dtype, steps: list[int], operands: Callable | None = None) -> int:
     """`derived`'s rows at `consumers` for a grouped call of `rows` rows a group on average: each group's
     last row tile holds half a tile of rows of padding on average, which its products multiply as any
     rows, so a tile of m rows does r / (r + m/2) of its products' work for the group's rows; the rows, in
@@ -388,7 +391,7 @@ def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, colu
         block_n = next(block_n for block_n in columns if block_n * block_m <= area)
         tiles = Tiles(block_m, block_n, steps[0], 2, 1, warpgroups=consumers, family=layouts[0].name)
         price = _tile_cost(tiles, family=layouts[0], target=target, dtype=dtype, rows=rows, width=block_n,
-                           padded=True)
+                           padded=True, operands=operands)
         if price is None:
             return balanced
         if best is None or price[0] <= best[0]:

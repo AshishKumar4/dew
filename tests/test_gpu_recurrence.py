@@ -69,7 +69,7 @@ from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule
+from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule, recurrent_gated_delta_rule
 from dew.training import MeshSpec
 
 pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel no model flow reaches: the ports, "
@@ -160,20 +160,36 @@ def repeats_bit_for_bit(make, kernel: str):
     gpu_flow.repeats_bit_for_bit(step, params, x)
 
 
+IDLE_ROWS = np.asarray([True, False, True, True, False, False, True, False])
+"""The decode step's drawing rows beside idle ones (`the_decode_kernel_leaves_an_idle_row_alone`)."""
+
+
+def _drawing_rows(step):
+    """`step`'s output and state at the drawing rows (`IDLE_ROWS`) alone."""
+    def rows(*operands):
+        out, final = step(*operands)
+        return out[IDLE_ROWS], final[IDLE_ROWS]
+    return rows
+
+
 def the_decode_kernel_leaves_an_idle_row_alone():
     """A serving step holds every slot, drawing or not: a row the step kernel (`decode_gated_delta_rule`)
     marks idle, at Qwen3.5-0.8B's 16 heads 128 wide, keeps its state bit for bit, unread and unwritten, and
-    outputs zeros; the drawing rows step to the bits they take with every row active."""
-    query, key, value, g, beta, state = decode_operands(np.random.default_rng(1), 8, 16, 128)
-    held = np.asarray(state)
-    active = jnp.asarray([True, False, True, True, False, False, True, False])
-    every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
-    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
-    drawing = np.asarray(active)
-    np.testing.assert_array_equal(np.asarray(got)[drawing], np.asarray(every)[drawing])
-    np.testing.assert_array_equal(np.asarray(got_state)[drawing], np.asarray(every_state)[drawing])
-    np.testing.assert_array_equal(np.asarray(got)[~drawing], 0)
-    np.testing.assert_array_equal(np.asarray(got_state)[~drawing], held[~drawing])
+    outputs zeros; its drawing rows on par (check 1) with the same step's every row active, the recurrence in
+    float64 the truth. The mask is an operand, a runtime one's program beside the unmasked step's, whose
+    arithmetic need not round as the other's (row 13548)."""
+    def draw(seed):
+        return (*decode_operands(np.random.default_rng(1 + seed), IDLE_ROWS.size, 16, 128),
+                jnp.asarray(IDLE_ROWS))
+
+    masked = jax.jit(decode_gated_delta_rule)
+    *operands, active = draw(0)
+    got, got_state = masked(*operands, active)
+    np.testing.assert_array_equal(np.asarray(got)[~IDLE_ROWS], 0)
+    np.testing.assert_array_equal(np.asarray(got_state)[~IDLE_ROWS], np.asarray(operands[-1])[~IDLE_ROWS])
+    assert_as_exact(_drawing_rows(masked), _drawing_rows(lambda *given: masked(*given[:-1])), draw,
+                    "the decode step's drawing rows beside idle ones", seeds=FEWEST_SEEDS,
+                    truth_fn=as_given(_drawing_rows(lambda *given: recurrent_gated_delta_rule(*given[:-1]))))
 
 
 def the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():

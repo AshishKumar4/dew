@@ -31,14 +31,17 @@ import dataclasses
 import functools
 import hashlib
 import math
+from collections.abc import Sequence
 from typing import Literal, NamedTuple
 
 import numpy as np
 from certified import allowance
 from interval_certificates import (
+    PART_BOUNDS,
     Iv,
     Lane,
     add,
+    aligned,
     blocked,
     cast,
     dot,
@@ -440,14 +443,19 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane, scale: float = 1.0)
 def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     """`algebra.key_diagonal_bands` `[C, C]` under a decay a key dimension, the pairs within each row's
     sub-chunk at or before it (zero elsewhere; a strict system's diagonal the caller masks): `sum_k r_ik
-    k_jk exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`,
-    `between` of each token against the one before), rounded a factor at a time from the row's own token
-    back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its
-    decay; under `Lane.unit_pairs` the key times its pair's decay rounded, then the row times it
-    (`algebra.decayed_key`, the native loop's fold, `own_pairs._own_span`); the last multiply an add may
-    fuse, and the terms' sum over every
-    key block within one sum's bound of them (a key block's sum and its adds into the total, at most as
-    many roundings as the width's terms)."""
+    k_jk exp2(E_ik - E_jk)` (`_diagonal_terms`), the terms' sum over every key block within one sum's bound
+    of them (a key block's sum and its adds into the total, at most as many roundings as the width's
+    terms)."""
+    return _terms_summed(_diagonal_terms(rows, k, exponents, lane), lane)
+
+
+def _diagonal_terms(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
+    """`key_diagonal`'s terms `[C, C, K]`, a key column each: each pair's decay the product of its tokens'
+    own (`algebra.token_decays`, `between` of each token against the one before), rounded a factor at a time
+    from the row's own token back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key
+    rounded, then times its decay; under `Lane.unit_pairs` the key times its pair's decay rounded, then the
+    row times it (`algebra.decayed_key`, the native loop's fold, `own_pairs._own_span`); the last multiply an
+    add may fuse; zero off its sub-chunk's pairs at or before a row."""
     exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
@@ -471,12 +479,107 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     else:
         keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), key), lane)
         terms = fused(mul(keyed, chain), lane)
-    terms = where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))
-    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
-    magnitude = np.maximum(np.abs(terms.lo), np.abs(terms.hi)).sum(-1) * (1 + 2.0 ** -50)
+    return where(placed[:, :, None], terms, point(np.zeros(terms.lo.shape)))
+
+
+def _terms_summed(terms: Iv, lane: Lane, *, products: int = 1, aligned_terms=None) -> Iv:
+    """Terms `[C, C, K]` summed over their last axis within one native sum's bound of them, each term
+    `products` products the sum takes (an anchored term's issued pairs of parts, `product.terms`), its
+    magnitude at least `aligned_terms`' where given (a tensor core's alignment of its parts, `dot`'s)."""
+    live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1) * products
+    each = np.maximum(np.abs(terms.lo), np.abs(terms.hi))
+    if aligned_terms is not None:
+        each = np.maximum(each, aligned_terms)
+    magnitude = each.sum(-1) * (1 + 2.0 ** -50)
     slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
              + (live + 1) * 2.0 ** -52 * magnitude)
     return onto(outward(terms.lo.sum(-1) - slack, terms.hi.sum(-1) + slack), FLOAT32)
+
+
+def key_anchored(rows: Iv, k, exponents: Exponents, lane: Lane, *, undecided: bool = False) -> Iv:
+    """`anchored.step`'s own pairs `[C, C]` under a decay a key dimension whose layer bounds it
+    (`Lane.anchored`), each sub-chunk's pairs at or before a row one product: `sum_k r_ik k_jk exp2(E_ik -
+    E_jk)` with both factors taken at the sub-chunk's middle token `A` (`algebra.own_anchors`), the rows gated
+    by `exp2(E_i - A)` and the keys by `exp2(A - E_j)` (`between`, either sign), each an fp32 product taken
+    as its operand form (`operand`, `Lane.pairing`), the products over the key blocks summed in one native
+    sum's bound of their terms (`key_pairs`' own); zero elsewhere. Where its guard may fail on a key block
+    (`undecided`, `_undecided`), each term either arithmetic's (`_diagonal_terms`'), enclosed a term at a time
+    before their sum: a key block takes either, so any mixture of them is enclosed."""
+    size = np.shape(k)[0]
+    tokens = np.arange(size)
+    gated, keyed = (operand(found, lane, lane.pairing)
+                    for found in _anchored_operands(rows, k, exponents, lane))
+    placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
+    zeros = point(np.zeros((size, size)))
+    if not undecided:
+        product = dot(gated, Iv(keyed.lo.T, keyed.hi.T), lane, FLOAT32, parts=(lane.pairing, lane.pairing))
+        return where(placed, product, zeros)
+    count, share, lost = product_terms(lane.pairing)
+    terms = mul(Iv(gated.lo[:, None, :], gated.hi[:, None, :]),
+                Iv(keyed.lo[None, :, :], keyed.hi[None, :, :]))
+    # Each term's parts as the tensor cores align them (`dot`'s `pairs`), its dropped pairs' share of them
+    # (`dot`'s `lost`) widening it.
+    pairs = aligned(gated, BFLOAT16)[:, None, :] * aligned(keyed, BFLOAT16)[None, :, :]
+    widen = lost * pairs * (1 + 2.0 ** -50)
+    terms = where(placed[:, :, None], outward(terms.lo - widen, terms.hi + widen),
+                  point(np.zeros(terms.lo.shape)))
+    either = hull(terms, _diagonal_terms(rows, k, exponents, lane))
+    return where(placed, _terms_summed(either, lane, products=count, aligned_terms=pairs * share), zeros)
+
+
+def product_terms(parts: int) -> tuple[int, float, float]:
+    """Two operands' products in `parts` parts each as `dot` issues them (`product.terms`): their count, the
+    share of a term the pairs issued may hold and the share the pairs dropped may (`PART_BOUNDS`)."""
+    issued = product.terms(parts, parts)
+    dropped = [(i, j) for i in range(parts) for j in range(parts) if (i, j) not in issued]
+    return (len(issued), sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in issued),
+            sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in dropped))
+
+
+def _anchored_operands(rows: Iv, k, exponents: Exponents, lane: Lane) -> tuple[Iv, Iv]:
+    """`anchored.step`'s scaled rows and keys `[C, K]` before their parts: each times its anchored factor
+    (`algebra.own_anchored`, `between` of its prefix and its sub-chunk's middle token's, either sign), one
+    fp32 product."""
+    exact, bound = exponents.exact, exponents.bound
+    tokens = np.arange(np.shape(k)[0])
+    anchors = tokens // SUB * SUB + SUB // 2
+    down = between(exact, bound, exact[anchors], bound[anchors], lane)
+    up = between(exact[anchors], bound[anchors], exact, bound, lane)
+    return fp32(mul(rows, down), lane), fp32(mul(point(np.asarray(k)), up), lane)
+
+
+def _undecided(outputs: Sequence[Iv], k, exponents: Exponents, lane: Lane) -> bool:
+    """Whether `anchored.step`'s guard may fail on any of a chunk's key blocks, which it decides jointly
+    over every output's rows and the keys (`recurrence_algebra`'s `own_reach_exceeded` and `own_out_of_band`):
+    a token's whole exponent within its prefix's bound possibly past `OWN_REACH` from its anchor's, or an
+    element of the rows or keys as `key_anchored` scales them (`_anchored_operands`, the same intervals)
+    past the band at either end, reaching below it (a nonzero value in it may: an interval meeting zero but
+    not zero alone), or not finite. Where it may, the kernel takes either arithmetic a block, so
+    `key_anchored` encloses both."""
+    exact, bound = exponents.exact, exponents.bound
+    tokens = np.arange(np.shape(k)[0])
+    anchors = tokens // SUB * SUB + SUB // 2
+    if not np.all(np.isfinite(exact + bound)):
+        return True
+    # The kernel's own reach test (`own_reach_exceeded`) of the prefix's whole powers of two at either end
+    # of its bound against its anchor's at the other.
+    low, high = (np.floor(end).astype(np.float32) for end in (exact - bound, exact + bound))
+    whole = np.zeros(low.shape, np.float32)
+    for near, far in ((low, high), (high, low)):
+        if np.any(recurrence_algebra.own_reach_exceeded((near, whole), (far[anchors], whole))):
+            return True
+    band = 2.0 ** recurrence_algebra.OWN_BAND
+    scaled = [_anchored_operands(rows, k, exponents, lane)[0] for rows in outputs]
+    scaled.append(_anchored_operands(outputs[0], k, exponents, lane)[1])
+    for found in scaled:
+        largest = np.maximum(np.abs(found.lo), np.abs(found.hi))
+        least = np.where((found.lo <= 0) & (found.hi >= 0), 0.0,
+                         np.minimum(np.abs(found.lo), np.abs(found.hi)))
+        nonzero = (found.lo != 0) | (found.hi != 0)
+        if (np.any(~np.isfinite(largest)) or np.any(largest > band)
+                or np.any(nonzero & (least < 1 / band))):
+            return True
+    return False
 
 
 def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
@@ -494,13 +597,22 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     tokens = np.arange(size)
     own = (tokens[:, None] // SUB) == (tokens[None, :] // SUB)
 
+    writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
+    undecided = lane.anchored and _undecided((writes, point(step.q)), step.k, exponents, lane)
+
+    def diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
+        """A sub-chunk's own pairs as the kernel forms them: each its own decay (`key_diagonal`); anchored
+        (`key_anchored`) where its layer bounds its decays, either a term where its guard is `undecided`."""
+        if not lane.anchored:
+            return key_diagonal(rows, k, exponents, lane)
+        return key_anchored(rows, k, exponents, lane, undecided=undecided)
+
     def pairs(rows: Iv) -> Iv:
-        """Each sub-chunk's own pairs (`key_diagonal`) and the pairs of sub-chunks (`key_pairs`), each zero
-        where the other is taken, so their sum exact."""
-        within = key_diagonal(rows, step.k, exponents, lane)
+        """Each sub-chunk's own pairs (`diagonal`) and the pairs of sub-chunks (`key_pairs`), each zero where
+        the other is taken, so their sum exact."""
+        within = diagonal(rows, step.k, exponents, lane)
         return where(own, within, key_pairs(rows, step.k, exponents, lane))
 
-    writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
     system = where(_lags(size) > 0, pairs(writes), zeros)
     w, c, values = solved_step(step, raised, lane)
     exact, bound = exponents.exact, exponents.bound
@@ -519,7 +631,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     shrinking, growing = min(abs(scale), 1.0), math.copysign(max(abs(scale), 1.0), scale)
     crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
                        point(np.float32(growing))), lane)
-    within = fp32(mul(key_diagonal(point(step.q), step.k, exponents, lane), factor), lane)
+    within = fp32(mul(diagonal(point(step.q), step.k, exponents, lane), factor), lane)
     scores = staged(where(_lags(size) >= 0, where(own, within, crossed), zeros), lane)
     queries = staged(fp32(mul(fp32(mul(point(step.q), raised), lane), factor), lane), lane)
     left = Iv(np.concatenate([queries.lo, scores.lo], 1), np.concatenate([queries.hi, scores.hi], 1))
@@ -617,6 +729,9 @@ class Run:
     unit_pairs: bool
     """Whether its own pairs fold each decay into the key before the row (`Lane.unit_pairs`): a delta rule's
     unit keys, as the draws' layers declare them."""
+    anchored: bool
+    """Whether its own pairs are anchored products (`Lane.anchored`: the layer declares its decay bound,
+    `anchored.anchoring`)."""
     rounded_prefix: bool
     """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
     `mainloop.prefix_limbs`)."""
@@ -906,6 +1021,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained), unit_pairs=unit_pairs,
+               anchored=np.ndim(g) == 4 and decay_bound is not None and jnp.dtype(dtype).itemsize == 2,
                solve=(mainloop.merge_parts(solving, jnp.float32 if wide else dtype, held=held, ranged=False),
                       tf32_conversion(solving)),
                rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,
@@ -970,7 +1086,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
                                merged=run.merged, tf32=run.tf32, solve=run.solve, unit_pairs=run.unit_pairs,
-                               rounded_prefix=run.rounded_prefix, clamped=run.clamped)
+                               anchored=run.anchored, rounded_prefix=run.rounded_prefix, clamped=run.clamped)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1573,7 +1689,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
                                merged=run.merged, tf32=run.tf32, solve=run.solve, unit_pairs=run.unit_pairs,
-                               rounded_prefix=run.rounded_prefix, clamped=run.clamped)
+                               anchored=run.anchored, rounded_prefix=run.rounded_prefix, clamped=run.clamped)
 
     def stored(iv: Iv, dtype, name: str) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
@@ -1641,15 +1757,28 @@ keys' sums and its values' gradient stored once in bf16: rows 11849, 11873), and
 rule (its values in parts)."""
 
 
+UNTRAINED = {("sm80", "fp32 under the delta rule"), ("sm80", "bf16 under the accurate forms")}
+"""The fast backward's forms (`BACKWARD_FORMS`) the template trains on no target of a generation
+(`Mosaic.trains`), whose training step takes another kernel there: on an A100, an fp32 call's (its registers
+264 to 328 a thread) and a bf16 call's under the accurate forms, its values in three parts (at 9827af608,
+the witness's draw of two heads, which its native cells take). Every other form is trained wherever the
+witness runs it and a declared one refused, so a form the template stops training fails its witness rather
+than passing it unwitnessed, and a declared one it trains again fails until struck (row 13550)."""
+
+
 def backward_form_held(lane: Lane, form: str, heads: int = 1) -> tuple[BackRun, dict] | None:
     """The fast backward's records in one of its forms (`BACKWARD_FORMS`) and whether each lies inside its
-    step's enclosure (`back_witnessed`), where the template trains the form on the device (`Run.trained`: an
-    A100's registers hold no fp32 call's, 264 to 328 a thread, whose training step takes another kernel);
-    None where it does not."""
+    step's enclosure (`back_witnessed`); None where the form is declared untrained on the target its
+    launches run for (`UNTRAINED`, `template.Mosaic.launched`), whose call the template must then refuse to
+    train (`Run.trained`), as it must train every other."""
     held = BACKWARD_FORMS[form]
     operands = draw(0, "mild", heads=heads, dtype=held.dtype)
     run = recorded(*operands, delta=held.delta, rounded=held.rounded)
-    if not run.trained:
+    target = template.Mosaic.launched().generation
+    untrained = (target, form) in UNTRAINED
+    assert run.trained != untrained, (f"the template trains {'a' if run.trained else 'no'} {form} call on "
+                                      f"{target}, declared otherwise (UNTRAINED)")
+    if untrained:
         return None
     back = recorded_backward(operands, delta=held.delta, run=run)
     return back, back_witnessed(back, lane)
@@ -1674,25 +1803,24 @@ def dropped_gate_held(back: BackRun, lane: Lane) -> np.ndarray:
     return back_witnessed(back._replace(records={**back.records, "dv": dropped}), lane)["dv"]
 
 
-def assert_backward_held(held: tuple[BackRun, dict] | None, lane: Lane) -> bool:
+def assert_backward_held(held: tuple[BackRun, dict] | None, lane: Lane) -> None:
     """A form's fast backward (`backward_form_held`'s) witnessed: every record each launch keeps inside its
     step's enclosure (row 2084 (e)), and where it gates the values, a walk that dropped the gate refused
-    (`dropped_gate_held`, `DROPPED_GATE_SHARE`). Whether the template trains it, so the form was witnessed."""
+    (`dropped_gate_held`, `DROPPED_GATE_SHARE`); none of a form declared untrained there (`UNTRAINED`)."""
     if held is None:
-        return False
+        return
     back, inside = held
     for name, found in inside.items():
         assert np.all(found), (back.run.write, back.run.held, name, np.mean(found))
     if back.run.write == "values":
         refused = np.mean(~dropped_gate_held(back, lane))
         assert refused >= DROPPED_GATE_SHARE, ("a dropped write gate", refused)
-    return True
 
 
-def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> bool:
-    """The step witness of the fast backward (`back_enclosures`) in one of its forms where the template
-    trains it (`backward_form_held`, `assert_backward_held`); whether it does."""
-    return assert_backward_held(backward_form_held(lane, form, heads), lane)
+def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> None:
+    """The step witness of the fast backward (`back_enclosures`) in one of its forms, trained unless declared
+    untrained on the target (`backward_form_held`, `assert_backward_held`)."""
+    assert_backward_held(backward_form_held(lane, form, heads), lane)
 
 
 def claimed_gradients_held(lane: Lane, heads: int = 1) -> dict:

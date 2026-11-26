@@ -76,6 +76,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
@@ -1675,15 +1676,17 @@ class RunConfig:
         ahead, so a config read alone reads none of it."""
         trainer = self.trainer
         checkpoints, tracker = resources.pop("checkpoints", None), resources.pop("tracker", None)
+        numerics = self.trained_numerics(objective)
+        scaled, drawn = (False, None) if numerics is not None else self.trained_knobs()
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, accumulation=trainer.accumulation,
             update_tokens=trainer.update_tokens, split=trainer.split, remat=trainer.remat,
             microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
             advanced=training.TrainerAdvanced(
                 layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
-                skip_nonfinite=trainer.skip_nonfinite,
-                dynamic_scale=trainer.precision.scales_loss(self.compute_dtype()),
-                tune_kernels=self.diagnostics.tune_kernels, param_dtype=self.drawn_dtype(),
+                skip_nonfinite=trainer.skip_nonfinite, numerics=numerics, dynamic_scale=scaled,
+                param_dtype=drawn,
+                tune_kernels=self.diagnostics.tune_kernels,
                 inspection=trainer.inspection, diloco=trainer.diloco,
                 **{"links": self.diagnostics.links, **resources}))
 
@@ -1693,13 +1696,33 @@ class RunConfig:
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
-    def drawn_dtype(self) -> str | None:
-        """The dtype the run stores the parameters it draws fresh in (`Trainer`'s `param_dtype`): its
-        numerics' `dtypes.params` where that is not Flax's own float32 and its model's record states
-        none; None leaves each module's own."""
-        params = self.trainer.precision.dtypes.params
-        return None if "param_dtype" in self.model.fields or jax.numpy.dtype(params) == jax.numpy.float32 \
-            else params
+    def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics | None:
+        """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
+        precision, with the compute dtype its modules state as their own in place of its own
+        (`stated_compute`: the record's where the run built them, `numerics_fields`, a handed model's own),
+        and the parameters' dtype its model's record states, which the model then draws them in itself. None
+        where its modules state no one compute dtype (Flax's None, a wrapper's, several among a multipart
+        objective's), which no trainer establishes: the run then hands its trainer the loss scale and drawn
+        dtype its record names (`trained_knobs`), as before numerics reached the trainer, its programs traced
+        under its numerics all the same (`traced`)."""
+        from dew.training.transaction import stated_compute
+
+        computes = stated_compute(objective)
+        if computes is None:
+            return None
+        precision = self.trainer.precision
+        stated = self.model.fields.get("param_dtype")
+        params = precision.dtypes.params if stated is None else str(stated)
+        return dataclasses.replace(precision, dtypes=dataclasses.replace(
+            precision.dtypes, compute=computes, params=params))
+
+    def trained_knobs(self) -> tuple[bool, str | None]:
+        """The loss scale and drawn dtype a trainer takes for a run whose numerics it cannot hold
+        (`trained_numerics`): its numerics' loss scaling at its record's compute dtype (`compute_dtype`), and
+        its parameters' dtype where that is not Flax's float32 and its model's record states none."""
+        precision = self.trainer.precision
+        drawn = None if "param_dtype" in self.model.fields else precision.drawn_dtype()
+        return precision.scales_loss(self.compute_dtype()), drawn
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,

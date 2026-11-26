@@ -75,7 +75,7 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
-from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix
+from dew.nn.dense import QUANTIZATION, _contractions, _linear_site, packed_matrix, packed_ternary
 from dew.nn.derivatives import contracted, surrogate, with_tangents_formed
 from dew.nn.fake_quant import (
     E2M1_MAX,
@@ -379,10 +379,13 @@ class LinearProducts(nn.Module):
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
         frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
         (`nn.with_logical_partitioning`)."""
-        from dew.nn.kernels.formats import NvFp4
+        from dew.nn.kernels.formats import NvFp4, TernaryWeights
 
         module = getattr(self, name)
         kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
+        if isinstance(kernel, TernaryWeights):
+            # A BitNet b1.58 matrix's codes times its scale (row 1464).
+            return kernel.decoded(jnp.float32)
         return packed_values(kernel) if isinstance(kernel, NvFp4) else meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
@@ -391,7 +394,10 @@ class LinearProducts(nn.Module):
         gradients (`quantized_products`; a weight-only rule leaves it linear, by its quantized matrix),
         read where `qwix`, and as a method interceptor answers for itself (a checkpoint's input
         quantization, read where `input_scales`, and frozen FP8 products, `dew.lora`'s dropout on a
-        training forward)."""
+        training forward). A packed BitNet b1.58 kernel's layer quantizes its input a token at a time, always
+        (`dense.Dense._packed`, row 1464)."""
+        if packed_ternary(getattr(self, name)):
+            return True
         return qwix and quantized_products(self, name).inputs
 
     def linear_product(self, name: str) -> bool:
@@ -707,16 +713,16 @@ def decoded_stored(variables: Variables) -> Variables:
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`' rows cast by the FP8 block cast
-    and multiplied by `rows` as the GEMM template multiplies FP8 (`gemm.gemm`): on
+    and multiplied by `rows` as the GEMM template multiplies FP8 (`gemm.fp8_codes_product`): on
     Hopper's FP8 tensor cores, each 128-deep step's product promoted into the fp32 sum apart, within the
     FP8 contract (testing.md, FP8 products: 2.8 to 12.8 times closer to float64 than cuBLASLt's FP8 GEMM, 1.36
     times its time at a training shape, row 3620); elsewhere the codes as exact bfloat16 values summed in
-    fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625). Both rows' scales apply
-    after (`_scaled`)."""
+    fp32, held apart from XLA's FP8 GEMM, whose sum is narrower (ledger 1625), the matrix's converted in the
+    template's stages where its selector takes them (row 8548). Both rows' scales apply after (`_scaled`)."""
     from dew.nn.kernels import gemm
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = gemm.gemm(codes, rows, transpose_rhs=True, out_dtype=jnp.float32)
+    product = gemm.fp8_codes_product(codes, rows, out_dtype=jnp.float32)
     return twice_scaled(product, scales, row_scales.T)
 
 

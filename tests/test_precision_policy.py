@@ -2045,3 +2045,21 @@ def test_a_raise_and_lowering_by_powers_of_two_are_ieee_from_the_bits_on_a_flush
     np.testing.assert_array_equal(binades[nonzero],
                                   np.floor(np.log2(np.abs(values[nonzero].astype(np.float64)))).astype(np.int32))
     np.testing.assert_array_equal(binades[~nonzero], -1024)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64])
+def test_a_signed_quiet_nan_is_the_formats_own_however_it_is_formed(dtype):
+    """`float_bits.quiet_nan`, the one signed quiet NaN a stored decoder lands (row 13450), is each format's
+    canonical quiet NaN bit for bit, its sign where asked: the bits numpy's NaN casts to, and its
+    negation's; and the E4M3 block scale's two NaN codes decode to float32's, signed as their code
+    (`bits.scales_decoded`, 0x7F and 0xFF)."""
+    from dew.algebra import bits
+    from dew.nn.float_bits import quiet_nan
+
+    with jax.enable_x64(dtype == jnp.float64):
+        formed = np.asarray(quiet_nan(jnp.asarray([False, True]), dtype))
+    word = f"uint{np.dtype(dtype).itemsize * 8}"
+    canonical = np.copysign(np.asarray([np.nan, np.nan]), [1.0, -1.0]).astype(dtype)
+    np.testing.assert_array_equal(formed.view(word), canonical.view(word))
+    scales = np.asarray(bits.scales_decoded(jnp.asarray([0x7F, 0xFF], jnp.uint32)))
+    np.testing.assert_array_equal(scales.view(np.uint32), np.asarray([0x7FC00000, 0xFFC00000], np.uint32))

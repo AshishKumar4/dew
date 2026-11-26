@@ -12,7 +12,7 @@ import pytest
 from blockwise_matrix import CUBLASLT_PRECISION
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
+from dew.nn.kernels import gemm, generation, grouped_quantized, projections, tuning
 from dew.nn.kernels.templates.gemm import tiling
 
 
@@ -159,7 +159,7 @@ def test_a_blockwise_fp8_product_at_large_finite_scales_is_finite():
 
 def test_a_blockwise_fp8_products_launch_reads_its_pin():
     """The blockwise FP8 product through the template named on an H100 launches through its launch
-    (`grouped_matmul.MosaicStepScaledGmm`, `tuning.KernelOp.__call__`): a pin of its kind is read, one it
+    (`grouped_quantized.MosaicStepScaledGmm`, `tuning.KernelOp.__call__`): a pin of its kind is read, one it
     cannot take refused by name (`tuning.Unpinnable`: an mma.sync tile, which no FP8 product of an H100
     takes), where the product called its mainloop beside the launch and ignored the pin."""
     case = {"columns": "128", "groups": "1"}
@@ -172,7 +172,8 @@ def test_a_blockwise_fp8_products_launch_reads_its_pin():
                                           interpret_on_cpu=True)
 
     with (generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"),
-          tuning.pinned({grouped_matmul.MosaicStepScaledGmm: untakeable}), pytest.raises(tuning.Unpinnable)):
+          tuning.pinned({grouped_quantized.MosaicStepScaledGmm: untakeable}),
+          pytest.raises(tuning.Unpinnable)):
         jax.eval_shape(product, *operands)
 
 

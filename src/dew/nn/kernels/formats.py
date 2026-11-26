@@ -265,7 +265,8 @@ class MxFp8:
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
         """Each E4M3 code times its E8M0 scale in `dtype`, with one destination rounding. The least
-        scale byte and subnormal result bits are kept even on FTZ backends; byte 255 is NaN (OCP MX 5.4.1).
+        scale byte and subnormal result bits are kept on FTZ backends. A NaN code keeps its sign at a valid
+        scale; scale byte 255 gives a positive quiet NaN (OCP MX 5.4.1).
         """
         exponent, invalid = e8m0_exponents(self.scales)
         exponent, invalid = (jnp.repeat(x, formats_of.MXFP8.depth, axis=-1) for x in (exponent, invalid))
@@ -283,16 +284,27 @@ def _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid):
 
 def _mxfp8_decoded(dtype, codes, exponents, invalid):
     if dtype == jnp.float64:
-        return _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid)
-    # Every nonzero finite E4M3 code first widens to a normal fp32. Only the final exponent
-    # application can enter the subnormals, so round the stored product at its destination.
-    _, sign, biased, fraction = raw_fields(codes.astype(jnp.float32))
-    held = jnp.where(biased != 0, fraction | np.uint32(1 << 23), fraction)
-    power = biased.astype(jnp.int32) - 150 + exponents
-    landing = dtype if dtype in (jnp.float16, jnp.bfloat16, jnp.float32) else jnp.float32
-    place = power + 23 - jnp.finfo(landing).nmant
-    return rounded_binary(sign, held, power, landing, last=place,
-                          nan=invalid | (biased == 0xFF)).astype(dtype)
+        landed = _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid)
+    else:
+        # Every nonzero finite E4M3 code first widens to a normal fp32. Only the final exponent
+        # application can enter the subnormals, so round the stored product at its destination.
+        _, sign, biased, fraction = raw_fields(codes.astype(jnp.float32))
+        held = jnp.where(biased != 0, fraction | np.uint32(1 << 23), fraction)
+        power = biased.astype(jnp.int32) - 150 + exponents
+        landing = dtype if dtype in (jnp.float16, jnp.bfloat16, jnp.float32) else jnp.float32
+        place = power + 23 - jnp.finfo(landing).nmant
+        landed = rounded_binary(sign, held, power, landing, last=place)
+
+    # Read the E4M3 sign from storage; an invalid E8M0 scale instead denotes an unsigned NaN.
+    stored = jax.lax.bitcast_convert_type(codes, jnp.uint8)
+    special = (stored & np.uint8(0x7F)) == np.uint8(0x7F)
+    negative = (stored == np.uint8(0xFF)) & ~invalid
+    limits = jnp.finfo(landed.dtype)
+    word = jnp.dtype(f"uint{limits.bits}")
+    quiet = word.type((((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1)))
+    bits = quiet | (negative.astype(word) << word.type(limits.bits - 1))
+    nan = jax.lax.bitcast_convert_type(bits, landed.dtype)
+    return jnp.where(special | invalid, nan, landed).astype(dtype)
 
 
 def _mxfp8_decode_tangent(dtype, primals, tangents):
@@ -604,3 +616,9 @@ def _ternary_decode_tangent(dtype, primals, tangents):
 _decode_ternary = contracted("test_decoded_ternary_preserves_its_linear_scale_rule")(
     declared_tangent(Protected(), _ternary_decoded, _ternary_decode_tangent,
                      nondiff_argnums=(0,), symbolic_zeros=True))
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights)
+"""The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
+codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
+(`checkpoints._packed_checked`)."""

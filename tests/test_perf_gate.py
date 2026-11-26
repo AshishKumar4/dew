@@ -36,6 +36,59 @@ def test_the_report_fails_on_a_broken_row_and_not_on_an_ungated_one(gate, tmp_pa
     assert gate.main() == code
 
 
+def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate, tmp_path, monkeypatch):
+    """A base whose probe ran and exited other than 0 every round is "base failed", which fails a report run
+    alone, where a base too old to run a row (no lock of it, `not run:`) is "not compared"; a run's
+    probe that exits so writes its rows `failed:` (audit 2026-11-26, row 13545)."""
+    from types import SimpleNamespace
+
+    row = gate.Row("gated", "ms", "")
+    assert gate.verdict(row, ["failed: exited 1"] * 6, samples(10.0), samples(10.0))[0] == "base failed"
+    assert gate.verdict(row, ["not run: no lock"] * 6, samples(10.0), [None] * 6)[0] == "not compared"
+    results = {"base": "main", "head": "head", "alone": "main~aa", "rows": [row.__dict__], "rounds": 6,
+               "samples": {"base": [{"gated": "failed: exited 1"}] * 6, "alone": [{"gated": 10.0}] * 6,
+                           "head": [{"gated": 10.0}] * 6}}
+    (tmp_path / "gate.json").write_text(json.dumps(results))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
+    assert gate.main() == 1
+    standing_in(gate, monkeypatch, passed=True)
+    stood_in = gate.subprocess.run
+    probe = next(probe for probe in gate.PROBES if probe.tool == "benchmark_step.py")
+
+    def failing(command, **kwargs):
+        if Path(command[1]).name == probe.tool:
+            return subprocess.CompletedProcess(command, 3, "", "out of memory")
+        return stood_in(command, **kwargs)
+
+    monkeypatch.setattr(gate.subprocess, "run", failing)
+    args = SimpleNamespace(only=[probe.rows[0].name], claim=False, model="unused", flowers="unused",
+                           torch_python="torch", out=tmp_path / "run.json")
+    sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False)
+    assert all(sample[row.name].startswith(f"failed: {probe.tool} exited 3") for row in probe.rows)
+
+
+def test_a_selection_of_no_row_is_refused_before_setup_and_an_empty_receipt_fails(
+        gate, tmp_path, monkeypatch):
+    """`--only` naming no row's word is refused before any environment is built, in a run and in a compile,
+    and a receipt holding no rows fails its report: an empty selection measured nothing (row 13552)."""
+    def built(*args, **kwargs):
+        raise AssertionError("an environment was built for a selection of nothing")
+
+    monkeypatch.setattr(gate, "environments", built)
+    for argv in (["run", "--base", "a=.", "--head", "b=.", "--model", "m", "--flowers", "f", "--out",
+                  str(tmp_path / "run.json"), "--only", "step", "nothing-named-so"],
+                 ["compile", "--base", "a=.", "--head", "b=.", "--kind", sorted(gate.COMPILE_TARGETS)[0],
+                  "--lock", "cuda12", "--out", str(tmp_path / "compile.json"), "--only", "nothing-named-so"]):
+        monkeypatch.setattr(sys, "argv", ["perf_gate.py", *argv])
+        with pytest.raises(SystemExit):
+            gate.main()
+    results = {"base": "main", "head": "head", "alone": "main~aa", "rows": [], "rounds": 6,
+               "samples": {"base": [{}] * 6, "alone": [{}] * 6, "head": [{}] * 6}}
+    (tmp_path / "empty.json").write_text(json.dumps(results))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "empty.json")])
+    assert gate.main() == 1
+
+
 def samples(*values) -> list[float]:
     """Six rounds' samples, `values` cycled: literals a binary float holds exactly."""
     return [float(values[index % len(values)]) for index in range(6)]

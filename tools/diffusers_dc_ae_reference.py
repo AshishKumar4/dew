@@ -194,8 +194,42 @@ def main(destination: str, variants: list[str]) -> None:
     print(f"{root}: {size / 1e6:.2f} MB")
 
 
+def seeds(variants: list[str]) -> None:
+    """The truths recordings of `variants`, one cohort's (`COHORTS`, `record_walk_truths`): each saved
+    model of tests/fixtures/dc_ae.tar.xz reloaded and walked, its encode and decode of a rectangular batch
+    and of a small one (tests/autoencoder_walks.py `DC_AE`), every parameter's gradient kept, as
+    tests/fixtures/dc_ae_<variant>_seeds.npz. No count of draws resolves a DC-AE walk's float32 errors
+    (its ReLU attention's tiny normalizers leave each draw's to one or two positions in both arms, 512
+    draws, row 705): each walk holds its function."""
+    from autoencoder_walks import DC_AE
+    from diffusers.models.autoencoders.autoencoder_dc import AutoencoderDC
+    from reference_vjp import FIXTURES, record_walk_truths, save_walks, unpacked
+
+    (cohort,) = {COHORTS[name] for name in variants}
+    release = require(cohort)["diffusers"]
+    torch.set_num_threads(2)
+    calls = {"encode": encoded, "decode": decoded}
+    with unpacked(FIXTURES / "dc_ae.tar.xz") as root:
+        for name in variants:
+            model = AutoencoderDC.from_pretrained(root / name).eval()
+            names = [key for key, _ in model.named_parameters()]
+            arrays = {}
+            for walk, draw in DC_AE[name].items():
+                call = calls[walk.split()[-1]]
+
+                def walked(model, x, call=call):
+                    return (call(model, x),)
+
+                arrays.update(record_walk_truths(f"{name} {walk}", model, walked, draw, names))
+            save_walks(f"dc_ae_{name}_seeds.npz", arrays, [f"{name} {walk}" for walk in DC_AE[name]],
+                       reference=f"AutoencoderDC (diffusers {release})", revision=f"diffusers=={release}",
+                       command=f"python tools/diffusers_dc_ae_reference.py seeds {name}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 2 and sys.argv[1] == "seeds":
+        seeds(sys.argv[2:])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-dc-ae-reference", sys.argv[2:])

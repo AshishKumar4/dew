@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.gemm import tiling
 
 from . import tuning
@@ -109,7 +110,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         if not ba.arguments.get('dense') or not isinstance(config, Tile | tiling.Tiles) or sides is None:
             return None
         rows, width = sides
-        grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n
+        grid = whole(rows, config.block_m) * whole(width, config.block_n)
         return 1 - rows * width / grid if grid else None
 
     def output_sides(self, ba) -> tuple[int, int] | None:

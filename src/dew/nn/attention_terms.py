@@ -218,27 +218,66 @@ def _relative_read(states: jax.Array, bank: jax.Array, distance: jax.Array) -> j
     return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, jnp.zeros((), wide))
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class RelativeTerms:
+    """A relative bias in both the forms a route may take (`attention.RouteBias`): each query's relative
+    states `states` `[B, Q, H, rank]` against `bank` `[rank, extent]`, its queries and keys at their
+    indices from the first key (a whole call's own tokens, `query_slots` and `key_slots` their slots):
+    its band (`relative_band`) for the template, its writing out (`relative_logits`) for every other
+    route, each formed only where a route reads it (row 13503)."""
+
+    states: jax.Array
+    bank: jax.Array
+    query_slots: jax.Array
+    key_slots: jax.Array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Its band's shape, `[B, H, Q, band_width(extent)]`, as the band would hold it (`BandBias.shape`)."""
+        from .kernels.templates import band
+
+        batch, queries, heads, _ = self.states.shape
+        return batch, heads, queries, band.band_width(self.bank.shape[-1])
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        """Its band's dtype: at least fp32 (`relative_band`)."""
+        return at_least_fp32(jnp.result_type(self.states, self.bank))
+
+    def band(self):
+        """The band about each query (`relative_band`), the keys at their indices."""
+        return relative_band(self.states, self.bank, jnp.zeros((), jnp.int32))
+
+    def dense(self, keys: int) -> jax.Array:
+        """The bias written out over the call's `keys` (`relative_logits`), `[B, H, Q, K]`."""
+        if self.key_slots.shape[-1] != keys:
+            raise ValueError(f"a relative bias over {self.key_slots.shape[-1]} keys is written out over "
+                             f"its own keys, not {keys}")
+        return relative_logits(self.states, self.bank, self.query_slots, self.key_slots)
+
+
 def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
     """`relative_logits`' bias as a band (`attention.BandBias`): each query's relative states `states` `[B, Q,
     H, rank]` against `bank` `[rank, extent]`, read at the query's place less each key's within its band and
     zero outside `[0, extent)`, the keys at their indices and each query at its index plus `offset` (`[]` or
     `[B]` int32: 0 for a prefill from the first key, a chunk's first place for a chunked one). Formed a
-    `template.BAND_GROUP` of queries at a time, each group's `[B, H, BAND_GROUP, extent]` products gathered
+    `band.BAND_GROUP` of queries at a time, each group's `[B, H, BAND_GROUP, extent]` products gathered
     into its band and dropped, so no call holds every query's products beside the band they are read into
     (an Inkling 2 prefill's 32768 queries' would hold 3.2 GiB a layer beside it). A caller whose places are
     not their indices so (counted places, `attention_key_positions`) takes `relative_logits`."""
     from .attention import BandBias
-    from .kernels.templates import attention as template
+    from .kernels.templates import band
 
     batch, queries, heads, _ = states.shape
     extent = bank.shape[-1]
     wide = at_least_fp32(jnp.result_type(states, bank))
-    width = template.band_width(extent)
-    group = max(1, min(queries, template.BAND_GROUP))
+    width = band.band_width(extent)
+    group = max(1, min(queries, band.BAND_GROUP))
     groups = -(-queries // group)
     padded = jnp.pad(states, ((0, 0), (0, groups * group - queries), (0, 0), (0, 0)))
     offset = jnp.asarray(offset, jnp.int32)
-    origins = template.band_origins(offset, groups * group, extent)
+    origins = band.band_origins(offset, groups * group, extent)
     places = jnp.reshape(offset, (-1, 1))
 
     def banded(index):
@@ -252,6 +291,6 @@ def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
 
     if groups == 0:
         return BandBias(jnp.zeros((batch, heads, 0, width), wide), offset, extent)
-    band = jax.lax.map(banded, jnp.arange(groups))
-    values = jnp.moveaxis(band, 0, 2).reshape(batch, heads, groups * group, width)[:, :, :queries]
+    by_group = jax.lax.map(banded, jnp.arange(groups))
+    values = jnp.moveaxis(by_group, 0, 2).reshape(batch, heads, groups * group, width)[:, :, :queries]
     return BandBias(values, offset, extent)

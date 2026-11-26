@@ -342,6 +342,19 @@ def _export_cli(input_path, destination):
                           check=False)
 
 
+def test_a_record_export_asking_its_documents_unended_is_refused_before_it_reads(tmp_path):
+    """`--no-eos` writes a token export's documents unended; a record export, which holds no tokens, asking
+    it is refused before it reads its chain or writes a file, never left unread."""
+    from dew._cli.main import DataExport
+
+    corpus, chain, destination = tmp_path / "corpus.txt", tmp_path / "chain.py", tmp_path / "out"
+    corpus.write_text("one line\nanother line\n", encoding="utf-8")
+    chain.write_text(f"from dew.data import Files\n\ndata = Files({str(corpus)!r}, format='text')\n")
+    with pytest.raises(ValueError):
+        DataExport(str(chain), str(destination), eos=False, read="memory").run_command()
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("missing", [False, True])
 def test_data_export_leaves_every_file_it_did_not_create(tmp_path, missing):
     destination = tmp_path / "out"

@@ -140,12 +140,15 @@ class _LinearAttention(nn.Module):
         )
         positions = height * width
         quadratic = positions <= self.head_dim
+        # Diffusers pins float32 (`SanaMultiscaleAttnProcessor2_0`, `.to(torch.float32)`): at least it, so a
+        # float64 run's truth stays float64, as the widened reference's pin widens.
+        wide = at_least_fp32(qkv.dtype)
         if not quadratic:
-            qkv = qkv.astype(jnp.float32)
+            qkv = qkv.astype(wide)
         qkv = qkv.reshape(batch, positions, -1, 3, self.head_dim)
         query, key, value = nn.relu(qkv[..., 0, :]), nn.relu(qkv[..., 1, :]), qkv[..., 2, :]
         if quadratic:
-            scores = float32_einsum("bmgd,bngd->bgmn", key, query).astype(jnp.float32)
+            scores = float32_einsum("bmgd,bngd->bgmn", key, query).astype(wide)
             scores = scores / (jnp.sum(scores, axis=2, keepdims=True) + _ATTENTION_EPS)
             attended = float32_einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
         else:

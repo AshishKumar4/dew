@@ -4,8 +4,6 @@ engine rewrote before evaluating (`dew.algebra.forms.rewritten`), each held to t
 the derived forms are (tests/test_algebra_derive.py, tests/test_algebra_scan.py), in the fast class and the
 accurate one."""
 
-import dataclasses
-
 import jax
 import jax.numpy as jnp
 import pytest
@@ -58,28 +56,27 @@ def test_the_rewritten_delta_rules_adjoint_is_the_token_scans_gradient():
     scans.assert_delta_adjoint(derived, scans.gated_delta, scans.gated_draw, "gated delta rewritten", seeds=8)
 
 
-def scaled_by_a_power_of_two(q, k, v, rows, keys):
-    """Attention whose logits' scale is a power of two (64 wide, 1/8): a scale the engine may move onto
-    either operand of its contraction exactly."""
-    del rows, keys
-    s = (q @ k.T) * 0.125
-    m = jnp.max(s, axis=-1)
-    p = jnp.exp(s - m[:, None])
-    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
+def row_scaled_attention(q, k, v, rows, keys):
+    """Softmax of a contraction with a bounded scale along its kept query axis."""
+    del keys
+    scale = jnp.tanh(rows.astype(q.dtype)) * 0.125
+    scores = (jnp.tanh(q) * scale[:, None]) @ jnp.tanh(k).T
+    weights = jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))
+    return (weights @ v) / jnp.sum(weights, axis=-1)[:, None]
 
 
 def test_the_engine_rewrites_a_derived_walk_and_it_computes_the_declared_function():
-    """A derived walk whose logits' scale is a power of two, its queries' and keys' ranges declared (the
-    draws' bound): the engine's rule that moves a power-of-two scale onto an operand of the contraction fires
-    in the derivation's e-graph (`linear`, its report in `report.rewrites`), its new operand bounded by the
-    range facts (§6.3), and the walk still computes the whole-operand function, against the float64 truth
-    (check 1)."""
-    declared = dataclasses.replace(walks.declared(scaled_by_a_power_of_two), ranges={"q": 8.0, "k": 8.0})
-    derived = derive.derive(declared, accurate=False, saturation=algebra.SATURATION)
+    """The bounded row-scaled contraction admits a linear rewrite inside the softmax walk.
+
+    The numerical gate compares the actual derived walk with the written whole-operand function
+    against independent wide arithmetic.
+    """
+    derived = derive.derive(walks.declared(row_scaled_attention), accurate=False,
+                            saturation=algebra.SATURATION)
     q, k, v = walks.draw(0)
     with report.refusals():
         jax.make_jaxpr(walks.walked_whole(derived))(q, k, v)
         fired = [made.fired for made in report.rewrites()]
     assert any(counts.get("linear", 0) > 0 for counts in fired), fired
-    assert_as_exact(jax.jit(walks.walked_whole(derived)), jax.jit(walks.whole(scaled_by_a_power_of_two)),
-                    walks.draw, "power-of-two scale rewritten", seeds=8)
+    assert_as_exact(jax.jit(walks.walked_whole(derived)), jax.jit(walks.whole(row_scaled_attention)),
+                    walks.draw, "row-scaled contraction rewritten", seeds=8)

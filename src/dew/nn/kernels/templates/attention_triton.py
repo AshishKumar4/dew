@@ -28,6 +28,7 @@ from dew.nn.kernels.templates import (
     attention_gradient as gradient,
     attention_program as program,
     axes,
+    band,
     outputs,
     report,
     resources,
@@ -39,6 +40,7 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     DTYPES,
     NATURAL,
+    TILED,
     WARPS,
     AttentionLaunch,
     Gradients,
@@ -47,6 +49,7 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     Split,
+    band_origins_of,
     block_map,
     blocked,
     by_power,
@@ -208,15 +211,29 @@ def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified
     return None
 
 
-def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
+def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None, origins=None):
     """A hook parameter's values for a tile, as `kind` lays them out (its `Kind`, its block
     `_param_spec`'s): the head's scalar, the tile's entries over its keys `keys` (a score tile's, a
-    singleton along an axis it does not vary on, `scored`) or its output rows'."""
+    singleton along an axis it does not vary on, `scored`) or its output rows'; a band's at the keys'
+    column of its block's rows from their origin (`origins`, its QUERY side's block after it, one origin a
+    `band.BAND_GROUP` of queries, which a program's query block lies within), zeros past its band."""
     del queries
     if kind is Kind.HEAD:
         return ref[head]
+    if kind is Kind.BAND:
+        assert keys is not None and origins is not None, "a band's tile is read at its keys by its origins"
+        column, inside = band.band_column(origins[0], keys.start, keys.size, ref.shape[-1])
+        return jnp.where(inside, ref[:, pl.ds(column, keys.size)], 0.0)
     tile = ref[axes.placed(_held(kind), {} if keys is None else {"keys": keys})]
     return tile if kind is Kind.OUTPUT else scored(tile, kind)
+
+
+def _tile_params(refs, kinds: tuple[Kind, ...], head, queries: jax.Array, keys: pl.Slice) -> list:
+    """Each score hook parameter's values for a tile (`_tile_param`), a band's read by its origins, the side
+    after it (`band_origins_of`)."""
+    pairs = band_origins_of(kinds)
+    return [_tile_param(ref, kind, head, queries, keys, refs[pairs[index]] if index in pairs else None)
+            for index, (ref, kind) in enumerate(zip(refs, kinds, strict=True))]
 
 
 def _held(kind: Kind) -> tuple[str, ...]:
@@ -265,8 +282,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
                                 spans,
                                 None if ids is None else (ids[0], ids[1][tile]))
-        params = tuple(_tile_param(ref, kind, head, q_pos, tile)
-                       for ref, kind in zip(score_refs, score_kinds, strict=True))
+        params = tuple(_tile_params(score_refs, score_kinds, head, q_pos, tile))
         logits = algebra.modify(form, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
         values = algebra.Operand((block_k, value_ref.shape[-1]), value_ref.dtype, lambda: value_ref[tile, :])
         return algebra.Keys(coords, logits, values, functools.partial(kernel_dot, interpret=interpret))
@@ -527,7 +543,7 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             whole = True
         for kind in self.score_kinds:
             extra += _param_staged(kind, rows, keys, stages, tensor_memory=staged.tensor_memory)
-            whole |= kind in (Kind.KEY, Kind.TILE)
+            whole |= kind in (Kind.KEY, *TILED)
         return Staging(elements * size + extra, whole)
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
@@ -569,7 +585,7 @@ def _param_staged(kind: Kind, rows: int, keys: int, stages: int, *, tensor_memor
     queries' with its rows, `_dkv_staging`)."""
     if kind is Kind.KEY:
         return 4 * (rows * keys if summed else keys)
-    if kind is Kind.TILE:
+    if kind in TILED:
         return 4 * rows * keys * (2 if summed else 1)
     if tensor_memory and kind is Kind.HEAD:
         return 4 * (stages - 1)
@@ -651,7 +667,7 @@ def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundA
     reservation its own (`resources.shared_programs`)."""
     held = target.multiprocessor
     step = held.register_step
-    allocated = -(-(launch.registers(ba, config) or step) // step) * step * _warps(config) * held.warp_threads
+    allocated = axes.whole(launch.registers(ba, config) or step, step) * _warps(config) * held.warp_threads
     most = min(held.registers // allocated, held.resident_blocks)
     return resources.shared_programs(most, launch.staged_bytes(ba, config, target),
                                      generation.shared_budget(target))
@@ -663,7 +679,8 @@ def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.Blo
     width."""
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda i, b, h: (0,))
-    extents = {"batch": None, "heads": None, "queries": block_q, "keys": keys, "width": param.shape[-1]}
+    extents = {"batch": None, "heads": None, "queries": block_q, "keys": keys, "width": param.shape[-1],
+               "band": param.shape[-1]}
     return pl.BlockSpec(axes.named(kind, extents),
                         lambda i, b, h: _block_of(kind, param, b, h, queries=i))
 
@@ -673,7 +690,7 @@ def _block_of(kind: Kind, param: jax.Array, row, head, **walked) -> tuple:
     `walked` axes' blocks and every other's first: a query's, key's or tile's `[B or 1, H or 1, ...]` at the
     row and head it shares where it holds one for every row or head (`shared_place`: T5's `[1, H, Q, K]`
     table read by every row, never broadcast), an output's at its own."""
-    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE, Kind.BAND):
         row, head = shared_place(param.shape, row, head)
     return axes.placed(kind, {"batch": row, "heads": head, **walked}, 0)
 
@@ -749,14 +766,19 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 call.score_params, call.output_params, m0, total0, acc0), call.queries
 
 
-def _key_param(ref, kind: Kind, head, rows):
+def _key_param(ref, kind: Kind, head, rows, keys: pl.Slice | None = None, origins=None):
     """A hook parameter's values for a dK/dV program's tile, its queries `rows` of the whole row
     (`_key_param_spec`'s block): the head's scalar, else the tile's entries, a singleton along an axis it
-    does not vary on (`scored`)."""
+    does not vary on (`scored`); a band's at the program's `keys`' column of the rows' band from their
+    origin (`origins`, its QUERY side's whole row after it), zeros past it."""
     if kind is Kind.OUTPUT:
         raise ValueError("an output hook's parameter has no score tile")
     if kind is Kind.HEAD:
         return ref[head]
+    if kind is Kind.BAND:
+        assert keys is not None and origins is not None, "a band's tile is read at its keys by its origins"
+        column, inside = band.band_column(origins[rows.start], keys.start, keys.size, ref.shape[-1])
+        return jnp.where(inside, ref[rows, pl.ds(column, keys.size)], 0.0)
     return scored(ref[axes.placed(_held(kind), {"queries": rows})], kind)
 
 
@@ -808,8 +830,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
         seen = _seen(k_pos, intervals, (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
-        params = [_tile_param(ref, kind, head, q_pos, keys)
-                  for ref, kind in zip(score_refs, score_kinds, strict=True)]
+        params = _tile_params(score_refs, score_kinds, head, q_pos, keys)
         return keys, k_pos, seen, params
 
     maximum = maximum_ref[...]
@@ -887,15 +908,17 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         refs.pop(0) for _ in range(9))
     score_refs = [refs.pop(0) for _ in score_kinds]
     # A tile parameter's gradient enters as its zeros, aliased to its output (`_dkv_launch`).
-    for _ in (kind for kind in score_kinds if kind == Kind.TILE):
+    for _ in (kind for kind in score_kinds if kind in TILED):
         refs.pop(0)
     dk_ref, dv_ref, *outputs = refs
     grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DKV_GRADS}
     block_k = key_ref.shape[0]
     head = pl.program_id(2)
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
+    keys = pl.ds(pl.program_id(0) * block_k, block_k)
     key, value = key_ref[...], value_ref[...]
     key_ids = [ref[...] for ref in id_refs[1:]]
+    pairs = band_origins_of(score_kinds)
 
     def formed(index):
         # A query tile's operands as the derived dK/dV walk reads them (`attention_program.dkv_sums`).
@@ -904,8 +927,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
         seen = _seen(k_pos, _intervals(start_ref, end_ref, rows),
                      (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
-        params = [_key_param(ref, kind, head, rows)
-                  for ref, kind in zip(score_refs, score_kinds, strict=True)]
+        params = [_key_param(ref, kind, head, rows, keys,
+                             score_refs[pairs[place]] if place in pairs else None)
+                  for place, (ref, kind) in enumerate(zip(score_refs, score_kinds, strict=True))]
         # The logits from the queries taken by the power; dK at the call's whole scale against the call's
         # own queries (`attention_program.dkv_sums`'s `grad_scale`).
         products = kernel_dot(by_power(query, prescale), key.T, interpret)
@@ -925,6 +949,16 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 grad_refs[place][rows, :] = piece
+            elif kind is Kind.BAND:
+                # At the keys' column of the rows' band, where the tile lies within it; past it the band
+                # holds no entry to write.
+                origins = score_refs[pairs[place]]
+                column, inside = band.band_column(origins[rows.start], keys.start, block_k,
+                                                  grad_refs[place].shape[-1])
+
+                @pl.when(inside)
+                def _(place=place, piece=piece, column=column):
+                    grad_refs[place][rows, pl.ds(column, block_k)] = piece
         return tuple(grad + piece if kind == Kind.KEY else grad
                      for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True))
 
@@ -1080,7 +1114,7 @@ def _dq_staging(ba: tokamax.BoundArguments, config: BackwardTiles, target: gener
         elements += keys * width + rows * keys
     extra = staged.barrier_bytes(3) + sum(
         _param_staged(kind, rows, keys, stages, tensor_memory=staged.tensor_memory) for kind in score_kinds)
-    whole = fp16 or staged.tensor_memory or any(kind in (Kind.KEY, Kind.TILE) for kind in score_kinds)
+    whole = fp16 or staged.tensor_memory or any(kind in (Kind.KEY, *TILED) for kind in score_kinds)
     return Staging(elements * size + extra, whole)
 
 
@@ -1119,7 +1153,7 @@ def _dkv_staging(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
     queried = _Staged.of(target, query.dtype, rows).tensor_memory
     extra += sum(_param_staged(kind, rows, keys, stages, tensor_memory=queried, summed=True)
                  for kind in score_kinds)
-    whole |= any(kind in (Kind.KEY, Kind.TILE) for kind in score_kinds)
+    whole |= any(kind in (Kind.KEY, *TILED) for kind in score_kinds)
     return Staging(elements * size + extra, whole)
 
 
@@ -1273,6 +1307,16 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                           query, dout))
             out_shape.append(_per_row(query, param))
             out_specs.append(columns)
+        elif kind is Kind.BAND:
+            # A row's whole band, each key block's program writing its tiles' columns; entries no program
+            # visits keep their zeros: the output aliases a zero input.
+            banded = pl.BlockSpec((None, None, queries, param.shape[-1]), lambda j, b, h: (b, h, 0, 0))
+            aliases[len(arrays)] = len(out_shape)
+            in_specs.append(banded)
+            arrays.append(launches.filled((query.shape[0], query.shape[2], *param.shape[2:]), jnp.float32,
+                                          query, dout))
+            out_shape.append(_per_row(query, param))
+            out_specs.append(banded)
     kernel = functools.partial(_dkv_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, prescale=prescale, grad_scale=grad_scale,
                                how=how,
@@ -1293,7 +1337,7 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
         raise ValueError("an output hook's parameter has no score tile")
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda j, b, h: (0,))
-    extents = {"batch": None, "heads": None, "queries": queries, "keys": block_k}
+    extents = {"batch": None, "heads": None, "queries": queries, "keys": block_k, "band": param.shape[-1]}
     return pl.BlockSpec(axes.named(kind, extents),
                         lambda j, b, h: _block_of(kind, param, b, h, keys=j))
 

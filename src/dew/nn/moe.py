@@ -1379,7 +1379,10 @@ def _exchange_shard[Parameters](
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
     rows = order // top_k
-    send = tokens[rows]
+    # Gathered through its wide form (exactly), so its transpose sums a token's routes wide and rounds once,
+    # as a gathered product's does (`gemm`'s `gather`, row 12396); each route's cotangent comes back over the
+    # exchange in the rows' own dtype, rounded there once.
+    send = tokens.astype(at_least_fp32(tokens.dtype))[rows].astype(tokens.dtype)
     if input_weights is not None:
         send = send * input_weights.ravel()[order][:, None].astype(send.dtype)
     # Every device's slots for every expert, `[sender, expert]` (a dropped slot's sentinel expert sorts last

@@ -58,6 +58,7 @@ import test_contracts_gemm as contracts_gemm
 import test_declared_cells_memory as declared_cells_memory
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
+import test_gemm_converted as gemm_converted
 import test_gemm_gather as gemm_gather
 import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
@@ -218,6 +219,16 @@ def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "xla fallback dense bf16 512x1024x768", seeds=8,
                     truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
+def _converted_cells() -> tuple[Cell, ...]:
+    """The converting FP8 codes product's check 1 on an A100, each format's (row 8548): its first native
+    run qualifies the accuracy its receipt's timing rests on."""
+    on_par = gemm_converted.an_fp8_codes_product_through_the_converting_template_is_on_par
+    return tuple(Cell(f"an fp8 codes product through the converting template is on par ({name}, {form})",
+                      functools.partial(on_par, name, orientation=form), "sm80", mosaic=True,
+                      native={"launch": "converted fp8 gmm", "format": name, "orientation": form})
+                 for name in gemm_converted.FORMATS for form in gemm_converted.ORIENTATIONS)
 
 
 def _scale_edge_cells() -> tuple[Cell, ...]:
@@ -387,6 +398,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
         *_scale_edge_cells(),
+        *_converted_cells(),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",

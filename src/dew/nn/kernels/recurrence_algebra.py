@@ -868,6 +868,102 @@ def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
                                                                                        strict=True)))
 
 
+OWN_REACH = 112
+"""The most whole powers of two an anchored factor's exponent spans (`own_anchored`): within it `between` is
+exact, past 120 it holds its scale and below -124 it may flush."""
+
+OWN_BAND = 100
+"""The magnitudes, as powers of two, every anchored operand's elements keep within or are zero as given
+(`own_out_of_band`): both of an element's two bf16 parts normal, its narrowing losing no more of it than its
+parts' 16 bits."""
+
+OWN_PRODUCT = 116
+"""The largest power of two the backward's anchored products' terms reach before their outer factors
+(`anchored.back`): its largest gradient block's element times its largest anchored operand's, so a sum of
+sixteen terms of three part products, two such sums added, stays within fp32's range (2^121)."""
+
+FIRST, MIDDLE, LAST = 0, SUB // 2, SUB - 1
+"""A sub-chunk's tokens its own pairs' anchors are taken at (`own_anchors`): the forward's middle, both
+factors before its product and within half a sub-chunk; the backward's rows' gradients' first and its keys'
+last, each outer factor (applied after its product) at most one."""
+
+
+def own_anchors(at: Callable[[int], tuple], shape: tuple[int, ...], token: int = MIDDLE, sub: int = SUB
+                ) -> tuple:
+    """Each row's sub-chunk's anchor, the separated prefix at its `token` (`at(token)`, a column's vectors;
+    `MIDDLE`, `FIRST` or `LAST`), laid over its rows, each half `shape` `[C, BK]` (`_laid_references`): the
+    point both factors of a sub-chunk's own pair are taken against (`own_anchored`), fla_kda's safe gate's
+    shifted first token."""
+    index, _ = tile_indices(shape)
+    return _laid_references(lambda s: at(s * sub + token), index, shape[0], sub)
+
+
+def own_anchored(prefix: tuple, anchors: tuple) -> tuple[jax.Array, jax.Array]:
+    """A key block's anchored factors `(exp2(g_i - A), exp2(A - g_i))` `[C, BK]` of its separated prefix
+    `prefix` against its rows' anchors (`own_anchors`): a sub-chunk's own pair `(i, j)` decays by the first's
+    on row `i` times the second's on key `j`, `exp2(g_i - g_j)` (`between`, its exponent either sign), so the
+    own pairs are one product of rows and keys each scaled once (fla_kda's safe-gate diagonal, chunk_intra.py
+    at 413ad2c), where `key_diagonal_bands` forms each pair's decay apart. Against a sub-chunk's first token
+    the first is at most one, against its last the second (a prefix falls along its tokens). The pairs past
+    a token (`j > i`) take factors past one, which every caller masks."""
+    return between(prefix, anchors), between(anchors, prefix)
+
+
+def own_reach_exceeded(prefix: tuple, anchors: tuple) -> jax.Array:
+    """Where a key block's anchored factors pass `OWN_REACH` (`own_anchored`), bool `[C, BK]`: a token's
+    prefix more whole powers of two from its anchor than the reach, or a prefix not finite."""
+    (whole, fraction), (other, its_fraction) = prefix, anchors
+    return (jnp.abs(whole - other) > OWN_REACH) | ~jnp.isfinite(fraction + its_fraction)
+
+
+def own_out_of_band(given: jax.Array, scaled: jax.Array) -> jax.Array:
+    """Where an anchored operand's elements leave its band, bool, each its `scaled` value of its `given` one:
+    not finite, or given nonzero and its magnitude past `2^OWN_BAND` or below `2^-OWN_BAND` (a value its two
+    bf16 parts take less exactly, or a fast-math flush to zero, of a term whose pair may keep it)."""
+    size = jnp.abs(scaled)
+    return ~jnp.isfinite(scaled) | ((given != 0) & ((size < 2.0 ** -OWN_BAND) | (size > 2.0 ** OWN_BAND)))
+
+
+def own_rows_failed(reached: jax.Array | None, operands: Sequence[tuple[jax.Array, jax.Array]] = ()
+                    ) -> jax.Array:
+    """The rows whose anchored products leave their guard, a row's vector `[C]` fp32, one where they do: an
+    element of `reached` (`own_reach_exceeded`, `[C, BK]`; None: none) or of an operand `(given, scaled)` of
+    `operands` out of its band (`own_out_of_band`), reduced along its row (a warp's own); a caller takes
+    their largest across the warps once (a row's vector's share of scratch, where the whole tile's took a
+    tile's)."""
+    flags = ([] if reached is None else [reached]) + [own_out_of_band(*operand) for operand in operands]
+    return jnp.max(jnp.where(functools.reduce(jnp.logical_or, flags), 1.0, 0.0), axis=1)
+
+
+def own_columns(pairs: jax.Array, *, chunk: int, transposed: bool = False, sub: int = SUB) -> jax.Array:
+    """A call's pairs `[R, H * chunk]` (each chunk's square of a head's pairs) as each token's own pairs
+    strictly before it, its sub-chunk's earlier tokens a column each `[R, H * sub]`: row `i`'s column `c` the
+    pair `(i, f + c)`, `f` its sub-chunk's first token, zero at and past `i`; `transposed`, each chunk's
+    square transposed first: row `j`'s column `r` the pair `(f + r, j)`, zero at and before `j`. The own
+    pairs' backward's operands (`anchored.back`), a sub-chunk's block of rows against its keys' rows."""
+    rows, heads = pairs.shape[0], pairs.shape[1] // chunk
+    squares = pairs.reshape(rows // chunk, chunk, heads, chunk)
+    if transposed:
+        squares = squares.transpose(0, 3, 2, 1)
+    token = jnp.arange(chunk)[:, None]
+    column = jnp.arange(sub)[None, :]
+    found = jnp.take_along_axis(squares, (token // sub * sub + column)[None, :, None, :], axis=3)
+    before = (column > token % sub) if transposed else (column < token % sub)
+    return jnp.where(before[None, :, None, :], found, jnp.zeros((), pairs.dtype)).reshape(rows, heads * sub)
+
+
+def own_compact(square: jax.Array, *, sub: int = SUB) -> jax.Array:
+    """A chunk's `[C, C]` product's own sub-chunks' blocks compact `[C, sub]` (`key_diagonal_bands`' form, a
+    row's column its earlier token's place in its sub-chunk's block): each row's pairs at or before it in its
+    own block, zero past it (selected: an anchored pair past its row may be any value, `own_anchored`), the
+    rest of the product unread."""
+    rows, lanes = tile_indices((square.shape[0], sub))
+    found = jnp.zeros(rows.shape, jnp.float32)
+    for s in range(square.shape[1] // sub):
+        found = jnp.where((rows // sub == s) & (lanes <= rows % sub), square[:, s * sub:(s + 1) * sub], found)
+    return found
+
+
 def own_bands(pairs: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
     """the own pairs' transpose, laid an offset a row: a call's pairs `[R, H * chunk]` (each chunk's square
     of a head's pairs) as their own pairs' bands `[H * sub, R]`, each head's row `e` the pairs `(i, i - e)` of

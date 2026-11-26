@@ -162,9 +162,10 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
 
 
 def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: tuple[int, int],
-               target, programs: int, *, dense: bool = True) -> tail_of.Tail | None:
+               target, programs: int, *, stored: float, dense: bool = True) -> tail_of.Tail | None:
     """The one balanced-tail decision for a dense GEMM over `(m, n, k)` `extents` at `tiles` on `target`:
-    shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945)."""
+    shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945); `stored`,
+    the bytes its outputs store an element of its `(m, n)` output, as its launch declares them (padded)."""
     if not merges(tiles, dtype, dense=dense, target=target):
         return None
     family = family_of(tiles, dtype, target)
@@ -179,12 +180,12 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     waves, rem = divmod(grid[0] * grid[1], pairs)
     if tiles.cluster > 1 and (waves > 1 or rem > pairs // 2):
         return None
-    # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
-    # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
-    # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
+    # Its partials' workspace is the launch's beside its operands and output, within its budget
+    # (`within_budget`): the output it writes, as stored, the bound past the reference's 32 MiB that a
+    # GH200's 128 x 256 tiles' 33 MiB tail reaches (M-NG-29: 14.4% and 11.7% slower held to cuBLAS's).
     tail = balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
     held = None if tail is None else math.prod(tail_workspace(tiles, family, programs, tail)) * 4
-    if held is None or not within_workspace(target, held):
+    if held is None or not within_budget(target, held, m * n * stored):
         return None
     return tail
 
@@ -202,12 +203,20 @@ def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
             tile_columns(tiles, family))
 
 
-def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
+def within_budget(target: generation.GpuTarget | None, held: float, written: float) -> bool:
     """Whether a launch's `held` bytes beside its operands and outputs (a split's fp32 partials, a balanced
-    tail's) are within the CUDA libraries' nominal ceiling for one GEMM's on `target`
-    (`GpuTarget.reference_workspace`), where it states one."""
+    tail's) are within its scratch budget on `target`: the CUDA libraries' nominal ceiling for one GEMM's
+    workspace (`GpuTarget.reference_workspace`) or the `written` bytes of its outputs as its launch stores
+    them, whichever is more: a bound on the one buffer, not on a step's peak, whose parity with the
+    reference is measured apart (kernel-templates.md §1, §7). None off a CUDA GPU."""
     bound = None if target is None else target.reference_workspace
-    return bound is None or held <= bound
+    return bound is None or held <= max(bound, written)
+
+
+def within_split_budget(target: generation.GpuTarget | None, held: float) -> bool:
+    """`within_budget` of a split's slices: `splits` fp32 copies of its output, past the output as stored
+    whatever its dtype, so their budget is the reference workspace's alone."""
+    return within_budget(target, held, 0)
 
 
 def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int], *, issued) -> float:
@@ -389,13 +398,13 @@ class SplitWalk:
     """One slice's fp32 partials of the output as its launch declares them (its rows padded, gathered or
     scattered), which a split launch holds `splits` of until their sum."""
     target: "generation.GpuTarget | None" = None
-    """The GPU the walk runs on, whose reference workspace a split's partials stay within (`best_splits`,
-    `within_workspace`); None where none is stated."""
+    """The GPU the walk runs on, whose scratch budget a split's partials stay within (`best_splits`,
+    `within_split_budget`); None where none is stated."""
 
     def holds(self, splits: int) -> bool:
-        """Whether `splits` slices' partials stay within the reference's workspace (`within_workspace`): one
-        slice holds none, its tile summed in registers."""
-        return splits == 1 or within_workspace(self.target, splits * self.partial_bytes)
+        """Whether `splits` slices' partials stay within their budget (`within_split_budget`): one slice
+        holds none, its tile summed in registers."""
+        return splits == 1 or within_split_budget(self.target, splits * self.partial_bytes)
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's

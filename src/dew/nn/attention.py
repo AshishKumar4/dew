@@ -14,14 +14,17 @@ import functools
 import importlib
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple, get_args
+from typing import Literal, NamedTuple, Protocol, get_args, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import tokamax
 from flax.linen.dtypes import promote_dtype
+from jax._src import core as jax_core
 from jax.ad_checkpoint import checkpoint_name
+from jax.extend import core
+from jax.interpreters import mlir
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
@@ -38,8 +41,9 @@ from .attention_kernels import (
     cudnn_packs,
     decodes,
     flash_target,
+    primal_alone,
     reverse_only,
-    template_infers,
+    unlowered,
 )
 from .attention_masks import (
     combined_attention_mask,
@@ -77,8 +81,8 @@ from .documents import (
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
-from .kernels.selection import forced, select, selected
-from .kernels.templates import attention as template
+from .kernels.selection import Unlowerable, forced, select, selected
+from .kernels.templates import attention as template, band
 from .precision import (
     EXACT_FLOAT32,
     asks_default_precision,
@@ -94,7 +98,7 @@ from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template",
-                        "inference"]
+                        "inference", "flash_inference"]
 """Names which kernel an attention call runs.
 
 A run names it once for every attention layer it traces (`generation.chosen(attention=...)`, a run's
@@ -186,7 +190,7 @@ class SeparableBias(NamedTuple):
 @dataclasses.dataclass(frozen=True)
 class BandBias:
     """An additive bias held within a band of keys about each query, `values` `[B or 1, H or 1, Q,
-    template.band_width(extent)]`: query `q`'s column `c` the bias of key `template.band_origins(offset, Q,
+    band.band_width(extent)]`: query `q`'s column `c` the bias of key `band.band_origins(offset, Q,
     extent)[q] + c`, every key outside its band biased by nothing. Every key within `extent - 1` before a
     query's place through its place (`offset`, `[]` or `[B]` int32: a query's place less its index, the key
     it is at; 0 from the first key) lies in its band: an input-conditioned relative bias (Inkling 2's,
@@ -201,19 +205,55 @@ class BandBias:
         # A tree's rebuild (`jax.tree.map`'s, a transform's) passes leaves of any kind: an array's checked.
         if not hasattr(self.values, "shape"):
             return
-        if self.extent < 1 or self.values.shape[-1:] != (template.band_width(self.extent),):
-            raise ValueError(f"a band of extent {self.extent} holds {template.band_width(self.extent)} "
+        if self.extent < 1 or self.values.shape[-1:] != (band.band_width(self.extent),):
+            raise ValueError(f"a band of extent {self.extent} holds {band.band_width(self.extent)} "
                              f"columns a query, got values {jnp.shape(self.values)}")
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Its values' shape, `[B or 1, H or 1, Q, band_width(extent)]`."""
+        return self.values.shape
+
+    @property
+    def dtype(self):
+        """Its values' dtype."""
+        return self.values.dtype
+
     def dense(self, keys: int) -> jax.Array:
-        """The bias written out over `keys`, `[B or 1, H or 1, Q, K]` (`template.band_dense`)."""
-        return template.band_dense(self.values, self.offset, self.extent, keys)
+        """The bias written out over `keys`, `[B or 1, H or 1, Q, K]` (`band.band_dense`)."""
+        return band.band_dense(self.values, self.offset, self.extent, keys)
+
+
+def _least_bias(bias) -> jax.Array:
+    """The least logit `bias` adds, fp32: a band's least value, or zero past its band."""
+    if isinstance(bias, BandBias):
+        return jnp.minimum(jnp.min(bias.values.astype(jnp.float32)), 0.0)
+    return jnp.min(jnp.asarray(dense_bias(bias), jnp.float32))
+
+
+@runtime_checkable
+class RouteBias(Protocol):
+    """A bias that states both forms a route may take: its band (`band`, a `BandBias` the template reads a
+    tile at a time) and its writing out over the call's keys (`dense`), the route taking the form it reads
+    (`scaled_dot_product_attention`: the band on the template outside forward mode, written out everywhere
+    else). The resolution reads its band's `shape` and `dtype` alone, as a `BandBias`'s, so a route that
+    writes the bias out traces no band (row 13503)."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> jnp.dtype: ...
+
+    def band(self) -> BandBias: ...
+
+    def dense(self, keys: int) -> jax.Array: ...
 
 
 def dense_bias(bias, keys: int | None = None):
     """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
-    a `BandBias` over `keys` (`BandBias.dense`), any other as it is."""
-    if isinstance(bias, BandBias):
+    a `BandBias` or a `RouteBias` over `keys` (their `dense`), any other as it is."""
+    if isinstance(bias, BandBias | RouteBias):
         if keys is None:
             raise ValueError("a band bias is written out over the call's keys, which its caller states")
         return bias.dense(keys)
@@ -446,7 +486,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
               query_slots=None, global_rows=None, global_heads=None, seed=None, bias=None, rows_bias=None,
-              columns_bias=None):
+              columns_bias=None, band_values=None, band_origins=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
                           block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
@@ -462,13 +502,19 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         if rows_bias is not None and columns_bias is not None:
             params = (Side(rows_bias, template.Kind.QUERY),
                       Side(columns_bias, template.Kind.KEY))
+        elif band_values is not None and band_origins is not None:
+            # A band read a tile at a time at its key tile's column (`band.band_tile`), its origins the
+            # side after it (`template.Kind.BAND`).
+            params = (Side(band_values, template.Kind.BAND),
+                      Side(band_origins[:, None, :], template.Kind.QUERY))
         elif bias is None:
             params = ()
         elif bias.shape[2] == 1:
             params = (Side(bias[:, :, 0], template.Kind.KEY),)
         else:
             params = (Side(bias, template.Kind.TILE),)
-        score_mod = capped if not params else template.Biased(capped)
+        score_mod = (capped if not params else template.Banded(template.Biased(capped))
+                     if band_values is not None and band_origins is not None else template.Biased(capped))
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
@@ -489,8 +535,14 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     # split (`on_attention_shards`'s coordinates), so it does not depend on the mesh or on the rules of the
     # other axes.
     rows = ("activation_batch",)
+    if isinstance(bias, BandBias) and bias.values.shape[2] == 1 and query.shape[1] > 1:
+        # One query's band broadcast over the call's queries: its key vector written out, O(K), as every
+        # route reads it (`BandBias.dense`), each query its one row's.
+        bias = bias.dense(key.shape[1])
     separable = bias if isinstance(bias, SeparableBias) else None
-    dense = None if isinstance(bias, SeparableBias) else bias
+    banded = bias if isinstance(bias, BandBias) else None
+    dense = None if isinstance(bias, SeparableBias | BandBias) else bias
+    band_origins = None if banded is None else band.band_origins(banded.offset, query.shape[1], banded.extent)
     return on_attention_shards(local, query, key, value, coordinates=dropout_seed is not None,
                       sinks=(sinks, ("activation_heads",) if sinks is None or sinks.ndim == 1
                              else ("activation_batch", "activation_length", "activation_heads")),
@@ -506,7 +558,11 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       rows_bias=(None if separable is None else separable.rows,
                                  _bias_axes(None if separable is None else separable.rows)[:3]),
                       columns_bias=(None if separable is None else separable.columns,
-                                    _bias_axes(None if separable is None else separable.columns)[:3]))
+                                    _bias_axes(None if separable is None else separable.columns)[:3]),
+                      band_values=(None if banded is None else banded.values,
+                                   _bias_axes(None if banded is None else banded.values)),
+                      band_origins=(band_origins, ("activation_batch" if band_origins is not None
+                                                   and band_origins.shape[0] > 1 else None, None)))
 
 
 def _bias_axes(bias: jax.Array | None) -> tuple[str | None, ...]:
@@ -947,7 +1003,6 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
-    bias = bias.dense(key.shape[-3]) if isinstance(bias, BandBias) else bias  # every route's, written out
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -956,7 +1011,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
-            sliding_window=sliding_window, mask=mask, bias=dense_bias(bias), sinks=sinks,
+            sliding_window=sliding_window, mask=mask, bias=dense_bias(bias, key.shape[-3]), sinks=sinks,
             key_value_seq_lengths=key_value_seq_lengths,
             dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words, visibility=visibility)
     else:
@@ -1044,7 +1099,7 @@ def _fill_weighs(fill: float, query, key, bias, softcap) -> jax.Array:
     reach = norm(query) * norm(key) * query.shape[-1] ** -0.5
     if softcap is not None:
         reach = jnp.minimum(reach, softcap)
-    least = -reach if bias is None else jnp.min(jnp.asarray(dense_bias(bias), jnp.float32)) - reach
+    least = -reach if bias is None else _least_bias(bias) - reach
     return fill > least - 105.0 - jnp.abs(least) * 2.0 ** -6
 
 
@@ -1251,9 +1306,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
     resolved = resolve_implementation(implementation, query, key, **facts).kernel
     if resolved != 'template' or FORWARD_MODE.get():
-        # The template reads a separable bias as its two terms (`template_attention`); every other route,
-        # 'inference''s two among them, adds it written out, as forward mode's reference and kernel do.
-        bias = dense_bias(bias)
+        # The template reads a separable bias as its two terms and a band a tile at a time
+        # (`template_attention`); every other route, 'inference''s two among them, adds it written out, as
+        # forward mode's reference and kernel do.
+        bias = dense_bias(bias, key.shape[-3])
+    elif isinstance(bias, RouteBias):
+        # The template's form, formed now it reads it.
+        bias = bias.band()
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
@@ -1274,18 +1333,26 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     def ran(kernel: str = resolved, fill: float | None = None) -> jax.Array:
         """The call on `kernel`, the one it resolved to by default, every key it hides at the logit `fill`
         (the reference's and the template's) where given, else a row that sees no key whatever it gives."""
-        if kernel == 'inference':
-            # A call no derivative is taken of on the template where it measured faster, a differentiated
-            # one's forward and derivatives xla's (`attention_kernels.template_infers`).
+        split = primal_alone(kernel, query.dtype, query.shape[-1], causal)
+        if split is not None:
+            # A call no derivative is taken of on the split's first kernel, a differentiated one's forward
+            # and derivatives its second's (`attention_kernels.primal_alone`).
             def on(implementation):
                 def run(query, key, value, bias, sinks, *extra):
+                    # An arm this host lowers for no GPU of the target (`attention_kernels.unlowered`)
+                    # stages its output's shapes, which a program keeping it refuses, named, as it lowers
+                    # (`unlowered_launch`): a rematerialized block stages the primal before its derivative
+                    # replaces it (row 13318), the differentiated program compiled ahead whatever it.
+                    if (why := unlowered(implementation)) is not None:
+                        like = jax.eval_shape(on(differentiated), query, key, value, bias, sinks, *extra)
+                        return unlowered_launch(generation.Choice.ATTENTION, implementation, why, like)
                     return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
                                 **operands_of(extra))
                 return run
 
-            primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
-            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks, *operands,
-                                          primal_alone=True, parameters=(3, 4))
+            primal, differentiated = split
+            return forward_differentiable(on(primal), on(differentiated), query, key, value, bias, sinks,
+                                          *operands, primal_alone=True, parameters=(3, 4))
 
         def fused(query, key, value, bias, sinks, *extra):
             return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill,
@@ -1310,6 +1377,35 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     filled = functools.partial(ran, 'reference' if templated else 'template', mask_fill)
     return _filled(ran, filled, mask_fill, live, query, key, value, bias=bias, sinks=sinks, softcap=softcap,
                    precision=precision, dropping=dropout_seed is not None)
+
+
+# A kernel's launch this host lowers for no GPU of the target, staged as its output's shapes alone and
+# refused, named, where a program keeps it as it lowers (`selection.Unlowerable`): a split kernel's arm a
+# rematerialized block stages before it is differentiated, whose differentiated program never lowers it.
+_unlowered_p = core.Primitive("dew_unlowered_kernel")
+_unlowered_p.multiple_results = True
+_unlowered_p.def_abstract_eval(lambda *_, avals, choice, kernel, why: avals)
+
+
+def _refused(*_, avals, choice, kernel, why):
+    raise Unlowerable(choice, kernel, why)
+
+
+_unlowered_p.def_impl(_refused)
+mlir.register_lowering(_unlowered_p, lambda ctx, *_, avals, choice, kernel, why: _refused(
+    choice=choice, kernel=kernel, why=why, avals=avals))
+
+
+def unlowered_launch[Tree](choice: str, kernel: str, why: str, like: Tree) -> Tree:
+    """A launch of `kernel` this host lowers for no GPU of the target (`why`), its output `like`'s tree of
+    shapes (`jax.eval_shape` of a kernel computing the same function): staged, a program that keeps it
+    refuses it, named, as it lowers, and one whose derivative replaces it (a split kernel's primal under
+    `nn.remat`) never lowers it."""
+    leaves, tree = jax.tree.flatten(like)
+    avals = tuple(jax_core.ShapedArray(leaf.shape, leaf.dtype, sharding=jax_core.get_cur_mesh_sharding())
+                  for leaf in leaves)
+    outputs = _unlowered_p.bind(avals=avals, choice=str(choice), kernel=kernel, why=why)
+    return jax.tree.unflatten(tree, outputs)
 
 
 def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False,
@@ -1380,8 +1476,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     (`_filled`).
     """
     if implementation != 'template':
-        # A separable bias reaches the template as its two terms alone (`template_attention`).
-        bias = dense_bias(bias)
+        # A separable bias reaches the template as its two terms alone, a band as its band
+        # (`template_attention`).
+        bias = dense_bias(bias, key.shape[-3])
     spanned = (block_groups, image_groups, key_valid, key_runs, places, query_slots)
     tpu_descriptor = None
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
@@ -1526,7 +1623,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    laid = None if bias is None else bias.shape if isinstance(bias, SeparableBias) else jnp.shape(bias)
+    laid = (None if bias is None else bias.shape if isinstance(bias, SeparableBias | RouteBias)
+            else jnp.shape(bias))
     # Groups a call reads under causality, or past the window of its runs (`scaled_dot_product_attention`).
     grouped = ((bool(causal) or key_runs is not None)
                and (block_groups is not None or image_groups is not None))
@@ -1547,8 +1645,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    and laid[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
-                    and not isinstance(bias, SeparableBias)),
-        separable_bias=isinstance(bias, SeparableBias),
+                    and not isinstance(bias, SeparableBias | BandBias | RouteBias)),
+        separable_bias=isinstance(bias, SeparableBias | BandBias | RouteBias),
         sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),

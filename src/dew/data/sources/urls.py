@@ -91,6 +91,39 @@ async def _get(session: aiohttp.ClientSession, url: str, limit: int,
     return status, b"", None
 
 
+def bounded_read(url: str, limit: int, timeout: float, *, web_only: bool = False) -> tuple[int, bytes]:
+    """The status and at most `limit` bytes of `url`, read within `timeout` seconds from connecting to its
+    last byte: an HTTP(S) url through fsspec's aiohttp session as urllib would read it (its redirects and
+    the environment's proxies), however slowly its server sends; any other url (a file's, an FTP one a
+    redirect ends at) by urllib, which gives no status but 200, its deadline judged once its read ends.
+    `web_only` reads HTTP(S) alone, within its deadline throughout: another url is refused, and a redirect
+    to one returns its redirect status unread. `Fetch` reads each record's url by it."""
+    deadline = time.monotonic() + timeout
+    web = urlsplit(url).scheme in ("http", "https")
+    if web_only and not web:
+        raise ValueError(f"{url} is not an HTTP(S) url")
+    if web:
+        # fsspec's own IO loop, where the loop's filesystem keeps its session for every fetch on it
+        # (`_filesystem`); the fetch's deadline is the only one (aiohttp's defaults bound each hop
+        # otherwise).
+        loop = get_loop()
+        http = _filesystem(loop)
+        status, payload, ftp = sync(loop, _get, sync(loop, http.set_session), url, limit, timeout)
+        if ftp is None or web_only:
+            return status, payload
+        url = ftp
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError(f"no time left to read {url}")
+    # urllib's timeout bounds each wait, not a body that keeps arriving, so the attempt's deadline
+    # judges the read once it ends.
+    with urllib.request.urlopen(url, timeout=left) as response:
+        payload = response.read(limit)
+    if time.monotonic() > deadline:
+        raise TimeoutError(f"{url} outlasted its {timeout:.1f} s")
+    return 200, payload
+
+
 @dataclass(frozen=True)
 class Fetch:
     """Fetch the bytes at a record's url into `output`, in one attempt: a url
@@ -145,7 +178,7 @@ class Fetch:
             return Rejected("invalid_url")
         try:
             with contextlib.nullcontext() if self._running is None else self._running:
-                status, payload = self._read(url)
+                status, payload = bounded_read(url, self.max_bytes + 1, self.timeout)
         except ValueError:
             return Rejected("invalid_url")
         except (OSError, aiohttp.ClientError) as error:
@@ -160,27 +193,3 @@ class Fetch:
             return Rejected("too_large")
         return {**record, self.output: payload, "content_sha256": hashlib.sha256(payload).hexdigest()}
 
-    def _read(self, url: str) -> tuple[int, bytes]:
-        """The status and at most `max_bytes` + 1 bytes of `url`; a url urllib
-        reads (a file's) has no status but 200."""
-        limit, deadline = self.max_bytes + 1, time.monotonic() + self.timeout
-        if urlsplit(url).scheme in ("http", "https"):
-            # fsspec's own IO loop, where the loop's filesystem keeps its session for every fetch on it
-            # (`_filesystem`); the fetch's deadline is the only one (aiohttp's defaults bound each hop
-            # otherwise).
-            loop = get_loop()
-            http = _filesystem(loop)
-            status, payload, ftp = sync(loop, _get, sync(loop, http.set_session), url, limit, self.timeout)
-            if ftp is None:
-                return status, payload
-            url = ftp
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError(f"no time left to read {url}")
-        # urllib's timeout bounds each wait, not a body that keeps arriving, so the attempt's deadline
-        # judges the read once it ends.
-        with urllib.request.urlopen(url, timeout=left) as response:
-            payload = response.read(limit)
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"{url} outlasted its {self.timeout:.1f} s")
-        return 200, payload

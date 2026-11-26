@@ -2,6 +2,7 @@
 once, into the jaxpr certification replays and compiles beside it, and the program it lowers is the one it
 lowers with no certification pending (row 8720)."""
 
+import numpy as np
 from process_support import fresh, keeping_picks
 
 CAPTURED_STEP = """
@@ -16,9 +17,17 @@ from jax.sharding import Mesh, PartitionSpec
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.lowered import kernel_calls
 from dew.nn.kernels.templates import report
 
-traced = []
+
+def program_of(lowered):
+    # The program as its typed lowering states it: its signature, and each kernel call's kind, name, config
+    # and operand and result types.
+    calls = [[call.kind, call.name, call.config, str(call.signature)] for call in kernel_calls(lowered)]
+    typed = [str(jax.tree.map(lambda aval: (aval.shape, str(aval.dtype)), avals))
+             for avals in (lowered.in_avals, lowered.out_info)]
+    return [typed, calls]
 
 
 @jax.custom_vjp
@@ -36,7 +45,6 @@ class Scaled(tuning.KernelOp):
     config_cls = int
 
     def _fwd(self, x, w, hook, *, config, return_residuals=False):
-        traced.append(config)
         return hook(scaled(x, w)), None
 
     def _get_heuristics_config(self, ba):
@@ -73,22 +81,37 @@ with report.certifying(compile_only_gpus("sm90")[0]):
     if mesh is not None:
         jax.set_mesh(mesh)
     if mode == "certified":
-        text = step.trace(*shapes).lower().as_text()
+        lowered = step.trace(*shapes).lower()
     else:
         # Certified aside as a compile's lowering is (`OuterProgram._lowered_aside`), settled at its end.
         with report.certifying_aside():
-            text = step.trace(*shapes).lower().as_text()
+            lowered = step.trace(*shapes).lower()
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
-print(json.dumps({"text": text, "traced": len(traced), "certified": found,
+    # The lowered program run here on nonzero operands, its hook's held value 2 either way (`t` sums to 2);
+    # and again on a `t` summing to 3, which the closed hook alone reads.
+    operands = (np.arange(1, 129, dtype=np.float32).reshape(8, 16) / 64,
+                np.linspace(-1, 1, 128, dtype=np.float32).reshape(8, 16), np.float32([1.5, 0.5]))
+    other = (*operands[:2], np.float32([2.0, 1.0]))
+    executable = lowered.compile()
+    ran, reran = executable(*operands), executable(*other)
+
+
+def listed(values):
+    return [np.asarray(value).tolist() for value in jax.tree.leaves(values)]
+
+
+print(json.dumps({"program": program_of(lowered), "certified": found, "ran": listed(ran),
+                  "plain": listed(step(*operands)), "reran": listed(reran), "replain": listed(step(*other)),
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """A launch of a custom derivative in a step's gradient traced and lowered with each launch certified on a
 compile-only H100: aside, in a block a compile's lowering certifies in (`report.certifying_aside`;
 `captured`, and `closed`, its hook closing over an operand of the step's trace, not a constant), or in turn
 (`certified`); whole, or a shard's inside a
-shard_map of four devices (`sharded`). The program's text, how many times the launch was traced, and what
-was certified."""
+shard_map of four devices (`sharded`). The program as its typed lowering states it (its signature and its
+kernel calls), its loss and gradients run on nonzero operands beside the step's own uncertified call's, and
+what was certified."""
 
 
 def stepped(tmp_path, placed: str, mode: str) -> dict:
@@ -98,24 +121,35 @@ def stepped(tmp_path, placed: str, mode: str) -> dict:
                  flags=f"{keeping_picks()} --xla_force_host_platform_device_count=4")
 
 
-def test_a_launch_certified_aside_is_traced_once_and_its_program_is_the_one_it_lowers_unpending(tmp_path):
-    """A step's launch certified aside (`report.capture`) is traced once, its program's trace's call
-    replayed for certification, where certifying it in turn traces it again alone (`_lowered_launch`); its
-    program, its gradient taken through the launch's custom derivative, lowers byte for byte as with no
-    certification pending, whole and as a shard inside a shard_map; and it is certified either way. A hook
-    closing over an operand of the step's own trace, which no launch traced alone could read, is certified
-    aside, its operand replayed as an argument."""
+def test_a_launch_certified_aside_lowers_the_program_it_lowers_unpending_and_is_certified(tmp_path):
+    """A step's launch certified aside (`report.capture`), its program's trace's call replayed for
+    certification: its program, its gradient taken through the launch's custom derivative, is the one it
+    lowers with no certification pending (its signature and kernel calls, typed), whole and as a shard
+    inside a shard_map, and its loss and both gradients run as the step's own uncertified call's, the
+    multiplier its derivative takes and the hook's held value in them; and it is certified either way. A
+    hook closing over an operand of the step's own trace, which no launch traced alone could read, is
+    certified aside, its operand replayed as an argument, and runs as with a constant of its value, another
+    value of it read as it is given."""
     for placed in ("whole", "sharded"):
         captured, certified, closed = (stepped(tmp_path, placed, mode)
                                        for mode in ("captured", "certified", "closed"))
-        assert captured["text"] == certified["text"], placed
-        assert (captured["traced"], certified["traced"], closed["traced"]) == (1, 2, 1), placed
+        assert captured["program"] == certified["program"], placed
+        loss, *gradients = captured["ran"]
+        assert loss != 0 and all(np.any(np.asarray(gradient)) for gradient in gradients), placed
+        for found in (captured, certified, closed):
+            for ran, plain in (("ran", "plain"), ("reran", "replain")):
+                np.testing.assert_allclose(np.concatenate([np.ravel(value) for value in found[ran]]),
+                                           np.concatenate([np.ravel(value) for value in found[plain]]),
+                                           rtol=0, atol=0, err_msg=placed)
+        for found in (certified, closed):
+            assert found["ran"] == captured["ran"], placed
+        # The closed hook reads the operand it was replayed with: another `t`, another result.
+        assert closed["reran"] != closed["ran"] and captured["reran"] == captured["ran"], placed
         for found in (captured, certified, closed):
             assert found["certified"] == [["Scaled", False]] and not found["uncertified"], (placed, found)
 
 
 TEMPLATE_GRADIENT = """
-import hashlib
 import json
 import sys
 
@@ -125,6 +159,7 @@ from kernel_compile import lowered_for
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.lowered import kernel_calls
 from dew.nn.kernels.templates import report
 
 # A shape whose derived configs all hold on an H100: no refusal steps a launch in turn that aside takes as
@@ -142,28 +177,33 @@ step = jax.value_and_grad(loss, argnums=(0, 1, 2))
 with report.certifying(compile_only_gpus("sm90")[0]):
     if sys.argv[1] == "captured":
         with report.certifying_aside():
-            text = lowered_for(step, shapes, "sm90").as_text()
+            lowered = lowered_for(step, shapes, "sm90")
         assert not report.refused_launches()
     else:
-        text = lowered_for(step, shapes, "sm90").as_text()
-    found = sorted([each.op, each.pulled, sorted((name, held[0]) for name, held in each.kernels.items())]
+        lowered = lowered_for(step, shapes, "sm90")
+    # Each kernel by its binary's typed facts: its registers, its frame, its threads.
+    found = sorted([each.op, each.pulled, sorted((name, binary.registers, binary.frame, binary.threads)
+                                                 for name, (_, binary) in each.kernels.items())]
                    for each in report.certifications())
-print(json.dumps({"text": hashlib.sha256(text.encode()).hexdigest(), "certified": found,
+# The program as its typed lowering states it: each kernel call's kind, name, config and types.
+calls = [[call.kind, call.name, call.config, str(call.signature)] for call in kernel_calls(lowered)]
+print(json.dumps({"program": calls, "certified": found,
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """An H100's attention template's gradient (its launches' custom derivatives) at a shape whose configs all
-hold, each launch certified on a compile-only H100 aside (`captured`) or in turn: its program's text's digest
-and each certification's op and kernels' modules."""
+hold, each launch certified on a compile-only H100 aside (`captured`) or in turn: its program's kernel calls
+as its typed lowering states them, and each certification's op and its kernels' binaries' facts."""
 
 
 def test_a_templates_gradient_certified_aside_lowers_as_certified_in_turn_and_certifies_its_kernels(tmp_path):
     """An attention template's forward and backward launches certified aside from the step's own calls
-    (`report.capture`) lower the step byte for byte as certifying each in turn does, and certify the same
-    kernels, by the same modules: the replay is the launch its program lowers. At a shape no config is
+    (`report.capture`) lower the step's program as certifying each in turn does, and certify the same
+    kernels, compiled alike (each binary's registers, frame and threads): the replay is the launch its
+    program lowers. At a shape no config is
     refused at: a refused one is stepped from in turn at the trace, aside at its program's compile."""
     captured, certified = (fresh(TEMPLATE_GRADIENT, mode, platforms="cpu", cache_dir=tmp_path / mode,
                                  flags=keeping_picks()) for mode in ("captured", "certified"))
-    assert captured["text"] == certified["text"]
+    assert captured["program"] == certified["program"]
     assert captured["certified"] and captured["certified"] == certified["certified"], (captured, certified)
     assert not captured["uncertified"], captured["uncertified"]
 

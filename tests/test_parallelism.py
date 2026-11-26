@@ -155,7 +155,7 @@ def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
                 Loader(lambda partition: batches(), None, batch=BATCH, records=None), steps=1)
 
     checkpoints = Checkpoints(str(tmp_path))
-    assert checkpoints.boxed() == {("params", "readout", "kernel"): (None, "vocab"),
+    assert checkpoints._boxed() == {("params", "readout", "kernel"): (None, "vocab"),
                                    ("params", "foreign", "kernel"): ("foreign_a", "foreign_b")}
     params = checkpoints.variables(mesh=MeshSpec(fsdp=2), layout=layout)["params"]
     assert params["readout"]["kernel"].sharding.spec == P(None, "fsdp")

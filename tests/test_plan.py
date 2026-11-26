@@ -1625,6 +1625,21 @@ def a_step_under_its_room_without_recomputation_plans_a_step_that_fits_there(mon
     assert int(state.step) == 1
 
 
+def test_a_fresh_states_start_is_compiled_without_an_algebra_pass():
+    """A fresh state's start, the program `place` builds it by, compiles with the algebra pass off
+    (`dew.objectives.drawn.drawing`): its forward makes no variable, so a pass over it rewrites nothing the
+    run reads, where its bodies, under the start's own trace context, missed every structural lookup the step
+    had made (row 11803: 562 of an every-template step's 803 on an sm100). The step's own compile passes."""
+    from dew.nn.kernels.templates import report
+
+    trainer = lm(split=1)
+    with report.recording() as started:
+        state = trainer.place()[0]
+    with report.recording() as stepped:
+        trainer.compile(state, BATCH)
+    assert not started.passes and stepped.passes, (started.passes, stepped.passes)
+
+
 LONG = 64
 """Rows of 64 tokens: a four-layer decoder's activations, which recomputation frees, outweigh its state."""
 LONG_BATCH = {"text": jnp.asarray((np.arange(ROWS * (LONG + 1)).reshape(ROWS, LONG + 1) * 7) % 64, jnp.int32)}

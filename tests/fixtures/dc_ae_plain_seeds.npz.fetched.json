@@ -1,0 +1,10 @@
+{
+ "bytes": 2443717,
+ "license": "Apache-2.0",
+ "origin": "github",
+ "path": "30227748a4e834dff897f27b25140c4224fc45fa8ab3010af417aea82794dacb.npz",
+ "reference": "AutoencoderDC (diffusers 0.39.0)",
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "30227748a4e834dff897f27b25140c4224fc45fa8ab3010af417aea82794dacb"
+}

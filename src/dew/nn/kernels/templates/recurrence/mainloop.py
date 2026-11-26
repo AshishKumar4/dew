@@ -61,7 +61,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
-from dew.nn.kernels.templates import bundles, cost, mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import axes, bundles, cost, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
@@ -133,7 +133,7 @@ def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, ke
     if tiles is not None:
         unit = math.lcm(unit, tiles.block_v * tiles.walkers, tiles.block_o or tiles.block_v)
     block = block_of(family)
-    return -(-key_width // block) * block, -(-value_width // unit) * unit
+    return axes.whole(key_width, block), axes.whole(value_width, unit)
 
 
 def block_of(family: mosaic.Family) -> int:
@@ -804,6 +804,10 @@ class Launch:
     """What its plan read (`resources.plan`'s launch: its streams scoped at each depth, its registers and
     roles) where its ring's depth is its tiles' (`Tiles.stages`, `launch_kernel`'s `ringed`), which
     `deepened` plans at another depth; None for every other launch, whose plan no depth of the tiles moves."""
+    reducing: int = 0
+    """The warpgroups whose arithmetic reduces across their warps implicitly, each its share of Mosaic GPU's
+    scratch (`launch_kernel`'s `reducing`): an own pairs' launch taking anchored products
+    (`anchored.step`, `anchored.back`), whose guard reduces a tile."""
 
     def deepened(self, stages: int, target: generation.GpuTarget) -> "Launch":
         """This launch as a trace at tiles `stages` deep on `target` records it: its plan at that depth
@@ -868,14 +872,15 @@ which their names read."""
 def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
                       consumers: int = 1, swizzles: dict[str, int] | None = None, reduces: bool = True,
                       after: tuple = (), issues: bool = True, together: tuple[int, ...] = (),
-                      sums: tuple[int, ...] = ()
+                      sums: tuple[int, ...] = (), reducing: int = 0
                       ) -> tuple[Callable[[int], dict], Callable[[int], resources.Scope], tuple, dict]:
     """A launch's shared memory at a ring depth, as `launch_kernel` lays it: its walked streams' and its
     streams loaded once' allocations (each its own; a pipelined family's stages are its allocation's), which
     a program opens with their views by name ('walked', 'once'), the scope they make with its staging and
     landing tiles a role (`_roles_staged`, `_landed`), whose bytes `resources.shared_bytes` counts, and those
     staging tiles (its landing's last) and landing tiles: the one account a launch's legality and its plan
-    both read; a launch issuing no products (not `issues`) scopes none of theirs."""
+    both read; a launch issuing no products (not `issues`) scopes none of theirs, and one whose arithmetic
+    reduces across warps implicitly its `reducing` warpgroups' share of the scratch (`resources.Scope`)."""
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
@@ -891,8 +896,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return allocation_scope(family, allocations(depth), (*staged, *products), reduces=reduces,
-                                after=after, addresses=addresses)
+        return dataclasses.replace(allocation_scope(family, allocations(depth), (*staged, *products),
+                                                    reduces=reduces, after=after, addresses=addresses),
+                                   reducing_warpgroups=reducing)
 
     return allocations, scope, staged, landed
 
@@ -1045,7 +1051,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
                   name: str | None = None, issues: bool = True, ringed: bool = False,
-                  together: tuple[int, ...] = (), sums: tuple[int, ...] = ()):
+                  together: tuple[int, ...] = (), sums: tuple[int, ...] = (), reducing: bool = False):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -1075,7 +1081,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     to write while its products read them. `together` are the widths of the groups a step sums together
     (`Issuer.summed_together`), each its own accumulator in the products' scratch; `sums` the widths of the
     sums its walk holds across its steps (`mosaic.Walk.sums`), which a family keeping them in memory of its
-    own scopes there (`Issuer.keeps_sums`)."""
+    own scopes there (`Issuer.keeps_sums`). A `reducing` program's roles reduce across their warps
+    implicitly (`own_pairs._anchored_step`'s guard), each its share of scratch (`reducing_warpgroups`)."""
     family = call.family
     name = named(name or f"recurrence{program.__qualname__.split('.')[0]}", call)
     producer = call.producers.of(name)
@@ -1084,7 +1091,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
                                                              reduces=reduces, after=after, issues=issues,
-                                                             together=together, sums=sums)
+                                                             together=together, sums=sums,
+                                                             reducing=consumers * reducing)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(consumers)
 
@@ -1106,7 +1114,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
         record = Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)), registers,
                         stages, stepped, found.programs if found else 0, consumers, family, producer,
-                        planning if ringed else None)
+                        planning if ringed else None, consumers * reducing)
         return functools.partial(_recorded, collected, record, out_type)
 
     def entry(*arrays):
@@ -1155,7 +1163,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                                          stored(*arrays, *jax.tree.leaves(out_type))),
                              model_flops=int(model * tiles),
                              resident=found.programs if found else 1, registers=registers,
-                             producer=producer)(*arrays)
+                             producer=producer, reducing_warpgroups=consumers * reducing)(*arrays)
 
     return launched
 
@@ -1405,7 +1413,8 @@ def fitting_block(call: Call, held: Callable[[int], Held], staged: Callable[[int
 
 
 def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
-              streamed: Callable[[int], dict] | None = None, *, contracted: bool = False) -> int:
+              streamed: Callable[[int], dict] | None = None, *, contracted: bool = False,
+              reducing: int = 0, widest: bool = False) -> int:
     """A launch's key block under a decay a key dimension, whose prefix, decays and gated keys it
     holds a block at a time in fp32: from the widest of the family's depths for 16-bit operands
     (`Family.depths`) down to the narrowest columns a staged operand takes (`key_blocks`: its depth's where
@@ -1415,14 +1424,19 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     most programs of (`_planned_launch`, at its register model and its shared memory), the widest of those.
     Its walks wait on their products' latency: the intra launch's 248 registers a thread and 143 KB held an
     H100 at one program a multiprocessor, its schedulers without a warp to issue 64% of its cycles
-    (kda-ncu2-h100-bc481d7de)."""
+    (kda-ncu2-h100-bc481d7de). A launch whose roles reduce across their warps implicitly counts their
+    `reducing` share of scratch (`resources.Scope.reducing_warpgroups`); one whose work a step is fixed
+    (`widest`: a guard, its factors and its staging a key block) takes the widest block holding a program."""
     if streamed is None:
         return fitting_block(call, held, staged, call.family.depths(jnp.bfloat16)[0],
                              _key_unit(call, contracted=contracted))
-    resident = functools.partial(_resident, call, held, staged, streamed)
+    resident = functools.partial(_resident, call, held, staged, streamed, reducing=reducing)
     # Where no block holds a program, the narrowest, as `fitting_block` falls back: the widest, which the
     # register-unchecked gate compiled, spilled 2784 bytes where the narrowest's need was the question
     # (row 5298, jsf-sm100-redgreen).
+    if widest:
+        return max(key_blocks(call, contracted=contracted),
+                   key=lambda block: (resident(block) > 0, block if resident(block) else -block))
     return max(key_blocks(call, contracted=contracted),
                key=lambda block: (resident(block), block if resident(block) else -block))
 
@@ -1460,18 +1474,28 @@ def launch_fits(call: Call, held: Held, staged: tuple, blocks: dict) -> bool:
             and registers <= call.family.registers(1))
 
 
+def key_block_holds(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
+                    streamed: Callable[[int], dict], *, contracted: bool = False, reducing: int = 0) -> bool:
+    """Whether a walk under a decay a key dimension holds a program a multiprocessor at any of its key
+    blocks (`key_block`'s, `_resident`, its roles' `reducing` share of scratch counted): a launch's form a
+    plan may take only where it does (the KDA backward's anchored own pairs, `anchored.back`)."""
+    return any(_resident(call, held, staged, streamed, block, reducing=reducing)
+               for block in key_blocks(call, contracted=contracted))
+
+
 def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
-              streamed: Callable[[int], dict], block: int) -> int:
+              streamed: Callable[[int], dict], block: int, *, reducing: int = 0) -> int:
     """The programs a multiprocessor holds of a walk at key block `block` (`_planned_launch`, at its register
-    model and its shared memory), none past a thread's registers."""
+    model and its shared memory, its `reducing` warpgroups' scratch counted), none past a thread's registers
+    or the device's block budget."""
     family = call.family
     staging, landing = staged(block)
     registers = held(block).registers(family, addressed(staging, landing))
     if registers > family.registers(1):
         return 0
-    _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing)
+    _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing, reducing=reducing)
     found = _planned_launch(call, resources.Launch(scope, 1, registers, floor=1, most=1))
-    return found.programs if found else 0
+    return found.programs if found and found.shared <= generation.shared_budget(call.target) else 0
 
 
 def _doubling_held(call: Call) -> list:

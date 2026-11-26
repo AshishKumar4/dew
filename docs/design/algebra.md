@@ -151,18 +151,19 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     Hoist a laid factor out of a sum, distribute, or factor a shared operand out of two products.
     A scalar power of two crossing a contraction needs a proof that the reordered intermediates
     neither flush nor overflow (row 13162); that move is not admitted today. A row or column scale
-    can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
-    comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
-    attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
+    can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). An extremum
+    stays over its written rounded products: scaling can collapse distinct values into a tie and
+    change how its cotangent is shared.
     The direct transposed byte product distinguishes the RHS kept axis. It lifts a positive dyadic
     scale only over exact byte casts and full float32 accumulation with at most 256 contracted entries
     (row 13172): every integer partial sum fits, and the shift stays normal for each nonzero term.
     The enclosing proof follows literal scales through broadcasts and selection. Arbitrary scales,
     unproven modes and explicit/manual placements do not take this transposed rewrite.
   - **identities** (compile time and dev time): commutativity, two float32 negations, and a proved
-    float16 or bfloat16 round trip through float32 inside an existing window. The casts must preserve the
-    original abstract value and carry no explicit or manual placement. The narrow value must be known to
-    contain only zeros or normal magnitudes (including infinities), without assuming finite program
+    float16 or bfloat16 round trip through float32. A matched cast pair can start its own window.
+    Both casts must preserve the original abstract value and carry no explicit or manual placement.
+    The narrow value must be known to contain only zeros or normal magnitudes (including infinities),
+    without assuming finite program
     inputs. CPU casts independently quiet float16 signaling NaNs and erase bfloat16 NaN payloads;
     a combined XLA round trip can hide this by deleting both casts. Narrow subnormals remain as
     written until preservation is known for every lowering; a bfloat16 subnormal is subnormal in float32
@@ -695,8 +696,7 @@ accurate forms): no infinity where the reference is finite. A reordering is admi
 bound under the program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
 its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
-admits nothing (but a positive scale out of a maximum or a minimum, which makes no new intermediate a bound
-would have to hold): the reference's value may sit far below any bound over it while the new intermediate
+admits nothing: the reference's value may sit far below any bound over it while the new intermediate
 overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. The value a rule gives is
 held too, as it rounds what it factors before the product: float32's `a x + a y` at `a = (2**24 - 4) 2**104`,
 `x = 1`, `y = 3 2**-24` rounds to the largest, where `a (x + y)` rounds `x + y` to `1 + 2**-22` and overflows,
@@ -799,6 +799,10 @@ def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]: ...  # e
 def cheapest(graph, root, model, *, exact=False, checked=False): ...  # extract.py: greedy-dag, each shared node once
 def extracted(graph, root, model): ...          # the exact extractor (a MILP), the oracle under `checked`
 ```
+
+Cached forms share a target's pricing facts (`cost.pricing_key`), excluding only the allocator's memory
+capacity. Bandwidth, on-chip limits, and every other hardware fact remain part of the price key. The
+actual capacity still governs which compiler and training plans fit; it is not changed while tracing.
 
 - A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
   with each shared e-class counted once, and a span is the largest any chosen node states (`extract.Level`'s

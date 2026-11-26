@@ -183,14 +183,6 @@ _STAGING: contextvars.ContextVar[bool] = contextvars.ContextVar("staging", defau
 """Whether a consumer's staged tiles are stored unpublished (`Family.staged_together`)."""
 
 
-def _disjoint(buffers: Sequence) -> None:
-    """Refuse `buffers` where two may alias: two views of one ref."""
-    roots = [id(buffer.ref if isinstance(buffer, state_types.TransformedRef) else buffer)
-             for buffer in buffers]
-    if len(set(roots)) != len(roots):
-        raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
-
-
 def issuing() -> None:
     """A product about to read shared memory asynchronously (warpgroup MMA, tcgen05): refused within
     `Family.staged_together`, whose stores its read would take unfenced."""
@@ -511,9 +503,11 @@ def laid(condition, like: jax.Array) -> jax.Array:
 
 
 def _warpgroup_barrier(ctx) -> None:
-    """A warpgroup's barrier (`synced`), inlined: synchronization alone, no work a count prices."""
+    """A warpgroup's barrier (`synced`), inlined, collective: every thread of the warpgroup reaches it from
+    one program point, so the fork drops a repeat of it (`core._drop_repeated_barriers`); synchronization
+    alone, no work a count prices."""
     del ctx
-    mgpu_utils.warpgroup_barrier()
+    mgpu_utils.warpgroup_barrier(collective=True)
 
 
 def synced(interpret: bool) -> None:
@@ -2233,16 +2227,9 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
 
-    def _store_staged(self, value: jax.Array, buffer, *, bracketed: bool = True) -> None:
-        del bracketed  # Mosaic GPU brackets an optimized store itself
+    def _store_staged(self, value: jax.Array, buffer) -> None:
+        # Mosaic GPU brackets an optimized store with the warpgroup's barriers itself.
         buffer[...] = value.astype(buffer.dtype)
-
-    @property
-    def brackets_staged(self) -> bool:
-        """Whether its staged stores take the warpgroup's barriers from its own code rather than Mosaic GPU's
-        automatic ones (`_store_staged`'s unoptimized stores, mma.sync's): a batch of them then takes one
-        pair for all (`staged_all`)."""
-        return False
 
     def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
         """fp32 `value`'s `count` bf16 parts (`product.formed`), natively each saturating one in the family's
@@ -2264,31 +2251,13 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             self.published()
         return buffer
 
-    def staged_all(self, pairs: Sequence[tuple[jax.Array, Ref]]) -> list[Ref]:
-        """Each value of `pairs` in its buffer, for products to read, written as one batch and published once:
-        no value read and no product issued between its stores (its values computed before it). An issuer
-        that brackets its stores itself (`brackets_staged`, mma.sync's) takes one barrier before the batch's
-        first store (every warp's reads of the buffers done) and one after its last (every warp's stores
-        seen), where `staged` takes a pair a store (a Kimi intra step's 20 a trip, FS-INTRA-BAR1). Buffers
-        that may alias (two views of one ref) are refused."""
-        buffers = [buffer for _, buffer in pairs]
-        _disjoint(buffers)
-        bracketed = self.brackets_staged
-        if bracketed:
-            synced(interpret=False)
-        for value, buffer in pairs:
-            self._store_staged(value, buffer, bracketed=False)
-        self.published()
-        if bracketed:
-            synced(interpret=False)
-        return buffers
-
     @contextlib.contextmanager
     def staged_together(self) -> Iterator[None]:
         """Within the block, each tile `staged` is stored unpublished, and all of them published once as it
         ends (`published`): one fence for a step's every staged buffer where each took its own (a B200's
         Kimi Linear intra walk staged 18 a step, their fences 5.7k of a warp's 85.1k cycles). No product
-        issues within it (`issuing`)."""
+        issues within it (`issuing`). Each store keeps its own barriers, the fork dropping one that repeats
+        the one before it (`core._drop_repeated_barriers`): stores in a row meet once between each two."""
         token = _STAGING.set(True)
         try:
             yield

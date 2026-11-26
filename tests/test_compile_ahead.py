@@ -669,7 +669,7 @@ def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
 
 def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_cuts_each():
     """A run over phases of 12, then 8 rows a step compiles its step ahead in a split that cuts every
-    phase's batch (`Trainer.reading`'s `Loader.batches`), as its fit plans it: a fixed split of 2 compiles,
+    phase's batch (`Trainer._reading`'s `Loader.batches`), as its fit plans it: a fixed split of 2 compiles,
     and one of 3, which cuts the first phase's 12 rows and not the second's 8, is refused, where it was
     compiled ahead for a run that then plans another program (row 4812's review)."""
     from dew.data import Memory, phases
@@ -1228,7 +1228,7 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     # The run's state as its step holds it (`Trainer.staged`): `fit` hands it back stored, a scanned stack's
     # layers each on its own name again, whose leaves the pool charges apart.
     stepper = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2)
-    run = stepper.staged(stepper.fit(rows, steps=1))
+    run = stepper._as_step(stepper.fit(rows, steps=1))
     built = [part for part in (run.compute, run.window) if part is not None]
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
@@ -1792,7 +1792,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_st
 def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progress(tmp_path):
     """A decision run bounded in examples, which its objective expands after its bound so no pass counts
     its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
-    that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
+    that progress as fit's does (`Trainer._reading`), under a schedule over the run (`Linear`), and the run
     ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434). Its
     tickets stream, of no record count, so its evaluations and checkpoints are counted in steps, as its run
     reads them (`CLOCKED`), which its compile reads too to compile its evaluations (row 4752)."""

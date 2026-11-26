@@ -11,7 +11,9 @@ fixed probes for the input and every parameter.
 Arrays are recorded channel-first with the frame axis dropped; the tests move
 channels last. Parameter gradients are written back into the source layout
 through the same `WeightLayout`s an export uses, so each is compared against
-the source tensor it names. Every gap is scaled by max(1, |reference|).
+the source tensor it names. Each walk is held to the source's by check 1 over
+drawn operands and probes, recorded with its float64 truth
+(`qwen_image_vae_seeds.npz`, the tool's `seeds`).
 """
 
 import json
@@ -22,22 +24,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from autoencoder_walks import QWEN_IMAGE_VAE, posterior, qwen_image_vae_call
 from interop_support import (
-    assert_coder_vjps,
     assert_layout_tensors,
+    assert_walk_as_recorded,
     channels_last,
     extract_fixture,
     fixture_arrays,
-    posterior_of,
     scaled_gap,
 )
+from model_support import attending
 
 from dew.interop.autoencoders.qwen_image import load_qwen_image_vae
 from dew.interop.diffusion import component_tensors
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
-GRADIENT = 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -79,23 +80,27 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, load
     assert_layout_tensors(layouts, {"autoencoder": params}, tensors, "vae/")
 
 
-def posterior(model, params, image):
-    """The posterior's mean and standard deviation, split from the encoder's
-    moments as `posterior_latent` splits them."""
-    return posterior_of(model.apply({"params": params}, image,
-                                    method=lambda vae, x: vae.quant_conv(vae.encoder(x))))
+@attending("reference")
+@pytest.mark.parametrize("walk", ["encode", "decode"])
+def test_the_posterior_and_the_decode_and_every_gradient_match_the_source(loaded, walk):
+    """The posterior's mean and standard deviation of an RGBA image, and the decode of a latent, and
+    against drawn probes the gradients of their probed sum in the operand and in every parameter (zero
+    where a walk never reads one: the other half of the autoencoder, the `time_conv` weights only a second
+    frame reaches), each written back into its source tensor's layout, on par with
+    `AutoencoderKLQwenImage21`'s from float64 over drawn operands and probes (check 1)."""
+    autoencoder, params, layouts, _ = loaded
+    model = autoencoder.model
+    assert_walk_as_recorded(ROOT / "tests/fixtures/qwen_image_vae_seeds.npz", walk, QWEN_IMAGE_VAE[walk],
+                            qwen_image_vae_call(model, walk), params, layouts,
+                            wide=qwen_image_vae_call(model.clone(dtype=jnp.float64), walk))
 
 
-def test_the_posterior_matches_the_source(loaded, reference):
+def test_the_encode_is_the_posteriors_mean(loaded, reference):
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
     image = channels_last(reference["image"])
-    mean, std = posterior(model, params, image)
+    mean, _ = posterior(model, params, image)
     assert mean.shape == (2, 2, 3, 8)
-    gaps = {"mean": scaled_gap(mean, channels_last(reference["mean"])),
-            "std": scaled_gap(std, channels_last(reference["std"]))}
-    print(f"posterior gaps {gaps}")
-    assert max(gaps.values()) < FORWARD, gaps
     latent = model.apply({"params": params}, image, method=model.encode)
     assert np.array_equal(np.asarray(latent), np.asarray(mean))
 
@@ -112,19 +117,12 @@ def test_a_sampled_latent_is_the_mean_plus_std_times_the_draw(loaded, reference)
     assert scaled_gap(sampled, mean) > 1e-2
 
 
-def test_the_decode_matches_the_source(loaded, reference):
+def test_the_decode_clamps_its_pixels(loaded, reference):
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
     pixels = model.apply({"params": params}, channels_last(reference["latent"]), method=model.decode)
     assert pixels.shape == (2, 32, 48, 4)
-    gap = scaled_gap(pixels, channels_last(reference["pixels"]))
-    print(f"decode gap {gap:.3g}")
-    assert gap < FORWARD
     assert float(jnp.abs(pixels).max()) <= 1.0
-
-
-def test_the_coder_gradients_match_the_source(loaded, reference):
-    assert_coder_vjps(loaded, reference, "image", posterior, GRADIENT)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):

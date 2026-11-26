@@ -152,3 +152,24 @@ def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
     step = pricing.step_seconds(tiles, h100, (size, size), issued=jnp.dtype(operands))
     rates = cost.rates(h100, device=False)
     assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]
+
+
+@pytest.mark.parametrize(("out_dtype", "admitted"), [("float32", True), ("bfloat16", False)])
+def test_a_balanced_tails_partials_are_budgeted_by_the_output_it_stores(out_dtype, admitted):
+    """A Hopper kernel gradient's balanced tail (a model fixture: 256 multiprocessors, its bandwidth past
+    any tile's need, so its cap alone decides): 8192 x 1280 at 128 x 256 x 64 tiles in cluster pairs, 160
+    tiles over a wave of 128, its 32-tile tail's fp32 partials 40 MiB, past cuBLAS's 32 MiB workspace,
+    admitted beside an fp32 output stored as 40 MiB and refused beside a bf16 one of 20 MiB
+    (`pricing.within_budget` of the output as its launch stores it); the tile legal either way."""
+    from dew.nn.kernels.templates.gemm import tiling
+
+    tgmm = grouped_matmul.MosaicTgmm()
+    tile = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
+    with generation.assumed("sm90"):
+        target = dataclasses.replace(generation.gpu_target(), multiprocessors=256, measured={},
+                                     memory_bandwidth=100e12)
+        ba = tgmm.bind(jax.ShapeDtypeStruct((8192, 8192), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((8192, 1280), jnp.bfloat16), jnp.asarray([8192], jnp.int32),
+                       out_dtype=out_dtype, interpret=False, dense=True)
+        assert tgmm.legal(ba, tile, target)
+        assert bool(tgmm.balanced(ba, tile, target)) == admitted

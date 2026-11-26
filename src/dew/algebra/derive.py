@@ -707,12 +707,13 @@ def context() -> tuple:
     declaration holds (`derive`'s forms, beside the rule sets its numerics admit, `rules.admitted_names`;
     `scan.derive_scan`'s carry splits): forms traced under one abstract
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
-    and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
-    the extractor oracle on or off (`Passes.checked`), by every registered rule set but those the pass leaves
-    out (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm). Not
-    the whole trace context, whose identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are
-    new in each lowering: every lowering derived again and the cache grew without end."""
-    return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
+    and are priced for one target's pricing facts (`cost.pricing_key`), under one run's numerics and
+    precision.
+    The extractor oracle may be on or off (`Passes.checked`), and the pass may leave out a registered set
+    of rules (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm).
+    Identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are not part of this key:
+    they are new in each lowering, which would derive again and grow the cache without end."""
+    return (jax.sharding.get_abstract_mesh(), cost.pricing_key(cost.target()), generation.numerics(),
             jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without,
             ALGEBRA.value.dev)
 
@@ -789,7 +790,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                  tuple(_parts_of(value, accumulated, added)
                        for accumulated, added in zip(made.accumulated, made.added, strict=True)))
         steps = [value(form) if part is None else None for part, form in zip(parts, made.steps, strict=True)]
-        taken = (None,) * len(made.steps) if stepped is None else tuple(stepped(tuple(state), parts))
+        taken = ((None,) * len(made.steps) if stepped is None
+                 else tuple(stepped(tuple(state), parts, tuple(steps))))
         stepped = [own if own is not None else made_step if made_step is not None else value(form)
                    for own, made_step, form in zip(taken, steps, made.steps, strict=True)]
         return tuple(stepped) if not outputs else (tuple(stepped), tuple(along))
@@ -868,9 +870,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     _register(graph, region, closed, names, walked_axes)
     walking = WALKING if declaration.rescale is None else WALKING_SCALED
     graph.run(walking.saturate())
-    for term in _opaque_locals(graph, region, walking):
-        graph.register(local(term))
-    graph.run(walking.saturate())
+    _register_local_opaques(graph, region, walking)
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
@@ -1003,40 +1003,40 @@ def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: t
 
 
 def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
-    """Register how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
-    for index, (primitive, params) in enumerate(list(region.params)):
+    """Batch how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
+    facts = []
+    for index, (primitive, params) in enumerate(region.params):
+        parameter = i64(index)
         declared = terms.OPERATIONS.get(primitive)
         kind = None if declared is None else declared.kind
         if kind in ("binary", "unary", "comparison", "cast"):
-            graph.register(keeps(i64(index)))
+            facts.append(keeps(parameter))
             if primitive is jax.lax.integer_pow_p and params.get("y") == 2:
-                graph.register(is_square(i64(index)))
+                facts.append(is_square(parameter))
         elif primitive is jax.lax.broadcast_in_dim_p:
             dims = tuple(int(d) for d in params["broadcast_dimensions"])
             after = tuple(int(s) for s in params["shape"])
-            for axis, to in enumerate(dims):
-                graph.register(lays(i64(index), i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to)) for axis, to in enumerate(dims))
             if dims == tuple(range(len(after))):
-                graph.register(identity_broadcast(i64(index)))
+                facts.append(identity_broadcast(parameter))
             elif len(dims) == len(after) - 1:
                 missing = [axis for axis in range(len(after)) if axis not in dims]
                 if len(missing) == 1 and dims == tuple(p for p in range(len(after)) if p != missing[0]):
-                    graph.register(inserts_axis(i64(index), i64(missing[0])))
+                    facts.append(inserts_axis(parameter, i64(missing[0])))
         elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
-            for axis in range(len(permutation)):
-                graph.register(lays(i64(index), i64(axis), i64(permutation.index(axis))))
+            facts.extend(lays(parameter, i64(axis), i64(permutation.index(axis)))
+                         for axis in range(len(permutation)))
         elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
-            for axis, to in _moved(primitive, params, region, index):
-                graph.register(lays(i64(index), i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to))
+                         for axis, to in _moved(primitive, params, region, index))
             if primitive is jax.lax.reshape_p and params.get("dimensions") is None:
-                for axis in _inserted_reshape_axes(region, index):
-                    graph.register(inserts_axis(i64(index), i64(axis)))
+                facts.extend(inserts_axis(parameter, i64(axis))
+                             for axis in _inserted_reshape_axes(region, index))
         elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
-            for axis in range(_rank_before(region, index, reduced)):
-                if axis not in reduced:
-                    graph.register(reduces(i64(index), i64(axis), i64(axis - sum(r < axis for r in reduced))))
+            facts.extend(reduces(parameter, i64(axis), i64(axis - sum(r < axis for r in reduced)))
+                         for axis in range(_rank_before(region, index, reduced)) if axis not in reduced)
         elif kind == "product":
             (left_contracted, right_contracted), (left_batch, right_batch) = params["dimension_numbers"]
             left_rank, right_rank = _dot_ranks(region, index)
@@ -1045,17 +1045,18 @@ def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
             right_free = [axis for axis in range(right_rank) if axis not in right_contracted and
                           axis not in right_batch]
             for position, (left, right) in enumerate(zip(left_batch, right_batch, strict=True)):
-                graph.register(left_of(i64(index), i64(int(left)), i64(position)),
-                               right_of(i64(index), i64(int(right)), i64(position)))
-            for position, axis in enumerate(left_free):
-                graph.register(left_of(i64(index), i64(axis), i64(len(left_batch) + position)))
-            for position, axis in enumerate(right_free):
-                place = len(left_batch) + len(left_free) + position
-                graph.register(right_of(i64(index), i64(axis), i64(place)))
-            for axis in left_contracted:
-                graph.register(contracts_left(i64(index), i64(int(axis))))
-            for axis in right_contracted:
-                graph.register(contracts_right(i64(index), i64(int(axis))))
+                facts.append(left_of(parameter, i64(int(left)), i64(position)))
+                facts.append(right_of(parameter, i64(int(right)), i64(position)))
+            left_at = len(left_batch)
+            right_at = left_at + len(left_free)
+            facts.extend(left_of(parameter, i64(axis), i64(left_at + position))
+                         for position, axis in enumerate(left_free))
+            facts.extend(right_of(parameter, i64(axis), i64(right_at + position))
+                         for position, axis in enumerate(right_free))
+            facts.extend(contracts_left(parameter, i64(int(axis))) for axis in left_contracted)
+            facts.extend(contracts_right(parameter, i64(int(axis))) for axis in right_contracted)
+    if facts:
+        graph.register(*facts)
 
 
 def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
@@ -1108,6 +1109,7 @@ def _least(graph: EGraph, region: terms.Region) -> None:
     may anchor (its own, or one made from it: a broadcast, a difference), one literal a dtype: maxima of two
     dtypes are each corrected by their own, where one value for the whole program refused them."""
     floors: dict[np.dtype, int] = {}
+    facts = []
     for term, _ in region.shapes:
         dtype = region.dtypes.get(terms.key(term))
         if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
@@ -1117,8 +1119,10 @@ def _least(graph: EGraph, region: terms.Region) -> None:
             floors[dtype] = len(region.literals) - 1
             literal = Term.literal(i64(floors[dtype]))
             region.shaped(literal, ())
-            graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
-        graph.register(set_(least(term)).to(i64(floors[dtype])))
+            facts.append(set_(rules.shape(literal)).to(Vec[i64]()))
+        facts.append(set_(least(term)).to(i64(floors[dtype])))
+    if facts:
+        graph.register(*facts)
 
 
 def _inserted_reshape_axes(region: terms.Region, index: int) -> list[int]:
@@ -1172,13 +1176,12 @@ def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     return 0, 0
 
 
-def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> list[Term]:
+def _register_local_opaques(graph: EGraph, region: terms.Region, walking: Ruleset) -> None:
     """The outputs of equations outside the language (`terms.Opaque`), each over local, unwalked inputs alone:
     local themselves, in program order, so an equation over an earlier one's outputs reads them as local. An
     equation outside the language over a value the walk reads is refused: over a walked value its axis is
     unknown, and over one a walked reduction gave (a total's `log2`) no form computes it from the walk's
     state, where evaluating it from the operands would read them whole."""
-    found = []
     for opaque in region.opaque:
         inputs = [term for term in opaque.inputs if term is not None]
         name = opaque.equation.primitive.name
@@ -1186,11 +1189,10 @@ def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> lis
             raise Refused(f"{name}: an equation outside the language over a walked value")
         if not all(_holds(graph, local(term)) and _holds(graph, unwalked(term)) for term in inputs):
             raise Refused(f"{name}: an equation outside the language over a value a walked reduction gave")
-        for leaf in opaque.outputs:
-            found.append(Term.leaf(i64(leaf)))
-            graph.register(local(Term.leaf(i64(leaf))), unwalked(Term.leaf(i64(leaf))))
-        graph.run(walking.saturate())
-    return found
+        facts = [fact(Term.leaf(i64(leaf))) for leaf in opaque.outputs for fact in (local, unwalked)]
+        if facts:
+            graph.register(*facts)
+            graph.run(walking.saturate())
 
 
 def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
@@ -1200,6 +1202,7 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
     correction is no broadcast of these, and the declaration is refused."""
     anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
     lifted = set()
+    facts = []
     for reduction in reductions:
         to = region.extents.get(terms.key(reduction))
         if to is None:
@@ -1215,9 +1218,11 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
                 dimensions = () if at < 0 else (at,)
                 params = {"shape": tuple(to), "broadcast_dimensions": dimensions, "sharding": None}
                 region.params.append((jax.lax.broadcast_in_dim_p, params))
-                graph.register(set_(lifts(Vec[i64](*(i64(size) for size in given)),
-                                          Vec[i64](*(i64(size) for size in to)), i64(at))).to(
+                facts.append(set_(lifts(Vec[i64](*(i64(size) for size in given)),
+                                        Vec[i64](*(i64(size) for size in to)), i64(at))).to(
                     i64(len(region.params) - 1)))
+    if facts:
+        graph.register(*facts)
 
 
 def _walked(graph: EGraph, term: Term) -> bool:

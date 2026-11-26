@@ -336,16 +336,6 @@ def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
     return text(args[1]), key(args[0])
 
 
-def binary_of(term: Term | Skeleton) -> tuple[str, Hashable, Hashable] | None:
-    """A binary term's operation name and its operands' keys (`key`), None where `term` is no binary: an
-    egglog term's or a skeleton's alike."""
-    if isinstance(term, Skeleton):
-        return (term.form[2], term.form[1], term.form[3]) if term.form[0] == "binary" else None
-    if (args := get_callable_args(term, Term.binary)) is None:
-        return None
-    return text(args[1]), key(args[0]), key(args[2])
-
-
 @dataclasses.dataclass
 class Opaque[Node: (Term, Skeleton)]:
     """An equation outside the language: its inputs' terms (None for a literal, kept in `literals`) and the
@@ -808,7 +798,25 @@ def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
         slot = len(opaques)
         opaques.append(key)
         return "object_ref", key[1], slot
-    return tuple(_collect_opaque(part, opaques) for part in key)
+    # Most subkeys are plain. Retain their tuples; only copy a path with a hoisted entry.
+    rebuilt = None
+    for index, part in enumerate(key):
+        if isinstance(part, tuple) and (resolved := _collect_opaque(part, opaques)) is not part:
+            if rebuilt is None:
+                rebuilt = list(key)
+            rebuilt[index] = resolved
+    return key if rebuilt is None else tuple(rebuilt)
+
+
+def _digest_parameters(equation: jcore.JaxprEqn, opaques: list[Hashable],
+                       in_process: bool, reject_device: bool) -> Hashable:
+    params = equation.params
+    if not in_process:
+        return _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
+    parameters_by_name = params.items()
+    ordered = sorted(parameters_by_name) if len(params) > 1 else parameters_by_name
+    return tuple((name, _collect_opaque(_in_process_param_key(part, reject_device=reject_device), opaques))
+                 for name, part in ordered)
 
 
 def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
@@ -820,13 +828,32 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
     hasher = hashlib.blake2b(digest_size=20)
     opaques: list[Hashable] = []
     ctx_keys: dict[int, Hashable] = {}
-    plain_types: dict[int, Hashable] = {}
+    plain_types: dict[int, int] = {}
     primitive_keys: dict[int, Hashable] = {}
-    position: dict[jcore.Var, int] = {}
+    binders: dict[jcore.Var, bytes] = {}
+    descriptors: dict[bytes, int] = {}
 
     def feed(part: Hashable) -> None:
         hasher.update(repr(part).encode())
         hasher.update(b"\0")
+
+    def descriptor(key: Hashable) -> int:
+        # First use is by the exact encoding, not by object equality: equal user-defined values
+        # may have different reprs. Persistent digests still write all descriptors at every use.
+        encoded = repr(key).encode()
+        ordinal = descriptors.get(encoded)
+        if ordinal is None:
+            ordinal = len(descriptors)
+            descriptors[encoded] = ordinal
+            feed(("abstract_descriptor", encoded))
+        return ordinal
+
+    def bind(variables: Sequence[jcore.Var]) -> None:
+        # Encode each ordinal once. Preserve both the in-process tag and persistent textual format.
+        for var in variables:
+            at = len(binders)
+            binders[var] = (((at << 8) | 1).to_bytes(9, "little") if in_process
+                            else repr(("var", at)).encode() + b"\0")
 
     def aval_key(given) -> Hashable:
         if not in_process or not isinstance(given, ShapedArray):
@@ -839,7 +866,8 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
         before = len(opaques)
         key = _collect_opaque((_abstract_key(given), _extended_dtype(given.dtype)), opaques)
         if len(opaques) == before:
-            plain_types[identity] = key
+            plain_types[identity] = ordinal = descriptor(key)
+            return ordinal
         return key
 
     def feed_atom(atom) -> None:
@@ -851,25 +879,21 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                       aval_key(atom.aval)))
                 return
             dtype, value = held_bits(atom.val)
-            raw = np.ascontiguousarray(value).tobytes()
+            raw = value.tobytes()
             ext = _collect_opaque(_extended_dtype(dtype), opaques) if in_process else None
             feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
             hasher.update(b"\0")
-        elif in_process:
-            # A binary tag distinct from the literals' leading tuple marker, followed by a fixed
-            # width binder position. No repr or temporary tuple for the dominant atom kind.
-            hasher.update(((position[atom] << 8) | 1).to_bytes(9, "little"))
         else:
-            feed(("var", position[atom]))
+            hasher.update(binders[atom])
 
     def var_key(var: jcore.Var) -> Hashable:
         return isinstance(var, jcore.DropVar), aval_key(var.aval)
 
     feed(("constvars", tuple(var_key(var) for var in jaxpr.constvars)))
     feed(("invars", tuple(var_key(var) for var in jaxpr.invars)))
-    for var in (*jaxpr.constvars, *jaxpr.invars):
-        position[var] = len(position)
+    bind(jaxpr.constvars)
+    bind(jaxpr.invars)
     feed(("eqns", len(jaxpr.eqns)))
     for equation in jaxpr.eqns:
         ctx = equation.ctx
@@ -884,14 +908,8 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                     str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis,
                     ctx.no_collectives, ctx.cur_abstract_mesh)), opaques)
             ctx_keys[id(ctx)] = ctx_key
-        params_key: Hashable = ()
-        if equation.params:
-            raw_params = (
-                tuple((name, _in_process_param_key(part, reject_device=reject_device))
-                      for name, part in sorted(equation.params.items()))
-                if in_process else parameters_key(equation.primitive, equation.params)[1]
-            )
-            params_key = _collect_opaque(raw_params, opaques)
+        params_key = (_digest_parameters(equation, opaques, in_process, reject_device)
+                      if equation.params else ())
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
         primitive = equation.primitive
         if in_process:
@@ -906,8 +924,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
               tuple(var_key(var) for var in equation.outvars)))
         for atom in equation.invars:
             feed_atom(atom)
-        for var in equation.outvars:
-            position[var] = len(position)
+        bind(equation.outvars)
     feed(("outvars", len(jaxpr.outvars)))
     for atom in jaxpr.outvars:
         feed_atom(atom)
@@ -984,16 +1001,22 @@ def provenance_key(closed: jcore.Jaxpr) -> str:
         result_paths = (di.result_paths if isinstance(di.result_paths, (type(None), tuple))
                         else repr(di.result_paths))
         feed(("debug_info", di.traced_for, di.func_src_info, di.arg_names, result_paths))
+    source_encodings: dict[tuple[int, int], bytes] = {}
     for equation in inner.eqns:
         si = equation.source_info
-        tb = si.traceback
-        if tb is None:
+        tb, names = si.traceback, si.name_stack.stack
+        # The equations keep both inputs live; the same traceback can have different name stacks.
+        source = id(tb), id(names)
+        if (encoded := source_encodings.get(source)) is None:
             frames = None
-        else:
-            codes, lastis = tb.raw_frames()
-            frames = tuple((code.co_filename, code.co_qualname, code.co_firstlineno, lasti)
-                           for code, lasti in zip(codes, lastis, strict=True))
-        feed(("eqn", si.name_stack.stack, frames))
+            if tb is not None:
+                codes, lastis = tb.raw_frames()
+                frames = tuple((code.co_filename, code.co_qualname, code.co_firstlineno, lasti)
+                               for code, lasti in zip(codes, lastis, strict=True))
+            encoded = repr(("eqn", names, frames)).encode()
+            source_encodings[source] = encoded
+        hasher.update(encoded)
+        hasher.update(b"\0")
         if equation.params:
             nested: list[str] = []
             _walk_sub_provenance(equation.params, nested, set())
@@ -1730,6 +1753,11 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         # its operand is.
         lower, _, upper = operands
         return None if lower is None or upper is None else max(lower, upper)
+    if name == "select_n":
+        # The selector chooses an arm but contributes no value to its bound.
+        cases = operands[1:]
+        known = [bound for bound in cases if bound is not None]
+        return max(known) if len(known) == len(cases) else None
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
@@ -1743,8 +1771,6 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         losing = 1 if name == "min" else -1
         within = [given[1 - at] for at in range(len(given)) if len(given) == 2 and apart[at].sign == losing]
         return min([max(given), *within])
-    if name == "select_n":
-        return max(given[1:])
     if name in ("reduce_max", "reduce_min") and _reduced(equation) < 1:
         # A maximum or a minimum of no element is its identity, an infinity.
         return None

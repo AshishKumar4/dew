@@ -327,10 +327,10 @@ def grain_kill_seconds() -> float:
 
 WORKER_BUFFER = 1
 """The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`):
-Grain's own (`per_worker_buffer_size`). Two read no faster on a CPU and hold a second batch in each worker
-(row 2508: two workers over a record step of a few milliseconds, eight draws each, two against one at
-1.03 times the samples a second, 0.66 to 1.35, with the consumer waiting on none; 0.98 times with it
-taking 5 ms a batch; 1.00 times at 20 ms)."""
+Grain's own (`per_worker_buffer_size`). Row 2508 resolved no benefit from two on the workload it timed, two
+workers over a record step of a few milliseconds, eight draws each: two against one at 1.03 times the
+samples a second, 0.66 to 1.35, with the consumer waiting on none; 0.98 times with it taking 5 ms a batch;
+1.00 times at 20 ms. Automatic loading may hold more for bursty batches (`Loading.resolved`)."""
 
 
 WORKER_PROCESS_BYTES = 219 * 2**20
@@ -484,9 +484,10 @@ class Loading:
 
     def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
-        by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
-        bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
-        changes the count as the read runs. Grain 0.2.18, which Dew pins, has no autotuning that
+        by default) from its CPUs and its memory together. At startup it times a bounded sample of
+        batches (their mean and slowest, the first left out where it can be) beside the batches' bytes
+        and the host's CPU and memory budgets, and sizes the workers and the read-ahead from them; the
+        settings do not change as the read runs. Grain 0.2.18, which Dew pins, has no autotuning that
         measures: its `autotune` and `AutotuneParameter` raise NotImplementedError. Its static pick
         (`pick_performance_config`) sizes workers from memory alone, `ram_budget_mb` over one batch's
         bytes, capped at `multiprocessing.cpu_count()`, the machine's CPUs, where a container or a

@@ -209,6 +209,73 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
                                           err_msg=f'{type(given).__name__} {name}')
 
 
+def _media_reader(tmp_path):
+    """The public processor of a bundle with a tokenizer and Inkling 2's processor, and its read of one
+    image (each conditioning field as an array), with a transparent RGBA image `[16, 24]` it reads."""
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    rgba = np.zeros((16, 24, 4), np.uint8)
+    rgba[4:12, 8:16] = (200, 30, 90, 255)
+
+    def read(given):
+        return {name: np.asarray(value) for name, value in
+                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
+    return loaded, rgba, read
+
+
+def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
+    """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
+    (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
+    answers 404 and a redirect off HTTP (to FTP, which a read could not hold to its deadline) are each
+    refused by name, and so is a body past the cap a read holds it to (`opened`'s `url_bytes`)."""
+    import http.server
+    import threading
+
+    from PIL import Image
+
+    from dew.interop.inkling_media import opened
+
+    _, rgba, read = _media_reader(tmp_path)
+    served = tmp_path / 'served'
+    served.mkdir()
+    Image.fromarray(rgba).save(served / 'transparent.png')
+
+    class Served(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(served), **kwargs)
+
+        def do_GET(self):
+            if self.path == '/elsewhere.png':
+                self.send_response(302)
+                self.send_header('Location', 'ftp://127.0.0.1/transparent.png')
+                self.end_headers()
+                return
+            super().do_GET()
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Served)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+        fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
+        for field, value in fetched.items():
+            np.testing.assert_array_equal(value, stored[field], err_msg=field)
+        for refused, named in (('missing.png', 'HTTP 404'), ('elsewhere.png', 'HTTP 302')):
+            with pytest.raises(ValueError) as refusal:
+                read(f'{url}/{refused}')
+            assert named in str(refusal.value), refusal.value
+        size = (served / 'transparent.png').stat().st_size
+        assert opened(f'{url}/transparent.png', url_bytes=size).size == (24, 16)
+        with pytest.raises(ValueError) as refusal:
+            opened(f'{url}/transparent.png', url_bytes=size - 1)
+        assert f'past {size - 1} bytes' in str(refusal.value), refusal.value
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path):
     """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule), and a JPEG
     turned by its EXIF orientation reads upright, whether the image is given through the public processor
@@ -222,11 +289,7 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
 
     from dew.interop.inkling_media import InklingProcessor
 
-    directory = _bundle_with_tokenizer(tmp_path)
-    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
-    loaded = Pretrained.load(directory, dtype='float32')
-    rgba = np.zeros((16, 24, 4), np.uint8)
-    rgba[4:12, 8:16] = (200, 30, 90, 255)
+    loaded, rgba, read = _media_reader(tmp_path)
     transparent = tmp_path / 'transparent.png'
     Image.fromarray(rgba).save(transparent)
     turned = tmp_path / 'turned.jpg'
@@ -234,10 +297,6 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
     exif[0x0112] = 6  # Orientation: the stored image turned a quarter, read upright.
     drawn = np.random.default_rng(13341).integers(0, 256, (16, 40, 3), np.uint8)
     Image.fromarray(drawn).save(turned, exif=exif)
-
-    def read(given):
-        return {name: np.asarray(value) for name, value in
-                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
 
     for stored, kind in ((transparent, 'png'), (turned, 'jpeg')):
         encoded = stored.read_bytes()

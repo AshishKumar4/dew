@@ -61,9 +61,16 @@ def rgb(image: object) -> np.ndarray:
     return composited(held) if held.shape[-1] == 4 else held
 
 
-def opened(image: str | Path | bytes | bytearray):
+URL_BYTES = 64 * 2**20
+"""The most bytes an image a URL names is read to (`opened`), as Dew's url fetch reads one (`Fetch`)."""
+URL_SECONDS = 60.0
+"""The time an image a URL names is read within, from connecting to its last byte (`bounded_read`)."""
+
+
+def opened(image: str | Path | bytes | bytearray, *, url_bytes: int = URL_BYTES):
     """An encoded image as PIL opens it, in its own mode, from each form transformers' `load_image` reads:
-    a URL's bytes fetched (`http://`, `https://`), a file's path, a base64 string or data URI
+    a URL's bytes fetched within a deadline and a size (`URL_SECONDS`, `URL_BYTES`, `bounded_read`), a
+    file's path, a base64 string or data URI
     (`data:image/...;base64,...`) decoded, and bytes as given."""
     import base64
     import binascii
@@ -73,11 +80,14 @@ def opened(image: str | Path | bytes | bytearray):
     from PIL import Image
 
     if isinstance(image, str) and image.startswith(("http://", "https://")):
-        import requests
+        from dew.data.sources.urls import bounded_read
 
-        response = requests.get(image, timeout=60)
-        response.raise_for_status()
-        image = response.content
+        status, payload = bounded_read(image, url_bytes + 1, URL_SECONDS, web_only=True)
+        if not 200 <= status < 300:
+            raise ValueError(f"the image at {image} answered HTTP {status}")
+        if len(payload) > url_bytes:
+            raise ValueError(f"the image at {image} is past {url_bytes} bytes")
+        image = payload
     elif isinstance(image, str) and (image.startswith("data:image/") or not os.path.isfile(image)):
         # Inline before any path probe (a long data URI is no path, `os.path.isfile` False where
         # `Path.is_file` raises), decoded as transformers' `base64.decodebytes` decodes one: line-wrapped

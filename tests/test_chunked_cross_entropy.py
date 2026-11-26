@@ -1323,6 +1323,55 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     assert jnp.array_equal(tiled[1], whole[1])
 
 
+@pytest.mark.parametrize(("devices", "meshed"), [(1, True), (2, True), (2, False)],
+                         ids=["one device", "contraction split", "contraction split, no mesh in context"])
+def test_a_bf16_whole_head_rounds_its_logits_once_its_sums_are_whole(devices, meshed):
+    """A bf16 whole head lowered for compile-only H100s (`chunked._whole_logits`), its logits' product read
+    off the lowered program's own operations: over one device the product writes them as bf16 from its fp32
+    sums, the fp32 product never held beside its rounding; over two whose tensor axis splits the features it
+    contracts, an odd count of tokens no token axis splits (the head called whole, `_sharded_head`), the
+    product is fp32, its shards' partials summed before the rounding, as XLA's partitioner sums them in the
+    product's own type (a bf16 sum of partials 1 and -1 + 2**-9 is 0, not 2**-9); and so where no mesh in
+    context proves the contraction whole, its devices its arguments' shardings'."""
+    import contextlib
+
+    from jax._src.lib.mlir import ir
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    mesh = Mesh(np.array(compile_only_gpus("sm90", devices)), ("tensor",))
+
+    def loss(states, matrix, targets):
+        losses, _, _ = chunked_cross_entropy(states, OutputTable(matrix, vocab_major=False), targets, 1,
+                                             tile=None)
+        return jnp.mean(losses)
+
+    shapes = (jax.ShapeDtypeStruct((15, 32), jnp.bfloat16, sharding=NamedSharding(mesh, P(None, "tensor"))),
+              jax.ShapeDtypeStruct((32, 64), jnp.bfloat16, sharding=NamedSharding(mesh, P("tensor", None))),
+              jax.ShapeDtypeStruct((15,), jnp.int32, sharding=NamedSharding(mesh, P())))
+    # Traced as an H100's run traces it, at JAX's default precision, which multiplies a bf16 head as bf16.
+    in_context = jax.set_mesh(mesh) if meshed else contextlib.nullcontext()
+    with generation.assumed("sm90"), jax.default_matmul_precision("default"), in_context:
+        module = jax.jit(jax.grad(loss, argnums=(0, 1))).trace(*shapes).lower(
+            lowering_platforms=("cuda",)).compiler_ir("stablehlo")
+    products = set()
+
+    def walked(operation) -> None:
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    if inner.operation.name == "stablehlo.dot_general":
+                        typed = ir.RankedTensorType(inner.operation.results[0].type)
+                        products.add((tuple(typed.shape), str(typed.element_type)))
+                    walked(inner.operation)
+
+    walked(module.operation)
+    logits = {dtype for shape, dtype in products if shape == (15, 64)}
+    assert logits == ({"bf16"} if devices == 1 else {"f32"}), products
+
+
 def test_an_fp32_whole_heads_overflowed_state_gradient_stays_infinite():
     """A whole fp32 head's state gradient overflows as one product's does: infinite, never inf - inf.
     One zero state, 2048 columns, the target's at -3e38 and the rest at +3e38: a finite loss, log

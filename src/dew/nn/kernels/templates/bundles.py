@@ -27,6 +27,7 @@ import jax.numpy as jnp
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import fed, mosaic, mosaic_sm80, mosaic_sm90, mosaic_sm100, placed, ring_family
+from dew.nn.kernels.templates.axes import whole
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,7 +198,7 @@ def useful_rows(family: mosaic.Family, rows: int) -> float:
     """The share of the rows `family`'s products issue for a launch of `rows` rows that are the launch's: its
     rows padded to the issuer's least (`Issuer.rows`), so 8 rows fill half of mma.sync's 16 and an eighth of
     wgmma's 64."""
-    return rows / (-(-rows // family.rows) * family.rows)
+    return rows / (whole(rows, family.rows))
 
 
 def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: bool = False,

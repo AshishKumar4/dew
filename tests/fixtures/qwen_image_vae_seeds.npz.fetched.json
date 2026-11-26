@@ -1,0 +1,10 @@
+{
+ "bytes": 94967577,
+ "license": "Apache-2.0",
+ "origin": "github",
+ "path": "2d92de5bdd2808b8d5eac54b76d7c32101417ad8547cfd860c89997ba5e127ba.npz",
+ "reference": "AutoencoderKLQwenImage21 (diffusers 0.41.0.dev0)",
+ "repo": "AshishKumar4/dew-fixtures",
+ "revision": "store-1",
+ "sha256": "2d92de5bdd2808b8d5eac54b76d7c32101417ad8547cfd860c89997ba5e127ba"
+}

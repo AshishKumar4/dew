@@ -10,6 +10,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A generated surrogate now uses its written value and derivative when an unhashable static argument
   cannot select a generated case.
 
+- Process-local algebra digests write each distinct abstract type once, using its exact encoding.
+  Parameter encoding and persistent digest bytes are unchanged.
+
+- Algebra encodes each binder and repeated source site once per digest and reuses the settled fact closure
+  when nothing changes. Derivations batch floors and broadcasts, and no longer register twice that an
+  opaque output is local. Persistent fingerprints and provenance are preserved.
+
+- Algebra derivation registers axis movement facts in one batch and avoids rebuilding plain structural
+  key tuples; literal bytes, opaque identities and rewrite cache admission are unchanged.
+
 - A run's surface names its everyday settings plainly and once (API03). `Trainer(objective, Muon(), lr=3e-4)`
   takes an optimizer's spec with its rate, its schedule (`schedule=`, whose peak is `lr` where it names none)
   and its clip beside it, and `accumulation`, `update_tokens`, `split`, `remat` and `microbatches` as its own

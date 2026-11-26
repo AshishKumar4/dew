@@ -145,8 +145,7 @@ def on_route(route: str | None):
 
 def routed(check, routes: tuple = ROUTES) -> Callable:
     """The decorator making `check` the test it decorates, run on each of `routes` (every one of `ROUTES`
-    where none are given, `on_route`): its name and documentation the test's, its one parameter the
-    route."""
+    where none are given, `on_route`): its name and documentation the test's, its one parameter the route."""
     def run(route):
         with on_route(route):
             check()
@@ -744,8 +743,7 @@ def transitioned(hooks: recurrence.Hooks, operands, seed: int):
 def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
     """Each transition (`TRANSITIONS`) through the chunked op, which the portable math takes (its forms the
     token update's derived, `scan.derive_scan`), against the decode step's reference a token at a time
-    (`token_by_token`): output, final memory and every operand's gradient from float64 (check 1, row
-    9029)."""
+    (`token_by_token`): output, final memory and every operand's gradient from float64 (check 1, row 9029)."""
     def ours(operands, starts=None):
         return chunk(hooks, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
 
@@ -858,6 +856,8 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+# Two draws a task: a case's eight drawing forty where its first are inconclusive took 107 to 158 s (13273).
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 @pytest.mark.parametrize('along', ['pulled back', 'pushed forward'])
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[4], ADDITIVE],
                          ids=['no decay', 'the delta rule', 'an additive erase'])
@@ -867,7 +867,7 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
     output, last memory and every operand's gradient (`pulled back`), or its tangent along its values, on
     par from float64 with the same call whole (check 1), each placed as its rows are (row 9690: its walk's
     carries, seeded within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a
-    no-decay call's gates, formed whole, its map's). Both directions in one case took 151 to 186 s (12802)."""
+    no-decay call's gates, formed whole, its map's)."""
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     rows = jax.sharding.NamedSharding(mesh, P('data'))
     run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
@@ -1560,7 +1560,7 @@ def document_by_document(hooks, operands, run=None, documents=DOCUMENTS, added: 
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], FORMED[9]], ids=str)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0], *FORMED[9:12]], ids=str)
 def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
     """80 draws, 8 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
     inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b); the gate holds a draw's
@@ -1569,9 +1569,9 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
     memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
     each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
-    entered twice sums both documents' gradients. RWKV6's readout of the memory entering its token
-    (`Hooks.reads`) among them: a window refused it, its document's memory entering mid-chunk (base review
-    80b5b68ad F1)."""
+    entered twice sums both documents' gradients. The readouts reaching a document's entering memory at its
+    first token among them (RWKV6's, the delta rule's read before its update, a write gate's own write
+    weighed): a window refused RWKV6's, its memory entering mid-chunk (base review 80b5b68ad F1)."""
     assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
                          f'xla {hooks} a forked call\'s documents', seeds=80)
 

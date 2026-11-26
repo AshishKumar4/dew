@@ -453,8 +453,8 @@ def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: in
                 if one_device:
                     _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
                 return state, shardings, position
-            # Held as this layout's step holds it: a stage-local run's layers stacked by stage (`staged`).
-            state = self.staged(jax.tree.map(lambda leaf: leaf.copy(), held))
+            # Held as this layout's step holds it: a stage-local run's layers stacked by stage (`_as_step`).
+            state = self._as_step(jax.tree.map(lambda leaf: leaf.copy(), held))
             return state, jax.tree.map(lambda leaf: leaf.sharding, state), None
 
     # Devices the peak table does not name (a CPU's) measure no link, so no projection would spread

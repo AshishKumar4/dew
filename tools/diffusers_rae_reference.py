@@ -151,18 +151,23 @@ def normal_latent(channels: int, grid: int) -> np.ndarray:
 
 
 def from_published(cls, repo: str, revision: str):
-    """`cls` built from the checkpoint's config and loaded with its tensors.
-    `from_pretrained` fails here: its weight init touches the final layer
-    norm's affine parameters, which the source removes. Only the decoder
-    table it recomputes is left unread, as `from_pretrained` leaves it."""
+    """`cls` built from the checkpoint's config and loaded with its tensors (`loaded`), from the hub."""
     from huggingface_hub import hf_hub_download
+
+    return loaded(cls, cls.load_config(repo, revision=revision),
+                  hf_hub_download(repo, "diffusion_pytorch_model.safetensors", revision=revision), repo)
+
+
+def loaded(cls, config, tensors_file, name: str):
+    """`cls` built from `config` and loaded with the tensors of `tensors_file`. `from_pretrained` fails
+    here: its weight init touches the final layer norm's affine parameters, which the source removes.
+    Only the decoder table it recomputes is left unread, as `from_pretrained` leaves it."""
     from safetensors.torch import load_file
 
-    model = cls.from_config(cls.load_config(repo, revision=revision)).eval()
-    tensors = load_file(hf_hub_download(repo, "diffusion_pytorch_model.safetensors", revision=revision))
-    missing, unexpected = model.load_state_dict(tensors, strict=False)
-    if missing or unexpected != ["decoder.decoder_pos_embed"]:
-        raise RuntimeError(f"{repo}: missing {missing}, unexpected {unexpected}")
+    model = cls.from_config(config).eval()
+    missing, unexpected = model.load_state_dict(load_file(tensors_file), strict=False)
+    if missing or unexpected not in ([], ["decoder.decoder_pos_embed"]):
+        raise RuntimeError(f"{name}: missing {missing}, unexpected {unexpected}")
     return model
 
 
@@ -248,11 +253,59 @@ def main(destination: str) -> None:
     print(f"{root}: {size / 1e6:.2f} MB")
 
 
+def encode_walk(model, image: torch.Tensor) -> tuple[torch.Tensor]:
+    """The frozen encoder's latent of `image` in [0, 1]."""
+    from diffusers.models.autoencoders.vae import EncoderOutput
+
+    return (returned(model.encode(image), EncoderOutput).latent,)
+
+
+def decode_walk(model, code: torch.Tensor) -> tuple[torch.Tensor]:
+    """The decoder's pixels of `code`."""
+    from diffusers.models.autoencoders.vae import DecoderOutput
+
+    return (returned(model.decode(code), DecoderOutput).sample,)
+
+
+def seeds() -> None:
+    """Check 1's recordings over seeds (`record_walk`): each tiny RAE of tests/fixtures/rae.tar.xz reloaded,
+    its frozen encoder's walk (the image's gradient alone) and its decoder's (every decoder parameter's
+    gradient too) (tests/autoencoder_walks.py `RAE`), as tests/fixtures/rae_seeds.npz."""
+    import jax.numpy as jnp
+    from autoencoder_walks import RAE, dew_walk, key_biases, rae_call
+    from diffusers.models.autoencoders.autoencoder_rae import AutoencoderRAE
+    from reference_vjp import FIXTURES, record_walk, save_walks, unpacked
+
+    from dew.interop.autoencoders.rae import load_rae
+
+    require("rae")
+    torch.set_num_threads(2)
+    arrays = {}
+    with unpacked(FIXTURES / "rae.tar.xz") as root:
+        for name in CONFIGS:
+            model = loaded(AutoencoderRAE, AutoencoderRAE.load_config(root / name),
+                           root / name / "diffusion_pytorch_model.safetensors", name)
+            decoder = [key for key, _ in model.named_parameters() if key.startswith("decoder.")]
+            coder, params, layouts, _ = load_rae(root / name)
+            ours = [layout for layout in layouts if layout.name.startswith("vae/decoder.")]
+            arrays.update(record_walk(f"{name} encode", model, encode_walk, RAE[name]["encode"], [],
+                                      dew_walk(rae_call(coder, "encode"), params, [], dtype=jnp.float32)))
+            arrays.update(record_walk(f"{name} decode", model, decode_walk, RAE[name]["decode"], decoder,
+                                      dew_walk(rae_call(coder, "decode"), params, ours, dtype=jnp.float32),
+                                      cancelled=key_biases(decoder)))
+    save_walks("rae_seeds.npz", arrays, [f"{name} {walk}" for name in CONFIGS for walk in RAE[name]],
+               reference=f"AutoencoderRAE (diffusers {DIFFUSERS}, transformers {TRANSFORMERS})",
+               revision=f"diffusers=={DIFFUSERS}",
+               command="DEW_WIDE_CPU_ARITHMETIC=1 python tools/diffusers_rae_reference.py seeds")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         from diffusers_dc_ae_reference import bundle
 
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 1 and sys.argv[1] == "seeds":
+        seeds()
     elif len(sys.argv) > 2 and sys.argv[1] == "published":
         published(sys.argv[2])
     else:
