@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from .binades import balanced, exactly, normal
-from .derivatives import Protected, contracted, declared_tangent
+from .binades import as_plain, balanced, normal
+from .derivatives import Protected, contracted, declared_tangent, surrogate
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -104,9 +104,10 @@ def _exact_share(eps: jax.Array, factor: jax.Array, denominator: jax.Array) -> j
     return jnp.where(normal(eps * factor) & normal(plain), plain, balanced(eps, (factor,), (denominator,)))
 
 
-_epsilon_share = exactly(_plain_share, _exact_share, "test_a_giant_heads_clip_holds_every_order")
+_epsilon_share = contracted("test_a_giant_heads_clip_holds_every_order")(
+    surrogate(_exact_share, as_plain(_plain_share), symbolic_zeros=True))
 """A giant head's epsilon share `eps s / (|y| + eps s)` (`_giant_jvp`): valued range-safe, differentiated
-as its plain quotient (`binades.exactly`)."""
+as its plain quotient (`binades.as_plain`)."""
 
 
 def _giant_jvp(threshold: float, eps: float, primals, tangents):
@@ -134,7 +135,7 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     share = jnp.where(ratio < 1, 1.0, jnp.where(ratio == 1, 0.5, 0.0)).astype(x.dtype)
     # Epsilon's relative share `eps s / (|y| + eps s)`: its plain quotient where that is normal, else over
     # the operands' significands (`binades.balanced`: `eps s` alone may be subnormal where the share is not,
-    # epsilon 2^-62 beside a head 2^62), differentiated as the plain quotient is (`binades.exactly`), so its
+    # epsilon 2^-62 beside a head 2^62), differentiated as the plain quotient is (`binades.as_plain`), so its
     # derivative in the length is live (row 13260).
     radial_share = (1 - share) + share * _epsilon_share(jnp.full_like(denominator, eps), factor, denominator)
     residuals = (scaled / jnp.where(length > 0, length, 1), radial_share, ratio, factor, denominator)

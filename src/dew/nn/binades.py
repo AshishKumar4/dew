@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .derivatives import contracted
+from .derivatives import contracted, surrogate
 from .float_bits import exact_power2, float_bits
 
 
@@ -118,31 +118,25 @@ def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
                                                                                          raised.dtype))
 
 
-def exactly(plain: Callable[..., jax.Array], exact: Callable[..., jax.Array], contract: str
-            ) -> Callable[..., jax.Array]:
-    """A function valued as `exact` computes it and differentiated as `plain` is, at every order
-    (`derivatives.surrogate`), held by the test `contract` names (`derivatives.contracted`): `exact` a
-    range-safe value of the arithmetic `plain` writes (a balanced product, a flush-safe one), `plain` that
-    arithmetic itself, whose derivatives JAX takes where its own intermediates are normal, as before the
-    range-safe value replaced it (rows 13260, 13261). An operand no derivative moves adds no term, so a
-    constant beside an infinite factor meets no `0 * inf`."""
+def as_plain(plain: Callable[..., jax.Array]) -> Callable:
+    """A surrogate's derivative rule (`derivatives.surrogate`, its `symbolic_zeros`) that differentiates
+    `plain` at every order: a range-safe value of `plain`'s arithmetic (a balanced product, a flush-safe one)
+    differentiated as that arithmetic, whose derivatives JAX takes where its own intermediates are normal, as
+    before the range-safe value replaced it (rows 13260, 13261). An operand no derivative moves adds no term,
+    so a constant beside an infinite factor meets no `0 * inf`."""
     from jax.custom_derivatives import SymbolicZero
 
-    from .derivatives import surrogate
-
     def derivative(primals, tangents, value):
-        live = [not isinstance(tangent, SymbolicZero) for tangent in tangents]
-        if not any(live):
+        live = tuple(index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero))
+        if not live:
             return jnp.zeros_like(value)
 
-        def at(*moving):
-            given = iter(moving)
-            return plain(*(next(given) if moves else primal
-                           for primal, moves in zip(primals, live, strict=True)))
-        return jax.jvp(at, tuple(p for p, moves in zip(primals, live, strict=True) if moves),
-                       tuple(t for t, moves in zip(tangents, live, strict=True) if moves))[1]
-
-    return contracted(contract)(surrogate(exact, derivative, symbolic_zeros=True))
+        def substituted(*moving):
+            return plain(*(dict(zip(live, moving, strict=True)).get(index, primal)
+                           for index, primal in enumerate(primals)))
+        return jax.jvp(substituted, tuple(primals[index] for index in live),
+                       tuple(tangents[index] for index in live))[1]
+    return derivative
 
 
 def _over_plain(quotient, numerator, denominator, moving):
@@ -165,9 +159,10 @@ def _over_exact(quotient, numerator, denominator, moving):
                               (kept_denominator, kept_denominator)))
 
 
-_over_valued = exactly(_over_plain, _over_exact, "test_the_precision_seams_hold_every_order")
+_over_valued = contracted("test_the_precision_seams_hold_every_order")(
+    surrogate(_over_exact, as_plain(_over_plain), symbolic_zeros=True))
 """`over_denominator`'s map, valued range-safe and differentiated as PyTorch's order at every order
-(`exactly`), held by the division's contract; built once."""
+(`as_plain`), held by the division's contract; built once."""
 
 
 def _over_apply(residuals, moving):
@@ -186,7 +181,7 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
     2026-11-26 audit and its review). Its contract: every first derivative (the tangent and its pullback)
     finite and exact where PyTorch's is a normal value, as PyTorch's order rounds it, and across fp32's
     range where PyTorch's overflows or flushes; higher orders are JAX's derivatives of PyTorch's order
-    everywhere (`exactly`: `2^-126 / 16` under `2^40`, differentiated in its numerator, is `2^32`, row
+    everywhere (`as_plain`: `2^-126 / 16` under `2^40`, differentiated in its numerator, is `2^32`, row
     13247; `2^-100 / 2^30` under `2^100`, `2^40`, row 13261), those whose own intermediates leave the range
     row 13232's."""
     from .kernels.generation import linear_map
