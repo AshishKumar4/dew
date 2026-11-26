@@ -320,17 +320,29 @@ class StageLocal:
         (`supplied`): what a run checks against its first batch before it places the state."""
         return jax.eval_shape(functools.partial(self.state, convert=self.staged), state)
 
-    def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState]
-                 ) -> tuple[TrainState, TrainState]:
+    def supplied(self, state: TrainState, validated: Callable[[TrainState], TrainState], *,
+                 consumed: bool = False) -> tuple[TrainState, TrainState]:
         """A state given whole, wherever its arrays are (one device's, another mesh's), its runs stacked by
         stage onto the placement `validated` gives the stacked state's shapes, and that placement: placed
-        whole on this mesh first, as `validated` places it, and stacked there."""
+        whole on this mesh first, as `validated` places it, and stacked there. A state the caller hands on
+        (`consumed`, a fit's `state=`, which its first step donates on a plain layout alike) gives its
+        moving arrays to the stacking (`apart`), so its leaves the stacking keeps alias theirs and its
+        layers' are freed as their stacks are made: borrowed, the devices held the state twice through
+        the run's plan search (row 12463: a second fit of a 4B run held 69 GiB, 34.6 GiB its state, and
+        fit no rung). Its frozen trees, which the objective's tree shares, are never given."""
         stack = functools.partial(self.state, convert=self.staged)
         placement = validated(self.stacked_shapes(state))
         if not self.sites:
             return jax.device_put(state, placement), placement
         whole = jax.device_put(state, validated(jax.eval_shape(lambda given: given, state)))
-        return owned_program(stack, out_shardings=placement)(whole), placement
+        if not consumed:
+            return owned_program(stack, out_shardings=placement)(whole), placement
+        from dew.state import apart, together  # read where called, as this module reads dew.state's types
+
+        moving, frozen = apart(whole)
+        stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
+                                 out_shardings=placement, donate_argnums=0)
+        return stacking(moving, frozen), placement
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,

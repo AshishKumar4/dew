@@ -1097,3 +1097,38 @@ def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     for held, after in zip(jax.tree.leaves(adapter.variables[FROZEN]),
                            jax.tree.leaves(again.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(after))
+
+
+def test_a_fit_handed_a_scanned_runs_state_holds_it_once():
+    """A scanned run's second fit, handed the state its first returned on its stored layers, stacks it by
+    stage giving it the handed moving arrays (`Staging.supplied`, consumed): through its steps the devices
+    hold the state once, the handed arrays consumed, as a plain layout's first step consumes them (row
+    12463: a 4B run's second fit held the handed layers beside their stacks, 69 of a GH200's 90 GiB, and
+    fit no rung); the objective's frozen tree is never given."""
+    import gc
+
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    model = models.build("causal_transformer", **{**TINY_DECODER, "vocab_size": VOCAB, "num_layers": 4,
+                                                  "max_seq_len": SEQ})
+    variables = dict(LMObjective(model, SEQ).init(jax.random.key(0)))
+    variables[FROZEN] = {"spare": jnp.ones((256,), jnp.float32)}
+    objective = LMObjective(model, SEQ, variables=variables)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), split=1)
+    rows = Pipeline(Memory(token_rows(VOCAB, 64, SEQ + 1))).repeat().batch(BATCH)
+    state = trainer.fit(rows, steps=1, log_every=100)
+    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state))
+    frozen = jax.tree.leaves(objective.variables[FROZEN])
+    seen = []
+
+    def live(_) -> int:
+        gc.collect()
+        seen.append(sum(array.nbytes for array in jax.live_arrays() if not array.is_deleted()) / held)
+        return 0
+
+    trainer.fit(rows, state=state, steps=3, log_every=100, observe=Observe(1, live))
+    assert seen and max(seen) < 1.5, seen
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state.variables["params"]))
+    assert not any(leaf.is_deleted() for leaf in frozen)
+

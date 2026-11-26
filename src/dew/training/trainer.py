@@ -1567,7 +1567,7 @@ class Trainer(Generic[Loss, Effects]):
             # devices (`_fitting`), as a fresh or resumed one is.
             return (int(initial.step), None,
                     lambda begun=None: self._staging.supplied(
-                        initial, lambda staged: self._validated(staged)[0]),
+                        initial, lambda staged: self._validated(staged)[0], consumed=True),
                     self._staging.stacked_shapes(initial), None)
         start = streaming.laid_start(self, run, dataset, resume)
         if checkpoints is not None and checkpoints.latest is not None:
