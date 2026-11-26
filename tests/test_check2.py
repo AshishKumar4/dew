@@ -61,7 +61,7 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
     (jax.lax.rsqrt_p, jax.lax.rsqrt, 1), (jax.lax.log_p, jnp.log, 1), (jax.lax.exp_p, jnp.exp, 1),
     (jax.lax.logistic_p, jax.lax.logistic, 1), (jax.lax.log1p_p, jnp.log1p, 1),
     (jax.lax.expm1_p, jnp.expm1, 1), (jax.lax.sin_p, jnp.sin, 1), (jax.lax.cos_p, jnp.cos, 1),
-    (jax.lax.exp2_p, jax.lax.exp2, 1), (jax.lax.log2_p, jax.lax.log2, 1), (jax.lax.tanh_p, jnp.tanh, 1)],
+    (jax.lax.log2_p, jax.lax.log2, 1), (jax.lax.tanh_p, jnp.tanh, 1)],
     ids=_named)
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(primitive, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and

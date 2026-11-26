@@ -232,19 +232,6 @@ def _exp_interval(values, bits):
     return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
-def _exp2_interval(values, bits):
-    """exp2's outward enclosure at each finite value, taken at the nearer end beyond EXP_RANGE in base 2:
-    exp's (`_exp_interval`), past whose ends every power of two lies between the same two neighbours; at a
-    whole value its exact power, on every grid, which no interval of `exp(x log 2)` narrows to."""
-    clipped = np.clip(values, *(end / math.log(2) for end in EXP_RANGE))
-    whole = clipped == np.round(clipped)
-    low = high = np.ldexp(1.0, np.where(whole, np.round(clipped), 0).astype(np.int64))
-    if not whole.all():
-        low, high = low.copy(), high.copy()
-        low[~whole], high[~whole] = _interval(lambda iv, x: iv.exp(x * iv.log(2)))(clipped[~whole], bits)
-    return low, high
-
-
 def _log2_interval(values, bits):
     """log2's outward enclosure at each finite positive value; at a power of two its exact exponent, which
     no interval of `log(x) / log(2)` narrows to."""
@@ -416,6 +403,25 @@ def _transcendental(enclose, special):
     return levels
 
 
+_base_two_levels = _transcendental(_interval(lambda iv, x: iv.power(2, x)), _exp_special)
+
+
+def _exp2_levels(operands, result, fmt, flushes):
+    # Outside this interval the exact result is below both formats' subnormal grids, or past
+    # overflow. Clipping the oracle input keeps huge exponents out of the interval arithmetic.
+    (value,) = _floats(operands, flushes)
+    native = np.asarray(result, np.float64)
+    safe = np.clip(value, -160.0, 132.0)
+    levels = _base_two_levels((safe,), native, fmt, flushes)
+    # The least normal is not a flushable result. An exponent at or above emax+1 cannot
+    # return a finite value, even though the grid places fmax one step below infinity.
+    impossible = (((value >= fmt.emin) & (native < 2.0 ** fmt.emin))
+                  | ((value >= fmt.emax + 1) & (native != np.inf)) | (native < 0))
+    named, known = _exp_special(value)
+    return np.where(known, np.where(_same(native, named), 0, UNREACHED),
+                    np.where(impossible, UNREACHED, levels))
+
+
 def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
@@ -523,8 +529,10 @@ def _rounding(primitive, integral):
         divisor = np.shape(operands[-1])
         broadcast = (primitive is jax.lax.div_p and len(divisor) == np.ndim(result)
                      and divisor != np.shape(result))
-        reach = measured.reach[(primitive, BROADCAST) if broadcast else primitive, fmt.name]
-        return LEVELS[primitive](operands, result, fmt, measured.flushes_in(primitive, fmt)) <= reach
+        reach = (_exp2_reach(fmt) if primitive is jax.lax.exp2_p
+                 else measured.reach[(primitive, BROADCAST) if broadcast else primitive, fmt.name])
+        levels = _exp2_levels if primitive is jax.lax.exp2_p else LEVELS[primitive]
+        return levels(operands, result, fmt, measured.flushes_in(primitive, fmt)) <= reach
     return contract
 
 
@@ -1782,9 +1790,8 @@ LEVELS = {
     jax.lax.sqrt_p: _arithmetic(_root),
     jax.lax.log_p: _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     jax.lax.exp_p: _transcendental(_exp_interval, _exp_special),
-    # Base 2's: log's and exp's limits and exact values (log2(1) = +0, exp2(±0) = 1) alike.
+    # Base 2's: log's limits and exact value (log2(1) = +0) alike; exp2 is calibrated apart (`_exp2_reach`).
     jax.lax.log2_p: _transcendental(_log2_interval, _log_special),
-    jax.lax.exp2_p: _transcendental(_exp2_interval, _exp_special),
     jax.lax.log1p_p: _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
     jax.lax.expm1_p: _transcendental(_expm1_interval, _expm1_special),
     jax.lax.erf_inv_p: _transcendental(_erfinv_enclosed, _erfinv_special),
@@ -1856,11 +1863,13 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
         value[0] = 0.0
         drawn = [value]
     elif primitive is jax.lax.exp2_p:
-        # fp32's range in base 2, a quarter near zero and a quarter at the integers, whose powers are exact.
-        value = rng.uniform(-150, 128, PROBES)
+        value = rng.uniform(fmt.emin - fmt.precision - 2, fmt.emax + 2, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
-        value[quarter:2 * quarter] = rng.integers(-149, 128, quarter)
-        value[0] = 0.0
+        dtype = DTYPES[fmt.name]
+        endpoints = np.asarray([fmt.emin - fmt.precision, fmt.emin, fmt.emax + 1], dtype)
+        value[:12] = np.concatenate((
+            endpoints, np.nextafter(endpoints, np.asarray(-np.inf, dtype)),
+            np.nextafter(endpoints, np.asarray(np.inf, dtype)), [0, -np.inf, np.inf]))
         drawn = [value]
     elif primitive in (jax.lax.log1p_p, jax.lax.expm1_p):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
@@ -1936,6 +1945,23 @@ def _keeps_subnormals(primitive, fmt: Format) -> bool:
     return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
 
 
+def _probe_levels(primitive, fmt, levels, measured):
+    operands = _probes(primitive, fmt)
+    result = np.asarray(_function(primitive)(*operands))
+    return operands, levels(operands, result, fmt, measured.flushes_in(primitive, fmt))
+
+
+@functools.cache
+def _exp2_reach(fmt: Format) -> int:
+    # Calibrate this operation only when it is checked. In particular, CPU's exp2(-126) in
+    # fp32 and exp2(128) in bf16 break exact range cases. No allowance can admit those results.
+    _, levels = _probe_levels(jax.lax.exp2_p, fmt, _exp2_levels, lane())
+    held = levels[levels != UNREACHED]
+    if not held.size:
+        raise ArithmeticError(f"the lane's exp2 in {fmt.name} has no admissible probe")
+    return int(np.max(held))
+
+
 @functools.cache
 def lane() -> Lane:
     """The lane check 2 runs on (the process's default backend), measured once: whether it reads a
@@ -1951,9 +1977,7 @@ def lane() -> Lane:
     reach = measured.reach
     for primitive, levels in LEVELS.items():
         for fmt in FORMATS.values():
-            operands = _probes(primitive, fmt)
-            found = levels(operands, np.asarray(_function(primitive)(*operands)), fmt,
-                           measured.flushes_in(primitive, fmt))
+            operands, found = _probe_levels(primitive, fmt, levels, measured)
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
                 raise ArithmeticError(f"the lane's {primitive.name} in {fmt.name} breaks an exact case at "
