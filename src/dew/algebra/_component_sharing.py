@@ -14,7 +14,7 @@ _MIN_SHARED = 6
 
 
 class _Fragment(ast.NodeTransformer):
-    """Alpha-rename a flat fragment. Only static broadcast shapes/axes may vary between copies."""
+    """Alpha-rename a fragment without changing its caller's geometry or logical shift direction."""
 
     def __init__(self, scope: set[str]):
         self.scope = scope
@@ -33,6 +33,13 @@ class _Fragment(ast.NodeTransformer):
         if node.id in self.bound:
             return ast.Name(id=self.bound[node.id], ctx=node.ctx)
         return self._input(node.id)
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        # Both logical shifts have the same bind interface. The caller passes the original primitive.
+        if (node.attr in ("shift_left_p", "shift_right_logical_p")
+                and isinstance(node.value, ast.Name) and node.value.id == "lax"):
+            return self._input(ast.unparse(node))
+        return self.generic_visit(node)
 
     def visit_keyword(self, node: ast.keyword) -> ast.AST:
         if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):

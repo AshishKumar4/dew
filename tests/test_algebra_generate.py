@@ -126,18 +126,19 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
 def test_shared_component_preserves_two_ordered_spans_in_one_body():
     from dew.algebra import _component_sharing, terms
 
-    def phase(value):
-        offset = value + 1
-        square = offset * offset
-        limit = jnp.sqrt(square)
-        exponent = jax.lax.logistic(limit + value)
-        return jnp.maximum(exponent, value)
+    def phase(value, shift):
+        amount = jax.lax.min(value, np.uint32(3))
+        payload = jax.lax.add(value, np.uint32(5))
+        shifted = shift(payload, amount)
+        allowed = jax.lax.lt(value, np.uint32(8))
+        retained = jax.lax.select(allowed, shifted, jax.lax.full_like(value, 0))
+        return jax.lax.bitwise_xor(retained, value)
 
     def twice(value):
-        first = phase(value)
-        return first, phase(first)
+        first = phase(value, jax.lax.shift_left)
+        return first, phase(first, jax.lax.shift_right_logical)
 
-    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    shape = jax.ShapeDtypeStruct((8,), jnp.uint32)
     written = jax.make_jaxpr(twice)(shape)
     source, _ = printed.source(written, "twice", borrow_shapes=True)
     factored = _component_sharing.shared({"twice": source})
@@ -145,7 +146,7 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
     loaded = printed.loaded("\n\n".join(factored.values()), "twice")
     rebuilt = jax.make_jaxpr(loaded)(shape)
     assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(written, in_process=True)
-    value = np.linspace(-2, 2, shape.size, dtype=np.float32)
+    value = np.arange(shape.size, dtype=np.uint32)
     for actual, expected in zip(jax.jit(loaded)(value), jax.jit(twice)(value), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
