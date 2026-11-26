@@ -224,6 +224,20 @@ def test_a_giant_heads_radial_derivative_keeps_epsilons_share():
     np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
 
 
+def test_an_unclipped_giant_heads_derivative_is_the_identity():
+    """`[2^62, 2^62, 0, ...]` under `2^63`, a giant head the clip leaves as it is: a seed `[1, 2^-30, 0,
+    ...]` passes through it unchanged both ways, where subtracting and adding back its part along the head
+    lost the small component (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    x[:2], seed[0], seed[1] = 2.0 ** 62, 1.0, 2.0 ** -30
+    _, moved = jax.jvp(lambda x: clipped(x, 2.0 ** 63, 1e-6), (jnp.asarray(x),), (jnp.asarray(seed),))
+    np.testing.assert_array_equal(np.asarray(moved), seed)
+    _, pull = jax.vjp(lambda x: clipped(x, 2.0 ** 63, 1e-6), jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), seed)
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped
