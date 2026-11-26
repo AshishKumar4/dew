@@ -458,8 +458,9 @@ def test_numerics_store_every_fresh_parameter_where_one_module_states_its_storag
 
         def loss(self, variables, batch, step):
             params = variables["params"]
-            prediction = (self.model.apply({"params": params["model"]}, batch["x"])
-                          + self.other.apply({"params": params["other"]}, batch["x"])).astype(jnp.float32)
+            prediction = (jnp.asarray(self.model.apply({"params": params["model"]}, batch["x"]))
+                          + jnp.asarray(self.other.apply({"params": params["other"]}, batch["x"])))
+            prediction = prediction.astype(jnp.float32)
             return jnp.mean((prediction - batch["y"]) ** 2), Aux({})
 
     state = Trainer(Two(), optax.sgd(.1), key=jax.random.key(0),

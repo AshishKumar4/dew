@@ -828,11 +828,9 @@ def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> st
     return next(iter(stated)) if len(stated) == 1 else None
 
 
-def _own(module: object, name: str) -> DTypeLike | None:
-    """The dtype `module` states in its own field `name` (`dtype`, `param_dtype`), a Flax module's; None
-    where it states none or is no Flax module."""
-    if not isinstance(module, linen.Module):
-        return None
+def _own(module: linen.Module, name: str) -> DTypeLike | None:
+    """The dtype `module` states in its own field `name` (`dtype`, `param_dtype`); None where it states
+    none."""
     return next((getattr(module, field.name) for field in dataclasses.fields(module) if field.name == name),
                 None)
 
