@@ -645,8 +645,8 @@ def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[
         if field not in parameters(held.member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], unset
-    owner = kind if isinstance(held, Mapping) else held
-    if not (dataclasses.is_dataclass(owner) and field in _names(owner)):
+    named = kind if isinstance(held, Mapping) else held
+    if not (dataclasses.is_dataclass(named) and field in _names(named)):
         raise KeyError(f"{path} names no field of the run record")
     return [*groups, field], unset
 
