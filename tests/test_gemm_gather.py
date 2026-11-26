@@ -970,9 +970,11 @@ def test_a_refused_gathered_tile_leaves_its_launch_a_config_it_takes(depth):
     sizes = jnp.asarray([512, 512], jnp.int32)
     table = jnp.arange(1024, dtype=jnp.int32) % 512
 
+    epilogue = Hook(rounded_gated(gated_hook("swiglu"), bf16))
+
     def paired(tokens, first, second):
         return gemm.gemm(tokens, first, sizes, compute=bf16, out_dtype=bf16, out_dtypes=(bf16,) * 3,
-                         paired=second, gather=table, epilogue=Hook(rounded_gated(gated_hook("swiglu"), bf16)))
+                         paired=second, gather=table, epilogue=epilogue)
 
     shapes = (jax.ShapeDtypeStruct((512, depth), bf16), jax.ShapeDtypeStruct((2, depth, 512), bf16),
               jax.ShapeDtypeStruct((2, depth, 512), bf16))
