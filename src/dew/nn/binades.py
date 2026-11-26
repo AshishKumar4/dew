@@ -102,6 +102,18 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     return _scaled_by(significands, exponent)
 
 
+def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
+    """`seed * coefficient`, a subnormal coefficient (`q / d` below the normal range) raised by `2^64`
+    through a correctly rounded division by an exact power (`divided_in`, which reads a subnormal from its
+    bits) and the seed lowered by as much, so a CPU flushing subnormal operands multiplies normal values,
+    and both factors stay differentiable."""
+    held = jax.lax.stop_gradient(coefficient)
+    small = finite_nonzero(held) & ~normal(held)
+    shift = jnp.where(small, 64, 0)
+    return (seed * exact_power2(-shift, seed.dtype)) * divided_in(coefficient, exact_power2(-shift,
+                                                                                         coefficient.dtype))
+
+
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
                      denominator: jax.Array) -> jax.Array:
     """The size of `n / d`'s tangent in its denominator, `t n / d^2`, a linear map of `t` that is its own
@@ -123,19 +135,20 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
         held_quotient, held_numerator, held_denominator, held_moving = jax.lax.stop_gradient(
             (quotient, numerator, denominator, moving))
         twice = divided_in(held_quotient, held_denominator)
-        product = held_moving * twice
+        product = _flush_safe(held_moving, twice)
         special = ~(finite_nonzero(held_numerator) & finite_nonzero(held_denominator)) | ~jnp.isfinite(
             held_moving)
         # PyTorch's order wherever its product is a normal value (its quotients subnormal or not, each
         # rounded once as PyTorch's are, and its derivatives JAX's of that order at every order: row 13247),
-        # or the seed is zero; the balanced one only where that product overflows or flushes.
-        torch = special | normal(product) | ~finite_nonzero(held_moving)
+        # or the seed is zero beside a finite coefficient; the balanced one where that product overflows
+        # or flushes, a zero seed beside an infinite coefficient among them (zero, not `0 * inf`).
+        torch = special | normal(product) | (~finite_nonzero(held_moving) & jnp.isfinite(twice))
         # Each branch's operands where the other is chosen held at one, so neither's derivative meets the
         # other's infinities.
         kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))
         balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
                                                     for value in (numerator, denominator))
-        return jnp.where(torch, moving * divided_in(kept_quotient, kept_denominator),
+        return jnp.where(torch, _flush_safe(moving, divided_in(kept_quotient, kept_denominator)),
                          balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
                                   (balanced_denominator, balanced_denominator)))
 

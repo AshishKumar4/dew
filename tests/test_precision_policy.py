@@ -863,10 +863,11 @@ def test_a_correctly_rounded_divisions_denominator_derivative_keeps_its_derivati
     def tangent(n):
         return jax.jvp(lambda d: divided(n, d), (denominator,), (seed,))[1]
 
+    # Jitted, as a CPU that flushes subnormal operands lowers them.
     numerator = np.float32(2.0 ** -126)
-    assert float(tangent(numerator)) == -(2.0 ** -94)
-    assert float(jax.jvp(tangent, (numerator,), (np.float32(1),))[1]) == -(2.0 ** 32)
-    assert float(jax.grad(tangent)(numerator)) == -(2.0 ** 32)
+    assert float(jax.jit(tangent)(numerator)) == -(2.0 ** -94)
+    assert float(jax.jit(lambda n: jax.jvp(tangent, (n,), (np.float32(1),))[1])(numerator)) == -(2.0 ** 32)
+    assert float(jax.jit(jax.grad(tangent))(numerator)) == -(2.0 ** 32)
 
 
 @pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])
