@@ -44,10 +44,6 @@ from .precision import at_least_fp32, compensated_sum, float32_dot_general, scal
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
-GATED_HIDDEN = "gated_mlp_hidden"
-"""The checkpoint name of a gated MLP's hidden product (`GatedMLP._gated_down`), which no remat policy
-saves: its reverse mode forms it again from the gate and up projections' outputs it holds already."""
-
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
 
@@ -380,10 +376,10 @@ class GatedMLP(nn.Module):
         4096 tokens unrematerialized). Its value and every gradient are the product's and the projection's
         as they are, bitwise: the same functions, the product's recomputation its forward's."""
         def run(module, *held):
-            return module._down(checkpoint_name(product(*held), GATED_HIDDEN), train)
+            return module._down(product(*held), train)
 
-        policy = jax.checkpoint_policies.save_anything_except_these_names(GATED_HIDDEN)
-        return nn.remat(run, policy=policy)(self, *halves)
+        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads.
+        return nn.remat(run, policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:
