@@ -697,8 +697,8 @@
 "tests/test_attention_stability.py::test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges[small values beside unseen ones near fp32's largest, float32]"
 ],
 "tests/test_attention_template.py": [
-"tests/test_attention_template.py::test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys[causal-window-none-float32-spanned-at-the-half]",
-"tests/test_attention_template.py::test_every_parameter_layout_and_the_output_hook_are_on_par[cross-causal-lengths-starts-bfloat16]",
+"tests/test_attention_template.py::test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys[causal-window-sinks-float32-sliced-at-a-tile-edge]",
+"tests/test_attention_template.py::test_a_wider_initial_state_is_read_in_its_own_dtype",
 "tests/test_attention_template.py::test_the_scores_hide_exactly_the_keys_their_spans_hide[cross-causal-lengths-starts]"
 ],
 "tests/test_attention_triton.py": [
@@ -1750,6 +1750,9 @@
 "tests/test_fla_gdn.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[data-split0-per head]",
 "tests/test_fla_gdn.py::test_the_port_keeps_the_kernel_contract_on_a_mesh[tensor-split1-per key dimension]"
 ],
+"tests/test_fla_kda.py": [
+"tests/test_fla_kda.py::test_the_rule_on_the_port_is_as_exact_as_the_math[1-2-64-64-128]"
+],
 "tests/test_flaxdiff_family_source.py": [
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[simple_mmdit/published]",
 "tests/test_flaxdiff_family_source.py::test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs[unet_3d/published]",
@@ -2141,6 +2144,12 @@
 "tests/test_inkling2.py::test_a_config_it_cannot_compute_is_refused[kinds-disagreeing]",
 "tests/test_inkling2.py::test_its_logits_are_on_par_with_transformers[inkling2-tiny-nvfp4-stepped_logits]",
 "tests/test_inkling2.py::test_its_logits_are_on_par_with_transformers[inkling2-tiny-stepped_logits]"
+],
+"tests/test_inkling2_draft.py": [
+"tests/test_inkling2_draft.py::test_a_drafts_taps_mix_by_their_weights_rounded",
+"tests/test_inkling2_draft.py::test_its_taps_and_draft_are_on_par_with_the_releases[draft_bf16-bfloat16-context]",
+"tests/test_inkling2_draft.py::test_speculative_decoding_with_its_draft_emits_the_greedy_walk",
+"tests/test_inkling2_draft.py::test_taps_past_the_targets_visits_are_refused[past]"
 ],
 "tests/test_inpainting_runs.py": [
 "tests/test_inpainting_runs.py::test_dew_train_trains_an_inpainting_pipeline_through_its_masks[diffusion]",
