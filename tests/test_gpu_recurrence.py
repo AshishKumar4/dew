@@ -491,6 +491,44 @@ def test_the_recurrence_matrix_holds_on_this_gpu():
     run_cells(kernel_matrix.seeded_cells("recurrence"))
 
 
+@pytest.mark.gpu(reason="the generated score tile has to hold on the native compiler, not only the CPU")
+@pytest.mark.generations("sm90")
+def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.algebra import component_cases, component_cases_derived
+    from dew.nn.kernels.templates import bundles
+
+    form = component_cases.SCORES
+    family = bundles.of("sm90", jnp.bfloat16)
+    assert family is not None
+    shape = (64, 64)
+
+    def call(component):
+        def scores(products, decays, scales, out, product_tile, decay_tile, column, staged, ready):
+            for source, tile in ((products, product_tile), (decays, decay_tile), (scales, column)):
+                plgpu.copy_gmem_to_smem(source, tile, ready)
+            plgpu.barrier_wait(ready)
+            values = component(family.tile_of(product_tile), family.tile_of(decay_tile),
+                               family.columns_of(column))
+            plgpu.store(staged, values, optimized=False)
+            plgpu.commit_smem()
+            plgpu.copy_smem_to_gmem(staged, out)
+            plgpu.wait_smem_to_gmem(0)
+
+        tile = plgpu.SMEM(shape, jnp.float32)
+        scratch = (tile, tile, plgpu.SMEM((64,), jnp.float32), tile, plgpu.Barrier(num_arrivals=3))
+        return jax.jit(plgpu.kernel(scores, out_type=jax.ShapeDtypeStruct(shape, jnp.float32),
+                                   num_threads=1, thread_name="wg", scratch_types=scratch))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(rng.uniform(-0.5, 0.5, dims).astype(np.float32) for dims in (shape, shape, (64,)))
+
+    assert_as_exact(call(component_cases_derived.scores), call(form.function), draw,
+                    "Mosaic recurrence scores, generated or traced", seeds=8, truth_fn=jax.jit(form.truth))
+
+
 def test_the_short_conv_matrix_holds_on_this_gpu():
     """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
     XLA's conv, at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`); its other pairs are the

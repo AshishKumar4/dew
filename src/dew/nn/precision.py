@@ -2215,9 +2215,12 @@ def _rounded(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
+def _rounded_tangent(dtype, primals, tangents, value):
+    return tangents[0]
+
+
 rounded_operand = contracted("test_the_precision_seams_hold_every_order")(
-    surrogate(_rounded, lambda dtype, primals, tangents, value: tangents[0],
-              nondiff_argnums=(1,)))
+    surrogate(_rounded, _rounded_tangent, nondiff_argnums=(1,)))
 """The value `x` takes in `dtype`, held in `x`'s own dtype (`_rounded`), with a straight-through
 derivative (`dew.nn.derivatives.surrogate`): its tangent is `x`'s, never rounded a second time."""
 
