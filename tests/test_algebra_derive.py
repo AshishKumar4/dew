@@ -1463,6 +1463,60 @@ def test_mixed_covariance_in_a_constant_direction_is_zero(rows, states):
         np.testing.assert_array_equal(jax.jit(mixed)(x, w, dy), np.zeros((rows,), np.float64))
 
 
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_weighted_moments_keep_the_direction_when_dividing_first_would_flush(mode):
+    from dew.algebra import moments
+
+    x = jnp.asarray([[0.0, 2.0 ** -60]], jnp.float32)
+    w = jnp.asarray([[0.0, 2.0 ** 100]], jnp.float32)
+    dw = jnp.asarray([[2.0 ** 100, 0.0]], jnp.float32)
+
+    def weighted(weights):
+        return moments.chunked_moments(x, weights, tile=1, mode=mode)
+
+    _, (mean_direction, var_direction) = jax.jvp(weighted, (w,), (dw,))
+    np.testing.assert_array_equal(mean_direction, [-2.0 ** -60])
+    np.testing.assert_array_equal(var_direction, [2.0 ** -120])
+
+    def covariance(weights):
+        return moments.chunked_covariance(x, x, weights, tile=1, mode=mode)[2]
+
+    _, pull = jax.vjp(covariance, w)
+    (weight_gradient,) = pull(jnp.asarray([2.0 ** 100], jnp.float32))
+    np.testing.assert_array_equal(weight_gradient, [[2.0 ** -120, 0.0]])
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_zero_weighted_values_keep_zero_tangents_when_finite_weights_overflow_the_mass(mode):
+    from dew.algebra import moments
+
+    x = jnp.zeros((1, 2), jnp.float32)
+    w = jnp.full_like(x, 2.0 ** 127)
+    dw = jnp.asarray([[1.0, 0.0]], jnp.float32)
+
+    def run(weights):
+        return moments.chunked_moments(x, weights, tile=1, mode=mode)
+
+    value, tangent = jax.jvp(run, (w,), (dw,))
+    np.testing.assert_array_equal(jnp.stack((*value, *tangent)), np.zeros((4, 1), np.float32))
+
+
+def test_a_normal_weight_quotient_preserves_stationary_covariance_rounding():
+    from dew.algebra import moments
+
+    x = jnp.asarray([[2.0 ** 64, -(2.0 ** 64)]], jnp.float32)
+    y = jnp.asarray([[2.0 ** 63, -(2.0 ** 63)]], jnp.float32)
+    w = jnp.full_like(x, 0.75)
+    dw = jnp.asarray([[1.5 + 2.0 ** -22, 0.0]], jnp.float32)
+
+    def covariance(weights):
+        return moments.chunked_covariance(x, y, weights, tile=1, mode="merge")[2]
+
+    value, tangent = jax.jvp(covariance, (w,), (dw,))
+    np.testing.assert_array_equal(value, [2.0 ** 127])
+    np.testing.assert_array_equal(tangent, [0.0])
+
+
 def test_chunked_moments_directed_overflow_mixed_zero_weight_and_direct_jvp():
     """Weight tangents stay finite when `cx * cy` overflows, mixed 2nd derivatives at zero individual and
     all-zero weights match the plain declaration, and direct `derive` forms preserve zero-weight JVP."""
