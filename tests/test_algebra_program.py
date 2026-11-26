@@ -159,14 +159,17 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
     dims = (((1,), (1,)), ((), ()))
     full = jax.lax.DotAlgorithmPreset.F32_F32_F32
 
-    def scaled(x, y, scale, precision):
+    def scaled(x, y, scale, precision, mesh=None):
         s = scale
         x, y = x.astype(s.dtype), y.astype(s.dtype)
         if side == "left":
             x = x * s[:, None]
         else:
             y = y * s[:, None]
-        return jax.lax.dot_general(x, y, dims, precision=precision)
+        if mesh is None:
+            return jax.lax.dot_general(x, y, dims, precision=precision)
+        with jax.sharding.use_abstract_mesh(mesh):
+            return jax.lax.dot_general(x, y, dims, precision=precision)
 
     def draw(seed, length=128):
         rng = np.random.default_rng(seed)
@@ -223,6 +226,15 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
         placed = jax.make_jaxpr(plain)(x_shape, y_shape, s_shape)
     graph, _, (placed_dot,) = program.graphed(terms.region(placed))
     assert not graph.check_bool(algebra.rules.exact_int8_product(placed_dot))
+
+    # Warm the shape-identical windows in both orders. Only the dot enters the local scope.
+    def scoped(x, y, s):
+        return scaled(x, y, selected(s), full, mesh)
+
+    for length, arms in ((128, (plain, scoped)), (96, (scoped, plain))):
+        inputs = draw(0, length)
+        for arm in arms:
+            assert cheaper_spliced(arm, *inputs) == (arm is plain)
 
 
 def test_a_saturation_of_no_growth_or_depth_is_refused():

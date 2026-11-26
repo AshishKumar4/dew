@@ -1143,7 +1143,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                     and equation.params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
                 named = key(term)
                 # If equal terms come from more than one mesh scope, every source must admit the move.
-                full_fp32_sites[named] = full_fp32_sites.get(named, True) and _unplaced_dot(equation)
+                full_fp32_sites[named] = full_fp32_sites.get(named, True) and unplaced_dot(equation)
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -1185,7 +1185,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                   }), frozenset(named for named, allowed in full_fp32_sites.items() if allowed))
 
 
-def _unplaced_dot(equation: jcore.JaxprEqn) -> bool:
+def unplaced_dot(equation: jcore.JaxprEqn) -> bool:
     """A dot seen later outside the tracing context may still hold explicit or manual placement."""
     mesh = equation.ctx.cur_abstract_mesh
     if mesh is not None and (mesh.explicit_axes or mesh.manual_axes):

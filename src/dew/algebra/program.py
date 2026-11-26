@@ -331,7 +331,12 @@ def structure_of(invars: Sequence[jcore.Var], eqns: Sequence[jcore.JaxprEqn],
 
     equations = []
     for equation in eqns:
-        equations.append((terms.parameters_key(equation.primitive, equation.params),
+        primitive, params = equation.primitive, equation.params
+        signature = terms.parameters_key(primitive, params)
+        if primitive is jax.lax.dot_general_p and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32:
+            # Empty operand meshes do not imply that the dot was traced outside an explicit scope.
+            signature = (signature, terms.unplaced_dot(equation))
+        equations.append((signature,
                           tuple(map(operand, equation.invars)),
                           tuple(terms.parameter_key(var.aval) for var in equation.outvars)))
         for var in equation.outvars:
@@ -345,7 +350,8 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     type and placement, the sharding and memory its forms' values take, as `terms.parameter_key` encodes an
     abstract value); each equation's primitive, its
     parameters as a region holds them (`terms.parameters_key`), its operands (an input's or an earlier
-    output's position, or a literal's value and type) and its outputs' types; and which values it yields.
+    output's position, or a literal's value and type), its outputs' types, and a full-fp32 dot's placement
+    admission in its recorded equation context; and which values it yields.
     Two windows of one structure, their values named apart, derive one rewrite: every layer of a stack's,
     every compile's of one step."""
     return structure_of(window.invars, window.eqns, window.outvars)
