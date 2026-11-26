@@ -356,7 +356,8 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     inside the logarithm (MaxText's, `mla.indexer_kl`'s) capped the loss near 8.5 and stilled the low
     score's gradient; scored 64 apart at 2^30, its exact KL rounded to fp32; scored fp32's largest and
     least, its KL fp32's largest (its exact value rounds there), not an infinity, over one group and as
-    the mean of two, and as the mean of one group's KL past fp32's range and another's 0; and over one
+    the mean of two, and as the mean of one group's KL past fp32's range and another's 0; a teacher's least
+    normal mass at a gap of 2^126, its term held within fp32's rounding; and over one
     selected token beside a key it does not select, nothing, the selected token's score fp32's least."""
     query = jnp.zeros((1, 2, 1, 4), jnp.float32)
     key = jnp.zeros((1, 2, 1, 4), jnp.float32)
@@ -397,6 +398,16 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     beside = block_sparse.msa_query_kls(apart, point, keys, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
                                         scale=1.0)
     np.testing.assert_array_equal(np.asarray(beside)[0], np.asarray([0.0, largest], np.float32))
+    # A teacher's least normal mass (e^-87 of a group's two keys) at a gap of 2^126 beside a group's 0: its
+    # term (~1.4, half of it the mean's) held, not flushed where a share of the mass, subnormal, took it.
+    rare = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 1, 0, 0].set(1.0)
+    far = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 1, 0, 0].set(-87.0)
+    gapped = jnp.asarray([[[[0.0, -np.inf], [0.0, -2.0**126]], [[0.0, -np.inf], [0.0, 0.0]]]], jnp.float32)
+    found = block_sparse.msa_query_kls(gapped, rare, far, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                       scale=1.0)
+    mass = np.exp(-87.0) / (1 + np.exp(-87.0))
+    terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
+    assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0

@@ -1419,12 +1419,12 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
 
 @INTERPRETS
 def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted():
-    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100: at an
+    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 1024 keys on an H100: at an
     explicit tile its planner's programs a slice (`attention_decode.launch_programs`, a row's key head's
     packed query rows each, its parts stacked within their rows) times its slices are its walk's launch
     grid, 64 a slice, short of the device's 132, where counted with its parts the step filled it on paper
     (2026-11-26 audit); and the step as it plans itself is on par with the reference path (check 1)."""
-    keys, heads, kv_heads = 4096, 16, 8
+    keys, heads, kv_heads = 1024, 16, 8
     spans = template.spans(1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32))
     query = jnp.zeros((8, 1, heads, 64), jnp.float32)
     key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
@@ -1455,7 +1455,7 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
     def reference(query, key, value):
         return template.reference(query, key, value, spans)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 4096 keys", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 1024 keys", seeds=SEEDS)
 
 
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():

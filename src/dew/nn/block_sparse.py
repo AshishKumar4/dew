@@ -317,13 +317,18 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1, keepdims=True))
         peak = jnp.where(jnp.isfinite(peak), peak, 0)
         spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak), 0), axis=-1))
-        # Each term at its share of the groups' mean (`weight`, the teacher's over the groups), so no group's
-        # own KL past fp32's range is rounded before the mean takes it back.
-        weight = target / groups
+        # Each term at its share of the groups' mean, taken as its product and then divided where the product
+        # holds in fp32 (a teacher's least normal mass at its gap, divided first, went subnormal and flushed),
+        # its gap divided first where the product passes fp32's range, and its peak's and score's shares
+        # apart where the gap itself does: no group's own KL past fp32's range is rounded before the mean.
         held = jnp.where(taken, scores, 0)
         gap = peak - held
-        gaps = jnp.where(taken, jnp.where(jnp.isfinite(gap), weight * gap, weight * peak - weight * held), 0)
-        entropy = jnp.where(taken, weight * jnp.log(jnp.where(taken, target, 1)), 0)
+        product = target * gap
+        gaps = jnp.where(taken, jnp.where(
+            jnp.isfinite(product), product / groups,
+            jnp.where(jnp.isfinite(gap), target * (gap / groups),
+                      target * (peak / groups) - target * (held / groups))), 0)
+        entropy = jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)) / groups, 0)
         divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
         return jnp.where(jnp.any(keep, axis=-1), divergence, 0)
