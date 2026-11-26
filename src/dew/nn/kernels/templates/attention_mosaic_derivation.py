@@ -62,17 +62,21 @@ def _planned_stages(family: mosaic.Family, scope_of: Callable[[int], resources.S
 
 
 def _priced(target: generation.GpuTarget) -> generation.GpuTarget:
-    """The facts a derivation's priced choice reads on `target`: its generation's canonical part's
-    (`generation.TARGETS`) at `target`'s size (its multiprocessors and shared memory), as a launch's identity
-    reads it (`report._identity`), so the config a priced choice takes on one part is the one every part of
-    its generation and size takes (row 8372: a GH200's own prices took 64-key tiles where the H100's took 128
-    and named its kernels apart). Pricing alone: a launch's other schedule decisions that read a part's live
-    facts (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ."""
+    """The facts a derivation's priced choice reads on `target`: its generation's canonical table
+    (`generation.TARGETS`) read as `target`'s part (its device kind: a GH200's measured rates, latencies and
+    peaks, not the H100's) at `target`'s size (its multiprocessors and shared memory), as a launch's identity
+    reads it (`report._identity`). A build compiled ahead states its part's kind (`generation.built_target`,
+    `training.ahead.BuildTarget.device_kind`), so the part a prepare prices for is the part its run prices
+    on (row 8372: a GH200's run had priced its own facts where its prepare priced the canonical H100's,
+    and named its kernels apart; row 13252). A kind the generation's table names no part of reads the
+    canonical one's. Pricing alone: a launch's other schedule decisions that read a part's live facts
+    (`attention_mosaic_forward.rewalks_in_place`'s bandwidth and launch latency) still may differ."""
     canonical = generation.TARGETS.get(target.generation)
     if canonical is None:
         return target
-    return dataclasses.replace(canonical, multiprocessors=target.multiprocessors,
-                               shared_limit=target.shared_limit)
+    named = target.device_kind and generation.gpu_target(target.device_kind).generation == target.generation
+    return dataclasses.replace(canonical, device_kind=target.device_kind if named else canonical.device_kind,
+                               multiprocessors=target.multiprocessors, shared_limit=target.shared_limit)
 
 
 def _choice_key(op, ba: tokamax.BoundArguments, candidates: tuple[Tiles, ...] | tuple[BackwardTiles, ...],

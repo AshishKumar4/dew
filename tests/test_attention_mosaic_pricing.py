@@ -72,3 +72,19 @@ def test_a_launch_past_its_registers_or_at_a_rate_unstated_is_never_priced_whole
     assert blind.memory_rate is None
     _, _, _, candidates, prices, _ = _priced(("sm90", "Qwen3-8B"), target=blind)
     assert candidates and all(unpriced for unpriced, _ in prices), prices
+
+
+def test_a_derivation_prices_a_gh200_at_its_own_measured_facts():
+    """A derivation's priced facts on a GH200 (`attention_mosaic_derivation._priced`) are its part's, its
+    device kind and the memory rate measured on it, not the canonical H100's, at its size: a build compiled
+    ahead states its part (`generation.built_target`'s `device_kind`), so its prepare and its run price one
+    part's facts (row 13252); a kind its generation names no part of prices the canonical one's."""
+    from dew.nn.kernels.templates import attention_mosaic_derivation as derivation
+
+    gh200, h100 = (generation.gpu_target(kind) for kind in ("NVIDIA GH200 480GB", "NVIDIA H100 80GB HBM3"))
+    priced_gh200, priced_h100 = derivation._priced(gh200), derivation._priced(h100)
+    assert priced_gh200.device_kind == gh200.device_kind
+    assert priced_gh200.memory_rate == gh200.memory_rate != priced_h100.memory_rate
+    unnamed = dataclasses.replace(h100, device_kind="an unnamed sm90 part")
+    assert derivation._priced(unnamed).device_kind == generation.TARGETS["sm90"].device_kind
+
