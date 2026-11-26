@@ -362,6 +362,29 @@ def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witne
                 np.testing.assert_array_equal(got[held], want[held], err_msg=f"{witness} {mainloop} {name}")
 
 
+def test_a_shared_bias_summed_a_slab_at_a_time_is_its_exact_sum():
+    """A tile bias's gradient summed across 4 rows (`template.raised_sum`) a slab of its columns at a time
+    where its digits would hold more entries than its cap (row 10694: 5.47 GiB at once on an
+    A100), each column still its exact sum rounded once: rows of `±2^100` under shifts of 150 that cancel to
+    0 beside a 2^-149 part kept, and a row's own scale per column, the same bits as the whole sum's."""
+    rng = np.random.default_rng(10694)
+    grad = rng.standard_normal((4, 2, 3, 64)).astype(np.float32)
+    grad[:2, :, :, :8] = np.float32(2.0 ** 100) * np.array([1, -1], np.float32)[:, None, None, None]
+    grad[2:, :, :, :8] = np.float32(2.0 ** -149) * np.array([1, 0], np.float32)[:, None, None, None]
+    shift = jnp.asarray(np.array([150, 150, 0, 3], np.int32)).reshape(4, 1, 1, 1)
+    whole = np.asarray(template.raised_sum(jnp.asarray(grad), shift, (0,)))
+    slabbed = np.asarray(template.raised_sum(jnp.asarray(grad), shift, (0,), most=2 * 3 * 4 * 16))
+    assert slabbed.shape == whole.shape == (1, 2, 3, 64)
+    np.testing.assert_array_equal(slabbed.view(np.uint32), whole.view(np.uint32))
+    truth = sum(grad[row].astype(np.float64) * 2.0 ** int(np.asarray(shift).ravel()[row]) for row in range(4))
+    np.testing.assert_array_equal(slabbed[0, :, :, :8], np.float32(truth[:, :, :8]))
+    # A negative axis the sum's own: rows of 64 summed whole, never slabbed along themselves (at a cap of 96
+    # entries a slab the kept axis needs three slabs, the summed one two, the fewer).
+    ones = jnp.ones((3, 64), jnp.float32)
+    summed = template.raised_sum(ones, jnp.zeros((3, 1), jnp.int32), (-1,), most=96)
+    np.testing.assert_array_equal(np.asarray(summed), np.full((3, 1), 64.0, np.float32))
+
+
 def test_the_references_tangent_keeps_a_part_beneath_values_that_cancel():
     """One fp32 query over four keys of zero logits, values `2^127` in one channel (their sums past the
     format): the reference's tangent along the values `[2^127, -2^127, 2^-30, 0]` moves the mean by `2^-32`,

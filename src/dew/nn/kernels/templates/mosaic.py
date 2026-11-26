@@ -2203,7 +2203,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
         """fp32 `value`'s `count` bf16 parts (`product.formed`), natively each saturating one in the family's
-        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits."""
+        register layout a pair an instruction (`inline_forms.satfinite_bf16`), the same bits; a family of no
+        register layout (a TPU core's, `mosaic_tpu.MxuIssuer`) forms them portably."""
         if interpret:
             return product.formed(value, count)
         narrowed = functools.partial(inline_forms.satfinite_bf16, layout=self.layout)
