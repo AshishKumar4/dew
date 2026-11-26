@@ -270,8 +270,9 @@ def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
     bytes less: a `[tokens, hidden]` value a layer."""
     tokens, hidden, features = (2, 12), 48, 16
     holding_linear = functools.partial(_HoldingDense, dot_general=float32_dot_general)
+    # A precision level (no dot algorithm, which the layer's own product keeps): fp32 sums on every arm.
     layer, holding, truth = (GatedMLP(hidden_features=hidden, out_features=features, dtype=dtype, **fields,
-                                      **extra)
+                                      precision=jax.lax.Precision.HIGHEST, **extra)
                              for dtype, extra in ((jnp.bfloat16, {}),
                                                   (jnp.bfloat16, {"linear": holding_linear}),
                                                   (jnp.float64, {})))
@@ -309,7 +310,8 @@ def test_a_gated_mlps_down_projection_multiplies_the_inputs_an_interceptor_hands
     rule), so its output is zeros and so is every gradient under a cotangent, the down kernel's, the gate
     and up kernels' and the input's; and a capture of its calls (`capture_intermediates`) keeps the output
     the layer returns."""
-    layer = GatedMLP(hidden_features=48, out_features=16, dtype=jnp.bfloat16)
+    layer = GatedMLP(hidden_features=48, out_features=16, dtype=jnp.bfloat16,
+                     precision=jax.lax.Precision.HIGHEST)
     rng = np.random.default_rng(1)
     x = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
     cotangent = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
