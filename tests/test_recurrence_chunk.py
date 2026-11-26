@@ -145,8 +145,7 @@ def on_route(route: str | None):
 
 def routed(check, routes: tuple = ROUTES) -> Callable:
     """The decorator making `check` the test it decorates, run on each of `routes` (every one of `ROUTES`
-    where none are given, `on_route`): its name and documentation the test's, its one parameter the
-    route."""
+    where none are given, `on_route`): its name and documentation the test's, its one parameter the route."""
     def run(route):
         with on_route(route):
             check()
@@ -744,8 +743,7 @@ def transitioned(hooks: recurrence.Hooks, operands, seed: int):
 def test_a_transitions_chunks_are_as_exact_as_its_tokens(hooks, packed):
     """Each transition (`TRANSITIONS`) through the chunked op, which the portable math takes (its forms the
     token update's derived, `scan.derive_scan`), against the decode step's reference a token at a time
-    (`token_by_token`): output, final memory and every operand's gradient from float64 (check 1, row
-    9029)."""
+    (`token_by_token`): output, final memory and every operand's gradient from float64 (check 1, row 9029)."""
     def ours(operands, starts=None):
         return chunk(hooks, dataclasses.replace(operands, starts=starts), chunk_size=CHUNK)
 
@@ -858,6 +856,8 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+# Two draws a task: a case's eight drawing forty where its first are inconclusive took 107 to 158 s (13273).
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 @pytest.mark.parametrize('along', ['pulled back', 'pushed forward'])
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[4], ADDITIVE],
                          ids=['no decay', 'the delta rule', 'an additive erase'])
@@ -867,7 +867,7 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
     output, last memory and every operand's gradient (`pulled back`), or its tangent along its values, on
     par from float64 with the same call whole (check 1), each placed as its rows are (row 9690: its walk's
     carries, seeded within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a
-    no-decay call's gates, formed whole, its map's). Both directions in one case took 151 to 186 s (12802)."""
+    no-decay call's gates, formed whole, its map's)."""
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     rows = jax.sharding.NamedSharding(mesh, P('data'))
     run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
