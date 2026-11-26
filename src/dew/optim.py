@@ -479,9 +479,9 @@ def scale_by_neuron_norm(beta2: float = 0.95, eps: float = 1e-10, per_head: Mapp
             # In float32 at least, so a neuron's guard and a block's squared sums hold in a half dtype.
             working = matrices.astype(jnp.promote_types(matrices.dtype, jnp.float32))
             flat = moment.reshape(matrices.shape[0], matrices.shape[2])
-            # Each entry's squared magnitude, `|z|^2` of a complex one, whose `square` (`z^2`) would turn
-            # its imaginary part onto the real axis.
-            neuron = beta2 * flat + (1 - beta2) * jnp.mean(jnp.square(jnp.abs(working)), axis=1)
+            # Each entry's squared magnitude, `z conj(z)`'s real part (`|z|^2`) of a complex one, whose
+            # `square` (`z^2`) would turn its imaginary part onto the real axis; a real one's own square.
+            neuron = beta2 * flat + (1 - beta2) * jnp.mean(jnp.real(working * jnp.conj(working)), axis=1)
             divided = working / (jnp.sqrt(neuron)[:, None, :] + eps)
             blocks, blocked = headed(working, width), headed(divided, width)
             norm = (jnp.linalg.norm(blocks[0], axis=(1, 2), keepdims=True)

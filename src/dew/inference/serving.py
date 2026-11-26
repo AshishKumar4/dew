@@ -716,7 +716,11 @@ def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None
     does (`dew.objectives.rl.RolloutScheduler.episodes`)."""
     *_, strategy = task.controls().components()
     layout = _laid(task.model, cache, capacity, strategy, None)
-    shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None)
+    own = task.model.kv_cache if isinstance(task.model, Layered) else None
+    # A model declaring pages of its own keeps them wherever a prefix cache over them pays, at any
+    # capacity; the measured crossover chooses pages over a model's whole rows (`_pages_pay`).
+    shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None,
+                                               measured=own is None or own.page_size is None)
     return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
@@ -1939,11 +1943,12 @@ the owner allowing no penalty where pages do not pay."""
 
 
 def _pages_pay(model: nn.Module, paged: KVCache, capacity: int, strategy: Strategy,
-               prefill_mesh: Mesh | None) -> bool:
+               prefill_mesh: Mesh | None, *, measured: bool = True) -> bool:
     """Whether shared pages (`PagedKV.shared`) pay over whole rows of `capacity` slots: a server over
     `paged` keeps a prefix cache (`_reuses_prefixes`), the model's max_seq_len holds a row in whole pages
-    (`_holds`), and the row is at least the measured crossover's (`SHARED_PAGES_FROM`)."""
-    return (type(capacity) is int and capacity >= SHARED_PAGES_FROM
+    (`_holds`), and, where `measured` (pages chosen over whole rows, not a model's own), the row is at
+    least the measured crossover's (`SHARED_PAGES_FROM`)."""
+    return ((not measured or (type(capacity) is int and capacity >= SHARED_PAGES_FROM))
             and _holds(model, capacity, paged.page_size)
             and _reuses_prefixes(model, paged, strategy, prefill_mesh))
 

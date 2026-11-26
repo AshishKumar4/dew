@@ -227,9 +227,9 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
 
 def test_normuon_normalizes_a_complex_update_by_its_entries_magnitudes():
     """NorMuon's normalization of a complex update (`scale_by_neuron_norm`) decays each neuron's mean
-    squared magnitude `|z|^2`, real, so its update is NorMuon's of the magnitudes, on par from float64 with
-    the paper's arithmetic on `|z|^2` (check 1), where `square` (`z^2`) turned each imaginary part onto the
-    real axis; a real update is its own as before."""
+    squared magnitude `|z|^2` (`z conj(z)`'s real part), so its update is NorMuon's of the magnitudes, on
+    par from float64 with the paper's arithmetic on `|z|^2` (check 1), where `square` (`z^2`) turned each
+    imaginary part onto the real axis; a real update's arithmetic is its own as before."""
     from dew.optim import scale_by_neuron_norm
 
     def draw(seed):
@@ -244,7 +244,7 @@ def test_normuon_normalizes_a_complex_update_by_its_entries_magnitudes():
 
     @as_given
     def paper(update):
-        moment = 0.05 * np.mean(np.abs(update) ** 2, axis=0)
+        moment = 0.05 * np.mean(np.real(update * np.conj(update)), axis=0)
         divided = update / (np.sqrt(moment) + 1e-10)
         return divided * np.linalg.norm(update) / (np.linalg.norm(divided) + 1e-10)
 
