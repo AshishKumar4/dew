@@ -71,7 +71,8 @@ def test_the_engine_rewrites_a_derived_walk_and_it_computes_the_declared_functio
     The numerical gate compares the actual derived walk with the written whole-operand function
     against independent wide arithmetic.
     """
-    derived = derive.derive(walks.declared(row_scaled_attention), accurate=False, saturation=algebra.SATURATION)
+    derived = derive.derive(walks.declared(row_scaled_attention), accurate=False,
+                            saturation=algebra.SATURATION)
     q, k, v = walks.draw(0)
     with report.refusals():
         jax.make_jaxpr(walks.walked_whole(derived))(q, k, v)
