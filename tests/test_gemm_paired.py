@@ -1634,3 +1634,28 @@ def test_a_paired_epilogue_returning_a_rounding_twice_reads_the_named_one():
 
     _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 4, kept=True,
                            named=(None, None, "gate_proj", "up_proj"))
+
+
+def test_an_fp16_adapted_products_factor_gradient_past_fp16s_range_takes_wide_operands():
+    """An fp16 adapted product whose scaled update's cotangent passes fp16's largest (`scale` 2^12 times
+    cotangents of 2^6 through a factor of 2^3, 2^21 an entry): its rank factor's gradient is formed from
+    wide operands (`low_rank._backward`'s `held`), finite and its float64 value's to fp32's rounding, where
+    the narrow products every call in range takes would read infinity (row 1304): 2^13 an entry."""
+    from dew.nn.kernels import low_rank
+
+    rows, depth, width, rank = 16, 32, 16, 4
+    x = jnp.full((rows, depth), 2.0 ** -12, jnp.float16)
+    w = jnp.zeros((depth, width), jnp.float16)
+    a = jnp.full((depth, rank), 2.0 ** -8, jnp.float16)
+    b = jnp.full((rank, width), 2.0 ** -1, jnp.float16)
+    dy = jnp.full((rows, width), 2.0 ** 6, jnp.float16)
+
+    def adapted(a):
+        return low_rank.low_rank(x, w, a, b, 2.0 ** 12, out_dtype=jnp.float16)
+
+    _, pull = jax.vjp(adapted, a)
+    (d_a,) = pull(dy)
+    scaled = 2.0 ** 12 * (np.full((rows, width), 2.0 ** 6) @ np.full((width, rank), 2.0 ** -1))
+    truth = np.full((depth, rows), 2.0 ** -12) @ scaled
+    assert scaled.max() > np.finfo(np.float16).max
+    np.testing.assert_array_equal(np.asarray(d_a, np.float64), truth.astype(np.float16).astype(np.float64))

@@ -106,6 +106,15 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                                               precision=at_work, preferred_element_type=wide)
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
+    # Narrow rows' cotangents (bf16, fp16) take the narrow products every call in range takes, as the adapter
+    # apart multiplies them (row 1304: fp32 operands at an exact precision made the factors' gradients the
+    # fused training's loss, growing with the rank, M-EM-56); `held`, whether the scaled update's cotangent
+    # is a normal value of that width or zero, else each product of it takes the wide operands.
+    narrow = jnp.dtype(work).itemsize < 4
+    held = None
+    if narrow and (wants_lhs or wants_a):
+        size, limits = jnp.abs(scaled), jnp.finfo(work)
+        held = jnp.all((size == 0) | ((size <= limits.max) & (size >= limits.tiny)))
     if wants_lhs:
         # The matrices as the forward multiplied them, in the rows' dtype, joined with the cotangents at the
         # cotangent's width; where the scaled update's cotangent (`scaled`, wide) is no normal value of that
@@ -121,12 +130,8 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                                  precision=_kept(precision) if wide_operands else precision,
                                  interpret_on_cpu=interpret_on_cpu)
 
-        if jnp.dtype(work).itemsize >= 4:
-            d_lhs = joined(work)
-        else:
-            size, limits = jnp.abs(scaled), jnp.finfo(work)
-            held = jnp.all((size == 0) | ((size <= limits.max) & (size >= limits.tiny)))
-            d_lhs = jax.lax.cond(held, lambda: joined(work), lambda: joined(wide))
+        d_lhs = (joined(work) if held is None
+                 else jax.lax.cond(held, lambda: joined(work), lambda: joined(wide)))
 
     # A replicated operand's gradient inside a checked `shard_map` is each device's partial over the rows it
     # holds, summed over the axes the rows vary over and the operand does not (`sharding.summed_to`), each
@@ -139,21 +144,29 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
         d_kernel = gemm_t(lhs.astype(work), dy, group_sizes, out_dtype=formed_in(kernel), precision=at_work,
                           interpret_on_cpu=interpret_on_cpu)
         d_kernel = d_kernel[0] if group_sizes is None else d_kernel
-    # The factors' gradients from the wide `scaled` (the rank-wide product's sum, unrounded) and from `t` as
-    # the forward multiplied it, rounded to the rows' dtype: fp32 operands each, at a precision keeping them.
+    # The factors' gradients from `scaled` (the rank-wide product's cotangent) and from `t` as the forward
+    # multiplied it, rounded to the rows' dtype: under narrow rows each a narrow product summed in fp32 (the
+    # adapter apart's), else fp32 operands at a precision keeping them.
     kept = _kept(precision)
+
+    def factor(left, right, dtype, at, operand):
+        if group_sizes is None:
+            return jnp.dot(left.T.astype(dtype), right.astype(dtype), precision=at,
+                           preferred_element_type=wide)
+        return gemm_t(left.astype(dtype), right.astype(dtype), group_sizes, out_dtype=formed_in(operand),
+                      precision=at, interpret_on_cpu=interpret_on_cpu)
+
     if wants_a:
-        d_a = (jnp.dot(lhs.T.astype(wide), scaled, precision=kept, preferred_element_type=wide)
-               if group_sizes is None
-               else gemm_t(lhs.astype(wide), scaled, group_sizes, out_dtype=formed_in(a), precision=kept,
-                           interpret_on_cpu=interpret_on_cpu))
+        if held is None:
+            d_a = factor(lhs, scaled, wide, kept, a)
+        else:
+            d_a = jax.lax.cond(held, lambda: factor(lhs, scaled, work, precision, a),
+                               lambda: factor(lhs, scaled, wide, kept, a))
     if wants_b:
-        # `t` holds the scale already: tᵀ · dy is the factor's gradient whole.
-        rank = t.astype(lhs.dtype).astype(wide)
-        d_b = (jnp.dot(rank.T, dy.astype(wide), precision=kept, preferred_element_type=wide)
-               if group_sizes is None
-               else gemm_t(rank, dy.astype(wide), group_sizes, out_dtype=formed_in(b), precision=kept,
-                           interpret_on_cpu=interpret_on_cpu))
+        # `t` holds the scale already: tᵀ · dy is the factor's gradient whole; `t` in the rows' dtype is the
+        # operand the forward multiplied, in range wherever that product was.
+        rank = t.astype(lhs.dtype)
+        d_b = factor(rank, dy, work, precision, b) if narrow else factor(rank, dy, wide, kept, b)
     if wants_scale:
         d_scale = jnp.sum(through * _rank_product(lhs, a, jnp.ones((), wide), precision, group_sizes))
     gradients = tuple(None if d is None else summed_to(d, operand).astype(operand.dtype) for d, operand in
