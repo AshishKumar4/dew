@@ -523,7 +523,17 @@ def test_an_msa_decoder_of_a_top_of_one_selects_each_querys_own_block_alone():
                   if "selected" in "/".join(str(key) for key in path)]
     assert selections
     for selected in selections:
-        np.testing.assert_array_equal(np.asarray(selected)[..., 0], np.arange(16) // 4)
+        first = np.asarray(selected)[..., 0]
+        assert first.shape[-1] == 16
+        np.testing.assert_array_equal(first, np.broadcast_to(np.arange(16) // 4, first.shape))
+
+
+def test_an_msa_decoder_refuses_a_logit_softcap():
+    """An MSA decoder under a logit softcap is refused at build: its indexer's loss targets its heads' plain
+    softmax (`msa_query_kls`), which the softcapped attention it would train toward parts from."""
+    with pytest.raises(ValueError):
+        tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8),
+             attn_logit_softcap=30.0).init(jax.random.key(1), jnp.zeros((1, 16), jnp.int32))
 
 
 @pytest.mark.parametrize(("selection", "refused"), [("moba", False), ("infllm", True), ("msa", True)])

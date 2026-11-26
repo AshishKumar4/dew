@@ -547,6 +547,9 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if self.selection == "infllm" and self.block % INFLLM_STRIDE:
             raise ValueError(f"InfLLM-V2's selection pools keys every {INFLLM_STRIDE} places into whole "
                              f"blocks, so takes a block of them, got {self.block}")
+        if self.selection == "msa" and ctx.attn_logit_softcap is not None:
+            raise ValueError("MSA's indexer loss takes its heads' plain softmax as its target, which a logit "
+                             "softcap would part from the attention it trains toward")
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")
