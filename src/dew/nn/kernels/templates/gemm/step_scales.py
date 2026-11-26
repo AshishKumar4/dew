@@ -29,8 +29,8 @@ SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling.UNSWI
 
 def walked(step_scales: tuple | None, n: int, block_n: int, extent: int) -> tuple:
     """A blockwise-scaled call's `step_scales` as its walk reads them: its rows' scales padded and
-    extended as the rows (`mosaic_gpu._walked_rows`), its columns' a tile's (`column_scales`), and the columns a scale
-    of a tile (`per`, 1 without them)."""
+    extended as the rows (`mosaic_gpu._walked_rows`), its columns' a tile's (`column_scales`), and the
+    columns a scale of a tile (`per`, 1 without them)."""
     if step_scales is None:
         return None, 1
     columns, per = column_scales(step_scales[1], n, block_n)

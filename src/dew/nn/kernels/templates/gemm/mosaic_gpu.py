@@ -78,8 +78,8 @@ from dew.nn.kernels.templates.gemm import (
     rows_padded,
     sides_extended,
     sides_padded,
+    step_scales as scales_of,
 )
-from dew.nn.kernels.templates.gemm import step_scales as scales_of
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
 from dew.nn.kernels.templates.gemm.hooks import NO_READ_OUT, read_out
 from dew.nn.kernels.templates.gemm.pricing import (
@@ -651,7 +651,7 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, dtype, pro
         _gmm_step, family=step_family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows, idle=idle,
         transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows, packed_format=packed_format,
-        block_k=tiles.block_k, scaling=scales_of.scaling(*scaled, tile[2], rows),
+        block_k=tiles.block_k, scaling=scales_of.scaling(scaled[0], scaled[1], scaled[2], tile[2], rows),
         chosen=chosen, **refs)
     prefetching = idle is None and prefetches(
         family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,

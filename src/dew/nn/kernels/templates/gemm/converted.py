@@ -80,6 +80,13 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
     def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
         return grouped_matmul.MosaicGmm._swaps_on(self, family, dtype)
 
+    def candidate(self, ba, config: tiling.Tiles, target) -> bool:
+        # Its stages convert at any width, each consumer its own share of columns or rows where they share
+        # none (`packed.shared_decode`): no packed matrix's 64-column fragments, so a swapped call's narrow
+        # columns (a decode's rows) take a tile.
+        return (config.cluster == 1 and config.splits == 1 and not config.swapped
+                and grouped_matmul.MosaicGmm.candidate(self, ba, config, target))
+
     def _swapped(self, ba, target):
         # The bfloat16 call's swapped binding (`MosaicGmm._swapped`), its rows the matrix's codes.
         swapped = grouped_matmul.MosaicGmm._swapped(self, ba, target)
