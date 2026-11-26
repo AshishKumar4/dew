@@ -2200,15 +2200,53 @@ def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_o
     assert anywhere.differences(h100) == [] and anywhere.differences(stated) == []
 
 
-def test_a_programs_lowering_for_a_stated_kind_derives_its_launches_from_that_part():
-    """Within `lowering_for` of a stated kind (a node's own topology's, as `compile_programs` and a prepare's
-    trace read it) the GPU in effect is that part's target, and the generation's canonical one without it
-    (row 13252: a GH200 prepare's launches priced as the canonical H100's)."""
-    from dew.nn.kernels.generation import built_target, gpu_target
-    from dew.training.ahead import lowering_for
+def test_a_programs_lowering_over_a_hosts_own_gpus_derives_for_its_kind_and_admits_its_own_kernels(tmp_path):
+    """Within `lowering_for` over a node's own topology's GPUs (`host_gpus`, a prepare's), the GPU in effect
+    is that kind's own target, the program for that GPU alone (`assumed`, not portable), certified on that
+    device, so a kernel whose plan holds to its GPU's model (cuDNN's) is refused for no portability; over
+    the generation's compile-only GPUs it is portable and cuDNN's refused so (rows 13252, 13275)."""
+    from generation_support import node_topology
 
-    with lowering_for("sm90", device_kind="NVIDIA GH200 480GB"):
-        assert gpu_target() == built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    from dew.nn import attention_kernels
+    from dew.nn.kernels.generation import assumption, built_target, gpu_target
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import host_gpus, lowering_for
+
+    own = host_gpus("sm90", node_topology(tmp_path / "topology.bin", gpu="sm90"), 1)
+    with lowering_for("sm90", devices=own):
+        assert gpu_target() == built_target("sm90", device_kind=own[0].device_kind)
+        assert not assumption().portable and report._certifying_device() == own[0]
+        refused = attention_kernels._unlowered("cudnn")
+        assert refused is None or "compiled for any" not in refused
     with lowering_for("sm90"):
-        assert gpu_target() == built_target("sm90")
+        assert gpu_target() == built_target("sm90") and assumption().portable
+        assert "compiled for any" in attention_kernels._unlowered("cudnn")
 
+
+def test_a_build_pinned_to_a_kind_loads_on_no_list_mixing_kinds_in_either_order():
+    """A list of GPUs of one generation and multiprocessors whose kinds differ (an H100's and an H200's, both
+    132) states no one kind (`held_kind`), whichever comes first: a build pinned to the H100 is refused
+    there, a generation's canonical build is not, and none is made over them as a host's own (`host_kind`,
+    which every build over a host's GPUs is pinned by) (row 13276)."""
+    from dataclasses import dataclass
+
+    from dew.nn.kernels.generation import built_target
+    from dew.training.ahead import BuildTarget, held_kind, host_kind
+
+    @dataclass(frozen=True)
+    class Gpu:
+        device_kind: str
+        platform: str = "gpu"
+
+    h100, h200 = Gpu("NVIDIA H100 80GB HBM3"), Gpu("NVIDIA H200")
+    assert held_kind([h100, h100]) == host_kind([h100, h100]) == h100.device_kind
+    pinned = BuildTarget.built(built_target("sm90", device_kind=h100.device_kind), 2,
+                               device_kind=h100.device_kind)
+    canonical = BuildTarget.built(built_target("sm90"), 2)
+    for mixed in ([h100, h200], [h200, h100]):
+        assert held_kind(mixed) is None
+        # No build is made over them as a host's own (`host_gpus`, the step's and a program's compile).
+        with pytest.raises(ValueError):
+            host_kind(mixed)
+        loading = dataclasses.replace(pinned, device_kind=held_kind(mixed))
+        assert pinned.differences(loading) != [] and canonical.differences(loading) == []
