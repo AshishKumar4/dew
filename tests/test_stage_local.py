@@ -1156,3 +1156,17 @@ def test_a_staged_run_handed_a_state_on_another_placement_frees_what_it_was_hand
     assert int(restarted.step) == 2
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(handed.variables["params"]))
 
+
+@pytest.mark.mesh(devices=8)
+def test_a_staged_runs_state_handed_to_a_run_keeping_every_layer_whole_frees_its_banks():
+    """A two-stage run's state, its banks stacked by stage, handed to a run over the same stages that keeps
+    every layer whole on every stage (`Layout(stage_local=False)`, no runs to stack), is taken over all the
+    same: its banks cut onto that run's layers (`received`) and its original banks freed once placed
+    (`Staging.supplied`), and the run trains from it (row 13238)."""
+    model, optimizer = decoder(), optax.adam(1e-2)
+    trained = trainer(model, optimizer, STAGED, 8).fit(stream(), steps=1, log_every=1)
+    whole = trainer(model, optimizer, STAGED, 8, stage_local=False)
+    restarted = whole.fit(stream(), steps=2, log_every=1, state=trained)
+    assert int(restarted.step) == 2
+    assert all(leaf.is_deleted() for leaf in jax.tree.leaves(trained.variables["params"]))
+
