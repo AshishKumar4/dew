@@ -52,12 +52,25 @@ def main() -> None:
                              out_shardings=out_specs)(parameters, x, weights, ids)
         assert actual[0][1].dtype == dtype
         maxima = []
-        for ours, theirs in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        (value, out), (d_parameters, d_x, d_weights) = actual
+        (value_, out_), (d_parameters_, d_x_, d_weights_) = expected
+        compared = [*((ours, theirs, False) for ours, theirs in zip(
+            jax.tree.leaves((value, out, d_parameters, d_weights)),
+            jax.tree.leaves((value_, out_, d_parameters_, d_weights_)), strict=True)), (d_x, d_x_, True)]
+        for ours, theirs, routed in compared:
+            whole = np.asarray(theirs).astype(np.float64)
+            # The exchange rounds each route's cotangent to the rows' dtype as it crosses back, before its
+            # token sums them wide; the one-process dispatch sums them unrounded (row 12396): a narrow
+            # input's cotangent apart by a rounding a route, at its largest entry's ulp.
+            narrow = routed and jnp.finfo(theirs.dtype).bits < 32
+            rtol = float(jnp.finfo(theirs.dtype).eps) if narrow else 3e-5
+            atol = rtol * float(np.max(np.abs(whole), initial=0)) if narrow else 3e-5
             for shard in ours.addressable_shards:
                 a = np.asarray(shard.data).astype(np.float64)
-                b = np.asarray(theirs)[shard.index].astype(np.float64)
-                np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-5)
-                maxima.append(float(np.max(np.abs(a - b), initial=0)))
+                b = whole[shard.index]
+                np.testing.assert_allclose(a, b, atol=atol, rtol=rtol)
+                # Each error as its share of its leaf's tolerance (`assert_exchange_across_processes`).
+                maxima.append(float(np.max(np.abs(a - b) / (atol + rtol * np.abs(b)), initial=0)))
         errors[f'{jnp.dtype(dtype).name}/{activation}/{skewed}'] = maxima
     output.write_text(json.dumps({'processes': jax.process_count(), 'errors': errors}))
     jax.distributed.shutdown()
