@@ -99,7 +99,8 @@ def attested[**P, R](function: Callable[P, R], rule: str, *, inputs: int = 0, ou
     attention states its roles: the first `inputs` operands and `outputs` outputs on its queries'
     positions."""
     assert rule in (CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE), rule
-    assert (rule == TOKENWISE) == (inputs == outputs == 0), (rule, inputs, outputs)
+    assert (inputs == outputs == 0) if rule == TOKENWISE else (inputs > 0 and outputs > 0), (rule, inputs,
+                                                                                               outputs)
     record = Attested(rule, inputs, outputs)
 
     def recorded(program: core.Jaxpr) -> None:
