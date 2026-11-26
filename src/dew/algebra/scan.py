@@ -705,7 +705,8 @@ def _form(extents: linear_scan.Extents, corrected: bool,
     prices the forms (`cost.pricing_key`, `cost.product_work`): different prices require a new derivation. Its
     products are priced at the precision they run at (`_portable`'s, IEEE float32 whatever the configured
     one), so the configured precision is no fact of the form."""
-    return _derived_form(extents, corrected, cost.pricing_key(cost.target()), ALGEBRA.value.checked, saturation)
+    return _derived_form(extents, corrected, cost.pricing_key(cost.target()), ALGEBRA.value.checked,
+                         saturation)
 
 
 @functools.cache
