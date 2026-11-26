@@ -1767,8 +1767,8 @@ layer."""
 
 @attending("reference")
 @pytest.mark.parametrize(("family", "order", "loop"), [
-    ("llama", (0, 0, 0, 1), Loop(3, (0, 1), step_norm=False)),
-    ("gemma3_text", (0, 1, 0, 1), Loop(2, (0, 2), step_norm=False)),
+    ("llama", (0, 0, 0, 1), Loop(steps=3, layers=(0, 1), step_norm=False)),
+    ("gemma3_text", (0, 1, 0, 1), Loop(steps=2, layers=(0, 2), step_norm=False)),
 ], ids=["llama-one-layer", "gemma3-sliding-and-full"])
 def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_layers(tmp_path, family, order,
                                                                                      loop):
