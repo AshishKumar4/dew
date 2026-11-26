@@ -470,14 +470,17 @@ def _summed(factors, operands: tuple, shape: tuple[int, ...], weights: scaled.Sc
             ) -> scaled.Scaled:
     """`sum_s weights_s x_s y_s` (the products alone where `weights` is None), `(x_s, y_s)` the
     `factors(*operands_s)` over the operands' and the weights' first axis, a term at a time in scaled
-    arithmetic, each product of the factors' scaled values: a sum of products past the format's range where
+    arithmetic. A factor of None is the identity when only one operand accompanies its held weight.
+    The sum keeps products past the format's range where
     the total is not kept (ReviewMomentum1454: `g(1, 2) w_1` -2^128 where the memory leaving is -2^127),
     and a product beneath its least normal kept for the weight that raises it (`q M` 2^-129 under a weight
     of -16, -2^-125), its carry typed as its operands vary (a checked `shard_map`'s)."""
     def term(total, step):
         *each, significand, exponent = step
         x, y = factors(*each)
-        weighed = scaled.mul(scaled.scaled(x), scaled.scaled(y))
+        weighed = scaled.scaled(y)
+        if x is not None:
+            weighed = scaled.mul(scaled.scaled(x), weighed)
         if weights is not None:
             weighed = scaled.mul(weighed, scaled.Scaled(significand, exponent, weights.reach))
         total = scaled.add(scaled.Scaled(total[0], total[1], LOCAL_REACH), weighed)
@@ -569,7 +572,18 @@ def _mapped(chunk: Chunked, state, w, issue=None):
     pair = state[1]
     weights = scaled.Scaled(chunk.sums.significand.T[..., None], chunk.sums.exponent.T[..., None],
                             chunk.sums.reach)
-    scored = _summed(_outer, (chunk.dots.T, w), (chunk.dots.shape[0], w.shape[-1]), weights)
+    shape = chunk.dots.shape[0], w.shape[-1]
+
+    def recover():
+        # The ordinary score can exceed the format even when its contribution to the state read is
+        # finite. Keep the score's exponent through the weight and corrected value, then sum.
+        dots = _read(chunk.queries, chunk.keys.T)
+        transposed = scaled.Scaled(dots.significand.T[..., None], dots.exponent.T[..., None], dots.reach)
+        scaled_weights = scaled.mul(transposed, weights)
+        return _summed(lambda values: (None, values[None, :]), (w,), shape, scaled_weights)
+
+    scored = lax.cond(jnp.any(~jnp.isfinite(chunk.dots)), recover,
+                      lambda: _summed(_outer, (chunk.dots.T, w), shape, weights))
     memory = scaled.mul(_read(chunk.queries, pair[0]), _column(chunk.kept_to))
     momentum = scaled.mul(_read(chunk.queries, pair[1]), _column(chunk.momentum))
     scores, flushed = _weighed(chunk.dots, chunk.sums)

@@ -1273,6 +1273,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
 - A generated form replaces the hand-written one when it meets both bars of §4, its efficiency and its
   accuracy. Its internals need not decompose into the hand-written functions. The replacement deletes
   what it replaces in the same change: no switch keeps a hand form beside its derived one.
+  The coupled walk keeps its ordinary local dot when finite. If that dot exceeds the format, its
+  scaled readout carries the score's exponent through the chunk weight and corrected value before landing.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;
