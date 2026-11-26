@@ -673,8 +673,10 @@ class PagedKV:
     shared: bool = False
     """Pages only where they pay (`_pages_pay`): where a server over them keeps a prefix cache, its caller's
     requests repeating prompts (a group's samples of one, a session's turns), the model's max_seq_len holds a
-    row in whole pages (`_holds`), and its rows are at least the measured crossover's capacity
-    (`SHARED_PAGES_FROM`); the model's own layout elsewhere (rows 5374, 5375, 7420, `PAGE_SIZE`)."""
+    row in whole pages (`_holds`), and, where the server chooses pages over whole rows, its rows are at least
+    the measured crossover's capacity (`SHARED_PAGES_FROM`): a stated `prefix_cache` or `host_pages`, or
+    pages a layout declares, hold at any capacity (`_measured`, row 13278); the model's own layout elsewhere
+    (rows 5374, 5375, 7420, `PAGE_SIZE`)."""
 
     def __post_init__(self) -> None:
         if self.layout is not None and (self.page_size is not None or self.pages is not None):
