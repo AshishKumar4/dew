@@ -885,15 +885,24 @@ def _truth_rows(truths, terms, *, xp):
 def _discrete_errors(reference, truth, xp):
     """A discrete leaf's errors (integers, booleans), taken in its own representation before the gate's
     float64 (`_laid`): its values' differences exact, where float64 rounds integers past 2^53 alike and
-    would make two that differ by one agree (row 13543); None for a leaf of floats. Each difference is
-    exact in float64 where it is below 2^53."""
+    would make two that differ by one agree (row 13543); None for a leaf of floats. Each value is laid in
+    unsigned 64 bits by its order (a signed one's sign bit flipped), its difference the larger less the
+    smaller, which wraps at no extreme, then signed and read in float64 (exact below 2^53). Leaves of
+    signed and unsigned values apart are refused: no one order of 64 bits holds both."""
     held, true = xp.asarray(reference), xp.asarray(truth)
     if not all(xp.issubdtype(leaf.dtype, xp.integer) or leaf.dtype == bool for leaf in (held, true)):
         return None
-    kind = xp.result_type(held, true)
-    kind = xp.int8 if xp.dtype(kind) == xp.dtype(bool) else kind
-    held, true = held.astype(kind), true.astype(kind)
-    # The larger less the smaller, which no unsigned or signed operand wraps, signed by its order.
+    signed = {bool(xp.issubdtype(leaf.dtype, xp.signedinteger)) for leaf in (held, true)}
+    if len(signed) > 1:
+        raise ValueError(f"a discrete leaf of {held.dtype} against a truth of {true.dtype}: its signed and "
+                         "unsigned values hold no one order to compare")
+
+    def ordered(leaf):
+        if signed == {True}:
+            return leaf.astype(xp.int64).astype(xp.uint64) ^ xp.uint64(1 << 63)
+        return leaf.astype(xp.uint64)
+
+    held, true = ordered(held), ordered(true)
     apart = (xp.maximum(held, true) - xp.minimum(held, true)).astype(_wide(reference))
     return xp.where(held >= true, apart, -apart)
 

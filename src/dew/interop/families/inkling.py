@@ -539,7 +539,6 @@ INKLING2 = DecoderFamily(
     routes=_ROUTES,
     prepare=_inkling2_prepare,
     packed=_PACKED,
-    writes_messages=True,
     sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
     whole_drafter=_draft_kept,
     preserve_source_layout=True,

@@ -727,13 +727,12 @@ CROSSING_UNWRITTEN = ("the source's format holds no cross-attention layers; a ru
 """Why a decoder that reads a context through cross-attention is written in no family's layout."""
 
 
-def unwritten_extension(model: nn.Module, *, messages: bool = False) -> str | None:
+def unwritten_extension(model: nn.Module) -> str | None:
     """Why no family's format holds `model`, where it extends its source with what none does, read off the
     model alone: cross-attention (`CROSSING_UNWRITTEN`), a loop's cross-pass messages
     (`dew.nn.cross_pass.MESSAGES_UNWRITTEN`), or attention residuals whose values it normalizes
     (`dew.nn.attention_residuals.NORMALIZED_UNWRITTEN`); None where it extends it with none. `source_layout`
-    answers it as `Unwritable`, and an export refuses it before it converts a weight. `messages` says the
-    format holds cross-pass messages (`DecoderFamily.writes_messages`), which then extend it with none."""
+    answers it as `Unwritable`, and an export refuses it before it converts a weight."""
     from dew.nn.attention_residuals import NORMALIZED_UNWRITTEN
     from dew.nn.cross_pass import MESSAGES_UNWRITTEN
     from dew.nn.protocols import CrossAttending, Looped, MediaWrapper, MixesDepth
@@ -742,8 +741,7 @@ def unwritten_extension(model: nn.Module, *, messages: bool = False) -> str | No
     if any(isinstance(each, CrossAttending) and each.cross_attention is not None
            for each in (model, decoder)):
         return CROSSING_UNWRITTEN
-    if (not messages and isinstance(decoder, Looped) and decoder.loop is not None
-            and decoder.loop.messages is not None):
+    if isinstance(decoder, Looped) and decoder.loop is not None and decoder.loop.messages is not None:
         return MESSAGES_UNWRITTEN
     residuals = decoder.attention_residuals if isinstance(decoder, MixesDepth) else None
     if residuals is not None and (residuals.normalize_values or residuals.scaled or not residuals.gained):

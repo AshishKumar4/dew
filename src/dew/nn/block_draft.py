@@ -45,6 +45,7 @@ from dew.nn.kv_cache import (
     compute_dtype,
     cursor,
     kept,
+    unpaged,
 )
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, capped_logits, float32_dot_general
@@ -170,7 +171,10 @@ class ContextStore(nn.Module):
 
     @nn.nowrap
     def spec(self, rows: int, dtype: jnp.dtype) -> KVSpec:
-        return KVSpec(self.kv_cache, rows, self.slots(), self.kv_heads, self.head_dim, dtype)
+        """Its store: the cache's own layout, a window's ring unpaged (`unpaged`, its format kept), whose
+        length no page size need divide."""
+        layout = self.kv_cache if self.window is None else unpaged(self.kv_cache)
+        return KVSpec(layout, rows, self.slots(), self.kv_heads, self.head_dim, dtype)
 
     @nn.nowrap
     def cache_spec(self, rows: int, dtype: jnp.dtype) -> CacheSpec:

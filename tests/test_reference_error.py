@@ -331,6 +331,13 @@ def test_check_1_reads_a_discrete_leaf_in_its_own_representation():
     big = np.int64(2**53)
     [(log_mse, *_)] = _error_rows([np.asarray([big + 1])], [np.asarray([big])], xp=np)
     assert log_mse == 0.0
+    # The extremes apart by the whole range, never wrapped to a one-count error; signed against unsigned
+    # refused.
+    least, most = np.iinfo(np.int64).min, np.iinfo(np.int64).max
+    [(log_mse, *_)] = _error_rows([np.asarray([most])], [np.asarray([least])], xp=np)
+    assert np.isclose(log_mse, 2 * np.log(2.0**64))
+    with pytest.raises(ValueError):
+        _error_rows([np.asarray([1], np.uint64)], [np.asarray([1], np.int64)], xp=np)
 
     def counted(value):
         return as_given(lambda seed: {"count": np.asarray([value], np.int64)})

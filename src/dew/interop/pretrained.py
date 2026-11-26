@@ -825,11 +825,7 @@ class Pretrained:
         from dew.nn.projections import unpacked
         from dew.nn.protocols import Differential
 
-        model_type = self.config.get("model_type")
-        family = (decoders.family_entry(model_type) if isinstance(model_type, str)
-                  and model_type in decoders.families() else None)
-        if (reason := unwritten_extension(self.model, messages=family is not None
-                                          and family.writes_messages)) is not None:
+        if (reason := unwritten_extension(self.model)) is not None:
             raise ValueError(reason)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read

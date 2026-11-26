@@ -148,6 +148,29 @@ def test_a_local_draft_layer_caches_its_window_alone(source):
         assert lengths == {expected}, (index, {name: leaf.shape for name, leaf in held.items()})
 
 
+def test_a_local_draft_layers_window_is_its_own_under_a_paged_target(source):
+    """A target whose cache is paged (pages of 64 slots) opens its draft's cache as the pages it names for
+    its global layers and a window's ring unpaged for its local ones, of 16 slots no page divides (row
+    13541): the cached draft is opened and drafts."""
+    import dataclasses
+
+    from dew.nn.kv_cache import KVCache
+
+    model = source.model.clone(kv_cache=dataclasses.replace(source.model.kv_cache or KVCache(), page_size=64))
+    _, opened = model.apply(source.variables, SHAPE[0], method='init_draft_cache', mutable=['cache'])
+    spec = RELEASE['mtp_config']
+    for index in spec['local_layer_ids']:
+        held = opened['cache']['block_drafter'][f'layers_{index}']['self_attn']['held_context']
+        assert held['cached_key'].shape[1] == spec['sliding_window_size']
+    inputs = draw(0)
+    context = context_of(model, source.variables, inputs['input_ids'])
+    _, written = model.apply({**source.variables, 'cache': opened['cache']}, context, None, method='draft',
+                             mutable=['cache'])
+    drafted = model.apply({**source.variables, 'cache': written['cache']}, None, inputs['anchor'],
+                          method='draft', mutable=['cache'])[0]
+    assert np.all(np.isfinite(np.asarray(drafted.logits)))
+
+
 def test_a_count_of_passes_is_refused_where_the_taps_are_recorded(source):
     """A forward recording the draft's taps over fewer passes than the loop's (`loop_passes`) is refused:
     its taps name visits in the loop's order, which a skipped pass would leave zeros in place of."""
@@ -187,27 +210,6 @@ def test_a_release_writes_each_sidecars_tensors_to_its_own_file(tmp_path):
               load_file(path).items()}
     assert list(shards) == ['model.weight']
     np.testing.assert_array_equal(shards['model.weight'], trunk)
-
-
-def test_a_saved_release_writes_its_draft_as_the_release_holds_it(source, tmp_path):
-    """`Pretrained.save` writes the draft as the release does (row 13538): its tensors in their own
-    `mtp.safetensors` beside the decoder's shards, none of them in the shards, each under its own name,
-    the Markov head's `rnn_proj` packed back whole (its step's and its context's columns, its bias), bit
-    for bit the fixture's; and the saved release loads its drafter's parameters as the fixture's do. Its
-    loop's cross-pass messages are the format's own (`DecoderFamily.writes_messages`, row 13561)."""
-    from safetensors.numpy import load_file
-
-    source.save(tmp_path)
-    written, given = load_file(tmp_path / 'mtp.safetensors'), load_file(TINY / 'mtp.safetensors')
-    assert sorted(written) == sorted(given)
-    for name, tensor in given.items():
-        np.testing.assert_array_equal(written[name], tensor, err_msg=name)
-    shards = [load_file(path) for path in tmp_path.glob('model*.safetensors')]
-    assert shards and not any(name.startswith('mtp.') for shard in shards for name in shard)
-    reloaded = Pretrained.load(tmp_path, dtype='float32')
-    for got, held in zip(jax.tree.leaves(reloaded.variables['params']['block_drafter']),
-                         jax.tree.leaves(source.variables['params']['block_drafter']), strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(held))
 
 
 def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):
