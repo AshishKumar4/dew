@@ -12,9 +12,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from .binades import balanced, normal, over_power
+from .binades import balanced, normal
 from .derivatives import Protected, contracted, declared_tangent
-from .float_bits import exact_power2, float_bits
 from .precision import at_least_fp32, computed_einsum
 
 
@@ -102,10 +101,11 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
     whole where it is normal, else as `v threshold / (|y| + eps s) s` over the operands' significands
     (`binades.balanced`). The scale is constant (no
-    tangent). Its contract: the first derivative exact across the format's range but for a component or a
-    product of terms below its normal range relative to the head (`2^-126` of its largest in fp32), which
-    flushes as any norm of a scaled head does (row 13152); higher orders are JAX's derivatives of this
-    expression, which may leave the range at its edges (row 13232)."""
+    tangent). Its contract: the first derivative exact across the format's range for a seed whose
+    projection on the head, `u . dx`, is finite, but for a component or a product of terms below its normal
+    range relative to the head (`2^-126` of its largest in fp32), which flushes as any norm of a scaled head
+    does (row 13152); a seed whose projection overflows (seeds near the format's largest along the head),
+    and higher orders, which are JAX's derivatives of this expression, are row 13232's."""
     from .kernels.generation import linear_map
 
     (x, factor), (tangent, _) = primals, tangents
@@ -121,29 +121,17 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
         radial = direction * jnp.sum(direction * tangent, axis=-1, keepdims=True)
         kept = (tangent - radial) + radial * radial_share
         gain = jnp.minimum(ratio, 1)
-        plain = kept * gain
-        # Where the gain is subnormal or the seed past 2^60, `g (dx + (c - 1) u (u . dx))` term by term: the
-        # seed's own part `g dx` whole, so its small components keep their share, and the radial part from
-        # the seed over its largest's power of two `2^m` (`binades.over_power`, exact divisions by normal
-        # powers), its projection's sum in range, `2^m` and a subnormal gain's threshold, scale and length
-        # factors of a product over the operands' significands (`binades.balanced`): `kept threshold`
+        # A subnormal gain's product over the operands' significands (`binades.balanced`): `kept threshold`
         # overflows where the result is near one (four channels of 2^127 under 2, a tangent 2^127 across:
-        # row 13169), and four seeds 2^127 along a head of four equal channels sum past the largest. Each
-        # branch's operands held where the other is chosen.
-        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(tangent), axis=-1, keepdims=True))
-        large = normal(largest) & (largest >= 2.0 ** 60)
-        subnormal = ~normal(gain)
-        apart = (subnormal | large) & jnp.all(jnp.isfinite(tangent), axis=-1, keepdims=True)
-        exponent = jnp.where(large, float_bits(jnp.where(large, largest, 1))[4], 0)
-        bounded = over_power(jnp.where(apart, tangent, 0), exponent)
-        shared = direction * jnp.sum(direction * bounded, axis=-1, keepdims=True) * (radial_share - 1)
-        gains = (jnp.where(apart & subnormal, threshold, jnp.where(apart, gain, 1)),
-                 jnp.where(apart & subnormal, factor, 1))
-        lengths = (jnp.where(apart & subnormal, denominator, 1),)
-        own = jnp.where(subnormal, balanced(jnp.where(apart & subnormal, tangent, 0), gains, lengths),
-                        jnp.where(apart, tangent, 0) * gains[0])
-        radial_part = balanced(shared, (*gains, exact_power2(exponent, tangent.dtype)), lengths)
-        return jnp.where(ratio > 1, tangent, jnp.where(apart, own + radial_part, plain))
+        # row 13169). Each branch's operands held at one where the other is chosen.
+        whole = normal(gain) | ~jnp.isfinite(kept)
+        held = (jnp.where(whole, 1, operand) for operand in (jnp.full_like(denominator, threshold), factor,
+                                                              denominator))
+        threshold_held, factor_held, denominator_held = held
+        scaled_down = jnp.where(whole, kept * jnp.where(whole, gain, 1),
+                                balanced(jnp.where(whole, 0, kept), (threshold_held, factor_held),
+                                         (denominator_held,)))
+        return jnp.where(ratio > 1, tangent, scaled_down)
 
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)
 
