@@ -233,6 +233,17 @@ def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
         np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
     np.testing.assert_array_equal(gradient, np.broadcast_to([[0.25], [0.5]], codes.shape))
 
+    @jax.jit
+    def exact_output(codes):
+        def convert(values):
+            return formats.MxFp8(values, stored).decoded(jnp.int32)
+
+        return jax.jvp(convert, (codes,), (jnp.ones_like(codes),))
+
+    integer, no_tangent = exact_output(codes)
+    np.testing.assert_array_equal(integer, np.broadcast_to([[0], [1]], codes.shape))
+    assert no_tangent.dtype == jax.dtypes.float0
+
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):

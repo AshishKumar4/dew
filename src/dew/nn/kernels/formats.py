@@ -277,7 +277,7 @@ def _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid):
     wide = jnp.promote_types(dtype, jnp.float32)
     values = codes.astype(wide)
     values = jnp.where(exponents == -127, values * jnp.asarray(0.5, wide), values)
-    powers = exact_power2(jnp.maximum(exponents, -126), wide)
+    powers = exact_power2(jnp.maximum(exponents, -126), jnp.finfo(wide).dtype)
     return (values * jnp.where(invalid, jnp.asarray(jnp.nan, wide), powers)).astype(dtype)
 
 
@@ -299,7 +299,7 @@ def _mxfp8_decode_tangent(dtype, primals, tangents):
     codes, exponents, invalid = primals
     moved, _, _ = tangents
     value = _decode_mxfp8(dtype, *primals)
-    if isinstance(moved, SymbolicZero):
+    if isinstance(moved, SymbolicZero) or not jnp.issubdtype(dtype, jnp.inexact):
         return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
 
     def applied(scales, direction):
