@@ -1493,7 +1493,6 @@ def test_a_minimum_normal_weight_keeps_zero_moment_tangents(mode):
     w_z = jnp.asarray([[np.finfo(np.float32).tiny]], jnp.float32)
     dw_z = jnp.asarray([[4.0]], jnp.float32)
 
-if tile == 1:
     (m_z, v_z), (dm_z, dv_z) = directed(x_z, w_z, dw_z)
     assert float(m_z[0]) == 0.0 and float(v_z[0]) == 0.0
     assert float(dm_z[0]) == 0.0 and float(dv_z[0]) == 0.0
