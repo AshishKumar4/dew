@@ -567,6 +567,9 @@ def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int, *,
     return 0, tiles
 
 
+# Traced once per spans geometry and tile (a jit's cache): a step's every launch over equal spans reads one
+# map's program, its 188 traces 35 s of a block-sparse step's 124 s compile (row 6766).
+@functools.partial(jax.jit, static_argnames=("block_q", "block_k"))
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
