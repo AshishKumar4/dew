@@ -1318,8 +1318,9 @@ def _negated(a, b, *, path: str, interpret: bool):
 def _read_past(a, b, *, between: str):
     """`a @ b` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup a program, two programs) read through
     `product_with` while `between` issues products into two accumulators the program scoped before it:
-    "two" issues both in the product's own trace, "branch" one under a branch on the program's index, which
-    one program takes and the other does not, "scope" one within a scope of its own."""
+    "two" issues both in the product's own trace, "eight" four into each there, "branch" one under a branch
+    on the program's index, which one program takes and the other does not, "scope" one within a scope of
+    its own."""
     from dew.nn.kernels.templates import mosaic_sm90
 
     family = mosaic_sm90.FED
@@ -1333,9 +1334,10 @@ def _read_past(a, b, *, between: str):
             mosaic.synced(interpret=False)
 
             def issued():
-                if between == "two":
-                    family.products(first, a_smem, b_smem)
-                    family.products(second, a_smem, b_smem)
+                if between in ("two", "eight"):
+                    for _ in range(1 if between == "two" else 4):
+                        family.products(first, a_smem, b_smem)
+                        family.products(second, a_smem, b_smem)
                 elif between == "branch":
                     @pl.when(jax.lax.axis_index("programs") == 0)
                     def _():
@@ -1361,11 +1363,12 @@ def _read_past(a, b, *, between: str):
                          interpret=False, name="read_past")(a, b)
 
 
-@pytest.mark.parametrize(("between", "in_flight"), [("two", 2), ("branch", 0), ("scope", 0)])
+@pytest.mark.parametrize(("between", "in_flight"), [("two", 2), ("eight", 7), ("branch", 0), ("scope", 0)])
 def test_a_products_read_leaves_in_flight_the_groups_every_run_commits_past_it(between, in_flight):
     """Traced for an H100: a product read through `product_with` (`Issuer.product_with`) leaves in flight the
-    groups its overlapped work committed in its own trace, two issued there, and none of one a branch
-    commits, which a run may skip, nor of one a scope of its own commits: its read's wait counts them
+    groups its overlapped work committed in its own trace, two issued there, at most the seven a wait's
+    immediate holds of eight, and none of one a branch commits, which a run may skip, nor of one a scope
+    of its own commits: its read's wait counts them
     (`mosaic.committed_here`), where callers declared a count, which a branch that committed fewer read the
     product unfinished by (row 10851)."""
     a = b = np.zeros((LANDED, LANDED), jnp.bfloat16)
