@@ -835,9 +835,10 @@ class Capped(tuning.FieldHook):
 
     @property
     def reciprocal(self) -> float:
-        """The cap's reciprocal rounded to fp32, which its logits are multiplied by, the forward's fold
+        """The fp32 cap's reciprocal, an fp32 division's (rounded once, where a float64 quotient rounded to
+        fp32 rounds twice), which its logits are multiplied by, the forward's fold
         (`attention_algebra.folds`) reading the same."""
-        return float(np.float32(1 / self.softcap))
+        return float(np.float32(1) / np.float32(self.softcap))
 
     def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
         del q_pos, k_pos
