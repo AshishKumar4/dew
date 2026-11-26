@@ -1645,9 +1645,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     refused; the rung its plan recorded is that GPU's, apart from the canonical build's beside it in one
     record directory. Its runs score no split midway, whose programs a build compiles too (row 4752), so its
     three builds are their steps' alone (row 3981); the first alone inspects, so compiles a sampled step
-    and keeps a record of its own, its plan fitting that step beside its step (the rung key states the
-    run's inspection), apart from the second's, uninspected, for the same GPU. Its GPUs' room is what the
-    step needs at two microbatches, less than one needs (each measured, `need_run`)."""
+    and keeps a record of its own (the rung key states inspection) beside the second's for the same GPU.
+    Its GPUs' room is what the step needs at two microbatches, less than one needs (`need_run`)."""
     import dataclasses
 
     from run_kinds import lm
@@ -1695,9 +1694,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     assert pcie.derived_for(held) == pcie.target
     with pytest.raises(ValueError):
         pcie.derived_for(gpu_target("sm90"))
-    # A record each: the inspected build's, whose plan fits its sampled step beside its step, the same
-    # build's uninspected, and the canonical GPU's (the rung key states the run's inspection).
-    assert len(list(records.rglob("*.json"))) == 3
+    assert len(list(records.rglob("*.json"))) == 3  # inspected, uninspected and canonical: one record each
 
 
 def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and_loads_where_that_is_held():
