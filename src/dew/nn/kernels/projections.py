@@ -749,7 +749,8 @@ def dot_general(xla, path: tuple | None = None):
 def _whole(*operands: jax.Array) -> bool:
     """Whether a product's `operands` are whole where it runs: no automatic mesh axis splits them
     (`automatic_axes`; a device's own rows inside a per-shard map) and no Explicit axis places any of them
-    (`explicit_spec`: a placement their types carry, which XLA's own product contracts, `contracted_alike`)."""
+    (`explicit_spec`: a placement their types carry, which XLA's own product contracts,
+    `contracted_alike`)."""
     return not automatic_axes() and all(explicit_spec(operand) is None for operand in operands)
 
 
