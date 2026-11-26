@@ -418,7 +418,9 @@ def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
 @pytest.mark.parametrize(("length", "reductions"), [(128, 1), (129, 2)])
 def test_floating_count_join_respects_the_accumulators_exact_integer_range(length, reductions):
     def counted(x, y):
-        return jax.lax.reduce_sum((x > 0).astype(x.dtype), (0,)) + jax.lax.reduce_sum((y > 0).astype(y.dtype), (0,))
+        left = jax.lax.reduce_sum((x > 0).astype(x.dtype), (0,))
+        right = jax.lax.reduce_sum((y > 0).astype(y.dtype), (0,))
+        return left + right
 
     x = jnp.ones((length,), jnp.bfloat16)
     y = x.at[0].set(0)
