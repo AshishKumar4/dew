@@ -1206,6 +1206,17 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
 
 
+def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
+    """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
+    (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at
+    width 64 on 4 slices walked 30.9 us at K128 and 37.2 at K64 (M-NA-27c-gh200), which its walk prices
+    alike."""
+    small, large = (attention_mosaic.Tiles(16, block_k, 3, 1, family="mma.sync.fed") for block_k in (64, 128))
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0, (8, large): 1.0}) == (4, large)
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0 + 2.0**-20}) == (4, small)
+    assert attention_decode.least_plan({(2, small): 1.0, (4, large): 1.0}) == (2, small)
+
+
 def _query_gated(o, q_p):
     """An output hook of a `Kind.QUERY` parameter, its tile's `[rows, 1]` query values (row 5385's shape)."""
     assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
