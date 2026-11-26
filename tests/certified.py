@@ -234,9 +234,22 @@ def _exp_interval(values, bits):
 
 def _exp2_interval(values, bits):
     """exp2's outward enclosure at each finite value, taken at the nearer end beyond EXP_RANGE in base 2:
-    exp's (`_exp_interval`), past whose ends every power of two lies between the same two neighbours."""
-    ends = tuple(end / math.log(2) for end in EXP_RANGE)
-    return _interval(lambda iv, x: iv.exp(x * iv.log(2)))(np.clip(values, *ends), bits)
+    exp's (`_exp_interval`), past whose ends every power of two lies between the same two neighbours; at a
+    whole value its exact power, on every grid, which no interval of `exp(x log 2)` narrows to."""
+    clipped = np.clip(values, *(end / math.log(2) for end in EXP_RANGE))
+    low, high = _interval(lambda iv, x: iv.exp(x * iv.log(2)))(clipped, bits)
+    whole = clipped == np.round(clipped)
+    power = np.ldexp(1.0, np.round(clipped).astype(np.int64))
+    return np.where(whole, power, low), np.where(whole, power, high)
+
+
+def _log2_interval(values, bits):
+    """log2's outward enclosure at each finite positive value; at a power of two its exact exponent, which
+    no interval of `log(x) / log(2)` narrows to."""
+    low, high = _interval(lambda iv, x: iv.log(x) / iv.log(2))(values, bits)
+    mantissa, exponent = np.frexp(values)
+    power = mantissa == 0.5
+    return np.where(power, exponent - 1.0, low), np.where(power, exponent - 1.0, high)
 
 
 def _near_zero_interval(function):
@@ -1703,7 +1716,7 @@ LEVELS = {
     jax.lax.log_p: _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     jax.lax.exp_p: _transcendental(_exp_interval, _exp_special),
     # Base 2's: log's and exp's limits and exact values (log2(1) = +0, exp2(±0) = 1) alike.
-    jax.lax.log2_p: _transcendental(_interval(lambda iv, x: iv.log(x) / iv.log(2)), _log_special),
+    jax.lax.log2_p: _transcendental(_log2_interval, _log_special),
     jax.lax.exp2_p: _transcendental(_exp2_interval, _exp_special),
     jax.lax.log1p_p: _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
     jax.lax.expm1_p: _transcendental(_expm1_interval, _expm1_special),
