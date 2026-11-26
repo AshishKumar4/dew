@@ -1594,7 +1594,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         7 * gib, 14 * gib)
     # Programs past the lane's share: none runs, none with a verdict, its row naming its need and the GPU,
     # and saying a lane of the whole GPU holds it only where that lane's (JAX's 75%) does.
-    for temporaries in (12 * gib, 70 * gib):
+    for temporaries in (70 * gib, 12 * gib):
         filed((gib, gib, temporaries))
         need = admitted((gib, gib, temporaries))
         runs = len(lane_runs(tmp_path, "test_flow"))
@@ -1615,13 +1615,13 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     past = time.time() - (ci.records.NEED_DAYS + 1) * 86400
     stored[old] = json.dumps({"need": 50 * gib, "at": past}).encode()
     assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
-    # Held by a lane given more of its GPU, its programs unchanged, its need stands, filed again: its run's
-    # measured peak is no admission's need, and the part after is sized by it still.
-    filed((gib, gib, 12 * gib))
-    need = admitted((gib, gib, 12 * gib))
+    # Held by a lane given more of its GPU, its programs unchanged (the 12 GiB refused last), its need stands,
+    # filed again then: its run's measured peak is no admission's need; the part after is sized by it still.
+    stored[key] = json.dumps({"need": need, "at": past + 86400}).encode()
     monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
     assert need <= 0.5 * total and lane()[1]["exitCode"] == 0
-    assert json.loads(stored[key])["need"] == need
+    refiled = json.loads(stored[key])
+    assert refiled["need"] == need and refiled["at"] > past + 86400
     assert holds(["tests/test_flow.py"]) == {"tests/test_flow.py": need}
     # Its programs shrunk, it is filed at what they need now.
     filed((gib, gib // 2, gib // 4))
