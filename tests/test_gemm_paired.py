@@ -1634,3 +1634,80 @@ def test_a_paired_epilogue_returning_a_rounding_twice_reads_the_named_one():
 
     _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 4, kept=True,
                            named=(None, None, "gate_proj", "up_proj"))
+
+
+def test_an_fp16_adapted_products_factor_gradient_past_fp16s_range_takes_wide_operands():
+    """An fp16 adapted product whose scaled update's cotangent passes fp16's largest (`scale` 2^12 times
+    cotangents of 2^6 through a factor of 2^3, 2^21 an entry): its rank factor's gradient is formed from
+    wide operands (`low_rank._backward`'s `held`), finite and its float64 value's to fp32's rounding, where
+    the narrow products every call in range takes would read infinity (row 1304): 2^13 an entry."""
+    from dew.nn.kernels import low_rank
+
+    rows, depth, width, rank = 16, 32, 16, 4
+    x = jnp.full((rows, depth), 2.0 ** -12, jnp.float16)
+    w = jnp.zeros((depth, width), jnp.float16)
+    a = jnp.full((depth, rank), 2.0 ** -8, jnp.float16)
+    b = jnp.full((rank, width), 2.0 ** -1, jnp.float16)
+    dy = jnp.full((rows, width), 2.0 ** 6, jnp.float16)
+
+    def adapted(a):
+        return low_rank.low_rank(x, w, a, b, 2.0 ** 12, out_dtype=jnp.float16)
+
+    _, pull = jax.vjp(adapted, a)
+    (d_a,) = pull(dy)
+    scaled = 2.0 ** 12 * (np.full((rows, width), 2.0 ** 6) @ np.full((width, rank), 2.0 ** -1))
+    truth = np.full((depth, rows), 2.0 ** -12) @ scaled
+    assert scaled.max() > np.finfo(np.float16).max
+    np.testing.assert_array_equal(np.asarray(d_a, np.float64), truth.astype(np.float16).astype(np.float64))
+
+
+def test_a_bf16_adapted_products_factor_gradient_keeps_a_cancellation_of_its_wide_cotangent():
+    """A bf16 adapted product whose rank factor's gradient sums two scaled cotangents that cancel below
+    bf16's rounding of either (rows of one, `b` [[1, 2^-8]], cotangents [1, 127/128] and [-1, -1], scale
+    129/128): the gradient is -2^-15 - 2^-22 exactly, the wide cotangent's sum, where rounding each scaled
+    term to bf16 first reads -2^-7 (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    x, w = jnp.ones((2, 1), bf16), jnp.zeros((1, 2), bf16)
+    b = jnp.asarray([[1.0, 2.0 ** -8]], bf16)
+    dy = jnp.asarray([[1.0, 127 / 128], [-1.0, -1.0]], bf16)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 129 / 128, out_dtype=bf16),
+                      jnp.ones((1, 1), bf16))
+    (d_a,) = pull(dy)
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == -2.0 ** -15 - 2.0 ** -22
+
+
+
+def test_a_bf16_adapted_products_factor_gradient_rounds_its_one_fp32_sum():
+    """A bf16 adapted product's rank factor gradient rounds the one fp32 sum of its wide cotangent's products
+    to bf16: rows of one, `b` [[1, 1]], cotangents [1, 2^-8] and [2^-24, 2^-36], scale 1 sum to
+    1 + 2^-8 + 2^-24 + 2^-36, whose fp32 rounding lies above bf16's tie at 1 + 2^-8, so 1 + 2^-7, where
+    terms of it summed apart round to the tie and down to 1 (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    x, w, b = jnp.ones((2, 1), bf16), jnp.zeros((1, 2), bf16), jnp.ones((1, 2), bf16)
+    dy = jnp.asarray([[1.0, 2.0 ** -8], [2.0 ** -24, 2.0 ** -36]], bf16)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 1.0, out_dtype=bf16,
+                                                  precision=jax.lax.Precision.HIGHEST),
+                      jnp.zeros((1, 1), bf16))
+    (d_a,) = pull(dy)
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == 1.0 + 2.0 ** -7
+
+
+def test_a_grouped_bf16_adapted_products_factor_gradient_rounds_its_one_fp32_sum():
+    """A grouped bf16 adapted product's rank factor gradient sums its wide cotangent's products in fp32 and
+    rounds once to bf16, as the dense one does: rows of one, `b` [[1, 2^-8]], cotangents [1, 2^-8] and
+    [2^-8, 0], scale 1 give 1 + 2^-7, where rounding each block first gives 1 (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    x, w = jnp.ones((2, 1), bf16), jnp.zeros((1, 1, 2), bf16)
+    b = jnp.asarray([[[1.0, 2.0 ** -8]]], bf16)
+    dy = jnp.asarray([[1.0, 2.0 ** -8], [2.0 ** -8, 0.0]], bf16)
+    sizes = jnp.asarray([2], jnp.int32)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 1.0, sizes, out_dtype=bf16),
+                      jnp.ones((1, 1, 1), bf16))
+    (d_a,) = pull(dy)
+    assert float(np.asarray(d_a, np.float64)[0, 0, 0]) == 1.0 + 2.0 ** -7

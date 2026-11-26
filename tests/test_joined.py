@@ -706,3 +706,68 @@ def test_a_tree_missing_a_projections_bias_is_refused_as_its_own_call_refuses_it
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", attention="xla"),
           pytest.raises(ScopeParamNotFoundError)):
         jax.eval_shape(layer.apply, params, x)
+
+
+class _EmptyJoin(nn.Module):
+    """Two bfloat16 projections with fp32-stored biases (`Dense._rounds_once`'s), joined per call on output
+    axis `axis` (`joined_dense`)."""
+
+    axis: int
+
+    @nn.compact
+    def __call__(self, x):
+        projections = tuple(Dense(4, dtype=jnp.bfloat16, param_dtype=jnp.float32, name=name)
+                            for name in ("first", "second"))
+        return joined_dense(x, projections, axis=self.axis)
+
+
+def _empty_pullback(apply, variables, x):
+    """`apply`'s value at `x` and its pullback of ones, jitted, under the 'fp8' recipe at the mlp role."""
+    from dew.nn.precision import FP8, projection_role
+
+    @jax.jit
+    def evaluate(params, rows):
+        value, pull = jax.vjp(apply, params, rows)
+        return value, pull(jnp.ones_like(value))
+
+    with projection_role("mlp"), generation.run_precision(FP8):
+        return evaluate(variables, x)
+
+
+@pytest.mark.parametrize("axis", [-2, -1])
+def test_an_empty_join_is_its_projections_plain_dots_and_biases(axis):
+    """Projections joined on rows of no inputs, under an active recipe, bfloat16 with fp32-stored biases: each
+    output its projection's own bias rounded once, stacked on `axis`; the rows' and kernels' cotangents
+    zero and each bias's the cotangents summed, the join's shared boundary taking no recipe or GEMM of zero
+    work (row 13328)."""
+    layer = _EmptyJoin(axis)
+    x = jnp.zeros((2, 3, 0), jnp.bfloat16)
+    biases = {"first": jnp.asarray([0.25, -2.0, 4.0, 1.5]), "second": jnp.asarray([-0.5, 3.0, 0.125, 2.0])}
+    variables = {"params": {name: {"kernel": jnp.zeros((0, 4), jnp.float32), "bias": bias}
+                            for name, bias in biases.items()}}
+    value, (gradients, d_rows) = _empty_pullback(layer.apply, variables, x)
+    stacked = jnp.stack([biases["first"], biases["second"]], axis=0 if axis == -2 else 1)
+    np.testing.assert_array_equal(np.asarray(value, np.float32),
+                                  np.broadcast_to(np.asarray(stacked.astype(jnp.bfloat16), np.float32),
+                                                  value.shape))
+    assert d_rows.shape == x.shape
+    for name in biases:
+        np.testing.assert_array_equal(gradients["params"][name]["kernel"], np.zeros((0, 4), np.float32))
+        np.testing.assert_array_equal(gradients["params"][name]["bias"], np.full((4,), 6.0, np.float32))
+
+
+def test_an_empty_narrow_dense_with_an_fp32_bias_under_a_recipe_is_its_plain_dot_and_bias():
+    """A bfloat16 Dense whose bias is stored at fp32 (its product and bias rounded once, `dense._summed`, the
+    recipe's boundary), its kernel `[0, 128]`, under an active recipe: its output its bias rounded once to
+    bfloat16, its kernel's cotangent empty and its bias's the cotangents summed, the recipe declining the
+    empty product (`projections.recipe_general`, row 13328)."""
+    layer = Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    x = jnp.zeros((4, 0), jnp.bfloat16)
+    bias = jnp.linspace(-3.0, 3.0, 128, dtype=jnp.float32)
+    variables = {"params": {"kernel": jnp.zeros((0, 128), jnp.float32), "bias": bias}}
+    value, (gradients, d_rows) = _empty_pullback(layer.apply, variables, x)
+    rounded = np.asarray(bias.astype(jnp.bfloat16), np.float32)
+    np.testing.assert_array_equal(np.asarray(value, np.float32), np.broadcast_to(rounded, (4, 128)))
+    assert d_rows.shape == x.shape
+    np.testing.assert_array_equal(gradients["params"]["kernel"], np.zeros((0, 128), np.float32))
+    np.testing.assert_array_equal(gradients["params"]["bias"], np.full((128,), 4.0, np.float32))
