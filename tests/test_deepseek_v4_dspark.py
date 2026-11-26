@@ -27,6 +27,7 @@ from deepseek_recorded import assert_cached_run_as_recorded, cleared_rows, held_
 from flax.traverse_util import flatten_dict
 from model_support import attending
 from reference_error import as_given, assert_as_exact
+from speculative_support import assert_replay_drafts_as_a_prefill, block_draw
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -101,6 +102,19 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
                           for strategy in (Sample(), Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
+
+
+@attending("reference")
+def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
+    """A speculative block's verified stretch replayed into the cache saved before it and recorded into
+    DSpark's windows, its rows keeping three tokens and fewer, drafts its next block as a fresh prefill of
+    each row's history does (row 13317; `speculative_support`), over the recorded cached rows, whose every
+    selection clears the gate's margin."""
+    def drawn(seed):
+        return block_draw(ROWS["cached_rows"][seed], 9, 3, np.random.default_rng([0x1331, seed]))
+
+    assert_replay_drafts_as_a_prefill(source.model, source.variables, drawn,
+                                      "DSpark's replayed block's draft", seeds=8)
 
 
 @attending("reference")
