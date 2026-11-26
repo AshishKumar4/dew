@@ -31,11 +31,14 @@ def kernel_parts(model: PreTrainedModel) -> None:
 
     config, known = model.config, {}
     for _, module in list(model.named_modules()):
-        # Each class matched once (its miss too); each instance's fields read off it.
+        # An instance's own forward is none of its class's; each class matched once (its miss too), each
+        # instance's fields read off it.
+        if 'forward' in vars(module):
+            continue
         if type(module) not in known:
             known[type(module)] = _kernel_part(module)
         matched = known[type(module)]
-        if matched is None or 'forward' in vars(module):
+        if matched is None:
             continue
         make, part, renaming = matched
         try:
@@ -77,14 +80,17 @@ def _norm_forward(module, part, renaming, fields) -> Callable | None:
     original = type(module).forward.__get__(module)
 
     def forward(hidden_states):
+        import torch
         from torchax.interop import jax_view, torch_view
 
         from dew.nn.norms import rms_normalized
 
         weight = getattr(module, named)
         # A weight of the input's dtype alone: transformers' product of a narrow input by a wide weight
-        # promotes its result, which Dew's norm, rounding to one dtype, does not.
-        if hidden_states.dtype != weight.dtype or not _traced(hidden_states):
+        # promotes its result, which Dew's norm, rounding to one dtype, does not; and at most float32, the
+        # statistics' dtype the source casts to (`x.float()`), where Dew's widen with a wider input.
+        if (hidden_states.dtype != weight.dtype or hidden_states.dtype == torch.float64
+                or not _traced(hidden_states)):
             return original(hidden_states)
         x, scale = jax_view((hidden_states, weight))
         # An offset weight `1 + w` added in float32, as the source's `self.weight.float()` adds it.
@@ -189,7 +195,7 @@ def _dew_chunk_rule(original: Callable) -> Callable:
         # output reads its own and earlier tokens, the final memory every token.
         out, final = attested(lambda q, k, v, decay, write, state: chunk_gated_delta_rule(
             q, k, v, decay, write, state, chunk_size, unit_queries=use_qk_l2norm_in_kernel),
-            CAUSAL_ATTENTION)(q, k, v, decay, write, state)
+            CAUSAL_ATTENTION, sequenced=1)(q, k, v, decay, write, state)
         return (torch_view(out.astype(jax_view(query).dtype)),
                 torch_view(final) if output_final_state else None)
     return rule

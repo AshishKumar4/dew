@@ -493,6 +493,12 @@ def test_representation_health_counts_no_row_filling_a_batch():
         pooled = Moments.pooled([empty[name], empty[name], alone[name]])
         np.testing.assert_array_equal(np.asarray(pooled.mean()[0]), np.asarray(alone[name].mean()[0]),
                                       err_msg=name)
+    # An empty part beside one real row of a magnitude whose square overflows, either order: the row's
+    # spread, zero, where the empty part's center left an infinite correction weighed by none.
+    large = representation_health(jnp.full((1, z.shape[1]), 2.0 ** 70, jnp.float32))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        for parts in ([empty[name], large[name]], [large[name], empty[name]]):
+            assert float(Moments.pooled(parts).mean()[0]) == 0.0, name
 
 
 # --- EMA target encoder ----------------------------------------------------
