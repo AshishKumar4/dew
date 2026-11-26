@@ -112,73 +112,85 @@ def _scores_0(x1, x2, x3):
     return (v12,)
 
 
+_keys_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (
+        ((64, 32), 'float32'), ((64, 32), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
+        ((64, 32), 'bool'))):
+        _keys_cotangent_0,
+}
+
+
 def keys_cotangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """keys_cotangent's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (
-        ((64, 32), 'float32'), ((64, 32), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
-        ((64, 32), 'bool'))):
-            _keys_cotangent_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _keys_cotangent_forms[(policy, target, case)](*operands)[0]
+
+
+_prefix_difference_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((32,), 'float32'), ((32,), 'float32'), ((64,), 'float32'), ((64,), 'float32'))):
+        _prefix_difference_0,
+}
 
 
 def prefix_difference(*operands, policy: str = 'default', target: str = 'sm90'):
     """prefix_difference's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((32,), 'float32'), ((32,), 'float32'), ((64,), 'float32'), ((64,), 'float32'))):
-            _prefix_difference_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _prefix_difference_forms[(policy, target, case)](*operands)[0]
+
+
+_queries_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
+    ('accurate', 'sm90', (
+        ((32, 64), 'float32'), ((32, 64), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
+        ((32,), 'float32'), ((32,), 'float32'), ((32, 64), 'bool'), ((32, 64), 'bool'))):
+        _queries_cotangent_0,
+}
 
 
 def queries_cotangent(*operands, policy: str = 'accurate', target: str = 'sm90'):
     """queries_cotangent's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('accurate', 'sm90', (
-        ((32, 64), 'float32'), ((32, 64), 'float32'), ((32,), 'float32'), ((32,), 'float32'),
-        ((32,), 'float32'), ((32,), 'float32'), ((32, 64), 'bool'), ((32, 64), 'bool'))):
-            _queries_cotangent_0,
-    }
-    return forms[(policy, target, case)](*operands)
+    return _queries_cotangent_forms[(policy, target, case)](*operands)
+
+
+_rounded_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((16, 32), 'float32'),)):
+        _rounded_0,
+    ('default', 'sm90', (((8, 64), 'float32'),)):
+        _rounded_0,
+}
 
 
 def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((16, 32), 'float32'),)):
-            _rounded_0,
-        ('default', 'sm90', (((8, 64), 'float32'),)):
-            _rounded_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _rounded_forms[(policy, target, case)](*operands)[0]
+
+
+_rounded_tangent_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((16, 32), 'float32'), ((16, 32), 'float32'), ((16, 32), 'float32'))):
+        _rounded_tangent_0,
+    ('default', 'sm90', (((8, 64), 'float32'), ((8, 64), 'float32'), ((8, 64), 'float32'))):
+        _rounded_tangent_0,
+}
 
 
 def rounded_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """rounded_tangent's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((16, 32), 'float32'), ((16, 32), 'float32'), ((16, 32), 'float32'))):
-            _rounded_tangent_0,
-        ('default', 'sm90', (((8, 64), 'float32'), ((8, 64), 'float32'), ((8, 64), 'float32'))):
-            _rounded_tangent_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _rounded_tangent_forms[(policy, target, case)](*operands)[0]
+
+
+_scores_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((16, 16), 'float32'), ((16, 16), 'float32'), ((16,), 'float32'))):
+        _scores_0,
+    ('default', 'sm90', (((32, 32), 'float32'), ((32, 32), 'float32'), ((32,), 'float32'))):
+        _scores_0,
+    ('default', 'sm90', (((64, 64), 'float32'), ((64, 64), 'float32'), ((64,), 'float32'))):
+        _scores_0,
+}
 
 
 def scores(*operands, policy: str = 'default', target: str = 'sm90'):
     """scores's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((16, 16), 'float32'), ((16, 16), 'float32'), ((16,), 'float32'))):
-            _scores_0,
-        ('default', 'sm90', (((32, 32), 'float32'), ((32, 32), 'float32'), ((32,), 'float32'))):
-            _scores_0,
-        ('default', 'sm90', (((64, 64), 'float32'), ((64, 64), 'float32'), ((64,), 'float32'))):
-            _scores_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _scores_forms[(policy, target, case)](*operands)[0]

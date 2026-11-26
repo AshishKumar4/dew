@@ -41,31 +41,34 @@ def _normalized_values_product_0(x1, x2, x3):
     v4 = lax.broadcast_in_dim_p.bind(x2, shape=(256, 64), broadcast_dimensions=(0,), sharding=None)
     v5 = lax.div_p.bind(x3, v4)
     v6 = lax.dot_general_p.bind(
-        x1, v5, dimension_numbers=(((1,), (0,)), ((), ())),
-        precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=None,
+        x1, v5, dimension_numbers=(((1,), (0,)), ((), ())), precision=None, preferred_element_type=None,
         out_sharding=None)
     return (v6,)
+
+
+_lse_folded_probabilities_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+        _lse_folded_probabilities_0,
+    ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+        _lse_folded_probabilities_0,
+}
 
 
 def lse_folded_probabilities(*operands, policy: str = 'default', target: str = 'sm90'):
     """lse_folded_probabilities's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_0,
-        ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
-            _lse_folded_probabilities_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _lse_folded_probabilities_forms[(policy, target, case)](*operands)[0]
+
+
+_normalized_values_product_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
+        _normalized_values_product_0,
+    ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
+        _normalized_values_product_0,
+}
 
 
 def normalized_values_product(*operands, policy: str = 'default', target: str = 'sm90'):
     """normalized_values_product's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
-    forms: dict[tuple, Callable[..., tuple]] = {
-        ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_0,
-        ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
-            _normalized_values_product_0,
-    }
-    return forms[(policy, target, case)](*operands)[0]
+    return _normalized_values_product_forms[(policy, target, case)](*operands)[0]
