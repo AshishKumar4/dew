@@ -49,6 +49,8 @@ class Apart(NamedTuple):
     number: bool = False
     finite: bool = False
     unit_norm: bool = False
+    dyadic_scale: bool = False
+    """A float32 positive power of two from 2**-100 through 2**100, at every element."""
 
     @property
     def above(self) -> int | None:
@@ -160,8 +162,10 @@ def _held_apart(apart: Apart, dtype) -> Apart:
     unit = apart.unit_norm and jnp.dtype(dtype).itemsize >= 2
     floor = (apart.floor if apart.floor is not None and int(floats.minexp) <= apart.floor < int(floats.maxexp)
              else None)
-    return apart if (floor == apart.floor and unit == apart.unit_norm) else apart._replace(
-        floor=floor, unit_norm=unit)
+    dyadic = apart.dyadic_scale and dtype == jnp.float32
+    if (floor, unit, dyadic) == (apart.floor, apart.unit_norm, apart.dyadic_scale):
+        return apart
+    return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic)
 
 
 def _constant_apart(value) -> Apart:
@@ -181,8 +185,12 @@ def _constant_apart(value) -> Apart:
         return NOWHERE
     sign = 1 if (values >= 0).all() else -1 if (values <= 0).all() else 0
     least = float(np.min(np.abs(values)))
+    dyadic = False
+    if array.ndim == 0 and array.dtype == np.float32:
+        fraction, exponent = math.frexp(float(values))
+        dyadic = fraction == 0.5 and -100 <= exponent - 1 <= 100
     return Apart(_floor_log2(least) if 0 < least < math.inf else None, sign, number=True,
-                 finite=bool(np.isfinite(values).all()))
+                 finite=bool(np.isfinite(values).all()), dyadic_scale=dyadic)
 
 
 def _declared_apart(declared: float | tuple[float, float] | Proven | None) -> Apart:

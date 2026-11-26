@@ -1053,6 +1053,7 @@ def _merge_proven(out_var: jcore.Var, bound: Magnitude | None, proved: Apart,
     merged = _held_apart(Apart(
         floor, sign, proved.number or ext_apart.number,
         proved.finite or ext_apart.finite, proved.unit_norm or ext_apart.unit_norm,
+        proved.dyadic_scale or ext_apart.dyadic_scale,
     ), out_var.aval.dtype)
     bounds = [b for b in (bound if proved.finite else None,
                           ext_bound if ext_apart.finite else None) if b is not None]
@@ -1425,7 +1426,9 @@ def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: l
     made = _float_apart(equation, name, operands, bounds, aval.dtype)
     # Finite where its operands make it so and its own bound is within its dtype; a finite value is a number.
     finite = made.finite and _within(bound, aval.dtype)
-    return _held_apart(made._replace(number=made.number or finite, finite=finite), aval.dtype)
+    dyadic = (name == "broadcast_in_dim" and operands[0].dyadic_scale
+              or name == "select_n" and all(held.dyadic_scale for held in operands[1:]))
+    return _held_apart(made._replace(number=made.number or finite, finite=finite, dyadic_scale=dyadic), aval.dtype)
 
 
 def _extremes(name: str, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
