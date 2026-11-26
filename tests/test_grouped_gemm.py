@@ -34,6 +34,7 @@ from dew.nn.kernels import (
     grouped_triton,
     tuning,
 )
+from dew.nn.kernels.templates import tail as tail_of
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.kernels.templates.hooks import Hook, Side
@@ -1166,7 +1167,8 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
-    back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
+    back through it, a token's cotangent its routes' summed exactly and rounded once (row 12396); with
+    `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
     layer's matrices' projection, each stack's gradient that layer's, every other zero; and an unpaired one
     whose epilogue reads its accumulator through its rounding alone, the rounding a named output (`gemm`'s
     `named`, row 7131's residual), its reverse pass bitwise the gathered rows' (the saved output read back
@@ -1192,11 +1194,27 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
                      for operand in operands)
     cotangent = tuple(jnp.asarray(rng.integers(-2, 3, size=(72, matrices.shape[-1])), tokens.dtype)
                       for _ in range(2))
-    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
-                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
+    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents)):
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
-    unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
-    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+    pulled, pulled_apart = (jax.vjp(f, *operands)[1](cotangent) for f in (fused, apart))
+    jax.tree.map(np.testing.assert_array_equal, pulled[1:], pulled_apart[1:])
+    # fp32 tokens: each route's cotangent as wide as its sum, so the rows gathered first's, bitwise.
+    # Narrow ones: each slot's products with both matrices, every route of a token summed exactly
+    # (integers: float64 holds each sum) and rounded once to the tokens' dtype (row 12396), where the rows
+    # gathered first round each route's before they add.
+    wide = jnp.dtype(tokens.dtype).itemsize >= 4
+    read = [np.asarray(c, np.float64) if slots is None else np.asarray(c, np.float64)[np.asarray(slots)]
+            for c in cotangent]
+    layered = [np.asarray(m, np.float64) if layer is None else np.asarray(m, np.float64)[int(layer)]
+               for m in matrices]
+    groups = np.repeat(np.arange(3), np.asarray(sizes))
+    routes = np.zeros((72, tokens.shape[1]))
+    for slot, group in enumerate(groups):
+        routes[slot] = sum(c[slot] @ m[group].T for c, m in zip(read, layered, strict=True))
+    want = np.zeros(tokens.shape)
+    np.add.at(want, np.asarray(table), routes)
+    np.testing.assert_array_equal(np.asarray(pulled[0]), np.asarray(pulled_apart[0]) if wide
+                                  else np.asarray(jnp.asarray(want, tokens.dtype)))
 
     def squared(acc):  # the accumulator read through its rounding alone, the named second output
         rounded = acc.astype(tokens.dtype)
@@ -1211,8 +1229,15 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         outs = gemm.gemm(tokens[table], first if layer is None else first[layer], sizes, **named)
         return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
-    jax.tree.map(np.testing.assert_array_equal, jax.vjp(named_fused, *operands[:2])[1](cotangent),
-                 jax.vjp(named_apart, *operands[:2])[1](cotangent))
+    # Its matrix's gradient bitwise the rows gathered first's, and its tokens' theirs gathered wide (each
+    # route's cotangent unrounded, summed in fp32, rounded once to the tokens' dtype: row 12396).
+    named_pulled, named_pulled_apart = (jax.vjp(f, *operands[:2])[1](cotangent) for f in (named_fused,
+                                                                                          named_apart))
+    with generation.chosen(grouped_matmul="xla"):  # fp32 rows: XLA's product, the law's
+        _, widened = jax.vjp(lambda rows: named_apart(rows, operands[1]), operands[0].astype(jnp.float32))
+    np.testing.assert_array_equal(np.asarray(named_pulled[1]), np.asarray(named_pulled_apart[1]))
+    np.testing.assert_array_equal(np.asarray(named_pulled[0]),
+                                  np.asarray(widened(cotangent)[0].astype(operands[0].dtype)))
 
 
 @runs("sm100")
@@ -1491,24 +1516,26 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                            interpret=False, dense=True)
         tile_64x256 = tiling.Tiles(64, 256, 32, 4, 16, warpgroups=1, family="mma.sync", programs=2)
         tail_deep = mosaic_gpu._dense_tail(tile_64x256, jnp.bfloat16, (8192, 4096, 28672), (2, 2), 216,
-                                           balanced=True)
+                                           balanced=True, stored=2)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
-        # A whole A100's 216 programs' partials (14 MiB) exceed the 4 MiB cuBLAS's workspace is, so no
-        # balanced tail there (row 12850); on 40 programs (2.6 MiB), a single-wave tail (64 tiles: waves=1,
-        # rem=24, 0 drift): planner produces one Tail plan passed straight to emitter via `_stated` without
-        # re-pricing.
+        # A whole A100's 216 programs' deep walk takes no balanced tail: none pays for itself there (its
+        # budget, its output's, not what refuses it). A shallow kernel gradient's tail on those programs
+        # is within its fp32 output's budget and balanced; on 20 multiprocessors (40 programs), a
+        # single-wave tail (64 tiles: waves=1, rem=24, 0 drift) the planner states once and passes straight
+        # to the emitter via `_stated`, never priced again.
         x_1w = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         tile_1w = tiling.Tiles(128, 64, 32, 4, 8, warpgroups=1, family="mma.sync", programs=2)
-        assert tgmm._stated(ba_1w, tile_1w, sm80)["balanced"] is False
+        # Its 216 programs' tail within its fp32 output's budget (`pricing.within_budget`), balanced.
+        assert isinstance(tgmm._stated(ba_1w, tile_1w, sm80)["balanced"], tail_of.Tail)
         few = dataclasses.replace(sm80, multiprocessors=20)
         x_few = jax.ShapeDtypeStruct((4096, 512), jnp.bfloat16)
         ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         stated_few = tgmm._stated(ba_few, tile_1w, few)
         tail_few = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (512, 1024, 4096), (2, 2), 40,
-                                          balanced=stated_few["balanced"])
+                                          balanced=stated_few["balanced"], stored=4)
         assert tail_few is stated_few["balanced"] and tail_few is not None
         assert tgmm.balanced(ba_few, tile_1w, few)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
@@ -1541,7 +1568,8 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         # whole waves' drift refuses it, as dense_tail does.
         assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=False, partial_bytes=0)
         assert tail_mod.balanced(10, 4, 4, traffic, handoff_steps=0.0, scoped=True, partial_bytes=0) is None
-        assert pricing.dense_tail(tile_mw, jnp.bfloat16, (320, 128, 128), (2, 2), small_sm80, 4) is None
+        assert pricing.dense_tail(tile_mw, jnp.bfloat16, (320, 128, 128), (2, 2), small_sm80, 4,
+                                  stored=2) is None
         assert_as_exact(native, jax.jit(plain), draw, "sm80 multi-wave nonzero-tail dense dX", seeds=SEEDS,
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
@@ -1598,7 +1626,8 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
 
     tile = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, cluster=2, family="wgmma")
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=mp, measured={})
-    assert pricing.dense_tail(tile, jnp.bfloat16, (rows, 256, depth), (2, 2), target, mp) is not None
+    assert pricing.dense_tail(tile, jnp.bfloat16, (rows, 256, depth), (2, 2), target, mp,
+                              stored=2) is not None
 
     def draw_fwd(seed):
         rng = np.random.default_rng(seed)
@@ -1632,7 +1661,8 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
             return jnp.dot(x.T.astype(wide), dy.astype(wide), preferred_element_type=wide).astype(out)
 
         with generation.assumed(target):
-            assert pricing.dense_tail(tile, jnp.bfloat16, (768, 256, depth), (2, 2), target, mp) is not None
+            assert pricing.dense_tail(tile, jnp.bfloat16, (768, 256, depth), (2, 2), target, mp,
+                                      stored=4) is not None
             assert_as_exact(dw_native, jax.jit(dw_plain), draw_dw, f"cluster2 tail dw 768x256x{depth}",
                             seeds=SEEDS,
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
@@ -1659,9 +1689,12 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132,
+                                  stored=2) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132,
+                                  stored=2) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132,
+                                  stored=2) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)

@@ -5,6 +5,7 @@ spill-free for a compile-only sm80."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 import jax
@@ -18,9 +19,10 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates.gemm import tiling
 
 FORMATS = {"e4m3": jnp.float8_e4m3fn, "e5m2": jnp.float8_e5m2}
-ROWS, DEPTH, WIDTH = 72, 200, 136
+ROWS, DEPTH, WIDTH, SKINNY = 72, 200, 136, 8
 """A product's rows, depth and width, none a whole tile: the depth and width padded with zero codes to whole
 steps (`converted.STEP`), the rows a partial tile's."""
 
@@ -41,12 +43,12 @@ def test_every_fp8_code_converts_exactly_where_no_tensor_core_multiplies_fp8(nam
     assert np.array_equal(converted[~nan].astype(jnp.bfloat16).astype(np.float32), widened[~nan])
 
 
-def _operands(name: str, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _operands(name: str, seed: int, rows: int = ROWS) -> tuple[np.ndarray, np.ndarray]:
     """A step's codes and a frozen site's codes, each a normal draw cast to the format (NumPy's: a GPU
     tier's prepare computes on no device)."""
     rng = np.random.default_rng(seed)
     dtype = FORMATS[name]
-    return (rng.normal(size=(ROWS, DEPTH)).astype(dtype), rng.normal(size=(WIDTH, DEPTH)).astype(dtype))
+    return (rng.normal(size=(rows, DEPTH)).astype(dtype), rng.normal(size=(WIDTH, DEPTH)).astype(dtype))
 
 
 def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
@@ -54,28 +56,46 @@ def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
         return gemm.fp8_codes_product(lhs, rhs, out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
 
 
-def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, interpret_on_cpu: bool = False
-                                                                   ) -> None:
-    """On an A100, the product of FP8 codes through the template named, its matrix's stages converted
-    exactly into bfloat16 before its products read them (`converted.MosaicConvertedGmm`), on par with XLA's
-    widened product (check 1) from float64; the routes it records name the template."""
+ORIENTATIONS = {
+    "unswapped": tiling.Tiles(64, 64, 64, 4, 2, warpgroups=1, family="mma.sync", programs=2),
+    "swapped": tiling.Tiles(64, 32, 64, 4, 1, warpgroups=1, family="mma.sync", programs=2, swapped=True),
+}
+"""The converting launch's two forms on an A100 (row 5387), each pinned so each runs by name: its matrix's
+codes converted a stage at a time, or a decode's, its codes the products' rows, each consumer converting its
+own (`MosaicConvertedGmm._swapped`)."""
+
+
+def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, interpret_on_cpu: bool = False,
+                                                                   orientation: str = "unswapped") -> None:
+    """On an A100, the product of FP8 codes through the template named in `orientation` (`ORIENTATIONS`'
+    tile pinned: at a partial tile's rows unswapped, at a decode's swapped), its codes converted exactly into
+    bfloat16 before its products read them (`converted.MosaicConvertedGmm`), on par with XLA's widened
+    product (check 1) from float64; the routes it records name the template."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates.gemm import converted
+
+    tile = ORIENTATIONS[orientation]
+    rows = SKINNY if tile.swapped else ROWS
+
     def truth(lhs, rhs):
         return jnp.asarray(lhs, jnp.float64) @ jnp.asarray(rhs, jnp.float64).T
 
-    with generation.routes() as routes:
+    with generation.routes() as routes, tuning.pinned({converted.MosaicConvertedGmm: tile}):
         assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu=interpret_on_cpu)),
                         jax.jit(functools.partial(_product, "xla", interpret_on_cpu=interpret_on_cpu)),
-                        functools.partial(_operands, name), f"fp8 codes product {name}", seeds=8,
-                        truth_fn=truth)
+                        functools.partial(_operands, name, rows=rows),
+                        f"fp8 codes product {name} {orientation}", seeds=8, truth_fn=truth)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
+@pytest.mark.parametrize("orientation", list(ORIENTATIONS))
 @pytest.mark.parametrize("name", list(FORMATS))
-def test_an_fp8_codes_product_through_the_converting_template_is_on_par(name):
+def test_an_fp8_codes_product_through_the_converting_template_is_on_par(name, orientation):
     """`an_fp8_codes_product_through_the_converting_template_is_on_par` interpreted on a CPU as an A100 runs
-    it (the GPU's native cell, tests/test_gpu_gemm.py, runs it compiled)."""
+    it (the GPU's native cells, tests/test_gpu_gemm.py, run it compiled), in each orientation."""
     with generation.assumed("sm80"):
-        an_fp8_codes_product_through_the_converting_template_is_on_par(name, interpret_on_cpu=True)
+        an_fp8_codes_product_through_the_converting_template_is_on_par(name, interpret_on_cpu=True,
+                                                                       orientation=orientation)
 
 
 def test_an_fp8_codes_product_unnamed_is_xlas_widened_product_until_a_receipt():
@@ -143,3 +163,24 @@ def test_an_fp8_codes_product_compiles_spill_free_for_an_a100(name):
         assert not record.get("error"), record
         assert record["kernels"], record
         assert all(kernel.get("spilled") == 0 for kernel in record["kernels"]), record
+
+
+def test_a_swapped_converting_tiles_stage_is_converted_once_between_its_consumers():
+    """A swapped converting tile of two consumers on an A100 moves one stage of its codes through their
+    conversion, each converting its own rows (`packed.ROW_CODES`), not a stage each (row 13505): its
+    shared bytes a step those of a one-consumer stage's conversion beside the same tile's reads."""
+    from dew.nn.kernels.templates.gemm import converted, pricing
+
+    launch = converted.MosaicConvertedGmm()
+    bound = launch.bind(converted.Codes(jax.ShapeDtypeStruct((SKINNY * 8, 256), jnp.float8_e4m3fn)),
+                        converted.Codes(jax.ShapeDtypeStruct((1, 192, 256), jnp.float8_e4m3fn)),
+                        jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
+                        trans_rhs=True, interpret=True, dense=True, exact_sums=False)
+    tile = dataclasses.replace(ORIENTATIONS["swapped"], block_m=128, warpgroups=2)
+    itemsizes, decoded = launch._operand_bytes(bound, tile)
+    assert decoded == ((2, 1), None)
+    with generation.assumed("sm80"):
+        family = pricing.family_of(tile, jnp.bfloat16, generation.gpu_target())
+    per_step = pricing.step_shared_bytes(tile, family, itemsizes, decoded)
+    twice = pricing.step_shared_bytes(tile, family, itemsizes, ((2, 2), None))
+    assert per_step < twice

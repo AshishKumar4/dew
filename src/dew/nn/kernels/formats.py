@@ -616,3 +616,9 @@ def _ternary_decode_tangent(dtype, primals, tangents):
 _decode_ternary = contracted("test_decoded_ternary_preserves_its_linear_scale_rule")(
     declared_tangent(Protected(), _ternary_decoded, _ternary_decode_tangent,
                      nondiff_argnums=(0,), symbolic_zeros=True))
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights)
+"""The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
+codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
+(`checkpoints._packed_checked`)."""

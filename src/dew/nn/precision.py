@@ -1766,7 +1766,7 @@ def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax
     or the scales' own product first where neither intermediate is normal and it is: a subnormal row scale
     beside a column scale near the largest (2**-128 and 2**127 of a 2.25 partial: 1.125, row 13274), which
     a recipe's block scales may be, as no NVFP4 tensor scale is. The one rule a blockwise product's every
-    arm scales its own partials by, a kernel's step and XLA's (`mosaic_gpu._step_scaling`,
+    arm scales its own partials by, a kernel's step and XLA's (`step_scales.scaled_step`,
     `xla_products.step_scaled`), whatever its codes' format (row 13291): the same partial and scales give
     the same value in each, though a step's partial itself is each arm's (Hopper's tensor cores align
     within a step where XLA's fp32 sum does not, docs/design/testing.md). Each order's operands are chosen

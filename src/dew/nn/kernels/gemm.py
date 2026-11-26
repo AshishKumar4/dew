@@ -55,8 +55,8 @@ from dew.nn.derivatives import (
     declared_tangent,
     with_gradients_formed,
 )
-from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
+from dew.nn.kernels import generation, grouped_matmul, grouped_quantized, selection, xla_products
+from dew.nn.kernels.formats import PACKED_FORMATS, MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
@@ -129,7 +129,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     int32 `[rows]` of a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read
     where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
     loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
-    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With
+    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads),
+    wide, rounded once (row 12396; a narrow prologue's routes round at its dtype first, row 13508). With
     a prologue, its side operands along the rows are the product's rows' (`gather`'s order, a normalized
     stream's scale gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's
     launch takes both (row 5391: an expert projection over a normalized or scaled token stream). `scatter`,
@@ -151,7 +152,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    if isinstance(rhs, (NvFp4, TernaryWeights)):
+    if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
                             refused=(transpose_rhs, prologue.fn, prologue.sides, paired, prologue_jvp,
@@ -192,7 +193,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
-        lhs = lhs if gather is None else lhs[gather]
+        lhs = lhs if gather is None else lhs.astype(at_least_fp32(lhs.dtype))[gather].astype(lhs.dtype)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
                                       epilogue_axes, dtypes, several, paired=paired, first=first,
@@ -279,9 +280,11 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
         pulled_lhs = tokens if (gather is None or prologue is None) else tokens[gather]
         d_lhs, d_prologue, operand = _input_cotangents(pulled_lhs, d_products, matrices, group_sizes,
                                                        prologue, prologue_arrays, prologue_axes, compute,
-                                                       {**held, 'gather': read})
+                                                       {**held, 'gather': read}, wide_rows=gather is not None)
         if gather is not None:
-            d_lhs = jnp.zeros(tokens.shape, d_lhs.dtype).at[gather].add(d_lhs)
+            # Each token's routes summed wide, then rounded once to its dtype, as the packed kernel's
+            # pullback sums them (row 12396: routes' 256 and -255.5, each rounded first, summed 0, not 0.5).
+            d_lhs = jnp.zeros(tokens.shape, d_lhs.dtype).at[gather].add(d_lhs).astype(tokens.dtype)
     # The operand the forward multiplied, as the kernel gradient reads it: written beside the input
     # gradient where its epilogue formed the prologue's VJP (`_prologue_pulled`), else the rows through the
     # prologue. A formed operand (`applied`) is the forward's alone, no residual of the reverse mode, so a
@@ -803,7 +806,7 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
     ))
 
 
-def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
+def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
     (`ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
@@ -1048,7 +1051,7 @@ class PackedRows(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
-    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
+    it on the target (`grouped_quantized.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
     its operands are whole arrays (`whole`: no mesh XLA places splits them, `automatic_axes`), which the
     packed launch reads one device's of whole."""
 
@@ -1130,7 +1133,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         raise ValueError("a stack of banks' layer is a grouped call's")
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
-    launch = grouped_matmul.MosaicPackedGmm()
+    launch = grouped_quantized.MosaicPackedGmm()
     words, scales = (jnp.asarray(field if group_sizes is not None else field[None])
                      for field in (matrix.words, matrix.scales))
     count = rows.shape[0] if gather is None else gather.shape[0]
@@ -1193,7 +1196,7 @@ def _undeferred(words, scales) -> NvFp4:
 
 
 def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, gather, first,
-            launch: grouped_matmul.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
+            launch: grouped_quantized.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
     """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
     their group axis, `sizes` each group's rows, `gather` the rows of `rows` they are where given, `first`
     the matrix of a stack the first group reads where given, `gmm`'s): the
@@ -1201,7 +1204,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
     differentiable at every order as `gemm` is (`generation.linear_tangent`): its tangent the decoded
     product's in XLA, its reverse mode the rows' gradient through the decoded values, summed back into the
     rows a gather read (the frozen words, scales, sizes and table taking none). It runs through `launch`
-    (`grouped_matmul.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
+    (`grouped_quantized.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
 
     def decoded(words, scales, first):
         # The bank's matrices, a dense call's one alone (`gemm`'s dense matrix is `[depth, width]`), a stack's
@@ -1274,13 +1277,15 @@ BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWI
             "FP8 product on warpgroup MMA, its matrix K-major, a step 128 deep, its column scales each a "
             "column's or a multiple of its tile's columns", BLOCKWISE_ROW),
         selection.Requirement(
-            'measured', lambda case: False, "no receipt yet has the step-scaled template beat the scaled "
-            "blocks' product in XLA", BLOCKWISE_ROW, kind='measured'))),
+            'measured', lambda case: False, "the step-scaled template awaits a qualified receipt at the "
+            "current head (M-NG-38: check 1 and its time against XLA's scaled blocks; M-NS-13 measured "
+            "its forwards 47-127x faster before the scaling contract changed)", BLOCKWISE_ROW,
+            kind='measured'))),
     selection.Kernel('xla', (), generic=True)))
 """A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the template's exactly summed walk,
 each step's partial scaled before its add (`mosaic_gpu.gmm`'s `step_scales`), where named
-(`generation.chosen(blockwise_fp8='mosaic')`) and planned, past the measured requirement no receipt has
-met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
+(`generation.chosen(blockwise_fp8='mosaic')`) and planned, its default pending a qualified receipt at the
+current head (M-NG-38); else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
@@ -1328,7 +1333,7 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
     from .templates.gemm import quantized
 
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
-    launch = grouped_matmul.MosaicStepScaledGmm()
+    launch = grouped_quantized.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
     # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
     out_forms = quantized.forms_of(out_forms, dtypes) or None
@@ -1394,7 +1399,7 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
-    launch = grouped_matmul.MosaicStepScaledTgmm()
+    launch = grouped_quantized.MosaicStepScaledTgmm()
     # Bound as the call it is, its operands' rows first as a kernel gradient states them: abstract shapes
     # alone during planning so transposes and scaled counts run only in the chosen branch.
     lhs_spec = jax.ShapeDtypeStruct((lhs_t.shape[1], lhs_t.shape[0]), lhs_t.dtype)
@@ -1512,7 +1517,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
 
     from .templates.gemm import quantized
 
-    launch = grouped_matmul.MosaicMxGmm()
+    launch = grouped_quantized.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
     out_forms = quantized.forms_of(out_forms, dtypes) or None
     hooks = NO_HOOKS if epilogue is None else Hooks(
@@ -1857,7 +1862,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
 
 
 def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prologue, prologue_arrays,
-                      prologue_axes, compute, plain: dict) -> tuple:
+                      prologue_axes, compute, plain: dict, *, wide_rows: bool = False) -> tuple:
     """`lhs`'s and the prologue side operands' cotangents from the cotangent of the operand the forward
     multiplied (`prologue(lhs)` rounded to `lhs`'s dtype): each matrix's product with its accumulator's
     cotangent (none where it has none), one matrix's rounded once to `lhs`'s dtype, a paired product's two
@@ -1867,7 +1872,9 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     rows landed). Where the prologue is entrywise (`_entrywise`), its VJP is the last product's epilogue
     (`_prologue_pulled`, kernel-templates Appendix C row 17), so the operand's cotangent is never written,
     and the operand itself is written beside the cotangents for the kernel gradient: returned third, None
-    where the prologue's VJP ran apart."""
+    where the prologue's VJP ran apart. With `wide_rows`, `lhs`'s cotangent is left wide (fp32 or wider),
+    through a prologue's VJP taken wide too: a gathered call's, whose routes `_pulled` sums before it rounds
+    once (row 12396)."""
     options = {'interpret_on_cpu': plain['interpret_on_cpu'], 'precision': plain['precision'],
                'transpose_rhs': not plain['transpose_rhs'], 'dense': plain['dense'], 'first': plain['first'],
                'gather': plain['gather']}
@@ -1875,7 +1882,10 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     operand_dtype = jnp.dtype(lhs.dtype if prologue is None else compute)
-    wide, d_operand = at_least_fp32(jnp.promote_types(lhs.dtype, operand_dtype)), None
+    # A gathered call's routes as wide as their products' cotangents too (an fp64 output's, unrounded).
+    wide = at_least_fp32(jnp.result_type(lhs.dtype, operand_dtype,
+                                         *(d.dtype for d, _ in reached if wide_rows)))
+    rounded, d_operand = wide if wide_rows else operand_dtype, None
     whole = not automatic_axes()
     taken = (None if entrywise
              else _one_launch(reached, group_sizes, operand_dtype, prologue, options, whole=whole))
@@ -1886,7 +1896,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         # wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient), a chain's overflowing tiles summed
         # again bounded (`mosaic_gpu.guarded_walk`).
         d, matrix, form, route = taken
-        out = wide if prologue is not None else operand_dtype
+        out = wide if prologue is not None else rounded
         d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
                                       several=False, summed_as=(operand_dtype,), selected=route, **form,
                                       **options))
@@ -1905,7 +1915,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                                       compute, options)
             if pulled is not None:
                 return pulled
-        out = wide if (not last or prologue is not None) else operand_dtype
+        out = wide if (not last or prologue is not None) else rounded
         if d_operand is not None and _keeps_launch(d, matrix, group_sizes, _added, (d_operand,), (out,),
                                                    (operand_dtype,), options):
             d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), _added, (d_operand,),
@@ -1920,11 +1930,15 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         return jnp.zeros(lhs.shape, lhs.dtype), tuple(_as_cotangent(jnp.zeros(a.shape, wide), a)
                                                       for a in prologue_arrays), None
     if prologue is None:
-        return d_operand.astype(lhs.dtype), (), None
-    d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes, group_sizes,
-                                             d_operand, compute)
-    return d_lhs.astype(lhs.dtype), tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays,
-                                                                                strict=True)), None
+        return d_operand.astype(rounded if wide_rows else lhs.dtype), (), None
+    # A gathered call's rows taken wide (exactly) into the prologue, run at its own dtype as the forward ran
+    # it: each route's cotangent the prologue's VJP gives, widened, not rounded to the rows' dtype. A narrow
+    # prologue's VJP takes its operand's cotangent in its own dtype first (reverse mode's: a value's
+    # cotangent is its dtype), each route rounded there before the sum (row 13508, open).
+    d_lhs, d_prologue = _prologue_cotangents(prologue, lhs.astype(wide) if wide_rows else lhs,
+                                             prologue_arrays, prologue_axes, group_sizes, d_operand, compute)
+    sides = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
+    return d_lhs.astype(wide if wide_rows else lhs.dtype), sides, None
 
 
 def _entrywise(lhs, prologue, arrays: tuple, axes_of: tuple, plain: dict) -> bool:

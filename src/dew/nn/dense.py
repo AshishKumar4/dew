@@ -39,7 +39,7 @@ from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
 from .kernels import projections
-from .kernels.formats import NvFp4, TernaryWeights
+from .kernels.formats import PACKED_FORMATS, NvFp4, TernaryWeights
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
 from .sharding import contracted_alike, declared
 
@@ -480,7 +480,7 @@ class Dense(_LinearEnvelope, nn.Dense):
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
-        if isinstance(kernel, (NvFp4, TernaryWeights)):
+        if isinstance(kernel, PACKED_FORMATS):
             return self._packed(inputs, kernel)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)

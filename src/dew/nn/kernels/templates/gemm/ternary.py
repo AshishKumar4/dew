@@ -15,7 +15,7 @@ from jax.core import Tracer
 
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
-from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
+from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.sharding import automatic_axes
@@ -24,7 +24,7 @@ TERNARY_WEIGHT_ROW = "ledger 1464"
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicTernaryPackedGmm(grouped_matmul.MosaicWordPackedGmm):
+class MosaicTernaryPackedGmm(grouped_quantized.MosaicWordPackedGmm):
     """`MosaicWordPackedGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, rows 1464,
     5387), supporting both staged decode and direct in-register swapped decode at skinny rows."""
     DEFAULT_FMT: ClassVar[str] = "ternary"

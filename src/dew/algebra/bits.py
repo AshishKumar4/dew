@@ -336,7 +336,7 @@ class BitForm:
         """The most registers a word's decode holds at once: its stored word and each step's value, each
         from the step that makes it to the step that last reads it (whose result may take its register),
         an output register's to the decode's end: what a consumer prices beside its tiles before it admits
-        one (`grouped_matmul.MosaicPackedGmm.registers`). `NVFP4_BFLOAT16_FORM` holds five."""
+        one (`grouped_quantized.MosaicPackedGmm.registers`). `NVFP4_BFLOAT16_FORM` holds five."""
         end = len(self.steps) + 1
         last = {value: value for value in range(end)}
         for index, step in enumerate(self.steps, start=1):
