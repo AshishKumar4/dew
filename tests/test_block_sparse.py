@@ -441,7 +441,8 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     `selection="infllm"`) over a row shorter than the selection's dense cut (8192 keys) attends densely:
     its logits are the same model's under causal attention's mixer, its parameters the same, bit for bit
     (`infllm_attention`'s dense branch is the plain causal call). Past its cut the mixer runs its selected
-    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses."""
+    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses, and a
+    right-padded row, whose padding would move its dense cut."""
     infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
@@ -458,6 +459,9 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     with pytest.raises(ValueError):
         tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
             jax.random.key(1), tokens)
+    padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
+    with pytest.raises(ValueError):
+        sparse.apply(params, tokens, coordinates=coordinates(valid=padded, right_padded=True))
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():

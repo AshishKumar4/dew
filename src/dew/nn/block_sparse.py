@@ -282,8 +282,12 @@ def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Arr
     return divergence.sum() / (rows * queries * groups)
 
 
+INFLLM_STRIDE = 16
+"""InfLLM-V2's pooling stride (arXiv 2509.24663 §3.3: windows of 32 keys every 16)."""
+
+
 def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int = 64, kernel: int = 32,
-                     stride: int = 16, initial: int = 1, local: int = 1) -> jax.Array:
+                     stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1) -> jax.Array:
     """InfLLM-V2's selection (arXiv 2509.24663 §3.3): keys mean-pooled by a window of `kernel` every `stride`
     into compressed keys (eq. 4), each head's softmax of its query against the compressed keys whose window
     it reaches whole, at the attention's scale `D ** -0.5` (eq. 5, causal), summed over a GQA group's heads
@@ -329,7 +333,7 @@ short calls' path, a selection of 64 blocks of 64 near every key of them anyway.
 
 
 def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, block: int = 64, top_k: int = 64,
-                     kernel: int = 32, stride: int = 16, initial: int = 1, local: int = 1,
+                     kernel: int = 32, stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1,
                      dense_below: int = INFLLM_DENSE_BELOW, implementation: AttentionImpl = "auto",
                      dtype=None, precision=None, force_fp32_for_softmax: bool = True,
                      wide_logits: bool = False, softcap: float | None = None,
@@ -432,12 +436,17 @@ class BlockSparseSelfAttention(CausalSelfAttention):
             wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
 
 
+    def _causal_implies_right_padding(self, metadata, causal: bool) -> bool:
+        # InfLLM-V2's dense cut reads the call's keys whole, its padding among them, so a right-padded row's
+        # validity reaches it (and its refusal), unelided: a padded row would choose its branch apart from
+        # the same real tokens unpadded.
+        return self.selection != "infllm" and super()._causal_implies_right_padding(metadata, causal)
+
     def _infllm(self, query, key, value, masking, append):
         """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
-        selected blocks of `block`, `top_k` of them, past it), a row one document: a packed row's documents,
-        a row's hidden tokens within it or a cache's slots its selection would read across. A row's trailing
-        padding (right-padded) it reads as tokens past the real ones, which causality keeps every real query
-        from; their own outputs are padding's."""
+        selected blocks of `block`, `top_k` of them, past it), a row one document of every token real: a
+        packed row's documents, a row's hidden tokens (trailing padding among them, which would move its
+        dense cut, `_causal_implies_right_padding`) or a cache's slots it refuses."""
         if append is not None or masking.documents is not None or masking.valid is not None:
             raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's real tokens, "
                              "its own: no cache, packed documents or hidden token")
@@ -454,7 +463,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         group's `top_k` blocks of `block` its own forced (`msa_selection`), through the template's indexed
         form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`) for its
         indexer loss (`msa_indexer_kl`), which trains the index branch alone. Over the call's own tokens,
-        a row one document, its trailing padding read as `_infllm` reads it."""
+        a row one document: a right-padded row's trailing padding it reads as keys past the real ones, which
+        causality keeps every real query from (no dense cut to move)."""
         if append is not None or masking.documents is not None or masking.valid is not None:
             raise ValueError(f"{self.name}: MSA's selection reads a row of one document's real tokens, its "
                              "own: no cache, packed documents or hidden token")
@@ -498,9 +508,9 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if not ctx.causal:
             raise ValueError("block_sparse_attention requires causal=True: a query selects the blocks before "
                              "its own")
-        if self.selection == "infllm" and self.block % 16:
-            raise ValueError(f"InfLLM-V2's selection pools keys every 16 places into whole blocks, so takes "
-                             f"a block of 16s, got {self.block}")
+        if self.selection == "infllm" and self.block % INFLLM_STRIDE:
+            raise ValueError(f"InfLLM-V2's selection pools keys every {INFLLM_STRIDE} places into whole "
+                             f"blocks, so takes a block of them, got {self.block}")
         if self.selection == "msa" and self.top_k < 2:
             raise ValueError(f"MSA's selection counts its own block among its top_k, so takes 2 or more, got "
                              f"{self.top_k}")
