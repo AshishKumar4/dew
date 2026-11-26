@@ -242,18 +242,26 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     its top 16 counting them, a single index head every group shares (`G` 1; the M3 index kernels of
     github.com/dphnAI/sonar, models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum,
     the forced pages prioritized within `topk`)."""
-    rows, groups, queries, _ = index_scores.shape
-    assert top_k > initial + local, "the selection counts its forced blocks among its top"
+    assert top_k >= 1, "a selection takes a block"
     pooled = block_maxima(index_scores, None, block)
-    keep = _earlier_blocks(queries, pooled.shape[-1], block) & (pooled > -jnp.inf)
+    blocks = pooled.shape[-1]
+    queries = pooled.shape[-2]
+    keep = _earlier_blocks(queries, blocks, block) & (pooled > -jnp.inf)
     own = jnp.arange(queries)[:, None] // block
-    forced = jnp.concatenate([jnp.broadcast_to(jnp.arange(initial)[None], (queries, initial)),
-                              own - jnp.arange(local)[None, ::-1]], axis=-1)
-    # A forced block the query reaches alone: none before the first, none past its own or the keys' last.
-    forced = jnp.where((forced >= 0) & (forced <= own) & (forced < pooled.shape[-1]), forced, -1)
-    forced = jnp.broadcast_to(forced, (rows, groups, *forced.shape))
-    ranked = top_k - initial - local
-    chosen = top_k_selection(pooled, keep, ranked, forced=forced)
+    index = jnp.arange(blocks)[None, :]
+    # The forced blocks as one mask, each once (the first `initial` and the `local` ending at the query's
+    # own, a query's own counted once however many name it), those it reaches alone: up to its own.
+    forced = ((index < initial) | ((index > own - local) & (index <= own))) & (index <= own)
+    # Ranked ahead of every other visible block within the one `top_k`, as M3's index kernels prioritize
+    # them: the forced first (lower blocks first), then the rest's top by score (`top_k_selection`), the
+    # forced bit ahead of any score, an infinite one too.
+    # The forced list is the call's geometry alone: ranked once `[Q, slots]`, every row and group its own.
+    slots = min(top_k, blocks)
+    first = jax.lax.top_k(forced.astype(jnp.int32), slots, is_stable=True)[1]
+    first = jnp.where(jnp.take_along_axis(forced, first, axis=-1), first, -1)
+    ordinary = top_k_selection(pooled, keep & ~forced, slots)
+    both = jnp.concatenate([jnp.broadcast_to(first, ordinary.shape), ordinary], axis=-1)
+    chosen = jnp.take_along_axis(both, jnp.argsort(both < 0, axis=-1, stable=True)[..., :slots], axis=-1)
     # Its `top_k` slots whatever its blocks: -1 past those it holds.
     return jnp.pad(chosen, ((0, 0),) * 3 + ((0, top_k - chosen.shape[-1]),), constant_values=-1)
 
