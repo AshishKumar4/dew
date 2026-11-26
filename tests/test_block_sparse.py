@@ -440,14 +440,24 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     """A decoder of block-selected attention by InfLLM-V2's selection (`block_sparse_attention`,
     `selection="infllm"`) over a row shorter than the selection's dense cut (8192 keys) attends densely:
     its logits are the same model's under causal attention's mixer, its parameters the same, bit for bit
-    (`infllm_attention`'s dense branch is the plain causal call)."""
-    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4, top_k=2),
+    (`infllm_attention`'s dense branch is the plain causal call). Past its cut the mixer runs its selected
+    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses."""
+    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
-    tokens = jax.random.randint(jax.random.key(0), (2, 16), 0, VOCAB)
+    tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, VOCAB)
     params = dense.init(jax.random.key(1), tokens)
     np.testing.assert_array_equal(np.asarray(infllm.apply(params, tokens)),
                                   np.asarray(dense.apply(params, tokens)))
+    # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone: the first, its
+    # own and its top one of those between, not the dense decoder's every key.
+    sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=1,
+                                     dense_below=32), dtype="float32")
+    selected = np.asarray(sparse.apply(params, tokens))
+    assert not np.array_equal(selected, np.asarray(dense.apply(params, tokens)))
+    with pytest.raises(ValueError):
+        tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
+            jax.random.key(1), tokens)
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():

@@ -378,6 +378,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
     top_k: int = 3
     index_width: int = 64
     """MSA's index heads' width (`MsaIndexer.width`, the paper's d_idx)."""
+    dense_below: int = INFLLM_DENSE_BELOW
+    """InfLLM-V2's dense cut (`infllm_attention`): fewer keys attend densely."""
 
     reads: ClassVar[frozenset[str]] = frozenset()
 
@@ -432,12 +434,15 @@ class BlockSparseSelfAttention(CausalSelfAttention):
 
     def _infllm(self, query, key, value, masking, append):
         """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
-        selected blocks of `block`, `top_k` of them, past it), a row one document of every token real: a
-        packed row's documents, a row's hidden tokens or a cache's slots its selection would read across."""
+        selected blocks of `block`, `top_k` of them, past it), a row one document: a packed row's documents,
+        a row's hidden tokens within it or a cache's slots its selection would read across. A row's trailing
+        padding (right-padded) it reads as tokens past the real ones, which causality keeps every real query
+        from; their own outputs are padding's."""
         if append is not None or masking.documents is not None or masking.valid is not None:
             raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's real tokens, "
                              "its own: no cache, packed documents or hidden token")
-        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k, dtype=self.ctx.dtype,
+        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k,
+                                dense_below=self.dense_below, dtype=self.ctx.dtype,
                                 precision=self.ctx.precision,
                                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                                 wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
@@ -449,7 +454,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         group's `top_k` blocks of `block` its own forced (`msa_selection`), through the template's indexed
         form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`) for its
         indexer loss (`msa_indexer_kl`), which trains the index branch alone. Over the call's own tokens,
-        a row one document of every token real."""
+        a row one document, its trailing padding read as `_infllm` reads it."""
         if append is not None or masking.documents is not None or masking.valid is not None:
             raise ValueError(f"{self.name}: MSA's selection reads a row of one document's real tokens, its "
                              "own: no cache, packed documents or hidden token")
@@ -467,15 +472,18 @@ class BlockSparseSelfAttention(CausalSelfAttention):
 @dataclasses.dataclass(frozen=True)
 class BlockSparseAttentionMixer(AttentionMixer):
     """Block-selected attention (`BlockSparseSelfAttention`): each query reads its own block and the earlier
-    blocks its `selection` picks, `top_k` with its own, blocks of `block` places of its document; MoBA's
-    (arXiv 2502.13189, whose experiments take blocks of 512 and the top 3). Its selection reads the layer's
-    own queries and keys, no parameter of its own, and a cached call's its cache's keys again, so it keeps no
-    state beside them."""
+    blocks its `selection` picks, `top_k` with its own, blocks of `block` places. MoBA's (the default; arXiv
+    2502.13189, blocks of 512 and the top 3) reads the layer's own queries and keys, no parameter of its own,
+    over each document's blocks and a cached call's cache. InfLLM-V2's (`"infllm"`, blocks of 16s, dense
+    below `dense_below` keys) and MSA's (`"msa"`, an index branch of parameters over the layer's input,
+    `index_width` wide, trained by its own loss) read a row of one document, uncached: a packed row, a hidden
+    token within it or a cache they refuse."""
 
     selection: Literal["moba", "infllm", "msa"] = "moba"
     block: int = 512
     top_k: int = 3
     index_width: int = 64
+    dense_below: int = INFLLM_DENSE_BELOW
 
     # It selects over each row's cache whole, one document a row.
     packed_cache = False
@@ -490,6 +498,9 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if not ctx.causal:
             raise ValueError("block_sparse_attention requires causal=True: a query selects the blocks before "
                              "its own")
+        if self.selection == "infllm" and self.block % 16:
+            raise ValueError(f"InfLLM-V2's selection pools keys every 16 places into whole blocks, so takes "
+                             f"a block of 16s, got {self.block}")
         if self.selection == "msa" and self.top_k < 2:
             raise ValueError(f"MSA's selection counts its own block among its top_k, so takes 2 or more, got "
                              f"{self.top_k}")
