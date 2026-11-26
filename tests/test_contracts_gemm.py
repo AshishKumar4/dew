@@ -1147,12 +1147,12 @@ def test_twice_scaled_keeps_the_plain_products_overflow_and_non_finite_values():
 
 
 def test_a_steps_scales_are_ordered_so_no_intermediate_overflows_or_underflows():
-    """`precision.ranged_scaled` (an FP8 step's partial, 2^-18 to 2^25, times its row and column scales, the
+    """`product.ranged_scaled` (an FP8 step's partial, 2^-18 to 2^25, times its row and column scales, the
     native blockwise step's order): two scales near 2^64 give 2^122 of a 2^-6 partial, not infinity; two
     near 2^-70 give 2^-120 of a 2^20 partial, not their product's underflow; far-apart normal scales
     (2^100 and 2^-120) their product's; a true overflow overflows; zeros and NaN as the plain product
     (rows 13257, 13274)."""
-    from dew.nn.precision import ranged_scaled
+    from dew.nn.kernels.templates.product import ranged_scaled
 
     f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
 

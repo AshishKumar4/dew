@@ -1444,8 +1444,8 @@ def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
     `mosaic.Issuer.summed_apart`'s `scale(start, columns, partial)`): times this consumer's rows' scales
     (`row_scales`) and the tile's columns' (`column_scales`: one a column, or the tile's block's at `offset`,
     `per` columns a scale), in an order the scales choose for an E4M3 step's partial, zero or 2^-18 to 2^25
-    (`precision.ranged_scaled`: no spurious overflow or underflow, rows 13257, 13274). `index` the step's."""
-    from dew.nn.precision import ranged_scaled
+    (`product.ranged_scaled`: no spurious overflow or underflow, rows 13257, 13274). `index` the step's."""
+    from dew.nn.kernels.templates.product import ranged_scaled
 
     del index
     rows = slots['row_scales'].at[0, mine_rows][...]

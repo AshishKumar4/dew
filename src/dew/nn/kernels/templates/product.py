@@ -414,3 +414,26 @@ class Blocks:
 
     def __init__(self, name: str, left: Callable, right: Callable, count: int):
         self.name, self.left, self.right, self.count = name, left, right, count
+
+
+def ranged_scaled(value: jax.Array, first: jax.Array, second: jax.Array, *, binades: tuple[int, int]
+                  ) -> jax.Array:
+    """`value` times two scales where `value` is zero or of a magnitude within 2^`binades[0]` to
+    2^`binades[1]` (a block-scaled FP8 step's exact partial: 2^-18 to 2^25), in an order chosen from the
+    scales alone: their product first where it holds every such value's product normal, else the smaller
+    scale first where their product is large and the larger where it is small, so no intermediate
+    overflows or underflows short of the result (`twice_scaled`'s guarantee for the scales of a value it
+    bounds, two multiplications of the value as the plain product's, rows 13257, 13274). A zero scale
+    beside one past 2^102 reads a nonzero value's NaN, as the plain product's order does: a block's scale is
+    zero only where its codes, so its value, are. Its tests are comparisons alone, so a kernel's step scales
+    by it (`gemm.mosaic_gpu._step_scaling`)."""
+    limits = jnp.finfo(jnp.result_type(value, first, second))
+    least, largest = binades
+    scales = first * second
+    magnitude = jnp.abs(scales)
+    whole = (magnitude >= 2.0 ** (limits.minexp - least)) & (magnitude < 2.0 ** (limits.maxexp - 1 - largest))
+    small = jnp.abs(first) <= jnp.abs(second)
+    # Large scales' product: the smaller scale first; a small one: the larger first.
+    leading = jnp.where((magnitude >= 1) == small, first, second)
+    trailing = jnp.where((magnitude >= 1) == small, second, first)
+    return value * jnp.where(whole, scales, leading) * jnp.where(whole, 1, trailing)
