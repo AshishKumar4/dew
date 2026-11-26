@@ -36,8 +36,8 @@ class Kernels:
     block's alike (`use(Kernels(attention="xla"))`), where a mapping of names held any string a parse never
     checked (api03)."""
 
-    attention: Literal['cudnn', 'flash', 'inference', 'reference', 'template', 'tpu', 'triton',
-                       'xla'] | None = None
+    attention: Literal['cudnn', 'flash', 'flash_inference', 'inference', 'reference', 'template', 'tpu',
+                       'triton', 'xla'] | None = None
     attention_mainloop: Literal['mosaic', 'portable', 'triton'] | None = None
     blockwise_fp8: Literal['mosaic', 'xla'] | None = None
     decode: Literal['cudnn', 'decode', 'reference', 'template', 'xla'] | None = None
