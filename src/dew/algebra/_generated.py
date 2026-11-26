@@ -10,7 +10,8 @@ def case_of(operands: Sequence) -> tuple:
     return tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
 
 
-def call(forms: dict[tuple, Callable[..., tuple]], operands: tuple, policy: str, target: str, *, single: bool):
+def call(forms: dict[tuple, Callable[..., tuple]], operands: tuple, policy: str, target: str, *,
+         single: bool):
     """Run only the checked form for the exact policy, target, shape and dtype key."""
     outputs = forms[policy, target, case_of(operands)](*operands)
     return outputs[0] if single else outputs
