@@ -717,6 +717,7 @@ def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_doc
     np.testing.assert_array_equal(found[0][queries[0] == 2], 0)
 
 
+@pytest.mark.compiles_at_run(reason="launches flash outside jit over its empty keys, no check-1 site")
 def queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
     """Queries packed by documents over a context of no tokens at all: every query reads nothing,
     its output and gradient exactly zero on flash as on the reference kernel, and the empty keys
