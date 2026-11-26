@@ -232,6 +232,13 @@ def _exp_interval(values, bits):
     return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
+def _exp2_interval(values, bits):
+    """exp2's outward enclosure at each finite value, taken at the nearer end beyond EXP_RANGE in base 2:
+    exp's (`_exp_interval`), past whose ends every power of two lies between the same two neighbours."""
+    ends = tuple(end / math.log(2) for end in EXP_RANGE)
+    return _interval(lambda iv, x: iv.exp(x * iv.log(2)))(np.clip(values, *ends), bits)
+
+
 def _near_zero_interval(function):
     """An outward float64 enclosure of an mpmath interval `function` of `1 + x` (log1p's) or of `exp(x) - 1`
     (expm1's) at each finite value, its precision raised by the value's own exponent below one, so `1 + x`
@@ -1371,6 +1378,51 @@ def _extremum(choose, integral):
     return contract
 
 
+def _arg_extremum(pick):
+    """argmax or argmin along its axis (`pick`, NumPy's) of the operand as the lane's arithmetic reads it
+    (`_read`), as XLA's reduction finds it (lax's `_ArgMinMaxReducer`): the first index of the extreme, zeros
+    of either sign alike; where a row holds a NaN, the index of a NaN, which of them the reduction's order
+    decides."""
+    def contract(params, operands, result, fmt):
+        (axis,) = params["axes"]
+        value = np.moveaxis(_read(operands[0], lane().flushes), axis, -1)
+        found = np.asarray(result).astype(np.int64)
+        expected = pick(value, axis=-1)
+        if not np.issubdtype(value.dtype, np.floating):
+            return found == expected
+        nan = np.isnan(value)
+        landed = np.take_along_axis(value, np.clip(found, 0, value.shape[-1] - 1)[..., None], -1)[..., 0]
+        return np.where(nan.any(-1), (found >= 0) & (found < value.shape[-1]) & np.isnan(landed),
+                        found == expected)
+    return contract
+
+
+def _scatter_extremum(choose, integral):
+    """A scatter-min or scatter-max's result: each operand element folded with every update that lands on it
+    (`_scatter_targets`) by the lane's min or max (`choose`, its order of zeros and NaN, which no order of
+    folding changes), values read as the lane's arithmetic reads them; of integers, `integral`."""
+    def contract(params, operands, result, fmt):
+        operand, indices, updates = (np.asarray(value) for value in operands)
+        targets = _scatter_targets(params, operand, indices, updates)
+        fold = integral if fmt is None else choose
+        folded, updates = ((operand.copy(), updates) if fmt is None
+                           else (_read(operand, lane().flushes), _read(updates, lane().flushes)))
+        for update, target in zip(updates.ravel(), targets, strict=True):
+            if target[0] >= 0:
+                folded[tuple(target)] = fold(folded[tuple(target)], update)
+        return np.asarray(result) == folded if fmt is None else _same(result, folded)
+    return contract
+
+
+def _leading_zeros(params, value):
+    """lax.clz's result: each integer's zero bits above its highest set bit, at its width (all of them at
+    zero)."""
+    value = np.asarray(value)
+    unsigned = value.view(np.dtype(f"u{value.dtype.itemsize}")).astype(np.uint64)
+    lengths = np.frompyfunc(int.bit_length, 1, 1)(unsigned.astype(object)).astype(np.int64)
+    return (8 * value.dtype.itemsize - lengths).astype(value.dtype)
+
+
 def _integral_extremum(reduce, extreme: str):
     """An integer or boolean extremum reduction from its type's identity: the least value for a max,
     the greatest for a min (False and True for booleans)."""
@@ -1650,6 +1702,9 @@ LEVELS = {
     jax.lax.sqrt_p: _arithmetic(_root),
     jax.lax.log_p: _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     jax.lax.exp_p: _transcendental(_exp_interval, _exp_special),
+    # Base 2's: log's and exp's limits and exact values (log2(1) = +0, exp2(±0) = 1) alike.
+    jax.lax.log2_p: _transcendental(_interval(lambda iv, x: iv.log(x) / iv.log(2)), _log_special),
+    jax.lax.exp2_p: _transcendental(_exp2_interval, _exp_special),
     jax.lax.log1p_p: _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
     jax.lax.expm1_p: _transcendental(_expm1_interval, _expm1_special),
     jax.lax.erf_inv_p: _transcendental(_erfinv_enclosed, _erfinv_special),
@@ -1704,7 +1759,7 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
         drawn = [scaled(-70, 63), scaled(-63, 70)]
     elif primitive is jax.lax.sqrt_p:
         drawn = [np.abs(scaled(-149, 127))]
-    elif primitive is jax.lax.log_p:
+    elif primitive in (jax.lax.log_p, jax.lax.log2_p):
         value = np.abs(scaled(-126, 127))
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         # A quarter where a logsumexp's sums of exponentials sit, and XLA:CPU's float32 log a step past
@@ -1717,6 +1772,13 @@ def _probes(primitive, fmt: Format) -> list[np.ndarray]:
     elif primitive in (jax.lax.exp_p, jax.lax.logistic_p):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 0.0
+        drawn = [value]
+    elif primitive is jax.lax.exp2_p:
+        # fp32's range in base 2, a quarter near zero and a quarter at the integers, whose powers are exact.
+        value = rng.uniform(-150, 128, PROBES)
+        value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[quarter:2 * quarter] = rng.integers(-149, 128, quarter)
         value[0] = 0.0
         drawn = [value]
     elif primitive in (jax.lax.log1p_p, jax.lax.expm1_p):
@@ -1757,7 +1819,8 @@ SUBNORMAL_OPERANDS = {
     jax.lax.add_p: lambda tiny: (tiny, tiny), jax.lax.sub_p: lambda tiny: (tiny, -tiny),
     jax.lax.mul_p: lambda tiny: (tiny, 2.0 ** 100), jax.lax.div_p: lambda tiny: (tiny, 2.0 ** -100),
     jax.lax.sqrt_p: lambda tiny: (tiny,), jax.lax.rsqrt_p: lambda tiny: (tiny,),
-    jax.lax.log_p: lambda tiny: (tiny,), jax.lax.log1p_p: lambda tiny: (tiny,),
+    jax.lax.log_p: lambda tiny: (tiny,), jax.lax.log2_p: lambda tiny: (tiny,),
+    jax.lax.log1p_p: lambda tiny: (tiny,),
     jax.lax.expm1_p: lambda tiny: (-tiny,),
     jax.lax.erf_inv_p: lambda tiny: (tiny,), jax.lax.sin_p: lambda tiny: (tiny,),
 }
@@ -1845,6 +1908,8 @@ CONTRACTS = {
     jax.lax.convert_element_type_p: _converted,
     jax.lax.log_p: _rounding(jax.lax.log_p, None),
     jax.lax.exp_p: _rounding(jax.lax.exp_p, None),
+    jax.lax.log2_p: _rounding(jax.lax.log2_p, None),
+    jax.lax.exp2_p: _rounding(jax.lax.exp2_p, None),
     jax.lax.log1p_p: _rounding(jax.lax.log1p_p, None),
     jax.lax.expm1_p: _rounding(jax.lax.expm1_p, None),
     jax.lax.erf_inv_p: _rounding(jax.lax.erf_inv_p, None),
@@ -1871,6 +1936,8 @@ CONTRACTS = {
     jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
     jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
     jax.lax.reduce_min_p: _extremum(_signed_min, _integral_extremum(np.min, "min")),
+    jax.lax.argmax_p: _arg_extremum(np.argmax),
+    jax.lax.argmin_p: _arg_extremum(np.argmin),
     jax.lax.select_n_p: _moved(_selected),
     jax.lax.broadcast_in_dim_p: _moved(_broadcast),
     jax.lax.reshape_p: _moved(_reshaped),
@@ -1891,9 +1958,13 @@ CONTRACTS = {
     jax.lax.dynamic_slice_p: _moved(_dynamic_sliced),
     # Exact functions of a value as the lane's arithmetic reads it (a flushed subnormal a zero).
     jax.lax.floor_p: _moved(lambda params, a: np.floor(_read(a, lane().flushes)).astype(a.dtype)),
+    jax.lax.ceil_p: _moved(lambda params, a: np.ceil(_read(a, lane().flushes)).astype(a.dtype)),
+    jax.lax.clz_p: _moved(_leading_zeros),
     jax.lax.nextafter_p: _moved(lambda params, a, b: np.nextafter(a, b)),
     jax.lax.scatter_p: _moved(_scattered),
     jax.lax.scatter_add_p: _scatter_added,
+    jax.lax.scatter_min_p: _scatter_extremum(_signed_min, np.minimum),
+    jax.lax.scatter_max_p: _scatter_extremum(_signed_max, np.maximum),
     primitives.ragged_dot_general_p: _ragged_dot,
     jax.lax.integer_pow_p: _integer_power,
     jax.lax.sort_p: _moved(lambda params, part: part),
