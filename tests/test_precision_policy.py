@@ -814,8 +814,9 @@ def test_a_correctly_rounded_division_of_subnormal_operands_is_their_values_quot
     (2.0 ** 20, 2.0 ** -60, 2.0 ** -60, 2.0 ** -60, -(2.0 ** 80), -(2.0 ** 80)),
     (2.0 ** -149, 2.0 ** -140, 2.0 ** -12, 2.0 ** -145, -(2.0 ** 119), -(2.0 ** -14)),
     (4.0, 2.0 ** -128, 2.0 ** -149, 2.0 ** -149, -(2.0 ** 109), -(2.0 ** 109)),
+    (2.0 ** -100, 2.0 ** 30, 2.0 ** 100, 2.0 ** 100, -(2.0 ** -60), -(2.0 ** -60)),
 ], ids=["its-twice-quotient-overflows", "a-subnormal-numerator-either-order-overflows",
-        "its-quotient-overflows-under-a-subnormal-seed"])
+        "its-quotient-overflows-under-a-subnormal-seed", "its-quotient-underflows-under-a-large-seed"])
 def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_its_value_is(
         numerator, denominator, tangent, cotangent, moved, pulled):
     """The derivative of `n / d` in `d`, `-t n / d^2`, where `(n / d) / d` overflows: a tangent and a
