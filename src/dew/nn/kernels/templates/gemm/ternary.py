@@ -17,7 +17,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
-from dew.nn.kernels.templates.gemm.factored import factored
+from dew.nn.kernels.templates.gemm.factored import factored, raised_factor
 from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -125,9 +125,11 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
         x_q, peak_raised, shift = _quantize_activations_peak(a)
         prod = precision.divided(run_dot(x_q), jnp.float32(127.0))
-        # A raised row's output lowered back by its shift, rounded once (`lowered_rounded`), past FTZ.
-        raised = precision.twice_scaled(prod, peak_raised[:, None], factor_of(s))
-        return float_bits.lowered_rounded(raised, shift[:, None]), prod
+        # A raised row's output lowered back by its shift and its raised scale's (`raised_factor`: a
+        # subnormal scale formed among the normals, row 13340), rounded once (`lowered_rounded`), past FTZ.
+        factor, raise_by = raised_factor(factor_of(s))
+        raised = precision.twice_scaled(prod, peak_raised[:, None], factor)
+        return float_bits.lowered_rounded(raised, shift[:, None] + raise_by), prod
 
     def ste_derivative(primals, tangents, value):
         a, s = primals

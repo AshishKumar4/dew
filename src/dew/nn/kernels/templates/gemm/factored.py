@@ -37,13 +37,13 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
     over before its pullback, and their partials after."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
-        return run(rows.astype(jnp.bfloat16), *operands) * factor
+        return scaled_exactly(run(rows.astype(jnp.bfloat16), *operands), factor)
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
                            explicit_spec(rows), wide, prepared or (lambda *each: each))
 
     def apply(residuals, moving):
         scale, ran, _ = residuals
-        return run(moving.astype(jnp.bfloat16), *ran) * scale
+        return scaled_exactly(run(moving.astype(jnp.bfloat16), *ran), scale)
 
     def pullback(residuals, cotangent):
         scale, ran, routed = residuals
@@ -51,6 +51,44 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
                                   ).astype(rows.dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands, (gather, wide_operands)), rows)
+
+
+FACTOR_RAISE = 62
+"""The power of two `raised_factor` raises a factor below `2**-FACTOR_RAISE` by: the least subnormal
+(`2**-149`) into the normals (`2**-87`), the largest it raises below 1, so no product of it overflows that the
+factor itself would not."""
+
+
+def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp32 `factor` as `(raised, k)`, `factor = raised * 2**-k`, exactly: raised by `2**FACTOR_RAISE`
+    from its bits where it lies below `2**-FACTOR_RAISE` (`float_bits.raised_exactly`: a subnormal read as
+    it is, which a process flushing subnormal operands reads as zero, XLA's CPU), as it is elsewhere (`k`
+    0), so a product of it is formed among the normals and lowered once (`scaled_exactly`)."""
+    factor = jnp.asarray(factor, jnp.float32)
+    binade = float_bits.binade_of(factor)
+    k = jnp.where((binade < -FACTOR_RAISE) & (binade > -1024), jnp.int32(FACTOR_RAISE), jnp.int32(0))
+    return float_bits.raised_exactly(factor, k), k
+
+
+def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
+    raised, k = raised_factor(factor)
+    return float_bits.lowered_rounded(product.astype(jnp.float32) * raised, k)
+
+
+def _scaled_tangent(primals, tangents):
+    product, factor = primals
+    d_product, d_factor = tangents
+    # The product's own derivative, linear in both directions (a higher order's, `linear_map`'s residuals).
+    return _scaled_value(product, factor), (d_product.astype(jnp.float32) * factor
+                                            + product.astype(jnp.float32) * d_factor)
+
+
+scaled_exactly = contracted("test_a_ternary_weight_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent))
+"""`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: the
+product times the raised factor (`raised_factor`), lowered back and rounded at the result's own place
+(`float_bits.lowered_rounded`), so a subnormal scale (a packed matrix's `2**-127`) or a result below fp32's
+least normal survives a process that flushes them (row 13340); its derivative the plain product's."""
 
 
 @dataclasses.dataclass(frozen=True)

@@ -81,6 +81,31 @@ def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
     np.testing.assert_array_equal(decoded.view(bits), expected.view(bits))
 
 
+@pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
+@pytest.mark.parametrize("columns", [False, True], ids=["one scale", "a scale a column"])
+def test_a_ternary_product_at_a_subnormal_scale_keeps_its_values(quantize, columns):
+    """Codes of +1 and -1 at a subnormal scale (`2**-127`) times rows of 1 and `2**126`: the products IEEE's
+    multiplies give, `+-2**-127` and `+-0.5`, signs and subnormal bits kept, on the XLA route and the
+    interpreted Mosaic one, with the activations quantized or not, the scale one or a column's: a process
+    that flushes subnormals (XLA's CPU) forms the scale's products among the normals and lowers them once
+    (`factored.scaled_exactly`, row 13340)."""
+    values = np.zeros((256, 2), np.float32)
+    values[0] = (1.0, -1.0)
+    scale = np.full((2,) if columns else (), 2.0 ** -127, np.float32)
+    weights = formats.TernaryWeights.of(values, scale=scale)
+    rows = np.zeros((2, 256), np.float32)
+    rows[:, 0] = (1.0, 2.0 ** 126)
+    want = np.asarray([[2.0 ** -127, -2.0 ** -127], [0.5, -0.5]], np.float32)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = jax.jit(functools.partial(gemm.ternary_weight_product, quantize_activations=quantize,
+                                            out_dtype=jnp.float32, interpret_on_cpu=interpret))(
+                jnp.asarray(rows, jnp.bfloat16), weights)
+        np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32), want.view(np.uint32),
+                                      err_msg=f"interpret={interpret}")
+
+
 def test_ternary_weight_product_holds_check_1_on_both_routes():
     """`gemm.ternary_weight_product` holds check 1 on both the default XLA and the interpreted Mosaic route
     at a per-column scale (row 1464)."""
