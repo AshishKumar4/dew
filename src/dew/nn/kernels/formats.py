@@ -771,3 +771,9 @@ def window_bits(byte: jax.Array, offset: jax.Array, base: jax.Array, escapes: tu
     escaped = jnp.where(mantissa <= 2, jnp.where(mantissa == 1, first, second),
                         jnp.where(mantissa == 3, third, fourth))
     return jnp.where(offset > 0, coded, jnp.where(mantissa > 0, escaped, sign << 15))
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights, Bf16Window)
+"""The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
+codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
+(`checkpoints._packed_checked`)."""
