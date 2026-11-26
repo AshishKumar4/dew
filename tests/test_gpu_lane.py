@@ -6,6 +6,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -632,7 +633,14 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
     interpreter(tmp_path, "3.12")
     dry_checkout(tmp_path)
     name = "tests/test_gpu_flows_x.py"
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=6))
+
+    def flows(count: int) -> None:
+        (tmp_path / name).write_text(FLOWS_FILE.format(flows=count))
+        # Its bytecode cached by the last run goes: a file rewritten at its size within its second passes
+        # pytest's check of it, and its run would collect the flows it held before.
+        shutil.rmtree(tmp_path / "tests" / "__pycache__", ignore_errors=True)
+
+    flows(6)
     nodes = [f"{name}::test_cpu", *(f"{name}::test_flow[{index}]" for index in range(6))]
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {node: [0.002 if node.endswith("[1]") else 0.0, None, 0] for node in nodes}))
@@ -659,11 +667,11 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
     # Its row's tests unchanged, it is reused.
     assert ran("1/3")[0] == []
     # A flow collected since, which no record names: its group runs it, its record keeps no key.
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=7))
+    flows(7)
     assert ran("3/3")[0] == ["test_flow[4]", "test_flow[5]", "test_flow[6]"]
     assert record("3/3")["key"] is None
     # A flow gone since, which the record still names: its groups run as collected, keyed by none.
-    (tmp_path / name).write_text(FLOWS_FILE.format(flows=5))
+    flows(5)
     assert ran("1/3")[0] == ["test_cpu", "test_flow[0]"]
     assert record("1/3")["key"] is None
     # Cut finer than it has tests, a group holds none: green at no seconds.
