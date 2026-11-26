@@ -392,6 +392,8 @@ class Region[Node: (Term, Skeleton)]:
     known, the floor and side a guarded reuse reads of a divisor (`rules.log2_floor`, `rules.positive`)."""
     nonnegative: frozenset[Hashable] = frozenset()
     """Keys of terms proven nonnegative numbers (`Apart.number` and `Apart.sign > 0`)."""
+    unplaced_full_fp32: frozenset[Hashable] = frozenset()
+    """Keys of full-fp32 dots traced without explicit or manual placement."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
@@ -1111,6 +1113,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
     # one is read as one broadcast of the source (exact: a layout alone), whose axes a hoist reads.
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]] = {}
+    unplaced_full_fp32: set[Hashable] = set()
     softmax = _SoftmaxTrack()
     opaque: list[Opaque] = []
     n_invars = len(jaxpr.invars)
@@ -1136,6 +1139,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             bound, proved = softmax.step(equation, *facts, apart_of)
             bound, apart[out] = _merge_proven(out, bound, proved, declared.get(n_invars + eq_idx))
             _typed(dtypes, magnitudes, term, out, bound)
+            if (equation.primitive is jax.lax.dot_general_p
+                    and equation.params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32
+                    and _unplaced_dot(equation)):
+                unplaced_full_fp32.add(key(term))
             depths[out] = 1 + max((depths.get(atom, 0) for atom in equation.invars
                                    if not isinstance(atom, jcore.Literal)), default=0)
             continue
@@ -1174,7 +1181,22 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                         if (held := apart.get(var, NOWHERE)).number and held.sign > 0),
                       *(key(forms.literal(index)) for index, value in enumerate(literals)
                         if (held := _constant_apart(value)).number and held.sign > 0),
-                  }))
+                  }), frozenset(unplaced_full_fp32))
+
+
+def _unplaced_dot(equation: jcore.JaxprEqn) -> bool:
+    """A dot seen later outside the tracing context may still hold explicit or manual placement."""
+    mesh = equation.ctx.cur_abstract_mesh
+    if mesh is not None and (mesh.explicit_axes or mesh.manual_axes):
+        return False
+    if equation.params.get("out_sharding") is not None:
+        return False
+    for atom in (*equation.invars, *equation.outvars):
+        if isinstance(aval := atom.aval, ShapedArray):
+            mesh = aval.sharding.mesh
+            if mesh.explicit_axes or mesh.manual_axes:
+                return False
+    return True
 
 
 def _prove_equation(equation: jcore.JaxprEqn, name: str, magnitude_of: Callable[..., Magnitude | None],

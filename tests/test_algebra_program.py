@@ -194,10 +194,12 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
     b = [5, 3] if side == "left" else [3, 5]
     x = jnp.broadcast_to(jnp.asarray([*a, *([0] * 126)], jnp.int8), (8, 128))
     y = jnp.broadcast_to(jnp.asarray([*b, *([0] * 126)], jnp.uint8), (16, 128))
-    s = jnp.full((8 if side == "left" else 16,), 1 + 2 ** -22, jnp.float32)
+    s = jnp.full((8 if side == "left" else 16,), 2.0, jnp.float32)
 
     def rounded(x, y, s):
-        return scaled(x, y, s, full)
+        bad = jax.lax.full(s.shape, 1 + 2 ** -22, s.dtype)
+        other = jax.lax.full(s.shape, 0.5, s.dtype)
+        return scaled(x, y, jax.lax.select(s > 1, bad, other), full)
 
     assert not cheaper_spliced(rounded, x, y, s)
     np.testing.assert_array_equal(jax.jit(algebra.rewritten(rounded))(x, y, s), jax.jit(rounded)(x, y, s))
@@ -211,6 +213,16 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
     graph, _, (short, long) = program.graphed(region)
     assert graph.check_bool(algebra.rules.exact_int8_product(short))
     assert not graph.check_bool(algebra.rules.exact_int8_product(long))
+
+    # The caller and the e-graph are outside the declared mesh, but the written dot is not.
+    from jax.sharding import AbstractMesh, AxisType
+
+    mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
+    x_shape, y_shape, s_shape = (jax.ShapeDtypeStruct(a.shape, a.dtype) for a in (x, y, s))
+    with jax.sharding.use_abstract_mesh(mesh):
+        placed = jax.make_jaxpr(plain)(x_shape, y_shape, s_shape)
+    graph, _, (placed_dot,) = program.graphed(terms.region(placed))
+    assert not graph.check_bool(algebra.rules.exact_int8_product(placed_dot))
 
 
 def test_a_saturation_of_no_growth_or_depth_is_refused():
