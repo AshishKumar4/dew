@@ -771,14 +771,16 @@ def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
     apply's routes, and an objective drawn after another's apply over the same decoder took a launch's route
     (Train 1209's red main: test_kernel_spills#10/10, its draw cells in one process)."""
     from dew.nn.kernels import projections
-    from dew.nn.kernels.generation import drawing, routes
+    from dew.nn.kernels.generation import chosen, drawing, routes
 
-    # On this host no launch takes it, so the forward's route is reported, as XLA runs it.
+    # XLA's dot chosen, so no launch takes it on any host and the forward's route is reported, as XLA runs
+    # it (a host whose scoreboard launches a product reports its route at the launch, not here).
     rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((64, 128), (128, 256)))
-    with routes() as applied:
-        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
-    with drawing(), routes() as drawn:
-        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    with chosen(grouped_matmul="xla"):
+        with routes() as applied:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+        with drawing(), routes() as drawn:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
     assert applied, "the product selects no kernel, so its draw's selecting none says nothing"
     assert not drawn, drawn
 

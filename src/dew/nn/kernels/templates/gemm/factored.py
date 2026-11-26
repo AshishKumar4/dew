@@ -11,9 +11,10 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.custom_derivatives import SymbolicZero
 
-from dew.nn import float_bits
+from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.sharding import explicit_spec, varying_like
@@ -37,13 +38,13 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
     over before its pullback, and their partials after."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
-        return run(rows.astype(jnp.bfloat16), *operands) * factor
+        return scaled_exactly(run(rows.astype(jnp.bfloat16), *operands), factor)
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
                            explicit_spec(rows), wide, prepared or (lambda *each: each))
 
     def apply(residuals, moving):
         scale, ran, _ = residuals
-        return run(moving.astype(jnp.bfloat16), *ran) * scale
+        return scaled_exactly(run(moving.astype(jnp.bfloat16), *ran), scale)
 
     def pullback(residuals, cotangent):
         scale, ran, routed = residuals
@@ -51,6 +52,89 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
                                   ).astype(rows.dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands, (gather, wide_operands)), rows)
+
+
+FLUSHING = ('cpu', 'tpu')
+"""The platforms whose float32 arithmetic flushes subnormal operands and results to zero (XLA's CPU, row 4023,
+and TPU), where a packed product's scales are applied in software (`scaled_exactly`, `raised_factor`); every
+other keeps them, its own multiply IEEE's."""
+
+FACTOR_RAISE = 62
+"""The power of two `raised_factor` raises a subnormal factor by: the least (`2**-149`) into the normals
+(`2**-87`), the largest still below `2**-64`, so no product of it overflows that the plain one would not."""
+
+
+def flushes() -> bool:
+    """Whether the platform the context places work on flushes float32 subnormals (`FLUSHING`)."""
+    return generation.placed_platform() in FLUSHING
+
+
+def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp32 `factor` as `(raised, k)`, `factor = raised * 2**-k`, exactly: a subnormal one raised by
+    `2**FACTOR_RAISE` from its bits (`float_bits.raised_exactly`) where the platform flushes it (`flushes`),
+    every other as it is (`k` 0), so the int8-row epilogue's products read it whole and lower by `k` with its
+    rows' shift (`ternary.ternary_weight_product`, `lowered_product`)."""
+    factor = jnp.asarray(factor, jnp.float32)
+    if not flushes():
+        return factor, jnp.zeros(factor.shape, jnp.int32)
+    binade = float_bits.binade_of(factor)
+    k = jnp.where((binade < jnp.finfo(jnp.float32).minexp) & (binade > -1024), jnp.int32(FACTOR_RAISE),
+                  jnp.int32(0))
+    return float_bits.raised_exactly(factor, k), k
+
+
+def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp32 `x` as its signed significand in `[1, 2)` and its binary exponent, one read of its bits
+    (`_decoded`); a zero, an infinity or a NaN as it is, exponent 0."""
+    significand, exponent, finite = _decoded(x)
+    return jnp.where(finite, significand, x), jnp.where(finite, exponent, 0).astype(jnp.int32)
+
+
+def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
+    """`left * right * 2**-k` (fp32 operands, `k` int32 at least 0, broadcast) rounded once to nearest even in
+    fp32, however far below its least normal, whatever the platform flushes: each operand's significand in
+    `[1, 2)` read from its bits (`_held_apart`, a subnormal's normalized), their product formed exactly
+    into a rounded product and its residual (`precision.two_product`, every part of it a normal float32),
+    its exponents carried apart and the product rounded once at its own place, the residual deciding a tie
+    (`float_bits.rounded_binary`'s `tail`); a zero, an infinity or a NaN multiplied as IEEE's."""
+    left, right = jnp.broadcast_arrays(jnp.asarray(left, jnp.float32), jnp.asarray(right, jnp.float32))
+    (left, left_exponent), (right, right_exponent) = _held_apart(left), _held_apart(right)
+    high, low = precision.two_product(left, right)
+    _, sign, biased, fraction = float_bits.raw_fields(high)
+    biased = biased.astype(jnp.int32)
+    significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
+    exponent = jnp.maximum(biased, 1) - 150 + left_exponent + right_exponent - k
+    # The exact product's residual decides a tie at the lowered place, so it rounds once.
+    tail = jnp.where(low == 0, 0, jnp.where((low > 0) == (high > 0), 1, -1)).astype(jnp.int32)
+    top = biased == 0xFF
+    return float_bits.rounded_binary(sign, significand, exponent, jnp.float32, tail=tail,
+                                     last=jnp.maximum(exponent, -149), infinite=top & (fraction == 0),
+                                     nan=top & (fraction != 0))
+
+
+def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
+    product, factor = product.astype(jnp.float32), jnp.asarray(factor, jnp.float32)
+    return lowered_product(product, factor, 0) if flushes() else product * factor
+
+
+def _scaled_tangent(primals, tangents):
+    (product, factor), (d_product, d_factor) = primals, tangents
+    value = scaled_exactly(product, factor)
+    # Each perturbed operand's term alone (`_Transpose.tangent`'s rule): a factor held still meets no
+    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero.
+    terms = [*(() if isinstance(d_product, SymbolicZero) else (d_product.astype(jnp.float32) * factor,)),
+             *(() if isinstance(d_factor, SymbolicZero) else (product.astype(jnp.float32) * d_factor,))]
+    if not terms:
+        return value, jnp.zeros_like(value)
+    return value, jnp.broadcast_to(functools.reduce(jnp.add, terms), value.shape)
+
+
+scaled_exactly = contracted("test_a_ternary_weight_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _scaled_value, _scaled_tangent, symbolic_zeros=True))
+"""`product * factor` in fp32 as IEEE's multiply rounds it, however small the factor or the result: where the
+platform flushes subnormals (`flushes`), `lowered_product`'s one rounding, so a subnormal scale (a packed
+matrix's `2**-127`) or a subnormal result survives (row 13340); elsewhere the plain multiply. Its derivative
+is the plain product's, each perturbed operand's term alone."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -477,6 +561,13 @@ FACTORED_LEAD = 6
 def _significand(x: jax.Array) -> jax.Array:
     """A finite fp32 `x`'s significand with its sign, in [1, 2), from its bits (`float_bits`): a subnormal's
     normalized, read where a process flushes subnormal operands; 0 for zero."""
-    sign, biased, fraction, normalized, _ = float_bits.float_bits(x.astype(jnp.float32))
-    one = sign | (127 << 23) | normalized
-    return jnp.where((biased == 0) & (fraction == 0), 0.0, jax.lax.bitcast_convert_type(one, jnp.float32))
+    return _decoded(x)[0]
+
+
+def _decoded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`_significand`'s significand of an fp32 `x` (0 for zero), its binary exponent and whether it is finite
+    and nonzero, from one read of its bits (`float_bits.float_bits`)."""
+    sign, biased, fraction, normalized, exponent = float_bits.float_bits(x.astype(jnp.float32))
+    one = jax.lax.bitcast_convert_type(sign | (127 << 23) | normalized, jnp.float32)
+    zero = (biased == 0) & (fraction == 0)
+    return jnp.where(zero, 0.0, one), exponent, ~zero & (biased != 0xFF)
