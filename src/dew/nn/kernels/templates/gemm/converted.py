@@ -17,7 +17,7 @@ import jax.numpy as jnp
 
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import axes, mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.precision import EXACT_FLOAT32
 from dew.nn.sharding import automatic_axes
@@ -162,7 +162,7 @@ def _converted(lhs: jax.Array, rhs: jax.Array, interpret: bool) -> jax.Array | N
             or lhs.dtype != rhs.dtype or not mosaic.converts(rhs.dtype)):
         return None
     (rows, depth), width = lhs.shape, rhs.shape[0]
-    padded_depth, padded_width = -(-depth // STEP) * STEP, -(-width // STEP) * STEP
+    padded_depth, padded_width = axes.whole(depth, STEP), axes.whole(width, STEP)
     launch = MosaicConvertedGmm()
 
     def bound(rows_of, codes, sizes):
