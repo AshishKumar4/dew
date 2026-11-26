@@ -135,3 +135,24 @@ def test_a_guided_prediction_holds_every_order(edge):
 
     assert_drawn_contract(guidance.guide, inputs, EDGES[edge], f"a guided prediction {edge}", truth_fn=affine,
                           plain_fn=affine)
+
+
+def test_a_guided_predictions_derivative_along_its_scale_and_conditional_is_the_affine_ones_at_a_unit_scale():
+    """`guidance.guide`'s derivative along its scale and its conditional prediction is the affine
+    combination's, one, at every scale, a unit one included, where its value is the conditional exactly; and
+    along its scale and its unconditional, minus one (a branch on the unit scale made both zero there: 512
+    of 1024 unit-scale elements of a mixed derivative missed)."""
+    from dew.sampling import guidance
+
+    conditional, unconditional = normal_draw((2302, 0), (4, 5), (4, 5))
+    scale = jnp.asarray([1.0, 3.5, -0.5, 1.0], jnp.float32)
+    ones, zeros = jnp.ones_like(conditional), jnp.zeros_like(conditional)
+
+    def along(conditional_direction, unconditional_direction):
+        def tangent(scale):
+            return jax.jvp(lambda c, u: guidance.guide(c, u, scale), (conditional, unconditional),
+                           (conditional_direction, unconditional_direction))[1]
+        return jax.jvp(tangent, (scale,), (jnp.ones_like(scale),))[1]
+
+    np.testing.assert_array_equal(np.asarray(along(ones, zeros)), np.ones((4, 5), np.float32))
+    np.testing.assert_array_equal(np.asarray(along(zeros, ones)), -np.ones((4, 5), np.float32))
