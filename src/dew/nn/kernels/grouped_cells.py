@@ -364,9 +364,10 @@ STEP_HELD: dict[tuple[str, Made], str] = {
 held on XLA's dot by evidence about the step around them, each with it (kernel-templates.md §1: peak
 memory). The GH200's dense input gradient's step leaked through the mapped projections' weight reductions
 (row 12898, fixed in `sharding.on_shards`) and an nGPT block's XLA fallback's fp32 product and convert
-(`gemm_xla.direct_dtype`); it stays held until the JAX build names a checkpointed value through
-`platform_dependent`'s inlined branch (post135; tests/test_miss_driven_rungs.py), with which every step
-memory test holds with it (witness/stepheld-post135-6)."""
+(`gemm_xla.direct_dtype`). The pinned JAX build (post132) keeps the hold: its `platform_dependent`'s inlined
+branch names no checkpointed value (tests/test_miss_driven_rungs.py). Under post135, which does, every step
+memory, miss-driven rung and lowering test held with the hold cleared (witness/stepheld-post135-6), so it
+goes with the pin that brings that build."""
 
 M_FS_34 = {
     'sm86': ("M-FS-34 / LF-P0-sm86-a10 (an A10, main 45131ca01, XLA tuned on the GPU): the template "
