@@ -1698,12 +1698,12 @@ Mosaic TPU."""
 
 def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
     """The kernels of a compiler the tuner times (`TUNED_COMPILERS`) that `lowered` launches and no launch of
-    Dew's traced (their names carry no launch's digest, `assembled.kernel_of`), each named with its compiler:
+    Dew's traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler:
     another library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
     from dew.nn.kernels.lowered import kernel_calls
 
     return tuple(dict.fromkeys(f"{call.kind}: {call.name}" for call in kernel_calls(lowered, unrun=True)
-                               if call.kind in TUNED_COMPILERS and assembled.kernel_of(call.name)[1] is None))
+                               if call.kind in TUNED_COMPILERS and call.launched is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:

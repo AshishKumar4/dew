@@ -14,9 +14,19 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec
 
-from dew.nn.kernels import options, tuning
+from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.lowered import kernel_calls
 from dew.nn.kernels.templates import report
+
+
+def program_of(lowered):
+    # The program as its typed lowering states it: its signature, and each kernel call's kind, name, config
+    # and operand and result types.
+    calls = [[call.kind, call.name, call.config, str(call.signature)] for call in kernel_calls(lowered)]
+    typed = [str(jax.tree.map(lambda aval: (aval.shape, str(aval.dtype)), avals))
+             for avals in (lowered.in_avals, lowered.out_info)]
+    return [typed, calls]
 
 
 @jax.custom_vjp
@@ -77,15 +87,15 @@ with report.certifying(compile_only_gpus("sm90")[0]):
             lowered = step.trace(*shapes).lower()
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
-print(json.dumps({"program": options.program_digest(lowered), "certified": found,
+print(json.dumps({"program": program_of(lowered), "certified": found,
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """A launch of a custom derivative in a step's gradient traced and lowered with each launch certified on a
 compile-only H100: aside, in a block a compile's lowering certifies in (`report.certifying_aside`;
 `captured`, and `closed`, its hook closing over an operand of the step's trace, not a constant), or in turn
 (`certified`); whole, or a shard's inside a
-shard_map of four devices (`sharded`). The program's fingerprint (`options.program_digest`) and what was
-certified."""
+shard_map of four devices (`sharded`). The program as its typed lowering states it (its signature and its
+kernel calls) and what was certified."""
 
 
 def stepped(tmp_path, placed: str, mode: str) -> dict:
@@ -98,7 +108,7 @@ def stepped(tmp_path, placed: str, mode: str) -> dict:
 def test_a_launch_certified_aside_lowers_the_program_it_lowers_unpending_and_is_certified(tmp_path):
     """A step's launch certified aside (`report.capture`), its program's trace's call replayed for
     certification: its program, its gradient taken through the launch's custom derivative, is the one it
-    lowers with no certification pending (its fingerprint, `options.program_digest`), whole and as a shard
+    lowers with no certification pending (its signature and kernel calls, typed), whole and as a shard
     inside a shard_map; and it is certified either way. A hook closing over an operand of the step's own
     trace, which no launch traced alone could read, is certified aside, its operand replayed as an
     argument."""
@@ -119,8 +129,8 @@ import jax.numpy as jnp
 from kernel_compile import lowered_for
 
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.kernels import options
 from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.lowered import kernel_calls
 from dew.nn.kernels.templates import report
 
 # A shape whose derived configs all hold on an H100: no refusal steps a launch in turn that aside takes as
@@ -146,12 +156,14 @@ with report.certifying(compile_only_gpus("sm90")[0]):
     found = sorted([each.op, each.pulled, sorted((name, binary.registers, binary.frame, binary.threads)
                                                  for name, (_, binary) in each.kernels.items())]
                    for each in report.certifications())
-print(json.dumps({"program": options.program_digest(lowered), "certified": found,
+# The program as its typed lowering states it: each kernel call's kind, name, config and types.
+calls = [[call.kind, call.name, call.config, str(call.signature)] for call in kernel_calls(lowered)]
+print(json.dumps({"program": calls, "certified": found,
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """An H100's attention template's gradient (its launches' custom derivatives) at a shape whose configs all
-hold, each launch certified on a compile-only H100 aside (`captured`) or in turn: its program's fingerprint
-(`options.program_digest`) and each certification's op and its kernels' binaries' facts."""
+hold, each launch certified on a compile-only H100 aside (`captured`) or in turn: its program's kernel calls
+as its typed lowering states them, and each certification's op and its kernels' binaries' facts."""
 
 
 def test_a_templates_gradient_certified_aside_lowers_as_certified_in_turn_and_certifies_its_kernels(tmp_path):
