@@ -789,7 +789,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                  tuple(_parts_of(value, accumulated, added)
                        for accumulated, added in zip(made.accumulated, made.added, strict=True)))
         steps = [value(form) if part is None else None for part, form in zip(parts, made.steps, strict=True)]
-        taken = (None,) * len(made.steps) if stepped is None else tuple(stepped(tuple(state), parts))
+        taken = ((None,) * len(made.steps) if stepped is None
+                 else tuple(stepped(tuple(state), parts, tuple(steps))))
         stepped = [own if own is not None else made_step if made_step is not None else value(form)
                    for own, made_step, form in zip(taken, steps, made.steps, strict=True)]
         return tuple(stepped) if not outputs else (tuple(stepped), tuple(along))

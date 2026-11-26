@@ -2255,12 +2255,11 @@ def declaration(*, base2: bool, keys_first: bool = False, factor: float | None =
     """Attention's forward as theme A's declaration (`dew.algebra.derive.Reduction`): `softmax_of` over the
     template's formed tiles, walked along the keys, its exponent the base the template folds (`folds`: 2
     where it folds `log2(e)` into its logits), its tile keys first where the mainloop holds it so; over the
-    tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`), so the
-    derivation may take their maximum and scale it once (`rules`' positive scale out of a maximum), the
-    hand step's 62 fewer multiplies a step at Qwen3's tile, its exponent's argument one fused multiply-add a
-    logit (`rules._contracted`). Its derived forms (`derived_forms`) are what this module's walk computes
-    by (`plain_step`, `merge`, `finish`), on par with XLA's against float64 (docs/design/algebra.md). The
-    accurate form's (`natural`, `Forward.natural`) declares its exponential (`natural_exp`) and its rescale
+    tile's raw products times `factor` where the mainloop gives them (`Keys.products`, `logits_of`). The
+    declaration reduces the rounded logits, including any ties they form. The exponent's argument can
+    use one fused multiply-add a logit (`rules._contracted`). Its derived forms (`derived_forms`) compute
+    the walk (`plain_step`, `merge`, `finish`), on par with XLA's against float64 (docs/design/algebra.md).
+    The accurate form's (`natural`, `Forward.natural`) exponential (`natural_exp`) and rescale
     (`natural_carried`, its exponent compensated), which the derivation evaluates as they are and rewrites
     none: over scaled logits its largest weight held to 1 (`softmax_of`'s `held`), over raw products
     (`Forward.raw`) each difference scaled by their `raw` scale, which the exponential carries and the
@@ -2351,7 +2350,7 @@ def _softmax(spec: Forward, state: Partial, keys: Keys):
     forms, tiles, fields = _step_forms(spec, keys)
     taken: list = []
 
-    def own(states, parts):
+    def own(states, parts, _advanced):
         # The sums kept as they were: the walk takes the tile's weights and values itself, so the forms
         # evaluate no product here.
         taken.append(dict(zip(fields, parts, strict=True)))
@@ -2380,7 +2379,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     after: list[Partial] = []
 
-    def own(states, parts):
+    def own(states, parts, advanced):
         taken = dict(zip(fields, parts, strict=True))
         accumulated, added = taken["acc"], taken["total"]
         assert isinstance(accumulated, Accumulated) and isinstance(added, Added)
@@ -2409,9 +2408,9 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                               held=held, spec=spec)
             return stepped(state, state.m, added.factor, added.terms.sum(axis=axis), products, scale, held)
 
-        # The tile's maximum as the forms' step reaches it, read only where a tile is scaled.
-        raised = raised_weights(spec, keys.logits, lambda: peak(spec, state.m, keys.logits, keys.products,
-                                                                axis=axis)[0], keys.coords)
+        # Use the same already-advanced anchor as the ordinary weights, including rounded ties.
+        maximum = advanced[fields.index("m")]
+        raised = raised_weights(spec, keys.logits, lambda: maximum, keys.coords)
         after.append(scaled_step(state, scale, step, raised=raised, branched=held_by is None))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 

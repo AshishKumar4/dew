@@ -73,7 +73,7 @@ def accurate_sums(dot: Callable) -> Callable:
     """The accurate form's walked sums of products (`Derived.step`'s `stepped`): each the score cotangents'
     product with the keys (dQ's, `Accumulated`) by their parts (`algebra.cotangent_product`, the accurate
     form's three), added into the sum the step carries; every other sum the derived forms' own."""
-    def stepped(states, parts):
+    def stepped(states, parts, _advanced):
         return tuple(None if not isinstance(part, Accumulated) else
                      (state if part.factor is None else algebra.expand(part.factor, state) * state)
                      + algebra.cotangent_product(part.weights, part.values, dot, accurate=True)
