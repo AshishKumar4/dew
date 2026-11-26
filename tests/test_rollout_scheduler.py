@@ -444,6 +444,11 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
     assert not isinstance(below.rows, PagedRows) and not below.reuses_prefixes
     assert served_layout(task, capacity - PAGE_SIZE, PagedKV(shared=True)) is None
     assert served_layout(task, capacity, PagedKV(shared=True)) is not None
+    # Pages a cache names itself are kept below the crossover, as the server lays them.
+    named = PagedKV(shared=True, layout=KVCache(page_size=PAGE_SIZE))
+    assert served_layout(task, capacity - PAGE_SIZE, named) is not None
+    named_server = Server.from_task(task, slots=2, capacity=capacity - PAGE_SIZE, cache=named)
+    assert isinstance(named_server.rows, PagedRows)
     server = Server.from_task(task, slots=2, capacity=capacity, cache=PagedKV(shared=True))
     assert server.reuses_prefixes
     prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]

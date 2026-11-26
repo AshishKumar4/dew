@@ -547,6 +547,53 @@ def test_a_tier_3_sources_norms_products_and_delta_rule_run_dews_kernels_as_exac
                     truth_fn=truth_fn)
 
 
+def test_a_tier_3_offset_norm_adds_its_offset_in_float32_as_its_source_does():
+    """A bf16 Qwen3-Next RMSNorm (Gemma's `(1 + w)` by code) routed through Dew's fused norm
+    (`kernel_parts`) adds its offset to its float32 weight, as its forward's `1.0 + self.weight.float()`
+    does: an input `[1, 0]` under a weight `[2^-8, 0]` gives the source's own `1.421875` first, bit for bit,
+    where the bf16 add rounded `1 + 2^-8` to 1 and gave `1.4140625` (row 13044's review)."""
+    import torchax
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
+
+    from dew.interop.torchax_kernels import kernel_parts
+
+    class Held(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = transformers.Qwen3NextConfig(hidden_size=2)
+            self.norm = Qwen3NextRMSNorm(2).to(torch.bfloat16)
+
+    held, source = Held(), Qwen3NextRMSNorm(2).to(torch.bfloat16)
+    for norm in (held.norm, source):
+        norm.weight.data = torch.tensor([2.0 ** -8, 0.0], dtype=torch.bfloat16)
+    kernel_parts(held)
+    assert "forward" in vars(held.norm)
+    given = torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = source(given).float().numpy()
+    env = torchax.default_env()
+    with env, torch.no_grad():
+        norm = held.norm.to("jax")
+        got = np.asarray(torchax.interop.jax_view(norm(given.to("jax"))).astype(jnp.float32))
+    np.testing.assert_array_equal(got, expected)
+    assert float(expected[0, 0]) == 1.421875
+
+
+def test_tier_3_leaves_the_mlps_its_swiglu_does_not_compute_as_their_source_writes_them():
+    """Gated MLPs `kernel_parts` recognizes by code but whose projections or arithmetic its SwiGLU does not
+    take keep their own forwards: GLM-4's packed `gate_up_proj` and LFM2's `w1`, `w3`, `w2`, where the
+    rewrite raised as it looked up Llama's names (row 13044's review)."""
+    from dew.interop.torchax_kernels import kernel_parts
+
+    tiny = {"hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
+            "intermediate_size": 48, "vocab_size": 64}
+    glm = transformers.Glm4ForCausalLM(transformers.Glm4Config(**tiny))
+    lfm = transformers.Lfm2ForCausalLM(transformers.Lfm2Config(**tiny, layer_types=["full_attention"]))
+    for model, mlp in ((glm, glm.model.layers[0].mlp), (lfm, lfm.model.layers[0].feed_forward)):
+        kernel_parts(model)
+        assert "forward" not in vars(mlp), type(mlp).__name__
+
+
 QUALIFIED_SEEDS = 64
 """The qualified source's check-1 seeds."""
 

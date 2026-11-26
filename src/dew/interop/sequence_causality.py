@@ -67,8 +67,9 @@ which keys a query reads is the caller's, so the walk holds each position to its
 
 TOKENWISE = "token-wise"
 """The rule of a program Dew computes token by token (tier 3's experts' dispatch,
-`torchax_fallback.functional_experts`; `attested`), whose outputs at a token read that token's inputs
-alone."""
+`torchax_fallback.functional_experts`, and its kernel parts' norms and gated products,
+`torchax_fallback.kernel_parts`; `attested`), whose outputs at a token read that token's inputs alone,
+its tokens on one axis of every operand and output."""
 
 _ATTESTED: weakref.WeakKeyDictionary[core.Jaxpr, str] = weakref.WeakKeyDictionary()
 """Each program Dew's own code bound under a rule (`attested`), by that rule: the walk reads a call by
@@ -428,9 +429,13 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
         out = _shape(eqn.outvars[0])
         aligned = [value for value in given if isinstance(value, Reads)]
-        if all(value.axis == 0 and len(value.latest) == out[0] for value in aligned):
+        # Its tokens on one axis every operand the tokens reach holds them on: the flattened tokens' 0
+        # (tier 3's experts), a `[B, S, ...]` value's 1 (a token's norm or gated product).
+        axis = aligned[0].axis
+        if axis is not None and all(value.axis == axis and axis < len(out) and len(value.latest) == out[axis]
+                                    for value in aligned):
             latest = np.maximum.reduce([value.latest for value in aligned])
-            return [Reads(0, latest)] * len(eqn.outvars), [None] * len(eqn.outvars)
+            return [Reads(axis, latest)] * len(eqn.outvars), [None] * len(eqn.outvars)
         return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
     if program is None:
         return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)

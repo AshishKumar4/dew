@@ -69,6 +69,7 @@ from dew.interop.sequence_causality import (
     causality_refusal,
 )
 from dew.interop.streaming import SourceLeaf
+from dew.interop.torchax_kernels import kernel_parts
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, chosen_attention
@@ -892,7 +893,7 @@ def _functional_experts() -> type:
     return FunctionalExperts
 
 
-def functional_parts(model: torch.nn.Module) -> int | None:
+def functional_parts(model: PreTrainedModel) -> int | None:
     """Replace `model`'s parts a traced program cannot run as transformers writes them with ones computing
     the same inside the trace (`functional_rotaries`, `functional_experts`), and route the parts Dew has
     kernels for through them (`kernel_parts`). Returns the cache's rebuild position
@@ -900,152 +901,6 @@ def functional_parts(model: torch.nn.Module) -> int | None:
     functional_experts(model)
     kernel_parts(model)
     return functional_rotaries(model)
-
-
-def kernel_parts(model: torch.nn.Module) -> None:
-    """Route each of `model`'s standard parts Dew computes by a kernel of its own through that kernel, as
-    a native model's do, identified by its code (`parts.identify`, the known classes of Dew's registered
-    families, under any renaming), never by a model's name: an RMSNorm (Llama's, Gemma's offset one, OLMo
-    2's weight-first one: `_norm_forward`, Dew's fused norm), a gated MLP's SiLU product (`_mlp_forward`,
-    Dew's fused SwiGLU), and a gated delta net's chunked rule (`_delta_net_forward`, Dew's chunked
-    recurrence, in place of the `torch_chunk_gated_delta_rule` its code calls). Each keeps its module, so
-    its parameters keep their names, its forward the instance's own; a part whose read differs from what
-    the kernel computes (a weight of another dtype than its input's, a biased MLP, another activation)
-    keeps transformers' forward."""
-    from dew.interop.parts import Ambiguous, PartView, identify
-
-    config = model.config
-    for _, module in list(model.named_modules()):
-        for role, make in (('norm', _norm_forward), ('mlp', _mlp_forward),
-                           ('gated_delta_net', _delta_net_forward)):
-            try:
-                part, renaming = identify(module, (role,))
-                fields = part.read(PartView(module, renaming, config))
-            except Ambiguous:
-                continue
-            forward = make(module, renaming, fields)
-            if forward is not None:
-                vars(module)['forward'] = forward
-            break
-
-
-_NORM_FIELDS = frozenset({'norm_eps', 'scale_after_cast', 'scale_offset'})
-"""An RMSNorm read's fields Dew's fused norm computes alone; a read of any other keeps its forward."""
-
-
-def _norm_forward(module, renaming, fields) -> Callable | None:
-    """An RMSNorm's forward through Dew's fused norm (`rms_normalized`, the generation's measured kernel),
-    its epsilon, offset and rounding the part's (`fields`), in float32 statistics; None for a read it does
-    not compute."""
-    if set(fields) != _NORM_FIELDS:
-        return None
-    # The weight the known part holds (`KnownPart.parameters`), by the source's name for it, read at each
-    # call: a traced call binds the module's parameters to its own values (`functional_call`).
-    named = renaming.attributes.get('weight', 'weight')
-    original = type(module).forward.__get__(module)
-
-    def forward(hidden_states):
-        from torchax.interop import jax_view, torch_view
-
-        from dew.nn.norms import rms_normalized
-
-        weight = getattr(module, named)
-        # A weight of the input's dtype alone: transformers' product of a narrow input by a wide weight
-        # promotes its result, which Dew's norm, rounding to one dtype, does not.
-        if hidden_states.dtype != weight.dtype or not _traced(hidden_states):
-            return original(hidden_states)
-        x, scale = jax_view((hidden_states, weight))
-        return torch_view(rms_normalized(x, scale, fields['norm_eps'], x.dtype, fields['scale_offset'],
-                                         fields['scale_after_cast'], fp32_statistics=True))
-    return forward
-
-
-def _mlp_forward(module, renaming, fields) -> Callable | None:
-    """A gated MLP's forward with its SiLU product through Dew's fused SwiGLU (`gated_product`), its gate,
-    up and down projections the module's own; None for a biased MLP or another activation."""
-    if fields.get('mlp') != 'swiglu' or fields.get('mlp_bias'):
-        return None
-    gate, up, down = (getattr(module, renaming.attributes.get(name, name))
-                      for name in ('gate_proj', 'up_proj', 'down_proj'))
-    original = type(module).forward.__get__(module)
-
-    def forward(x):
-        from torchax.interop import jax_view, torch_view
-
-        from dew.nn.activations import gated_product
-
-        if not _traced(x):
-            return original(x)
-        gated, upped = jax_view((gate(x), up(x)))
-        return down(torch_view(gated_product('swiglu')(gated, upped)))
-    return forward
-
-
-def _delta_net_forward(module, renaming, fields) -> Callable | None:
-    """A gated delta net's forward whose chunked rule is Dew's (`_dew_chunk_rule`), its code otherwise: a
-    copy of its forward whose `torch_chunk_gated_delta_rule` names Dew's, where its module's binding is
-    transformers' chunked rule by its code (`_is_chunk_rule`); None where it is not."""
-    import inspect
-    import types
-
-    # Past its wrappers (accelerate's offload hooks, which tier 3 sets none of), the module binding its rule.
-    function = inspect.unwrap(type(module).forward)
-    bound = function.__globals__.get('torch_chunk_gated_delta_rule')
-    if bound is None or not _is_chunk_rule(bound):
-        return None
-    names = {**function.__globals__, 'torch_chunk_gated_delta_rule': _dew_chunk_rule(bound)}
-    copied = types.FunctionType(function.__code__, names, function.__name__, function.__defaults__,
-                                function.__closure__)
-    copied.__kwdefaults__ = function.__kwdefaults__
-    return copied.__get__(module)
-
-
-def _is_chunk_rule(bound) -> bool:
-    """Whether `bound` (a module's `torch_chunk_gated_delta_rule`, under transformers' hub-kernel wrapper)
-    computes Qwen3-Next's chunked delta rule by its code (`same_code`), as Dew's does."""
-    import inspect
-    import types
-
-    from transformers.models.qwen3_next import modeling_qwen3_next
-
-    from dew.interop.code_identity import Renaming, same_code
-
-    known = inspect.unwrap(modeling_qwen3_next.torch_chunk_gated_delta_rule)
-    candidate = inspect.unwrap(bound)
-    return isinstance(candidate, types.FunctionType) and same_code(candidate, known, Renaming())
-
-
-def _dew_chunk_rule(original: Callable) -> Callable:
-    """transformers' chunked delta rule's signature over Dew's (`chunk_gated_delta_rule`): queries and keys
-    l2-normalized in float32 where asked (FLA's `l2norm` at 1e-6), the rule over float32 operands, its output
-    in the queries' dtype; `original` where it runs outside a trace or packs documents (`cu_seqlens`)."""
-    def rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False,
-             use_qk_l2norm_in_kernel=False, **kwargs):
-        from torchax.interop import jax_view, torch_view
-
-        from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule
-        from dew.nn.precision import l2norm
-
-        if kwargs.get('cu_seqlens') is not None or not _traced(query):
-            return original(query, key, value, g=g, beta=beta, chunk_size=chunk_size,
-                            initial_state=initial_state, output_final_state=output_final_state,
-                            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs)
-        q, k, v, decay, write = (x.astype(jnp.float32) for x in jax_view((query, key, value, g, beta)))
-        if use_qk_l2norm_in_kernel:
-            q, k = l2norm(q, 1e-6), l2norm(k, 1e-6)
-        state = None if initial_state is None else jax_view(initial_state).astype(jnp.float32)
-        out, final = chunk_gated_delta_rule(q, k, v, decay, write, state, chunk_size,
-                                            unit_queries=use_qk_l2norm_in_kernel)
-        return (torch_view(out.astype(jax_view(query).dtype)),
-                torch_view(final) if output_final_state else None)
-    return rule
-
-
-def _traced(tensor) -> bool:
-    """Whether `tensor` is torchax's, inside a trace; an eager call (a probe's) keeps transformers'."""
-    import torchax
-
-    return isinstance(tensor, torchax.tensor.Tensor)
 
 
 _REACH: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_reach", default=None)

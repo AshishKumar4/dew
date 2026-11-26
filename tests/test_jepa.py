@@ -485,6 +485,14 @@ def test_representation_health_counts_no_row_filling_a_batch():
     for name in ("repr_std", "repr_cov_offdiag"):
         np.testing.assert_array_equal(np.asarray(marked[name].mean()[0]), np.asarray(alone[name].mean()[0]),
                                       err_msg=name)
+    # Microbatches of filler alone pool as nothing: two of them, then the real rows, read as the real rows.
+    from dew.objectives.base import Moments
+
+    empty = representation_health(jnp.asarray(filled[:8]), jnp.zeros(8, bool))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        pooled = Moments.pooled([empty[name], empty[name], alone[name]])
+        np.testing.assert_array_equal(np.asarray(pooled.mean()[0]), np.asarray(alone[name].mean()[0]),
+                                      err_msg=name)
 
 
 # --- EMA target encoder ----------------------------------------------------

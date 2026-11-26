@@ -244,6 +244,12 @@ class Moments(Pooled):
         if not isinstance(later, Moments):
             raise TypeError(f"moments join moments, not a {type(later).__name__}")
         count, center, delta, weight = joined_moments(self.count, self.center, later.count, later.center)
+        # A part of no rows (a microbatch of filler alone, `of`'s `real`) joins as nothing: the whole is the
+        # other part, where Chan's update divides by a whole of none.
+        held = count > 0
+        center = jnp.where(held, center, self.center)
+        weight = jnp.where(held, weight, 0)
+        delta = jnp.where(held, delta, 0)
         squares = self.squares + later.squares + weight * delta ** 2
         products = None if self.products is None or later.products is None else (
             self.products + later.products + weight * jnp.outer(delta, delta))

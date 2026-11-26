@@ -717,10 +717,12 @@ def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None
     *_, strategy = task.controls().components()
     layout = _laid(task.model, cache, capacity, strategy, None)
     own = task.model.kv_cache if isinstance(task.model, Layered) else None
-    # A model declaring pages of its own keeps them wherever a prefix cache over them pays, at any
-    # capacity; the measured crossover chooses pages over a model's whole rows (`_pages_pay`).
+    # Pages a layout declares, the one a cache names (`PagedKV.layout`) or else the model's own, are kept
+    # wherever a prefix cache over them pays, at any capacity, as `_laid` keeps them; the measured
+    # crossover chooses pages over whole rows (`_pages_pay`).
+    base = cache.layout if isinstance(cache, PagedKV) and cache.layout is not None else own
     shares = layout is not None and _pages_pay(task.model, layout, capacity, strategy, None,
-                                               measured=own is None or own.page_size is None)
+                                               measured=base is None or base.page_size is None)
     return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
