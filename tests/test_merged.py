@@ -1198,7 +1198,7 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
         with _mosaic_served(target_name):
             base_work = merged.launch_work(spec, padded, stacked, queries, width, target,
                                            out_dtype=jnp.bfloat16, out_heads=out_heads)
-        block, _ = merged._planned_block(
+        block, *_ = merged._planned_block(
             algebra.units_of(spec), padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
             out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
         rows = padded.shape[0] * queries * padded.shape[3]

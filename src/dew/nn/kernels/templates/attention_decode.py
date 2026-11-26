@@ -36,7 +36,7 @@ from jax.extend import core as jaxpr_core
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, merged
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -334,8 +334,8 @@ def _bound(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: fl
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
                    target: generation.GpuTarget, initial: bool) -> float:
-    """The seconds of the merge of a split walk's `slices` (`merged.launch_work`): the walk's outputs as its
-    launch writes them, `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
+    """The seconds of the merge of a split walk's `slices` (`merged.launch_seconds`): the walk's outputs as
+    its launch writes them, `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
     (`attention_mosaic_forward.SplitOutput`)."""
     family = attention_mosaic.bundle_of(config, query.dtype, target=target)
     rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
@@ -344,9 +344,8 @@ def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
     spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    work = merged.launch_work(spec, padded, stacked, query.shape[1], value.shape[-1], target,
-                              has_initial=initial)
-    return cost.seconds(work, target)
+    return merged.launch_seconds(spec, padded, stacked, query.shape[1], value.shape[-1], target,
+                                 has_initial=initial)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
