@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
 from dew.nn.kernels.templates.attention import DKV_GRADS, TILED, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
+    Parked,
     TileWalk,
     _coords,
     _Spans,
@@ -926,7 +927,7 @@ def _parked(step: Callable, family: mosaic.Family, smem, interpret: bool, index,
     dk, dv = accumulators
     family.written(smem, dv)
     mosaic.synced(interpret)
-    return step(index, slots, carry, (dk, smem), masked=masked)
+    return step(index, slots, carry, (dk, Parked(smem)), masked=masked)
 
 
 def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first, rows: int) -> tuple:

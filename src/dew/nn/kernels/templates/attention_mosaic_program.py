@@ -451,6 +451,13 @@ class _Issuing(NamedTuple):
     interpret: bool
 
 
+class Parked(NamedTuple):
+    """Sums parked in a shared tile `ref` across a step's other products (`BackwardTiles.parked`), which
+    `issued_into` reads back for their own product."""
+
+    ref: Any
+
+
 def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool, *,
                 shape: tuple[int, int] | None = None):
     """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `parts`' products with `rhs`,
@@ -459,10 +466,9 @@ def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool, *,
     left operand in registers and formed as it is taken (`algebra.formed_parts`); an fp16 part's
     (`product.Scaled`) its own accumulator, restored by its row's power of two (`algebra.restored`) and
     added in."""
-    if acc is not None and not isinstance(acc, jax.Array):
-        # Sums parked in a shared tile (`BackwardTiles.parked`), read back for their product alone.
+    if isinstance(acc, Parked):
         mosaic.synced(interpret)
-        acc = family.tile_of(acc)
+        acc = family.tile_of(acc.ref)
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     products = (("part", part, right) for part in parts)
