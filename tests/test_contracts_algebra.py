@@ -49,7 +49,7 @@ def _chunked_cov(x, y, w):
     return moments.chunked_covariance(x, y, w, tile=4, mode="merge")
 
 
-# The complete reverse-over-reverse program peaks above 9 GiB cold on the standard CI host.
+# Reverse-over-reverse needs about 8 GiB cold, leaving too little room for other tests' compilers.
 @pytest.mark.parametrize("taken", [pytest.param(order, marks=pytest.mark.fresh_process)
                                   if order == "grad of grad" else order for order in ORDER_SETS])
 def test_chunked_moments_holds_every_order(taken):
