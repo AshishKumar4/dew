@@ -336,6 +336,27 @@ def test_a_narrow_finished_state_lands_mean_and_mass_in_its_own_format(dtype):
         np.testing.assert_array_equal(result, np.asarray(expected, dtype))
 
 
+@pytest.mark.parametrize(("dtype", "mantissa"), [(jnp.bfloat16, 7), (np.float16, 10)])
+def test_a_narrow_merged_total_rounds_once_above_its_midpoint(dtype, mantissa):
+    totals = np.asarray([[1, 2.0 ** -(mantissa + 1), 0], [1, 2.0 ** -(mantissa + 1), 2.0 ** -24]], dtype)
+    anchors = np.zeros_like(totals)
+    run = jax.jit(lambda t, a: means.merged_total(t, a, windows.Units(scale=0), 1)[0])
+    np.testing.assert_array_equal(run(totals, anchors), np.asarray([1, 1 + 2.0 ** -mantissa], dtype))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, np.float16])
+def test_two_words_at_narrow_underflow_and_overflow_boundaries_round_once(dtype):
+    limits = jnp.finfo(dtype)
+    boundary = 2 - 2.0 ** -(limits.nmant + 1)
+    heads = np.asarray([1, 1, -1, boundary, boundary], np.float32)
+    tails = np.asarray([-2.0 ** -24, 2.0 ** -24, -2.0 ** -24, -2.0 ** -24, 2.0 ** -24], np.float32)
+    halfway = limits.minexp - limits.nmant - 1
+    exponents = np.asarray([halfway, halfway, halfway, limits.maxexp - 1, limits.maxexp - 1], np.int32)
+    landed = jax.jit(lambda a, b, e: windows._landed((a, b, e), dtype))(heads, tails, exponents)
+    expected = np.asarray([0, limits.smallest_subnormal, -limits.smallest_subnormal, limits.max, np.inf], dtype)
+    np.testing.assert_array_equal(np.asarray(landed).view(np.uint16), expected.view(np.uint16))
+
+
 def test_a_narrow_mass_relocates_before_rounding_past_its_last_binade():
     totals, anchors = np.asarray([65504, 16], np.float16), np.zeros(2, np.float16)
     total, anchor = jax.jit(lambda t, a: means.merged_total(t, a, windows.Units(), 0))(totals, anchors)
