@@ -41,6 +41,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.batch import Batch
+    from dew.objectives.base import Objective
     from dew.state import TrainState
     from dew.training._candidates import StepSettings
     from dew.training.trainer import StepFn
@@ -103,7 +104,7 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
             'xla_flags': ' '.join(flags)}
 
 
-def _configured(settings: StepSettings) -> dict[str, object]:
+def _configured(settings: StepSettings) -> Mapping[str, object]:
     """What a run's `settings` state of its step by value, beside the code `_code` states: each setting that
     is no function, mesh or module (its loss scale, whether it skips a step not finite, its layout, its
     microbatches, its Newton-Schulz group...), its objective's own configuration (`objective_configured`:
@@ -121,10 +122,10 @@ def _configured(settings: StepSettings) -> dict[str, object]:
             "optimizer": source if isinstance(source, OptimConfig) else None}
 
 
-def objective_configured(objective: object) -> dict[str, object]:
+def objective_configured(objective: Objective) -> Mapping[str, object]:
     """An objective's own configuration, the plain values it holds by name (numbers, strings, flags and
     tuples of them; none private), which its modules (`Objective.program_key`) do not state."""
-    def plain(value: object) -> bool:
+    def plain(value: JSON | tuple | list) -> bool:
         if isinstance(value, (tuple, list)):
             return all(plain(each) for each in value)
         return value is None or isinstance(value, (bool, int, float, str))

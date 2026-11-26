@@ -2051,8 +2051,7 @@ def test_a_rung_key_states_the_settings_a_step_computes_by():
     plain = lm()
     skipping = lm()
     skipping.skip_nonfinite = True
-    chunked = lm()
-    chunked.objective.head_chunks = 8
+    chunked = lm(objective=lambda model, seq_len: LMObjective(model, seq_len=seq_len, head_chunks=8))
     first = key(plain)
     assert first is not None and first == key(lm())
     assert key(skipping) != first and key(chunked) != first
