@@ -124,3 +124,51 @@ def test_mxfp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
         with generation.chosen(mxfp8="xla"):
             ref = gemm.mxfp8_product(lhs, matrices, blocks, out_dtype=jnp.float32, interpret_on_cpu=False)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+
+def test_a_block_holding_an_infinity_or_a_nan_takes_the_nan_scale_quantized_or_in_the_epilogue():
+    """A 32-column block holding an infinity or a NaN takes the NaN scale (`0xFF`), its other blocks their
+    own, alike whether `formats.MxFp8.quantized` quantizes it or a GEMM's quantizing epilogue does
+    (`gemm.gemm_quantized(..., MxFp8)`), so the block decodes to NaN either way (row 13164: the epilogue's
+    247 against the quantizer's 118 and 0)."""
+    x = jnp.ones((16, 64), jnp.float32).at[0, 3].set(jnp.inf).at[1, 40].set(jnp.nan)
+    eye = jnp.eye(64, dtype=jnp.float32)
+    quantized = formats.MxFp8.quantized(x)
+    fused = gemm.gemm_quantized(x.astype(jnp.bfloat16), eye.astype(jnp.bfloat16), minifloat=formats.MxFp8)
+    as_bytes = [np.asarray(jax.lax.bitcast_convert_type(each.scales, jnp.uint8))
+                for each in (quantized, fused)]
+    np.testing.assert_array_equal(as_bytes[0], as_bytes[1])
+    assert as_bytes[0][0, 0] == 0xFF and as_bytes[0][1, 1] == 0xFF and as_bytes[0][0, 1] == 127
+    assert bool(jnp.all(jnp.isnan(quantized.decoded()[0, :32])))
+    assert bool(jnp.all(jnp.isnan(fused.decoded()[1, 32:])))
+
+
+def test_an_mxfp8_products_least_scale_meets_its_largest_in_the_exponents():
+    """An MXFP8 product of a code of one at the least scale (`0x00`, 2^-127, a float32 subnormal) and a code
+    of one at the largest (`0xFE`, 2^127) is one a depth, summed: exactly 32 over a block, on a CPU, whose
+    XLA flushes a subnormal operand to zero (row 13164: the decoded operands' product read 0)."""
+    scale = formats.MxFp8(jnp.ones((128, 32), jnp.float8_e4m3fn),
+                          jax.lax.bitcast_convert_type(jnp.zeros((128, 1), jnp.uint8), jnp.float8_e8m0fnu))
+    large = formats.MxFp8(jnp.ones((1, 128, 32), jnp.float8_e4m3fn),
+                          jax.lax.bitcast_convert_type(jnp.full((1, 128, 1), 0xFE, jnp.uint8),
+                                                       jnp.float8_e8m0fnu))
+    with generation.chosen(mxfp8="xla"):
+        out = jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.asarray([1], jnp.int32),
+                                                      out_dtype=jnp.float32))(scale, large)
+    np.testing.assert_array_equal(np.asarray(out), np.full((128, 128), 32.0, np.float32))
+
+
+def test_a_blockwise_products_rows_past_its_groups_are_zero_whatever_their_scales():
+    """The blockwise FP8 product's portable sum (`xla_products.step_scaled`): rows past the groups are zero
+    even where their row scales are infinite, a padded row's (row 13164: masked before its scaling, its zero
+    times an infinite scale read NaN)."""
+    from dew.nn.kernels import xla_products
+
+    tokens = jnp.ones((256, 128), jnp.bfloat16)
+    kernel = jnp.ones((1, 128, 128), jnp.bfloat16)
+    row_scales = jnp.ones((1, 256), jnp.float32).at[0, 128:].set(jnp.inf)
+    column_scales = jnp.ones((1, 1, 1), jnp.float32)
+    out = jax.jit(xla_products.step_scaled)(tokens, kernel, jnp.asarray([128], jnp.int32), row_scales,
+                                           column_scales)
+    np.testing.assert_array_equal(np.asarray(out[128:]), np.zeros((128, 128), np.float32))
+    np.testing.assert_array_equal(np.asarray(out[:128]), np.full((128, 128), 128.0, np.float32))

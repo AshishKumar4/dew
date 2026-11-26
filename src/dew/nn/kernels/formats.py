@@ -253,11 +253,16 @@ class MxFp8:
         top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
         scale = formats_of.MXFP8.scale
         bias = -jnp.finfo(scale).minexp
+        # A block holding an infinity or a NaN takes the NaN scale (`0xFF`), its codes at a unit scale, as
+        # the GEMM epilogue's quantizer takes it (`quantized._mxfp8_quantize_epilogue`; row 13164).
+        finite = jnp.isfinite(largest)
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
+        exponent = jnp.where(finite, exponent, 0)
         # The power its scale is, set in E8M0's bits by the one owner of an exact power (`exact_power2`: every
         # biased exponent a power, none a zero; its byte the exponent plus 127, which its int8 sum wraps to
         # past 127 and its bitcast reads back; row 8832).
-        scales = exact_power2(exponent, scale)
+        scales = jnp.where(finite, exact_power2(exponent, scale),
+                           jax.lax.bitcast_convert_type(jnp.uint8(0xFF), scale))
         # Each value over its scale as its exponent (`precision.power2`, the one owner of scaling by a power
         # of two; row 8971), as `decoded` applies it: the least scale, a block of zeros' or of magnitudes
         # under 2^-118, is float32's subnormal 2^-127, which a program that flushes subnormals (XLA's CPU, op
@@ -286,6 +291,14 @@ def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
     for `0xFF`, `2^-127` for `0x00`) plus the boolean mask of `0x00` subnormal blocks (row 9040)."""
     held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.uint32)
     return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
+
+def e8m0_exponents(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """E8M0 `scales` as their powers' exponents (int32: a byte less 127, `0x00`'s -127 too) and the mask of
+    the NaN byte `0xFF`: a block-scaled product's scales as they meet in a sum of exponents
+    (`xla_products.exponent_scaled`), no power decoded alone."""
+    held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.int32)
+    return held - 127, held == 0xFF
+
 
 def scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ...]) -> None:
     """Validate that `scale_shape` satisfies the single unambiguous broadcast contract for a scaled packed
