@@ -26,7 +26,6 @@ logits through vLLM's draft ported (tools/inkling2_draft_reference.py) as record
 """
 
 import argparse
-import copy
 import json
 import re
 from pathlib import Path
@@ -478,7 +477,7 @@ def write_draft_recording() -> None:
     from _dew_torch.precision import float64
 
     model, wide = text_pair(TINY)
-    narrow = copy.deepcopy(model).to(torch.bfloat16)
+    narrow = text_model(TINY, torch.bfloat16)
     stored = load_file(TINY / 'mtp.safetensors')
     visits = DRAFT['target_layer_ids'][:-1]
 
@@ -522,18 +521,25 @@ def draw(seed: int) -> dict[str, np.ndarray]:
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
 
 
-def text_pair(directory: Path):
-    """The fixture at `directory` as transformers reads it, its experts dequantized where stored quantized,
-    fp32 on eager attention, and its float64 twin."""
-    from _dew_torch.precision import float64_twin
-
+def text_model(directory: Path, dtype: torch.dtype = torch.float32):
+    """The fixture at `directory` as transformers reads it at `dtype` (its router's weights fp32, as its
+    class keeps them), its experts dequantized where stored quantized, on eager attention."""
     configuration, modeling = _modeling()
     config = configuration.Inkling2LoopTextConfig(**TEXT)
     model = modeling.Inkling2LoopForCausalLM.from_pretrained(
-        directory, config=config, dtype=torch.float32, attn_implementation='eager').eval()
+        directory, config=config, dtype=dtype, attn_implementation='eager').eval()
     # The experts' own loop (`Inkling2LoopExperts.forward`), which runs in float64 as torch's grouped
     # products do not; its modules read the choice off the config at each call (integrations/moe.py:633).
     model.config._experts_implementation = 'eager'
+    return model
+
+
+def text_pair(directory: Path):
+    """The fixture at `directory` in fp32 (`text_model`) and its float64 twin."""
+    from _dew_torch.precision import float64_twin
+
+    _, modeling = _modeling()
+    model = text_model(directory)
     truth = float64_twin(model, lambda: modeling.Inkling2LoopForCausalLM(model.config))
     truth.config._experts_implementation = 'eager'
     return model, truth
