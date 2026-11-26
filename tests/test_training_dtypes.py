@@ -432,14 +432,12 @@ def test_a_trainer_given_numerics_traces_draws_and_scales_under_them(preset):
 
 
 def test_a_trainer_refuses_numerics_its_model_computes_outside_or_beside_their_own_knobs():
-    """Numerics whose compute dtype the model it trains does not compute in are refused, the model's dtype
-    being its own field (Flax's None computing in its parameters' float32), as numerics set beside the
-    `param_dtype` and `dynamic_scale` they state are."""
+    """Numerics whose compute dtype the model it trains states another of are refused, the model's dtype
+    being its own field, as numerics set beside the `param_dtype` and `dynamic_scale` they state are."""
     numerics = Numerics(DTYPE_PRESETS["16-mixed"])
     read = numerics_reader([])
-    for dtype in (jnp.float32, None):
-        with pytest.raises(ValueError):
-            Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
+    with pytest.raises(ValueError):
+        Trainer(Fitted(read(jnp.float32)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
     for knobs in ({"param_dtype": "bfloat16"}, {"dynamic_scale": True}):
         with pytest.raises(ValueError):
             Trainer(Fitted(read(jnp.float16)), optax.sgd(.1),

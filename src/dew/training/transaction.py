@@ -816,28 +816,33 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
 
 
+def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[str, ...]:
+    """The compute dtypes the Flax modules `objective` trains state (their `dtype` fields), each once, in
+    order: a model computes in the dtype it was built with, a field of its own no trainer sets; none for a
+    module that states none (Flax's None, its compute inferred from its inputs and its submodules')."""
+    stated = (held.get("dtype") for held in _trained_fields(objective))
+    return tuple(dict.fromkeys(jnp.dtype(dtype).name for dtype in stated if dtype is not None))
+
+
+def _trained_fields[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[dict[str, object]]:
+    """Each Flax module `objective` trains, as its fields by name."""
+    return [{field.name: getattr(entry.module, field.name) for field in dataclasses.fields(entry.module)}
+            for entry in objective.program_key() if entry.trained and isinstance(entry.module, linen.Module)]
+
+
 def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                    numerics: Numerics) -> tuple[bool, str | None]:
     """Whether a trainer under `numerics` scales its loss dynamically and the dtype it stores the parameters
     it draws fresh in (`TrainerAdvanced.numerics`): the one resolution of both, a run config's among them
-    (`dew.config.RunConfig.trained_numerics`). A model computes in the dtype it was built with, a field of
-    its own the trainer cannot set, so a module `objective` trains that computes in another dtype than
-    `numerics`' compute is refused (Flax's None, in its parameters')."""
-    modules = [entry.module for entry in objective.program_key()
-               if entry.trained and isinstance(entry.module, linen.Module)]
-    fields = [{field.name: getattr(module, field.name) for field in dataclasses.fields(module)}
-              for module in modules]
-    drawn = numerics.drawn_dtype([held["param_dtype"] for held in fields
-                                  if held.get("param_dtype") is not None])
-    compute = jnp.dtype(numerics.dtypes.compute)
-    for module, held in zip(modules, fields, strict=True):
-        if "dtype" not in held:
-            continue
-        computed = jnp.dtype(numerics.dtypes.params if held["dtype"] is None else held["dtype"])
-        if computed != compute:
-            raise ValueError(f"{type(module).__name__} computes in {computed} and the run's numerics in "
-                             f"{compute}: build the model with dtype={compute.name}, or name its dtype in "
-                             "the numerics (Dtypes.compute)")
+    (`dew.config.RunConfig.trained_numerics`). A module `objective` trains that states another compute dtype
+    than `numerics`' (`stated_compute`) is refused: the trainer cannot set it, and the loss would be scaled
+    for a compute the model does not run."""
+    drawn = numerics.drawn_dtype([jnp.dtype(dtype) for held in _trained_fields(objective)
+                                  if (dtype := held.get("param_dtype")) is not None])
+    compute = jnp.dtype(numerics.dtypes.compute).name
+    if other := [dtype for dtype in stated_compute(objective) if dtype != compute]:
+        raise ValueError(f"the model computes in {' and '.join(other)} and the run's numerics in {compute}: "
+                         f"build it with dtype={compute}, or name its dtype in the numerics (Dtypes.compute)")
     return numerics.scales_loss(), drawn
 
 

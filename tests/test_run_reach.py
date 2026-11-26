@@ -517,7 +517,7 @@ def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_nam
     loaded = RunConfig.load(str(earlier(pretrained, tmp_path, pretrained_param_dtype="bfloat16",
                                         trainer={"dynamic_scale": True})))
     assert loaded.source.param_dtype == "bfloat16" and loaded.trainer.precision.dtypes.params == "float32"
-    assert loaded.trained_numerics().drawn_dtype() is None
+    assert loaded.trainer.precision.drawn_dtype() is None
     assert loaded.trainer.precision.loss_scaling == "dynamic"
     with pytest.raises(ValueError):
         LMRunConfig.read(json.loads((tmp_path / "earlier" / "run.json").read_text()))

@@ -1682,7 +1682,7 @@ class RunConfig:
             microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
             advanced=training.TrainerAdvanced(
                 layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
-                skip_nonfinite=trainer.skip_nonfinite, numerics=self.trained_numerics(),
+                skip_nonfinite=trainer.skip_nonfinite, numerics=self.trained_numerics(objective),
                 tune_kernels=self.diagnostics.tune_kernels,
                 inspection=trainer.inspection, diloco=trainer.diloco,
                 **{"links": self.diagnostics.links, **resources}))
@@ -1693,15 +1693,18 @@ class RunConfig:
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
-    def trained_numerics(self) -> Numerics:
-        """The run's numerics as its trainer reads them (`TrainerAdvanced.numerics`): its precision, with
-        the compute dtype its model computes in (`compute_dtype`) and the parameters' its model's record
-        states in their place, which the model then draws them in itself."""
+    def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics:
+        """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
+        precision, with the compute dtype its model computes in in place of its own, the one the model it is
+        handed states (`stated_compute`, a model built in Python), else its record's (`compute_dtype`), and
+        the parameters' dtype its model's record states, which the model then draws them in itself."""
+        from dew.training.transaction import stated_compute
+
         precision = self.trainer.precision
-        stated = self.model.fields.get("param_dtype")
+        stated, computes = self.model.fields.get("param_dtype"), stated_compute(objective)
         params = precision.dtypes.params if stated is None else str(stated)
         return dataclasses.replace(precision, dtypes=dataclasses.replace(
-            precision.dtypes, compute=self.compute_dtype(), params=params))
+            precision.dtypes, compute=computes[0] if computes else self.compute_dtype(), params=params))
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,
