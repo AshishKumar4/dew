@@ -82,9 +82,9 @@ def test_a_4b_cell_holds_at_the_rows_its_receipts_timed_and_not_past_them():
 @pytest.mark.parametrize("board", grouped_cells.SCOREBOARDS, ids=lambda board: board.evidence.split()[0])
 def test_a_scoreboards_products_run_the_template_where_at_parity_and_its_kind_elsewhere(board):
     """A dense kind runs the template whole only where every product any receipt timed of it is at parity in
-    time and temporaries and its step holds no more (kernel-templates.md §1; bible §6, 2026-11-24); a kind with a product lagging keeps XLA's dot, its products at parity the
-    template's over their timed rows, its lagging ones and every product it did not time XLA's
-    (`grouped_cells.Scoreboard`)."""
+    time and temporaries and its step holds no more (kernel-templates.md §1; bible §6, 2026-11-24); a kind
+    with a product lagging keeps XLA's dot, its products at parity the template's over their timed rows,
+    its lagging ones and every product it did not time XLA's (`grouped_cells.Scoreboard`)."""
     untimed = (3 * 1024 + 64, 8 * 1024 + 64)
     for made, projections in board.times.items():
         lags = any(timing.winner == "xla" for timing in grouped_cells.timings()
