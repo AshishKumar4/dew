@@ -419,7 +419,7 @@ def _check_joint(closed: jcore.Jaxpr, widths: Sequence[int], accurate: bool, *,
         return shared
     region = terms.region(closed)
     graph, _, _ = program.graphed(region)
-    program.saturate(graph, region, rules.admitted(accurate), SATURATION)
+    program.saturate(graph, region, rules.admitted(accurate), SATURATION, facts_settled=True)
     # Each output's term, the program's results first, then each declaration's in the same order.
     terms_made = region.outputs
     equal, program_at = [], 0

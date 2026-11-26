@@ -67,7 +67,7 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     facts = cost.target()
     timed = cost.model(region, cost.fused(facts))
     _, written_seconds = extract.cheapest(graph, bundle, timed)
-    program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation)
+    program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation, facts_settled=True)
     tree = jax.tree.structure(shaped)
     cheapest, _ = program.extracted(graph, bundle, timed)
     proposed = {"cheapest": cheapest,

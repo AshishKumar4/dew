@@ -819,11 +819,18 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
     ctx_keys: dict[int, Hashable] = {}
     plain_types: dict[int, Hashable] = {}
     primitive_keys: dict[int, Hashable] = {}
-    position: dict[jcore.Var, int] = {}
+    binders: dict[jcore.Var, bytes] = {}
 
     def feed(part: Hashable) -> None:
         hasher.update(repr(part).encode())
         hasher.update(b"\0")
+
+    def bind(variables: Sequence[jcore.Var]) -> None:
+        # Encode each ordinal once. Preserve both the in-process tag and persistent textual format.
+        for var in variables:
+            at = len(binders)
+            binders[var] = (((at << 8) | 1).to_bytes(9, "little") if in_process
+                            else repr(("var", at)).encode() + b"\0")
 
     def aval_key(given) -> Hashable:
         if not in_process or not isinstance(given, ShapedArray):
@@ -853,20 +860,16 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
             feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
             hasher.update(b"\0")
-        elif in_process:
-            # A binary tag distinct from the literals' leading tuple marker, followed by a fixed
-            # width binder position. No repr or temporary tuple for the dominant atom kind.
-            hasher.update(((position[atom] << 8) | 1).to_bytes(9, "little"))
         else:
-            feed(("var", position[atom]))
+            hasher.update(binders[atom])
 
     def var_key(var: jcore.Var) -> Hashable:
         return isinstance(var, jcore.DropVar), aval_key(var.aval)
 
     feed(("constvars", tuple(var_key(var) for var in jaxpr.constvars)))
     feed(("invars", tuple(var_key(var) for var in jaxpr.invars)))
-    for var in (*jaxpr.constvars, *jaxpr.invars):
-        position[var] = len(position)
+    bind(jaxpr.constvars)
+    bind(jaxpr.invars)
     feed(("eqns", len(jaxpr.eqns)))
     for equation in jaxpr.eqns:
         ctx = equation.ctx
@@ -906,8 +909,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
               tuple(var_key(var) for var in equation.outvars)))
         for atom in equation.invars:
             feed_atom(atom)
-        for var in equation.outvars:
-            position[var] = len(position)
+        bind(equation.outvars)
     feed(("outvars", len(jaxpr.outvars)))
     for atom in jaxpr.outvars:
         feed_atom(atom)
@@ -984,16 +986,22 @@ def provenance_key(closed: jcore.Jaxpr) -> str:
         result_paths = (di.result_paths if isinstance(di.result_paths, (type(None), tuple))
                         else repr(di.result_paths))
         feed(("debug_info", di.traced_for, di.func_src_info, di.arg_names, result_paths))
+    source_encodings: dict[tuple[int, int], bytes] = {}
     for equation in inner.eqns:
         si = equation.source_info
-        tb = si.traceback
-        if tb is None:
+        tb, names = si.traceback, si.name_stack.stack
+        # The equations keep both inputs live; the same traceback can have different name stacks.
+        source = id(tb), id(names)
+        if (encoded := source_encodings.get(source)) is None:
             frames = None
-        else:
-            codes, lastis = tb.raw_frames()
-            frames = tuple((code.co_filename, code.co_qualname, code.co_firstlineno, lasti)
-                           for code, lasti in zip(codes, lastis, strict=True))
-        feed(("eqn", si.name_stack.stack, frames))
+            if tb is not None:
+                codes, lastis = tb.raw_frames()
+                frames = tuple((code.co_filename, code.co_qualname, code.co_firstlineno, lasti)
+                               for code, lasti in zip(codes, lastis, strict=True))
+            encoded = repr(("eqn", names, frames)).encode()
+            source_encodings[source] = encoded
+        hasher.update(encoded)
+        hasher.update(b"\0")
         if equation.params:
             nested: list[str] = []
             _walk_sub_provenance(equation.params, nested, set())
