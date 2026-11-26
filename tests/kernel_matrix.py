@@ -291,13 +291,13 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gated_mlp.py::test_the_gated_mlp_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
 )
-"""The flows that run the matrices' seeded cases on the GPU tier (`seeded_cells`), by pytest node id: a
-family no GPU-only red seeded runs on the CPU alone."""
+"""GPU tier matrix flows by node id: seeded native cases, plus the gated MLP native route matrix."""
 
 TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",

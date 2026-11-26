@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from contract_support import normal_draw
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
@@ -62,13 +63,16 @@ def supported(case: dict[str, str]) -> bool:
     return [route.kernel for route in routes if route.choice == "gated_mlp"] == [case["kernel"]]
 
 
-def _drawing(layer: GatedMLP, dtype):
-    """A draw of `layer`'s step by seed: its parameters (drawn once), an input and its output's cotangent."""
-    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
-
+def _drawing(dtype):
+    """Draw an initialized parameter tree, inputs and a cotangent on the host for Check 1's prepare."""
     def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (params, *(jax.random.normal(drawn, (*ROWS, FEATURES)).astype(dtype) for drawn in keys))
+        gate, up = normal_draw(1958, (FEATURES, HIDDEN), (FEATURES, HIDDEN), scale=FEATURES ** -0.5,
+                               dtype=dtype)
+        down, = normal_draw(1959, (HIDDEN, FEATURES), scale=HIDDEN ** -0.5, dtype=dtype)
+        params = {"params": {"gate_proj": {"kernel": gate}, "up_proj": {"kernel": up},
+                             "down_proj": {"kernel": down}}}
+        operands = normal_draw([1960, seed], (*ROWS, FEATURES), (*ROWS, FEATURES), dtype=dtype)
+        return params, *operands
 
     return draw
 
@@ -100,7 +104,7 @@ def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["gated_mlp"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
-    draw = _drawing(layer, dtype)
+    draw = _drawing(dtype)
 
     def under(kernel, run):
         def arm(*operands):
@@ -129,7 +133,7 @@ def per_shard(choice: str, kernel: str) -> dict:
     shapes = next(case for case in CASES if case[0] == "sm90" and case[-1] == kernel)
     case = dict(zip(AXES["gated_mlp"], shapes, strict=True))
     layer = _layer(case)
-    draw = _drawing(layer, jnp.dtype(case["dtype"]))
+    draw = _drawing(jnp.dtype(case["dtype"]))
 
     def truth(*operands):
         # The layer apart in float64 through XLA's products, which a float64 product runs on.
