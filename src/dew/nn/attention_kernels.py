@@ -856,11 +856,14 @@ def _attention_preferred(case: AttentionCase) -> str:
     whose products a quantized model's rule owns runs the kernel that computes the rule's arithmetic
     (`AttentionCase.quantized`), which every kernel forming its products whole refuses, a declared cell's
     included. A separable bias (`AttentionCase.separable_bias`, FoX's) runs the template on every backend,
-    which alone holds its two terms, not the `[B, H, S, S]` bias every other route writes out."""
+    which alone holds its two terms, not the `[B, H, S, S]` bias every other route writes out; a call of
+    each query's own sinks (`AttentionCase.query_sinks`) runs it on a GPU and a TPU, whose initial state
+    holds them as it streams, where splash and the decode kernel take a head's alone and the reference path
+    forms the scores whole (row 13108)."""
     backend = generation.backend()
     if case.quantized is not None:
         return case.quantized
-    if case.separable_bias or (case.spans_only and backend in ('gpu', 'tpu')):
+    if case.separable_bias or ((case.spans_only or case.query_sinks) and backend in ('gpu', 'tpu')):
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
@@ -941,10 +944,14 @@ def _decode_preferred(case: AttentionCase) -> str:
     template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
     next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere; the
     kernel computing a quantized model's rule where the rule owns the call's products, as attention's
-    (`AttentionCase.quantized`)."""
+    (`AttentionCase.quantized`); the template for a call of each query's own sinks."""
     if case.quantized is not None:
         return case.quantized
-    return 'decode' if generation.backend() == 'gpu' else 'xla'
+    if generation.backend() != 'gpu':
+        return 'xla'
+    # Each query's own sinks, which the decode kernel takes a head's of alone: the template's initial state
+    # (`_attention_preferred`'s, row 13108).
+    return 'template' if case.query_sinks else 'decode'
 
 
 _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel and the attention template's "
