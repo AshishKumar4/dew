@@ -91,6 +91,36 @@ def test_an_fp8_codes_product_unnamed_is_xlas_widened_product_until_a_receipt():
     np.testing.assert_array_equal(np.asarray(chosen), np.asarray(plain))
 
 
+@pytest.mark.parametrize("kernel", ["mosaic", "xla"])
+def test_an_fp8_codes_product_differentiates_its_rows_alone(kernel):
+    """On an A100, through the converting launch named or XLA's arm, the FP8 codes product of rows and a
+    matrix cast to E4M3 (an unaligned depth and width, padded and sliced back) takes the rows' tangent times
+    the matrix's exact values, its pullback that product's transpose rounded through the rows' cast, and the
+    matrix no cotangent: a frozen site's (row 8548's review)."""
+    rng = np.random.default_rng(8548)
+    x, w, dx = (rng.normal(size=shape).astype(np.float32) for shape in ((ROWS, DEPTH), (WIDTH, DEPTH),
+                                                                         (ROWS, DEPTH)))
+    cotangent = rng.normal(size=(ROWS, WIDTH)).astype(np.float32)
+    e4m3 = jnp.float8_e4m3fn
+    matrix = np.asarray(jnp.asarray(w).astype(e4m3).astype(jnp.float32), np.float64)
+
+    def product(rows, weights):
+        return _product(kernel, True, rows.astype(e4m3), weights.astype(e4m3))
+
+    with generation.assumed("sm80"):
+        _, tangent = jax.jvp(lambda rows: product(rows, jnp.asarray(w)), (jnp.asarray(x),),
+                             (jnp.asarray(dx),))
+        _, pull = jax.vjp(product, jnp.asarray(x), jnp.asarray(w))
+        d_rows, d_weights = pull(jnp.asarray(cotangent))
+    moved = np.asarray(jnp.asarray(dx).astype(e4m3).astype(jnp.float32), np.float64)
+    np.testing.assert_allclose(np.asarray(tangent, np.float64), moved @ matrix.T, rtol=1e-6, atol=1e-6)
+    # Rounded to E4M3 by the rows' cast: within its step (2^-3 relative, 2^-9 at its least subnormal).
+    np.testing.assert_allclose(np.asarray(d_rows), cotangent.astype(np.float64) @ matrix, rtol=2.0 ** -3,
+                               atol=2.0 ** -9)
+    assert np.count_nonzero(np.asarray(d_rows)) > d_rows.size // 2
+    np.testing.assert_array_equal(np.asarray(d_weights), np.zeros_like(w))
+
+
 @pytest.mark.parametrize("name", [pytest.param(name, marks=lowers("sm80")) for name in FORMATS])
 def test_an_fp8_codes_product_compiles_spill_free_for_an_a100(name):
     """The converting launch compiles spill-free for a compile-only sm80 at a frozen FP8 site's decode rows

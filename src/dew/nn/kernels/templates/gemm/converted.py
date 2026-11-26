@@ -15,9 +15,8 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import zero_from_primal
 
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
@@ -34,16 +33,15 @@ products): a 64-column tile's and a bfloat16 step's least (`MosaicConvertedGmm.c
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Codes:
-    """A matrix of FP8 codes as the converted launch binds it (`MosaicConvertedGmm`): `codes` K-major,
-    `[groups, width, depth]`, its shape and dtype the bfloat16 matrix they widen to exactly, `[groups,
-    depth, width]`, as a packed matrix states its decoded one (`grouped_matmul._PackedMatrix`)."""
+    """A matrix of FP8 codes as the converting launch binds it (`MosaicConvertedGmm`, `trans_rhs`): `codes`
+    K-major, `[groups, width, depth]`, its shape theirs and its dtype the bfloat16 they widen to exactly, the
+    products', as a packed matrix states its decoded one (`grouped_matmul._PackedMatrix`)."""
 
     codes: jax.Array | jax.ShapeDtypeStruct
 
     @property
-    def shape(self) -> tuple[int, int, int]:
-        groups, width, depth = self.codes.shape
-        return groups, depth, width
+    def shape(self) -> tuple[int, ...]:
+        return self.codes.shape
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -121,68 +119,76 @@ def fp8_codes_product(lhs: jax.Array, rhs: jax.Array, *, out_dtype, interpret_on
                       ) -> jax.Array:
     """`lhs @ rhs.T` of FP8 codes, `[rows, depth]` and K-major `[width, depth]` (a frozen FP8 site's,
     `quantization._fp8_rows`), in `out_dtype`: `gemm.gemm`'s FP8 product where the target's tensor cores
-    multiply FP8 (the promoted walk); elsewhere each code's exact bfloat16 value, the products summed in fp32,
-    through the template's converting launch where its selector takes it (`FP8_CODES`), else `gemm.gemm`'s
-    XLA arm, which widens both. Its codes take no cotangent: a frozen matrix's."""
+    multiply FP8 (the promoted walk); on a CUDA GPU whose do not, each code's exact bfloat16 value, the
+    products summed in fp32, through the template's converting launch where its selector takes it
+    (`FP8_CODES`), else `gemm.gemm`'s XLA arm, which widens both. One derivative on every route: the rows'
+    tangent times the matrix's exact values; the matrix, a frozen site's, takes none."""
     if lhs.ndim != 2 or rhs.ndim != 2 or lhs.shape[1] != rhs.shape[1]:
         raise ValueError(f"an FP8 codes product is [rows, depth] by [width, depth], not {lhs.shape} by "
                          f"{rhs.shape}")
-    plain = functools.partial(gemm.gemm, lhs, rhs, transpose_rhs=True, out_dtype=out_dtype,
-                              interpret_on_cpu=interpret_on_cpu)
-    if (generation.fp8_tensor_cores(generation.gpu_target().generation) or lhs.dtype != rhs.dtype
-            or not mosaic.converts(rhs.dtype)):
-        return plain()
+    options = {'dtype': rhs.dtype, 'out_dtype': jnp.dtype(out_dtype)}
+    value = functools.partial(_valued, interpret=interpret_on_cpu, **options)
+    product = contracted("test_an_fp8_codes_product_holds_every_order")(
+        surrogate(value, functools.partial(_tangent, **options)))
+    # The matrix as its bytes: an integer operand, which takes no tangent.
+    return product(lhs, jax.lax.bitcast_convert_type(rhs, jnp.uint8))
+
+
+def _valued(lhs: jax.Array, matrix: jax.Array, *, dtype, out_dtype, interpret: bool) -> jax.Array:
+    """`fp8_codes_product`'s value, `matrix` its codes' bytes."""
+    rhs = jax.lax.bitcast_convert_type(matrix, dtype)
+    converted = _converted(lhs, rhs, interpret)
+    if converted is None:
+        return gemm.gemm(lhs, rhs, transpose_rhs=True, out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return converted.astype(out_dtype)
+
+
+def _tangent(primals, tangents, value, *, dtype, out_dtype) -> jax.Array:
+    """`fp8_codes_product`'s tangent: the rows' tangent times the matrix's exact values, an fp32 product at
+    an exact boundary, whatever route the value took."""
+    del value
+    (_, matrix), (d_lhs, _) = primals, tangents
+    rhs = jax.lax.bitcast_convert_type(matrix, dtype).astype(jnp.float32)
+    return jax.lax.dot_general(d_lhs.astype(jnp.float32), rhs, (((1,), (1,)), ((), ())),
+                               precision=EXACT_FLOAT32, preferred_element_type=jnp.float32).astype(out_dtype)
+
+
+def _converted(lhs: jax.Array, rhs: jax.Array, interpret: bool) -> jax.Array | None:
+    """The converting launch's fp32 sums of `lhs @ rhs.T` where the target is a CUDA GPU of no FP8 products
+    and the selector takes it (`FP8_CODES`), each operand padded with zero codes to whole `STEP`s and the
+    sums sliced back; None elsewhere."""
+    target = generation.gpu_target().generation
+    if (generation.capability(target) is None or generation.fp8_tensor_cores(target)
+            or lhs.dtype != rhs.dtype or not mosaic.converts(rhs.dtype)):
+        return None
     (rows, depth), width = lhs.shape, rhs.shape[0]
     padded_depth, padded_width = -(-depth // STEP) * STEP, -(-width // STEP) * STEP
     launch = MosaicConvertedGmm()
-    bound = launch.bind(jax.ShapeDtypeStruct((rows, padded_depth), jnp.bfloat16),
-                        Codes(jax.ShapeDtypeStruct((1, padded_width, padded_depth), rhs.dtype)),
-                        jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
-                        trans_rhs=False, interpret=interpret_on_cpu, dense=True, exact_sums=False)
-    with xla_products.interpreted_context(interpret_on_cpu):
-        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
-        taken = selection.select(FP8_CODES, case).kernel == "mosaic"
-    if not taken:
-        return plain()
-    codes = jnp.pad(rhs, ((0, padded_width - width), (0, padded_depth - depth)))[None]
-    # Widened before it is padded: no transpose of the pad sums in the codes' 8 bits.
-    widened = jnp.pad(lhs.astype(jnp.bfloat16), ((0, 0), (0, padded_depth - depth)))
-    sizes = jnp.asarray([rows], jnp.int32)
-    product = contracted("test_an_fp8_codes_product_holds_every_order")(
-        generation.linear_tangent(*_rules(launch, codes.dtype, interpret_on_cpu), live_cotangents=True,
-                                  kind=KernelGlue()))
-    # The codes as their bytes: an integer operand, which takes no tangent (a frozen matrix's).
-    with xla_products.interpreted_context(interpret_on_cpu):
-        return product(widened, jax.lax.bitcast_convert_type(codes, jnp.uint8), sizes)[:, :width].astype(
-            out_dtype)
 
+    def bound(rows_of, codes, sizes):
+        return launch.bind(rows_of, Codes(codes), sizes, (), (), None, None, None, out_dtype="float32",
+                           trans_rhs=True, interpret=interpret, dense=True, exact_sums=False)
 
-def _rules(launch: MosaicConvertedGmm, dtype, interpret: bool) -> tuple:
-    """`(forward, backward, portable)` of the converting launch's product of bfloat16 rows and K-major
-    `[1, width, depth]` codes of `dtype` given as their bytes (`generation.linear_tangent`'s): the rows'
-    cotangent the cotangent times the codes' exact values in fp32, the codes' and the sizes' none."""
+    planned = bound(jax.ShapeDtypeStruct((rows, padded_depth), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((1, padded_width, padded_depth), rhs.dtype),
+                    jax.ShapeDtypeStruct((1,), jnp.int32))
+    with xla_products.interpreted_context(interpret):
+        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, planned), not automatic_axes())
+        if selection.select(FP8_CODES, case).kernel != "mosaic":
+            return None
 
-    def coded(codes):
-        return jax.lax.bitcast_convert_type(codes, dtype)
+    def kernel(rows_of, codes, sizes, *, interpret: bool):
+        return launch(rows_of, Codes(codes), sizes, (), (), None, None, None, out_dtype='float32',
+                      trans_rhs=True, interpret=interpret, dense=True, exact_sums=False)
 
-    def kernel(rows, codes, sizes, *, interpret: bool):
-        return launch(rows, Codes(coded(codes)), sizes, (), (), None, None, None, out_dtype='float32',
-                      trans_rhs=False, interpret=interpret, dense=True, exact_sums=False)
-
-    def portable(rows, codes, sizes):
+    def portable(rows_of, codes, sizes):
         del sizes
-        return jax.lax.dot_general(rows, coded(codes)[0].astype(jnp.bfloat16), (((1,), (1,)), ((), ())),
+        return jax.lax.dot_general(rows_of, codes[0].astype(jnp.bfloat16), (((1,), (1,)), ((), ())),
                                    preferred_element_type=jnp.float32)
 
-    def forward(rows, codes, sizes):
-        return xla_products.dispatched(kernel, portable, interpret, rows, codes, sizes), ()
-
-    def backward(saved, operands, cotangent, live):
-        del saved
-        rows, codes, sizes = operands
-        d_rows = jnp.dot(cotangent, coded(codes)[0].astype(jnp.float32), precision=EXACT_FLOAT32,
-                         preferred_element_type=jnp.float32)
-        leaves = (d_rows.astype(rows.dtype), zero_from_primal(codes), zero_from_primal(sizes))
-        return tuple(leaves[index] for index in live)
-
-    return forward, backward, portable
+    codes = jnp.pad(rhs, ((0, padded_width - width), (0, padded_depth - depth)))[None]
+    widened = jnp.pad(lhs.astype(jnp.bfloat16), ((0, 0), (0, padded_depth - depth)))
+    with xla_products.interpreted_context(interpret):
+        summed = xla_products.dispatched(kernel, portable, interpret, widened, codes,
+                                         jnp.asarray([rows], jnp.int32))
+    return summed[:, :width]

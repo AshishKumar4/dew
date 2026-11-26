@@ -192,8 +192,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                 'scales': ((across, block_k // 16), jnp.float8_e4m3fn)}
 
     is_packed = packed or packed_format is not None
-    # A matrix of 8-bit codes beside 16-bit rows, each stage converted exactly into them (row 8548).
-    converted = mosaic.converts(rhs_dtype) and jnp.dtype(rhs_dtype).itemsize < jnp.dtype(dtype).itemsize == 2
+    converted = packing.converted(dtype, rhs_dtype)  # 8-bit codes beside 16-bit rows (row 8548)
     matrix = words(block_n) if is_packed and not packed_rows else {'matrix': (rhs_block, rhs_dtype)}
     blocks = {**(words(block_m) if packed_rows else {'rows': (lhs_block, dtype)}), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
@@ -522,7 +521,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     their steps over the programs, the program walking a tile's first step adding its partials and storing
     it (`tail.Tail`, `mosaic.Family.fixed_up`), once a configuration; `chained` on: `guarded_walk`'s."""
     family = family_of(tiles, _products_dtype(lhs, {'matrix': rhs}, packed_rows))
-    decode = packed_format or (packing.CODES if jnp.dtype(rhs.dtype).itemsize == 1 else None)
+    decode = packed_format or (packing.CODES if packing.converted(lhs.dtype, rhs.dtype) else None)
     (prologue, prologue_axes, epilogue, epilogue_axes), (prologue_operands, epilogue_operands) = hooks, sides
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, part = tiles.warpgroups, tiles.cluster, (tiles.share, block_n)

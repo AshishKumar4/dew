@@ -200,6 +200,16 @@ CODES = "codes"
 converted exactly (`mosaic_gpu.gmm`'s, row 8548), where no format's words are packed."""
 
 
+def converted(rows, matrix) -> bool:
+    """Dew: whether a matrix of `matrix` dtype beside rows of `rows` dtype is a matrix of codes each stage of
+    which converts exactly into the rows' dtype (`CODES`): 8-bit codes a device converts in registers
+    (`mosaic.converts`) beside 16-bit rows, the one decision of its stages' buffers and their decode
+    (`mosaic_gpu.gmm_allocations`, `_gmm_mainloop`)."""
+    from dew.nn.kernels.templates import mosaic
+
+    return mosaic.converts(matrix) and jnp.dtype(matrix).itemsize == 1 and jnp.dtype(rows).itemsize == 2
+
+
 @dataclasses.dataclass(frozen=True)
 class Decoding:
     """Dew: a consumer's decode of a packed matrix's stages (`_gmm_step`'s): its `buffers` (`[stages,

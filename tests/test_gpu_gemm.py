@@ -226,7 +226,7 @@ def _converted_cells() -> tuple[Cell, ...]:
     run qualifies the accuracy its receipt's timing rests on."""
     on_par = gemm_converted.an_fp8_codes_product_through_the_converting_template_is_on_par
     return tuple(Cell(f"an fp8 codes product through the converting template is on par ({name})",
-                      functools.partial(on_par, name), "sm80",
+                      functools.partial(on_par, name), "sm80", mosaic=True,
                       native={"launch": "converted fp8 gmm", "format": name})
                  for name in gemm_converted.FORMATS)
 
