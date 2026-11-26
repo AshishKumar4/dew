@@ -12,6 +12,7 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -142,8 +143,8 @@ def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smem
                                         ("columns",)).astype(jnp.float32)
             z = z + jax.lax.broadcast_in_dim(bias_col, z.shape, (1,))
         if softcap is not None:
-            cap = jnp.float32(softcap)
-            z = cap * jnp.tanh(z / cap)
+            # The cap's reciprocal rounded once, as `precision.capped_logits` states it (row 13353).
+            z = jnp.float32(softcap) * jnp.tanh(z * float(np.float32(1) / np.float32(softcap)))
         col_global = col_tile + start + family.iota(z.shape, 1)
         in_vocab = col_global < vocab
         z_masked = jnp.where(in_vocab, z, jnp.float32(-jnp.inf))
