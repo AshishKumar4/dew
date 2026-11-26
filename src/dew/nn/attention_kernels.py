@@ -784,6 +784,25 @@ INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need
     "densely: the template takes it", row=INHERENT), _FITS))
 """The template for a call no derivative is taken of and xla's attention for one differentiated."""
 
+FLASH_INFERENCE = Kernel[AttentionCase]('flash_inference', (*FLASH_SUPPORTS, *TEMPLATE_SUPPORTS))
+"""FlashAttention for a call no derivative is taken of and the template for one differentiated, its forward
+and derivatives the template's: where FlashAttention's forward holds check 1 and its backward does not (an
+A100's, M-NA-44)."""
+
+
+def primal_alone(kernel: str, dtype, width: int, causal: bool) -> tuple[str, str] | None:
+    """The kernels a split kernel runs (`dew.nn.attention.forward_differentiable`'s `primal_alone`): one for
+    a call no derivative is taken of and one for a differentiated call, its forward and derivatives that
+    one's; None for every other kernel. 'inference' infers on the template where it measured faster
+    (`template_infers`) and trains on xla's attention; 'flash_inference' infers on FlashAttention and trains
+    on the template."""
+    if kernel == INFERENCE.name:
+        return ('template' if template_infers(dtype, width, causal) else 'xla'), 'xla'
+    if kernel == FLASH_INFERENCE.name:
+        return 'flash', 'template'
+    return None
+
+
 DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
     ('sm90', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
@@ -824,9 +843,13 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "plain cuDNN's 2.26), the whole 4B step's peak 95.3 GiB against the template's 61.4 at four "
                  "rows (LF-STEP85-b200); rows 4839 and 5368 retire it"),
     ('sm80', CallKind.of(jnp.bfloat16)): (
-        FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
-                 "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
-                 "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
+        FLASH_INFERENCE,
+        "FlashAttention-2 measured faster than the template on an A100 (CELLS-a100: a training step's "
+        "attention at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
+        "full, CUPTI, 11 interleaved rounds); at that shape its forward holds check 1 and faster (1.15 to "
+        "1.64 times), its backward does not (dK's RMS 1.74 to 1.78 times the reference's error, causal dV's "
+        "1.537, past 1.5; M-NA-44-a100-s4096), so a differentiated call trains on the template, 1.59 to 2.39 "
+        "times FlashAttention's time (row 13277)"),
     ('sm80', CallKind.of(jnp.float32)): (
         XLA, "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
                "Qwen3-8B's widths (32/8 heads x 128, CUPTI medians, one warm process, W76-a100, M-ET-28): a "
@@ -952,6 +975,7 @@ ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
     INFERENCE,
+    FLASH_INFERENCE,
 ), _attention_preferred, _unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
@@ -961,7 +985,8 @@ decode call keeps its own kernels whatever the form (`DECODE`). The template com
 reference path, which takes every call, so it runs where the preference names it or a call names it; and
 'inference' after it, the template for a call no derivative is taken of and xla's attention for one
 differentiated (`dew.nn.attention.forward_differentiable`'s `primal_alone`), where a cell declares it or
-a dense bias's preference names it."""
+a dense bias's preference names it; 'flash_inference' last, FlashAttention for a call no derivative is
+taken of and the template for one differentiated, where a cell declares it (`primal_alone`)."""
 
 
 

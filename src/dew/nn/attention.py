@@ -38,8 +38,8 @@ from .attention_kernels import (
     cudnn_packs,
     decodes,
     flash_target,
+    primal_alone,
     reverse_only,
-    template_infers,
 )
 from .attention_masks import (
     combined_attention_mask,
@@ -94,7 +94,7 @@ from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template",
-                        "inference"]
+                        "inference", "flash_inference"]
 """Names which kernel an attention call runs.
 
 A run names it once for every attention layer it traces (`generation.chosen(attention=...)`, a run's
@@ -1303,18 +1303,19 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     def ran(kernel: str = resolved, fill: float | None = None) -> jax.Array:
         """The call on `kernel`, the one it resolved to by default, every key it hides at the logit `fill`
         (the reference's and the template's) where given, else a row that sees no key whatever it gives."""
-        if kernel == 'inference':
-            # A call no derivative is taken of on the template where it measured faster, a differentiated
-            # one's forward and derivatives xla's (`attention_kernels.template_infers`).
+        split = primal_alone(kernel, query.dtype, query.shape[-1], causal)
+        if split is not None:
+            # A call no derivative is taken of on the split's first kernel, a differentiated one's forward
+            # and derivatives its second's (`attention_kernels.primal_alone`).
             def on(implementation):
                 def run(query, key, value, bias, sinks, *extra):
                     return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
                                 **operands_of(extra))
                 return run
 
-            primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
-            return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks, *operands,
-                                          primal_alone=True, parameters=(3, 4))
+            primal, differentiated = split
+            return forward_differentiable(on(primal), on(differentiated), query, key, value, bias, sinks,
+                                          *operands, primal_alone=True, parameters=(3, 4))
 
         def fused(query, key, value, bias, sinks, *extra):
             return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill,
