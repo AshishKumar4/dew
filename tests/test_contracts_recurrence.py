@@ -473,13 +473,48 @@ CHECK1_SHARDS = {
         {"seeds": 8, "per_task": 4},
     "test_the_template_rule_holds_its_orders_over_normal_draws[jvp-of-grad-scanned]":
         {"seeds": 8, "per_task": 4},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-first-orders]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-jvp-of-grad]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-second-jvp]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-grad-of-grad]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-jvp-of-grad-remat]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-second-jvp-remat]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-jvp-of-grad-nested-jit]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[gated_delta-jvp-of-grad-scanned]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-first-orders]":
+        {"seeds": 8, "per_task": 8},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-jvp-of-grad]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-second-jvp]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-grad-of-grad]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-jvp-of-grad-remat]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-second-jvp-remat]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-jvp-of-grad-nested-jit]":
+        {"seeds": 8, "per_task": 2},
+    "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws[kimi_delta-jvp-of-grad-scanned]":
+        {"seeds": 8, "per_task": 2},
 }
 """The selective scan's normal-draw sites, an order set each (`ORDER_SETS`), by node id, a literal the CI plan
 reads as it reads a mark's (tools/armada/ci.py): a map task compiles a set's programs once for its draws (an
 interpreted second order's 60 to 170 s, then 30 to 40 s a draw: the five sets in two tasks of four draws each
 ran past 20 minutes a task, a set's eight draws in one 141 to 421 s), four draws a task but the second jvp's
 eight; and the template rule's normal-draw sites, an order set each (`TEMPLATE_ORDER_SETS`), sized each run
-in one cell 92 to 161 s (main's tests/test_durations.json at 0a14c3e75, row 12405), four draws a task."""
+in one cell 92 to 161 s (main's tests/test_durations.json at 0a14c3e75, row 12405), four draws a task; and the
+derived delta rule's, a form and an order set each (`derived_delta_cases`): Kimi's second orders, its per-key
+derivatives' scaled pairs compiled once a map task (about 62 s), took 110 to 166 s a case over their draws in
+one (row 13309), two draws a task; the gated delta rule's and Kimi's first orders, every draw in one."""
 
 
 def normal_order_cases(test: str, sets: dict) -> list:
@@ -803,14 +838,36 @@ def _read(h, q, k, v, g, beta):
 # entries (ledger 2470, `precedent_chunked`).
 @pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated_delta", "kimi_delta"])
-@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
-def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
+def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, taken):
+    """`assert_derived_delta_contract` near float32's least normal."""
+    assert_derived_delta_contract(per_key, "near the least normal", taken)
+
+
+def derived_delta_cases() -> list:
+    """The derived delta rule's normal-draw parameters, a form and an order set each (`ORDER_SETS`), marked
+    from `CHECK1_SHARDS`."""
+    test = "test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws"
+    cases = [(per_key, taken, f"{form}-{taken.replace(',', '').replace(' ', '-')}")
+             for per_key, form in ((False, "gated_delta"), (True, "kimi_delta")) for taken in ORDER_SETS]
+    return [pytest.param(per_key, taken, id=ident,
+                         marks=pytest.mark.check1_shards(**CHECK1_SHARDS[f"{test}[{ident}]"]))
+            for per_key, taken, ident in cases]
+
+
+@pytest.mark.parametrize("per_key, taken", derived_delta_cases())
+def test_the_derived_delta_rule_chunks_hold_their_orders_over_normal_draws(per_key, taken, request):
+    """`assert_derived_delta_contract` in the normal domain over an order set, check 1 over its declared draws
+    (`CHECK1_SHARDS`)."""
+    assert_derived_delta_contract(per_key, "normal", taken, seeds=marked_seeds(request))
+
+
+def assert_derived_delta_contract(per_key: bool, edge: str, taken: str, seeds: int | None = None) -> None:
     """`dew.algebra.scan`'s chunk forms of the delta rule, its decay a scalar (the gated delta rule) or each
     key's own (Kimi's delta attention), walked over three chunks from a zero state through their custom
-    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order,
-    forward mode among them, finite wherever float64 is a normal float32 and the token-by-token scan's are,
-    at unit queries, keys and values and at ones whose products near float32's least normal, an order set a
-    case (`ORDER_SETS`)."""
+    derivatives (the decays' range sums, `_decays_of`; the solve's inverse, `_lowered`): every order of
+    `taken` (`ORDER_SETS`), forward mode among them, finite wherever float64 is a normal float32 and the
+    token-by-token scan's are, at `edge`: unit queries, keys and values (check 1 over `seeds` draws) or ones
+    whose products near float32's least normal."""
     tokens, chunk, keys_, values = 24, 8, 4, 6
     def draw(seed, scale):
         draws = jax.random.split(seeded_key(3311 + per_key + 4096 * seed), 7)
@@ -846,7 +903,7 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
 
     scanned = jax.jit(tokenwise)
     assert_drawn_contract(jax.jit(derived), draw, EDGES[edge], f"the derived delta rule {edge}",
-                          truth_fn=scanned, plain_fn=scanned, taking=ORDER_SETS[taken])
+                          truth_fn=scanned, plain_fn=scanned, taking=ORDER_SETS[taken], seeds=seeds)
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
