@@ -423,6 +423,87 @@ def test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_sof
 
 
 @INTERPRETS
+def test_a_decode_steps_state_near_fp32s_largest_resumes_each_rows_own_output_interpreted():
+    """A decode step's state (`attend`'s `finished=False`) of two rows over four keys of eight that weigh
+    alike at a logit of 2^27, each row's values of one magnitude near fp32's largest (2^127 and 1.5 x 2^127,
+    bf16), resumed over the other four, whose values are zeros: each row's output is half its values', its
+    first four keys' mass against its last four's. The state's numerator, the output times a total of four,
+    passes fp32's largest: held so, both rows resumed as +inf and their outputs were NaN; held a power of
+    two down with its maximum as far up, the maximum rounded the power away at 2^27 and the first keys
+    weighed an eighth of the rest (`attention_decode.resumable`)."""
+    magnitudes = jnp.asarray([2.0**127, 1.5 * 2.0**127], jnp.float32)
+    query = jnp.zeros((2, 1, 8, 64), jnp.bfloat16).at[..., 0].set(1.0)
+    key = jnp.zeros((2, KEYS, 2, 64), jnp.bfloat16).at[..., 0].set(2.0**30)
+    first_values = jnp.broadcast_to(magnitudes[:, None, None, None], (2, KEYS, 2, 64))
+    value = jnp.where(jnp.arange(KEYS)[None, :, None, None] < 4, first_values, 0.0).astype(jnp.bfloat16)
+    lengths, cut = jnp.asarray([8, 8], jnp.int32), jnp.asarray([4, 4], jnp.int32)
+    first = template.spans(1, KEYS, 2, lengths=cut)
+    rest = template.spans(1, KEYS, 2, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(initial=state), interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32),
+                                  np.broadcast_to(np.asarray(magnitudes / 2)[:, None, None, None], out.shape))
+
+
+@INTERPRETS
+def test_a_resumed_decode_state_takes_its_steps_output_hook_at_one_slice_interpreted():
+    """A decode step of 256 rows (one slice: its programs fill the device) resumed from a state over the
+    first four of eight keys that weigh alike, values of one, under an output hook doubling its output:
+    the step's output is two, the hook applied past the merge of the resumed state (`Initial.normalized`),
+    where a hook of no parameters was dropped there and the output was one."""
+    rows = 256
+    query = jnp.zeros((rows, 1, 4, 64), jnp.bfloat16)
+    key = jnp.zeros((rows, KEYS, 4, 64), jnp.bfloat16)
+    value = jnp.ones((rows, KEYS, 4, 64), jnp.bfloat16)
+    lengths, cut = jnp.full((rows,), 8, jnp.int32), jnp.full((rows,), 4, jnp.int32)
+    first = template.spans(1, KEYS, rows, lengths=cut)
+    rest = template.spans(1, KEYS, rows, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(
+            initial=state, output=Hook(lambda o: o * 2.0)), interpret=True)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), 2.0)
+
+
+def test_a_resumed_decode_state_is_no_walks_initial_state():
+    """A resumed decode state holds its output (`Initial.normalized`), which no walk resumes from (each
+    reads its numerator): the template's route, its reference, the Mosaic forward's certify form and the
+    Triton forward's fitting refuse it, as the decode step alone merges it past its own walk; a numerator
+    held read four keys of value two as one quarter of their output."""
+    import functools
+
+    from dew.nn.kernels.templates import attention_mosaic, attention_route, attention_triton
+
+    query = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    key = value = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    spans = template.spans(4, 4, 1)
+    state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 4.0), jnp.full((1, 2, 4, 64), 2.0),
+                             normalized=True)
+    walks = (attention_route.attend, template.reference, attention_mosaic.certified,
+             functools.partial(attention_triton.unfitted, certified=True))
+    with generation.assumed("sm90"):
+        for walk in walks:
+            with pytest.raises(ValueError):
+                walk(query, key, value, spans, template.Hooks(initial=state))
+
+
+def test_a_resumed_states_output_spans_fp32s_range_as_its_finish_held_it():
+    """A finished state whose output holds fp32's largest and least magnitudes in one row (2^127 and
+    2^-149) over a total of four, resumed (`attention_decode.resumable`) and taken back as a merge takes an
+    initial state (`algebra.initial_state`), gives its output back bit for bit: its numerator would pass
+    fp32 at the large channel (2^129) and a power of two taken off it flushed the small one (2^-150)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
+
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=8, scale=1.0))
+    output = jnp.asarray([[[2.0**127, 2.0**-149]]], jnp.float32)
+    state = algebra.Partial(output, jnp.zeros((1, 1), jnp.float32), jnp.full((1, 1), 4.0, jnp.float32))
+    resumed = attention_decode.resumable(spec, state)
+    back = algebra.initial_state(spec, resumed, normalized=True)
+    np.testing.assert_array_equal(np.asarray(back.acc), np.asarray(output))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("page", [None, 16], ids=["rows", "pages"])
 def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted(page):
     """A serving step's work list over a cache of two rows (kernel-templates.md §A row 33): three items, a

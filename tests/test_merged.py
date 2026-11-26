@@ -22,6 +22,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_decode,
     emission,
     merged,
     merged_mosaic,
@@ -890,8 +891,8 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                     "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)
 
 def test_resumable_split_merge_preserves_subnormal_initial_mass():
-    """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its
-    natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
+    """Row 10818: `attention_decode.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps
+    its natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
     low-logit slice (`-140`) preserves the resumed output instead of letting the low-logit slice overwrite
     it."""
     batch, slices, rows, kv_heads, width, queries = 1, 2, 4, 1, 16, 2
@@ -910,9 +911,9 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     low_stacked = jnp.stack([low_m, low_t])
 
     def step(p_in, st_in, low_s):
-        resumed = algebra.resumable(spec, st_in)
+        resumed = attention_decode.resumable(spec, st_in)
         next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
-                                     jnp.swapaxes(resumed.acc, 1, 2))
+                                     jnp.swapaxes(resumed.acc, 1, 2), normalized=True)
         out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
                                      out_dtype=jnp.float32, out_heads=queries, initial=next_init)
         return resumed.m, out

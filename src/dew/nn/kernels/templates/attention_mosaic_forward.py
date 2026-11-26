@@ -67,6 +67,7 @@ from dew.nn.kernels.templates.attention import (
     prologued,
     shared_place,
     sums_units,
+    walked_initial,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BlockPlan,
@@ -1523,6 +1524,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     exponentials `ex2.approx` where the launch approximates (`approximate`). A call of one block of the value
     columns (`Tiles.columns` None), one slice, no output hook. Its launch states its registers by
     `registered` (`_launch`'s)."""
+    walked_initial(hooks.initial)
     if tiles.columns is not None or hooks.output.fn is not None:
         raise ValueError("the certify form walks one block of the value columns, no output hook")
     family = bundle_of(tiles, query.dtype)

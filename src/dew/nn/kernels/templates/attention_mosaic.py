@@ -51,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
     logit_scale,
     prologued,
     prologues_taken,
+    walked_initial,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
@@ -1511,6 +1512,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     unread key bias's stream on tcgen05's rows, whose issuer streams the keys and values alone, was never
     released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.bf16_part_count(accurate=True) if fp32 else 1
     if hooks.query.fn is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
