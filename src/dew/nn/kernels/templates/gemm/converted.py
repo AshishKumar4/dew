@@ -112,13 +112,13 @@ class MosaicConvertedGmm(grouped_matmul.MosaicGmm):
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         # Its rows' bytes and its codes' one, each stage of codes converted into bfloat16 buffers: the
-        # matrix's its consumers share or each holds (`packed.shared_decode`), a swapped call's rows each
-        # consumer's own.
+        # matrix's its consumers share or each holds (`packed.shared_decode`); a swapped call's rows each
+        # consumer converts its own share of, one stage's whole between them (`Decoding.converts_rows`).
         from dew.nn.kernels.templates.gemm import packed
 
         rows = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         if tile.swapped:
-            return (1.0, rows), ((rows, tile.warpgroups), None)
+            return (1.0, rows), ((rows, 1), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
         return (rows, 1.0), (None, (rows, copies))
 

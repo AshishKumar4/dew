@@ -5,6 +5,7 @@ spill-free for a compile-only sm80."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 
 import jax
@@ -162,3 +163,24 @@ def test_an_fp8_codes_product_compiles_spill_free_for_an_a100(name):
         assert not record.get("error"), record
         assert record["kernels"], record
         assert all(kernel.get("spilled") == 0 for kernel in record["kernels"]), record
+
+
+def test_a_swapped_converting_tiles_stage_is_converted_once_between_its_consumers():
+    """A swapped converting tile of two consumers on an A100 moves one stage of its codes through their
+    conversion, each converting its own rows (`packed.ROW_CODES`), not a stage each (row 13505): its
+    shared bytes a step those of a one-consumer stage's conversion beside the same tile's reads."""
+    from dew.nn.kernels.templates.gemm import converted, pricing
+
+    launch = converted.MosaicConvertedGmm()
+    bound = launch.bind(converted.Codes(jax.ShapeDtypeStruct((SKINNY * 8, 256), jnp.float8_e4m3fn)),
+                        converted.Codes(jax.ShapeDtypeStruct((1, 192, 256), jnp.float8_e4m3fn)),
+                        jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
+                        trans_rhs=True, interpret=True, dense=True, exact_sums=False)
+    tile = dataclasses.replace(ORIENTATIONS["swapped"], warpgroups=2)
+    itemsizes, decoded = launch._operand_bytes(bound, tile)
+    assert decoded == ((2, 1), None)
+    with generation.assumed("sm80"):
+        family = pricing.family_of(tile, jnp.bfloat16, generation.gpu_target())
+    per_step = pricing.step_shared_bytes(tile, family, itemsizes, decoded)
+    twice = pricing.step_shared_bytes(tile, family, itemsizes, ((2, 2), None))
+    assert per_step < twice

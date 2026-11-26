@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from generation_support import generations
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, seeds_for, with_gradients
 from test_gemm_formed import FEATURES, HIDDEN, _draw
 
 from dew.nn import activations
@@ -612,7 +612,7 @@ def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
 
 class _HoldingItsHidden(GatedMLP):
     """A gated MLP whose down projection reads its gated product as a value it holds for reverse mode (the
-    path before `_gated_down`): the reference its value and gradients are bitwise."""
+    path before `_gated_down`): the reference its value and gradients are held to (check 1)."""
 
     def _gated_down(self, product, halves, train):
         return self._down(product(*halves), train)
@@ -623,24 +623,39 @@ class _HoldingItsHidden(GatedMLP):
 def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed, dropout):
     """A gated MLP of bf16 projections, its gate and up apart or packed (`[..., 2, H]`), unrematerialized,
     in training (its dropout's key fixed): its output and its pullback under one cotangent, every
-    parameter's and the input's, bitwise the path that held its hidden product, and its reverse mode holds
+    parameter's and the input's, on par (check 1) with the path that held its hidden product, each from its
+    float64 truth (a separately compiled program's, testing.md), and its reverse mode holds
     the gate's and the up projection's outputs (or their packed one) and never the down projection's input
     (`GatedMLP._gated_down`: 18 GiB at Qwen3.5-4B's 8 x 4096 tokens), formed again from them."""
     tokens, hidden, features = 24, 48, 16
     rng = np.random.default_rng(13460)
     x = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
-    layer, before = (cls(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, packed=packed,
-                         dropout_rate=dropout) for cls in (GatedMLP, _HoldingItsHidden))
+    layer, before, wide = (cls(hidden_features=hidden, out_features=features, dtype=dtype, packed=packed,
+                               dropout_rate=dropout)
+                           for cls, dtype in ((GatedMLP, jnp.bfloat16), (_HoldingItsHidden, jnp.bfloat16),
+                                              (_HoldingItsHidden, jnp.float64)))
     params = layer.init(jax.random.key(0), x)
     rngs = {"dropout": jax.random.key(7)}
 
-    def apply_of(module):
-        return lambda variables, rows: module.apply(variables, rows, train=True, rngs=rngs)
+    def apply_of(module, variables=params):
+        return lambda rows, cotangent: with_gradients(
+            lambda v, r: module.apply(v, r, train=True, rngs=rngs))(variables, rows, cotangent)
 
-    got, want = (jax.jit(with_gradients(apply_of(module)))(params, x, cotangent)
-                 for module in (layer, before))
-    jax.tree.map(np.testing.assert_array_equal, got, want)
+    def draw(seed):
+        rows = np.random.default_rng(13460 + seed)
+        return (jnp.asarray(rows.normal(size=(tokens, features)), jnp.bfloat16),
+                jnp.asarray(rows.normal(size=(tokens, features)), jnp.bfloat16))
+
+    def truth(rows, cotangent):  # the same mask (its key's), every product float64
+        return apply_of(wide, jax.tree.map(lambda leaf: leaf.astype(jnp.float64), params))(rows, cotangent)
+
+    label = f"gated mlp hidden {'packed' if packed else 'apart'} dropout {dropout}"
+    dew_fn, ref_fn = jax.jit(apply_of(layer)), jax.jit(apply_of(before))
+    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth,
+                    seeds=seeds_for(ref_fn, draw, label, truth_fn=truth, dew_fn=dew_fn))
+
+    def applied(module):
+        return lambda variables, rows: module.apply(variables, rows, train=True, rngs=rngs)
 
     def witnessed(module) -> tuple[bool, bool]:
         """Whether `module`'s pullback holds its hidden product (the down projection's input, or before its
@@ -658,8 +673,8 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
             return out
 
         with nn.intercept_methods(read), forward_only():
-            apply_of(module)(params, x)
-        _, pull = jax.vjp(apply_of(module), params, x)
+            applied(module)(params, x)
+        _, pull = jax.vjp(applied(module), params, x)
         held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
                 if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
 
