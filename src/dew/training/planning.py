@@ -963,13 +963,14 @@ class FitSearch[LossT, EffectsT]:
     a fresh compile does (`peak_live` reads its stored buffer assignment, its argument map from the
     lowering's kept arguments).
 
-    The ladder holds no host offload. XLA:GPU holds the optimizer state and the EMA whole on the device
-    for the update wherever they rest between steps, so keeping them on the host frees nothing at a
-    step's peak (a decoder's step on an A100 peaked at 8.427 GB either way, node receipt
-    TL-a100-offload-1338-c); a run keeps them there by its layout (`Layout.host`) alone. A remat policy
-    that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
-    'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
-    132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
+    The live ladder chooses no host placement. A run places its commit state in pinned host memory by its
+    layout (`Layout.host`), which `Transaction.past` stages; its compiled assignment and its allocator's
+    peak differ, so the two are read apart beside its transfers' time (M-CF-4b on an A100: the allocator's
+    peak 11.606 GB resident against 9.559 GB with the optimizer state on the host, its step 475.35 ms
+    against 641.55; the compiled assignment's static peak 8.427 GB either way, TL-a100-offload-1338-c). A
+    rung whose residuals rest in pinned host memory ('minimal_offloaded') is the offline frontier's
+    alternative to 'full' at a fitting 'full' split (`above`), never a live rung, and a run takes it by its
+    own remat."""
     lower: Lower
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]

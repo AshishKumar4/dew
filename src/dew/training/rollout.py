@@ -37,11 +37,13 @@ if TYPE_CHECKING:
 class Rollout(Protocol):
     """Produces a batch on the host, before the compiled step reads it.
 
-    Sampling has side effects and cannot be traced, so it runs outside `jit`. The
-    trainer calls the rollout with the state, the prefetched batch and a key
-    folded from the run key and the step, then reshards the result with
-    `shard_batch`. The returned batch must hold arrays of fixed shapes, so the
-    step still compiles once per run.
+    The trainer calls the rollout on the host, before it dispatches the update, with
+    the state, the prefetched batch and a key folded from the run key and the step,
+    then reshards the result with `shard_batch`. A rollout may run compiled device
+    programs of its own (Dreamer's imagined rollout and replay draw, PPO's critic);
+    a simulator's or a service's calls and other host effects stay outside the
+    update's `jit`. A batch of one signature reuses the update's program for that
+    signature and plan, as any batch does.
 
     A rollout may have `metrics`, a mapping of names to floats about its latest
     call (rewards, lag, truncation); each logging interval sends them to the
@@ -108,10 +110,10 @@ def rolled_out[LossT, EffectsT](rollout: Rollout | None, state: TrainState, batc
     look-ahead that finds the stream's end, and the position the step saves, come after every batch it read,
     in a pool each a pooled read (`FitRun.further`). With the batch, the position the step saves, or None.
 
-    Host-side and untraceable: sampling, scoring, advantages. The key folds the
-    step key once more, keeping the rollout's draws off the step's stream; both
-    are checkpointed, so a resumed run samples forward. Fixed shapes mean the
-    step still compiles once.
+    Run on the host before the update: sampling, scoring, advantages, each of which
+    may dispatch compiled programs of its own. The key folds the step key once more,
+    keeping the rollout's draws off the step's stream; both are checkpointed, so a
+    resumed run samples forward.
     """
     from dew.distributed.batches import shard_batch
 

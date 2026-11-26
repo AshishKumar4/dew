@@ -840,9 +840,12 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     three times their bytes, so they round once as the whole head's products do.
     The default is the measured one (`chunked_tile`); a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
-    instead of recomputing them, which is faster wherever they fit: on one
-    A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
-    held, at 4.6 GiB, against 60.2 ms tiled (`LMObjective.head_tile`).
+    instead of recomputing them; which is faster depends on the workload and
+    the compiler's options: on one A100, Qwen3-0.6B's head at 4096 tokens took
+    33.1 ms with the logits held, at 4.6 GiB, against 60.2 ms tiled, where on
+    an RTX 4080 at 4096 tokens under XLA's Triton GEMM fusions the whole step
+    took 286.0 ms against 114.6 ms at a 4096 x 8192 tile (docs/performance.md;
+    `LMObjective.head_tile`).
     `temperature` divides the capped logits (`OutputTable.logits`), which
     scores the draws of a sampler at that temperature. `excluded` is a
     column the distribution gives no mass, left out of the partition and the
