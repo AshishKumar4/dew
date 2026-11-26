@@ -172,24 +172,32 @@ def _drawing_rows(step):
     return rows
 
 
+def _idle_draw(seed: int) -> tuple:
+    """A decode token's operands at Qwen3.5-0.8B's 16 heads 128 wide (`decode_operands`) and the rows that
+    draw (`IDLE_ROWS`), the mask an operand: the masked program reads it at run time."""
+    drawn = decode_operands(np.random.default_rng(1 + seed), IDLE_ROWS.size, 16, 128)
+    return (*drawn, jnp.asarray(IDLE_ROWS))
+
+
 def the_decode_kernel_leaves_an_idle_row_alone():
     """A serving step holds every slot, drawing or not: a row the step kernel (`decode_gated_delta_rule`)
     marks idle, at Qwen3.5-0.8B's 16 heads 128 wide, keeps its state bit for bit, unread and unwritten, and
-    outputs zeros; its drawing rows on par (check 1) with the same step's every row active, the recurrence in
-    float64 the truth. The mask is an operand, a runtime one's program beside the unmasked step's, whose
-    arithmetic need not round as the other's (row 13548)."""
-    def draw(seed):
-        return (*decode_operands(np.random.default_rng(1 + seed), IDLE_ROWS.size, 16, 128),
-                jnp.asarray(IDLE_ROWS))
-
-    masked = jax.jit(decode_gated_delta_rule)
-    *operands, active = draw(0)
-    got, got_state = masked(*operands, active)
+    outputs zeros."""
+    *operands, active = _idle_draw(0)
+    got, got_state = jax.jit(decode_gated_delta_rule)(*operands, active)
     np.testing.assert_array_equal(np.asarray(got)[~IDLE_ROWS], 0)
     np.testing.assert_array_equal(np.asarray(got_state)[~IDLE_ROWS], np.asarray(operands[-1])[~IDLE_ROWS])
-    assert_as_exact(_drawing_rows(masked), _drawing_rows(lambda *given: masked(*given[:-1])), draw,
+
+
+def the_decode_kernels_drawing_rows_step_beside_idle_ones_as_with_none():
+    """The step kernel's (`decode_gated_delta_rule`) drawing rows beside idle ones, at Qwen3.5-0.8B's 16
+    heads 128 wide, on par (check 1) with the same step's every row active, the recurrence in float64 the
+    truth: a runtime mask's program and the unmasked one's, whose arithmetic need not round alike, so no
+    bits are compared (row 13548)."""
+    masked = jax.jit(decode_gated_delta_rule)
+    assert_as_exact(_drawing_rows(masked), _drawing_rows(lambda *given: masked(*given[:-1])), _idle_draw,
                     "the decode step's drawing rows beside idle ones", seeds=FEWEST_SEEDS,
-                    truth_fn=as_given(_drawing_rows(lambda *given: recurrent_gated_delta_rule(*given[:-1]))))
+                    truth_fn=_drawing_rows(lambda *given: recurrent_gated_delta_rule(*given[:-1])))
 
 
 def the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
@@ -409,8 +417,13 @@ def walk_cells() -> list[Cell]:
 def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
+        # Each its rows' check, so the covering keeps both (`gpu_flow.covering`: a cell no native value
+        # distinguishes is dropped).
         Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone,
-             native={"launch": "decode step"}, at_run=BITWISE),
+             native={"launch": "decode step", "rows": "idle"}, at_run=BITWISE),
+        Cell("the decode kernel's drawing rows step beside idle ones as with none",
+             the_decode_kernels_drawing_rows_step_beside_idle_ones_as_with_none,
+             native={"launch": "decode step", "rows": "drawing"}),
         Cell("the fused decode step gives the same bits however its launches are timed",
              the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed, fault=RACES,
              at_run=BITWISE),

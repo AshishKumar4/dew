@@ -368,14 +368,16 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
     scored, outputs, later = "scores" in products, len(products), _later(call)
     placed, inverted = placed_form(call), inverse_form(call)
     reading = reads is not None
+    read_out = (_read_out_staged(call, products),)
     keys = key_block(call, functools.partial(_sub_chunk_held, call, outputs=outputs),
                      functools.partial(_sub_chunk_staged, call, products=products),
-                     functools.partial(pair_streams, call, queries=scored, reads=reading), contracted=True)
+                     functools.partial(pair_streams, call, queries=scored, reads=reading), contracted=True,
+                     after_walks=read_out)
     steps = width // keys
     shrinking = min(abs(scale), 1.0)
     growing = math.copysign(max(abs(scale), 1.0), scale)
 
-    def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+    def program(at, q_ref, k_ref, *refs, streams, staging, landing, after):
         reads_ref, refs = (refs[0], refs[1:]) if reading else (None, refs)
         prefix_refs, (beta_ref, _taken_ref, *rest) = refs[:len(prefix)], refs[len(prefix):]
         own_refs, sums = rest[:len(own)], rest[len(own):]
@@ -388,7 +390,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
                                 else {}),
                              **({"reads": call.given.views(reads_ref, row, chunk, keyed, width)} if reading
                                 else {}))
-        (lefts, raised, separated), solve = staging[:3], staging[3:]
+        lefts, raised, separated = staging
         # The own blocks' views, read into their tiles after the walk (`_read_out`).
         owned = [tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
                  for form, ref in zip((placed, inverted), own_refs, strict=False)]
@@ -438,8 +440,8 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
 
         def read(carry, totals):
             del carry
-            _read_out(call, products, totals, owned, solve, landing, sums, row=row, head=h,
-                      growing=growing)
+            after(lambda solve: _read_out(call, products, totals, owned, solve, landing, sums, row=row,
+                                          head=h, growing=growing))
 
         return mosaic.Walk(views, step, steps=steps, sums=((algebra.SUB, chunk),) * (outputs * later),
                            read=read)
@@ -454,7 +456,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
                          model=_sub_chunk_flops(call, keys, outputs),
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
-                         swizzles=_pair_swizzles(call, blocks, keys))(*inputs)
+                         swizzles=_pair_swizzles(call, blocks, keys), after_walks=read_out)(*inputs)
 
 
 def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve: tuple, landing: dict,
@@ -660,7 +662,7 @@ def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tu
     (`intra_block_stored`). The keys gated up take one buffer every sub-chunk restages where the issuer's
     products are done when issued (mma.sync's, `Family.products_overlap` false), one a sub-chunk where its
     products may still read them as the next is staged: a buffer a sub-chunk held 32 KiB more a program at
-    Kimi Linear's 64-key block in two parts."""
+    Kimi Linear's 64-key block in two parts. The tiles the walk's read-out takes are `_read_out_staged`'s."""
     chunk, pairing, sub = call.chunk, _pairing_operand(call), algebra.SUB
     held = dataclasses.replace(call.held, rows=call.rows)
     landing = {"square": held.landing(sub, chunk),
@@ -668,16 +670,23 @@ def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tu
     lefts = tuple(staging_tiles(pairing, (chunk, keys))[0] for _ in products)
     raised = staging_tiles(pairing, *((chunk, keys),) * (_later(call) if call.family.products_overlap else 1))
     separated = swizzling.plain((2, chunk, keys), jnp.float32)
-    # After the walk (`_read_out`): a row block's tile the own scores are copied into, plain, as a thread's
-    # copy addresses it; and solving, the own inverses' tiles (`own_loaded`, a part each, plain), the
-    # substitution's left and right operands and its rows of blocks, in the merges' form.
+    return (lefts, raised, separated), landing
+
+
+def _read_out_staged(call: Call, products: tuple[str, ...]) -> tuple:
+    """The tiles `_read_out` takes past the walk, none of them at a key block (`launch_kernel`'s
+    `after_walks`, in their own scope where the family scopes its walks apart): a row block's tile the own
+    scores are copied into, plain, as a thread's copy addresses it; and solving, the own inverses' tiles
+    (`own_loaded`, a part each, plain), the substitution's left and right operands and its rows of blocks,
+    in the merges' form. Beside the walk's staging they held an A100's Kimi Linear intra launch at one
+    program a multiprocessor, 108,544 bytes, the walk's rings 32 KB of them and these 30 KB (row 13507)."""
+    chunk, sub = call.chunk, algebra.SUB
     inverted = inverse_form(call)
     wide = swizzling.plain((sub, chunk), placed_form(call).stored)
     if "system" not in products:
-        return (lefts, raised, separated, wide, (), (), (), ()), landing
+        return wide, (), (), (), ()
     own = (tuple(swizzling.plain((chunk, sub), inverted.stored) for _ in range(inverted.parts)),)
-    solve = staging_tiles(inverted, (sub, chunk), (sub, chunk), (chunk, chunk))
-    return (lefts, raised, separated, wide, own, *solve), landing
+    return wide, own, *staging_tiles(inverted, (sub, chunk), (sub, chunk), (chunk, chunk))
 
 
 def intra_rows(call: Call, name: str, operand: Callable[[str], jax.Array], beta, *,

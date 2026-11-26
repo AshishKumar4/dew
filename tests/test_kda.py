@@ -41,6 +41,7 @@ from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
+from dew.nn.kernels.templates import report
 from dew.nn.precision import l2norm as jax_l2norm
 from tools.kda_reference import (
     RECORDED,
@@ -473,7 +474,10 @@ def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_ampere_gpu(product)
     shape and dtype were refused at the launch's trace (`mosaic.checked`, row 3180). The routes asserted the
     template's, so a fallback to another kernel hides no launch that does not lower. A consumer Blackwell,
     mma.sync's issuer too (`mosaic_sm80.MmaIssuer`, which the streams' rule reads), takes fla's port for this
-    call, its template refusing it for its resources (row 12681)."""
+    call, its template refusing it for its resources (row 12681). Its routes are its model's, in a refusal
+    scope of its own (`report.refusals`): on an A100 the suite's earlier native compiles of an fp32 backward
+    had recorded spills that stepped this one down to the port, its route then {mosaic_gpu, fla}
+    (M-JS-276 and M-JS-279's A100 suites at 4de55cfdb and 0fd97d046)."""
     rows, length, heads, width = 1, 128, 2, 64
     operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 4
                 + [jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
@@ -486,7 +490,7 @@ def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_ampere_gpu(product)
 
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
     # The default product precision the fast forms round at (the suite's lanes configure 'highest').
-    with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
+    with (report.refusals(), generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
           generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
           jax.default_matmul_precision('default'), generation.routes() as found):
         traced = jax.jit(forward if product == 'forward' else training).trace(*operands)
