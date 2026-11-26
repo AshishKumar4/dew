@@ -422,6 +422,28 @@ def test_a_decode_steps_state_resumed_over_the_rest_of_its_keys_is_its_whole_sof
 
 
 @INTERPRETS
+def test_a_decode_steps_state_near_fp32s_largest_resumes_each_rows_own_output_interpreted():
+    """A decode step's state (`attend`'s `finished=False`) of two rows whose keys weigh alike, each row's
+    values all of one magnitude near fp32's largest (2^127 and 1.5 x 2^127, bf16), over four keys of
+    eight, resumed over the other four: each row's output is its values', finite and its own. Its sums at
+    its maximum, the output times a total of four, pass fp32's largest; held so (`algebra.resumable`) both
+    rows resumed as +inf and the step's outputs were NaN."""
+    magnitudes = jnp.asarray([2.0**127, 1.5 * 2.0**127], jnp.float32)
+    query = jnp.zeros((2, 1, 8, 64), jnp.bfloat16)
+    key = jnp.zeros((2, KEYS, 2, 64), jnp.bfloat16)
+    value = jnp.broadcast_to(magnitudes[:, None, None, None], (2, KEYS, 2, 64)).astype(jnp.bfloat16)
+    lengths, cut = jnp.asarray([8, 8], jnp.int32), jnp.asarray([4, 4], jnp.int32)
+    first = template.spans(1, KEYS, 2, lengths=cut)
+    rest = template.spans(1, KEYS, 2, lengths=lengths, starts=cut)
+    with generation.assumed("sm90"):
+        state = attention_decode.attend(query, key, value, first, None, interpret=True, finished=False)
+        out = attention_decode.attend(query, key, value, rest, template.Hooks(initial=state), interpret=True)
+    assert bool(jnp.all(jnp.isfinite(state.acc)))
+    np.testing.assert_array_equal(np.asarray(out, np.float32),
+                                  np.broadcast_to(np.asarray(magnitudes)[:, None, None, None], out.shape))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("page", [None, 16], ids=["rows", "pages"])
 def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted(page):
     """A serving step's work list over a cache of two rows (kernel-templates.md §A row 33): three items, a
