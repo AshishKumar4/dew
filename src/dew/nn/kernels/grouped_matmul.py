@@ -80,13 +80,19 @@ def _stored_bytes(ba, rows: int, width: int) -> float:
     narrowed one's half the tile), and its epilogue operands' bytes over the output's elements (an [rows,
     columns] operand's an element, a column vector's a row's share)."""
     from .templates import cost
+
+    return (_output_bytes(ba) + cost.stored(*ba.arguments.get('epilogue_operands', ()))
+            / max(rows * width, 1))
+
+
+def _output_bytes(ba) -> float:
+    """The bytes a product's outputs store an element of its output, each output's dtype's over its form's
+    divisor (`Hooks.out_forms`), its epilogue's operands none: its scratch budget's (`pricing.dense_tail`)."""
     from .templates.gemm import quantized
 
     dtypes = _stored_dtypes(ba)
     forms = quantized.forms_of(ba.arguments['hooks'].out_forms, dtypes) or (None,) * len(dtypes)
-    written = sum(jnp.dtype(dtype).itemsize / (1 if form is None else form.divisor)
-                  for dtype, form in zip(dtypes, forms, strict=True))
-    return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
+    return quantized.stored_bytes(dtypes, forms)
 
 def _matrix_extents(ba) -> tuple[int, int]:
     """A bound product call's depth and width as its matrix lies (`trans_rhs`'s `[width, depth]`), its width
@@ -168,7 +174,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 else self._launched(config, bool(ba.arguments['interpret']), target))
 
     def _tail_plan(self, ran, config: tiling.Tiles, target):
-        from .templates.gemm import pricing
+        from .templates.gemm import mosaic_gpu, pricing
 
         call = ran.arguments
         dense = (bool(call.get('dense')) and call.get('paired') is None
@@ -182,8 +188,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         k = tokens.shape[0] if self.STAGED_ROWS else depth
         assert k is not None
         itemsizes = (jnp.dtype(tokens.dtype).itemsize, jnp.dtype(rhs.dtype).itemsize)
-        return pricing.dense_tail(config, dtype, (m, n, k), itemsizes, target,
-                                  self._tail_programs(ran, config, target), stored=_stored_bytes(ran, m, n),
+        # Its output's rows as its launch declares them (`mosaic_gpu.row_unit`'s), its bytes its outputs'.
+        unit = mosaic_gpu.row_unit(pricing.family_of(config, dtype, target), dtype)
+        return pricing.dense_tail(config, dtype, (-(-m // unit) * unit, n, k), itemsizes, target,
+                                  self._tail_programs(ran, config, target), stored=_output_bytes(ran),
                                   dense=dense)
 
     def _holds(self, ba, config: tiling.Tiles, registers: int | None, target=None) -> bool:

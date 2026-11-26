@@ -154,17 +154,22 @@ def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
     assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]
 
 
-def test_a_launchs_scratch_budget_is_its_output_where_that_is_past_the_reference_workspace():
-    """A launch's scratch on an H100 (`pricing.within_budget`): a GH200 tail's 33 MiB of fp32 partials,
-    past cuBLAS's 32 MiB workspace, is admitted beside an output written as 40 MiB (8192 x 2560 bf16, the
-    4B forward M-NG-29 found 14.4% slower held to the workspace) and refused beside a 16 MiB one; a split's
-    slices, copies of the output, stay within the workspace alone; off a CUDA GPU none is bounded."""
-    from dew.nn.kernels.templates.gemm import pricing
+@pytest.mark.parametrize(("out_dtype", "admitted"), [("float32", True), ("bfloat16", False)])
+def test_a_balanced_tails_partials_are_budgeted_by_the_output_it_stores(out_dtype, admitted):
+    """A Hopper kernel gradient's balanced tail (a model fixture: 256 multiprocessors, its bandwidth past
+    any tile's need, so its cap alone decides): 8192 x 1280 at 128 x 256 x 64 tiles in cluster pairs, 160
+    tiles over a wave of 128, its 32-tile tail's fp32 partials 40 MiB, past cuBLAS's 32 MiB workspace,
+    admitted beside an fp32 output stored as 40 MiB and refused beside a bf16 one of 20 MiB
+    (`pricing.within_budget` of the output as its launch stores it); the tile legal either way."""
+    from dew.nn.kernels.templates.gemm import tiling
 
+    tgmm = grouped_matmul.MosaicTgmm()
+    tile = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
     with generation.assumed("sm90"):
-        target = generation.gpu_target()
-    tail, output = 33 * 2**20, 8192 * 2560 * 2
-    assert pricing.within_budget(target, tail, output)
-    assert not pricing.within_budget(target, tail, 16 * 2**20)
-    assert pricing.within_split_budget(target, 32 * 2**20) and not pricing.within_split_budget(target, tail)
-    assert pricing.within_budget(None, tail, 0)
+        target = dataclasses.replace(generation.gpu_target(), multiprocessors=256, measured={},
+                                     memory_bandwidth=100e12)
+        ba = tgmm.bind(jax.ShapeDtypeStruct((8192, 8192), jnp.bfloat16),
+                       jax.ShapeDtypeStruct((8192, 1280), jnp.bfloat16), jnp.asarray([8192], jnp.int32),
+                       out_dtype=out_dtype, interpret=False, dense=True)
+        assert tgmm.legal(ba, tile, target)
+        assert bool(tgmm.balanced(ba, tile, target)) == admitted

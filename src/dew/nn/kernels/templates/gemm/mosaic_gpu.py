@@ -392,7 +392,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     can_balance = dense and tiles.splits == 1 and not (beside or packed_format) and paired is scales is None
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
                        balanced=balanced if can_balance else False,
-                       stored=sum(jnp.dtype(typed).itemsize for typed in dtypes))
+                       stored=quantized.stored_bytes(dtypes, forms))
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
     walk = functools.partial(
         _gmm_mainloop, lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
@@ -461,7 +461,7 @@ def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiproc
                 balanced: bool | tail_of.Tail, stored: float):
     """Dew: a dense `gmm` or `tgmm` launch's last wave balanced over the programs (`pricing.dense_tail`),
     reusing the planner's `Tail` when passed so planner and emitter make one decision (row 11945); else
-    `stored` its outputs' bytes an element (an unplanned call's, its dtypes' whole)."""
+    `stored` its outputs' bytes an element (`quantized.stored_bytes`)."""
     if isinstance(balanced, tail_of.Tail):
         return balanced
     if not balanced:

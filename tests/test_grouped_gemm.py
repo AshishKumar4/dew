@@ -1453,8 +1453,9 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                                            balanced=True, stored=2)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
-        # A whole A100's 216 programs' partials (14 MiB) exceed the 4 MiB cuBLAS's workspace is, so no
-        # balanced tail there (row 12850); on 40 programs (2.6 MiB), a single-wave tail (64 tiles: waves=1,
+        # A whole A100's 216 programs' deep walk prices no balanced tail (its partials' 14 MiB within the
+        # 64 MiB output's budget, `pricing.within_budget`); on 40 programs (2.6 MiB), a single-wave tail
+        # (64 tiles: waves=1,
         # rem=24, 0 drift): planner produces one Tail plan passed straight to emitter via `_stated` without
         # re-pricing.
         x_1w = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
@@ -1467,7 +1468,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         ba_few = tgmm.bind(x_few, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
         stated_few = tgmm._stated(ba_few, tile_1w, few)
         tail_few = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (512, 1024, 4096), (2, 2), 40,
-                                          balanced=stated_few["balanced"], stored=2)
+                                          balanced=stated_few["balanced"], stored=4)
         assert tail_few is stated_few["balanced"] and tail_few is not None
         assert tgmm.balanced(ba_few, tile_1w, few)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
@@ -1594,7 +1595,7 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
 
         with generation.assumed(target):
             assert pricing.dense_tail(tile, jnp.bfloat16, (768, 256, depth), (2, 2), target, mp,
-                                      stored=2) is not None
+                                      stored=4) is not None
             assert_as_exact(dw_native, jax.jit(dw_plain), draw_dw, f"cluster2 tail dw 768x256x{depth}",
                             seeds=SEEDS,
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
