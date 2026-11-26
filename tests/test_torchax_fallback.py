@@ -1748,9 +1748,12 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     step = jax.jit(jax.grad(loss))
     # The queries', keys' and values' dtypes each call of the delta rule takes in the source's traced
     # forward, as the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`),
-    # before the step's replay inlines it (`TorchGraph.traced`).
+    # before the step's replay inlines it (`TorchGraph.traced`), its parameters at the load's bf16 as its
+    # forward computes them.
     assert isinstance(loaded.model, TorchCausalLM)
-    forward, _, _ = loaded.model.graph.traced(params, loaded.variables["buffers"],
+    computed = {name: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+                for name, leaf in params.items()}
+    forward, _, _ = loaded.model.graph.traced(computed, loaded.variables["buffers"],
                                               jnp.asarray(tokens[:, :-1]), None, train=False)
     handed = [tuple(var.aval.dtype for var in eqn.invars[:3] if isinstance(var.aval, ShapedArray))
               for eqn in equations(forward.jaxpr)
