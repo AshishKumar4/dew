@@ -17,14 +17,7 @@ from dew import algebra
 from dew.algebra import program, terms
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-
-
-def _equations(jaxpr):
-    for equation in jaxpr.eqns:
-        yield equation
-        for value in equation.params.values():
-            if hasattr(value, "jaxpr"):
-                yield from _equations(value.jaxpr)
+from dew.nn.programs import equations
 
 
 def _rows(seed: int, *shapes: tuple[int, ...]) -> tuple[np.ndarray, ...]:
@@ -45,7 +38,7 @@ def test_a_norm_of_norms_backward_reuses_a_reduction_through_a_cotangent_sum():
     gradient = jax.grad(loss)
     rewritten = algebra.rewritten(gradient)
     rows = jax.ShapeDtypeStruct((32, 128), jnp.float32)
-    original, selected = (list(_equations(jax.make_jaxpr(arm)(rows).jaxpr))
+    original, selected = (list(equations(jax.make_jaxpr(arm)(rows).jaxpr))
                           for arm in (gradient, rewritten))
     assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in selected) < sum(
         eq.primitive is jax.lax.reduce_sum_p for eq in original)
@@ -72,7 +65,7 @@ def test_cotangent_reductions_keep_their_explicit_placements():
         compute = algebra.rewritten(reduced)
         actual = jax.jit(compute)(*inputs)
         np.testing.assert_array_equal(actual, expected)
-        selected = _equations(jax.make_jaxpr(compute)(*inputs).jaxpr)
+        selected = equations(jax.make_jaxpr(compute)(*inputs).jaxpr)
         add, = (eq for eq in selected if eq.primitive is add_jaxvals_p)
         assert [atom.aval.shape for atom in add.invars if isinstance(atom.aval, ShapedArray)] == [(), ()]
 
@@ -190,14 +183,23 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
         denom = jnp.mean(jnp.square(jnp.tanh(z)), axis=-1, keepdims=True) + jnp.float32(1e-5)
         return jnp.tanh(x) / jnp.sqrt(denom)
 
-    x0, z0 = _rows(0, (16, 64), (16, 64))
+    def roots_in_branches(x, z):
+        # The other arm accepts an unbounded divisor, so reuse must leave its square root and division.
+        return jax.lax.cond(x[0, 0] > 0, standalone_root,
+                            lambda x, z: jnp.tanh(x) / jnp.sqrt(z), x, z)
+
+    def draw_roots(seed):
+        x, z = _rows(seed, (16, 64), (16, 64))
+        return x, np.abs(z) + np.float32(0.125)
+
+    x0, z0 = draw_roots(0)
     with algebra.rules.enabling_dev("reuse"):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", DeprecationWarning)
-            sm_before = list(_equations(jax.make_jaxpr(plain_softmax)(x0).jaxpr))
-            sm_after = list(_equations(jax.make_jaxpr(algebra.rewritten(plain_softmax))(x0).jaxpr))
-            rt_before = list(_equations(jax.make_jaxpr(standalone_root)(x0, z0).jaxpr))
-            rt_after = list(_equations(jax.make_jaxpr(algebra.rewritten(standalone_root))(x0, z0).jaxpr))
+            sm_before = list(equations(jax.make_jaxpr(plain_softmax)(x0).jaxpr))
+            sm_after = list(equations(jax.make_jaxpr(algebra.rewritten(plain_softmax))(x0).jaxpr))
+            rt_before = list(equations(jax.make_jaxpr(roots_in_branches)(x0, z0).jaxpr))
+            rt_after = list(equations(jax.make_jaxpr(algebra.rewritten(roots_in_branches))(x0, z0).jaxpr))
             with generation.assumed("sm90"):
                 rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
                               jax.ShapeDtypeStruct((256,), jnp.bfloat16))
@@ -208,11 +210,12 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
         assert any(eq.primitive is jax.lax.div_p for eq in sm_before)
         assert not any(eq.primitive is jax.lax.div_p for eq in sm_after)
         assert any(eq.primitive is jax.lax.integer_pow_p and eq.params.get("y") == -1 for eq in sm_after)
-        assert not any(eq.primitive is jax.lax.sqrt_p for eq in rt_after)
+        assert sum(eq.primitive is jax.lax.sqrt_p for eq in rt_before) == 2
+        assert sum(eq.primitive is jax.lax.sqrt_p for eq in rt_after) == 1
         assert (sum(eq.primitive is jax.lax.div_p for eq in rt_before)
                 - sum(eq.primitive is jax.lax.div_p for eq in rt_after)) == 1
         assert any(eq.primitive is jax.lax.rsqrt_p for eq in rt_after)
         assert_as_exact(jax.jit(algebra.rewritten(plain_softmax)), jax.jit(plain_softmax),
                         lambda seed: _rows(seed, (16, 64)), "reuse softmax hoist", seeds=8)
-        assert_as_exact(jax.jit(algebra.rewritten(standalone_root)), jax.jit(standalone_root),
-                        lambda seed: _rows(seed, (16, 64), (16, 64)), "reuse standalone root", seeds=8)
+        assert_as_exact(jax.jit(algebra.rewritten(roots_in_branches)), jax.jit(roots_in_branches),
+                        draw_roots, "reuse roots in guarded and unguarded branches", seeds=8)
