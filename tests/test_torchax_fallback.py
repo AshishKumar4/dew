@@ -1949,6 +1949,70 @@ def test_a_recomputed_layer_that_drops_draws_its_forwards_draws(tmp_path):
         jax.tree.leaves(gradient(recomputed, 1)), jax.tree.leaves(gradient(recomputed, 2)), strict=True))
 
 
+def test_a_trace_held_inside_a_layer_keeps_another_threads_trace_out_until_it_leaves(tmp_path):
+    """One tier-3 source traced in two threads at once, a seeded training call (attention dropout) in one
+    and a plain evaluation in the other: the first held inside its first decoder layer (a forward pre-hook)
+    keeps the second, which has announced its call, from entering any trace until it is released, as one
+    trace at a time binds the module's parameters, training mode and seams (`_TRACING`); and each call's
+    logits are, bit for bit, what it gives alone (row 13156, the review of row 13139's witness)."""
+    import threading
+
+    torch.manual_seed(0)
+    config = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
+    transformers.LlamaForCausalLM(config).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    model = loaded.model
+    (ids,) = token_draw(0x13156, LLAMA["vocab_size"], (2, 12))(0)
+
+    def trained():
+        return np.asarray(model.apply(loaded.variables, ids, train=True, rngs={"dropout": jax.random.key(3)}))
+
+    def evaluated():
+        return np.asarray(model.apply(loaded.variables, ids))
+
+    alone = {"trained": trained(), "evaluated": evaluated()}
+    held, release, announced, entered = (threading.Event() for _ in range(4))
+    holder = {}
+
+    def hook(module, args):
+        if threading.current_thread() is holder.get("first") and not held.is_set():
+            held.set()
+            release.wait(timeout=600)
+        elif threading.current_thread() is holder.get("second"):
+            entered.set()
+
+    layer = model.graph.module._model.get_decoder().layers[0]
+    handle = layer.register_forward_pre_hook(hook)
+    ran = {}
+
+    def first():
+        holder["first"] = threading.current_thread()
+        ran["trained"] = trained()
+
+    def second():
+        holder["second"] = threading.current_thread()
+        held.wait(timeout=600)
+        announced.set()
+        ran["evaluated"] = evaluated()
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    try:
+        for thread in threads:
+            thread.start()
+        assert held.wait(timeout=600) and announced.wait(timeout=600)
+        # Held inside a layer, the first trace keeps the second from reaching any layer while it waits.
+        assert not entered.wait(timeout=10)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=600)
+    finally:
+        release.set()
+        handle.remove()
+    assert sorted(ran) == ["evaluated", "trained"]
+    for name, logits in ran.items():
+        np.testing.assert_array_equal(logits, alone[name], err_msg=name)
+
+
 def test_two_variants_of_one_source_trace_side_by_side_as_each_does_alone(tmp_path):
     """Two variants of one tier-3 source sharing its torch graph (`PretrainedFallback.with_model`'s): a loop
     over its first layer and its layers recomputed, each one's gradient traced (an unjitted call traces) four
