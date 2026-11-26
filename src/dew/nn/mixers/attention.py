@@ -22,7 +22,6 @@ from jax.typing import DTypeLike
 from dew.batch import Coordinates
 from dew.nn.activations import GATE_ACTIVATIONS, logistic
 from dew.nn.attention import (
-    FORWARD_MODE,
     AttentionImpl,
     attention_case,
     chosen_attention,
@@ -44,9 +43,9 @@ from dew.nn.attention_masks import (
 from dew.nn.attention_terms import (
     QKClip,
     RelativeBias,
+    RelativeTerms,
     clipped,
     log_ratio_scale,
-    relative_band,
     relative_logits,
 )
 from dew.nn.blocks import normal_kernel
@@ -103,7 +102,7 @@ from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.residuals import QKV_RESIDUALS, Residual
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
-from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared, sequence_shards
+from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.short_conv_site import ShortConvs, ShortConvSite
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
@@ -925,8 +924,8 @@ class CausalSelfAttention(nn.Module):
         """`relative_bias`'s bias of the queries' input `x` (its states tuned by the queries' `places` under
         `temperature`) at `query_slots` against the keys at `key_slots`: `[B, H, Q, K]` (`relative_logits`),
         or, where `banded` (a call's places its indices, the only bias: row 13138), the band about each
-        query (`relative_band`, `attention.BandBias`), which holds `Q band_width` entries a head where the
-        dense one holds `Q K`."""
+        query and its writing out both (`RelativeTerms`, an `attention.RouteBias`), the route taking the one
+        it reads: a band holds `Q band_width` entries a head where the dense one holds `Q K`."""
         spec = self.relative_bias
         assert spec is not None, "a relative bias is read where the layer computes one"
         B, S, _ = x.shape
@@ -938,7 +937,7 @@ class CausalSelfAttention(nn.Module):
             states = states * (scale[..., None, None] if scale.ndim == 2
                                else scale[None, :, None, None]).astype(states.dtype)
         if banded:
-            return relative_band(states, self.relative_bank, jnp.zeros((), jnp.int32))
+            return RelativeTerms(states, self.relative_bank, query_slots, key_slots)
         return relative_logits(states, self.relative_bank, query_slots, key_slots)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
@@ -1124,14 +1123,13 @@ class CausalSelfAttention(nn.Module):
 
         kv_len = key.shape[-3]
         # A whole call whose places are its indices (none given, none counted), its keys more than a band
-        # holds and no QK-Clip maxima sown (whose probe writes every logit out): its relative bias a band
-        # (`relative_band`, row 13138), its places its keys' indices.
-        # Only where the call reaches a route that reads a band natively: a sequence-sharded call and forward
-        # mode's write any bias out before their exchange (`scaled_dot_product_attention`).
+        # holds and no QK-Clip maxima sown (whose probe writes every logit out): its relative bias in both
+        # forms (`RelativeTerms`, rows 13138 and 13503), the route the call resolves to taking the band (the
+        # template) or the bias written out (every other, a sequence-sharded call's and forward mode's
+        # among them: `scaled_dot_product_attention`).
         indexed = (not decode and positions is None and logical_positions is None and not self.ctx.kv_shared
                    and self.relative_bias is not None and not self._sows
-                   and band.band_width(self.relative_bias.extent) < key.shape[-3]
-                   and sequence_shards() == 1 and not FORWARD_MODE.get())
+                   and band.band_width(self.relative_bias.extent) < key.shape[-3])
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
                                                          decode, S)
         # The tokens' logical places (`Coordinates.positions`): the caller's, else the slots a cache

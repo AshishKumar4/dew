@@ -14,7 +14,7 @@ import functools
 import importlib
 import math
 from collections.abc import Callable
-from typing import Literal, NamedTuple, get_args
+from typing import Literal, NamedTuple, Protocol, get_args, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -231,10 +231,29 @@ def _least_bias(bias) -> jax.Array:
     return jnp.min(jnp.asarray(dense_bias(bias), jnp.float32))
 
 
+@runtime_checkable
+class RouteBias(Protocol):
+    """A bias that states both forms a route may take: its band (`band`, a `BandBias` the template reads a
+    tile at a time) and its writing out over the call's keys (`dense`), the route taking the form it reads
+    (`scaled_dot_product_attention`: the band on the template outside forward mode, written out everywhere
+    else). The resolution reads its band's `shape` and `dtype` alone, as a `BandBias`'s, so a route that
+    writes the bias out traces no band (row 13503)."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> jnp.dtype: ...
+
+    def band(self) -> BandBias: ...
+
+    def dense(self, keys: int) -> jax.Array: ...
+
+
 def dense_bias(bias, keys: int | None = None):
     """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
-    a `BandBias` over `keys` (`BandBias.dense`), any other as it is."""
-    if isinstance(bias, BandBias):
+    a `BandBias` or a `RouteBias` over `keys` (their `dense`), any other as it is."""
+    if isinstance(bias, BandBias | RouteBias):
         if keys is None:
             raise ValueError("a band bias is written out over the call's keys, which its caller states")
         return bias.dense(keys)
@@ -1291,6 +1310,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # (`template_attention`); every other route, 'inference''s two among them, adds it written out, as
         # forward mode's reference and kernel do.
         bias = dense_bias(bias, key.shape[-3])
+    elif isinstance(bias, RouteBias):
+        # The template's form, formed now it reads it.
+        bias = bias.band()
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
@@ -1601,7 +1623,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    laid = None if bias is None else bias.shape if isinstance(bias, SeparableBias) else jnp.shape(bias)
+    laid = (None if bias is None else bias.shape if isinstance(bias, SeparableBias | RouteBias)
+            else jnp.shape(bias))
     # Groups a call reads under causality, or past the window of its runs (`scaled_dot_product_attention`).
     grouped = ((bool(causal) or key_runs is not None)
                and (block_groups is not None or image_groups is not None))
@@ -1622,8 +1645,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    and laid[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
-                    and not isinstance(bias, SeparableBias | BandBias)),
-        separable_bias=isinstance(bias, SeparableBias | BandBias),
+                    and not isinstance(bias, SeparableBias | BandBias | RouteBias)),
+        separable_bias=isinstance(bias, SeparableBias | BandBias | RouteBias),
         sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
