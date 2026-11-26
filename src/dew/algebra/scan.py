@@ -1074,6 +1074,24 @@ def token_terms(parts, token: tuple, states: int = 1) -> tuple[tuple[int, ...], 
     return shape, along
 
 
+def _subnormal_contract(axes: Sequence[str], output: str, operands: tuple, scale, dtype):
+    """Contract operands and a subnormal scale as unlanded factors, not as an underflowed input."""
+    reduced = tuple(dict.fromkeys(tag for used in axes for tag in used if tag not in output))
+    layout = (*output, *reduced)
+    factors = []
+    for used, operand in zip(axes, operands, strict=True):
+        permutation = tuple(used.index(tag) for tag in layout if tag in used)
+        placed = jnp.transpose(operand.astype(dtype), permutation)
+        shape = tuple(operand.shape[used.index(tag)] if tag in used else 1 for tag in layout)
+        factors.append(placed.reshape(shape))
+    factors.append(jnp.asarray(np.asarray(scale, dtype)))
+    over = tuple(range(len(output), len(layout)))
+    terms = ((1.0, tuple(("v", i) for i in range(len(factors)))),)
+    form = ratios.Ratio(terms, (), 0, reduced=False, units=windows.Units(), over=over, ieee_products=True)
+    value = ratios.ratio(factors, form)
+    return jnp.squeeze(value, axis=over) if over else value
+
+
 @functools.cache
 def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: np.dtype | None):
     """A multilinear contraction whose transposes apply its scalar before their products. Equal-valued
@@ -1088,6 +1106,9 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
 
     def value(*operands):
         factor = scale if scale_dtype is None else jnp.asarray(scale, dtype=scale_dtype)
+        first = jnp.result_type(factor, operands[0])
+        if jnp.issubdtype(first, jnp.floating) and 0 < abs(float(scale)) < jnp.finfo(first).tiny:
+            return _subnormal_contract(axes, output, operands, scale, jnp.result_type(factor, *operands))
         return _portable_einsum(subscripts, factor * operands[0], *operands[1:])
 
     def tangent(primals, tangents):
