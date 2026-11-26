@@ -1229,6 +1229,19 @@ class PretrainedFallback(Pretrained):
     def pipeline(self):
         return self.text_generation()
 
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model`, which runs its torch forward (`torchax_fallback.replaced`), in place."""
+        from dew.interop.torchax_fallback import replaced
+
+        return replace(self, model=replaced(self.model, model))
+
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """`Pretrained.export`, refused for a model whose release would lose its loop (`unlooped`)."""
+        from dew.interop.torchax_fallback import unlooped
+
+        unlooped(self.model)
+        return super().export(variables)
+
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
         (`PretrainedDecoder.text_generation`)."""
