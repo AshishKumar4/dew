@@ -858,13 +858,12 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         return declaration.function(**dict(zip(names, values, strict=True)))
 
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-    # The declaration is the algebra's statement, no model's products: traced inside a quantized model's
-    # method, a provider's interception would have quantized it, a form no rule writes (row 4858).
+    # A declaration is the algebra's statement, not a model's intercepted quantized products.
+    ranges = {index: declaration.ranges[name] for index, name in enumerate(names)
+              if name in declaration.ranges}
     with jax.disable_jit():
-        closed = jax.make_jaxpr(unintercepted(inlined(named)))(*avals)
-    # The ranges by input, as the region reads them (its constants apart).
-    region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
-                                   if name in declaration.ranges})
+        closed = jax.make_jaxpr(unintercepted(inlined(named, ranges=ranges)))(*avals)
+    region = terms.region(closed, ranges)
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
     walking = WALKING if declaration.rescale is None else WALKING_SCALED

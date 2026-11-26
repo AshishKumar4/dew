@@ -1459,15 +1459,32 @@ def _proven_walk(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | Non
     return held, apart
 
 
+def input_proof(value, dtype) -> tuple[Magnitude | None, Apart]:
+    """An explicitly declared interval, in the dtype at which it enters the walk."""
+    return _declared(value), _held_apart(_declared_apart(value), dtype)
+
+
+def normal_or_zero(dtype, bound: Magnitude | None, apart: Apart) -> bool:
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return True
+    return apart.finite and (bound == NOTHING or
+                             (apart.floor is not None and apart.floor >= jnp.finfo(dtype).minexp))
+
+
+def literal_proof(atom: jcore.Literal) -> tuple[Magnitude | None, Apart]:
+    return _magnitude(atom.val), _constant_apart(atom.val)
+
+
 def proven(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | None = None,
            targets: Sequence[jcore.Var] | None = None,
-           deep: bool = False) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
+           deep: bool = False, given: Mapping[jcore.Var, tuple[Magnitude | None, Apart]] | None = None,
+           ) -> tuple[dict[jcore.Var, Magnitude | None], dict[jcore.Var, Apart]]:
     """What `jaxpr` proves of each variable (`held` magnitudes and `apart`), without building terms or
     interning parameters (`dew.algebra.program._held`), sharing `_propagate_facts` with `_region` so both
     produce identical facts when `deep=False`. With `deep=True` and optional `consts`/`targets`, walks only
     the dependency slice of `targets` without touching tracers or device arrays, peeling called bodies and
     tracking `concatenate`, slicing, NaN guards, and unit-norm denominators."""
-    return _proven_walk(jaxpr, consts=consts, targets=targets, deep=deep)
+    return _proven_walk(jaxpr, consts=consts, targets=targets, deep=deep, init=given)
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)

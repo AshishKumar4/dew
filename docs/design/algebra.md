@@ -1556,6 +1556,12 @@ chunks and reduces the signed products before dividing and landing. This preserv
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
 directions. A finite observation at zero weight retains its one-sided weight derivative.
+For a finite row with a nonzero stored subnormal weight, weighted moments keep the mass and its
+weighted products unlanded in the same ratios used for their derivatives. Other rows keep their
+ordinary path. The float-mass monoid requires zero or normal weights. A generic declaration may
+substitute the protected weighted law only after proving that domain, not as a bitwise rewrite or
+canonical recognition.
+
 Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
 or missing observations. Its covariance term centers and differentiates only pairs that are present.
 
