@@ -18,6 +18,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates.gemm import tiling
 
 FORMATS = {"e4m3": jnp.float8_e4m3fn, "e5m2": jnp.float8_e5m2}
 ROWS, DEPTH, WIDTH, SKINNY = 72, 200, 136, 8
@@ -54,46 +55,31 @@ def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
         return gemm.fp8_codes_product(lhs, rhs, out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
 
 
-ORIENTATIONS = {"unswapped": False, "swapped": True}
-"""The converting launch's two forms (row 5387): its matrix's codes converted a stage at a time, or a
-decode's, its codes the products' rows, each consumer converting its own (`MosaicConvertedGmm._swapped`)."""
-
-
-def _pinned_tile(rows: int, swapped: bool):
-    """The converting launch's derived tile on an A100 at `rows` (a decode's `SKINNY` rows run swapped, a
-    partial tile's `ROWS` not), pinned so each orientation is run by name, and refused where the derivation
-    no longer takes the orientation named at those rows."""
-    from dew.nn.kernels.templates.gemm import converted
-
-    launch = converted.MosaicConvertedGmm()
-    bound = launch.bind(jax.ShapeDtypeStruct((rows, -(-DEPTH // 64) * 64), jnp.bfloat16),
-                        converted.Codes(jax.ShapeDtypeStruct((1, -(-WIDTH // 64) * 64, -(-DEPTH // 64) * 64),
-                                                             jnp.float8_e4m3fn)),
-                        jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
-                        trans_rhs=True, interpret=True, dense=True, exact_sums=False)
-    with generation.assumed("sm80"):
-        tile = bound.heuristics_config
-    assert tile.swapped == swapped, (rows, tile)
-    return tile
+ORIENTATIONS = {
+    "unswapped": tiling.Tiles(64, 64, 64, 4, 2, warpgroups=1, family="mma.sync", programs=2),
+    "swapped": tiling.Tiles(64, 32, 64, 4, 1, warpgroups=1, family="mma.sync", programs=2, swapped=True),
+}
+"""The converting launch's two forms on an A100 (row 5387), each pinned so each runs by name: its matrix's
+codes converted a stage at a time, or a decode's, its codes the products' rows, each consumer converting its
+own (`MosaicConvertedGmm._swapped`)."""
 
 
 def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, interpret_on_cpu: bool = False,
                                                                    orientation: str = "unswapped") -> None:
-    """On an A100, the product of FP8 codes through the template named in `orientation` (`ORIENTATIONS`,
-    its tile pinned: a partial tile's rows unswapped, a decode's swapped), its codes converted exactly into
+    """On an A100, the product of FP8 codes through the template named in `orientation` (`ORIENTATIONS`'
+    tile pinned: at a partial tile's rows unswapped, at a decode's swapped), its codes converted exactly into
     bfloat16 before its products read them (`converted.MosaicConvertedGmm`), on par with XLA's widened
     product (check 1) from float64; the routes it records name the template."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.templates.gemm import converted
 
-    swapped = ORIENTATIONS[orientation]
-    rows = SKINNY if swapped else ROWS
+    tile = ORIENTATIONS[orientation]
+    rows = SKINNY if tile.swapped else ROWS
 
     def truth(lhs, rhs):
         return jnp.asarray(lhs, jnp.float64) @ jnp.asarray(rhs, jnp.float64).T
 
-    with generation.routes() as routes, tuning.pinned({converted.MosaicConvertedGmm: _pinned_tile(rows,
-                                                                                                  swapped)}):
+    with generation.routes() as routes, tuning.pinned({converted.MosaicConvertedGmm: tile}):
         assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu=interpret_on_cpu)),
                         jax.jit(functools.partial(_product, "xla", interpret_on_cpu=interpret_on_cpu)),
                         functools.partial(_operands, name, rows=rows),
