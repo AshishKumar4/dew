@@ -1710,8 +1710,9 @@ def test_a_staged_batch_holds_each_value_in_its_buffer():
         np.testing.assert_array_equal(np.asarray(value), times * np.asarray(x))
 
 
-def _barriers(call) -> int:
-    """The warpgroup barriers (`nvvm.barrier`) in the typed module `call` lowers to for an A100."""
+def _accesses(call) -> str:
+    """The typed module `call` lowers to for an A100, in program order, as its warpgroup barriers ('B',
+    `nvvm.barrier`), shared-memory stores ('W') and shared-memory reads ('R', `ldmatrix` or a load)."""
     import jax.experimental.mosaic.gpu as mgpu
     from kernel_compile import lowered_for
 
@@ -1720,15 +1721,31 @@ def _barriers(call) -> int:
     lowered = lowered_for(call, (jax.ShapeDtypeStruct((16, 64), jnp.float32),), "sm80")
     (kernel,) = [each for each in kernel_calls(lowered) if each.kind == "mosaic_gpu"]
     module = mgpu.deserialized(kernel.ir)
-    pending, found = [module.operation], 0
+    found: list[str] = []
+
+    def walk(operation) -> None:
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    name = inner.operation.name
+                    shared = any("workgroup" in str(each.type) or ", 3>" in str(each.type)
+                                 for each in inner.operation.operands)
+                    if name == "nvvm.barrier":
+                        found.append("B")
+                    elif shared and name.endswith("store"):
+                        found.append("W")
+                    elif shared and (name.endswith("load") or name == "nvvm.ldmatrix"):
+                        found.append("R")
+                    walk(inner.operation)
+
     with module.context:
-        while pending:
-            for region in pending.pop().regions:
-                for block in region.blocks:
-                    for inner in block.operations:
-                        found += inner.operation.name == "nvvm.barrier"
-                        pending.append(inner.operation)
-    return found
+        walk(module.operation)
+    return "".join(found)
+
+
+def _barriers(call) -> int:
+    """The warpgroup barriers (`nvvm.barrier`) in the typed module `call` lowers to for an A100."""
+    return _accesses(call).count("B")
 
 
 @COMPILES_ON_CPU
@@ -1741,6 +1758,37 @@ def test_three_mma_sync_staged_stores_take_a_barrier_at_each_end_and_one_between
     store's own pair and the staging's beside it took 12 apiece and a batch's own pair 8 (a Kimi intra
     step's 20 a trip, FS-INTRA-BAR1; row 13053)."""
     assert _barriers(functools.partial(_staged_three, interpret=False, batched=batched)) == 4
+
+
+def _staged_twice(x):
+    """An mma.sync issuer whose warps split a tile's columns stages a tile into one shared buffer, reads it,
+    stages another into the same buffer and reads that."""
+    family = bundles.named("mma.sync", jnp.bfloat16, None).specialized(16, 64)
+
+    def body(x_gmem, first, second):
+        def scoped(buffer):
+            value = family.zeros((16, 64))
+            family.staged(value + 1, buffer)
+            first[...] = family.tile_of(buffer).astype(jnp.float32)
+            family.staged(value + 2, buffer)
+            second[...] = family.tile_of(buffer).astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((16, 64), jnp.bfloat16))
+
+    out = jax.ShapeDtypeStruct((16, 64), jnp.float32)
+    return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=False, name="staged_twice")(x)
+
+
+@COMPILES_ON_CPU
+def test_an_mma_sync_staged_buffer_read_and_overwritten_meets_a_barrier_between_each_two():
+    """Lowered for an A100: a buffer an mma.sync issuer's split-column warps stage into, read, stage into
+    again and read, holds a warpgroup barrier between every store and the read past it (RAW) and between
+    every read and the store over it (WAR), its stores' brackets Mosaic GPU's own (row 13053)."""
+    accesses = _accesses(_staged_twice)
+    assert accesses.count("W") >= 2 and accesses.count("R") == 2, accesses
+    # Between two barriers, stores alone or reads alone: no store and read of the buffer unordered.
+    assert not [run for run in accesses.split("B") if "W" in run and "R" in run], accesses
 
 
 def _staged_together(x, w, *, interpret, shared: bool):

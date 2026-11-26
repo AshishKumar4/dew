@@ -541,14 +541,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         cast = value.astype(buffer.dtype)
         if self.rows_whole or launches.interpreting():
             buffer[...] = cast
-            return
-        # An unoptimized store (its warps splitting a row's columns) takes no automatic barriers as
-        # `buffer[...] =` does: the sync before keeps a warp from overwriting a column another still reads
-        # (WAR), the sync after a later read from preceding every warp's store (RAW). Stores in a row meet
-        # once between each two: the fork drops a barrier repeating the one before it.
-        mosaic.synced(interpret=False)
-        plgpu.store(buffer, cast, optimized=False)
-        mosaic.synced(interpret=False)
+        else:
+            # Its warps split a row's columns: an unoptimized store, which Mosaic GPU brackets with the
+            # warpgroup's barriers as it does any store (its automatic barriers), one before it for the reads
+            # it overwrites and one after it for the reads past it.
+            plgpu.store(buffer, cast, optimized=False)
 
     def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
                         pending: int = 0) -> tuple[T, jax.Array]:
