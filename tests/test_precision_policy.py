@@ -17,6 +17,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dense import Dense
 from dew.nn.diffusion_gemma import soft_embeddings
+from dew.nn.division import _rounded_significand
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.float_bits import (
     TWO_FACTOR_REACH,
@@ -33,7 +34,6 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.division import _rounded_significand
 from dew.nn.precision import (
     ACCURATE,
     Numerics,
