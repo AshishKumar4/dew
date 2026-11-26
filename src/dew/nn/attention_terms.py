@@ -37,7 +37,11 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     `threshold` (`QKClip`), in at least fp32 and returned in `x`'s dtype."""
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
-    length = jnp.sqrt(jnp.sum(jnp.square(x_wide), axis=-1, keepdims=True))
+    squared = jnp.sum(jnp.square(x_wide), axis=-1, keepdims=True)
+    # A zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's
+    # constant region), where the square root's would be infinite times zero.
+    held = squared > 0
+    length = jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
     return (x_wide * jnp.minimum(threshold / (length + eps), 1)).astype(x.dtype)
 
 

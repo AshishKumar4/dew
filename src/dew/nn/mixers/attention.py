@@ -1242,8 +1242,9 @@ class CausalSelfAttention(nn.Module):
     @property
     def reads_context(self) -> bool:
         """Whether it projects keys and values of its own to read a context with (`context_keys`):
-        a KV-sharing layer does not."""
-        return not self.ctx.kv_shared
+        a KV-sharing layer does not, nor one whose sinks each query projects (`projected_sinks`), which a
+        context's softmax (`attend_context`) takes no query's of."""
+        return not self.ctx.kv_shared and not self.projected_sinks
 
     @nn.nowrap
     def context_heads(self) -> tuple[int, int, int]:
@@ -1658,8 +1659,9 @@ class CausalSelfAttention(nn.Module):
 
     @property
     def _reads_places(self) -> bool:
-        """Whether the layer reads its keys' places, a chunk or ALiBi, so its cache keeps them."""
-        return self.ctx.attention_chunk is not None or self.alibi
+        """Whether the layer reads its keys' places, a chunk, ALiBi or a relative bias (`relative_bias`, its
+        distances the queries' places less the keys'), so its cache keeps them."""
+        return self.ctx.attention_chunk is not None or self.alibi or self.relative_bias is not None
 
     def _attended(self, masking: _Masking, positions, append, sinks, train: bool, *, bias=None):
         """The attention output through the kernel the masking chose: the

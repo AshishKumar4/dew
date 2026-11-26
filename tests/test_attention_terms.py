@@ -108,3 +108,16 @@ def test_a_layers_sinks_are_a_heads_or_each_querys_own():
     layer = CausalSelfAttention(context, nope=True, projected_sinks=True)
     with pytest.raises(ValueError):
         layer.init(jax.random.key(0), jnp.zeros((1, 4, FEATURES)))
+
+
+def test_a_zero_head_passes_its_gradient_through_the_clip():
+    """A head of zeros lies in the clip's constant region: its gradient is the cotangent itself, where the
+    square root of its zero length would make it NaN."""
+    from dew.nn.attention_terms import clipped
+
+    x = jnp.zeros((2, 3, 8), jnp.float32).at[1].set(5.0)
+    cotangent = jnp.arange(48, dtype=jnp.float32).reshape(2, 3, 8)
+    _, pull = jax.vjp(lambda x: clipped(x, 4.0, 1e-6), x)
+    (gradient,) = pull(cotangent)
+    np.testing.assert_array_equal(np.asarray(gradient[0]), np.asarray(cotangent[0]))
+    assert bool(jnp.all(jnp.isfinite(gradient)))

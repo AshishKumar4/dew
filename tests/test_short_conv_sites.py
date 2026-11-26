@@ -92,6 +92,32 @@ def test_a_sites_history_carries_its_rows_real_inputs_alone(dynamic):
 
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_a_packed_prompts_last_document_continues_through_the_sites_history(dynamic):
+    """A cached prompt packing two documents (segments 1 then 2), then the next tokens stated as the second
+    document's (segment 2): they convolve as one call over the second document alone does, bit for bit,
+    the history holding its tokens alone."""
+    site = ShortConvSite(FEATURES, KERNEL, HEADS if dynamic else None)
+    rng = np.random.default_rng(0xC11)
+    x = jnp.asarray(rng.normal(size=(1, 8, FEATURES)), jnp.float32)
+    side = jnp.asarray(rng.normal(size=(1, 8, 5)), jnp.float32)
+    variables = nn.unbox(site.init(jax.random.key(0), x[:, :6],
+                                   dynamic_input=side[:, :6] if dynamic else None))
+    params = {"params": variables["params"]}
+    cache = {"cache": {"conv_state": jnp.zeros((1, KERNEL - 1, FEATURES), jnp.float32)}}
+
+    def call(segments):
+        segments = jnp.asarray([segments], jnp.int32)
+        return MixerCall(AttentionMetadata(coordinates=coordinates(segments.shape, segments=segments)),
+                         decode=True)
+    _, held = site.apply({**params, **cache}, x[:, :6], call([1, 1, 2, 2, 2, 2]),
+                         side[:, :6] if dynamic else None, mutable=["cache"])
+    stepped, _ = site.apply({**params, **held}, x[:, 6:], call([2, 2]), side[:, 6:] if dynamic else None,
+                            mutable=["cache"])
+    whole = site.apply(params, x[:, 2:], dynamic_input=side[:, 2:] if dynamic else None)
+    np.testing.assert_array_equal(np.asarray(stepped), np.asarray(whole[:, -2:]))
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
 def test_a_layer_with_short_convolutions_decodes_as_it_prefills(dynamic):
     """A decoder whose attention convolves its keys and values and whose blocks convolve their mixer's and
     feed-forward's outputs (`LayerKind.mixer_conv`, `feedforward_conv`), decoded a token at a time after a

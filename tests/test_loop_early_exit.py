@@ -17,6 +17,7 @@ from model_support import (
     TINY_DECODER,
     attending,
     decode_steps,
+    decode_with,
     method_run,
     model_draw,
     stacked,
@@ -206,18 +207,10 @@ def test_a_pass_runs_over_the_rows_still_looping_alone(opened, shared):
 
 def _decoded(model, prompt: int):
     """`model`'s logits over `ids`, its first `prompt` tokens prefilled into an allocated cache and each
-    later one decoded alone."""
-    made, step = decode_steps(model)
-
-    def run(variables, ids):
-        cache = made(variables, ids.shape[0])
-        logits, cache = step(variables, cache, ids[:, :prompt])
-        each = [logits]
-        for index in range(prompt, ids.shape[1]):
-            logits, cache = step(variables, cache, ids[:, index:index + 1])
-            each.append(logits)
-        return jnp.concatenate(each, axis=1)
-    return run
+    later one decoded alone (`model_support.decode_with`)."""
+    steps = decode_steps(model)
+    return lambda variables, ids: decode_with(steps, variables, ids[:, :prompt], ids[:, prompt:],
+                                              prefilled=True)
 
 
 def _tokens_exiting(**loop) -> CausalTransformer:
