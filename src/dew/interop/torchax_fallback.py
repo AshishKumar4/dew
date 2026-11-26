@@ -1051,7 +1051,7 @@ class TorchGraph:
                  precision: jax.lax.PrecisionLike = None, laid: Coordinates | None = None,
                  visible: jax.Array | None = None, key_places: jax.Array | None = None,
                  head_input: jax.Array | None = None, recomputed: bool = False,
-                 loop: Loop | None = None) -> tuple[jax.Array, jax.Array]:
+                 loop: Loop | None = None, passes: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
@@ -1063,12 +1063,13 @@ class TorchGraph:
         given, is the output head's input in place of the states the forward computes, so the
         logits are the head's over it, every step the forward takes after the head included. `recomputed`
         recomputes each decoder layer in the backward (`TorchCausalLM.remat`); `loop` runs a block of the
-        layers over its own output (`TorchCausalLM.loop`)."""
+        layers over its own output (`TorchCausalLM.loop`), at most `passes` of its passes where given (a
+        count a call runs, `loop_passes`)."""
         documents, max_segments = _documents(laid)
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
         arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
-                     key_places, head_input, None, None)
+                     key_places, head_input, None, None, None if passes is None else jnp.asarray(passes))
         (logits, hidden), _ = self._run(arguments, train=train, precision=precision,
                                         max_segments=max_segments, recomputed=recomputed, loop=loop)
         return logits, hidden
@@ -1084,7 +1085,7 @@ class TorchGraph:
         its row's furthest position where None."""
         (logits, _), written = self._run(
             (dict(params), dict(buffers), tokens, None, positions, None, None, None, None, None,
-             (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1,
+             (dict(cache), slots, filled), reach, None), train=False, precision=precision, max_segments=1,
             loop=loop)
         return logits, written
 
@@ -1133,7 +1134,8 @@ class TorchGraph:
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
-               cache: tuple | None = None, reach: jax.typing.ArrayLike | None = None, *, train: bool,
+               cache: tuple | None = None, reach: jax.typing.ArrayLike | None = None,
+               passes: jax.typing.ArrayLike | None = None, *, train: bool,
                precision: jax.lax.PrecisionLike = None, max_segments: int = 1, layers: list | None = None,
                loop: Loop | None = None):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
@@ -1146,7 +1148,7 @@ class TorchGraph:
         draws = _Draws()
 
         def forward(params, buffers, tokens, key, positions, documents, valid, visible, key_places,
-                    head_input, cache, reach):
+                    head_input, cache, reach, passes):
             arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions, head_input))
             if reach is None and documents is not None:
                 reach = document_reach(documents, valid, positions)
@@ -1160,7 +1162,7 @@ class TorchGraph:
             # The source model's own mode (the wrapper's flag is its own), restored to it whole.
             was = self.module._model.training
             self.module.train(train)
-            seam = _layer_seam(self.module._model, env, layers=layers, loop=loop)
+            seam = _layer_seam(self.module._model, env, layers=layers, loop=loop, passes=passes)
             try:
                 # The runtime property scoped to this trace whatever it is handed, so a draw inside (a refused
                 # nested layer's) leaves no key of its trace in the environment past it.
@@ -1176,7 +1178,7 @@ class TorchGraph:
         with _TRACING, configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
                 dict(params), dict(buffers), tokens, key, positions, documents, valid, visible, key_places,
-                head_input, cache, reach)
+                head_input, cache, reach, passes)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -1428,6 +1430,9 @@ class _Seam:
     first: int
     end: int
     norm: Callable | None
+    passes: jax.Array | None = None
+    """A count of passes a call runs (`loop_passes`): each later pass at or past it skipped, its state
+    carried (`replayed`); every pass where None."""
     captured: dict[int, tuple] = field(default_factory=dict)
     replaying: bool = False
 
@@ -1475,25 +1480,52 @@ class _Seam:
         return env.j2t_iso(out)
 
     def replayed(self, output, loop: Loop):
+        """The block's later passes after its first's `output`: each from the pass before's state, the
+        decoder's norm between them under `step_norm`; under a count (`passes`), a pass at or past it
+        skipped and one before the last `backprop_steps` it allows run passing no gradient back, as a native
+        loop's counted pass (`looping.counted_branch`), each branch its own program (`lax.switch`)."""
+        from dew.nn.backbones.looping import counted_branch
+
+        env, passes = self.env, self.passes
         self.replaying = True
         try:
             for step in range(1, loop.steps):
-                state, norm = _state_of(output), self.norm
-                state = norm(state) if loop.step_norm and norm is not None else state
-                token = _PASS.set(step)
-                try:
-                    for index in range(self.first, self.end):
-                        args, kwargs = self.captured[index]
-                        if args:
-                            output = self.stack[index](state, *args[1:], **kwargs)
-                        else:
-                            output = self.stack[index](**{**kwargs, 'hidden_states': state})
-                        state = _state_of(output)
-                finally:
-                    _PASS.reset(token)
+                if passes is None:
+                    output = self.run_pass(output, loop, step)
+                    continue
+
+                def run(state, step=step):
+                    return env.t2j_iso(_state_of(self.run_pass(env.j2t_iso(state), loop, step)))
+
+                def held_back(state, step=step):
+                    return jax.lax.stop_gradient(run(state, step))
+
+                branches = (lambda state: state, run) if loop.backprop_steps is None else (
+                    lambda state: state, held_back, run)
+                index = counted_branch(step, passes, loop.backprop_steps)
+                state = jax.lax.switch(index, branches, env.t2j_iso(_state_of(output)))
+                output = _with_state(output, env.j2t_iso(state))
             return output
         finally:
             self.replaying = False
+
+    def run_pass(self, output, loop: Loop, step: int):
+        """Later pass `step` of the block over the pass before's `output`, each layer called with the
+        arguments its first pass took, its attention's dropout its own (`_PASS`)."""
+        state, norm = _state_of(output), self.norm
+        state = norm(state) if loop.step_norm and norm is not None else state
+        token = _PASS.set(step)
+        try:
+            for index in range(self.first, self.end):
+                args, kwargs = self.captured[index]
+                if args:
+                    output = self.stack[index](state, *args[1:], **kwargs)
+                else:
+                    output = self.stack[index](**{**kwargs, 'hidden_states': state})
+                state = _state_of(output)
+        finally:
+            _PASS.reset(token)
+        return output
 
 
 _SEAM: contextvars.ContextVar[_Seam | None] = contextvars.ContextVar("dew_tier3_seam", default=None)
@@ -1512,6 +1544,11 @@ def _state_of(output):
     return output if _is_tensor(output) else output[0]
 
 
+def _with_state(output, state):
+    """A decoder layer's `output` with its hidden output `state` in its place (`_state_of`)."""
+    return state if _is_tensor(output) else (state, *output[1:])
+
+
 def _cache_entry(layer: int) -> int:
     """The decode cache entry a decoder layer's keys and values keep (`_Cached`): its own index, and a later
     pass of this trace's loop (`_SEAM`, `_PASS`) its own apart, after the stack's (`looping.pass_offset`),
@@ -1525,7 +1562,8 @@ def _cache_entry(layer: int) -> int:
 
 
 @contextlib.contextmanager
-def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | None) -> Iterator[None]:
+def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | None,
+                passes: jax.Array | None = None) -> Iterator[None]:
     """This trace's seam over `model`'s decoder layers (`_Seam`), which their dispatchers (`_dispatched`,
     installed once) read from this context alone (`_SEAM`), so traces of variants sharing the layers, nested
     or in other threads, keep their own: none for a trace running neither `layers` nor `loop`, whose
@@ -1537,8 +1575,11 @@ def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | No
     `loop`, the block `loop.layers` runs `loop.steps` times: past its last layer's first call, its later
     passes, each layer called with the arguments its own first pass took (the call's masks and rotary
     tables, which differ by layer kind), its hidden input the pass before's output, the decoder's `norm`
-    between passes under `step_norm`, each pass's attention dropout its own (`_PASS`)."""
-    seam = None if layers is None and loop is None else _seam_of(model, env, layers, loop)
+    between passes under `step_norm`, each pass's attention dropout its own (`_PASS`); under `passes`, a
+    count a call runs, each later pass at or past it skipped (`_Seam.replayed`)."""
+    if passes is not None and loop is None:
+        raise ValueError("a count of passes runs a loop's passes, and this tier-3 model loops not")
+    seam = None if layers is None and loop is None else _seam_of(model, env, layers, loop, passes)
     tokens = _SEAM.set(seam), _PASS.set(0)
     try:
         yield
@@ -1547,7 +1588,8 @@ def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | No
         _SEAM.reset(tokens[0])
 
 
-def _seam_of(model, env: Environment, layers: list | None, loop: Loop | None) -> _Seam:
+def _seam_of(model, env: Environment, layers: list | None, loop: Loop | None,
+             passes: jax.Array | None = None) -> _Seam:
     """`model`'s decoder layers' seam for one trace (`_layer_seam`), its loop's block checked against them."""
     held, stack = model.get_decoder(), _layer_list(model)
     if stack is None:
@@ -1561,7 +1603,7 @@ def _seam_of(model, env: Environment, layers: list | None, loop: Loop | None) ->
         raise ValueError(f"a loop's step norm is the decoder's final norm, and {type(held).__name__} holds "
                          "no `norm`")
     _dispatched(model)
-    return _Seam(stack, env, layers, loop, first, end, norm)
+    return _Seam(stack, env, layers, loop, first, end, norm, passes)
 
 
 _BROADCASTING = frozenset((primitives.add_p, primitives.sub_p, primitives.mul_p, primitives.div_p,
@@ -1851,15 +1893,17 @@ class TorchCausalLM(nn.Module):
                                positions=places, reach=reach, precision=precision,
                                loop=None if self.loop is None else runnable_loop(self.loop))
 
-    def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
+    def logits(self, tokens, *, train: bool = False, loop_passes: jax.Array | None = None,
+               **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
-        (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
-        logits, _ = self._run(tokens, train, self._laid(packing))
+        (`at_least_fp32`), so a float64 model's are float64, as its output table's are; under
+        `loop_passes`, its loop's passes at or past that count skipped (`_Seam.replayed`)."""
+        logits, _ = self._run(tokens, train, self._laid(packing), passes=loop_passes)
         return logits.astype(at_least_fp32(logits.dtype))
 
     def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
                       attention_pairwise_mask=None, attention_key_runs=None, attention_key_positions=None,
-                      **packing) -> jax.Array:
+                      loop_passes: jax.Array | None = None, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`, for rows laid as `logits` lays them
         (`_laid`). `attention_pairwise_mask` `[B, S, S]`, or `attention_key_runs` `[B, S, R, 2]` (the keys
         each token sees as runs, `AttentionMetadata.key_runs`), states what each token sees, which then
@@ -1878,14 +1922,14 @@ class TorchCausalLM(nn.Module):
             attention_pairwise_mask = visibility_mask(length, length, causal=False, sliding_window=None,
                                                       key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
-            return self._run(tokens, train, laid)[1]
+            return self._run(tokens, train, laid, passes=loop_passes)[1]
         if not self.graph.dew_attention:
             # Transformers' own attention reads its own causal mask; Dew's reads the stated one.
             raise ValueError("a stated visibility (attention_pairwise_mask) runs on Dew's attention, and "
                              "this model runs transformers' own")
         keys = None if attention_key_positions is None else jnp.asarray(attention_key_positions)
         return self._run(tokens, train, laid, visible=jnp.asarray(attention_pairwise_mask, bool),
-                         key_places=keys)[1]
+                         key_places=keys, passes=loop_passes)[1]
 
     def logits_from_hidden(self, hidden: jax.Array) -> jax.Array:
         """The output head over `hidden` `[B, S, features]`, every step the forward takes after the
@@ -1917,25 +1961,27 @@ class TorchCausalLM(nn.Module):
         return laid
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
-             head_input=None) -> tuple[jax.Array, jax.Array]:
+             head_input=None, passes=None) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
             # The source's variables are its own: the forward's shapes over them, as zeros.
             def over(held):
-                return self._over(held, tokens, laid, visible, key_places, head_input, train=False)
+                return self._over(held, tokens, laid, visible, key_places, head_input, train=False,
+                                  passes=passes)
 
             shapes = jax.eval_shape(over, self.graph.shapes)
             return jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype), shapes)
-        return self._over(self.variables, tokens, laid, visible, key_places, head_input, train=train)
+        return self._over(self.variables, tokens, laid, visible, key_places, head_input, train=train,
+                          passes=passes)
 
     def _over(self, held, tokens, laid, visible, key_places, head_input, *,
-              train: bool) -> tuple[jax.Array, jax.Array]:
+              train: bool, passes=None) -> tuple[jax.Array, jax.Array]:
         params, buffers, compute = self._operands(held)
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         loop = None if self.loop is None else runnable_loop(self.loop)
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
                           precision=self._products(compute), laid=laid, visible=visible,
                           key_places=key_places, head_input=head_input, recomputed=self.remat and train,
-                          loop=loop)
+                          loop=loop, passes=passes)
 
     def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
         """The forward's parameters at `dtype`, its buffers, and the dtype its products take: `dtype`, or

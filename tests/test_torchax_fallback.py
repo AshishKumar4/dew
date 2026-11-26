@@ -2006,3 +2006,40 @@ def test_a_plain_trace_nested_in_a_looped_ones_seam_runs_its_own_layers_and_leav
     with _layer_seam(source, _environment(), layers=None, loop=Loop(steps=3, layers=(0, 1), step_norm=False)):
         nested = loaded.model.apply(loaded.variables, ids)
     np.testing.assert_array_equal(np.asarray(nested), np.asarray(alone))
+
+
+def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path):
+    """A source taken to tier 3 looping its first layer three passes runs a count a call gives
+    (`loop_passes`): its logits at each count are, bit for bit, the loop of that many passes' (each later pass
+    at or past the count skipped, as a native loop's counted pass, `looping.counted_branch`, row 13144); and
+    a trainer drawing each microbatch's count (`TrainerAdvanced.sampled_passes`) steps it at more than one
+    count, every loss finite."""
+    from dew.training.compiler import DrawingStep
+    from dew.training.interval import Interval
+    from dew.training.phase_passes import SampledPasses
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    looped = loaded.model.with_loop(Loop(steps=3, layers=(0, 1), step_norm=False))
+    (ids,) = token_draw(0x13144, LLAMA["vocab_size"], (2, 12))(0)
+    counted = jax.jit(lambda variables, ids, passes: looped.apply(variables, ids, method="logits",
+                                                                  loop_passes=passes))
+    for count in (1, 2, 3):
+        np.testing.assert_array_equal(
+            np.asarray(counted(loaded.variables, ids, jnp.int32(count))),
+            np.asarray(jax.jit(looped.with_passes(count).apply)(loaded.variables, ids)), err_msg=f"{count}")
+    held = dataclasses.replace(loaded, model=looped)
+    trainer = Trainer(LMObjective(held, 11, ema_decay=None), optax.sgd(0.1), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(sampled_passes=SampledPasses(mean=2.0, dispersion=0.5, cap=3)))
+    state, _, _ = trainer.place()
+    batch = {"text": jnp.asarray(ids)}
+    step = trainer.compile(state, batch)
+    assert isinstance(step, DrawingStep)
+    counts = []
+    for index in range(6):
+        step.drawn(Interval(0.0, None, microbatches=0), index)
+        counts.extend(step.counts)
+        state, loss, *_ = step(state, batch)
+        assert np.isfinite(float(loss)), (index, counts)
+    assert len(set(counts)) > 1, counts

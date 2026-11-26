@@ -649,7 +649,7 @@ class _Passes:
                 return carry, (zero if self.exit_states else None, output)
 
             if backprop is None:
-                return _sown_switch((step < passes).astype(jnp.int32), (skip, run), module, carry)
+                return _sown_switch(counted_branch(step, passes, None), (skip, run), module, carry)
 
             def held_back(module, carry):
                 # A pass before the cut passes no gradient back through its block, its state stopped where
@@ -659,11 +659,20 @@ class _Passes:
                                             block=self.pass_block)
                 return jax.lax.stop_gradient(state), exits
 
-            index = jnp.where(step >= passes, 0, jnp.where(step < passes - backprop, 1, 2))
-            return _sown_switch(index, (skip, held_back, run), module, carry)
+            return _sown_switch(counted_branch(step, passes, backprop), (skip, held_back, run), module, carry)
 
         stepping = nn.remat(fixed_remat(branched)) if self.loop.remat else branched
         return stepping(module, carry, step, passes)
+
+
+def counted_branch(step, passes, backprop_steps: int | None) -> jax.Array:
+    """The branch later pass `step` of a count `passes` given per call takes (`_Passes.counted_step`, and
+    tier 3's, `torchax_fallback._Seam.replayed`): 0, skipped, at or past `passes`; without
+    `backprop_steps`, 1, run; with it, 1, run passing no gradient back, before the last `backprop_steps`
+    passes the count allows, else 2, run."""
+    if backprop_steps is None:
+        return (step < passes).astype(jnp.int32)
+    return jnp.where(step >= passes, 0, jnp.where(step < passes - backprop_steps, 1, 2)).astype(jnp.int32)
 
 
 def _sown_switch(index, branches, module, *operands):
