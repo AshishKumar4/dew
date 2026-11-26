@@ -311,6 +311,26 @@ def test_a_giant_heads_epsilon_share_keeps_its_derivative_in_the_head():
     np.testing.assert_array_equal(np.asarray(second), np.float32([-(2.0 ** -66)]))
 
 
+def test_a_subnormal_scaled_epsilons_share_rounds_once():
+    """`[2^62, 0, ...]` clipped to `2^61` with epsilon `(1 + 2^-19) 2^-64`, its scaled epsilon `2^-131 +
+    2^-150` subnormal and its share `2^-126` normal: a radial seed `2^120` moves the clip by `2^-7 +
+    2^-26`, both ways, jitted, epsilon's low bit kept, where the scaled epsilon rounded before its division
+    lost it on a backend keeping subnormals (row 13260's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    x[0], seed[0] = 2.0 ** 62, 2.0 ** 120
+    epsilon = float(np.float32((1 + 2.0 ** -19) * 2.0 ** -64))
+
+    def clip(x):
+        return clipped(x, 2.0 ** 61, epsilon)
+
+    moved = jax.jit(lambda x, seed: jax.jvp(clip, (x,), (seed,))[1])(jnp.asarray(x), jnp.asarray(seed))
+    pulled = jax.jit(lambda x, seed: jax.vjp(clip, x)[1](seed)[0])(jnp.asarray(x), jnp.asarray(seed))
+    for derivative in (np.asarray(moved), np.asarray(pulled)):
+        assert derivative[0] == np.float32(2.0 ** -7 + 2.0 ** -26), derivative
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped

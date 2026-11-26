@@ -144,6 +144,35 @@ def exactly(plain: Callable[..., jax.Array], exact: Callable[..., jax.Array]) ->
     return surrogate(exact, derivative, symbolic_zeros=True)
 
 
+def _over_plain(quotient, numerator, denominator, moving):
+    """`over_denominator`'s arithmetic as PyTorch's backward writes it, whose derivatives it takes."""
+    return moving * divided_in(quotient, denominator)
+
+
+def _over_exact(quotient, numerator, denominator, moving):
+    """`over_denominator`'s value: PyTorch's order wherever its product is a normal value (its quotients
+    subnormal or not, each rounded once as PyTorch's are), or the seed is zero beside a finite coefficient,
+    valued as where subnormals are kept (`_flush_safe`); the balanced order where that product overflows or
+    flushes, a zero seed beside an infinite coefficient among them (zero, not `0 * inf`)."""
+    twice = divided_in(quotient, denominator)
+    product = _flush_safe(moving, twice)
+    special = ~(finite_nonzero(numerator) & finite_nonzero(denominator)) | ~jnp.isfinite(moving)
+    torch = special | normal(product) | (~finite_nonzero(moving) & jnp.isfinite(twice))
+    kept_numerator, kept_denominator = (jnp.where(torch, 1, value) for value in (numerator, denominator))
+    return jnp.where(torch, jnp.where(special, moving * twice, product),
+                     balanced(jnp.where(torch, 0, moving), (kept_numerator,),
+                              (kept_denominator, kept_denominator)))
+
+
+_over_valued = contracted("test_the_precision_seams_hold_every_order")(exactly(_over_plain, _over_exact))
+"""`over_denominator`'s map, valued range-safe and differentiated as PyTorch's order at every order
+(`exactly`), held by the division's contract; built once."""
+
+
+def _over_apply(residuals, moving):
+    return _over_valued(*residuals, moving)
+
+
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
                      denominator: jax.Array) -> jax.Array:
     """The size of `n / d`'s tangent in its denominator, `t n / d^2`, a linear map of `t` that is its own
@@ -161,28 +190,4 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
     row 13232's."""
     from .kernels.generation import linear_map
 
-    def plain(quotient, numerator, denominator, moving):
-        return moving * divided_in(quotient, denominator)
-
-    def exact(quotient, numerator, denominator, moving):
-        twice = divided_in(quotient, denominator)
-        product = _flush_safe(moving, twice)
-        special = ~(finite_nonzero(numerator) & finite_nonzero(denominator)) | ~jnp.isfinite(moving)
-        # PyTorch's order wherever its product is a normal value (its quotients subnormal or not, each
-        # rounded once as PyTorch's are), or the seed is zero beside a finite coefficient, valued as where
-        # subnormals are kept (`_flush_safe`); the balanced order where that product overflows or flushes,
-        # a zero seed beside an infinite coefficient among them (zero, not `0 * inf`).
-        torch = special | normal(product) | (~finite_nonzero(moving) & jnp.isfinite(twice))
-        kept_numerator, kept_denominator = (jnp.where(torch, 1, value) for value in (numerator, denominator))
-        return jnp.where(torch, jnp.where(special, moving * twice, product),
-                         balanced(jnp.where(torch, 0, moving), (kept_numerator,),
-                                  (kept_denominator, kept_denominator)))
-
-    # Valued range-safe, differentiated as PyTorch's order at every order (`exactly`), which the division's
-    # contract holds.
-    valued = contracted("test_the_precision_seams_hold_every_order")(exactly(plain, exact))
-
-    def apply(residuals, moving):
-        return valued(*residuals, moving)
-
-    return linear_map(apply, apply, (quotient, numerator, denominator), tangent)
+    return linear_map(_over_apply, _over_apply, (quotient, numerator, denominator), tangent)

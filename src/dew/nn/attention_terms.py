@@ -98,8 +98,10 @@ def _plain_share(eps: jax.Array, factor: jax.Array, denominator: jax.Array) -> j
 
 
 def _exact_share(eps: jax.Array, factor: jax.Array, denominator: jax.Array) -> jax.Array:
+    # The plain quotient where its scaled epsilon and the quotient are both normal; a subnormal `eps s`,
+    # rounded before its division, the balanced one's (row 13260's review).
     plain = _plain_share(eps, factor, denominator)
-    return jnp.where(normal(plain), plain, balanced(eps, (factor,), (denominator,)))
+    return jnp.where(normal(eps * factor) & normal(plain), plain, balanced(eps, (factor,), (denominator,)))
 
 
 _epsilon_share = contracted("test_a_giant_heads_clip_holds_every_order")(exactly(_plain_share, _exact_share))
