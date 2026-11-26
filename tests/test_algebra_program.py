@@ -2048,6 +2048,23 @@ def test_repeated_primitive_slots_keep_distinct_primitive_identities():
     assert terms.jaxpr_digest(traced, in_process=True) != terms.jaxpr_digest(changed, in_process=True)
 
 
+def test_in_process_digest_distinguishes_which_link_each_equation_reads():
+    shape = jax.ShapeDtypeStruct((), jnp.float32)
+
+    def step(x, y):
+        both = jax.lax.add(x, y)
+        return jax.lax.sub(both, x)
+
+    def other(x, y):
+        both = jax.lax.add(x, y)
+        return jax.lax.sub(both, y)
+
+    first, clone, different = (jax.make_jaxpr(fn)(shape, shape) for fn in (step, jax.jit(step), other))
+    key = terms.jaxpr_digest(first, in_process=True)
+    assert key == terms.jaxpr_digest(clone.eqns[0].params["jaxpr"], in_process=True)
+    assert key != terms.jaxpr_digest(different, in_process=True)
+
+
 def _bf16_rms(x, w):
     """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
     mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)

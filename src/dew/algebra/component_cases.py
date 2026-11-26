@@ -10,9 +10,11 @@ import numpy as np
 
 from dew.algebra.generate import Cases, ComponentForm, declare
 from dew.nn import precision
+from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
 from dew.nn.kernels.templates import attention_algebra
 from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents, derived_from_weights
+from dew.nn.kernels.templates.operands import Parts
 
 
 def _arrays(seed, operands):
@@ -173,6 +175,56 @@ def _split_kv_draw(seed, operands):
     return left, left_peak, left_total, right, right_peak, right_total
 
 
+def _carry_product(name, left, right):
+    del name
+    left, right = (x.value() if isinstance(x, Parts) else x for x in (left, right))
+    return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION)
+
+
+def _chunk_carry(state, keys, values, weights, kept):
+    corrected = recurrence_algebra.corrected(values, lambda _: weights, [state], keys.dtype, _carry_product)
+    (leaving,) = recurrence_algebra.carried([state], lambda _: keys, corrected, [kept], keys.dtype,
+                                           _carry_product)
+    return leaving, corrected
+
+
+def _chunk_carry_truth(state, keys, values, weights, kept):
+    corrected = values - weights @ state
+    return kept * state + keys.T @ corrected, corrected
+
+
+def _chunk_pullback(grad, keys, weights, queries, out_grad, local, kept):
+    key_tile, weight_tile, query_tile = (Parts((a,), a.dtype) for a in (keys, weights, queries))
+    (entered,), corrected = recurrence_algebra.key_reverse_carried(
+        [grad], lambda _: key_tile, lambda _: weight_tile, lambda _: query_tile,
+        Parts((out_grad,), out_grad.dtype), local, [kept], keys.dtype, _carry_product)
+    return entered, corrected
+
+
+def _chunk_pullback_truth(grad, keys, weights, queries, out_grad, local, kept):
+    corrected = keys @ grad + local
+    return kept * grad + queries.T @ out_grad - weights.T @ corrected, corrected
+
+
+def _chunk_inputs(seed, operands):
+    state, keys, values, weights, kept = _arrays(seed, operands)
+    kept[:] = 2.0 ** -np.abs(np.round(kept))
+    # Padding supplies no write or correction. A huge surviving memory needs its own decay.
+    keys[0], values[0], weights[0] = 0, 0, 0
+    if seed % 2:
+        state[0], weights[:, 0], kept[0] = 2.0 ** 127, 0, 2.0 ** -126
+    return state, keys, values, weights, kept
+
+
+def _chunk_pullback_inputs(seed, operands):
+    grad, keys, weights, queries, out_grad, local, kept = _arrays(seed, operands)
+    kept[:] = 2.0 ** -np.abs(np.round(kept))
+    keys[0], weights[0], queries[0], out_grad[0], local[0] = 0, 0, 0, 0, 0
+    if seed % 2:
+        grad[0], keys[:, 0], kept[0] = 2.0 ** 127, 0, 2.0 ** -126
+    return grad, keys, weights, queries, out_grad, local, kept
+
+
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 ROUNDED = declare(__name__, "rounded", ComponentForm(
@@ -196,3 +248,11 @@ ONLINE_STEP = declare(__name__, "online_softmax_step", ComponentForm(
 SPLIT_KV_MERGE = declare(__name__, "split_kv_merge", ComponentForm(
     _split_kv_merge, _split_kv_truth, dataclasses.replace(
         _cases(*[((q, d), (q,), (q,)) * 2 for q, d in ((32, 64), (64, 128))]), draw=_split_kv_draw)))
+CHUNK_CARRY = declare(__name__, "chunk_carry", ComponentForm(
+    _chunk_carry, _chunk_carry_truth, dataclasses.replace(
+        _cases(*[((k, v), (c, k), (c, v), (c, k), (k, 1)) for c, k, v in ((16, 32, 32), (64, 64, 32))]),
+        draw=_chunk_inputs)))
+CHUNK_PULLBACK = declare(__name__, "chunk_pullback", ComponentForm(
+    _chunk_pullback, _chunk_pullback_truth, dataclasses.replace(
+        _cases(*[((k, v), (c, k), (c, k), (c, k), (c, v), (c, v), (k, 1))
+                 for c, k, v in ((16, 32, 32), (64, 64, 32))]), draw=_chunk_pullback_inputs)))
