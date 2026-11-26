@@ -4,17 +4,22 @@ its product's reverse mode forms nothing for: each interpreted as a GPU on a CPU
 products composed on them compiled for compile-only GPUs within their resources."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from generation_support import COMPILES_ON_CPU, generations
 from reference_error import assert_as_exact, with_gradients
 
+from dew.nn.dense import Dense
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 
 ROWS, FEATURES, HIDDEN = 136, 128, 256
 """Rows no tile divides, the features a gated MLP reads and writes, its hidden width."""
@@ -237,3 +242,116 @@ def test_a_remat_keeping_the_projections_forms_the_hidden_activation_by_no_produ
         launched = {name: sum(times for _, times in kernel_launches(lowered_for(step, shapes, "sm90")))
                     for name, step in steps.items()}
     assert launched["saved"] == launched["whole"], launched
+
+
+class _HoldingDense(Dense):
+    """A Dense that reads no formed input (`protocols.ReadsFormed`): a gated MLP's down projection that
+    multiplies its gated product as any input, holding it for reverse mode, the path before."""
+
+    @property
+    def reads_formed(self) -> bool:
+        return False
+
+
+GATED_LAYERS = {
+    "swiglu": {},
+    "clamped geglu": {"activation": "geglu", "swiglu_limit": 1.5},
+    "packed": {"packed": True},
+    "scaled gate": {"gate_multiplier": 0.5},
+}
+
+
+@pytest.mark.parametrize("fields", GATED_LAYERS.values(), ids=GATED_LAYERS.keys())
+def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
+    """A bf16 gated MLP, its gate and up apart or packed (`[..., 2, H]`), clamped or its gate scaled,
+    unrematerialized: its output and every gradient under a cotangent (each kernel's and the input's) as
+    exact as the path holding its hidden product (its down projection reading no formed input) from float64
+    truth (check 1), and its reverse mode, compiled as the held one's, holds at least the hidden product's
+    bytes less: a `[tokens, hidden]` value a layer."""
+    tokens, hidden, features = (2, 12), 48, 16
+    holding_linear = functools.partial(_HoldingDense, dot_general=float32_dot_general)
+    # The bf16 arms state the default precision, which a formed product runs at, over the scope a check's
+    # arms configure; the float64 truth its own.
+    layer, holding, truth = (GatedMLP(hidden_features=hidden, out_features=features, dtype=dtype, **fields,
+                                      **extra)
+                             for dtype, extra in ((jnp.bfloat16, {"precision": jax.lax.Precision.DEFAULT}),
+                                                  (jnp.bfloat16, {"linear": holding_linear,
+                                                                  "precision": jax.lax.Precision.DEFAULT}),
+                                                  (jnp.float64, {})))
+    shapes = jax.eval_shape(layer.init, jax.random.key(0), jnp.zeros((*tokens, features), jnp.bfloat16))
+    leaves, tree = jax.tree.flatten(shapes)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(*tokens, features)), jnp.bfloat16),
+                *(jnp.asarray(rng.normal(size=leaf.shape) / np.sqrt(leaf.shape[0]), jnp.bfloat16)
+                  for leaf in leaves),
+                jnp.asarray(rng.normal(size=(*tokens, features)), jnp.bfloat16))
+
+    def applied(module):
+        return lambda x, *kernels: module.apply(jax.tree.unflatten(tree, kernels), x)
+
+    assert_as_exact(with_gradients(applied(layer)), jax.jit(with_gradients(applied(holding))), draw,
+                    "a gated MLP's down projection of its formed product", seeds=SEEDS,
+                    truth_fn=with_gradients(applied(truth)))
+
+    x, *kernels, _ = draw(0)
+
+    def held_bytes(module) -> int:
+        """The bytes of the arrays `module`'s reverse mode holds (its jitted pullback's leaves of more than
+        one entry: no launch's one-entry table of group sizes)."""
+        _, pull = jax.vjp(jax.jit(applied(module)), x, *kernels)
+        return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(pull) if leaf.size > 1)
+
+    product = math.prod(tokens) * hidden * jnp.dtype(jnp.bfloat16).itemsize
+    assert held_bytes(holding) - held_bytes(layer) >= product
+
+
+def test_a_gated_mlps_down_projection_multiplies_the_inputs_an_interceptor_hands_it():
+    """A gated MLP whose down projection an interceptor hands other inputs (an input quantizer's rounded
+    rows; zeros here): the projection multiplies those, its formed product left unread (`Dense`'s identity
+    rule), so its output is zeros and so is every gradient under a cotangent, the down kernel's, the gate
+    and up kernels' and the input's; and a capture of its calls (`capture_intermediates`) keeps the output
+    the layer returns."""
+    layer = GatedMLP(hidden_features=48, out_features=16, dtype=jnp.bfloat16,
+                     precision=jax.lax.Precision.DEFAULT)
+    rng = np.random.default_rng(1)
+    x = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(4, 16)), jnp.bfloat16)
+    variables = layer.init(jax.random.key(0), x)
+
+    def zeroed(next_fun, args, kwargs, context):
+        if context.module.name == "down_proj" and context.method_name == "__call__":
+            args = (jnp.zeros_like(args[0]), *args[1:])
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(zeroed):
+        out, pull = jax.vjp(jax.jit(layer.apply), variables, x)
+        gradients = pull(cotangent)
+    assert not np.any(np.asarray(out, np.float32))
+    for leaf in jax.tree.leaves(gradients):
+        assert not np.any(np.asarray(leaf, np.float32))
+
+    out, state = layer.apply(variables, x, capture_intermediates=True, mutable=["intermediates"])
+    np.testing.assert_array_equal(np.asarray(state["intermediates"]["down_proj"]["__call__"][0], np.float32),
+                                  np.asarray(out, np.float32))
+    assert np.any(np.asarray(out, np.float32))
+
+
+def test_a_gated_mlp_under_a_precision_above_the_default_holds_its_hidden_product():
+    """A gated MLP under a run's precision above the default (the test lane's 'highest'): its down
+    projection multiplies its hidden product as the layer states its precision, holding it for reverse
+    mode, as a projection reading no formed input does (`_HoldingDense`): the same bytes held."""
+    tokens, hidden, features = (2, 12), 48, 16
+    x = jnp.asarray(np.random.default_rng(3).normal(size=(*tokens, features)), jnp.bfloat16)
+    layer, holding = (GatedMLP(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, **extra)
+                      for extra in ({}, {"linear": functools.partial(_HoldingDense,
+                                                                     dot_general=float32_dot_general)}))
+    variables = layer.init(jax.random.key(0), x)
+
+    def held_bytes(module) -> int:
+        _, pull = jax.vjp(jax.jit(lambda variables, x: module.apply(variables, x)), variables, x)
+        return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(pull) if leaf.size > 1)
+
+    with jax.default_matmul_precision("highest"):
+        assert held_bytes(layer) == held_bytes(holding)

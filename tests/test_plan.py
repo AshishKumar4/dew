@@ -2197,16 +2197,17 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
 
 
-@pytest.mark.parametrize("width, between", [
+@pytest.mark.parametrize("width, between, seq", [
     # Its temporaries scaled by its rows (a narrow layer).
-    (16, (1, 2)),
+    (16, (1, 2), SEQ),
     # They fall faster than its rows.
-    (16, (2, 4)),
-    # Mostly fixed (a wide layer over few tokens: the gradients of its weights).
-    (1024, (2, 4)),
+    (16, (2, 4), SEQ),
+    # Mostly fixed (a wide layer over few tokens: the gradients of its weights), its rows long enough that
+    # the whole batch's activations still pass a quarter's beside its accumulator.
+    (1024, (2, 4), 24),
 ])
 def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_once_warm(monkeypatch, tmp_path,
-                                                                                        width, between):
+                                                                                        width, between, seq):
     """What a run pays at its start where its batch does not fit whole (the owner's contract: "a single
     trace and compile most often"): cold, the plan is the split seen to fit beside the next coarser seen
     to miss, those `between`, each split compiled once at most, no more than the splits there are; warm,
@@ -2214,14 +2215,20 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     one compile, its step the one it runs. The devices' memory lies between the fewest's need and the least
     of the whole batch's and the first's, so both miss: the whole batch's need, its accumulator absent, is
     not the most of every split's."""
-    whole, fewer, fewest = (needs(monkeypatch, lm(split=split, width=width)) for split in (1, *between))
+    batch = {"text": jnp.asarray((np.arange(ROWS * (seq + 1)).reshape(ROWS, seq + 1) * 7) % 64, jnp.int32)}
+
+    def need(split):
+        trainer = lm(split=split, width=width, seq=seq)
+        return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=batch))
+
+    whole, fewer, fewest = (need(split) for split in (1, *between))
     missing = min(whole, fewer)
     assert fewest < missing, (fewest, whole, fewer)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, (missing + fewest) // 2)
-    cold_run, warm = lm(width=width), lm(width=width)
+    cold_run, warm = lm(width=width, seq=seq), lm(width=width, seq=seq)
     with Compiles("step") as compiles:
-        trained(cold_run, steps=0)
+        trained(cold_run, steps=0, batch=batch)
     probes = cold_run.plan["probes"]
     assert cold_run.plan["split"] == between[1], probes
     assert any(probe["split"] == between[0] and not probe["fits"] for probe in probes), probes
@@ -2229,7 +2236,7 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     assert len(set(asked)) == len(asked) <= ROWS and compiles.count <= len(asked), (compiles.count, probes)
     # A warm process: the cold one's record, none of its executables, which no trainer holds past itself.
     with Compiles("step") as compiles:
-        trained(warm, steps=0)
+        trained(warm, steps=0, batch=batch)
     assert compiles.count == 1 and warm.plan["split"] == between[1]
 
 
