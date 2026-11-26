@@ -46,6 +46,7 @@ from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -227,6 +228,35 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
     for name, parameter in model.named_parameters():
         expected = parameter.grad.numpy()
         assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
+
+
+def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transformers(loaded, tokens):
+    """With `remat`, a step's backward recomputes each of the source's decoder layers from its inputs
+    (one `jax.checkpoint` a layer in the step's program), and its gradients are, bit for bit, the step's
+    without it; its record names its rung, and the ladder climbs no further."""
+    recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
+    assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
+    assert loaded.model.recompute_record() is None
+    assert loaded.model.restore_recompute(recomputed.model.recompute_record()) == recomputed.model
+    objective = LMObjective(recomputed, seq_len=SEQ, ema_decay=None)
+    params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
+
+    def loss(params):
+        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
+    program = jax.make_jaxpr(jax.grad(loss))(params)
+    (checkpoint,) = (eqn.primitive for eqn in jax.make_jaxpr(jax.checkpoint(lambda x: x))(1.0).eqns)
+    checkpoints = [eqn for eqn in equations(program) if eqn.primitive is checkpoint]
+    assert len(checkpoints) == TINY["num_hidden_layers"], len(checkpoints)
+    # Recomputing a layer evaluates its program again: the same gradients, bit for bit, as the step that
+    # keeps its residuals, whose gradients are transformers' (`test_the_gradients_are_transformers`).
+    plain = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+
+    def kept(params):
+        return objective_loss(plain, {**loaded.variables, "params": params}, tokens, scalar=True)
+    recomputed_gradients, kept_gradients = jax.jit(jax.grad(loss))(params), jax.jit(jax.grad(kept))(params)
+    for name, gradient in kept_gradients.items():
+        np.testing.assert_array_equal(np.asarray(recomputed_gradients[name]), np.asarray(gradient),
+                                      err_msg=name)
 
 
 @pytest.mark.mesh
@@ -1527,6 +1557,15 @@ LONGCAT_SEEDS = 8
 """Longcat's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
+def torch_arm(source, precision=contextlib.nullcontext):
+    """`source`'s float64 logits over drawn ids (`as_given`, `torch_logits`) run under `precision`: a
+    check-1 reference or truth arm of a torch model."""
+    def run(ids):
+        with precision():
+            return torch_logits(source, ids)
+    return as_given(run)
+
+
 def _longcat(tmp_path, config: dict, **load):
     """A tiny Longcat Flash of `config` loaded in tier 3 with `load`, its eager copy and its float64 twin,
     and its logits' arms: `ours(tokens)` from the loaded model, `theirs(source, precision)` from a source."""
@@ -1548,13 +1587,8 @@ def _longcat(tmp_path, config: dict, **load):
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(tokens):
-            with precision(), torch.no_grad():
-                return source(torch.from_numpy(tokens).long()).logits.double().numpy()
-        return as_given(run)
 
-    return model, reference, wide, ours, theirs
+    return model, reference, wide, ours, torch_arm
 
 
 def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_computes_them(tmp_path):
@@ -1571,7 +1605,7 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
     identity = routes[0] >= LONGCAT["n_routed_experts"]
     assert identity.any() and not identity.all()
     assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
-                    truth_fn=theirs(wide, float64))
+                    truth_fn=torch_arm(wide, float64))
 
 
 def a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path):
@@ -1653,7 +1687,8 @@ def test_identity_experts_alone_run_as_transformers_runs_them(tmp_path):
     _, reference, wide, ours, theirs = _longcat(
         tmp_path, {**LONGCAT, "n_routed_experts": 0, "zero_expert_num": 3}, fallback="torchax")
     assert_as_exact(ours, theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
-                    "identity-only longcat logits", seeds=IDENTITY_SEEDS, truth_fn=theirs(wide, float64))
+                    "identity-only longcat logits", seeds=IDENTITY_SEEDS,
+                    truth_fn=torch_arm(wide, float64))
 
 
 ERNIE = {**TINY, "num_key_value_heads": 2, "moe_num_experts": 4, "moe_k": 2, "moe_intermediate_size": 32,
@@ -1682,3 +1717,164 @@ def test_a_functional_rotary_computes_the_tables_its_source_rotary_computes(fami
         for theirs, ours in zip(expected, computed, strict=True):
             assert ours.dtype == theirs.dtype
             assert torch.equal(ours, theirs)
+
+
+MIXTRAL = {**TINY, "num_key_value_heads": 2, "num_local_experts": 4, "num_experts_per_tok": 2,
+           "intermediate_size": 32, "tie_word_embeddings": False}
+"""A tiny Mixtral, its routed experts dispatched through transformers' experts interface."""
+
+
+@attending("reference")
+def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_path):
+    """A Mixtral taken to tier 3, its routed experts asked of transformers' experts interface (`EXPERTS`):
+    Dew's grouped dispatch computes every layer's (`_dew_experts`, its ragged products), and its logits over
+    drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
+    torch.manual_seed(0)
+    model = transformers.MixtralForCausalLM(transformers.MixtralConfig(**MIXTRAL)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    assert isinstance(loaded, PretrainedFallback)
+    forward = jax.jit(loaded.model.apply)
+    tokens = token_draw(0x13044, MIXTRAL["vocab_size"], (2, 12))
+    # Each layer's experts Dew's grouped products over the rows sorted by expert (`_dew_experts`), which
+    # lower to ragged products where transformers' batched products are dense ones: as many a layer as one
+    # layer's own Mixtral holds.
+    def ragged(directory) -> int:
+        held = Pretrained.load(directory, dtype="float32", fallback="torchax")
+        program = jax.make_jaxpr(held.model.apply)(held.variables, *tokens(0))
+        return sum(eqn.primitive.name.startswith("ragged_dot") for eqn in equations(program))
+    single = transformers.MixtralConfig(**{**MIXTRAL, "num_hidden_layers": 1})
+    transformers.MixtralForCausalLM(single).save_pretrained(tmp_path / "one")
+    one = ragged(tmp_path / "one")
+    assert one > 0 and ragged(tmp_path) == MIXTRAL["num_hidden_layers"] * one
+
+    def built(dtype):
+        built = transformers.AutoModelForCausalLM.from_config(
+            model.config, dtype=dtype, attn_implementation="eager", experts_implementation="eager").eval()
+        built.load_state_dict(model.state_dict())
+        return built
+
+    with float64():
+        wide = built(torch.float64)
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_arm(built(torch.float32)), tokens, "interface experts logits", seeds=8,
+                    truth_fn=torch_arm(wide, float64))
+
+
+GEMMA3 = {**TINY, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 4,
+          "layer_types": ["sliding_attention", "full_attention"], "intermediate_size": 64}
+"""A tiny Gemma 3 text decoder of one sliding and one full layer, whose masks and rotary tables differ by
+layer."""
+
+
+@attending("reference")
+@pytest.mark.parametrize(("family", "order", "loop"), [
+    ("llama", (0, 0, 0, 1), Loop(steps=3, layers=(0, 1), step_norm=False)),
+    ("gemma3_text", (0, 1, 0, 1), Loop(steps=2, layers=(0, 2), step_norm=False)),
+], ids=["llama-one-layer", "gemma3-sliding-and-full"])
+def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_layers(tmp_path, family, order,
+                                                                                     loop):
+    """A source taken to tier 3 looping a block of its layers (`TorchCausalLM.loop`, no step norm): its logits
+    over drawn ids hold check 1 against transformers' own decoder of those layers repeated in `order`, each
+    the source's, its float64 twin the truth; each repeated layer reads its own masks and rotary tables (a
+    Gemma 3 block of a sliding and a full layer). A run's configuration sets the loop
+    (`DecoderRunConfig.looped`), the source's parameters its own; a count alone over no loop, a loop stating
+    an exit gate, and a release of the looped source (whose config records no loop) are refused."""
+    config = LLAMA if family == "llama" else GEMMA3
+    torch.manual_seed(0)
+    model = transformers.AutoModelForCausalLM.from_config(
+        transformers.AutoConfig.for_model(family, **config)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    assert isinstance(loaded, PretrainedFallback)
+    # A run's loop (`DecoderRunConfig.looped`): the source's own parameters, none drawn; a run's pass count
+    # restates it, and alone, over a source with no loop, is refused.
+    from dew.config import DecoderRunConfig
+
+    held = DecoderRunConfig(loop=dataclasses.replace(loop, steps=loop.steps + 1),
+                            passes=loop.steps).looped(loaded)
+    looped = held.model
+    assert looped.loop == loop and held.variables is loaded.variables and not held.fresh
+    with pytest.raises(ValueError):
+        DecoderRunConfig(passes=2).looped(loaded)
+    with pytest.raises(ValueError):
+        held.export()
+    draw = token_draw(0x13046, config["vocab_size"], (2, 12))
+    with pytest.raises(ValueError):
+        loaded.model.clone(loop=dataclasses.replace(loop, exit_gate=True)).apply(loaded.variables, *draw(0))
+    assert loaded.model.with_passes(loop.steps, loop.layers, exit_gate=True) is None
+    forward = jax.jit(looped.apply)
+    state = model.state_dict()
+
+    def repeated(dtype):
+        stated = {**config, "num_hidden_layers": len(order)}
+        if family != "llama":
+            stated["layer_types"] = [config["layer_types"][layer] for layer in order]
+        built = transformers.AutoModelForCausalLM.from_config(
+            transformers.AutoConfig.for_model(family, **stated)).to(dtype).eval()
+        weights = {name: value for name, value in state.items() if not name.startswith("model.layers.")}
+        for index, layer in enumerate(order):
+            prefix = f"model.layers.{layer}."
+            weights |= {f"model.layers.{index}.{name.removeprefix(prefix)}": value
+                        for name, value in state.items() if name.startswith(prefix)}
+        built.load_state_dict(weights)
+        built.set_attn_implementation("eager")
+        return built
+
+    with float64():
+        wide = repeated(torch.float64)
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_arm(repeated(torch.float32)), draw, f"looped tier 3 {family} logits", seeds=8,
+                    truth_fn=torch_arm(wide, float64))
+
+
+def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(tmp_path):
+    """An unregistered source on Dew's attention (`dew_attention`), whose cache opens unlooped, opens none
+    looped: its
+    block runs once a pass, a cache keeping one entry a layer. Its loop exits no pass but its last, so a
+    loss weighing each pass's exit is refused as it is built, where a native looped decoder's is taken."""
+    from test_pass_weights import looped as native_looped
+
+    from dew.objectives.lm import LMObjective
+
+    saved_cohere(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert isinstance(loaded, PretrainedFallback) and loaded.model.graph.dew_attention
+    loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1)))
+    with pytest.raises(Lacks):
+        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+    with pytest.raises(Lacks):
+        looped.apply(loaded.variables, np.zeros((2, 1), np.int32), decode=True, mutable=["cache"])
+    with pytest.raises(ValueError):
+        LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights="mean")
+    # Weights on the last pass alone are its own loss, which reads no earlier exit.
+    LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights=(0.0, 1.0))
+    LMObjective(native_looped(), 16, pass_weights="mean")
+
+
+def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
+    """A source whose layers draw (attention dropout, ATen's, which no public torch function names) refuses
+    recomputing them and refuses training unseeded, either way leaving torchax's key as it was; the same
+    model traces unrecomputed under a dropout key after it, drawing from that key."""
+    from dew.interop.torchax_fallback import _environment
+
+    dropping = transformers.LlamaConfig(**{**LLAMA, "attention_dropout": 0.5})
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(dropping).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    tokens = np.zeros((2, 8), np.int32)
+    env = _environment()
+    before = env.prng_key
+    recomputed = loaded.model.clone(remat=True)
+    for model, rngs in ((recomputed, {"dropout": jax.random.key(1)}), (loaded.model, {})):
+        with pytest.raises(ValueError):
+            jax.make_jaxpr(lambda v, model=model, rngs=rngs: model.apply(v, tokens, train=True, rngs=rngs))(
+                loaded.variables)
+        assert env.prng_key is before
+
+    def train(variables, key):
+        return loaded.model.apply(variables, tokens, train=True, rngs={"dropout": key})
+    first, second = (jax.jit(train)(loaded.variables, jax.random.key(seed)) for seed in (1, 2))
+    assert not np.array_equal(np.asarray(first), np.asarray(second))
