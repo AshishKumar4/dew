@@ -62,15 +62,16 @@ def pytest_sessionstart(session) -> None:
 
 
 def pytest_collection_finish(session) -> None:
-    """The tests after which this session ends, around each marked `FRESH` (the one before it and itself),
-    read once; and the first process of a row writes what its session selected (`SELECTED`), a later one
-    nothing."""
-    items = session.items
-    _session["fresh_after"] = {items[at + step].nodeid for at, item in enumerate(items)
-                               if item.get_closest_marker(FRESH) is not None
-                               for step in (-1, 0) if at + step >= 0}
+    """The first process of a row writes what its session selected (`SELECTED`); a later one, nothing."""
     if (selected := os.environ.get(SELECTED)) and not Path(selected).exists():
         Path(selected).write_text(json.dumps({"selected": [item.nodeid for item in session.items]}))
+
+
+def pytest_runtest_teardown(item, nextitem) -> None:
+    """Whether the session ends after `item` for a test marked `FRESH`: it, or the test pytest runs next
+    (`nextitem`, as the tests it runs stand, a resumed attempt's set aside already)."""
+    _session["fresh"] = any(each is not None and each.get_closest_marker(FRESH) is not None
+                            for each in (item, nextitem))
 
 
 def pytest_runtest_logfinish(nodeid: str, location) -> None:
@@ -79,7 +80,7 @@ def pytest_runtest_logfinish(nodeid: str, location) -> None:
     at, recycled, session = os.environ.get(RECYCLE_AT), os.environ.get(RECYCLED), _session.get("it")
     if not at or not recycled or session is None or not session.items or session.items[-1].nodeid == nodeid:
         return
-    fresh = nodeid in _session.get("fresh_after", ())
+    fresh = _session.pop("fresh", False)
     # Past the bound only what the allocator cannot return: a process recycled is a row run again by each train.
     if fresh or (resident() > int(at) and trimmed() > int(at)):
         Path(recycled).write_text(nodeid)
