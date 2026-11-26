@@ -817,11 +817,18 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
 
 
-def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[str, ...]:
-    """The compute dtypes the Flax modules `objective` trains state, theirs and their submodules' (their
-    `dtype` fields), each once, in order: a model computes in the dtype it was built with, a field of its
-    own no trainer sets."""
-    stated = (dtype for module in _trained_modules(objective) for dtype in _stated(module, "dtype")[0])
+def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[str, ...] | None:
+    """The compute dtypes the Flax modules `objective` trains state, theirs or, a wrapper's stating none, the
+    submodules' its fields hold (their `dtype` fields), each once, in order: a model computes in the dtype it
+    was built with, a field of its own no trainer sets. None where one takes a compute dtype and states none
+    (Flax's None), its compute inferred from its inputs and its parameters together (`jnp.result_type`),
+    which no reading of the module establishes."""
+    stated: list[DTypeLike] = []
+    for module in _trained_modules(objective):
+        dtypes, takes = _stated(module, "dtype")
+        if takes and not dtypes:
+            return None
+        stated += dtypes
     return tuple(dict.fromkeys(jnp.dtype(dtype).name for dtype in stated))
 
 
@@ -833,7 +840,7 @@ def _trained_modules[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
 def _stated(module: linen.Module, name: str) -> tuple[list[DTypeLike], bool]:
     """The dtype `module` states in its field `name` (`dtype`, `param_dtype`), else those the submodules its
     fields hold state, in order (a wrapper's, stating none of its own); and whether any of them has that
-    field at all (stating None, Flax's own: computed in its inputs' and parameters' dtypes)."""
+    field at all (stating None, Flax's own)."""
     fields = {field.name: getattr(module, field.name) for field in dataclasses.fields(module)
               if field.name != "parent"}
     if fields.get(name) is not None:
@@ -853,21 +860,16 @@ def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     """Whether a trainer under `numerics` scales its loss dynamically and the dtype it stores the parameters
     it draws fresh in (`TrainerAdvanced.numerics`): the one resolution of both, a run config's among them
     (`dew.config.RunConfig.trained_numerics`). A module `objective` trains is refused where it states another
-    compute dtype than `numerics`' (`stated_compute`), or takes one and states none, computing in its
-    parameters' (Flax's None) where they are not it: the trainer cannot set it, and the loss would be scaled
-    for a compute the model does not run."""
-    modules = _trained_modules(objective)
-    drawn = numerics.drawn_dtype([dtype for module in modules
+    compute dtype than `numerics`', or states none, inferring it (`stated_compute`): the trainer cannot set
+    it, and the loss would be scaled for a compute the model may not run."""
+    stated = stated_compute(objective)
+    compute = jnp.dtype(numerics.dtypes.compute).name
+    if stated is None or (other := [dtype for dtype in stated if dtype != compute]):
+        computes = "infers its compute dtype" if stated is None else f"computes in {' and '.join(other)}"
+        raise ValueError(f"the model {computes} and the run's numerics name {compute}: build it with "
+                         f"dtype={compute}, or name its dtype in the numerics (Dtypes.compute)")
+    drawn = numerics.drawn_dtype([dtype for module in _trained_modules(objective)
                                   for dtype in _stated(module, "param_dtype")[0]])
-    compute = jnp.dtype(numerics.dtypes.compute)
-    for module in modules:
-        stated, takes = _stated(module, "dtype")
-        computed = {jnp.dtype(dtype) for dtype in stated} or (
-            {jnp.dtype(numerics.dtypes.params)} if takes else set())
-        if other := sorted(dtype.name for dtype in computed if dtype != compute):
-            raise ValueError(f"{type(module).__name__} computes in {' and '.join(other)} and the run's "
-                             f"numerics in {compute.name}: build it with dtype={compute.name}, or name its "
-                             "dtype in the numerics (Dtypes.compute)")
     return numerics.scales_loss(), drawn
 
 

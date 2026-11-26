@@ -1676,13 +1676,16 @@ class RunConfig:
         ahead, so a config read alone reads none of it."""
         trainer = self.trainer
         checkpoints, tracker = resources.pop("checkpoints", None), resources.pop("tracker", None)
+        numerics = self.trained_numerics(objective)
+        scaled, drawn = (False, None) if numerics is not None else self.trained_knobs()
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, accumulation=trainer.accumulation,
             update_tokens=trainer.update_tokens, split=trainer.split, remat=trainer.remat,
             microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
             advanced=training.TrainerAdvanced(
                 layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
-                skip_nonfinite=trainer.skip_nonfinite, numerics=self.trained_numerics(objective),
+                skip_nonfinite=trainer.skip_nonfinite, numerics=numerics, dynamic_scale=scaled,
+                param_dtype=drawn,
                 tune_kernels=self.diagnostics.tune_kernels,
                 inspection=trainer.inspection, diloco=trainer.diloco,
                 **{"links": self.diagnostics.links, **resources}))
@@ -1693,18 +1696,32 @@ class RunConfig:
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
-    def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics:
+    def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics | None:
         """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
         precision, with the compute dtype its model computes in in place of its own, the one the model it is
         handed states (`stated_compute`, a model built in Python), else its record's (`compute_dtype`), and
-        the parameters' dtype its model's record states, which the model then draws them in itself."""
+        the parameters' dtype its model's record states, which the model then draws them in itself. None
+        where a module it trains infers its compute (Flax's None), which no trainer establishes: the run
+        then hands its trainer the loss scale and drawn dtype its record names (`trained_knobs`), as before
+        numerics reached the trainer, its programs traced under its numerics all the same (`traced`)."""
         from dew.training.transaction import stated_compute
 
+        computes = stated_compute(objective)
+        if computes is None:
+            return None
         precision = self.trainer.precision
-        stated, computes = self.model.fields.get("param_dtype"), stated_compute(objective)
+        stated = self.model.fields.get("param_dtype")
         params = precision.dtypes.params if stated is None else str(stated)
         return dataclasses.replace(precision, dtypes=dataclasses.replace(
             precision.dtypes, compute=computes[0] if computes else self.compute_dtype(), params=params))
+
+    def trained_knobs(self) -> tuple[bool, str | None]:
+        """The loss scale and drawn dtype a trainer takes for a run whose numerics it cannot hold
+        (`trained_numerics`): its numerics' loss scaling at its record's compute dtype (`compute_dtype`), and
+        its parameters' dtype where that is not Flax's float32 and its model's record states none."""
+        precision = self.trainer.precision
+        drawn = None if "param_dtype" in self.model.fields else precision.drawn_dtype()
+        return precision.scales_loss(self.compute_dtype()), drawn
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,

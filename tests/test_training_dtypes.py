@@ -450,17 +450,17 @@ def test_a_step_compiled_ahead_traces_under_its_trainers_numerics():
 
 
 def test_a_trainer_refuses_numerics_its_model_computes_outside_or_beside_their_own_knobs():
-    """Numerics whose compute dtype the model it trains states another of are refused, the model's dtype
-    being its own field, as numerics set beside the `param_dtype` and `dynamic_scale` they state are."""
+    """Numerics whose compute dtype the model it trains states another of, or states none of, are refused,
+    the model's dtype being its own field, as numerics set beside the `param_dtype` and `dynamic_scale` they
+    state are."""
     numerics = Numerics(DTYPE_PRESETS["16-mixed"])
     read = numerics_reader([])
-    # Stating float32, or none (Flax's None, computing in its float32 parameters).
-    for dtype in (jnp.float32, None):
+    # Stating float32; or none (Flax's None), inferring it from its inputs and parameters, under numerics
+    # whose compute its float32 parameters' matches too.
+    full = Numerics(DTYPE_PRESETS["32-true"])
+    for dtype, stated in ((jnp.float32, numerics), (None, numerics), (None, full)):
         with pytest.raises(ValueError):
-            Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
-    # Stating none where its parameters are the numerics' compute dtype computes in it.
-    assert not Trainer(Fitted(read(None)), optax.sgd(.1),
-                       advanced=TrainerAdvanced(numerics=Numerics(DTYPE_PRESETS["32-true"]))).dynamic_scale
+            Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=stated))
     for knobs in ({"param_dtype": "bfloat16"}, {"dynamic_scale": True}):
         with pytest.raises(ValueError):
             Trainer(Fitted(read(jnp.float16)), optax.sgd(.1),
