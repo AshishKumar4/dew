@@ -1253,20 +1253,9 @@ BLOCKWISE_ROW = 'ledger 4518'
 class ScaledCase:
     """A scaled product as its selector reads it (`BLOCKWISE_FP8`, `MXFP8`, `NVFP4_BLOCK_OP`): the tile the
     template's launch plans for it on the target (`mosaic_gpu.gmm`'s `step_scales` or `mx_scales`), None
-    where it plans none; and whether a receipt timed the template ahead of XLA's arm for its kind on the
-    target's generation (`measured`, `BLOCKWISE_FORWARD_MEASURED`)."""
+    where it plans none."""
 
     tile: tiling.Tiles | None
-    measured: bool = False
-
-
-BLOCKWISE_FORWARD_MEASURED = frozenset({'sm90'})
-"""GPU generations whose blockwise FP8 forward the template takes by receipt (row 4518): M-NS-13 (H100, the
-DeepSeek-V3 MoE gate, up and down at 8192 and 32768 tokens, Qwen3-30B-A3B's gate) timed it 47-127x faster
-than XLA's arm of the same arithmetic (`xla_products.step_scaled`, a ragged dot a 128-deep block), the
-template the one implementation of the scaled blocks' product Dew has there; its native check 1 holds on a
-GH200 (row 5415, tests/test_gpu_gemm.py's blockwise cells). M-NS-13's 1.24-1.42x was against the unscaled
-exact FP8 product, other arithmetic. Its kernel gradient has no receipt and keeps XLA's arm."""
 
 
 BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
@@ -1276,15 +1265,13 @@ BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWI
             "FP8 product on warpgroup MMA, its matrix K-major, a step 128 deep, its column scales each a "
             "column's or a multiple of its tile's columns", BLOCKWISE_ROW),
         selection.Requirement(
-            'measured', lambda case: case.measured, "no receipt has the step-scaled template beat the scaled "
-            "blocks' product in XLA for this kind on this generation (`BLOCKWISE_FORWARD_MEASURED`)",
-            BLOCKWISE_ROW, kind='measured'))),
+            'measured', lambda case: False, "no receipt yet has the step-scaled template beat the scaled "
+            "blocks' product in XLA", BLOCKWISE_ROW, kind='measured'))),
     selection.Kernel('xla', (), generic=True)))
 """A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the template's exactly summed walk,
 each step's partial scaled before its add (`mosaic_gpu.gmm`'s `step_scales`), where named
-(`generation.chosen(blockwise_fp8='mosaic')`) and planned, and by default where a receipt has it beat XLA's
-arm for the kind on the generation (`BLOCKWISE_FORWARD_MEASURED`); else the scaled blocks summed in XLA
-(`xla_products.step_scaled`)."""
+(`generation.chosen(blockwise_fp8='mosaic')`) and planned, past the measured requirement no receipt has
+met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
@@ -1366,8 +1353,7 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
         return _finished(portable(lhs, kernel, sizes, row_scales, column_scales), sides, epilogue, dtypes,
                          out_forms)
 
-    measured = generation.gpu_target().generation in BLOCKWISE_FORWARD_MEASURED
-    if selection.select(BLOCKWISE_FP8, ScaledCase(tile, measured)).kernel == 'mosaic':
+    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
                                        row_scales, column_scales, *sides)
