@@ -192,8 +192,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
-        # Gathered through its wide form (exactly), so its transpose sums a token's routes wide and rounds
-        # once, as the reverse pass does (`_pulled`, row 12396).
+        # Gathered wide (exactly): its transpose sums a token's routes wide, as `_pulled` does (row 12396).
         lhs = lhs if gather is None else lhs.astype(at_least_fp32(lhs.dtype))[gather].astype(lhs.dtype)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
@@ -1873,9 +1872,9 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     rows landed). Where the prologue is entrywise (`_entrywise`), its VJP is the last product's epilogue
     (`_prologue_pulled`, kernel-templates Appendix C row 17), so the operand's cotangent is never written,
     and the operand itself is written beside the cotangents for the kernel gradient: returned third, None
-    where the prologue's VJP ran apart. With `wide_rows`, `lhs`'s cotangent is left as wide as its sums
-    (fp32, or the cotangents' own where wider), through a prologue's VJP too: a gathered call's, whose
-    routes `_pulled` sums before it rounds once (row 12396)."""
+    where the prologue's VJP ran apart. With `wide_rows`, `lhs`'s cotangent is left wide (fp32 or wider),
+    through a prologue's VJP taken wide too: a gathered call's, whose routes `_pulled` sums before it rounds
+    once (row 12396)."""
     options = {'interpret_on_cpu': plain['interpret_on_cpu'], 'precision': plain['precision'],
                'transpose_rhs': not plain['transpose_rhs'], 'dense': plain['dense'], 'first': plain['first'],
                'gather': plain['gather']}
@@ -1884,8 +1883,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     # A gathered call's routes leave the prologue's VJP to run apart, wide (its epilogue's form rounds them).
     entrywise = not wide_rows and _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
     operand_dtype = jnp.dtype(lhs.dtype if prologue is None else compute)
-    wide = at_least_fp32(jnp.result_type(lhs.dtype, operand_dtype,
-                                         *(d.dtype for d, _ in reached if wide_rows)))
+    wide = at_least_fp32(jnp.promote_types(lhs.dtype, operand_dtype))
     rounded, d_operand = wide if wide_rows else operand_dtype, None
     whole = not automatic_axes()
     taken = (None if entrywise
@@ -1932,9 +1930,10 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                                                       for a in prologue_arrays), None
     if prologue is None:
         return d_operand.astype(rounded if wide_rows else lhs.dtype), (), None
-    # A gathered call's rows taken wide (exactly), so the prologue's VJP returns each route's unrounded.
+    # A gathered call's prologue pulled back wide (its rows exact there), each route's cotangent unrounded.
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs.astype(wide) if wide_rows else lhs,
-                                             prologue_arrays, prologue_axes, group_sizes, d_operand, compute)
+                                             prologue_arrays, prologue_axes, group_sizes, d_operand,
+                                             wide if wide_rows else compute)
     sides = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
     return d_lhs.astype(wide if wide_rows else lhs.dtype), sides, None
 

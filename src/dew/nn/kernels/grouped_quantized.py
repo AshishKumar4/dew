@@ -8,7 +8,7 @@ step at a time
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +20,10 @@ from .grouped_matmul import MosaicGmm, MosaicTgmm, _beside, _stored_dtypes
 from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import NVFP4, SCALE_DEPTH
+
+if TYPE_CHECKING:
+    from .templates import mosaic
+    from .templates.gemm import mosaic_gpu
 
 
 class _PackedMatrix(Protocol):

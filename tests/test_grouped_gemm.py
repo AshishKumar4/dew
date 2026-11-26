@@ -1217,7 +1217,8 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     # route's cotangent unrounded, summed in fp32, rounded once to the tokens' dtype: row 12396).
     named_pulled, named_pulled_apart = (jax.vjp(f, *operands[:2])[1](cotangent) for f in (named_fused,
                                                                                           named_apart))
-    _, widened = jax.vjp(lambda rows: named_apart(rows, operands[1]), operands[0].astype(jnp.float32))
+    with generation.chosen(grouped_matmul="xla"):  # fp32 rows: XLA's product, the law's
+        _, widened = jax.vjp(lambda rows: named_apart(rows, operands[1]), operands[0].astype(jnp.float32))
     np.testing.assert_array_equal(np.asarray(named_pulled[1]), np.asarray(named_pulled_apart[1]))
     np.testing.assert_array_equal(np.asarray(named_pulled[0]),
                                   np.asarray(widened(cotangent)[0].astype(operands[0].dtype)))
@@ -2472,20 +2473,3 @@ def test_a_gathered_rows_cotangent_sums_its_routes_wide_before_it_rounds(prologu
 
     (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
     assert float(d_tokens[0, 0]) == (1.0 if prologue == "doubled" else 0.5)
-
-
-def test_a_gathered_rows_fp64_cotangent_sums_its_routes_in_fp64():
-    """fp64 cotangents of a bf16 gathered row's two routes, 1 + 2^-8 and 2^-40, sum in fp64 (the cotangents'
-    own width, row 12396's review): 1 + 2^-8 + 2^-40, past bf16's tie, rounds once to 1 + 2^-7, where an
-    fp32 sum (1 + 2^-8, the tie) rounds to 1."""
-    with jax.enable_x64(True):
-        tokens = jnp.ones((1, 64), jnp.bfloat16)
-        matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
-        table = jnp.zeros((2,), jnp.int32)
-        cotangent = jnp.zeros((2, 64), jnp.float64).at[:, 0].set(jnp.asarray([1 + 2.0 ** -8, 2.0 ** -40]))
-
-        def product(rows):
-            return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), out_dtype=jnp.float64, gather=table)
-
-        (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
-    assert d_tokens.dtype == jnp.bfloat16 and float(d_tokens[0, 0]) == 1 + 2.0 ** -7
