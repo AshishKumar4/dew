@@ -6,13 +6,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import allocating
 from test_frozen_tree import adapted
-from test_plan import free_until_placed
 
 from dew.training import MeshSpec, Trainer
 
-ROWS = 64
+ROWS = 8
 TEXT = np.random.default_rng(0).integers(0, 256, (ROWS, 9))
+LIMIT = 1 << 40
 
 
 @pytest.mark.gpu(reason="a compile's memory limit applies on a GPU alone (`memory.compile_limit`)")
@@ -32,7 +33,8 @@ def test_a_lora_start_keeping_its_base_compiles_in_the_room_its_admission_reads(
     def first_probe(room: int):
         # Each fit's rung its own (`DEW_RUNG_RECORDS`): the second starts where the first did.
         monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / str(room)))
-        free_until_placed(monkeypatch, room)
+        # A BFC pool's reading, the whole limit its pool, `room` of it free before the run places anything.
+        allocating(monkeypatch, LIMIT, LIMIT, LIMIT - room)
         # Loaded once the devices read room: the base is in use beside the start, as a loaded run's is.
         trainer = Trainer(adapted(placed=True), optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(),
                           split=1)
