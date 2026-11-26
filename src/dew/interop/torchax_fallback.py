@@ -1324,10 +1324,8 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jax
                 outputs = jax.checkpoint(functools.partial(_evaluated, evaluate, inner))(*inputs)
             elif inner is not None:
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
-            elif equation.primitive is jax.lax.scan_p:
-                outputs = _accumulated_scan(evaluate, equation, inputs)
-            elif equation.primitive is jax.lax.cond_p:
-                outputs = _accumulated_switch(evaluate, equation, inputs)
+            elif equation.primitive in (jax.lax.scan_p, jax.lax.cond_p):
+                outputs = _accumulated_inside(evaluate, equation, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),
                                             tuple(equation.params["broadcast_dimensions"]))]
@@ -1350,29 +1348,22 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jax
     return evaluate(closed.jaxpr, closed.consts, arguments)
 
 
-def _accumulated_scan(evaluate, equation, inputs: list) -> list[jax.Array]:
-    """A scan `equation` over `inputs`, its body evaluated by `evaluate` (`_accumulating`'s) step by step
-    under `lax.scan` as its parameters state it: its constants, its carry and its scanned inputs."""
-    params = equation.params
-    body, constants, carried = params["jaxpr"], params["num_consts"], params["num_carry"]
-    consts, carry = inputs[:constants], inputs[constants:constants + carried]
-    scanned = inputs[constants + carried:]
+def _accumulated_inside(evaluate, equation, inputs: list) -> list[jax.Array]:
+    """A scan's or a switch's `equation` (`scan_p`, `cond_p`) over `inputs`, bound as it is but for its
+    body or branches, each the program `evaluate` (`_accumulating`'s) makes of it: one traced over the
+    same inputs, so the equation's other parameters hold."""
+    def remade(closed):
+        return jax.make_jaxpr(lambda *values: evaluate(closed.jaxpr, closed.consts, list(values)))(
+            *closed.in_avals)
 
-    def step(carry, row):
-        outputs = evaluate(body.jaxpr, body.consts, [*consts, *carry, *row])
-        return outputs[:carried], outputs[carried:]
-
-    carry, stacked = jax.lax.scan(step, list(carry), list(scanned), length=params["length"],
-                                  reverse=params["reverse"], unroll=params["unroll"])
-    return [*carry, *stacked]
-
-
-def _accumulated_switch(evaluate, equation, inputs: list) -> list[jax.Array]:
-    """A switch (`cond_p`) `equation` over `inputs`, its index first, each branch evaluated by `evaluate`
-    (`_accumulating`'s) under `lax.switch`."""
-    branches = [functools.partial(lambda branch, *operands: evaluate(branch.jaxpr, branch.consts, operands),
-                                  branch) for branch in equation.params["branches"]]
-    return jax.lax.switch(inputs[0], branches, *inputs[1:])
+    params = dict(equation.params)
+    if equation.primitive is jax.lax.scan_p:
+        params["jaxpr"] = remade(params["jaxpr"])
+    else:
+        params["branches"] = tuple(remade(branch) for branch in params["branches"])
+    with equation.ctx.manager:
+        outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
+    return outputs if equation.primitive.multiple_results else [outputs]
 
 
 def _evaluated(evaluate, inner: Jaxpr, *inputs: jax.Array) -> list[jax.Array]:
