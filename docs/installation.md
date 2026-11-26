@@ -101,13 +101,13 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post131,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post132,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
 
 <!-- BEGIN Dew's JAX builds (site/scripts/gen_install.py) -->
-Dew's CUDA and PJRT plugins are post131's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post131's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post131`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
+Dew's CUDA and PJRT plugins are post132's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post132's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post132`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
 <!-- END Dew's JAX builds -->
 
 Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package comes from PyPI. The fixes:
@@ -192,6 +192,7 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - The Pallas lowering cache encodes each abstract value and dtype a kernel's key interns once per key, where a kernel of many operands encoded each again for every use.
 - A Pallas Mosaic GPU lowering cache hit makes its kernel's custom call from what its entry holds of it (its serialized bytecode, its kernel hash, its resource estimate), with no serde pass, bytecode or hash of its own: about 0.2 s a kernel a cached step saved (post130).
 - An XLA CUDA executor loads the kernels its graphs' conditionals and barriers launch as it makes its first command buffer, so recording a graph loads no module: in one process driving two GPUs, a graph recorded on one while the other's graph waited inside a collective compiled that PTX under the CUDA driver's lock, and both waited for ever.
+- XLA instantiates a command buffer's CUDA graph only at thunk initialization, never as it executes: a buffer holding a custom call or a collective recorded and instantiated its graph after its first execution, inside a later one, while a peer GPU's collective could wait on it.
 - `emit_pipeline`'s prefetch runs once a step, never for a slot no copy filled: past the last step and for a dynamic grid of no steps it read a slot no copy had written.
 - Mosaic GPU's layout inference splits a kernel's independent groups in time linear in their number: a padded merge's inference took 193 s of its compile, now 18 s.
 - A serialized executable's output types unpickle with JAX's own `AutoLayout`, so a loaded executable's outputs trace as a fresh run's do: a nested `jit` fed them traced twice and a step compiled ahead recompiled on the GPU.

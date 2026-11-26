@@ -26,6 +26,8 @@ class _Hold(NamedTuple):
     name: str
     applied: Callable[[Any, Any], jax.Array]
     taken: Callable[[Any, Any], jax.Array]
+    holding: Callable[[Any], jax.Array]
+    """Whether the wrapper's state holds an input it took but has applied no update of yet."""
 
 
 @functools.cache
@@ -40,9 +42,9 @@ def _holds() -> Mapping[type, _Hold]:
         optax.MultiStepsState: _Hold(
             "optax.MultiSteps", lambda before, after: after.gradient_step != before.gradient_step,
             lambda before, after: (after.gradient_step != before.gradient_step)
-            | (after.mini_step != before.mini_step)),
+            | (after.mini_step != before.mini_step), lambda state: state.mini_step != 0),
         every: _Hold("optax.apply_every", lambda before, after: after.count == 0,
-                     lambda before, after: jnp.asarray(a=True)),
+                     lambda before, after: jnp.asarray(a=True), lambda state: state.count != 0),
     }
 
 
@@ -104,6 +106,16 @@ def input_taken(before: optax.OptState, after: optax.OptState) -> jax.Array:
     for previous, current in zip(_outermost(before), _outermost(after), strict=True):
         taken = taken & table[type(current)].taken(previous, current)
     return taken
+
+
+def input_held(opt_state: optax.OptState) -> jax.Array:
+    """Whether the optimizer whose state is `opt_state` holds an input it took but has applied no update of
+    yet: an `optax.MultiSteps` window part filled; false where none holds updates back."""
+    table = _holds()
+    held = jnp.asarray(a=False)
+    for state in _outermost(opt_state):
+        held = held | table[type(state)].holding(state)
+    return held
 
 
 class PhasedState(NamedTuple):

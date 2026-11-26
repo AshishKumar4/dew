@@ -4,6 +4,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import FEWEST_SEEDS, assert_as_exact
 
 from dew.nn.attention import reference_attention
@@ -75,3 +76,26 @@ def test_a_walk_beside_a_sink_of_minus_infinity_whose_every_key_is_masked_weighs
     out = reference_attention(query, key, value, mask=mask, mask_fill=-jnp.inf,
                               sinks=jnp.full((1,), -jnp.inf), logit_floor=-jnp.inf)
     np.testing.assert_array_equal(np.asarray(out), np.zeros_like(out))
+
+
+@pytest.mark.parametrize("rows", [(1, 1, 1), (1, 2, 2), (1, 1, 2)],
+                         ids=["one", "keys-broadcast", "values-broadcast"])
+def test_a_grouped_query_walk_shares_its_keys_and_holds_on_par(rows):
+    """A grouped-query walk (four query heads over two key heads) whose skipped tiles every head shares
+    takes its keys and values whole, grouped by key head, NaN keys skipped as ever, and holds on par
+    (check 1) with the call over the visited keys alone, its query's, keys' and values' rows broadcast
+    against each other too (row 12848's review: its keys repeated a query head each)."""
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (rows[0], 4, 4, 8), jnp.float32),
+                *(jax.random.normal(stream, (count, 4, 2, 8), jnp.float32)
+                  for stream, count in zip(streams[1:], rows[1:], strict=True)))
+
+    def walked(query, key, value):
+        poisoned = (array.at[:, 2:].set(jnp.nan) for array in (key, value))
+        return reference_attention(query, *poisoned, skipped=SKIPPED)
+
+    def visited(query, key, value):
+        return reference_attention(query, key[:, :2], value[:, :2])
+
+    assert_as_exact(walked, visited, draw, "a grouped-query walk", seeds=FEWEST_SEEDS)

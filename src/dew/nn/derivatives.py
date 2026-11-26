@@ -24,6 +24,7 @@ Each lane moves its sites onto them (rows 4026 to 4030); then the slop check ref
 from __future__ import annotations
 
 import collections
+import contextvars
 import dataclasses
 import functools
 import inspect
@@ -570,7 +571,7 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
     from dew.nn.kernels import options
     from dew.nn.kernels.templates import report
 
-    if report.launch_tracing():
+    if report.launch_tracing() or any(variable.get() is not None for variable in _UNHELD_WHILE):
         # Within a launch's trace (a Mosaic kernel's body): the launch's own, which its held trace holds
         # (`tuning.lowered_once`); keyed here, its pending launch would miss at every launch and pin its
         # frames (row 11002's review, F4). Asked without the launch's digest, whose identity traces the
@@ -583,6 +584,20 @@ def _span_key(kind: Kind, function: Callable, structure, flat: Sequence) -> Hash
         return None
     return (kind, structure, statement, tuple(jax.typeof(leaf) for leaf in flat), options.held_context(),
             tuple(sorted(np.geterr().items())))
+
+
+_UNHELD_WHILE: list[contextvars.ContextVar] = []
+"""The contexts within which no marked span is held (`unheld_while`)."""
+
+
+def unheld_while(variable: contextvars.ContextVar) -> contextvars.ContextVar:
+    """`variable`, a context a trace reads that no trace's key states (`dew._cache.untraced`), registered so
+    that no marked span traced while it holds a value is held or taken from `_SPANS` (`_span_key`): a span
+    held there would carry what the context made it trace into every later trace of the same key, the
+    context set or not, a span enclosing one that reads it among them, whose key states only its own kind
+    (`dew.nn.in_backward`'s plan and gates, row 12980's review)."""
+    _UNHELD_WHILE.append(variable)
+    return variable
 
 
 def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[..., Result]:
@@ -647,3 +662,10 @@ formed_together = contracted("test_a_module_reading_its_parameters_formed_togeth
 primal. What reads them computes in any way of its own; the layer below, reading `value`'s cotangent, waits
 on the parameters' (row 11713: a loop pass's bank cotangent summed over the layers above in one
 accumulator, `decoder_stack._scanned_runs`)."""
+
+
+def formed_together_at(operands: tuple, parameters: Collection[int]) -> tuple:
+    """`operands`, those at `parameters` its parameters', through `formed_together`: the rest's cotangents
+    leave only with the parameters' formed, every operand back at its position (`_apart`, `_together`)."""
+    inputs, held = formed_together(*_apart(operands, parameters))
+    return _together(inputs, held, parameters)

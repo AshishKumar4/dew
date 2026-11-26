@@ -457,12 +457,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def lhs(self):
         return plgpu.Layout.MMA_LHS(self.dtype, m_warps=self.m_warps)
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def hook_columns(self, columns: int) -> int:
+        # Its accumulator in registers: a hook takes `HOOK_COLUMNS` of it at a time (`WgmmaIssuer`'s).
+        return min(columns, mosaic.HOOK_COLUMNS)
+
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
         # The accumulators in their own layout, stated: an epilogue's broadcast of a side vector across one
         # takes the accumulator's layout as its result's (`side_tile`'s vectors its reductions), where left to
         # inference it took the vector's ("Tiling rank different than broadcast result rank, (16,) vs
         # (64, 128)", a scaled forward on sm80, EM-hooks6).
-        yield 0, tuple(plgpu.layout_cast(acc, self.layout) for acc in accumulators)
+        yield from super().chunks(tuple(plgpu.layout_cast(acc, self.layout) for acc in accumulators), columns)
 
     def side_tile(self, ref, held_axes: tuple):
         # In the accumulator's layout, or the accumulator's vector layout of
@@ -554,10 +558,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # store, `rows_whole`, it does).
         return not self.rows_whole and not launches.interpreting()
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
-        if pending:
-            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
         out = self.products(self.zeros(shape), lhs, rhs)
         return between(), out
 
@@ -908,7 +910,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         staging = self.output_staging(outputs, consumers, chunks)
         opened: list = []
 
-        def store(output, value, ref, place):
+        def store(output, value, ref, place, within=None):
+            del within  # each tile staged whole (`stores_chunks` off): a hook reads it out whole
             # A narrowed output (`stores.Output.narrowed`) is staged whole at its stored shape, its `place`
             # its own columns (its caller's), as a chunk-staging family's stores take it (`stores.staged`).
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
@@ -1027,19 +1030,15 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             specs = _specs(streams.pipeline,
                            {name: functools.partial(_at, streams.views[name][1], placed) for name in names})
 
-            def walked(carry, body=body, specs=specs, trips=trips):
-                # Two consumers run one pipeline, each copying its share of every block (`thread_axis`).
-                return plgpu.emit_pipeline(
-                    body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
-                    init_carry=carry, prefetch=prefetched_of if prefetching else None,
-                    thread_axis=None if streams.pipeline.consumers == 1 else "wg",
-                )(*(streams.views[name][0] for name in names))
-
-            # A pipeline that prefetches reads its first step's fragments as it starts, filled or not: a
-            # segment whose trips are known only as it runs (a common segment's) runs its pipeline only
-            # where it has any, every consumer alike, so an empty one reads no slot no copy filled.
-            carry = (walked(carry) if not prefetching or isinstance(trips, int)
-                     else lax.cond(trips > 0, walked, lambda carry: carry, carry))
+            # Two consumers run one pipeline, each copying its share of every block (`thread_axis`). A
+            # pipeline that prefetches reads a step's fragments only once a copy filled its slot (Dew's fork
+            # at post131, row 12695), so a segment whose trips are known only as it runs (a common
+            # segment's) runs its pipeline whatever their count: an empty one prefetches nothing.
+            carry = plgpu.emit_pipeline(
+                body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
+                init_carry=carry, prefetch=prefetched_of if prefetching else None,
+                thread_axis=None if streams.pipeline.consumers == 1 else "wg",
+            )(*(streams.views[name][0] for name in names))
         return carry
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:

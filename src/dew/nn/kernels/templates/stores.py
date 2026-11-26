@@ -14,7 +14,7 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import swizzling
+from dew.nn.kernels.templates import copies, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,18 +40,6 @@ OUTPUT_BUFFERS = 2
 """The chunk buffers a consumer stages an output tile through: one written while the last one's store
 reads it."""
 
-TMA_STORE_BYTES = 16
-"""The bytes a TMA store's row is a whole number of: a tensor map's box takes an inner dimension of a
-multiple of 16 bytes (CUDA's `cuTensorMapEncodeTiled`: `boxDim[0]` times the element's size), so a staged
-chunk stores rows of whole 16-byte units in each output's dtype (8 bf16 columns, 4 fp32)."""
-
-TMA_BOX_ELEMENTS = 256
-"""The most elements a tensor map's box takes along a dimension (`cuTensorMapEncodeTiled`'s `boxDim`): a
-packed chunk's buffer is at most this many of its dtype's along each axis."""
-
-TMA_SMEM_ALIGNMENT = 128
-"""The bytes a tensor copy's shared-memory address is aligned to (CUDA's asynchronous copies, Table 26): a
-packed chunk's buffer is a whole number of them, so each of a stack of them starts aligned."""
 
 
 class Output(NamedTuple):
@@ -106,9 +94,9 @@ def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES,
 def _packed_refusal(chunk: int, packed: tuple[Output, ...]) -> str | None:
     """Why a chunk of `chunk` tile columns stores no whole rows of each of `packed`'s outputs, None where
     it does: each one's divisor dividing the chunk; its buffer (`[rows, chunk // divisor]`, a transposed
-    one's `[chunk // divisor, rows]`, `Output.transposed`) at most `TMA_BOX_ELEMENTS` along each axis, its
-    stored row (the inner axis) whole `TMA_STORE_BYTES`-byte units by its dtype's bits (a packed fp4's half
-    byte), and the buffer whole `TMA_SMEM_ALIGNMENT`-byte units, so each buffer of their stack starts
+    one's `[chunk // divisor, rows]`, `Output.transposed`) at most `copies.BOX_ELEMENTS` along each axis, its
+    stored row (the inner axis) whole `copies.ROW_BYTES`-byte units by its dtype's bits (a packed fp4's half
+    byte), and the buffer whole `copies.SHARED_ALIGNMENT`-byte units, so each buffer of their stack starts
     aligned for its tensor copy."""
     for output in packed:
         name, bits = jnp.dtype(output.dtype).name, jax.dtypes.itemsize_bits(output.dtype)
@@ -117,15 +105,15 @@ def _packed_refusal(chunk: int, packed: tuple[Output, ...]) -> str | None:
             return f"a chunk of {chunk} columns holds no whole {output.divisor}-column blocks"
         stored = chunk // output.divisor
         outer, inner = (stored, rows) if output.transposed else (rows, stored)
-        if inner * bits % (8 * TMA_STORE_BYTES):
+        if not copies.whole_rows(inner, output.dtype):
             return (f"a chunk of {chunk} columns stored {output.divisor} a column in {name} is no whole "
-                    f"{TMA_STORE_BYTES}-byte TMA rows")
-        if max(outer, inner) > TMA_BOX_ELEMENTS:
+                    f"{copies.ROW_BYTES}-byte TMA rows")
+        if max(outer, inner) > copies.BOX_ELEMENTS:
             return (f"a chunk of {chunk} columns stages a {outer} x {inner} {name} buffer, past a tensor "
-                    f"map's {TMA_BOX_ELEMENTS} a dimension")
-        if outer * inner * bits % (8 * TMA_SMEM_ALIGNMENT):
+                    f"map's {copies.BOX_ELEMENTS} a dimension")
+        if outer * inner * bits % (8 * copies.SHARED_ALIGNMENT):
             return (f"a chunk of {chunk} columns stages a {outer} x {inner} {name} buffer of no whole "
-                    f"{TMA_SMEM_ALIGNMENT} bytes, so its stack's next starts unaligned")
+                    f"{copies.SHARED_ALIGNMENT} bytes, so its stack's next starts unaligned")
     return None
 
 
@@ -153,7 +141,7 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     candidate asks of a pin before it takes it (a GEMM's tile's). A chunk divides the tile and the `piece`
     its issuer emits at once (`Issuer.chunk_columns`, the tile's width where none is given): a tcgen05 tile
     of 128 columns emits pieces of 64, which a 128-column chunk does not hold. A stated chunk stores whole
-    TMA rows in each of `dtypes` (`TMA_STORE_BYTES`), by each dtype's bits (a packed fp4's half byte): a bf16
+    TMA rows in each of `dtypes` (`copies.ROW_BYTES`), by each dtype's bits (a packed fp4's half byte): a bf16
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
     to. Outputs stored packed (`packed`, whose dtypes `dtypes` are) are refused where a chunk, stated or
     derived, stores no whole rows of them (`_packed_refusal`): a 128-column tile's NVFP4 scales."""
@@ -162,11 +150,9 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
         return (f"a {columns}-column output tile emitted {piece or columns} columns at once stages in no "
                 f"{buffers} buffers of {chunk} columns")
-    row_bits = 8 * TMA_STORE_BYTES
-    partial = [jnp.dtype(dtype).name for dtype in dtypes
-               if chunk * jax.dtypes.itemsize_bits(dtype) % row_bits]
+    partial = [jnp.dtype(dtype).name for dtype in dtypes if not copies.whole_rows(chunk, dtype)]
     if staging is not None and not packed and partial:
-        return (f"a stated chunk of {chunk} columns stores no whole {TMA_STORE_BYTES}-byte TMA rows in "
+        return (f"a stated chunk of {chunk} columns stores no whole {copies.ROW_BYTES}-byte TMA rows in "
                 f"{', '.join(partial)}")
     return _packed_refusal(chunk, packed)
 
@@ -224,7 +210,7 @@ def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
 
 def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
                   waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
-                  narrowed: bool = False) -> None:
+                  narrowed: bool = False, within: tuple[int, int] | None = None) -> None:
     """A consumer's share `value` of an output tile staged through its chunk buffers (`smem`, `[buffers,
     rows, columns]`) a buffer's columns at a time (`column_chunks`) and stored to `ref` at `place`
     (`(row_start, first, stored, column, *ladder)`, `staged_rows`), each chunk's buffer written once the
@@ -234,14 +220,18 @@ def staged_chunks(smem, value: jax.Array, ref, place: tuple, *, write: Callable 
     every chunk staged commits at least one (`buffer_waits`). An output stored packed (`divisor`,
     `Output.divisor`) stages a buffer's columns times it of the tile a chunk, stored at its tile column over
     it; `transposed` (`Output.transposed`), its buffer `[columns, rows]`, stored whole (`transposed_rows`);
-    `narrowed` (`Output.narrowed`), its value and `place` already its stored columns, a buffer's at a time."""
+    `narrowed` (`Output.narrowed`), its value and `place` already its stored columns, a buffer's at a time.
+    `within` (the value's first column in its tile and the tile's columns, where an epilogue reads its tile
+    out a part at a time, `hooks.ReadOut.columns`): its chunks the tile's from that column on, each in its
+    turn's buffer, waiting as the tile's whole sequence of chunks does."""
     pl.when(place[2] > 0)(functools.partial(staged, smem, value, ref, place, write=write, waits=waits,
-                                            divisor=divisor, transposed=transposed, narrowed=narrowed))
+                                            divisor=divisor, transposed=transposed, narrowed=narrowed,
+                                            within=within))
 
 
 def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = written,
            waits: tuple[int, ...] | None = None, divisor: int = 1, transposed: bool = False,
-           narrowed: bool = False) -> None:
+           narrowed: bool = False, within: tuple[int, int] | None = None) -> None:
     """`staged_chunks`' chunks staged whatever rows `place` stores: each its buffer's wait, its write and
     its stores."""
     buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
@@ -262,14 +252,18 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     # A narrowed value and its place are its stored columns already (its caller's: a tile's column over the
     # divisor is no multiple of the stores' tiling the lowering can prove); a packed one's its tile's.
     chunks = column_chunks(value, width if narrowed else width * divisor)
-    waits = buffer_waits(len(chunks), buffers) if waits is None else waits
+    # A part of its tile (`within`): its chunks the tile's from its first column's on, in that turn.
+    offset, total = (0, len(chunks)) if within is None else (
+        within[0] // (width * divisor), -(-within[1] // (width * divisor)))
+    waits = buffer_waits(total, buffers)[offset:] if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
         plgpu.wait_smem_to_gmem(waits[chunk], wait_read_only=True)
         at = column + start if narrowed else (column + start) // divisor
+        buffer = smem.at[(offset + chunk) % buffers]
         if transposed:
-            transposed_rows(smem.at[chunk % buffers], piece, ref, row_start, at, write=write)
+            transposed_rows(buffer, piece, ref, row_start, at, write=write)
             continue
-        staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored, at, *ladder, write=write)
+        staged_rows(buffer, piece, ref, row_start, first, stored, at, *ladder, write=write)
 
 
 def _whole_shares(rows: int, columns: int, extent: int, first, stored) -> None:
@@ -296,14 +290,14 @@ def _static(value, expected: int) -> bool:
 
 def _aligned_ladder(row_bytes: int, first, ladder: list) -> None:
     """Refuse a packed chunk's row ladder (`store_rows`: copies of a power of two of rows from `first`, the
-    smallest `least`, `ladder`'s second) whose copies may start a shared row at no `TMA_SMEM_ALIGNMENT` bytes:
-    a row of `row_bytes` that is no whole number of them starts aligned only at a static first row 0 and
-    rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
+    smallest `least`, `ladder`'s second) whose copies may start a shared row at no `copies.SHARED_ALIGNMENT`
+    bytes: a row of `row_bytes` that is no whole number of them starts aligned only at a static first row 0
+    and rungs of whole aligned rows (a dense call's 8-row least of a 16-byte NVFP4 scale row)."""
     least = ladder[1] if len(ladder) > 1 else 1
-    aligned = least * row_bytes % TMA_SMEM_ALIGNMENT == 0
-    if row_bytes % TMA_SMEM_ALIGNMENT and not (_static(first, 0) and aligned):
+    aligned = least * row_bytes % copies.SHARED_ALIGNMENT == 0
+    if row_bytes % copies.SHARED_ALIGNMENT and not (_static(first, 0) and aligned):
         raise ValueError(f"a packed chunk's {row_bytes}-byte rows copied from row {first} in rungs of "
-                         f"{least} start a tensor copy at no {TMA_SMEM_ALIGNMENT}-byte shared address")
+                         f"{least} start a tensor copy at no {copies.SHARED_ALIGNMENT}-byte shared address")
 
 
 def transposed_rows(smem, value: jax.Array, o_gmem, row_start, column, *, write: Callable = written) -> None:

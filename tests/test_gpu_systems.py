@@ -23,6 +23,8 @@ from gpu_flow import Cell, isolated, run_cells
 pytestmark = pytest.mark.gpu(reason="each system's GPU reads: CUPTI, the allocator, Triton")
 
 
+@pytest.mark.compiles_at_run(reason="reads this GPU's systems (CUPTI, the allocator, Triton) as a run does: "
+                                    "no check-1 site")
 def test_a_runs_systems_read_this_gpu(tmp_path_factory):
     """Every systems cell above on this GPU (`gpu_flow.run_cells`), each run as the suite runs a test
     (`gpu_flow.isolated`), each one's failure kept and all raised together."""

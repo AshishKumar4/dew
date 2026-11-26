@@ -23,6 +23,9 @@ from dew.nn.kernels.generation import assumed
 from dew.training.ahead import BuildTarget, compiled_in, dumps
 
 pytestmark = pytest.mark.gpu(reason="a program compiled ahead runs on the GPU it was built for")
+AT_RUN = ("a behavioral check of programs compiled ahead, built and loaded by processes of its own on this "
+          "GPU: no check-1 site, nothing its part's prepare can compile ahead")
+"""Why a test here but the drawn-bits one compiles at its run (`compiles_at_run`)."""
 
 HERE = """
 import pickle
@@ -299,6 +302,7 @@ def computing_otherwise(environment: dict[str, str]) -> dict[str, str]:
     return {**environment, "XLA_FLAGS": f"{environment.get('XLA_FLAGS', '')} {COMPUTING}".strip()}
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_for_bit_as_compiled_here(
         tmp_path):
     own = BuildTarget.of(jax.devices()[:1])
@@ -350,6 +354,7 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
         assert ahead[name].dtype == compiled.dtype and ahead[name].tobytes() == compiled.tobytes(), name
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused_where_xla_computes_otherwise(
         tmp_path):
     """A run handed its step compiled ahead for this GPU where no GPU is visible, two microbatches a step and
@@ -379,6 +384,7 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
                    env=computing_otherwise(environment), check=True)
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_sampled_run_compiled_ahead_for_this_gpu_compiles_none_of_its_counts_on_it(tmp_path):
     """A run that draws its looped model's pass count per microbatch (`SampledPasses`), handed its step
     compiled ahead for this GPU where no GPU is visible, trains in a fresh process compiling nothing on the
@@ -399,6 +405,7 @@ def test_a_sampled_run_compiled_ahead_for_this_gpu_compiles_none_of_its_counts_o
                    env=environment, check=True)
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_deviceless_compile_stores_nothing_a_device_run_reads(tmp_path):
     """The contract between the persistent cache's key and the autotuner: a program compiled in a process that
     sees no GPU (none visible, `JAX_PLATFORMS=cpu`) over this host's own topology (`host_gpus`), as a user's
@@ -475,8 +482,9 @@ def test_a_fresh_state_placed_on_a_gpu_draws_the_bits_of_jaxs_default_lowering()
             return (np.asarray(jax.random.key_data(jax.random.key(seed))),)
 
     def placed(data):
-        key = jax.random.wrap_key_data(data)
-        return floats(trainer(key).place()[0].variables)
+        # `place` stacks a one-stage scanned run under `stages`; `stored` reads its stored `layers_N`.
+        run = trainer(jax.random.wrap_key_data(data))
+        return floats(run.stored(run.place()[0]).variables)
 
     drawn_here, replayed = jax.jit(initial), float64_replay(initial)
     assert_as_exact(as_given(placed), as_given(lambda data: floats(drawn_here(data))), drawn,
@@ -530,6 +538,7 @@ print(json.dumps(sorted({json.dumps(each, sort_keys=True) for each in stated})))
 """
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_certification_compiles_alike_on_this_gpu_and_a_compile_only_one_of_its_generation(tmp_path):
     """A launch's certification, its kernels compiled alone to be read and run nowhere (`report.certified`),
     compiles under the same options on this GPU as on a compile-only GPU of its generation, so a run reads a
@@ -553,6 +562,7 @@ def test_a_certification_compiles_alike_on_this_gpu_and_a_compile_only_one_of_it
     assert here and here == options("compile-only"), here
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 @pytest.mark.users_process
 def test_a_program_compiled_ahead_for_compile_only_gpus_of_no_stated_memory_computes_as_compiled_here():
     """Dew's portable recurrence gradient (test_recurrence_stability's scalar delta at aligned keys), compiled
@@ -649,6 +659,7 @@ exactly, how many programs its cache served and had none of, and how many it com
 hears a compile whether or not the cache keeps it)."""
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_gpu_process_keeps_a_program_its_cache_serves_and_another_runs_it_compiling_nothing(tmp_path):
     """On a GPU a block keeping its programs (`ahead.keeping`) reads JAX's persistent cache as any compile
     does: a Pallas program the cache serves is kept and saved whole, its kernel among it, and a third

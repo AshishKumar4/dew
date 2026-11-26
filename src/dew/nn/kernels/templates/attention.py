@@ -36,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
+from numpy.lib.array_utils import normalize_axis_tuple
 
 from dew._hashing import fmix32
 from dew.nn.aligned import aligned_sum
@@ -2082,7 +2083,8 @@ def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
     return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
 
 
-def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...], *, most: int | None = None
+               ) -> jax.Array:
     """`grad` fp32, each part `2^shift` beneath its truth (`shift` int32, at least 0, broadcast against it),
     raised and summed over `axes` (kept): a part apiece exactly (`shifted`) where it sums none; else the
     exact sum of the raised parts rounded once (`aligned.aligned_sum`), so parts past fp32's largest that
@@ -2094,6 +2096,52 @@ def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.
     `0 * inf`."""
     if not axes:
         return shifted(grad, shift)
+    shift = jnp.broadcast_to(shift, jnp.broadcast_shapes(shift.shape, (1,) * grad.ndim))
+    axes = normalize_axis_tuple(axes, grad.ndim)
+    # The sum is elementwise over every other axis: taken a slab of one of them at a time where its digits
+    # would hold more than `most` entries at once (`RAISED_ELEMENTS` where None; row 10694: a tile bias's
+    # gradient over 4 rows of 8 heads' 2048 x 2048 logits asked 5.47 GiB of an A100's 40 at once), along
+    # the kept axis whose divisors give the fewest slabs that fit (every slab of one size; the cap best
+    # effort where no axis's do).
+    most = RAISED_ELEMENTS if most is None else most
+    kept = [axis for axis in range(grad.ndim) if axis not in axes and grad.shape[axis] > 1]
+    if not kept or grad.size <= most:
+        return _raised(grad, shift, axes)
+    slabs, axis = _slab_axis(grad.size, {axis: grad.shape[axis] for axis in kept}, most)
+
+    def split(x):
+        # `x` in `slabs` along `axis`, the slab its leading axis; one of no extent there each slab's whole.
+        if x.shape[axis] == 1:
+            return jnp.broadcast_to(x, (slabs, *x.shape))
+        return jnp.moveaxis(x.reshape(*x.shape[:axis], slabs, x.shape[axis] // slabs, *x.shape[axis + 1:]),
+                            axis, 0)
+
+    # A slab at a time (`lax.map`, a loop), so one slab's digits are live at once.
+    pieces = jax.lax.map(lambda parts: _raised(parts[0], parts[1], axes), (split(grad), split(shift)))
+    merged = jnp.moveaxis(pieces, 0, axis)
+    return merged.reshape(*merged.shape[:axis], -1, *merged.shape[axis + 2:])
+
+
+RAISED_ELEMENTS = 1 << 24
+"""The most entries `raised_sum` sums aligned at once: its digits hold about 44 bytes an entry (`aligned`'s
+levels of int32), so 0.7 GiB a slab."""
+
+
+def _slab_axis(size: int, extents: dict[int, int], most: int) -> tuple[int, int]:
+    """The slab count and axis of `extents` (axis: extent) to sum `size` entries in, `most` or fewer a slab:
+    the fewest slabs of equal size (a divisor of its extent) that fit, over every axis; where no axis's do,
+    the axis of most slabs, each its extent's one, the least a slab holds."""
+    wanted = -(-size // most)
+    fitting = [(min(count for count in range(wanted, extent + 1) if extent % count == 0), axis)
+               for axis, extent in extents.items() if extent >= wanted]
+    if fitting:
+        return min(fitting)
+    axis = max(extents, key=extents.__getitem__)
+    return extents[axis], axis
+
+
+def _raised(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """`raised_sum`'s exact sum of `grad`'s parts raised by `2^shift` over `axes` (kept)."""
     one = jnp.ones((), jnp.float32)
     third = shift // 3
     factors = (power2(one, third), power2(one, third), power2(one, shift - 2 * third))

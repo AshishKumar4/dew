@@ -183,6 +183,16 @@ seams: "grouped-kinds": {
 	}
 }
 
+seams: "grouped-step-held": {
+	kind:    "declared-set"
+	purpose: "the dense kinds at parity per product whose trainer step holds more with the template (tests/step_memory.py), kept on XLA's dot (grouped_matmul.DECLARED)"
+	paths:   ["src/dew/nn/kernels/grouped_cells.py"]
+	entries: "STEP_HELD"
+	declared: {
+		"(sm90, Made.INPUT_GRADIENT)": "the GH200's dense input gradient on XLA: the template's holds layers' cotangents past their layer in a trainer step (tests/step_memory.py)"
+	}
+}
+
 seams: "join-cells": {
 	kind:    "declared-set"
 	purpose: "each cell runs a join's projections as one GEMM on a device whose receipt shows the join faster"

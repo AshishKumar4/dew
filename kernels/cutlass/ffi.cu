@@ -1,7 +1,7 @@
 // CUTLASS's grouped GEMMs as exported XLA FFI handlers, which dew_cutlass registers through ctypes, so the
 // library carries no Python ABI. Each handler dispatches on the compute capability of the device its stream
-// runs on, to the kernel built for it (grouped_sm80.cu for every 8.x, grouped_sm90.cu for 9.0), and answers
-// an error naming any other. Problem
+// runs on, to the kernel built for it (grouped_sm80.cu for every 8.x, grouped_sm90.cu for 9.0,
+// grouped_sm100.cu for 10.0), and answers an error naming any other. Problem
 // shapes are set up on the device from the group sizes, in scratch from XLA's allocator, so a call never
 // synchronizes with the host and stays jit- and graph-safe.
 #include <cuda_runtime.h>
@@ -92,11 +92,13 @@ ffi::Error failed(const char* target, const std::string& why) {
 
 // The generation of the kernels a device of `capability` (10 * major + minor) runs, as KERNELS names them:
 // Ampere's sm80 kernels on every 8.x, whose plain SASS each later minor of its major runs (CUDA's binary
-// compatibility); Hopper's sm90a kernels, of its arch-specific instructions, on 9.0 alone; nullptr on any
-// other device. The one statement of the library's dispatch: both targets' and dew_cutlass.architecture's.
+// compatibility); Hopper's sm90a kernels and Blackwell's sm100a, of their arch-specific instructions, on 9.0
+// and 10.0 alone; nullptr on any other device. The one statement of the library's dispatch: both targets'
+// and dew_cutlass.architecture's.
 const char* architecture_for(int capability) {
   if (capability / 10 == 8) return "sm80";
   if (capability == 90) return "sm90";
+  if (capability == 100) return "sm100";
   return nullptr;
 }
 
@@ -160,6 +162,7 @@ extern "C" const char* dew_cutlass_kernels() {
                                         std::pair{dew_cutlass::Dtype::kF32, "float32"}}) {
       add("sm80", dtype, dew_cutlass::sm80_kernel(result));
       add("sm90", dtype, dew_cutlass::sm90_kernel(result));
+      add("sm100", dtype, dew_cutlass::sm100_kernel(result));
     }
     return entries;
   }();
@@ -205,6 +208,9 @@ ffi::Error GroupedGemm(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::
   } else if (architecture == "sm90") {
     why = dew_cutlass::sm90_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
                                     device->multiprocessors);
+  } else if (architecture == "sm100") {
+    why = dew_cutlass::sm100_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
+                                     device->multiprocessors);
   }
   if (why != nullptr) return dew_cutlass::failed(kTarget, why);
   dew_cutlass::zero_unrouted_rows(call.out, m, n * static_cast<int64_t>(ffi::ByteWidth(out->element_type())),
@@ -247,6 +253,9 @@ ffi::Error GroupedGemmK(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi:
   } else if (architecture == "sm90") {
     why = dew_cutlass::sm90_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
                                       device->multiprocessors);
+  } else if (architecture == "sm100") {
+    why = dew_cutlass::sm100_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
+                                       device->multiprocessors);
   }
   if (why != nullptr) return dew_cutlass::failed(kTarget, why);
   dew_cutlass::zero_empty_groups(call.out, k * n * static_cast<int64_t>(ffi::ByteWidth(out->element_type())),

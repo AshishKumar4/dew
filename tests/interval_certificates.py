@@ -139,6 +139,16 @@ class Lane:
     'rna', rounded to TF32 to nearest, a tie away from zero, first (`cvt.rna.tf32.f32`,
     `Family.rounds_tf32`: mma.sync's); 'read', read as TF32 from its fp32 register by the instruction, no
     conversion stated (warpgroup MMA's), which encloses either of the others."""
+    solve: tuple[int, Literal["plain", "rna", "read"]] | None = None
+    """The merges' parts and TF32 conversion (`merged`, `tf32`) a decay a key dimension's solve takes on the
+    intra walk's bundle (`intra.sub_chunked`: mma.sync's on every target, an H100's one TF32 part rounded a
+    tie away where its other launches take warpgroup MMA's two bf16 parts); the call's where None."""
+
+    def solving(self) -> "Lane":
+        """This lane as a decay a key dimension's solve runs in (`solve`)."""
+        if self.solve is None:
+            return self
+        return dataclasses.replace(self, merged=self.solve[0], tf32=self.solve[1])
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:

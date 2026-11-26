@@ -44,13 +44,14 @@ struct GroupedK {
 // The kernel an architecture's file instantiates writing `result`, read from its instantiated types, as Dew's
 // records name a launch (dew_cutlass.KERNELS): its tile's rows, columns and depth, its ring's stages, its
 // consumer threads (those issuing its products), the multiprocessors of its cluster along the rows, and its
-// instruction family (Dew's bundles' names: "mma.sync", "wgmma").
+// instruction family (Dew's bundles' names: "mma.sync", "wgmma", "tcgen05").
 struct Instantiated {
   int rows, columns, depth, stages, consumers, cluster;
   const char* instructions;
 };
 Instantiated sm80_kernel(Dtype result);
 Instantiated sm90_kernel(Dtype result);
+Instantiated sm100_kernel(Dtype result);
 
 // Each runs the call on `stream` and returns nullptr, or names why it cannot (an unsupported dtype or
 // alignment, scratch exhausted, a CUTLASS status).
@@ -62,6 +63,10 @@ const char* sm90_grouped(const Grouped& call, cudaStream_t stream, const Allocat
                          int multiprocessors);
 const char* sm90_grouped_k(const GroupedK& call, cudaStream_t stream, const Allocate& allocate, int device,
                            int multiprocessors);
+const char* sm100_grouped(const Grouped& call, cudaStream_t stream, const Allocate& allocate, int device,
+                          int multiprocessors);
+const char* sm100_grouped_k(const GroupedK& call, cudaStream_t stream, const Allocate& allocate, int device,
+                            int multiprocessors);
 
 // The rows of out [m, n] (row_bytes each) from the groups' sum to m, written zero on `stream`, and, for the
 // weight gradient, each empty group's [k, n] block of out (block_bytes each).

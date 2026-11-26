@@ -599,6 +599,26 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
 
 
+@pytest.mark.parametrize("b_dtype, c_dtype", [(jnp.float8_e4m3fn, jnp.float4_e2m1fn),
+                                              (jnp.float4_e2m1fn, jnp.float8_e4m3fn)], ids=["fp8 B", "fp4 B"])
+def test_a_named_template_refuses_either_state_rows_no_bulk_copy_takes(b_dtype, c_dtype):
+    """An fp8 and an fp4 state operand at 16 states, B's or C's: the fp4 rows (8 bytes) no bulk copy's 16
+    divide, so the call naming the template is refused for them in either order, as its streams copy B and C
+    each in its own dtype (the review of toolkit/views-copies 0a632c088: the case read one of the two,
+    chosen by bytes an element, which an fp8 and an fp4 tie at)."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    rows, length, channels, states = 1, selective.CHUNK, selective.block_scan.THREADS, 16
+    inputs = (*(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in (
+        (rows, length, channels), (rows, length, channels), (channels, states))),
+        jax.ShapeDtypeStruct((rows, length, states), b_dtype), jax.ShapeDtypeStruct((rows, length, states),
+                                                                                   jnp.float32),
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    with pytest.raises(KernelRefused) as refused:
+        jax.eval_shape(dispatched("fast", named=True, c_dtype=c_dtype, target="sm90"), *inputs)
+    assert "state rows" in [refusal.code for refusal in refused.value.refusals]
+
+
 @COMPILES_ON_CPU
 @lowers('sm90')
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
@@ -724,7 +744,7 @@ def test_a_routed_forked_training_step_compiles_spill_free(target):
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     forked = FORKED["shared and chained"]
-    rows, length, channels, states = 2, 2048, 256, 16
+    rows, length, channels, states = 2, 512, 256, 16
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
         jax.ShapeDtypeStruct((channels, states), jnp.float32),
         *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
@@ -830,6 +850,33 @@ def test_a_spill_steps_the_kernel_that_spilled():
         assert stepped is not None and stepped != derived
         assert selective.SELECTIVE.legal(bound, stepped, target)
     the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=stepped)
+
+
+@pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def test_a_spilled_backward_takes_its_models_next_plan(target):
+    """`Selective.derived` past a backward's spill on an A100's and an H100's facts for Mamba-1 2.8B's bf16
+    scan: the register model's next plan (`backward_plans`), the next again past its spill too. Halving
+    the spilled plan's tokens, an A100's 8 tokens at three programs, which spill 48 bytes, ran 4 at four,
+    the model's third, past 16 at two, its second, which compiles spill-free (row 1300)."""
+    operands = (jax.ShapeDtypeStruct((8, 2048, 5120), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((5120, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((8, 2048, 16), jnp.bfloat16),) * 2, jax.ShapeDtypeStruct((5120,), jnp.float32))
+    facts = generation.gpu_target(target)
+    # The model's order (`backward_plans`): 8 tokens at three programs and 16 at two each two steps a token's
+    # (2 p + 32) / (p programs), more programs first, then 4 at four's 2.5.
+    plans = [(8, 3), (16, 2), (4, 4)]
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands)
+        identity = report._identity(selective.SELECTIVE, bound, facts)
+        derived = selective.SELECTIVE.derived(bound, facts)
+        assert (derived.positions, derived.resident) == plans[0]
+        refused = [derived]
+        for plan in plans[1:]:
+            with report.refusals():
+                report.refuse([(identity, tiles, {'selective_scan_backward'}) for tiles in refused])
+                stepped = selective.SELECTIVE.derived(bound, facts)
+            assert (stepped.chunk, stepped.positions, stepped.resident) == (derived.chunk, *plan), stepped
+            refused.append(stepped)
 
 
 @pytest.mark.parametrize('target', ['sm80', 'sm90'])

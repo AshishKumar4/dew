@@ -7,8 +7,8 @@ project(dew_cutlass LANGUAGES CXX CUDA)
 set(UPSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/upstream" CACHE PATH "CUTLASS checkout")
 set(XLA_FFI_INCLUDE "" CACHE PATH "jaxlib's include directory, holding xla/ffi/api/ffi.h")
 # sm80 code runs on every compute capability 8.x (CUTLASS 2's grouped GEMM, grouped_sm80.cu); sm90a is
-# Hopper's warp-specialized TMA kernels (grouped_sm90.cu). Each handler picks the device's at the call
-# (ffi.cu), and compiles for sm100a too, where it refuses the call: no kernel object holds Blackwell's code.
+# Hopper's warp-specialized TMA kernels (grouped_sm90.cu); sm100a Blackwell's tcgen05 kernels
+# (grouped_sm100.cu). Each handler picks the device's at the call (ffi.cu).
 set(CMAKE_CUDA_ARCHITECTURES 80-real 90a-real 100a-real)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,15 +16,18 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(CUDAToolkit REQUIRED)
 
-# Each architecture's kernels compile for it alone (grouped_sm80.cu for sm80, grouped_sm90.cu for sm90a), so
-# no file holds code its instructions cannot run; ffi.cu's handlers and zeroing kernels compile for every
-# architecture.
+# Each architecture's kernels compile for it alone (grouped_sm80.cu for sm80, grouped_sm90.cu for sm90a,
+# grouped_sm100.cu for sm100a), so no file holds code its instructions cannot run; ffi.cu's handlers and
+# zeroing kernels compile for every architecture.
 add_library(dew_cutlass_sm80 OBJECT grouped_sm80.cu)
 set_target_properties(dew_cutlass_sm80 PROPERTIES CUDA_ARCHITECTURES 80-real)
 add_library(dew_cutlass_sm90 OBJECT grouped_sm90.cu)
 set_target_properties(dew_cutlass_sm90 PROPERTIES CUDA_ARCHITECTURES 90a-real)
-add_library(dew_cutlass SHARED ffi.cu $<TARGET_OBJECTS:dew_cutlass_sm80> $<TARGET_OBJECTS:dew_cutlass_sm90>)
-foreach(target dew_cutlass dew_cutlass_sm80 dew_cutlass_sm90)
+add_library(dew_cutlass_sm100 OBJECT grouped_sm100.cu)
+set_target_properties(dew_cutlass_sm100 PROPERTIES CUDA_ARCHITECTURES 100a-real)
+add_library(dew_cutlass SHARED ffi.cu $<TARGET_OBJECTS:dew_cutlass_sm80> $<TARGET_OBJECTS:dew_cutlass_sm90>
+    $<TARGET_OBJECTS:dew_cutlass_sm100>)
+foreach(target dew_cutlass dew_cutlass_sm80 dew_cutlass_sm90 dew_cutlass_sm100)
   target_include_directories(${target} PRIVATE "${XLA_FFI_INCLUDE}" "${UPSTREAM}/include"
       "${UPSTREAM}/tools/util/include")
   target_compile_definitions(${target} PRIVATE NDEBUG)

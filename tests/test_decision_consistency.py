@@ -663,8 +663,10 @@ def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_cou
     [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
     variables = capped.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(1), None)
-    loss, aux = once.loss(variables, batch, step)
-    _, capped_aux = capped.loss(variables, batch, step)
+    # Each loss one compiled program: applied op by op, each of a looped loss's operations compiles on its
+    # own (row 12804).
+    loss, aux = jax.jit(once.loss)(variables, batch, step)
+    _, capped_aux = jax.jit(capped.loss)(variables, batch, step)
     assert jax.tree.structure(aux.metrics) == jax.tree.structure(capped_aux.metrics)
     assert [(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(aux.metrics)] == [
         (leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(capped_aux.metrics)]

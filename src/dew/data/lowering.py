@@ -77,7 +77,6 @@ from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.handoff import (
     EXPANDED_DRAWS,
     RecordStage,
-    _Barren,
     _carried,
     _elastic_cut,
     _Ended,
@@ -101,9 +100,9 @@ from dew.data.mixing import (
     TokenDeficit,
     mix_end,
     mixed_indexed,
-    rewound,
 )
 from dew.data.ordering import Skipping, place_of
+from dew.data.passes import Passes
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -146,6 +145,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     accounts,
+    allocation,
     chains,
     children,
     consumed_by,
@@ -1034,81 +1034,15 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     a rejecting step keeps none of, which read on forever. A pass a step emptied that may yield rows next
     time (a fetch that failed for now, a draw, `varying` naming those steps) is read on, saying so at each
     empty pass after the first: the share, the passes so far and those steps. Every pass of a stream
-    goes on counting its corpus (`_Passes`). A worker's pass of its inputs and the markers of what they
+    goes on counting its corpus (`Passes`). A worker's pass of its inputs and the markers of what they
     dropped that holds nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    passes = _Passes(parent, name, endless=epochs is None, certain=certain, barren=barren, varying=varying)
+    passes = Passes(parent, name, endless=epochs is None, certain=certain, barren=barren, varying=varying)
     return gx.RepeatIterDataset(passes, epochs)
-
-
-class _Passes(pygrain.IterDataset):
-    """A stream a repeat reads pass after pass, each going on counting its corpus. Endlessly read
-    (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
-    and said at each empty pass after the first otherwise, naming the steps that may yield another row
-    on a later pass (`varying`)."""
-
-    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool,
-                 barren: bool = False, varying: tuple[str, ...] = ()):
-        super().__init__(parent)
-        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren, self._varying = barren, varying
-
-    def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain, self._barren,
-                               self._varying)
-
-
-class _PassesIterator(pygrain.DatasetIterator):
-    """Its parent's rows and position. The repeat restarts a pass by restoring, right after one
-    ends, the very position it took as the first pass's start (Grain's `_parent_starting_state`,
-    the first this iterator gives); any other restore, a checkpoint's even once the last pass
-    ended, lands where its position says, with the counts it holds."""
-
-    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
-                 barren: bool = False, varying: tuple[str, ...] = ()):
-        super().__init__(parent)
-        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
-        self._barren, self._varying = barren, varying
-        self._yielded = self._ended = False
-        self._empty = 0
-        self._opening: object | None = None
-
-    def __next__(self):
-        try:
-            value = next(self._rows)
-        except StopIteration:
-            if not self._yielded and self._barren:
-                raise _Barren(self._name) from None
-            if not self._yielded and self._endless:
-                if self._certain:
-                    raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
-                                     "nothing forever") from None
-                self._empty += 1
-                # Every empty pass after the first, loudly: a read that is not moving says why it reads on.
-                if self._empty > 1:
-                    _log.warning("%s yielded no row in its last %d passes; it reads on, as %s may make "
-                                 "a row on a later pass", self._name, self._empty,
-                                 ", ".join(self._varying) or "a step before its repeat")
-            self._ended = True
-            raise
-        self._yielded, self._empty = True, 0
-        return value
-
-    def get_state(self):
-        state = self._rows.get_state()
-        if self._opening is None:
-            self._opening = state
-        return state
-
-    def set_state(self, state) -> None:
-        # The repeat rewinding the pass that just ended keeps the corpus's counts.
-        rewinding = self._ended and state is self._opening
-        self._rows.set_state(rewound(state, self._rows.get_state()) if rewinding else state)
-        self._yielded, self._ended = not rewinding, False
 
 
 def _varies(stage: Stage) -> bool:
@@ -1133,7 +1067,7 @@ def _same_each_pass(stages: Sequence[Stage], shares: int) -> bool:
     shares, derived stage by stage from its input's: none that varies (`_varies`); a shuffle reseeded each
     pass keeps its input's records in another order, so a step after it that keeps records by their place
     (a limit, a slice, a layout, a batch) holds others, as does the cut of several shares
-    (`index::count`). So a pass that keeps no row keeps none on any (`_PassesIterator`, `Accepted`)."""
+    (`index::count`). So a pass that keeps no row keeps none on any (`PassesIterator`, `Accepted`)."""
     ordered = True
     for stage in stages:
         if _varies(stage):
@@ -1399,12 +1333,32 @@ class _Build:
 
     def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
-        analysis, keyed by the name it goes by there (`_member_key`)."""
+        analysis, keyed by the name it goes by there (`_member_key`), at its share of the pool."""
+        return self._member(index, None if self.pool is None else self._shares[index])
+
+    def member_builds(self, capacities: Sequence[int | None]) -> list[_Build]:
+        """Every member's build (`child`), the pool shared out once for them all within each member's
+        `capacities` (`dew.data.pipeline.allocation`, `capacities`)."""
+        if self.pool is None or not capacities:
+            return [self.child(index) for index in range(len(self.lowering.children))]
+        counts = allocation(self.pool.count, self._weights, tuple(capacities))
+        return [self._member(index, Workers(count, self.pool.buffer)) for index, count in enumerate(counts)]
+
+    @functools.cached_property
+    def _weights(self) -> tuple[float, ...]:
+        """A mixture's draw weights (`_Lowering.draws`), which its members share its workers by; phases' and
+        a concatenation's, each read in turn, equal."""
+        return tuple(self.lowering.draws) or (1.0,) * len(self.lowering.children)
+
+    @functools.cached_property
+    def _shares(self) -> tuple[Workers, ...]:
+        """Each member's share of the pool (`allocation`), worked out once for the build: a member's build
+        asked of each of a thousand corpora worked it out whole for each."""
+        assert self.pool is not None
+        return tuple(Workers(count, self.pool.buffer) for count in allocation(self.pool.count, self._weights))
+
+    def _member(self, index: int, pool: Workers | None) -> _Build:
         members = strings(self.lowering.order["members"], "mixture members")
-        # A mixture's members share its workers by their draw weights (`_Lowering.draws`); phases' and a
-        # concatenation's, each read in turn, equally.
-        weights = list(self.lowering.draws) or [1.0] * len(members)
-        pool = None if self.pool is None else self.pool.shared(weights, index)
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
         # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
@@ -1428,8 +1382,7 @@ class _Build:
         ordered = self.in_order
         if self.global_order or not self.training or not (ordered or pooled):
             return self
-        pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
-                    Workers(count, self.loading.worker_buffer))
+        pool = worker_stage(pipeline, self.loading)
         return dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=count), pool=pool)
 
     def owning(self, pipeline: Pipeline) -> _Build:
@@ -1441,18 +1394,57 @@ class _Build:
         loading = dataclasses.replace(self.loading, workers=written.count)
         return dataclasses.replace(self, pool=written, loading=loading)
 
-    def pools(self, pipeline: Pipeline) -> dict[str, int]:
-        """The loading workers each corpus reads in, as `pooled` shares them out, by the corpus's
-        place among the mixtures above it, which a position saved under one sharing restores only
-        under the same, a corpus a mixture keeps across an edit included."""
+    def pools(self, pipeline: Pipeline, partition: DataPartition) -> dict[str, int]:
+        """The loading workers each corpus reads in, as `pooled` shares them out for `partition`'s share
+        (`capacities`), by the corpus's place among the mixtures above it, which a position saved under one
+        sharing restores only under the same, a corpus a mixture keeps across an edit included."""
+        return {key: stage.count for key, stage in self.pool_stages(pipeline, partition).items()}
+
+    def pool_stages(self, pipeline: Pipeline, partition: DataPartition,
+                    files: Mapping[tuple, tuple[int | None, ...]] | None = None) -> dict[str, Workers]:
+        """The worker stage each corpus reads in (`pools`), its count and the buffer its reader is built
+        with: a corpus's own written stage, else its share of its mixture's, by each mixture's whole-file
+        shards (`whole_files`) as `files` holds them where given (`whole_files_of`), read where not."""
         build = self.owning(pipeline)
         source = pipeline.source
         if build.pool is None or build.in_order:
             return {}
         if not isinstance(source, Combined):
-            return {"/".join(str(key) for key in build.corpus): build.pool.count}
-        return {key: count for index, child in enumerate(source.pipelines)
-                for key, count in build.child(index).pools(child).items()}
+            return {"/".join(str(key) for key in build.corpus): build.pool}
+        shards = build.whole_files(pipeline) if files is None else files.get(build.corpus, ())
+        builds = build.member_builds(_capacities(shards, partition))
+        return {key: stage for child, member in zip(source.pipelines, builds, strict=True)
+                for key, stage in member.pool_stages(child, partition, files).items()}
+
+    def whole_files_of(self, pipeline: Pipeline) -> dict[tuple, tuple[int | None, ...]]:
+        """Each mixture's whole-file shards `pipeline` reads (`whole_files`), by the corpus key its build
+        reads them under: what `pool_stages` deals any share's workers by, read once."""
+        build = self.owning(pipeline)
+        source = pipeline.source
+        if build.pool is None or build.in_order or not isinstance(source, Combined):
+            return {}
+        shards = build.whole_files(pipeline)
+        found = {build.corpus: shards}
+        for child, member in zip(source.pipelines, build.member_builds(_capacities(shards, DataPartition())),
+                                 strict=True):
+            found.update(member.whole_files_of(child))
+        return found
+
+    def whole_files(self, pipeline: Pipeline) -> tuple[int | None, ...]:
+        """The shards each corpus `pipeline` mixes is read in where its read streams and its store cannot cut
+        them finer (whole compressed files, each a worker's own), so no corpus is dealt more workers than it
+        holds shards for each, which the cut refuses (`dew.data.shards._shards`); None for a corpus of
+        mixtures or one whose shards subdivide; none where the read is not a streamed mixture's in workers."""
+        if self.pool is None or self.read != "streamed" or not isinstance(pipeline.source, Combined):
+            return ()
+        found: list[int | None] = []
+        for child in pipeline.source.pipelines:
+            if isinstance(child.source, Combined):
+                found.append(None)
+                continue
+            manifest = base.stream_manifest(child.source, positioned=False)
+            found.append(None if manifest.subdivide is not None else len(manifest.shards))
+        return tuple(found)
 
     def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
@@ -1477,7 +1469,7 @@ class _Build:
         read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose share
         is no thread reads on the thread that draws from it."""
         nested = children(pipeline)
-        builds = [self.child(index) for index in range(len(nested))]
+        builds = self.member_builds(_capacities(self.whole_files(pipeline), partition))
         builds = [dataclasses.replace(build, loading=dataclasses.replace(
             build.loading, threads=build.loading.threads // len(nested),
             read_buffer=build.loading.read_buffer // len(nested))) for build in builds]
@@ -2013,7 +2005,7 @@ class _Build:
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
-            # A stream's passes replay its first (`_PassesIterator`), its shuffles and its share's cut alike:
+            # A stream's passes replay its first (`PassesIterator`), its shuffles and its share's cut alike:
             # only a step that varies (`_varies`) may make another row on a later pass.
             before = pipeline.stages[:at]
             moving = tuple(_identity(written).name for written in before if _varies(written))
@@ -2366,7 +2358,7 @@ class _Build:
         reader that wraps this stream."""
         stages = [(at, pipeline.stages[at]) for at in after]
         if self.loading.workers and self.pool is None and _at(pipeline.stages, Workers) is None:
-            workers = Workers(self.loading.worker_count, self.loading.worker_buffer)
+            workers = Workers(self.loading.worker_count, self.loading.ahead)
             stages.append((len(pipeline.stages), workers))
         for at, stage in stages:
             # A pooled read's workers read before its batch (`pooled`).
@@ -2410,10 +2402,22 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             yield spans
 
 
+def _capacities(shards: tuple[int | None, ...], partition: DataPartition) -> tuple[int | None, ...]:
+    """The most of a pool's workers (`allocation`) a share's reader deals each corpus: its whole-file shards
+    (`_Build.whole_files`) over `partition`'s shares."""
+    return tuple(None if count is None else count // partition.count for count in shards)
+
+
+def worker_stage(pipeline: Pipeline, loading: Loading) -> Workers:
+    """The worker stage a read of `pipeline` runs in, as its reader is built: the one it writes
+    (`.workers(n, buffer=)`), its count and buffer, else `loading`'s count, each worker holding the batches
+    its loading holds ready (`Loading.ahead`)."""
+    return next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
+                Workers(loading.worker_count, loading.ahead))
+
+
 def _workers(pipeline: Pipeline, loading: Loading) -> int:
-    return next(
-        (stage.count for stage in pipeline.stages if isinstance(stage, Workers)), loading.worker_count
-    )
+    return worker_stage(pipeline, loading).count
 
 
 @dataclasses.dataclass(frozen=True)

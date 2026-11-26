@@ -703,7 +703,10 @@ def model_site(directory):
             return arm(latents, jnp.full((MODEL_ROWS,), MODEL_TIME, latents.dtype), context, *added)
         return run
 
-    return with_gradients(dew), with_gradients(diffusers(False)), with_gradients(diffusers(True)), draw
+    # Each arm one compiled program over its draws: applied op by op, each of a U-Net's operations and their
+    # transposes compiles on its own, every draw (row 7004).
+    return (jax.jit(with_gradients(dew)), jax.jit(with_gradients(diffusers(False))),
+            jax.jit(with_gradients(diffusers(True))), draw)
 
 
 def check_model(directory):

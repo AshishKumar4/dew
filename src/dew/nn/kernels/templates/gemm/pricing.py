@@ -14,7 +14,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
+from dew.nn.kernels.templates import (
+    bundles,
+    cost as unit_cost,
+    mosaic,
+    product as product_of,
+    tail as tail_of,
+)
 from dew.nn.kernels.templates.gemm.tiling import TilesTemplate as TilesTemplate
 
 if TYPE_CHECKING:
@@ -44,16 +50,18 @@ def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
-                 decoded: tuple = (None, None)) -> float | None:
+                 decoded: tuple = (None, None), *, issued) -> float | None:
     """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
     (`split_count`) and a balanced tail (`handoff_steps`) price their walks in: the longer of its products'
-    FLOPs at the multiprocessor's 16-bit tensor rate and its operands' bytes through its shared memory at
+    FLOPs at the multiprocessor's tensor rate for the dtype its MMA issues (`issued`, its caller's: an FP8
+    operand's `Rates.eight` (`product.eight`), fp32's TF32, every other the 16-bit rate, which packed operands
+    decoded before their products take) and its operands' bytes through its shared memory at
     that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
     units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
     and the right's) in their `decoded` forms; None where the target states no tensor rate. A pair's step is
     a CTA's: its rows by the pair's columns (`tile_columns`)."""
     rates = unit_cost.rates(target, device=False)
-    tensor = (rates.tf32 or rates.tensor) if itemsizes == (4, 4) else rates.tensor
+    tensor = _tensor_rate(rates, issued)
     shared = rates.shared
     if tensor is None:
         return None
@@ -70,6 +78,14 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
         vmem = (moved + 2 * tiles.block_m * columns * 4) / shared if shared is not None else 0.0
         return max(products, dma, vmem) + (target.kernel_step_seconds or 0.0)
     return products if shared is None else max(products, moved / shared)
+
+
+def _tensor_rate(rates, issued) -> float | None:
+    """The multiprocessor's tensor rate (`cost.Rates`) for the operands its MMA issues (`step_seconds`): an
+    FP8 operand's (`product.eight`; a 4-bit float, one byte stored, no rate of its own, the 16-bit's)."""
+    if product_of.eight(issued):
+        return rates.eight or rates.tensor
+    return (rates.tf32 or rates.tensor) if jnp.dtype(issued) == jnp.float32 else rates.tensor
 
 
 def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[float, float],
@@ -130,7 +146,7 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     (`handoff_steps`), its `fixed_up` partials' bytes (each tile's fp32 block) and whether its family's walk
     is scoped to its block, which a balanced tail launches persistent (`mosaic.Family.walks_scoped`), each
     priced by `tail.balanced`; None where the target states no rate or walking beats balancing."""
-    step, rate = step_seconds(tiles, target, itemsizes), target.memory_rate
+    step, rate = step_seconds(tiles, target, itemsizes, issued=dtype), target.memory_rate
     pairs = programs // tiles.cluster
     if step is None or rate is None or pairs <= 0:
         return None
@@ -140,7 +156,8 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     traffic = tail_of.Traffic(grid, tiles.grid_block_n, tile_rows(tiles, family) * tiles.block_k * left,
                               tiles.block_n * tiles.block_k * right, step, mp, rate, target.l2_bytes)
     return tail_of.balanced(grid[0] * grid[1], steps, pairs, traffic,
-                            handoff_steps=handoff_steps(tiles, target, itemsizes), scoped=family.walks_scoped,
+                            handoff_steps=handoff_steps(tiles, target, itemsizes, issued=dtype),
+                            scoped=family.walks_scoped,
                             partial_bytes=tile_rows(tiles, family) * tile_columns(tiles, family) * 4)
 
 
@@ -165,17 +182,23 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     # Its partials' workspace is the launch's beside its operands and output, no more than the reference's
     # (`GpuTarget.reference_workspace`): a GH200's 128 x 256 tiles' over 132 programs, 33 MiB, held past
     # cuBLAS's 32 (M-NG-45b's 34.6 MB temporaries a cell, row 12850).
-    if not within_workspace(target, math.prod(tail_workspace(tiles, family, programs)) * 4):
+    tail = balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    held = None if tail is None else math.prod(tail_workspace(tiles, family, programs, tail)) * 4
+    if held is None or not within_workspace(target, held):
         return None
-    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
+    return tail
 
 
-def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int) -> tuple[int, ...]:
+def tail_workspace(tiles: "Tiles", family: mosaic.Family, programs: int,
+                   tail: tail_of.Tail) -> tuple[int, ...]:
     """A balanced tail's fp32 partials' shape, the one its planner bounds (`dense_tail`) and its launches
-    allocate (`mosaic_gpu._workspace`): each of a launch's `programs` (cluster pairs of `tiles.cluster`), two
-    tiles' (the one its range starts inside and the one it walks the first step of), each consumer's share
-    of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`)."""
-    return (tiles.cluster, programs // tiles.cluster, 2, tiles.warpgroups, tiles.share,
+    allocate (`mosaic_gpu._workspace`): a slot each of a launch's `programs` (cluster pairs of
+    `tiles.cluster`), the partial of the tile its range starts inside, then one each of the tail's tiles
+    (`tail.Tail.tiles`), its first program's partial of it (`Family.fixed_up`'s `firsts`), each a consumer's
+    share of the tile's rows by its columns (a tail's tile is no ping-pong one, `fixes_up`): a slot a tile,
+    not a second one a program, where the tail's tiles are fewer than its programs (a GH200's 128 x 256
+    outlier's 66 pairs and 14 tiles: 21 MiB where two a program held 33, past cuBLAS's 32, NG29)."""
+    return (tiles.cluster, programs // tiles.cluster + tail.tiles, tiles.warpgroups, tiles.share,
             tile_columns(tiles, family))
 
 
@@ -187,11 +210,11 @@ def within_workspace(target: generation.GpuTarget | None, held: float) -> bool:
     return bound is None or held <= bound
 
 
-def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
+def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int], *, issued) -> float:
     """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
     of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its rate is
     unmeasured."""
-    step, handoff = step_seconds(tiles, target, itemsizes), target.handoff_seconds
+    step, handoff = step_seconds(tiles, target, itemsizes, issued=issued), target.handoff_seconds
     return 0.0 if step is None or handoff is None else handoff / step
 
 
@@ -221,13 +244,43 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
     return min([1, *filter(walk.holds, counts)], key=walk.seconds)
 
 
+def hook_chunk(family: mosaic.Family, share: int, columns: int, dtypes: tuple = (), forms: tuple = (),
+               staging: tuple[int, int] | None = None, *, local: bool = False) -> int:
+    """The columns an epilogue's hook takes at a time on `family` (`hooks.read_out`, the one decision its
+    kernel and its register model read): where the hook is column-local (`local`, `hooks.ColumnLocal`) and
+    its family's stores take chunks (`mosaic.Transport.stores_chunks`), a hook's chunk
+    (`Issuer.hook_columns`) widened to whole staged chunks of each of its outputs (each output's own
+    `stores.output_staging` of its dtype and form, `share` rows a consumer's), so a chunk's values fill whole
+    buffers; elsewhere, an output a form narrows or transposes among them, or no such chunk dividing the
+    tile, the issuer's own read-out (`chunk_columns`: a register accumulator's whole, tcgen05's 64)."""
+    from dew.nn.kernels.templates import stores
+
+    native = family.chunk_columns(columns)
+    chunk = family.hook_columns(columns)
+    forms = forms or (None,) * len(dtypes)
+    if (not local or not family.stores_chunks or chunk >= native or not dtypes
+            or any(form is not None and (form.narrowed or form.transposed) for form in forms)):
+        return native
+    piece = native
+    for dtype, form in zip(dtypes, forms, strict=True):
+        dtype = jnp.dtype(dtype)
+        packed = () if form is None else (stores.Output((share, columns), dtype, divisor=form.divisor),)
+        if stores.staging_refusal(columns, (dtype,), staging, piece=piece, packed=packed) is not None:
+            return native
+        chunk = math.lcm(chunk, stores.output_staging(columns, (dtype,), staging, piece=piece,
+                                                      packed=packed)[0])
+    return chunk if chunk < native and native % chunk == 0 else native
+
+
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
                        vectors: int = 0, tiles: tuple = (), has_hook: bool = False,
-                       staging: tuple[int, int] | None = None) -> int:
+                       staging: tuple[int, int] | None = None, hooked: int | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
     the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982). `tiles`,
     the dtypes of the `[rows, columns]` tiles beside the accumulator's chunk while its hook runs, each at the
-    width its issuer loads it in (`Issuer.side_bytes`, row 12689)."""
+    width its issuer loads it in (`Issuer.side_bytes`, row 12689). A hook's temporaries are a chunk's:
+    `hooked` columns where its kernel takes them so (`hook_chunk`), its issuer's read-out (`chunk_columns`)
+    elsewhere, beside the accumulator the mainloop's model holds whole."""
     from dew.nn.kernels.templates import resources, stores
 
     scalar = family.scalar_registers()
@@ -240,7 +293,8 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
 
     if not has_hook:
         return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
-    accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
+    chunk = family.chunk_columns(columns) if hooked is None else hooked
+    accumulator = -(-share * chunk // resources.THREADS)
     held = sum(-(-accumulator * family.side_bytes(dtype) // 4) for dtype in tiles)
     live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
     hook = max(0, resources.CONTROL_REGISTERS + vectors + held - scalar) + sum(live[1:])
@@ -334,14 +388,14 @@ class SplitWalk:
     partial_bytes: float = 0.0
     """One slice's fp32 partials of the output as its launch declares them (its rows padded, gathered or
     scattered), which a split launch holds `splits` of until their sum."""
-    workspace: float | None = None
-    """The most a launch holds beside its operands and output (`GpuTarget.reference_workspace`), which a
-    split's partials stay within (`best_splits`); None where the target states none."""
+    target: "generation.GpuTarget | None" = None
+    """The GPU the walk runs on, whose reference workspace a split's partials stay within (`best_splits`,
+    `within_workspace`); None where none is stated."""
 
     def holds(self, splits: int) -> bool:
-        """Whether `splits` slices' partials stay within the reference's workspace (`workspace`): one
+        """Whether `splits` slices' partials stay within the reference's workspace (`within_workspace`): one
         slice holds none, its tile summed in registers."""
-        return splits == 1 or self.workspace is None or splits * self.partial_bytes <= self.workspace
+        return splits == 1 or within_workspace(self.target, splits * self.partial_bytes)
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
@@ -423,13 +477,12 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
                      held * width * stored / bandwidth / step_seconds,
                      drift_horizon, drift_extra,
-                     held * width * 4.0 if partial_bytes is None else partial_bytes,
-                     None if target is None else target.reference_workspace)
+                     held * width * 4.0 if partial_bytes is None else partial_bytes, target)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
                        columns: int | None, held: int, operands: tuple, stored: float,
-                       multiprocessors: int, partial_bytes: float | None = None) -> dict:
+                       multiprocessors: int, issued, partial_bytes: float | None = None) -> dict:
     """A product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords): swapped
     (`Tiles.swapped`), its matrix the rows (`width`) over its `depth`, the call's `rows` its padded `columns`;
     multi-row-tile calls (`rows > groups * block_m`), all `rows` over `depth` (row 10151); else each
@@ -447,7 +500,7 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
                  'partial_rows': held}
     unswapped = dataclasses.replace(tiles, swapped=False)
     return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
-            'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
+            'step_seconds': step_seconds(unswapped, target, itemsizes, decoded, issued=issued),
             'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
             'partial_bytes': partial_bytes}
 
