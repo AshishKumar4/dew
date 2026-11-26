@@ -488,7 +488,8 @@ MOSAIC_SLOWER = frozenset({"sm80", "sm90"})
 until it does not (kernel-templates.md §7), a decode step at one row (row 12398), the slices' launch
 unchanged: a GH200's 2.4 to 4.7 times Triton's (M-NA-4-gh200 20261123T165603Z: bf16 K32768 d64 67.9
 against 14.5 us, fp16 K32768 d128 84.0 against 21.8), an A100's 1.4 to 3.9 times (M-NA-4-a100
-20261123T171841Z: bf16 K32768 d64 89.28 against 24.58 us, fp16 K32768 d64 60.96 against 15.58)."""
+20261123T171841Z: bf16 K32768 d64 89.28 against 24.58 us, fp16 K32768 d64 60.96 against 15.58). The default
+`generation.chosen(merge=...)` overrides (`_uses_mosaic`)."""
 
 
 def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None) -> bool:
