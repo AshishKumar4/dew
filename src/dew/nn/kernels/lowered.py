@@ -80,7 +80,7 @@ class CustomCall:
 
 
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None], *,
-             unrun: bool = False) -> list[tuple[T, float]]:
+             unrun: bool = False, every_branch: bool = False) -> list[tuple[T, float]]:
     """What `read` makes of each operation of a lowered program's StableHLO module, each once with the times
     it runs a call of the program, as `hlo_flops` weighs an executable's computations
     (`instrumentation.call_weights`): its function's runs from the entry (a nested jit's, a kernel
@@ -90,7 +90,9 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
     function's where its first call is (each lowered once, however many calls reach it), so a kernel's
     compile reports printed as it lowered (Mosaic GPU's resource estimates) come in this order. A function
     no run reaches (behind a loop of no trips, or no call at all) runs none and is left out, or with
-    `unrun` given at 0 times, as JAX lowers and compiles it all the same."""
+    `unrun` given at 0 times, as JAX lowers and compiles it all the same. With `every_branch`, each
+    conditional's every branch runs as often as the conditional (a run takes one, which no reading of the
+    program decides): the operations any run may reach, at the times they may run."""
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
     found: list[tuple[T, float]] = []
@@ -102,8 +104,11 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
         # each function's conditionals' largest branches in program order (`_Branches`).
         branches = _Branches(functions)
         callees: dict[str, dict[str, float]] = {name: {} for name in functions}
+        def chosen(name: str) -> Iterator[int] | None:
+            return None if every_branch else branches.of(name)
+
         for name, function in functions.items():
-            for operation, times in _walked(function, 1.0, branches.of(name)):
+            for operation, times in _walked(function, 1.0, chosen(name)):
                 if operation.name == "func.call":
                     callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
                     callees[name][callee] = callees[name].get(callee, 0.0) + times
@@ -114,7 +119,7 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
             entered.add(name)
             if not runs.get(name, 0.0) and not unrun:
                 return
-            for operation, times in _walked(functions[name], runs.get(name, 0.0), branches.of(name)):
+            for operation, times in _walked(functions[name], runs.get(name, 0.0), chosen(name)):
                 if (made := read(operation)) is not None:
                     found.append((made, times))
                 if operation.name == "func.call":
@@ -129,7 +134,7 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
     return found
 
 
-def _walked(operation: ir.Operation, times: float, largest: Iterator[int]
+def _walked(operation: ir.Operation, times: float, largest: Iterator[int] | None
             ) -> Iterator[tuple[ir.Operation, float]]:
     """`operation`, which runs `times`, and every operation its regions hold, in program order, each with
     the times it runs: a `stablehlo.while`'s condition as often as the loop, its body its trips more
@@ -137,9 +142,10 @@ def _walked(operation: ir.Operation, times: float, largest: Iterator[int]
     `stablehlo.case`'s or `stablehlo.if`'s regions) the one `largest` gives next (`_Branches.of`, its
     conditionals' in this order: the branch whose kernels state the most FLOPs) as often as the
     conditional and every other none, as `hlo_flops` counts a conditional's largest branch: it runs one;
-    any other region (a reduction's body) as often as its operation."""
+    with no `largest`, every branch as often as the conditional; any other region (a reduction's body) as
+    often as its operation."""
     yield operation, times
-    chosen = next(largest) if _branched(operation) else None
+    chosen = next(largest) if largest is not None and _branched(operation) else None
     for index, region in enumerate(operation.regions):
         within = times
         if operation.name == "stablehlo.while" and index == 1:
@@ -275,7 +281,7 @@ def _constant(value: ir.Value) -> int | None:
 
 
 def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None], *,
-                   unrun: bool = False) -> list[tuple[T, float]]:
+                   unrun: bool = False, every_branch: bool = False) -> list[tuple[T, float]]:
     """What `read` makes of each custom call a lowered program makes, given its target and its
     operation, in the order JAX lowered them, each once with the times it runs (`_read`, `unrun` its):
     the calls it makes something of."""
@@ -284,7 +290,7 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
             return None
         return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
 
-    return _read(lowered, call, unrun=unrun)
+    return _read(lowered, call, unrun=unrun, every_branch=every_branch)
 
 
 def read_operations[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
@@ -336,6 +342,13 @@ def kernel_launches(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list
     layer that calls a kernel lowered once, and every trip of a loop around it; infinite where a loop
     around it states no static count."""
     return _read_calls(lowered, kernel_call, unrun=unrun)
+
+
+def reached_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """The kernel calls some run of a lowered program may make (`_read` with `every_branch`): each in a
+    function a call reaches, a conditional's every branch alike (a run takes one, which no reading of the
+    program decides), none behind a loop of no trips, which JAX lowers all the same."""
+    return [call for call, times in _read_calls(lowered, kernel_call, every_branch=True) if times > 0]
 
 
 def kernel_call(target: str, operation: ir.Operation) -> KernelCall | None:
