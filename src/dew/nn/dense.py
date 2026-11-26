@@ -485,7 +485,7 @@ class Dense(_LinearEnvelope, nn.Dense):
 
 
     @nn.nowrap
-    def _packed(self, inputs: Array, matrix) -> jax.Array:
+    def _packed(self, inputs: Array, matrix: NvFp4 | TernaryWeights) -> jax.Array:
         """The layer over its packed kernel (`packed_matrix`, a checkpoint's weight served as its codes):
         an NVFP4 matrix's product (`gemm.nvfp4_product`, row 8550: the inputs rounded to bfloat16, each code
         times its block's scale exact, the sums in fp32 and the matrix's tensor scale after) or a BitNet
@@ -509,8 +509,10 @@ class Dense(_LinearEnvelope, nn.Dense):
                 if self.use_bias else None)
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
         rows = jnp.reshape(inputs, (-1, width))
-        product = ternary_weight_product if isinstance(matrix, TernaryWeights) else nvfp4_product
-        summed = product(rows, matrix, out_dtype=jnp.float32)
+        if isinstance(matrix, TernaryWeights):
+            summed = ternary_weight_product(rows, matrix, out_dtype=jnp.float32)
+        else:
+            summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
         if bias is not None:
             summed = summed + jnp.asarray(bias, jnp.float32)
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
