@@ -1452,6 +1452,8 @@ class _Seam:
         leaves, structure = _pytree.tree_flatten((args, kwargs))
         tensors = [index for index, leaf in enumerate(leaves) if _is_tensor(leaf)]
 
+        drew: list[bool] = []
+
         def run(key, *values):
             # The layer's draws (its dropout) from the key it is handed, and its successor handed back: the
             # program's own input and output, so a recompute draws what the forward drew (row 13147).
@@ -1460,10 +1462,16 @@ class _Seam:
             for index, value in zip(tensors, values, strict=True):
                 given[index] = env.j2t_iso(value)
             args, kwargs = _pytree.tree_unflatten(given, structure)
-            return env.t2j_iso(forward(*args, **kwargs)), env.prng_key
+            out = env.t2j_iso(forward(*args, **kwargs))
+            drew.append(env.prng_key is not key)
+            return out, env.prng_key
 
-        out, env.prng_key = nested(run, traced=programs.append)(
-            env.prng_key, *(env.t2j_iso(leaves[index]) for index in tensors))
+        held = env.prng_key
+        out, successor = nested(run, traced=programs.append)(
+            held, *(env.t2j_iso(leaves[index]) for index in tensors))
+        # A layer that drew moves the trace's key on; one that drew nothing leaves it the key it was, so the
+        # trace reads no draw (`TorchGraph.traced`'s `keyed`).
+        env.prng_key = successor if any(drew) else held
         return env.j2t_iso(out)
 
     def replayed(self, output, loop: Loop):
