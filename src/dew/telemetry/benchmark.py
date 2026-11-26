@@ -512,7 +512,8 @@ def _program_of(fn: Callable) -> jax.stages.Compiled:
 
 def _module_of(program: jax.stages.Compiled) -> str:
     """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its HLO's own."""
-    found = re.match(r"\s*HloModule\s+([\w.]+)", program.as_text())
+    text = program.as_text()
+    found = None if text is None else re.match(r"\s*HloModule\s+([\w.]+)", text)
     if found is None:
         raise AmbiguousCapture(f"{program} states no module name")
     return found.group(1)
