@@ -413,6 +413,14 @@ class VisionTransformer(nn.Module):
             "item": jnp.where(valid, 1, 0),
             "window": None if windows is None else jnp.where(valid, windows + 1, 0),
         }
+        if tokens.count and not images:
+            # A packed row is one image here, its special tokens (a class token, registers) in its frame.
+            if set(lay.attention) != {"full"} or set(lay.order) != {"patches"} or any(lay.sinks):
+                raise ValueError("a packed image's special tokens join its patches in full layers alone, in "
+                                 "their own order and with no sinks")
+            joined = jnp.ones((segments["full"].shape[0], tokens.count), segments["full"].dtype)
+            segments["full"] = jnp.concatenate(
+                [joined, segments["full"]] if tokens.cls == "first" else [segments["full"], joined], axis=1)
         current = "patches"
         for index in range(lay.depth):
             wanted = lay.order[index]
