@@ -1659,3 +1659,20 @@ def test_an_fp16_adapted_products_factor_gradient_past_fp16s_range_takes_wide_op
     truth = np.full((depth, rows), 2.0 ** -12) @ scaled
     assert scaled.max() > np.finfo(np.float16).max
     np.testing.assert_array_equal(np.asarray(d_a, np.float64), truth.astype(np.float16).astype(np.float64))
+
+
+def test_a_bf16_adapted_products_factor_gradient_keeps_a_cancellation_of_its_wide_cotangent():
+    """A bf16 adapted product whose rank factor's gradient sums two scaled cotangents that cancel below
+    bf16's rounding of either (rows of one, `b` [[1, 2^-8]], cotangents [1, 127/128] and [-1, -1], scale
+    129/128): the gradient is -2^-15 - 2^-22 exactly, the wide cotangent's sum, where rounding each scaled
+    term to bf16 first reads -2^-7 (row 1304's review)."""
+    from dew.nn.kernels import low_rank
+
+    bf16 = jnp.bfloat16
+    x, w = jnp.ones((2, 1), bf16), jnp.zeros((1, 2), bf16)
+    b = jnp.asarray([[1.0, 2.0 ** -8]], bf16)
+    dy = jnp.asarray([[1.0, 127 / 128], [-1.0, -1.0]], bf16)
+    _, pull = jax.vjp(lambda a: low_rank.low_rank(x, w, a, b, 129 / 128, out_dtype=bf16),
+                      jnp.ones((1, 1), bf16))
+    (d_a,) = pull(dy)
+    assert float(np.asarray(d_a, np.float64)[0, 0]) == -2.0 ** -15 - 2.0 ** -22

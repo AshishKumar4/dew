@@ -106,13 +106,13 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                                               precision=at_work, preferred_element_type=wide)
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
-    # Narrow rows' cotangents (bf16, fp16) take the narrow products every call in range takes, as the adapter
-    # apart multiplies them (row 1304: fp32 operands at an exact precision made the factors' gradients the
-    # fused training's loss, growing with the rank, M-EM-56); `held`, whether the scaled update's cotangent
-    # is a normal value of that width or zero, else each product of it takes the wide operands.
+    # Narrow rows' products take narrow operands where no digit is lost (row 1304: fp32 operands at an exact
+    # precision made the factors' gradients the fused training's loss, growing with the rank, M-EM-56);
+    # `held`, whether the scaled update's cotangent is a normal value of the narrow width or zero, else the
+    # input gradient's product of it takes the wide operands.
     narrow = jnp.dtype(work).itemsize < 4
     held = None
-    if narrow and (wants_lhs or wants_a):
+    if narrow and wants_lhs:
         size, limits = jnp.abs(scaled), jnp.finfo(work)
         held = jnp.all((size == 0) | ((size <= limits.max) & (size >= limits.tiny)))
     if wants_lhs:
@@ -157,11 +157,18 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                       precision=at, interpret_on_cpu=interpret_on_cpu)
 
     if wants_a:
-        if held is None:
-            d_a = factor(lhs, scaled, wide, kept, a)
+        if jnp.dtype(work) == jnp.dtype(jnp.bfloat16) and jnp.dtype(lhs.dtype) == jnp.dtype(jnp.bfloat16):
+            # bf16 rows times the wide `scaled` whole: `scaled` as three bf16 terms summing to it exactly
+            # (bf16 holds fp32's range; each term the last one's rounding residual), multiplied as one
+            # product of three times the rank's columns, every product exact and each block's fp32 sum
+            # added: the fp32 operands' product the narrow arithmetic computes in one pass of the rows
+            # (row 1304's review: `scaled` rounded once lost a cancellation the fp32 sum keeps).
+            terms = _bf16_terms(scaled)
+            blocks = factor(lhs, jnp.concatenate(terms, axis=-1), work, precision, a)
+            width = scaled.shape[-1]
+            d_a = sum(blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3))
         else:
-            d_a = jax.lax.cond(held, lambda: factor(lhs, scaled, work, precision, a),
-                               lambda: factor(lhs, scaled, wide, kept, a))
+            d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:
         # `t` holds the scale already: tᵀ · dy is the factor's gradient whole; `t` in the rows' dtype is the
         # operand the forward multiplied, in range wherever that product was.
@@ -173,6 +180,15 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
                       zip((d_kernel, d_a, d_b, d_scale), (kernel, a, b, scale), strict=True))
     d_lhs, gradients = with_gradients_formed(d_lhs, gradients)
     return d_lhs, *gradients, zero_from_primal(group_sizes)
+
+
+def _bf16_terms(value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`value` (fp32) as three bf16 terms whose fp32 sum is it exactly: each the rounding of the last's
+    residual, which fp32 holds exactly (a residual of a bf16 rounding has at most 16 of fp32's digits)."""
+    high = value.astype(jnp.bfloat16)
+    rest = value - high.astype(value.dtype)
+    middle = rest.astype(jnp.bfloat16)
+    return high, middle, (rest - middle.astype(value.dtype)).astype(jnp.bfloat16)
 
 
 def _kept(precision: PrecisionLike) -> PrecisionLike:

@@ -379,10 +379,13 @@ class LinearProducts(nn.Module):
         interceptor that changes that answers for itself: `dew.lora`'s adds its factors' update, and a
         frozen FP8 site's is its codes decoded. `get_variable` hands back the box the kernel was drawn in
         (`nn.with_logical_partitioning`)."""
-        from dew.nn.kernels.formats import NvFp4
+        from dew.nn.kernels.formats import NvFp4, TernaryWeights
 
         module = getattr(self, name)
         kernel = packed_matrix(module, "kernel", lambda: module.get_variable("params", "kernel"))
+        if isinstance(kernel, TernaryWeights):
+            # A BitNet b1.58 matrix's codes times its scale (row 1464).
+            return kernel.decoded(jnp.float32)
         return packed_values(kernel) if isinstance(kernel, NvFp4) else meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
@@ -391,7 +394,13 @@ class LinearProducts(nn.Module):
         gradients (`quantized_products`; a weight-only rule leaves it linear, by its quantized matrix),
         read where `qwix`, and as a method interceptor answers for itself (a checkpoint's input
         quantization, read where `input_scales`, and frozen FP8 products, `dew.lora`'s dropout on a
-        training forward)."""
+        training forward). A packed BitNet b1.58 kernel's layer quantizes its input a token at a time, always
+        (`dense.Dense._packed`, row 1464)."""
+        from dew.nn.kernels.formats import TernaryWeights
+
+        module = getattr(self, name)
+        if isinstance(packed_matrix(module, "kernel", lambda: None), TernaryWeights):
+            return True
         return qwix and quantized_products(self, name).inputs
 
     def linear_product(self, name: str) -> bool:

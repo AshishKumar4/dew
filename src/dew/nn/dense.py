@@ -19,9 +19,11 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
+import dataclasses
 import functools
 import importlib.util
 import inspect
+import math
 import sys
 import types
 from collections.abc import Callable, Iterable, Mapping
@@ -508,9 +510,12 @@ class Dense(_LinearEnvelope, nn.Dense):
                                             else self.kernel_axes[-1:]), (self.features,), self.param_dtype)
                 if self.use_bias else None)
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
-        rows = jnp.reshape(inputs, (-1, width))
+        # The rows counted, not inferred: a packed matrix of no depth takes inputs of no width.
+        rows = jnp.reshape(inputs, (math.prod(jnp.shape(inputs)[:-1]), width))
         if isinstance(matrix, TernaryWeights):
-            summed = ternary_weight_product(rows, matrix, out_dtype=jnp.float32)
+            # Frozen, its scale too: the product differentiates in its scale (`ternary_weight_product`).
+            frozen = dataclasses.replace(matrix, scale=jax.lax.stop_gradient(matrix.scale))
+            summed = ternary_weight_product(rows, frozen, out_dtype=jnp.float32)
         else:
             summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
         if bias is not None:
