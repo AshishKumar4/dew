@@ -1532,7 +1532,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     no test of its files (a GPU lane's prepare, `recorded` false) records no row. A process of the files under
     other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the same cut of them, its rows and
     their records named apart (`varied`); `judged` grades its rows first. `written`: each earlier process's
-    checkout writes; `publish_by`: when its records' writes end by (a dry prepare's shared budget, row 13014).
+    checkout writes; `publish_by`: when its records' writes end by (a dry prepare's shared budget, row 13014)."""
     began = time.monotonic()
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
