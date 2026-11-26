@@ -361,11 +361,12 @@ def _backward_weights_truth(logits, peak, total, *, keys_first):
 
 def _dropped_cotangents(logits, products, peak, total, anchor, delta, keep, seen, at_anchor, *, keys_first):
     return derived_cotangents(keys_first=keys_first, dropped=True, masked=True, anchored=True).mapped(
-        {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor, "delta": delta,
-         "keep": keep, "seen": seen, "at_anchor": at_anchor})
+        {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor,
+         "delta": delta, "keep": keep, "seen": seen, "at_anchor": at_anchor})
 
 
-def _dropped_cotangents_truth(logits, products, peak, total, anchor, delta, keep, seen, at_anchor, *, keys_first):
+def _dropped_cotangents_truth(logits, products, peak, total, anchor, delta, keep, seen, at_anchor, *,
+                              keys_first):
     exponential, weights = _backward_weights_truth(logits, peak, total, keys_first=keys_first)
     centered = jnp.where(at_anchor, 0.0, products * keep - _per_query(anchor, keys_first))
     return exponential, weights, jnp.where(seen, weights * (centered - _per_query(delta, keys_first)), 0.0)
@@ -413,7 +414,9 @@ def _attention_recompute_cases(*, keys_first, dropped):
         tile = jax.ShapeDtypeStruct((keys, rows) if keys_first else (rows, keys), jnp.float32)
         query = jax.ShapeDtypeStruct((rows,), jnp.float32)
         mask = jax.ShapeDtypeStruct(tile.shape, jnp.bool_)
-        return ((tile, tile, query, query, query, query, tile, mask, mask) if dropped else (tile, query, query))
+        if dropped:
+            return tile, tile, query, query, query, query, tile, mask, mask
+        return tile, query, query
 
     return Cases(tuple(of(rows, keys) for rows, keys in ((32, 64), (64, 128))), draw, seeds=8,
                  policies=("default",))

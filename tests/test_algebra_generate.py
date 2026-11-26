@@ -80,6 +80,33 @@ def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, o
                              f"{name} ({arm}, {policy}, {index})", seeds=declaration.cases.seeds)
 
 
+def test_shared_component_keeps_primitive_sequences_and_live_results_in_each_layout():
+    from dew.algebra import _component_sharing, terms
+
+    def tile(value, row, *, axis, keep_product):
+        extended = jax.lax.broadcast_in_dim(row, value.shape, (axis,))
+        product = value * extended
+        base = jnp.abs(product + value)
+        root = jnp.sqrt(base)
+        shifted = root + extended
+        result = jax.lax.logistic(shifted)
+        return (result, product) if keep_product else (result,)
+
+    layouts = {"row_first": ((7, 13), 0, False), "key_first": ((13, 7), 1, True)}
+    arguments, separate = {}, {}
+    for name, (shape, axis, keep_product) in layouts.items():
+        arguments[name] = (jax.ShapeDtypeStruct(shape, jnp.bfloat16),
+                           jax.ShapeDtypeStruct((shape[axis],), jnp.bfloat16))
+        fn = functools.partial(tile, axis=axis, keep_product=keep_product)
+        separate[name] = printed.source(jax.make_jaxpr(fn)(*arguments[name]), name, borrow_shapes=True)[0]
+    shared = _component_sharing.shared(separate)
+    assert len(shared) == len(separate) + 1
+    for name, operands in arguments.items():
+        original = jax.make_jaxpr(printed.loaded(separate[name], name))(*operands)
+        composed = jax.make_jaxpr(printed.loaded("\n\n".join(shared.values()), name))(*operands)
+        assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
+
+
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
     (example,) = component_cases.ROUNDED.cases.operands[0]

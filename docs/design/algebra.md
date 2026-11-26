@@ -1406,9 +1406,10 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 ```
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
-its independent reference and its cases. The shared registry emits it without substituting an autodiff or
-lower-price implementation. Larger template and surrogate declarations will group such components and
-their trees and flags. The pilots add no run-time dispatch to the algebra engine.
+its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
+primitive sequences share a generated helper, with shapes and broadcast axes passed as static arguments.
+Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
+to the component's program.
 
 - **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
