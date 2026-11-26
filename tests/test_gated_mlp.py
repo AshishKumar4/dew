@@ -641,8 +641,9 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(wanted))
 
     def held(module):
-        residuals = jax.ad_checkpoint.saved_residuals(lambda v, r: module.apply(v, r), params, x)
-        return [aval for aval, _ in residuals if math.prod(aval.shape) == tokens * hidden]
+        # The values its pullback holds (`jax.vjp`'s function a pytree of its residuals) of the hidden's size.
+        _, pull = jax.vjp(lambda v, r: module.apply(v, r), params, x)
+        return [leaf.shape for leaf in jax.tree.leaves(pull) if math.prod(leaf.shape) == tokens * hidden]
 
     # Apart, the gate's and the up projection's outputs; packed, their one `[tokens, 2, hidden]` output.
     assert len(held(layer)) == (0 if packed else 2), held(layer)
