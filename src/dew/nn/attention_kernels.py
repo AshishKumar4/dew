@@ -707,7 +707,8 @@ class Timed:
     `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
     `causal` or full (any of each where None), windowed where `windows`, else no window; and its calls of
     packed documents `documents`: these same calls (True), none (False), or the calls those receipts timed
-    (a `Timed` of their own)."""
+    (a `Timed` of their own); where a receipt timed one call alone, its `rows`, query and key `heads` and
+    `dtypes` exactly (any where None)."""
 
     shortest: int
     longest: int
@@ -716,6 +717,9 @@ class Timed:
     causal: bool | None = None
     windows: bool = True
     documents: "bool | Timed" = True
+    rows: tuple[int, ...] | None = None
+    heads: tuple[tuple[int, int], ...] | None = None
+    dtypes: tuple[str, ...] | None = None
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls: none holds a separable bias
@@ -730,7 +734,10 @@ class Timed:
                 and (self.groups is None or case.heads // case.kv_heads in self.groups)
                 and (self.causal is None or case.causal == self.causal)
                 and (self.windows or case.window is None)
-                and (case.documents is None or self.documents is True))
+                and (case.documents is None or self.documents is True)
+                and (self.rows is None or case.rows in self.rows)
+                and (self.heads is None or (case.heads, case.kv_heads) in self.heads)
+                and (self.dtypes is None or case.dtype.name in self.dtypes))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
@@ -740,7 +747,10 @@ MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     ('sm100', CallKind.of(jnp.bfloat16)): Timed(
         256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
         documents=Timed(12288, 12288, (256,), (4,), causal=True, windows=False)),
-    ('sm120', CallKind.of(jnp.bfloat16)): Timed(4096, 4096, (64,), (4,), windows=False, documents=False),
+    # Its one call, exactly: its full training no receipt timed (the template's failed to compile there).
+    ('sm120', CallKind.of(jnp.bfloat16)): Timed(4096, 4096, (64,), (4,), causal=True, windows=False,
+                                                documents=False, rows=(1,), heads=((32, 8),),
+                                                dtypes=("bfloat16",)),
 }
 """The shapes each generation's DECLARED receipts timed for a kind of call, exactly; a call outside them is
 a cell none declares (`AttentionCase.cell`), which takes the template. On a B200 a 16-bit call's: from 256
@@ -756,9 +766,10 @@ FlashAttention against the template from 1024 to 32768 tokens there, holds no su
 out, neither half's survive, its record's provenance correction of 2026-11-20); M-NA-44 times that sweep,
 and its receipt replaces this placeholder. An fp32 call's: up to 1024 tokens, a training step's attention
 at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100).
-On an RTX PRO 6000 a 16-bit call's: 1 x 4096 at width 64, 32 query heads over 8, causal and full, its
-forward and the causal training step (M-NA-35-prefill-g4: FlashAttention-2 against the template, full
-forward 420.9 against 537.5 us, causal 271.4 against 311.0, the causal step 935.6 against 1501.1); a step at
+On an RTX PRO 6000 a bf16 call's: 1 x 4096 at width 64, 32 query heads over 8, causal, its forward and its
+training step, exactly (M-NA-35-prefill-g4: FlashAttention-2 against the template, causal 271.4 against
+311.0 us, the causal step 935.6 against 1501.1; its full forward 420.9 against 537.5, its full training no
+receipt timing, as a kernel is chosen for both before the call is differentiated); a step at
 width 256 measured faster on FlashAttention-2 (G4-ET-ATT-SCOREBOARD, 2.72 against 4.55 ms) states no shape
 of its call and declares none."""
 

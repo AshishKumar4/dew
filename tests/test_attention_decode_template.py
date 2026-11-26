@@ -1325,19 +1325,40 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
 
 
 @INTERPRETS
-def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
-    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100 (132
-    multiprocessors) launches 64 programs (a row's key head's packed query rows each), its parts stacked
-    within their rows (`MosaicForward.parts`), short of the device: its plan splits the keys. Counted as
-    parts times programs (2026-11-26 audit), the step filled the device on paper (192) and walked its keys
-    in one slice."""
-    keys = 4096
-    query = jnp.zeros((8, 1, 16, 64), jnp.float32)
-    key = jnp.zeros((8, keys, 8, 64), jnp.float32)
-    with generation.assumed("sm90"):
-        work, *_ = attention_decode.planned(query, key, key, template.spans(
-            1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32)), template.Hooks())
-    assert work and all(plan.slices > 1 for plan in work.values()), work
+def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted():
+    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100: at an
+    explicit tile its planner's programs a slice (`attention_decode.launch_programs`, a row's key head's
+    packed query rows each, its parts stacked within their rows) times its slices are its walk's launch
+    grid, 64 a slice, short of the device's 132, where counted with its parts the step filled it on paper
+    (2026-11-26 audit); and the step as it plans itself is on par with the reference path (check 1)."""
+    keys, heads, kv_heads = 4096, 16, 8
+    spans = template.spans(1, keys, 8, lengths=jnp.full((8,), keys, jnp.int32))
+    query = jnp.zeros((8, 1, heads, 64), jnp.float32)
+    key = jnp.zeros((8, keys, kv_heads, 64), jnp.float32)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma")
+    with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+        work, rows, *_ = attention_decode.planned(query, key, key, spans, template.Hooks())
+        traced = jax.make_jaxpr(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True))(
+            query, key, key).jaxpr
+    walks = [math.prod(equation.params["grid_mapping"].grid) for equation in programs.equations(traced)
+             if equation.primitive.name == "pallas_call"
+             and "forward" in str(equation.params.get("name_and_src_info", ""))]
+    assert walks == [attention_decode.launch_programs(rows, tiles) * work["plain"].slices], (walks, work)
+    assert attention_decode.launch_programs(rows, tiles) == 64
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (8, 1, heads, 64), jnp.float32),
+                *(jax.random.normal(stream, (8, keys, kv_heads, 64), jnp.float32) for stream in streams[1:]))
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 4096 keys", seeds=SEEDS)
 
 
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
