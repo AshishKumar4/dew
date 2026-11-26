@@ -13,7 +13,6 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import Tracer
 from jax.custom_derivatives import SymbolicZero
 from jax.typing import DTypeLike
 
@@ -484,8 +483,7 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 class TernaryWeights:
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
-    absmean/per-column/per-group `scale` fp32, each entry zero or a finite normal (`_scale_admitted`,
-    row 13340), and `form` digest."""
+    absmean/per-column/per-group `scale` fp32, and `form` digest."""
     words: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
@@ -495,8 +493,7 @@ class TernaryWeights:
     def of(cls, weights: jax.Array | np.ndarray, *,
            scale: jax.Array | np.ndarray | float | None = None) -> "TernaryWeights":
         """Quantize `weights` (`[..., depth, width]`, `depth % 256 == 0`) to BitNet b1.58 `{-1, 0, +1}`
-        under absmean `scale` (computed automatically when None, at least 1e-5) and pack into staged
-        `uint32` words; a given scale neither zero nor a finite normal refused (`_scale_admitted`)."""
+        under absmean `scale` (computed automatically when None) and pack into staged `uint32` words."""
         source = jnp.asarray(weights, jnp.float32)
         if source.ndim not in (2, 3) or source.shape[-2] % TERNARY_STAGE != 0:
             raise ValueError(
@@ -511,10 +508,7 @@ class TernaryWeights:
                 safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
                 absmean = peak * jnp.mean(abs_w / safe_peak, axis=(-2, -1), keepdims=(source.ndim == 3))
                 scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
-                cls._scale_admitted(scale_arr)  # a nonfinite weight's NaN or infinite absmean
         else:
-            # A given scale checked as given, before JAX stages it (a closed-over host value under `jit`).
-            cls._scale_admitted(scale)
             scale_arr = jnp.asarray(scale, jnp.float32)
         scale_checked(scale_arr.shape, source.shape)
         quantized = jnp.clip(jnp.round(source / jnp.where(scale_arr > 0, scale_arr, jnp.float32(1.0))),
@@ -524,43 +518,6 @@ class TernaryWeights:
         staged = codes[..., ternary_staged_rows(source.shape[-2]), :]
         packed_words = ternary_packed(jnp.swapaxes(staged, -1, -2))
         return cls(packed_words, scale_arr, ternary_form_version())
-
-    @staticmethod
-    def _scale_admitted(scale, *, agreeing: bool = True) -> None:
-        """Refuse an fp32 `scale` holding an entry neither zero nor a finite normal (a subnormal, an
-        infinity, a NaN), read on the host: its products then normal wherever their values are, as a
-        process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). Each rank reads its own
-        shards; a scale spanning every process is refused on every rank where one refuses it (`agreed`:
-        each rank holds it, so each calls this), none raising alone, and one on some processes but not all
-        refused on each; read on this rank alone where its caller agrees around it (not `agreeing`). A traced
-        scale is checked where concrete."""
-        if isinstance(scale, Tracer):
-            return
-        # The processes holding it, the same set on every rank (its sharding's): several of them agree.
-        owners = ({device.process_index for device in scale.sharding.device_set}
-                  if isinstance(scale, jax.Array) else set())
-        if agreeing and 1 < len(owners) < jax.process_count():
-            raise ValueError(f"a TernaryWeights scale on {len(owners)} of {jax.process_count()} processes: "
-                             "its admission agrees across the whole pool: place it on one process or all")
-        spans = agreeing and len(owners) > 1
-        pieces = ([shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array)
-                  else [scale])
-
-        def scanned() -> None:
-            for piece in pieces:
-                held = np.abs(np.asarray(piece, np.float32))
-                refused = ~((held == 0) | (np.isfinite(held) & (held >= np.finfo(np.float32).tiny)))
-                if refused.any():
-                    raise ValueError(f"TernaryWeights scale {held[refused].flat[0]!r} is neither zero nor a "
-                                     "finite normal fp32 (row 13340): serve these weights unpacked, or pack "
-                                     "them at a normal scale (`TernaryWeights.of`)")
-
-        if spans:
-            from dew._coordination import agreed
-
-            agreed("ternary scale", scanned)
-        else:
-            scanned()
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -572,14 +529,9 @@ class TernaryWeights:
         return (*groups, 16 * words, width)
 
     def checked(self, form=None) -> "TernaryWeights":
-        """Verify stored `form` version (every addressable shard; a traced one where concrete), scale shape
-        and its zero or finite normal entries (`_scale_admitted`) match this Dew's encoder. Given the
-        gathered `form` a collective restore hands it, its scale is read on this rank alone, the restore
-        agreeing on every leaf's outcome at once (`checkpoints._packed_checked`)."""
-        if not isinstance(self.form if form is None else form, Tracer):
-            _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
+        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
+        _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
         scale_checked(jnp.shape(self.scale), self.shape)
-        self._scale_admitted(self.scale, agreeing=form is None)
         return self
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
