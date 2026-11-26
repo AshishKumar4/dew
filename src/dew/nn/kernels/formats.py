@@ -444,7 +444,7 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 class TernaryWeights:
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
-    absmean/per-column/per-group `scale` fp32, each entry zero or a finite normal (`scale_admitted`,
+    absmean/per-column/per-group `scale` fp32, each entry zero or a finite normal (`_scale_admitted`,
     row 13340), and `form` digest."""
     words: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
@@ -456,7 +456,7 @@ class TernaryWeights:
            scale: jax.Array | np.ndarray | float | None = None) -> "TernaryWeights":
         """Quantize `weights` (`[..., depth, width]`, `depth % 256 == 0`) to BitNet b1.58 `{-1, 0, +1}`
         under absmean `scale` (computed automatically when None, at least 1e-5) and pack into staged
-        `uint32` words; a given scale neither zero nor a finite normal refused (`scale_admitted`)."""
+        `uint32` words; a given scale neither zero nor a finite normal refused (`_scale_admitted`)."""
         source = jnp.asarray(weights, jnp.float32)
         if source.ndim not in (2, 3) or source.shape[-2] % TERNARY_STAGE != 0:
             raise ValueError(
@@ -472,9 +472,10 @@ class TernaryWeights:
                 absmean = peak * jnp.mean(abs_w / safe_peak, axis=(-2, -1), keepdims=(source.ndim == 3))
                 scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
         else:
+            # A given scale checked as given, before JAX stages it (a closed-over host value under `jit`).
+            cls._scale_admitted(scale)
             scale_arr = jnp.asarray(scale, jnp.float32)
         scale_checked(scale_arr.shape, source.shape)
-        cls.scale_admitted(scale_arr)
         quantized = jnp.clip(jnp.round(source / jnp.where(scale_arr > 0, scale_arr, jnp.float32(1.0))),
                              -1.0, 1.0)
         codes = jnp.where(quantized > 0, jnp.uint32(1),
@@ -484,12 +485,13 @@ class TernaryWeights:
         return cls(packed_words, scale_arr, ternary_form_version())
 
     @staticmethod
-    def scale_admitted(scale) -> None:
+    def _scale_admitted(scale) -> None:
         """Refuse an fp32 `scale` holding an entry neither zero nor a finite normal (a subnormal, an
-        infinity, a NaN), each addressable shard read on the host; a traced scale is checked where it is
-        concrete (`checked`, its product): its products then normal wherever their values are, as a process
-        that flushes a subnormal operand (XLA's CPU) forms them (row 13340)."""
-        if isinstance(scale, Tracer):
+        infinity, a NaN), read on the host: its products then normal wherever their values are, as a
+        process that flushes a subnormal operand (XLA's CPU) forms them (row 13340). A traced scale is
+        checked where it is concrete; one spanning processes where every rank agrees on its refusal (a
+        restore's `checkpoints._packed_checked`), none raising alone."""
+        if isinstance(scale, Tracer) or (isinstance(scale, jax.Array) and not scale.is_fully_addressable):
             return
         pieces = ([shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array)
                   else [scale])
@@ -511,11 +513,12 @@ class TernaryWeights:
         return (*groups, 16 * words, width)
 
     def checked(self, form=None) -> "TernaryWeights":
-        """Verify stored `form` version (every addressable shard), scale shape and its zero or finite normal
-        entries (`scale_admitted`) match this Dew's encoder."""
-        _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
+        """Verify stored `form` version (every addressable shard; a traced one where concrete), scale shape
+        and its zero or finite normal entries (`_scale_admitted`) match this Dew's encoder."""
+        if not isinstance(self.form if form is None else form, Tracer):
+            _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
         scale_checked(jnp.shape(self.scale), self.shape)
-        self.scale_admitted(self.scale)
+        self._scale_admitted(self.scale)
         return self
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:

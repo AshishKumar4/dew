@@ -587,7 +587,8 @@ def test_a_ternary_matrix_at_a_scale_neither_zero_nor_finite_normal_is_refused_w
     """A BitNet b1.58 matrix's fp32 scale is zero or a finite normal (row 13340): a subnormal one given to
     `TernaryWeights.of` is refused, as are an infinity and a NaN; so is a negative subnormal among a
     per-column scale's normal entries, packed under `jit` (its scale traced there) and checked concrete after
-    (`checked`, its restore's), and one a traced form's product meets concrete; zero and the least normal
+    (`checked`, its restore's), a closed-over host scale packed under `jit`, and a stored one an eager or a
+    traced form's product meets; zero and the least normal
     scale pack, where a process that flushes a subnormal operand (XLA's CPU) read its products as zeros."""
     weights = np.zeros((256, 2), np.float32)
     weights[0] = [1.0, -1.0]
@@ -598,8 +599,12 @@ def test_a_ternary_matrix_at_a_scale_neither_zero_nor_finite_normal_is_refused_w
     packed = jax.jit(lambda s: formats.TernaryWeights.of(weights, scale=s))(jnp.asarray(mixed))
     with pytest.raises(ValueError):
         packed.checked()
+    with pytest.raises(ValueError):
+        jax.jit(lambda: formats.TernaryWeights.of(weights, scale=np.float32(2.0 ** -127)))()
     normal = formats.TernaryWeights.of(weights, scale=np.float32(1.0))
     stored = dataclasses.replace(normal, scale=np.float32(2.0 ** -127))
+    with pytest.raises(ValueError):
+        gemm.ternary_weight_product(jnp.ones((1, 256), jnp.float32), stored, quantize_activations=False)
     with pytest.raises(ValueError):
         jax.jit(lambda form: gemm.ternary_weight_product(
             jnp.ones((1, 256), jnp.float32), dataclasses.replace(stored, form=form),
