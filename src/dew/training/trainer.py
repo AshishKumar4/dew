@@ -508,7 +508,7 @@ class Trainer(Generic[Loss, Effects]):
             deferred=waiting(opt_state))
         return state if not self.diloco else self.diloco.started(state, self.device_mesh)
 
-    def staged(self, state: TrainState) -> TrainState:
+    def _as_step(self, state: TrainState) -> TrainState:
         """`state` (`initial_state`'s, `stored`'s) held and placed as the step holds it, as `fit` starts."""
         return self._staging.supplied(self._staging.received(self.objective, state), self.shardings)[0]
 
@@ -524,7 +524,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _staged_start(self, initializer: Initializer | None = None, key: int | jax.Array | None = None
                       ) -> TrainState:
-        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`staged`): the
+        """`initial_state` as the step holds it, a stage-local run's layers stacked by stage (`_as_step`): the
         state built first, so the layout reads the shapes its draw recorded (`Objective.drawn_shapes`)."""
         state = self.initial_state(initializer, key)
         return self._staging.state(state, self._staging.staged)

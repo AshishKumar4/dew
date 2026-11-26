@@ -1228,7 +1228,7 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     # The run's state as its step holds it (`Trainer.staged`): `fit` hands it back stored, a scanned stack's
     # layers each on its own name again, whose leaves the pool charges apart.
     stepper = fine_tune(MeshSpec().build(jax.devices()[:1]), split=2)
-    run = stepper.staged(stepper.fit(rows, steps=1))
+    run = stepper._as_step(stepper.fit(rows, steps=1))
     built = [part for part in (run.compute, run.window) if part is not None]
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
