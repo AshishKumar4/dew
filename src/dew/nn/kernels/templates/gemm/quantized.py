@@ -154,15 +154,16 @@ def _mxfp8_quantize_epilogue(acc: jax.Array) -> tuple[jax.Array, jax.Array]:
     E4M3 codes (`float8_e4m3fn`) and OCP MX E8M0 block scales (`float8_e8m0fnu`, broadcast over each
     32-column block) via `bits.encode_form` inline PTX, bitwise matching `formats.MxFp8.quantized` (rows
     8547, 12037)."""
-    block_max = _block_max(acc, product_formats.MXFP8.depth)
-    biased = (jax.lax.bitcast_convert_type(block_max, jnp.uint32) >> jnp.uint32(23)) & jnp.uint32(0xFF)
-    # OCP MX rule: exponent = clip(max_exp - 8, -127, 127) -> biased E8M0 byte = clip(biased - 8, 0, 254).
-    scale_byte = jnp.where(biased > jnp.uint32(8), jnp.minimum(biased - jnp.uint32(8), jnp.uint32(254)),
-                           jnp.uint32(0))
-    # Multiply by exact normal float32 power 2^(127 - scale_byte) = bitcast((254 - scale_byte) << 23).
-    inv_scale = jax.lax.bitcast_convert_type((jnp.uint32(254) - scale_byte) << jnp.uint32(23), jnp.float32)
+    from dew.nn.kernels.formats import mxfp8_scale_bytes
+
+    # The scale's exponent and E8M0 byte from the block's largest magnitude's bits, as the quantizer takes
+    # them (`formats.mxfp8_scale_bytes`; rows 13164, 13249).
+    exponent, stored = mxfp8_scale_bytes(_block_max(acc, product_formats.MXFP8.depth))
+    # Multiply by the exact normal float32 power 2^-exponent, set in its exponent bits.
+    inv_scale = jax.lax.bitcast_convert_type((127 - exponent).astype(jnp.uint32) << jnp.uint32(23),
+                                             jnp.float32)
     codes = encode_tile(acc * inv_scale, bits.E4M3)
-    scales = jax.lax.bitcast_convert_type(scale_byte.astype(jnp.uint8), jnp.float8_e8m0fnu)
+    scales = jax.lax.bitcast_convert_type(stored.astype(jnp.uint8), jnp.float8_e8m0fnu)
     return codes, scales
 
 
