@@ -1075,11 +1075,14 @@ def _merge_proven(out_var: jcore.Var, bound: Magnitude | None, proved: Apart,
     ext_apart = _held_apart(_declared_apart(ext), out_var.aval.dtype)
     floors = [f for f in (proved.floor, ext_apart.floor) if f is not None]
     floor = max(floors) if floors else None
+    nonzero = proved.nonzero_floor
+    if (other := ext_apart.nonzero_floor) is not None and (nonzero is None or other > nonzero):
+        nonzero = other
     sign = proved.sign if proved.sign != 0 else ext_apart.sign
     merged = _held_apart(Apart(
         floor, sign, proved.number or ext_apart.number,
         proved.finite or ext_apart.finite, proved.unit_norm or ext_apart.unit_norm,
-        proved.dyadic_scale or ext_apart.dyadic_scale,
+        proved.dyadic_scale or ext_apart.dyadic_scale, nonzero,
     ), out_var.aval.dtype)
     bounds = [b for b in (bound if proved.finite else None,
                           ext_bound if ext_apart.finite else None) if b is not None]
@@ -1467,8 +1470,8 @@ def input_proof(value, dtype) -> tuple[Magnitude | None, Apart]:
 def normal_or_zero(dtype, bound: Magnitude | None, apart: Apart) -> bool:
     if not jnp.issubdtype(dtype, jnp.floating):
         return True
-    return apart.finite and (bound == NOTHING or
-                             (apart.floor is not None and apart.floor >= jnp.finfo(dtype).minexp))
+    floor = apart.floor if apart.floor is not None else apart.nonzero_floor
+    return apart.finite and (bound == NOTHING or (floor is not None and floor >= jnp.finfo(dtype).minexp))
 
 
 def literal_proof(atom: jcore.Literal) -> tuple[Magnitude | None, Apart]:
@@ -1653,8 +1656,12 @@ def _float_apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart],
     if name == "select_n":
         cases, case_bounds = operands[1:], bounds[1:]
         kept = [held.floor for held in cases if held.floor is not None]
+        nonzero = [held.floor if held.floor is not None else held.nonzero_floor
+                   for held, bound in zip(cases, case_bounds, strict=True) if bound != NOTHING]
+        found = [floor for floor in nonzero if floor is not None]
         return Apart(min(kept) if len(kept) == len(cases) else None, _shared_sign(cases, case_bounds),
-                     all(held.number for held in cases), all(held.finite for held in cases))
+                     all(held.number for held in cases), all(held.finite for held in cases),
+                     nonzero_floor=min(found, default=None) if len(found) == len(nonzero) else None)
     if name == "neg":
         return first._replace(sign=-first.sign)
     if name == "sign":

@@ -1070,6 +1070,34 @@ def test_uncovered_moments_and_misaligned_mean_broadcasts_are_refused():
             forms.init(shapes)
 
 
+def test_a_binary_mask_proves_weight_domain_without_a_caller_range():
+    from dew.algebra import moments
+
+    def masked_weighted(x, mask):
+        return moments.weighted_moments(x, jnp.where(mask, 1.0, 0.0))
+
+    axes = {"x": ("r", "k"), "mask": ("r", "k")}
+    shapes = {"x": ((1, 4), jnp.float32), "mask": ((1, 4), jnp.bool_)}
+    forms = derive.derive(derive.Reduction(masked_weighted, axes, walked="k"),
+                          accurate=False, saturation=SATURATION)
+    state = forms.init(shapes)
+    first = {"x": np.asarray([[1, 100, 3, -100]], np.float32),
+             "mask": np.asarray([[True, False, True, False]])}
+    second = {"x": np.asarray([[100, 5, -100, 7]], np.float32),
+              "mask": np.asarray([[False, True, False, True]])}
+    joined = forms.merge(forms.step(state, first), forms.step(state, second), shapes=shapes)
+    np.testing.assert_array_equal(forms.finish(joined, shapes=shapes), ([4], [5]))
+
+    def maybe_tiny_weighted(x, mask):
+        w = jnp.where(mask, np.float32(2.0 ** -128), np.float32(0))
+        return moments.weighted_moments(x, w)
+
+    tiny = derive.derive(derive.Reduction(maybe_tiny_weighted, axes, walked="k"),
+                         accurate=False, saturation=SATURATION)
+    with pytest.raises(derive.Refused):
+        tiny.init(shapes)
+
+
 def test_central_moment_derivation_checks_the_weight_domain_and_handles_extreme_ranges():
     """The public runtime handles subnormal weights; the float-mass walk requires proof they are absent."""
     from dew.algebra import moments

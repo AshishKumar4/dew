@@ -1560,7 +1560,8 @@ For a finite row with a nonzero stored subnormal weight, weighted moments keep t
 weighted products unlanded in the same ratios used for their derivatives. Other rows keep their
 ordinary path. The float-mass monoid requires zero or normal weights. A generic declaration may
 substitute the protected weighted law only after proving that domain, not as a bitwise rewrite or
-canonical recognition.
+canonical recognition. A selection can prove every weight zero or normal even when its zero arm
+prevents any strict positive bound.
 
 Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
 or missing observations. Its covariance term centers and differentiates only pairs that are present.
