@@ -172,7 +172,7 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone(monkeypatch):
     # And a list mixing indices and UUIDs, whose GPUs CUDA numbers in an order of its own (row 13118): `0`
     # and `GPU-1b22` may be one GPU where CUDA's order is not the list's.
     refused = ((LISTING, "0,99,1"), (None, "0,1"), (LISTING, "GPU-9f,0"), (LISTING, "0,GPU-0a11"),
-               (LISTING, "MIG-5e55,MIG-6f66"), (LISTING, "0,GPU-1b22"))
+               (LISTING, "MIG-5e55,MIG-6f66"), (LISTING, "0,GPU-1b22"), (LISTING, "0,00"))
     for listing, visible in refused:
         with pytest.raises(ValueError):
             pool(listing, "JAX_PLATFORMS=cuda", f"CUDA_VISIBLE_DEVICES={visible}")

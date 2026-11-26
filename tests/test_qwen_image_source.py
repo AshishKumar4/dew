@@ -176,8 +176,9 @@ def cudnn_case():
     they were a constant the prepare's arms and the run's did not share)."""
     model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
                                  context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16)
-    mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
-    times = jnp.asarray([731.0, 42.0])
+    # Host values, constants of each program: nothing runs on a device before the site.
+    mask = np.arange(25)[None] < np.asarray([[25], [13]])
+    times = np.asarray([731.0, 42.0], np.float32)
 
     # XLA's attention initializes: cuDNN's is the pullback's under test.
     @jax.jit

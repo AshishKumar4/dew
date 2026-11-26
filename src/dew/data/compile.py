@@ -22,7 +22,7 @@ import threading
 import typing
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, NamedTuple, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -1295,6 +1295,17 @@ def _batch_steps(pipeline: Pipeline) -> tuple[tuple[HostStep, ...], tuple[Device
             tuple(step for step in steps if isinstance(step, DeviceStep)))
 
 
+class _Declared(NamedTuple):
+    """What `pipelines`' packs declare (`_declared`): each packed ids field's fields, its most documents a
+    window holds, whether the read lays its windows out, and its windows' longest length."""
+
+    fields: dict[str, tuple[str, ...]]
+    bounds: dict[str, int]
+    laid: dict[str, bool]
+    widths: dict[str, int]
+    unseen: bool
+
+
 def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     """The step that lays each packed window's documents out as the model
     reads them (`Coordinated`), one per packed ids field, declaring the most
@@ -1306,9 +1317,18 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
     holds no more documents than tokens. A corpus that shows no packing
     while another packs into the same batches holds windows packed where
     none of this can see, so then each declares its window's length."""
+    declared = _declared(*pipelines)
+    return tuple(Coordinated.laid(declared.fields[ids], None if declared.unseen else bound,
+                                  declared.laid[ids]) for ids, bound in declared.bounds.items())
+
+
+def _declared(*pipelines: Pipeline) -> _Declared:
+    """What `pipelines`' packs declare, each pack's window seen where `_coordinated` sees it: its own stages',
+    its source's written ones and a source's declared layout (`PackedLayout`)."""
     fields: dict[str, tuple[str, ...]] = {}
     bounds: dict[str, int] = {}
     laid: dict[str, bool] = {}
+    widths: dict[str, int] = {}
     unseen = False
 
     def declare(pack: Pack, most: int | None, laid_out: bool = True) -> None:
@@ -1316,6 +1336,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
         fields[ids] = tuple(dict.fromkeys((*fields.get(ids, ()), *pack.fields)))
         bound = pack.seq_len if most is None else max(1, min(pack.seq_len, most))
         bounds[ids] = max(bounds.get(ids, 0), bound)
+        widths[ids] = max(widths.get(ids, 0), pack.seq_len)
         # A field's windows laid out by the read unless a step over a pack's windows lays them out itself.
         laid[ids] = laid.get(ids, True) and laid_out
 
@@ -1351,8 +1372,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
 
     for pipeline in pipelines:
         walk(pipeline, packed=False)
-    return tuple(Coordinated.laid(fields[ids], None if unseen else bound, laid[ids])
-                 for ids, bound in bounds.items())
+    return _Declared(fields, bounds, laid, widths, unseen)
 
 
 def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -> tuple[Coordinated, ...]:
@@ -2243,17 +2263,9 @@ def _one_bound[Entry](readers: Mapping[str, Reader | Entry], chains: Mapping[str
 
 def _shape_of(reader: functools.partial, chain: Pipeline | None, ids: str) -> tuple[str, int | None, int]:
     """The shape a held reader's packed field `ids` batches in: the field, its windows' length (the longest
-    pack of it its `chain` as written holds, `_windows`; None where none shows) and the reader's batch."""
-    return ids, None if chain is None else _windows(chain, ids), reader.keywords["build"].batch
-
-
-def _windows(pipeline: Pipeline, ids: str) -> int | None:
-    """The longest window a pack of field `ids` lays out in `pipeline`, its corpora's among them."""
-    lengths = [stage.seq_len for stage in pipeline.stages
-               if isinstance(stage, Pack) and stage.fields[0] == ids]
-    if isinstance(pipeline.source, Combined):
-        lengths.extend(found for child in pipeline.source.pipelines if (found := _windows(child, ids)))
-    return max(lengths, default=None)
+    window its `chain` as written declares, as its bound was read, `_declared`; None where none shows) and
+    the reader's batch."""
+    return ids, None if chain is None else _declared(chain).widths.get(ids), reader.keywords["build"].batch
 
 
 def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:

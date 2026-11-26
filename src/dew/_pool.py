@@ -106,11 +106,11 @@ class GpuListing:
         return sum(uuid.startswith(entry) for uuid in (*self.gpus, *self.migs)) == 1
 
     def gpu(self, entry: str) -> str | None:
-        """The whole GPU an entry it names (`names`) is, as its kind names it: an index as itself, a UUID or
-        its start as the UUID it starts; None for a MIG device, which CUDA enumerates by its own rules (at
-        most one compute instance a GPU instance)."""
+        """The whole GPU an entry it names (`names`) is, as its kind names it: an index as its number (`00`
+        is `0`), a UUID or its start as the UUID it starts; None for a MIG device, which CUDA enumerates by
+        its own rules (at most one compute instance a GPU instance)."""
         if entry.isdigit():
-            return entry
+            return str(int(entry))
         found = [uuid for uuid in self.gpus if uuid.startswith(entry)]
         return found[0] if found else None
 
