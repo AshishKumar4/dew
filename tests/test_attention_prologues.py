@@ -269,7 +269,8 @@ def test_the_certify_form_takes_its_prologues_as_the_forward_does_interpreted(dt
         return hooked if side == "both" else dataclasses.replace(hooked, query=NO_HOOK)
 
     def ours(query, key, value, query_weight, key_weight):
-        with generation.assumed("sm90"):
+        # The certify form's own refusal of fp32, at the precision the Mosaic parts take (`MosaicForward`).
+        with generation.assumed("sm90"), jax.default_matmul_precision("default"):
             _, (out, _, _) = attention_mosaic.certified(query, key, value, spans,
                                                         given(query_weight, key_weight), interpret=True)
         return out
