@@ -832,7 +832,7 @@ def graphed(region: terms.Region) -> tuple[EGraph, terms.Term, list[terms.Term]]
 
 def dtype_parameter(region: terms.Region, index: int, primitive, params):
     """What an equation's parameters say about its result dtype, or None if its constructor decides."""
-    if primitive is jax.lax.convert_element_type_p:
+    if primitive in (jax.lax.convert_element_type_p, jax.lax.bitcast_convert_type_p):
         dtype = params["new_dtype"]
     elif primitive is jax.lax.dot_general_p and (product := region.products.get(index)) is not None:
         dtype = product.made

@@ -1048,6 +1048,35 @@ def test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs(dtype, mode)
         jax.jit(moments.weighted_covariance), draw_cov, f"narrow cov {dtype} ({mode})", seeds=8)
 
 
+def test_direct_weighted_broadcast_keeps_marginal_shapes_and_counts_each_weight_once():
+    from dew.algebra import moments
+
+    x = np.asarray([1, 3], np.float32)
+    y = np.asarray([[2, 6], [3, 9]], np.float32)
+    run = jax.jit(moments.weighted_covariance)
+    mean_x, mean_y, covariance = run(x, y, np.ones(2, np.float32))
+    np.testing.assert_array_equal(mean_x, np.asarray(2, np.float32))
+    np.testing.assert_array_equal(mean_y, [4, 6])
+    np.testing.assert_array_equal(covariance, [2, 3])
+
+    mean_x, mean_y, covariance = run(x, y, np.ones(1, np.float32))
+    np.testing.assert_array_equal(mean_x, np.asarray(4, np.float32))
+    np.testing.assert_array_equal(mean_y, [8, 12])
+    np.testing.assert_array_equal(covariance, [20, 30])
+    mean, variance = jax.jit(moments.weighted_moments)(x, np.ones(1, np.float32))
+    np.testing.assert_array_equal((mean, variance), (4, 10))
+
+    y[1, 1] = np.inf
+    w = np.asarray([1, 0], np.float32)
+    (mean_x, mean_y, covariance), (_, _, moved) = jax.jit(
+        lambda w, dw: jax.jvp(lambda weights: moments.weighted_covariance(x, y, weights), (w,), (dw,)))(
+            w, np.asarray([0, 1], np.float32))
+    np.testing.assert_array_equal(mean_x, np.asarray(1, np.float32))
+    np.testing.assert_array_equal(mean_y, [2, 3])
+    np.testing.assert_array_equal(covariance, [0, 0])
+    np.testing.assert_array_equal(moved, [8, 0])
+
+
 @pytest.mark.parametrize("mode", ["direct", "walk", "merge"])
 def test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions(mode):
     from dew.algebra import moments
