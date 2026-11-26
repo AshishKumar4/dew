@@ -33,10 +33,10 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.division import _rounded_significand
 from dew.nn.precision import (
     ACCURATE,
     Numerics,
-    _rounded_significand,
     compensated_add,
     compensated_difference,
     exact_products,
