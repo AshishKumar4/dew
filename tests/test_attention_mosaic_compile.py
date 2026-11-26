@@ -1079,7 +1079,7 @@ def test_an_output_hook_taking_erf_lowers(backend, target):
 
     forward = attention_mosaic.forward if backend == "mosaic" else attention_triton.forward
     shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
-    hooks = template.Hooks(output_mod=lambda o: o * 0.5 * (1.0 + jax.lax.erf(o * 0.7071067811865476)))
+    hooks = template.Hooks(output=Hook(lambda o: o * 0.5 * (1.0 + jax.lax.erf(o * 0.7071067811865476))))
     spans = template.spans(256, 256, 1, causal=True)
     lowered_for(lambda q, k, v: forward(q, k, v, spans, hooks), (shape,) * 3, target)
 
