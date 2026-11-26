@@ -427,7 +427,7 @@ def _selective_decay_truth(step, rate, kept=None):
 def _selective_decay_draw(seed, operands):
     rng = np.random.default_rng(seed)
     step = rng.uniform(0, 2, operands[0].shape).astype(np.float32)
-    rate = -rng.uniform(0, 2, operands[1].shape).astype(np.float32)
+    rate = np.asarray(-rng.uniform(0, 2, operands[1].shape), dtype=np.float32)
     if seed == 1:
         step[:] = 0
         rate[...] = -np.float32(3 * 2.0 ** 126)
