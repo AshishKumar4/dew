@@ -1364,9 +1364,9 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
 (`ComponentForm`, rows 6109 and 6110). The generated components cover the online-softmax step and pairwise
-split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents and its
-key-first weight consumer, recurrence scores, compensated prefix differences, chunk carries and
-reverse carries with already-gated keys and queries, the strict-lower chunk solver's shared doubling
+split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents, its
+key-first weight consumer and value-gradient tile, recurrence scores, compensated prefix differences,
+chunk carries and reverse carries with gated keys and queries, the strict-lower solver's shared doubling
 stage and its weighted value application. Recurrence cases include padded tokens and top-binade
 values; the checked stage composes a complete solve. Attention's forward cases include a wholly masked
 tile, empty slices, and a large shared maximum with separate masses. The same writer checks rounded-operand

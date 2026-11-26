@@ -176,6 +176,30 @@ def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_s
                     seeds=8, truth_fn=truth)
 
 
+def test_generated_value_gradient_accumulates_two_query_tiles():
+    from dew.algebra.component_cases_derived import values_gradient
+
+    def generated(scores, cotangent, peak, total):
+        return (values_gradient(scores[:32], cotangent[:32], peak[:32], total[:32])
+                + values_gradient(scores[32:], cotangent[32:], peak[32:], total[32:]))
+
+    def written(scores, cotangent, peak, total):
+        return component_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
+
+    def truth(scores, cotangent, peak, total):
+        keep = jnp.isfinite(peak)
+        weights = jnp.exp(jnp.where(keep[:, None], scores - peak[:, None], -jnp.inf))
+        return weights.T @ (cotangent / jnp.where(total > 0, total, 1)[:, None])
+
+    def draw(seed):
+        case = component_cases.VALUES_GRADIENT.cases
+        left = case.draw(seed, case.operands[0])
+        right = case.draw(seed + 19, case.operands[0])
+        return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
+
+    assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

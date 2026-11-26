@@ -13,7 +13,11 @@ from dew.nn import precision
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
 from dew.nn.kernels.templates import attention_algebra
-from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents, derived_from_weights
+from dew.nn.kernels.templates.attention_backward_algebra import (
+    derived_cotangents,
+    derived_from_weights,
+    softmax_gradients,
+)
 from dew.nn.kernels.templates.operands import Parts
 
 
@@ -225,6 +229,37 @@ def _chunk_pullback_inputs(seed, operands):
     return grad, keys, weights, queries, out_grad, local, kept
 
 
+def _value_gradient(logits, dout, peak, total):
+    # The written backward's dV depends on no Q, K, V, score products or score cotangent.
+    rows, keys = logits.shape
+    zeros = jnp.zeros((rows,), logits.dtype)
+    q = jnp.zeros((rows, 1), logits.dtype)
+    k = jnp.zeros((keys, 1), logits.dtype)
+    v = jnp.zeros((keys, dout.shape[-1]), dout.dtype)
+    return softmax_gradients(logits, q, k, v, dout, peak, total, zeros, zeros, scale=1.0)[2]
+
+
+def _value_gradient_truth(logits, dout, peak, total):
+    used = jnp.isfinite(logits)
+    exponent = jnp.where(used, logits - peak[:, None], -jnp.inf)
+    weights = jnp.exp(exponent) / jnp.where(total > 0, total, 1)[:, None]
+    return weights.T @ dout
+
+
+def _value_gradient_draw(seed, operands):
+    logits, dout, _, _ = _arrays(seed, operands)
+    logits[0, :] = -np.inf
+    logits[1, ::2] = -np.inf
+    if seed % 2:
+        logits[2, :] = np.float32(2.0 ** 30)
+    peak = np.max(logits, axis=1)
+    if seed % 2 == 0:
+        peak[0] = np.finfo(logits.dtype).min
+    safe = np.where(np.isfinite(peak), peak, np.inf)
+    total = np.exp(logits.astype(np.float64) - safe[:, None]).sum(axis=1).astype(logits.dtype)
+    return logits, dout, peak, total
+
+
 def _chunk_level(system, inverse, level):
     rows, cols = recurrence_algebra.tile_indices(system.shape)
     return recurrence_algebra.doubled_level(-system, inverse, rows, cols, level, _carry_product)
@@ -319,3 +354,7 @@ CHUNK_WEIGHTED = declare(__name__, "chunk_weighted", ComponentForm(
     _chunk_weighted, _chunk_weighted_truth,
     dataclasses.replace(_cases(*[((c, c), (c, v), (c,)) for c, v in ((16, 32), (32, 32), (64, 64))]),
                         draw=_chunk_weighted_draw)))
+VALUES_GRADIENT = declare(__name__, "values_gradient", ComponentForm(
+    _value_gradient, _value_gradient_truth, dataclasses.replace(
+        _cases(*[((q, k), (q, v), (q,), (q,)) for q, k, v in ((32, 64, 128), (64, 128, 256))]),
+        draw=_value_gradient_draw)))
