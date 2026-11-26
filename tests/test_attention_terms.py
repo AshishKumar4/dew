@@ -195,6 +195,8 @@ def test_a_relative_band_holds_a_groups_products_at_a_time():
     """Row 13138: a relative band (`relative_band`) forms each query group's products against the bank and
     reads them into the band, never every query's at once beside it: no array of its program holds the
     call's `[Q, extent]` products (an Inkling 2 prefill's 32768 queries', 3.2 GiB a layer)."""
+    from reference_error import equations
+
     from dew.nn import programs
     from dew.nn.attention_terms import relative_band
     from dew.nn.kernels.templates import attention as template
@@ -203,13 +205,23 @@ def test_a_relative_band_holds_a_groups_products_at_a_time():
     states = jax.ShapeDtypeStruct((1, BAND_QUERIES, 2, 3), jnp.float32)
     bank = jax.ShapeDtypeStruct((3, extent), jnp.float32)
     traced = jax.make_jaxpr(lambda s, b: relative_band(s, b, jnp.int32(0)).values)(states, bank).jaxpr
-
-    def shapes(jaxpr):
-        for equation in jaxpr.eqns:
-            yield from (getattr(var.aval, "shape", ()) for var in equation.outvars)
-            for inner in programs.bodies(equation):
-                yield from shapes(inner)
-
-    found = list(shapes(traced))
+    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, skip=programs.opaque)
+             for var in equation.outvars]
     assert any(shape[-2:] == (template.BAND_GROUP, extent) for shape in found), found
     assert not any(shape[-2:] == (BAND_QUERIES, extent) for shape in found)
+
+
+def test_a_relative_band_of_no_queries_or_rows_is_empty():
+    """Row 13138: a relative band (`relative_band`) over no queries, and a band of no rows written out
+    (`BandBias.dense`), are empty as `relative_logits`' bias over them is, its other axes theirs."""
+    from dew.nn.attention import BandBias
+    from dew.nn.attention_terms import relative_band, relative_logits
+    from dew.nn.kernels.templates import attention as template
+
+    extent, keys = 5, 16
+    states = jnp.zeros((2, 0, 3, 4), jnp.float32)
+    bank = jnp.zeros((4, extent), jnp.float32)
+    band = relative_band(states, bank, jnp.int32(0))
+    assert band.dense(keys).shape == relative_logits(states, bank, np.arange(0), np.arange(keys)).shape
+    rowless = BandBias(jnp.zeros((0, 3, 7, template.band_width(extent)), jnp.float32), jnp.int32(0), extent)
+    assert rowless.dense(keys).shape == (0, 3, 7, keys)

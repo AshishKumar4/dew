@@ -482,13 +482,15 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
                 has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
                 out_heads: int | None = None, output_mod: Callable | None = None,
                 output_kinds: tuple[Kind, ...] = (),
-                output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> cost.Work:
+                output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), *, traced: bool = False,
+                merge: str | None = None) -> cost.Work:
     """One native `merged_padded` launch's device work at `_channel_block`'s chosen block (`_planned_block`,
     row 8779): common-path arithmetic across the grid, valid device traffic with row-stat stores counted once
-    per row (row 8809), span `3 * chunks`, one kernel."""
+    per row (row 8809), span `3 * chunks`, one kernel; on the lowering `merge` names where `traced` (a traced
+    merge's own, `merged_padded_p`'s `merge`), else the one named here (`_named_merge`)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,
                           raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs,
-                          merge=_named_merge())[1]
+                          merge=merge if traced else _named_merge())[1]
 
 
 MOSAIC_SLOWER = frozenset({"sm80", "sm90"})

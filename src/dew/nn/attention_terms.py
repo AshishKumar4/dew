@@ -107,7 +107,7 @@ def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
     extent = bank.shape[-1]
     wide = at_least_fp32(jnp.result_type(states, bank))
     width = template.band_width(extent)
-    group = min(queries, template.BAND_GROUP)
+    group = max(1, min(queries, template.BAND_GROUP))
     groups = -(-queries // group)
     padded = jnp.pad(states, ((0, 0), (0, groups * group - queries), (0, 0), (0, 0)))
     offset = jnp.asarray(offset, jnp.int32)
@@ -126,6 +126,8 @@ def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
         read = jnp.take_along_axis(products, read_at, axis=-1)
         return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, jnp.zeros((), wide))
 
+    if groups == 0:
+        return BandBias(jnp.zeros((batch, heads, 0, width), wide), offset, extent)
     band = jax.lax.map(banded, jnp.arange(groups))
     values = jnp.moveaxis(band, 0, 2).reshape(batch, heads, groups * group, width)[:, :, :queries]
     return BandBias(values, offset, extent)

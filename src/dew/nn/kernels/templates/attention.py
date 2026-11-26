@@ -745,7 +745,8 @@ def band_dense(values: jax.Array, offset: jax.Array, extent: int, keys: int) -> 
     origins = band_origins(offset, queries, extent)
     column = jnp.arange(keys, dtype=jnp.int32)[None, None, :] - origins[:, :, None]
     inside = (column >= 0) & (column < width)
-    batch = max(rows, origins.shape[0])
+    # The rows the values and the origins broadcast to: a row of either broadcasts, none of either is none.
+    batch = jnp.broadcast_shapes((rows,), (origins.shape[0],))[0]
     index = jnp.broadcast_to(jnp.clip(column, 0, width - 1)[:, None], (batch, heads, queries, keys))
     read = jnp.take_along_axis(jnp.broadcast_to(values, (batch, heads, queries, width)), index, axis=-1)
     return jnp.where(inside[:, None], read, jnp.zeros((), values.dtype))
