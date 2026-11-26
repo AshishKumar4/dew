@@ -108,6 +108,22 @@ def test_structural_closed_preserves_equation_source_info_and_nested_body_proven
     assert "noop_b" in str(ob.jaxpr.eqns[0].source_info.name_stack)
 
 
+def test_a_broadcast_max_initializer_does_not_inherit_the_scalars_axis_map():
+    """A scalar max expanded by its initializer does not witness a maximum in each output column."""
+    def column_totals(x):
+        peak = jax.lax.reduce_max(x, (0, 1))
+        init = jax.lax.broadcast_in_dim(jnp.float32(-jnp.inf), (2,), ())
+        grown = jax.lax.max(peak, init)
+        placed = jax.lax.broadcast_in_dim(grown, (3, 2), (1,))
+        return jnp.sum(jnp.exp2(x - placed), axis=0)
+
+    rows = jnp.array([[0.0, -1.0], [-2.0, -3.0], [-4.0, -5.0]], jnp.float32)
+    traced = jax.make_jaxpr(column_totals)(rows).jaxpr
+    _, apart = terms.proven(traced)
+    assert apart[traced.outvars[0]].floor is None
+    np.testing.assert_array_equal(jax.jit(algebra.rewritten(column_totals))(rows), [1.3125, 0.65625])
+
+
 def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warning():
     """`_SoftmaxTrack` proves `sum(exp(x - max(x))) >= 1` finite/bounded (rejecting misaligned axes and lossy
     casts), `reuse` hoists `jax.nn.softmax` broadcast division to `integer_pow(-1)` and standalone
@@ -115,6 +131,7 @@ def test_reuse_hoists_softmax_and_standalone_root_and_emits_no_debug_info_warnin
     zero JAX `missing a DebugInfo` DeprecationWarnings."""
     def softmax_sum(x):
         peak = jax.lax.stop_gradient(jnp.max(x, axis=-1, keepdims=True))
+        peak = jax.lax.max(peak, jnp.float32(-jnp.inf))
         return jnp.sum(jnp.exp(x - peak), axis=-1)
 
     def bad_axis_sum(x):

@@ -480,7 +480,8 @@ class _SoftmaxTrack:
         if prim is jax.lax.max_p and len(invars) == 2:
             for i in (0, 1):
                 cand, other = invars[i], invars[1 - i]
-                if isinstance(cand, jcore.Var) and cand in self.max_of and self._is_neg_inf_atom(other):
+                if (isinstance(cand, jcore.Var) and cand in self.max_of and self._is_neg_inf_atom(other)
+                        and _shape(cand) == out_aval.shape):
                     self.max_of[out] = self.max_of[cand]
             return bound, proved
         if prim in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p) and isinstance(invars[0], jcore.Var):
