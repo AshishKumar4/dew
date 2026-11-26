@@ -2052,9 +2052,9 @@ def test_a_rung_key_states_the_settings_a_step_computes_by():
     skipping = lm()
     skipping.skip_nonfinite = True
     chunked = lm(objective=lambda model, seq_len: LMObjective(model, seq_len=seq_len, head_chunks=8))
-    first = key(plain)
-    assert first is not None and first == key(lm())
-    assert key(skipping) != first and key(chunked) != first
+    first, skipped, chunks = key(plain), key(skipping), key(chunked)
+    assert None not in (first, skipped, chunks)
+    assert first == key(lm()) and skipped != first and chunks != first
 
 
 def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):

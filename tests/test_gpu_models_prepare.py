@@ -128,7 +128,6 @@ m_dew_run = arm_role("dew", run_mb[0], m_label)
 assert m_dew_prep is not None, "ModernBERT dew arm has no statement"
 assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices: {m_dew_prep} != {m_dew_run}"
 c_label = prep_causal[3]
-c_ref_run = arm_role("reference", run_causal[1], c_label)
 c_sample = drawn_on_the_host(run_causal[2], 0)
 
 # Confirm ModernBERT's run-side program name matches what sm90 prepare stored.
