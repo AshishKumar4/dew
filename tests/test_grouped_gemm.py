@@ -1150,7 +1150,8 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
-    back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
+    back through it, a token's cotangent its routes' summed exactly and rounded once (row 12396); with
+    `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
     layer's matrices' projection, each stack's gradient that layer's, every other zero; and an unpaired one
     whose epilogue reads its accumulator through its rounding alone, the rounding a named output (`gemm`'s
     `named`, row 7131's residual), its reverse pass bitwise the gathered rows' (the saved output read back
@@ -1176,11 +1177,24 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
                      for operand in operands)
     cotangent = tuple(jnp.asarray(rng.integers(-2, 3, size=(72, matrices.shape[-1])), tokens.dtype)
                       for _ in range(2))
-    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
-                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
+    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents)):
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
-    unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
-    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+    pulled, pulled_apart = (jax.vjp(f, *operands)[1](cotangent) for f in (fused, apart))
+    jax.tree.map(np.testing.assert_array_equal, pulled[1:], pulled_apart[1:])
+    # The tokens' cotangent: each slot's products with both matrices, every route of a token summed exactly
+    # (integers: float64 holds each sum) and rounded once to the tokens' dtype (row 12396), where the rows
+    # gathered first round each route's before they add.
+    read = [np.asarray(c, np.float64) if slots is None else np.asarray(c, np.float64)[np.asarray(slots)]
+            for c in cotangent]
+    layered = [np.asarray(m, np.float64) if layer is None else np.asarray(m, np.float64)[int(layer)]
+               for m in matrices]
+    groups = np.repeat(np.arange(3), np.asarray(sizes))
+    routes = np.zeros((72, tokens.shape[1]))
+    for slot, group in enumerate(groups):
+        routes[slot] = sum(c[slot] @ m[group].T for c, m in zip(read, layered, strict=True))
+    want = np.zeros(tokens.shape)
+    np.add.at(want, np.asarray(table), routes)
+    np.testing.assert_array_equal(np.asarray(pulled[0]), np.asarray(jnp.asarray(want, tokens.dtype)))
 
     def squared(acc):  # the accumulator read through its rounding alone, the named second output
         rounded = acc.astype(tokens.dtype)
