@@ -16,10 +16,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
+from arm_forms import dew_path
 from flax import linen as nn
 from interop_support import extract_fixture, scaled_gap as relative_gap
 from model_support import attending
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, sd3_fields, translate_sd3_weights
@@ -201,8 +203,9 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     so this is the actual sharded seam rather than a declaration about it. The
     case is deliberately awkward: a CLIP-length 77 context beside a
     rectangular 12x6 latent, so the joint sequence is 95 queries over 2
-    shards, and the prediction and the parameter gradient are compared against
-    the same walk on a mesh that keeps sequences whole.
+    shards, and the loss and the parameter gradient are on par with the same
+    walk on a mesh that keeps sequences whole over drawn contexts and probes
+    (check 1).
     """
     from dew.training import Layout, MeshSpec
 
@@ -215,26 +218,47 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     params, buffers, _ = translate_sd3_weights(
         component_tensors(source / "rect_cropped", "transformer"))
     rows = latent.shape[0]
-    context = jax.random.normal(jax.random.PRNGKey(5), (rows, 77, config["joint_attention_dim"]))
-    probe = jax.random.normal(jax.random.PRNGKey(6), latent.shape)
 
-    def loss(variables):
+    def draw(seed):
+        generator = np.random.default_rng([0x5D3, seed])
+        return (generator.standard_normal((rows, 77, config["joint_attention_dim"])).astype(np.float32),
+                generator.standard_normal(latent.shape).astype(np.float32))
+
+    def loss(variables, context, probe):
         output = model.apply({"params": variables, "buffers": buffers}, latent, times,
                              DenoisingCondition(context, pooled))
         return jnp.sum(output * probe)
 
-    def run(spec):
+    def placed(spec):
+        """The loss and its parameter gradient on `spec`'s mesh, the parameters placed as training places
+        them."""
         mesh = spec.build()
         placement = Layout().shardings(mesh, {"params": params})["params"]
-        with jax.set_mesh(mesh):
-            placed = jax.device_put(params, placement)
-            return jax.jit(jax.value_and_grad(loss))(placed)
+        step = jax.jit(jax.value_and_grad(loss))
 
-    whole, split = run(MeshSpec(fsdp=4)), run(MeshSpec(fsdp=2, sequence=2))
-    assert relative_gap(split[0], whole[0]) < 1e-5
-    gaps = [relative_gap(a, b) for a, b in zip(jax.tree.leaves(split[1]),
-                                               jax.tree.leaves(whole[1]), strict=True)]
-    assert max(gaps) < 1e-5, max(gaps)
+        def run(context, probe):
+            with jax.set_mesh(mesh):
+                return step(jax.device_put(params, placement), context, probe)
+
+        return run
+
+    # Two programs of Dew's, the sequence split against it whole: held so, and not bit for bit.
+    split, whole = (as_given(placed(spec)) for spec in (MeshSpec(fsdp=2, sequence=2), MeshSpec(fsdp=4)))
+    wide = model.clone(dtype=jnp.float64)
+    held = float64_held({"params": params, "buffers": buffers,
+                         "inputs": (latent, times, pooled)})
+
+    @as_given
+    def truth(context, probe):
+        def wide_loss(variables, context):
+            output = wide.apply({"params": variables, "buffers": held["buffers"]}, held["inputs"][0],
+                                held["inputs"][1], DenoisingCondition(context, held["inputs"][2]))
+            return jnp.sum(output * probe)
+
+        return jax.value_and_grad(wide_loss)(held["params"], context)
+
+    assert_as_exact(split, dew_path(whole), draw, "SD3 on a sequence-sharded mesh", seeds=FEWEST_SEEDS,
+                    truth_fn=truth)
 
 
 # The tiny pipeline the reference tool saves and walks: two CLIP towers, a T5
