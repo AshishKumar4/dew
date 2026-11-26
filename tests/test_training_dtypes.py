@@ -427,7 +427,8 @@ def test_a_trainer_given_numerics_traces_draws_and_scales_under_them(preset):
     assert {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])} == {
         jnp.dtype(numerics.dtypes.params)}
     drawn = len(traced)
-    trainer.compile(state, {"x": jnp.ones((4, 2), jnp.float32), "y": jnp.zeros((4, 1), jnp.float32)})
+    rows = 2 * jax.device_count()
+    trainer.compile(state, {"x": jnp.ones((rows, 2), jnp.float32), "y": jnp.zeros((rows, 1), jnp.float32)})
     assert 0 < drawn < len(traced) and all(seen == numerics for seen in traced)
 
 
