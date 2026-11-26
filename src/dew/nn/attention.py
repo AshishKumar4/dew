@@ -1551,7 +1551,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
                     and not isinstance(bias, SeparableBias)),
         separable_bias=isinstance(bias, SeparableBias),
-        sinks=sinks is not None, query_sinks=jnp.ndim(sinks) > 1, softcap=softcap,
+        sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
