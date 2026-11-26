@@ -125,8 +125,10 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["mxfp8"], case, strict=True))
     format_, groups, out_dtype = combination["format"], int(combination["groups"]), combination["out_dtype"]
     with generation.routes() as routes:
+        # The reference the decoded operands' whole product, as the native kernel's was timed against.
+        reference = values_product(mx_values if format_ == "mxfp8" else nvfp4_values, 128 * _blocks(groups))
         assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic")),
-                        jax.jit(_product(format_, groups, out_dtype, "xla")),
+                        jax.jit(lambda rows, matrices: reference(rows, matrices).astype(out_dtype)),
                         lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
                         truth_fn=_truth(format_, groups))
     recorded = {(found.choice, found.kernel) for found in routes}

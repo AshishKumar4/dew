@@ -126,24 +126,28 @@ def test_mxfp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
-def test_a_block_holding_an_infinity_or_a_nan_takes_the_nan_scale_quantized_or_in_the_epilogue():
-    """A 32-column block holding an infinity or a NaN takes the NaN scale (`0xFF`), every finite block its
-    own, alike whether `formats.MxFp8.quantized` quantizes a product or a GEMM's quantizing epilogue does
-    (`gemm.gemm_quantized(..., MxFp8)`), so each such block decodes to NaN either way (row 13164: the
-    epilogue's 247 against the quantizer's 118 and 0)."""
-    x = jnp.ones((16, 64), jnp.bfloat16).at[0, 3].set(jnp.inf).at[1, 40].set(jnp.nan)
-    w = jnp.eye(64, dtype=jnp.bfloat16).at[3, 1:].set(1).at[40, :32].set(1)
+def test_a_block_holding_an_infinity_takes_the_nan_scale_quantized_or_in_the_epilogue():
+    """A 32-column block of a product whose fp32 sum overflows takes the NaN scale (`0xFF`), its codes at a
+    unit scale, and its row's finite block its own scale, alike whether `formats.MxFp8.quantized` quantizes
+    the product or the GEMM's quantizing epilogue does (`gemm.gemm_quantized(..., MxFp8)`), bit for bit
+    (row 13164: the epilogue's 247 against the quantizer's 118)."""
+    x = jnp.zeros((16, 64), jnp.bfloat16).at[:, 1].set(1).at[0, 0].set(2.0 ** 127)
+    w = jnp.zeros((64, 64), jnp.bfloat16).at[1, :].set(1).at[0, :32].set(4)
     product = jnp.dot(x, w, preferred_element_type=jnp.float32)
     fused = gemm.gemm_quantized(x, w, minifloat=formats.MxFp8)
     assert isinstance(fused, formats.MxFp8)
     quantized = formats.MxFp8.quantized(product)
-    as_bytes = [np.asarray(jax.lax.bitcast_convert_type(each.scales, jnp.uint8))
-                for each in (quantized, fused)]
-    np.testing.assert_array_equal(as_bytes[0], as_bytes[1])
-    finite = np.asarray(jnp.all(jnp.isfinite(product.reshape(16, 2, 32)), axis=-1))
-    assert not finite.all() and finite.any()
-    np.testing.assert_array_equal(as_bytes[0] == 0xFF, ~finite)
-    np.testing.assert_array_equal(np.asarray(jnp.isnan(fused.decoded())).reshape(16, 2, 32).all(-1), ~finite)
+    def raw(array):
+        return np.asarray(jax.lax.bitcast_convert_type(array, jnp.uint8))
+
+    scales = (raw(quantized.scales), raw(fused.scales))
+    codes = (raw(quantized.codes), raw(fused.codes))
+    np.testing.assert_array_equal(scales[0], scales[1])
+    np.testing.assert_array_equal(codes[0], codes[1])
+    unit = np.asarray(jax.lax.bitcast_convert_type(jnp.ones((), jnp.float8_e4m3fn), jnp.uint8))
+    assert scales[0][0, 0] == 0xFF and scales[0][0, 1] == 127 - 8 and (scales[0][1:] == 127 - 8).all()
+    np.testing.assert_array_equal(codes[0][0, 32:], np.full(32, unit))
+    assert bool(jnp.all(jnp.isnan(fused.decoded()[0, :32])))
 
 
 def test_an_mxfp8_products_least_scale_meets_its_largest_in_the_exponents():
@@ -175,3 +179,52 @@ def test_a_blockwise_products_rows_past_its_groups_are_zero_whatever_their_scale
                                            column_scales)
     np.testing.assert_array_equal(np.asarray(out[128:]), np.zeros((128, 128), np.float32))
     np.testing.assert_array_equal(np.asarray(out[:128]), np.full((128, 128), 128.0, np.float32))
+
+
+def test_an_mxfp8_products_partials_below_fp32s_normals_sum_to_its_normal_result():
+    """Two 32-deep blocks of codes of one, each operand's scale 2^-66 (`0x3D`): each block's partial is
+    2^-127, below fp32's normals, and their sum 2^-126 is normal, exactly so where a CPU sums wide (Dew's
+    tests' `precision.WIDE_CPU_ARITHMETIC`, as the decoded products' sum did; row 13164's review)."""
+    tiny = jax.lax.bitcast_convert_type(jnp.full((128, 2), 0x3D, jnp.uint8), jnp.float8_e8m0fnu)
+    rows = formats.MxFp8(jnp.ones((128, 64), jnp.float8_e4m3fn), tiny)
+    matrices = formats.MxFp8(jnp.ones((1, 128, 64), jnp.float8_e4m3fn), tiny[None])
+    with generation.chosen(mxfp8="xla"):
+        out = jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.asarray([1], jnp.int32),
+                                                      out_dtype=jnp.float32))(rows, matrices)
+    np.testing.assert_array_equal(np.asarray(out), np.full((128, 128), 2.0 ** -126, np.float32))
+
+
+def test_an_mxfp8_product_of_no_depth_is_zero():
+    """An MXFP8 product over no depth (no 32-deep block) is its zeros, as the empty sum is."""
+    no_scales = jnp.zeros((128, 0), jnp.float8_e8m0fnu)
+    rows = formats.MxFp8(jnp.zeros((128, 0), jnp.float8_e4m3fn), no_scales)
+    matrices = formats.MxFp8(jnp.zeros((1, 64, 0), jnp.float8_e4m3fn), no_scales[:64][None])
+    with generation.chosen(mxfp8="xla"):
+        out = jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.asarray([1], jnp.int32),
+                                                      out_dtype=jnp.float32))(rows, matrices)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((128, 64), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_mxfp8_product_keeps_its_matrices_explicit_column_placement():
+    """An MXFP8 product under an Explicit mesh, its matrices' columns split over two CPU devices and its rows
+    whole: its output placed as the columns are, its value the unsplit product's (row 13164's review: the
+    block walk's sum placed as its partials)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    x = formats.MxFp8.quantized(spread(0, (128, 64), product.MXFP8.depth))
+    w = formats.MxFp8.quantized(spread(1, (1, 128, 64), product.MXFP8.depth))
+    blocks = jnp.asarray([1], jnp.int32)
+
+    def run(a, b):
+        return gemm.mxfp8_product(a, b, blocks, out_dtype=jnp.float32)
+
+    with generation.chosen(mxfp8="xla"):
+        whole = jax.jit(run)(x, w)
+        with jax.set_mesh(mesh):
+            columns = NamedSharding(mesh, PartitionSpec(None, "data"))
+            split = jax.tree.map(lambda leaf: jax.device_put(leaf, columns), w)
+            out = jax.jit(run)(jax.device_put(x, NamedSharding(mesh, PartitionSpec())), split)
+    assert out.sharding.spec[1] == "data", out.sharding
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(whole))
