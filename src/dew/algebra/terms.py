@@ -1878,6 +1878,11 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         # its operand is.
         lower, _, upper = operands
         return None if lower is None or upper is None else max(lower, upper)
+    if name == "select_n":
+        # The selector chooses an arm but contributes no value to its bound.
+        cases = operands[1:]
+        known = [bound for bound in cases if bound is not None]
+        return max(known) if len(known) == len(cases) else None
     if any(bound is None for bound in operands):
         return None
     given: list[int] = [bound for bound in operands if bound is not None]
@@ -1891,8 +1896,6 @@ def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | 
         losing = 1 if name == "min" else -1
         within = [given[1 - at] for at in range(len(given)) if len(given) == 2 and apart[at].sign == losing]
         return min([max(given), *within])
-    if name == "select_n":
-        return max(given[1:])
     if name in ("reduce_max", "reduce_min") and _reduced(equation) < 1:
         # A maximum or a minimum of no element is its identity, an infinity.
         return None
