@@ -1378,8 +1378,8 @@ FP16 rounded-operand bodies and preserves their written higher-order rule. Other
 softcap hook and its slope, projected sink state,
 document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
 Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
-witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload. Each case has an independent
-reference. The template component suites check their primitives on the CPU.
+witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload.
+Each case has an independent reference. The template component suites check their primitives on the CPU.
 Production still uses the written bodies (row 3272).
 
 ```python
@@ -1413,7 +1413,7 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
 sequences of primitive binds, literal construction and emitted calls share a generated helper, with
-geometry and logical shift direction bound statically.
+geometry, integer literals and logical shift direction bound statically.
 Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
 to the component's program.
 

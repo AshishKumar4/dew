@@ -43,6 +43,18 @@ class _Fragment(ast.NodeTransformer):
             return self._input(ast.unparse(node))
         return self.generic_visit(node)
 
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        found = self.generic_visit(node)
+        assert isinstance(found, ast.Call)
+        call = found.func
+        if (isinstance(call, ast.Attribute) and call.attr == "array" and isinstance(call.value, ast.Name)
+                and call.value.id == "np" and found.args and isinstance(found.args[0], ast.Constant)
+                and type(found.args[0].value) is int):
+            # The printer's integer masks and shifts differ by value, not by dtype or primitive.
+            # Pass the Python integer; construct its array at the original point of the trace.
+            found.args[0] = self._input(str(found.args[0].value))
+        return found
+
     def visit_keyword(self, node: ast.keyword) -> ast.AST:
         if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):
             return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
