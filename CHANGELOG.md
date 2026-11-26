@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Process-local algebra digests write each distinct abstract type once, using its exact encoding.
+  Parameter encoding and persistent digest bytes are unchanged.
+
 - Algebra encodes each binder and repeated source site once per digest and reuses the settled fact closure
   when nothing changes. Derivations batch floors and broadcasts, and no longer register twice that an
   opaque output is local. Persistent fingerprints and provenance are preserved.
