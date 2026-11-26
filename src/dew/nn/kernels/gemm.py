@@ -56,7 +56,7 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights
+from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
@@ -1531,6 +1531,17 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     def portable(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *rest):
         gather_arg, side_args = rest[:len(tables)], rest[len(tables):]
         sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
+        if isinstance(lhs, MxFp8):
+            # Each block's codes multiplied whole and its scales met as exponents (`exponent_scaled`): no
+            # operand decoded apart, whose 2^-127 a backend flushing subnormals reads as zero (row 13164).
+            codes = lhs_codes if not gather_arg else lhs_codes[gather_arg[0]]
+            row_scales = lhs_scales if not gather_arg else lhs_scales[gather_arg[0]]
+            (row_exps, row_nan), (mat_exps, mat_nan) = map(e8m0_exponents, (row_scales, mat_scales))
+            summed = xla_products.exponent_scaled(
+                codes.astype(jnp.bfloat16), row_exps, jnp.swapaxes(mat_codes, 1, 2).astype(jnp.bfloat16),
+                jnp.swapaxes(mat_exps, 1, 2), sizes, depth=product_of.MXFP8.depth, unscaled=row_nan,
+                kernel_unscaled=jnp.swapaxes(mat_nan, 1, 2))
+            return _finished(summed, side_args, epilogue, dtypes, out_forms)
         lhs_val = dataclasses.replace(lhs, codes=lhs_codes, scales=lhs_scales).decoded()
         mat_val = dataclasses.replace(matrices, codes=mat_codes, scales=mat_scales).decoded()
         values = lhs_val if not gather_arg else lhs_val[gather_arg[0]]
