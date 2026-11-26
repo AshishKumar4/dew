@@ -63,6 +63,37 @@ TEXT = {
 stated, alike. `log_scaling_n_floor` is low enough that the global layers' query temperature grows within
 the drawn ids, and `rel_extent` reaches past the window, where a sliding layer's bank spans the window."""
 
+VISION_TINY = TINY.parent / 'inkling2-vision-tiny'
+VISION = {'model_type': 'inkling2_vision', 'text_hidden_size': TEXT['hidden_size'], 'temporal_patch_size': 2,
+          'native_patch_size': 4, 'adapter_merge_size': 2, 'projection_hidden_dim': 48,
+          'projector_bias': False,
+          'hidden_size': 32, 'num_hidden_layers': 2, 'num_attention_heads': 4, 'mlp_ratio': 2.0,
+          'posemb_grid_size': 5, 'layer_norm_eps': 1e-05}
+"""The tiny vision config, in the release's fields (its config.json's vision_config): 4-pixel patches merged
+two by two, a 5-square position table which every grid resamples, two layers."""
+
+IMAGES = ((2, 3), (3, 2))
+"""Each drawn image's grid, in language-model tokens (merge blocks): rectangular both ways, so the rotary's
+columns and rows and the table's resampling read apart."""
+
+PROMPT = 6
+"""The text tokens before each image, and after the last."""
+
+_VISION_SPELLINGS = (
+    (r'^model\.vision_tower\.embeddings\.position_embedding\.weight$',
+     'model.visual.backbone.embeddings.position_embedding'),
+    (r'^model\.vision_tower\.embeddings\.', 'model.visual.backbone.embeddings.'),
+    (r'^model\.vision_tower\.pre_layernorm\.', 'model.visual.backbone.ln_pre.'),
+    (r'^model\.vision_tower\.merger\.linear_1\.', 'model.visual.proj_in.'),
+    (r'^model\.vision_tower\.merger\.linear_2\.', 'model.visual.proj_out.'),
+    (r'\.layernorm_before\.', '.ln_1.'), (r'\.layernorm_after\.', '.ln_2.'),
+    (r'\.mlp\.fc1\.', '.mlp.c_fc.'), (r'\.mlp\.fc2\.', '.mlp.c_proj.'),
+    (r'\.lambda_1$', '.ls_1.gamma'), (r'\.lambda_2$', '.ls_2.gamma'),
+    (r'^model\.vision_tower\.layers\.', 'model.visual.backbone.layers.'),
+)
+"""transformers' vision names onto the release's: conversion_mapping.py's `inkling2` renames read
+backwards."""
+
 _SPELLINGS = (
     (r'^model\.final_input\.query$', 'model.attn_res.output_query'),
     (r'^model\.layers\.(\d+)\.mlp_input\.query$', r'model.attn_res.mlp_queries.\1'),
@@ -101,7 +132,8 @@ def _modeling():
 
 
 def release_tensors(model, vocabulary: int) -> dict[str, torch.Tensor]:
-    """`model`'s weights in the release's names and layout, its conversion read backwards: each attention
+    """`model`'s weights in the release's names and layout, its conversion read backwards (a wrapper's
+    vision tower by `_VISION_SPELLINGS`, its text decoder as a causal LM's): each attention
     query one layer down (`Inkling2IndexOffsetWeightRename`), the loop's message queries as the two stacks
     the release keeps (`Inkling2LoopMergeMessageQueries`), each expert's gate and up rows interleaved
     (`Interleave(dim=1)`), and the head at the embedding's `vocabulary` rows, the release's padding rows
@@ -109,6 +141,13 @@ def release_tensors(model, vocabulary: int) -> dict[str, torch.Tensor]:
     stored = {}
     for name, tensor in model.state_dict().items():
         tensor = tensor.detach()
+        if name.startswith('model.vision_tower.'):
+            for pattern, spelling in _VISION_SPELLINGS:
+                name = re.sub(pattern, spelling, name)
+            stored[name] = tensor
+            continue
+        # A wrapper's text decoder, as a causal LM's.
+        name = name.replace('model.language_model.', 'model.', 1)
         if name == 'lm_head.weight':
             rows, width = tensor.shape
             padding = torch.randn(vocabulary - rows, width, generator=torch.Generator().manual_seed(7)) * 0.05
@@ -197,6 +236,118 @@ def write_quantized() -> None:
     (QUANTIZED / 'config.json').write_text(json.dumps(wrapper, indent=2) + '\n')
 
 
+def write_vision() -> None:
+    """inkling2-vision-tiny: the tiny text decoder's weights (inkling2-tiny's, its model read back) beside
+    a random vision tower and merger at `VISION`, an Inkling2LoopForConditionalGeneration, written in the
+    release's names and read back through transformers to the same weights."""
+    from safetensors.torch import save_file
+
+    from dew.interop.verify import scatter_weights
+
+    configuration, modeling = _modeling()
+    VISION_TINY.mkdir(parents=True, exist_ok=True)
+    config = configuration.Inkling2LoopConfig(text_config=TEXT, vision_config=VISION)
+    config._attn_implementation = 'eager'
+    torch.manual_seed(1)
+    model = modeling.Inkling2LoopForConditionalGeneration(config).float().eval()
+    scatter_weights(model, 4321)
+    save_file(release_tensors(model, TEXT['vocab_size']), VISION_TINY / 'model.safetensors',
+              metadata={'format': 'pt'})
+    wrapper = {'architectures': ['Inkling2LoopForConditionalGeneration'], 'model_type': 'inkling2_loop',
+               'text_config': TEXT, 'vision_config': VISION, 'image_token_id': IMAGE_TOKEN}
+    (VISION_TINY / 'config.json').write_text(json.dumps(wrapper, indent=2) + '\n')
+    read = modeling.Inkling2LoopForConditionalGeneration.from_pretrained(
+        VISION_TINY, config=config, dtype=torch.float32).state_dict()
+    written = model.state_dict()
+    differing = sorted(set(read) ^ set(written)) or [name for name in written
+                                                     if not torch.equal(read[name], written[name])]
+    if differing:
+        raise SystemExit(f"transformers reads the written release back otherwise: {differing}")
+
+
+IMAGE_TOKEN = 120
+"""The tiny bundle's image placeholder id, inside its scored vocabulary."""
+
+
+def vision_draw(seed: int) -> dict[str, np.ndarray]:
+    """Check 1's inputs of the vision bundle: `IMAGES`' images, each NCHW in [-1, 1] at its grid's pixels,
+    and the ids around them, `PROMPT` text tokens before each and after the last, each image's placeholders
+    one a merged token."""
+    rng = np.random.default_rng(seed)
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    images = [rng.uniform(-1, 1, (3, rows * side, columns * side)).astype(np.float32)
+              for rows, columns in IMAGES]
+    ids = []
+    for rows, columns in IMAGES:
+        ids += list(rng.integers(0, IMAGE_TOKEN, PROMPT)) + [IMAGE_TOKEN] * (rows * columns)
+    ids += list(rng.integers(0, IMAGE_TOKEN, PROMPT))
+    return {'input_ids': np.asarray([ids], np.int32),
+            **{f'image_{index}': image for index, image in enumerate(images)}}
+
+
+def reference_inputs(drawn: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+    """`vision_draw`'s inputs as transformers' processor gives them (processing_inkling2.py,
+    image_processing_inkling2.py): each image's merged-token blocks `[side, side, 3]` in raster order and
+    its grid `[1, rows, columns]` in merged tokens."""
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    blocks, grids = [], []
+    for index, (rows, columns) in enumerate(IMAGES):
+        image = drawn[f'image_{index}'].transpose(1, 2, 0)
+        blocked = image.reshape(rows, side, columns, side, 3).transpose(0, 2, 1, 3, 4)
+        blocks.append(blocked.reshape(-1, side, side, 3))
+        grids.append([1, rows, columns])
+    return {'input_ids': torch.from_numpy(drawn['input_ids']).long(),
+            'pixel_values': torch.from_numpy(np.concatenate(blocks)),
+            'image_grid_thw': torch.tensor(grids)}
+
+
+def write_vision_recording() -> None:
+    """inkling2-vision-tiny as transformers reads it, fp32 on eager attention, and its float64 twin, recorded
+    over check 1's seeds (`record_case`, its summary): each seed's merged image features (`image_features`,
+    `get_image_features`' pooled output) and the wrapper's logits over the ids around the images
+    (`logits`), as recorded_vision.npz there."""
+    import jax
+    import transformers
+    from recorded_references import provenance, record_case, save
+
+    from _dew_torch.precision import float64, float64_twin
+
+    configuration, modeling = _modeling()
+    config = configuration.Inkling2LoopConfig(text_config=TEXT, vision_config=VISION,
+                                              image_token_id=IMAGE_TOKEN)
+    model = modeling.Inkling2LoopForConditionalGeneration.from_pretrained(
+        VISION_TINY, config=config, dtype=torch.float32, attn_implementation='eager').eval()
+    model.config._experts_implementation = 'eager'
+    wide = float64_twin(model, lambda: modeling.Inkling2LoopForConditionalGeneration(model.config))
+    wide.config._experts_implementation = 'eager'
+
+    def outputs(network, drawn):
+        given = reference_inputs(drawn)
+        pixels = given['pixel_values'].to(next(network.parameters()).dtype)
+        with torch.no_grad():
+            features = network.get_image_features(pixels, given['image_grid_thw'], return_dict=True)
+            logits = network(input_ids=given['input_ids'], pixel_values=pixels,
+                             image_grid_thw=given['image_grid_thw'], use_cache=False).logits
+        # `pooler_output` is split image by image; the images' merged tokens in order.
+        return {'image_features': torch.cat(features.pooler_output).numpy(), 'logits': logits.numpy()}
+
+    def evaluate(drawn):
+        with float64():
+            truth = outputs(wide, drawn)
+        return outputs(model, drawn), truth
+
+    with jax.enable_x64(new_val=True):
+        recording = record_case('vision', vision_draw, evaluate, store_inputs=False, summary=True)
+    command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py '
+               '--vision --recording')
+    reference = 'Inkling2LoopForConditionalGeneration (transformers)'
+    record = provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu', command,
+                        torch=torch.__version__, dtype='float32', attention='eager',
+                        transformers=transformers.__version__)
+    save(VISION_TINY / 'recorded_vision.npz', {**recording, 'vision.provenance': record},
+         reference=reference, license='Apache-2.0')
+
+
 def draw(seed: int) -> dict[str, np.ndarray]:
     """Check 1's ids, uniform over the embedding's rows."""
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
@@ -232,10 +383,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--quantized', action='store_true',
                         help="the fixture whose experts are stored as the release stores them")
+    parser.add_argument('--vision', action='store_true',
+                        help="the bundle of the tiny decoder beside a tiny vision tower and merger")
     parser.add_argument('--recording', action='store_true',
                         help="record the tiny model's logits over the seeds")
     arguments = parser.parse_args()
-    if arguments.recording:
+    if arguments.vision:
+        write_vision_recording() if arguments.recording else write_vision()
+    elif arguments.recording:
         write_recording(QUANTIZED if arguments.quantized else TINY)
     elif arguments.quantized:
         write_quantized()

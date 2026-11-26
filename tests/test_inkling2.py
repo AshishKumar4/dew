@@ -97,13 +97,17 @@ def test_a_cached_decode_at_given_places_scores_as_its_whole_call():
         cache = allocated_cache(model, variables, ids.shape[0])
         prefilled, state = model.apply({**variables, 'cache': cache}, ids[:, :STEPPED], decode=True,
                                        positions=places[:, :STEPPED], mutable=['cache'])
-        each, cache = [prefilled], state['cache']
-        for index in range(STEPPED, SHAPE[1]):
-            logits, state = model.apply({**variables, 'cache': cache}, ids[:, index:index + 1], decode=True,
-                                        positions=places[:, index:index + 1], mutable=['cache'])
-            each.append(logits)
-            cache = state['cache']
-        return jnp.concatenate(each, axis=1)
+
+        def step(cache, column):
+            token, place = column
+            logits, state = model.apply({**variables, 'cache': cache}, token[:, None], decode=True,
+                                        positions=place[:, None], mutable=['cache'])
+            return state['cache'], logits[:, 0]
+
+        # The steps one program under a scan (`steps_from`'s), where unrolled they compiled 16 decodes.
+        _, steps = jax.lax.scan(step, state['cache'], (jnp.moveaxis(ids[:, STEPPED:], 1, 0),
+                                                       jnp.moveaxis(places[:, STEPPED:], 1, 0)))
+        return jnp.concatenate([prefilled, jnp.moveaxis(steps, 0, 1)], axis=1)
 
     wide = model.clone(dtype=jnp.float64)
     whole = jax.jit(lambda variables, ids: model.apply(variables, ids, positions=places))

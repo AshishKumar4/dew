@@ -168,6 +168,11 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     retained = {}
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
+        if group == "language_model" and local not in readings:
+            # A tensor the decoder family's `prepare` rewrote into others (Inkling 2's depth queries,
+            # stacked): read through those, bound under no raw name, as a decoder load binds its
+            # readings' names alone (`decoder_layouts`).
+            continue
         if group == "language_model":
             layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
                                     record["text_model_type"], language_tree, _in_language_model)
