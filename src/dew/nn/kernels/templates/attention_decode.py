@@ -253,7 +253,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
         initial=None if hooks is None else hooks.initial,
-        single_launch=(single_hooks, jnp.float32 if defer_output else None))
+        single_launch=(single_hooks, jnp.float32 if defer_output else None), deferred=defer_output)
     if priced is not None:
         slices, tile = priced
         if slices == 1:
@@ -289,8 +289,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
                    counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
-                   scales, chosen: Walk, in_key: bool, initial: Initial | None, single_launch: tuple
-                   ) -> tuple[int, attention_mosaic.Tiles] | None:
+                   scales, chosen: Walk, in_key: bool, initial: Initial | None, single_launch: tuple,
+                   deferred: bool = False) -> tuple[int, attention_mosaic.Tiles] | None:
     """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
     and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
@@ -313,6 +313,10 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
                                                                                      issued=True)
     if alone is None:
         return None
+    if deferred:
+        # Its finish the merge's past the walk at one slice too (`planned`'s deferral: a resumed state, a hook
+        # its packed rows cannot read), a launch of its own.
+        alone += _merge_seconds(query, value, spans, single, 1, target=target, initial=initial)
     prices = {(1, single): alone}
     for count in counts:
         sliced_op, sliced_ba = bound(splits=count)

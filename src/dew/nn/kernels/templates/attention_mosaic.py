@@ -1413,7 +1413,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `value` its keys' leading columns (`MosaicForward.in_key`): its programs read them from the key's slot,
     and the value array, a view of the key's, is no operand of the launch.
     """
-    walked_initial(None if hooks is None else hooks.initial)
     # The key prologue taken as XLA's program before the launch (`key_prologue_taken`); the query's where the
     # call's consumers cannot take it (`_forward_call`).
     in_key = reads_in_key(in_key, key, value, hooks, residuals, table=table, scales=scales)
@@ -1510,6 +1509,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     are none of the launch's: no operand, stream or load of them (an unread key bias's stream on tcgen05's
     rows, whose issuer streams the keys and values alone, was never released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     if hooks.score_mod is None and hooks.score_params:
         hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))

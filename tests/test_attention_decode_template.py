@@ -467,18 +467,24 @@ def test_a_resumed_decode_state_takes_its_steps_output_hook_at_one_slice_interpr
 
 def test_a_resumed_decode_state_is_no_walks_initial_state():
     """A resumed decode state holds its output (`Initial.normalized`), which no walk resumes from (each
-    reads its numerator): the template's route and its reference refuse it, as the decode step alone merges
-    it past its own walk; a numerator held read four keys of value two as one quarter of their output."""
-    from dew.nn.kernels.templates import attention_route
+    reads its numerator): the template's route, its reference, the Mosaic forward's certify form and the
+    Triton forward's fitting refuse it, as the decode step alone merges it past its own walk; a numerator
+    held read four keys of value two as one quarter of their output."""
+    import functools
+
+    from dew.nn.kernels.templates import attention_mosaic, attention_route, attention_triton
 
     query = jnp.zeros((1, 4, 2, 64), jnp.float32)
     key = value = jnp.zeros((1, 4, 2, 64), jnp.float32)
     spans = template.spans(4, 4, 1)
     state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 4.0), jnp.full((1, 2, 4, 64), 2.0),
                              normalized=True)
-    for walk in (attention_route.attend, template.reference):
-        with pytest.raises(ValueError):
-            walk(query, key, value, spans, template.Hooks(initial=state))
+    walks = (attention_route.attend, template.reference, attention_mosaic.certified,
+             functools.partial(attention_triton.unfitted, certified=True))
+    with generation.assumed("sm90"):
+        for walk in walks:
+            with pytest.raises(ValueError):
+                walk(query, key, value, spans, template.Hooks(initial=state))
 
 
 def test_a_resumed_states_output_spans_fp32s_range_as_its_finish_held_it():

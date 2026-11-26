@@ -703,7 +703,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     forward keeps where the call takes it). The operands pad to whole blocks of the largest tile and to
     power-of-two head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
-    walked_initial(None if hooks is None else hooks.initial)
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
     # The prologues taken as XLA's program before the launch (`prologues_taken`).
@@ -730,7 +729,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     """`forward`'s launch, its padded operands (`padded_call`) and the call's queries before padding."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
-    initial = hooks.initial
+    initial = walked_initial(hooks.initial)
     m0 = total0 = acc0 = None
     if initial is not None:
         m0, total0 = call.rows(initial.m, algebra.LEAST), call.rows(initial.total)
