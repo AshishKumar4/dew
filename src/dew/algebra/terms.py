@@ -801,7 +801,14 @@ def _collect_opaque(key, opaques: list[Hashable]) -> Hashable:
         slot = len(opaques)
         opaques.append(key)
         return "object_ref", key[1], slot
-    return tuple(_collect_opaque(part, opaques) for part in key)
+    # Most subkeys are plain. Retain their tuples; only copy a path with a hoisted entry.
+    rebuilt = None
+    for index, part in enumerate(key):
+        if isinstance(part, tuple) and (resolved := _collect_opaque(part, opaques)) is not part:
+            if rebuilt is None:
+                rebuilt = list(key)
+            rebuilt[index] = resolved
+    return key if rebuilt is None else tuple(rebuilt)
 
 
 def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
@@ -844,7 +851,7 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                       aval_key(atom.aval)))
                 return
             dtype, value = held_bits(atom.val)
-            raw = np.ascontiguousarray(value).tobytes()
+            raw = value.tobytes()
             ext = _collect_opaque(_extended_dtype(dtype), opaques) if in_process else None
             feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
@@ -877,14 +884,16 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                     str(ctx.cur_layout_mode), ctx.remove_size_one_mesh_axis,
                     ctx.no_collectives, ctx.cur_abstract_mesh)), opaques)
             ctx_keys[id(ctx)] = ctx_key
+        params = equation.params
         params_key: Hashable = ()
-        if equation.params:
-            raw_params = (
-                tuple((name, _in_process_param_key(part, reject_device=reject_device))
-                      for name, part in sorted(equation.params.items()))
-                if in_process else parameters_key(equation.primitive, equation.params)[1]
-            )
-            params_key = _collect_opaque(raw_params, opaques)
+        if params:
+            if in_process:
+                items = params.items()
+                params_key = tuple((name, _collect_opaque(
+                    _in_process_param_key(part, reject_device=reject_device), opaques))
+                    for name, part in (sorted(items) if len(params) > 1 else items))
+            else:
+                params_key = _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()
         primitive = equation.primitive
         if in_process:
