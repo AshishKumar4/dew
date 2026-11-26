@@ -204,6 +204,32 @@ def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound(
     assert declared == {"two": {4}, "four": {4}, "ready": {9}}, declared
 
 
+def test_packed_splits_of_other_window_lengths_keep_their_own_bounds():
+    """Packed validation splits of two window lengths, 9 tokens and 36, each declare the most documents a
+    window of their own length holds, merged among splits of their length alone: a split of 36-token windows
+    compiles apart whatever bound it declares, so its bound widens no 9-token split's (row 12846: a pack(512)
+    split beside a pack(2048) one declared 2048 documents a 512-token row)."""
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    def split(length: int, windows: int, per_window: int) -> Pipeline:
+        return Pipeline(Memory(tuple({"text": np.arange(length // per_window, dtype=np.int32)}
+                                     for _ in range(windows * per_window)))).pack(length)
+
+    train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
+    splits = {"short-two": split(9, 3, 2), "short-three": split(9, 3, 3), "long": split(36, 2, 12)}
+    _, readers = fitted(train.batch(4), splits, objective=ObjectiveData(), steps=2)
+    assert readers is not None
+    declared = {}
+    for name, reader in readers.items():
+        opened = reader(DataPartition())
+        try:
+            declared[name] = {batch["text_coordinates"].max_segments for batch in opened}
+        finally:
+            if isinstance(opened, Closeable):
+                opened.close()
+    assert declared == {"short-two": {3}, "short-three": {3}, "long": {12}}, declared
+
+
 def test_a_handed_validation_pass_passes_on_a_batch_of_no_rows_after_a_whole_one():
     """A handed validation pass whose source yields a batch of no rows after a whole one passes it on as it
     is, with no rows to fill out with, rather than refusing it (review of row 12474)."""

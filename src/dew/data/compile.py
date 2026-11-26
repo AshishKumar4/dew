@@ -2215,21 +2215,41 @@ def _one_bound[Entry](readers: Mapping[str, Reader | Entry]) -> dict[str, Reader
     """A run's held readers each declaring, for every packed field whose bound it knows, the most documents a
     window of any of them holds (`Coordinates.max_segments`), so every split of one shape lays its windows
     out to one static bound and its evaluation compiles once, where each split's own most, 14 documents
-    in one and 15 in the next, compiled a program apiece (row 12474). A split that cannot see its windows'
+    in one and 15 in the next, compiled a program apiece (row 12474); splits of other shapes apart
+    (`_shape_of`). A split that cannot see its windows'
     packing declares its window's length as it does, apart, and widens no known split's bound to it: a
     sequence kernel's work follows the bound (`dew.nn.chunked_launch`). A reader that is not one of
     `held`'s (a reader of the caller's, an evaluation suite) is passed on as it is."""
     # Each held reader `validation` compiled (`_validation_reader`).
     compiled = {name: entry for name, entry in readers.items()
                 if isinstance(entry, functools.partial) and entry.func is _validation_reader}
-    most: dict[str, int] = {}
+    # Merged among splits of one shape alone, their packed field, its windows' length and their batch: a
+    # split of another shape compiles apart whatever bound it declares, and a bound past its windows' own
+    # makes its sequence kernels launch for documents none of its windows holds (row 12846: a pack(512)
+    # split beside a pack(2048) one declared 2048 documents a 512-token row).
+    most: dict[tuple[str, int | None, int], int] = {}
     for entry in compiled.values():
         for step in _packed_steps(entry):
             if step.max_segments is not None:
-                ids = step.fields[0]
-                most[ids] = max(most.get(ids, 0), step.max_segments)
+                shape = _shape_of(entry, step.fields[0])
+                most[shape] = max(most.get(shape, 0), step.max_segments)
     return {name: _held_bounded(compiled[name], most) if name in compiled else entry
             for name, entry in readers.items()}
+
+
+def _shape_of(reader: functools.partial, ids: str) -> tuple[str, int | None, int]:
+    """The shape a held reader's packed field `ids` batches in: the field, its windows' length (the longest
+    pack of it the reader's chain holds, `_windows`; None where none shows) and the reader's batch."""
+    return ids, _windows(reader.keywords["pipeline"], ids), reader.keywords["build"].batch
+
+
+def _windows(pipeline: Pipeline, ids: str) -> int | None:
+    """The longest window a pack of field `ids` lays out in `pipeline`, its corpora's among them."""
+    lengths = [stage.seq_len for stage in pipeline.stages
+               if isinstance(stage, Pack) and stage.fields[0] == ids]
+    if isinstance(pipeline.source, Combined):
+        lengths.extend(found for child in pipeline.source.pipelines if (found := _windows(child, ids)))
+    return max(lengths, default=None)
 
 
 def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
@@ -2237,9 +2257,11 @@ def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
     return tuple(step for step in reader.keywords["host"] if isinstance(step, Coordinated))
 
 
-def _held_bounded(reader: functools.partial, most: Mapping[str, int]) -> functools.partial:
-    """`reader` with each packed field's step whose bound it knows declaring `most`'s for its field."""
-    host = tuple(Coordinated.laid(step.fields, most[step.fields[0]], step.laid_out)
+def _held_bounded(reader: functools.partial, most: Mapping[tuple[str, int | None, int], int]
+                  ) -> functools.partial:
+    """`reader` with each packed field's step whose bound it knows declaring `most`'s for its shape
+    (`_shape_of`)."""
+    host = tuple(Coordinated.laid(step.fields, most[_shape_of(reader, step.fields[0])], step.laid_out)
                  if isinstance(step, Coordinated) and step.max_segments is not None else step
                  for step in reader.keywords["host"])
     return functools.partial(reader.func, *reader.args, **{**reader.keywords, "host": host})
