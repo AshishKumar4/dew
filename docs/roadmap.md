@@ -23,7 +23,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The attention forward's derivation ranking does not predict its time on most cells measured. [6216]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
-- Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873]
+- Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873, 13489]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - The cold 4B start's search cannot read which remat frees its miss. [13304]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
@@ -32,6 +32,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
+- A forked chunked call whose readout reads the memory entering its token or weighs its own write (recurrence.Hooks.reads 'before', Hooks.own_weight: RWKV6's)…. [6267]
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
@@ -47,7 +48,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
-- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 
 ## Models and interop
 
@@ -64,6 +64,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - A single process driving two H100s (Mesh fsdp=2, CUDA 12, driver 570.148.08, NCCL_RUNTIME_CONNECT=0, Dew's default XLA_FLAGS) deadlocks at the first execution…. [12714]
+- Qualify generated Algebra components for production use. [3272]
 - Owner-approved Audit 4 API cleanup. [11935]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
@@ -92,6 +93,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- 3.12:tests/test_algebra_derive.py#2/8 took 1279 s. [13490]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
