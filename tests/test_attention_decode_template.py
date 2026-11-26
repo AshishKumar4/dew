@@ -491,8 +491,8 @@ def test_a_resumed_decode_state_is_no_walks_initial_state():
 def test_a_resumed_decode_state_is_no_backwards_initial_state():
     """A resumed decode state (`Initial.normalized`) is refused by every standalone backward given the
     forward's residuals, as by every walk: the route's, the Triton mainloop's and its certified fitting, the
-    portable one's and Mosaic GPU's binding. Taken, the state's gradient divided its output by its total a second time (an output of 6
-    over a total of 3 weighed as 2, train 1318's review)."""
+    portable one's and Mosaic GPU's binding. Taken, the state's gradient divided its output by its total a
+    second time (an output of 6 over a total of 3 weighed as 2, train 1318's review)."""
     from dew.nn.kernels.templates import (
         attention_mosaic,
         attention_portable,
