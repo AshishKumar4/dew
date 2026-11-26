@@ -358,7 +358,8 @@ def test_generate_runs_an_exchange_wherever_the_decoder_routes_it(rng, site):
     key = jax.random.key(1)
     with jax.set_mesh(spec.build()):
         exchanged = generate(model("exchange"), placed, prompt, 3, key=key, sampling=greedy)
-        np.testing.assert_array_equal(np.asarray(exchanged.tokens), np.asarray(alone.tokens))
+        # Its real rows, the mesh's padding rows aside (`Generation.host`).
+        np.testing.assert_array_equal(exchanged.host().tokens, np.asarray(alone.tokens))
 
         def undefined_after_the_first(state: decoding.StepState, scores):
             return jnp.where(state.step >= 1, -jnp.inf, scores)

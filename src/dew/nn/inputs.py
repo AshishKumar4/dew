@@ -1334,16 +1334,23 @@ class RowPlan:
         # A request key replicated over a multi-process mesh is not addressable: every replica holds the
         # same key data, so each process lays this process's copy over the mesh replicated, its rows'
         # indices sharded as the rows are, and the fold reads no host and moves no key between devices.
-        replicated = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+        from dew.nn.kernels.options import program
+
+        replicated = jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec())
         local = jax.random.key_data(key.addressable_data(0))
         held = jax.random.wrap_key_data(jax.make_array_from_process_local_data(replicated, local),
                                         impl=jax.random.key_impl(key))
         placed = jax.make_array_from_process_local_data(sharding, indices)
-        return jax.jit(jax.vmap(jax.random.fold_in, in_axes=(None, 0)), out_shardings=sharding)(held, placed)
+        return program(_row_keys, out_shardings=sharding)(held, placed)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
         return host_rows(leaf, self.rows)
+
+
+def _row_keys(key: jax.Array, rows: jax.Array) -> jax.Array:
+    """`key` folded by each of `rows`' indices (`RowPlan.keys`)."""
+    return jax.vmap(jax.random.fold_in, in_axes=(None, 0))(key, rows)
 
 
 @dataclass(frozen=True)
