@@ -7,12 +7,13 @@ correctly rounded division's denominator derivative by it (`over_denominator`,
 (`stood_in`, `finite_nonzero`)."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .derivatives import contracted, surrogate
 from .float_bits import exact_power2, float_bits
 
 
@@ -117,32 +118,55 @@ def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
                                                                                          raised.dtype))
 
 
-def _pytorch_product(seed: jax.Array, coefficient: jax.Array, special: jax.Array) -> jax.Array:
-    """`seed * coefficient` valued as where subnormals are kept (`_flush_safe`; a special lane the plain
-    product, IEEE's), its sign and zeros its own, and differentiated as the plain product is
-    (`derivatives.surrogate`: `dseed * coefficient + seed * dcoefficient`), so no rescale enters a
-    derivative at any order."""
-    from .derivatives import contracted, surrogate
-
-    def forward(seed, coefficient, special):
-        return jnp.where(special, seed * coefficient, _flush_safe(seed, coefficient))
+def as_plain(plain: Callable[..., jax.Array]) -> Callable:
+    """A surrogate's derivative rule (`derivatives.surrogate`, its `symbolic_zeros`) that differentiates
+    `plain` at every order: a range-safe value of `plain`'s arithmetic (a balanced product, a flush-safe one)
+    differentiated as that arithmetic, whose derivatives JAX takes where its own intermediates are normal, as
+    before the range-safe value replaced it (rows 13260, 13261). An operand no derivative moves adds no term,
+    so a constant beside an infinite factor meets no `0 * inf`."""
+    from jax.custom_derivatives import SymbolicZero
 
     def derivative(primals, tangents, value):
-        # The lane mask, boolean, takes no tangent; a factor no derivative moves adds no term, as JAX's
-        # product rule omits it (its constant beside an infinite factor, no `0 * inf`).
-        from jax.custom_derivatives import SymbolicZero
-
-        (seed, coefficient, _), (moved_seed, moved_coefficient, _) = primals, tangents
-        terms = [tangent * held for tangent, held in ((moved_seed, coefficient), (seed, moved_coefficient))
-                 if not isinstance(tangent, SymbolicZero)]
-        if not terms:
+        live = tuple(index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero))
+        if not live:
             return jnp.zeros_like(value)
-        # One term alone as it is, its sign kept (a zero's no `+0` from a sum).
-        return terms[0] if len(terms) == 1 else terms[0] + terms[1]
 
-    # The division's derivative, which the division's contract holds at every order.
-    return contracted("test_the_precision_seams_hold_every_order")(
-        surrogate(forward, derivative, symbolic_zeros=True))(seed, coefficient, special)
+        def substituted(*moving):
+            given = dict(zip(live, moving, strict=True))
+            return plain(*(given.get(index, primal) for index, primal in enumerate(primals)))
+        return jax.jvp(substituted, tuple(primals[index] for index in live),
+                       tuple(tangents[index] for index in live))[1]
+    return derivative
+
+
+def _over_plain(quotient, numerator, denominator, moving):
+    """`over_denominator`'s arithmetic as PyTorch's backward writes it, whose derivatives it takes."""
+    return moving * divided_in(quotient, denominator)
+
+
+def _over_exact(quotient, numerator, denominator, moving):
+    """`over_denominator`'s value: PyTorch's order wherever its product is a normal value (its quotients
+    subnormal or not, each rounded once as PyTorch's are), or the seed is zero beside a finite coefficient,
+    valued as where subnormals are kept (`_flush_safe`); the balanced order where that product overflows or
+    flushes, a zero seed beside an infinite coefficient among them (zero, not `0 * inf`)."""
+    twice = divided_in(quotient, denominator)
+    product = _flush_safe(moving, twice)
+    special = ~(finite_nonzero(numerator) & finite_nonzero(denominator)) | ~jnp.isfinite(moving)
+    torch = special | normal(product) | (~finite_nonzero(moving) & jnp.isfinite(twice))
+    kept_numerator, kept_denominator = (jnp.where(torch, 1, value) for value in (numerator, denominator))
+    return jnp.where(torch, jnp.where(special, moving * twice, product),
+                     balanced(jnp.where(torch, 0, moving), (kept_numerator,),
+                              (kept_denominator, kept_denominator)))
+
+
+_over_valued = contracted("test_the_precision_seams_hold_every_order")(
+    surrogate(_over_exact, as_plain(_over_plain), symbolic_zeros=True))
+"""`over_denominator`'s map, valued range-safe and differentiated as PyTorch's order at every order
+(`as_plain`), held by the division's contract; built once."""
+
+
+def _over_apply(residuals, moving):
+    return _over_valued(*residuals, moving)
 
 
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
@@ -156,34 +180,10 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
     back to 2^-14; 2^-100 / 2^30 under 2^100 is 2^-60; a zero seed is zero beside an infinite `q / d`: the
     2026-11-26 audit and its review). Its contract: every first derivative (the tangent and its pullback)
     finite and exact where PyTorch's is a normal value, as PyTorch's order rounds it, and across fp32's
-    range where PyTorch's overflows or flushes; higher orders are JAX's derivatives of PyTorch's order where
-    it is taken (`2^-126 / 16` under `2^40`, differentiated in its numerator, is `2^32`: row 13247), and
-    none where the balanced one is (`balanced` holds its operands constant), row 13232's."""
+    range where PyTorch's overflows or flushes; higher orders are JAX's derivatives of PyTorch's order
+    everywhere (`as_plain`: `2^-126 / 16` under `2^40`, differentiated in its numerator, is `2^32`, row
+    13247; `2^-100 / 2^30` under `2^100`, `2^40`, row 13261), those whose own intermediates leave the range
+    row 13232's."""
     from .kernels.generation import linear_map
 
-    def apply(residuals, moving):
-        quotient, numerator, denominator = residuals
-        held_quotient, held_numerator, held_denominator, held_moving = jax.lax.stop_gradient(
-            (quotient, numerator, denominator, moving))
-        twice = divided_in(held_quotient, held_denominator)
-        product = _flush_safe(held_moving, twice)
-        special = ~(finite_nonzero(held_numerator) & finite_nonzero(held_denominator)) | ~jnp.isfinite(
-            held_moving)
-        # PyTorch's order wherever its product is a normal value (its quotients subnormal or not, each
-        # rounded once as PyTorch's are, and its derivatives JAX's of that order at every order: row 13247),
-        # or the seed is zero beside a finite coefficient; the balanced one where that product overflows
-        # or flushes, a zero seed beside an infinite coefficient among them (zero, not `0 * inf`).
-        torch = special | normal(product) | (~finite_nonzero(held_moving) & jnp.isfinite(twice))
-        # Each branch's operands where the other is chosen held at one, so neither's derivative meets the
-        # other's infinities.
-        kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))
-        balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
-                                                    for value in (numerator, denominator))
-        # PyTorch's order as its value is where subnormals are kept, its derivatives that order's own
-        # (`_pytorch_product`, as before row 13163): no subnormal flushed into the value, no rescale into a
-        # derivative.
-        kept = _pytorch_product(moving, divided_in(kept_quotient, kept_denominator), special)
-        return jnp.where(torch, kept, balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
-                                               (balanced_denominator, balanced_denominator)))
-
-    return linear_map(apply, apply, (quotient, numerator, denominator), tangent)
+    return linear_map(_over_apply, _over_apply, (quotient, numerator, denominator), tangent)

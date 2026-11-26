@@ -503,6 +503,98 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                     token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
+QWEN3_NEXT = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+              "head_dim": 16, "intermediate_size": 96, "vocab_size": 256, "max_position_embeddings": 64,
+              "tie_word_embeddings": False, "pad_token_id": 0, "linear_num_key_heads": 2,
+              "linear_num_value_heads": 4, "linear_key_head_dim": 16, "linear_value_head_dim": 8,
+              "linear_conv_kernel_dim": 4, "layer_types": ["linear_attention", "full_attention"],
+              "mlp_only_layers": [0, 1], "partial_rotary_factor": 0.5}
+"""A dense hybrid Qwen3-Next: a gated delta net beside a full attention layer, each with an RMSNorm pair
+and a gated MLP."""
+
+
+def test_a_tier_3_sources_norms_products_and_delta_rule_run_dews_kernels_as_exact_as_transformers(
+        tokens, tmp_path):
+    """A source taken to tier 3 (`fallback='torchax'`) routes the parts Dew computes by kernels of its own
+    through them (`kernel_parts`, row 13044): its RMSNorms (Dew's fused norm), its gated MLPs' SiLU products
+    (Dew's fused SwiGLU) and its delta net's chunked rule (Dew's chunked recurrence), each identified by its
+    code; its LM loss and every parameter's gradient are as exact as transformers' own over the same
+    weights, measured from transformers in float64 (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    ran = loaded.model.graph.module._model
+    layer = ran.model.layers[0]
+    routed = [layer.input_layernorm, layer.post_attention_layernorm, layer.mlp, layer.linear_attn,
+              ran.model.norm]
+    assert all("forward" in vars(module) for module in routed)
+    dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
+                                                for name, leaf in loaded.variables["params"].items()})
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
+                    token_draws(tokens), "tier 3 Qwen3-Next LM step", seeds=UNREGISTERED_SEEDS,
+                    truth_fn=truth_fn)
+
+
+def test_a_tier_3_offset_norm_adds_its_offset_in_float32_as_its_source_does():
+    """A bf16 Qwen3-Next RMSNorm (Gemma's `(1 + w)` by code) routed through Dew's fused norm
+    (`kernel_parts`) adds its offset to its float32 weight, as its forward's `1.0 + self.weight.float()`
+    does: an input `[1, 0]` under a weight `[2^-8, 0]` gives the source's own `1.421875` first, bit for bit,
+    where the bf16 add rounded `1 + 2^-8` to 1 and gave `1.4140625` (row 13044's review)."""
+    import torchax
+    from torchax.interop import jax_view
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
+
+    from dew.interop.torchax_kernels import kernel_parts
+
+    class Held(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = transformers.Qwen3NextConfig(hidden_size=2)
+            self.norm = Qwen3NextRMSNorm(2).to(torch.bfloat16)
+
+    held, source = Held(), Qwen3NextRMSNorm(2).to(torch.bfloat16)
+    for norm in (held.norm, source):
+        norm.weight.data = torch.tensor([2.0 ** -8, 0.0], dtype=torch.bfloat16)
+    kernel_parts(held)
+    assert "forward" in vars(held.norm)
+    given = torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16)
+    with torch.no_grad():
+        expected = source(given).float().numpy()
+    env = torchax.default_env()
+    with env, torch.no_grad():
+        norm = held.norm.to("jax")
+        got = np.asarray(jax_view(norm(given.to("jax"))).astype(jnp.float32))
+    np.testing.assert_array_equal(got, expected)
+    assert float(expected[0, 0]) == 1.421875
+
+
+def test_tier_3_leaves_the_mlps_its_swiglu_does_not_compute_as_their_source_writes_them():
+    """Gated MLPs `kernel_parts` recognizes by code but whose projections or arithmetic its SwiGLU does not
+    take keep their own forwards: GLM-4's packed `gate_up_proj` and LFM2's `w1`, `w3`, `w2`, where the
+    rewrite raised as it looked up Llama's names (row 13044's review)."""
+    from dew.interop.torchax_kernels import kernel_parts
+
+    tiny = {"hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
+            "intermediate_size": 48, "vocab_size": 64, "pad_token_id": 0}
+    glm = transformers.Glm4ForCausalLM(transformers.Glm4Config(**tiny))
+    lfm = transformers.Lfm2ForCausalLM(transformers.Lfm2Config(**tiny, layer_types=["full_attention"]))
+    for model, mlp in ((glm, glm.model.layers[0].mlp), (lfm, lfm.model.layers[0].feed_forward)):
+        kernel_parts(model)
+        assert "forward" not in vars(mlp), type(mlp).__name__
+
+
 QUALIFIED_SEEDS = 64
 """The qualified source's check-1 seeds."""
 

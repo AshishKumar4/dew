@@ -24,7 +24,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873]
-- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
@@ -81,11 +80,10 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
+- RL: lossless records, composed methods and real publication. [579, 886, 729, 605]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
-- A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
 - H-Net general composable recursive dynamic-chunking architecture. [12389]
 
 ## Algebra

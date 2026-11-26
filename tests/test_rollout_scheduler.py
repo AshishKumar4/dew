@@ -425,20 +425,31 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
 def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
     """A server whose caller says its requests repeat prompts (`Server.from_task`'s `PagedKV(shared=True)`),
     as a served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix
-    cache, so a group's samples of one prompt prefill it once (row 5375); one that names no layout keeps the
-    model's own whole rows, which serve prompts no two of which share faster (M-IG-12); a model whose
-    LongRoPE rebuilds a crossing request, one whose loop shares a cache its later passes rewrite, which
-    shares no prompt over pages, and one whose max_seq_len holds no row in whole pages keep each row's cache
-    whole."""
+    cache and its rows are at least the measured crossover's (`SHARED_PAGES_FROM`), so a group's samples of
+    one prompt prefill it once (row 5375); rows below it stay whole, where pages lost (M-IG-11: 3% at
+    512-token prompts, row 7420); one that names no layout keeps the model's own whole rows, which serve
+    prompts no two of which share faster (M-IG-12); a model whose LongRoPE rebuilds a crossing request, one
+    whose loop shares a cache its later passes rewrite, which shares no prompt over pages, and one whose
+    max_seq_len holds no row in whole pages keep each row's cache whole."""
     from model_support import serving_task
 
-    from dew.inference.serving import PAGE_SIZE, PagedRows
+    from dew.inference.serving import PAGE_SIZE, SHARED_PAGES_FROM, PagedRows, served_layout
     from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.rope import LongRopeScaling
 
-    task = serving_task(capacity=2 * PAGE_SIZE)
-    assert not isinstance(Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE).rows, PagedRows)
-    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE, cache=PagedKV(shared=True))
+    capacity = SHARED_PAGES_FROM
+    task = serving_task(capacity=capacity)
+    assert not isinstance(Server.from_task(task, slots=2, capacity=capacity).rows, PagedRows)
+    below = Server.from_task(task, slots=2, capacity=capacity - PAGE_SIZE, cache=PagedKV(shared=True))
+    assert not isinstance(below.rows, PagedRows) and not below.reuses_prefixes
+    assert served_layout(task, capacity - PAGE_SIZE, PagedKV(shared=True)) is None
+    assert served_layout(task, capacity, PagedKV(shared=True)) is not None
+    # Pages a cache names itself are kept below the crossover, as the server lays them.
+    named = PagedKV(shared=True, layout=KVCache(page_size=PAGE_SIZE))
+    assert served_layout(task, capacity - PAGE_SIZE, named) is not None
+    named_server = Server.from_task(task, slots=2, capacity=capacity - PAGE_SIZE, cache=named)
+    assert isinstance(named_server.rows, PagedRows)
+    server = Server.from_task(task, slots=2, capacity=capacity, cache=PagedKV(shared=True))
     assert server.reuses_prefixes
     prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]
     server([prompt, prompt], 2, key=0)
@@ -449,7 +460,7 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
                               original_max_position_embeddings=16)
     looped = task.model.clone(loop=Loop(steps=2, shared_cache=True))
     for model in (task.model.clone(rope_scaling=scaling), looped):
-        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE,
+        whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=capacity,
                                  cache=PagedKV(shared=True))
         assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
     short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, cache=PagedKV(shared=True))

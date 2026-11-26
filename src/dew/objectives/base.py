@@ -220,20 +220,37 @@ class Moments(Pooled):
     statistic: str = struct.field(pytree_node=False)
 
     @classmethod
-    def of(cls, rows: jax.Array, statistic: str, product: Callable | None = None) -> Self:
+    def of(cls, rows: jax.Array, statistic: str, product: Callable | None = None,
+           real: jax.Array | None = None) -> Self:
         """The moments of `rows` `[B, D]` in fp32, their co-moment by `product` (a matmul) where `statistic`
-        reads it."""
+        reads it; over the rows `real` `[B]` marks where given (`Objective.real_rows`), a repeat filling an
+        evaluation batch counted in none of them."""
         rows = rows.astype(jnp.float32)
-        center = jnp.mean(rows, axis=0)
-        deviations = rows - center
+        if real is None:
+            count = jnp.asarray(rows.shape[0], jnp.float32)
+            center = jnp.mean(rows, axis=0)
+            deviations = rows - center
+        else:
+            held = real[:, None]
+            count = jnp.sum(real.astype(jnp.float32))
+            # Selected rather than multiplied, so a repeat holding a NaN adds nothing.
+            center = jnp.sum(jnp.where(held, rows, 0), axis=0) / jnp.maximum(count, 1)
+            deviations = jnp.where(held, rows - center, 0)
         products = None if statistic == "std" else (product or jnp.matmul)(deviations.T, deviations)
         squares = jnp.sum(deviations ** 2, axis=0)
-        return cls(jnp.asarray(rows.shape[0], jnp.float32), center, squares, products, statistic)
+        return cls(count, center, squares, products, statistic)
 
     def joined(self, later: Pooled) -> Moments:
         if not isinstance(later, Moments):
             raise TypeError(f"moments join moments, not a {type(later).__name__}")
         count, center, delta, weight = joined_moments(self.count, self.center, later.count, later.center)
+        # A part of no rows (a microbatch of filler alone, `of`'s `real`) joins as nothing: the whole is the
+        # other part, its center the other's and no correction, where Chan's update divides by a whole of
+        # none or weighs an infinite difference by none.
+        both = (self.count > 0) & (later.count > 0)
+        center = jnp.where(both, center, jnp.where(later.count > 0, later.center, self.center))
+        weight = jnp.where(both, weight, 0)
+        delta = jnp.where(both, delta, 0)
         squares = self.squares + later.squares + weight * delta ** 2
         products = None if self.products is None or later.products is None else (
             self.products + later.products + weight * jnp.outer(delta, delta))

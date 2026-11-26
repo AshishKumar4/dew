@@ -207,7 +207,7 @@
 "tests/test_attention_derived.py": [
 "tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[128]",
 "tests/test_attention_derived.py::test_sm90_roofline_forward_and_fused_backward_compile_spill_free[64]",
-"tests/test_attention_derived.py::test_the_accurate_backward_declaration_derives_on_par[keys-first-exact]"
+"tests/test_attention_derived.py::test_the_accurate_backward_declaration_derives_on_par[queries-first-raw]"
 ],
 "tests/test_attention_dropout.py": [
 "tests/test_attention_dropout.py::test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_backward[causal-window-bfloat16]",
@@ -230,7 +230,7 @@
 "tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-documents-valid-accurate]",
 "tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-documents-valid-forward]",
 "tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-documents-valid-fused]",
-"tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-fused-shared-keys]",
+"tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-fused-keys-first]",
 "tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-window-places-accurate]",
 "tests/test_attention_mosaic.py::test_a_call_over_runs_is_on_par_interpreted[sm90-runs-window-places-forward]",
 "tests/test_attention_mosaic.py::test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted",
@@ -985,7 +985,7 @@
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
 ],
 "tests/test_code_digest.py": [
-"tests/test_code_digest.py::test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else"
+"tests/test_code_digest.py::test_a_slotted_instance_of_a_class_of_dews_is_walked_by_its_slots"
 ],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once",
@@ -1343,9 +1343,6 @@
 "tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-plain-0.0-share]",
 "tests/test_decision_workflow.py::test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs",
 "tests/test_decision_workflow.py::test_the_workflows_task_answers_from_its_compiled_programs"
-],
-"tests/test_declared_cells_memory.py": [
-"tests/test_declared_cells_memory.py::test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer[sm90-one device]"
 ],
 "tests/test_decode_attention.py": [
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-16]",
@@ -1828,7 +1825,9 @@
 "tests/test_fused_gemm.py::test_fused_product_fuses_its_epilogue_with_gather_and_scatter"
 ],
 "tests/test_gated_mlp.py": [
-"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[geglu-None-wide-sm80]",
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-wide-sm100]",
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-None-wide-sm80]"
 ],
 "tests/test_gemm_blockwise.py": [
 "tests/test_gemm_blockwise.py::test_a_blockwise_fp8_product_through_the_template_is_on_par[128-4]"
@@ -3237,7 +3236,7 @@
 "tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True]"
 ],
 "tests/test_recurrence_chunk.py": [
-"tests/test_recurrence_chunk.py::test_a_forked_call_of_entry_writes_of_no_terms_lowers_on_the_template[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=False, rated=True, skip=True, output=None, write_bound=None, unit_queries=False, unit_reads=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1, coupled=None)]",
+"tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[an additive erase-pulled back]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[an additive erase-pushed forward]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[no decay-pulled back]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[no decay-pushed forward]",
@@ -3512,10 +3511,6 @@
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[lightning]",
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[mamba3]",
 "tests/test_recurrent_sequence_split.py::test_a_recurrent_mixer_reads_forks_under_a_sequence_axis_as_on_one_device[mamba]"
-],
-"tests/test_reference_runs.py": [
-"tests/test_reference_runs.py::test_dit_work_includes_the_native_conditioning_geometry",
-"tests/test_reference_runs.py::test_the_dew_qwen35_runner_trains_its_compiled_step"
 ],
 "tests/test_release_parity.py": [
 "tests/test_release_parity.py::test_each_release_answers_as_its_own_engine[joint joint_images]",
@@ -4194,6 +4189,9 @@
 "tests/test_trainer.py::test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads",
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
+],
+"tests/test_training_dtypes.py": [
+"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[float32]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
