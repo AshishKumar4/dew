@@ -65,7 +65,11 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
 
 
 @pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",
-                                  "key_dropped_cotangents", "selective_decay", "key_memory_decay"])
+                                  "key_dropped_cotangents", "selective_decay", "key_memory_decay",
+                                  "softcap_tile", "sink_state", "sliding_visibility", "selective_adjoint",
+                                  "kda_strict_band", "gdn_value_pullback", "ssd_chunk_forward",
+                                  "ssd_chunk_pullback",
+                                  "gemm_partial_scale", "fp8_epilogue"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
@@ -117,6 +121,34 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
         for actual, expected in zip(jax.jit(after)(*values), jax.jit(before)(*values), strict=True):
             np.testing.assert_array_equal(actual, expected)
         assert terms.jaxpr_digest(original, in_process=True) == terms.jaxpr_digest(composed, in_process=True)
+
+
+def test_shared_component_preserves_two_ordered_spans_in_one_body():
+    from dew.algebra import _component_sharing, terms
+
+    def phase(value, shift):
+        amount = jax.lax.min(value, np.uint32(3))
+        payload = jax.lax.add(value, np.uint32(5))
+        shifted = shift(payload, amount)
+        allowed = jax.lax.lt(value, np.uint32(8))
+        retained = jax.lax.select(allowed, shifted, jax.lax.full_like(value, 0))
+        return jax.lax.bitwise_xor(retained, value)
+
+    def twice(value):
+        first = phase(value, jax.lax.shift_left)
+        return first, phase(first, jax.lax.shift_right_logical)
+
+    shape = jax.ShapeDtypeStruct((8,), jnp.uint32)
+    written = jax.make_jaxpr(twice)(shape)
+    source, _ = printed.source(written, "twice", borrow_shapes=True)
+    factored = _component_sharing.shared({"twice": source})
+    assert len(factored) == 2
+    loaded = printed.loaded("\n\n".join(factored.values()), "twice")
+    rebuilt = jax.make_jaxpr(loaded)(shape)
+    assert terms.jaxpr_digest(rebuilt, in_process=True) == terms.jaxpr_digest(written, in_process=True)
+    value = np.arange(shape.size, dtype=np.uint32)
+    for actual, expected in zip(jax.jit(loaded)(value), jax.jit(twice)(value), strict=True):
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])

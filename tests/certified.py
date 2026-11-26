@@ -2196,6 +2196,11 @@ def observing():
         del _OBSERVING[next(index for index, observer in enumerate(_OBSERVING) if observer is seen)]
 
 
+_RAW_BITCAST_PAIRS = frozenset({(np.dtype(np.uint8), np.dtype(jax.numpy.float8_e4m3fn)),
+                               (np.dtype(jax.numpy.float8_e4m3fn), np.dtype(np.uint8))})
+"""Explicit integer/FP8 storage views the exact bitcast contract can check without a float format."""
+
+
 def _held(eqn, operands, results, findings, at) -> None:
     # An operation is its primitive object: one of another library's or a user's that bears a name of
     # JAX's has no contract here, and is refused by that name.
@@ -2206,7 +2211,10 @@ def _held(eqn, operands, results, findings, at) -> None:
         findings.append(f"{at}: uncertifiable, no contract for {name}")
         return
     hosted = [_host(value) for value in operands]
-    for value in [*hosted, *(_host(result) for result in results)]:
+    hosted_results = [_host(result) for result in results]
+    raw_bitcast = (primitive is jax.lax.bitcast_convert_type_p
+                   and (hosted[0].dtype, hosted_results[0].dtype) in _RAW_BITCAST_PAIRS)
+    for value in () if raw_bitcast else (*hosted, *hosted_results):
         dtype = getattr(value, "dtype", None)
         keyed = dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:

@@ -652,6 +652,25 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+@pytest.mark.parametrize("raw", [False, True], ids=["fp8-first", "bytes-first"])
+def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(raw):
+    codes = np.arange(256, dtype=np.uint8)
+    stored = codes.view(ml_dtypes.float8_e4m3fn)
+    start, middle, returned = ((codes, jnp.float8_e4m3fn, jnp.uint8) if raw
+                               else (stored, jnp.uint8, jnp.float8_e4m3fn))
+
+    def viewed(value):
+        other = jax.lax.bitcast_convert_type(value, middle)
+        return other, jax.lax.bitcast_convert_type(other, returned)
+
+    (other, repeat), findings = ct.certified(viewed, start)
+    assert not findings, findings
+    np.testing.assert_array_equal(np.asarray(other).view(np.uint8), codes)
+    np.testing.assert_array_equal(np.asarray(repeat).view(np.uint8), codes)
+    _, findings = ct.certified(lambda value: value.astype(jnp.float32), stored)
+    assert findings and all("no format for float8_e4m3fn" in finding for finding in findings)
+
+
 def test_an_integer_division_is_held_at_every_64_bit_magnitude():
     """An integer division truncates toward zero and wraps to its width, and its remainder takes the
     dividend's sign: int64's least value, -2^63, over 3 is -3074457345618258602, over -1 itself, uint64's

@@ -11,15 +11,16 @@ import numpy as np
 
 from dew.algebra.generate import Cases, ComponentForm, declare
 from dew.nn import precision
-from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels import recurrence_algebra, ssd
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
-from dew.nn.kernels.templates import attention_algebra
+from dew.nn.kernels.templates import attention, attention_algebra, attention_gradient
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
     derived_from_weights,
     derived_weights,
     softmax_gradients,
 )
+from dew.nn.kernels.templates.gemm import quantized
 from dew.nn.kernels.templates.operands import Parts
 
 
@@ -527,3 +528,215 @@ KEY_MEMORY_DECAY = declare(__name__, "key_memory_decay", ComponentForm(
         tuple((jax.ShapeDtypeStruct(shape, dtype), jax.ShapeDtypeStruct(shape, jnp.float32))
               for shape, dtype in (((64, 64), jnp.float32), ((128, 64), jnp.bfloat16))),
         _key_memory_decay_draw, seeds=8, policies=("default",))))
+
+
+def _softcap_tile(logits, seen):
+    capped, slopes = attention_gradient.tile_logits(attention.Capped(50.0), logits, seen, None, None, (),
+                                                     scale=0.125, slopes=True)
+    assert slopes is not None
+    # Split out the negative-infinity sentinel for the finite error gate without losing any output.
+    unseen = capped == -jnp.inf
+    return jnp.where(unseen, 0.0, capped), slopes[0], unseen
+
+
+def _softcap_tile_truth(logits, seen):
+    z = logits / 400
+    t = jnp.tanh(z)
+    return jnp.where(seen, 50 * t, 0.0), 1 - t * t, ~seen
+
+
+def _softcap_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    logits = rng.uniform(-200, 200, operands[0].shape).astype(np.float32)
+    seen = rng.random(logits.shape) > 0.3
+    logits[0, :5] = [0.0, -0.0, 1, -1, 1000]
+    seen[0, :] = False
+    logits[1, :3], seen[1, :3] = [0.0, -1.0, 1000], True
+    return logits, seen
+
+
+def _sink_state(values):
+    initial = attention.sinks(values, values.shape[0], values.shape[1], 64)
+    return initial.m, initial.total, initial.acc
+
+
+def _sink_state_truth(values):
+    peak = jnp.einsum("bqh->bhq", values)
+    return peak, jnp.ones_like(peak), jnp.zeros((*peak.shape, 64), peak.dtype)
+
+
+def _sliding_visibility(key, start, stop, queries, documents):
+    return attention.within(key[None, :], start[:, None], stop[:, None],
+                            (queries[:, None], documents[None, :]))
+
+
+def _sliding_visibility_truth(key, start, stop, queries, documents):
+    def visible(lo, hi, document):
+        return (documents == document) & (key - lo >= 0) & (hi - key > 0)
+
+    return jax.vmap(visible)(start, stop, queries)
+
+
+def _sliding_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    rows, keys = operands[1].shape[0], operands[0].shape[0]
+    key = np.arange(keys, dtype=np.int32) + 32
+    stop = rng.integers(16, keys + 48, size=rows, dtype=np.int32)
+    start = stop - rng.integers(0, 48, size=rows, dtype=np.int32)
+    start[:3], stop[:3] = [32, 32, 40], [32, 33, 44]
+    queries = rng.integers(0, 3, size=rows, dtype=np.int32)
+    documents = (np.arange(keys, dtype=np.int32) // 8) % 3
+    queries[:3] = [0, 0, 2]
+    return key, start, stop, queries, documents
+
+
+def _selective_adjoint_truth(cotangent, before, decay, written, step, value, b, dy, rate):
+    carried = cotangent * decay * before
+    write = cotangent * b
+    return (step * write, rate * carried + value * write, (step * value) * cotangent,
+            (before * decay + written) * dy, step * carried)
+
+
+def _selective_adjoint_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    cotangent, before, decay, written, step, value, b, dy, rate = _arrays(seed, operands)
+    decay = rng.uniform(0, 1, operands[2].shape).astype(np.float32)
+    step = np.abs(step)
+    rate = -np.abs(rate)
+    # A reset contributes no entering-state derivative; a padded token has no write.
+    decay[0], written[1], step[1] = 0, 0, 0
+    return cotangent, before, decay, written, step, value, b, dy, rate
+
+
+def _kda_strict_band(bands):
+    return recurrence_algebra.block_masked(bands, strict=True, scale=1.0)
+
+
+def _kda_band_truth(bands):
+    sub = bands.shape[1]
+    return jnp.tril(bands.reshape(-1, sub, sub), k=-1).reshape(bands.shape)
+
+
+def _kda_band_draw(seed, operands):
+    (bands,) = _arrays(seed, operands)
+    # The inverse must never read the diagonal or an upper entry of a sub-chunk.
+    token = np.arange(bands.shape[0]) % bands.shape[1]
+    columns = np.arange(bands.shape[1])
+    bands[columns[None, :] >= token[:, None]] = np.nan if seed % 2 else np.inf
+    return (bands,)
+
+
+def _gdn_values_truth(cotangent, values, beta):
+    return jnp.einsum("cv,c->cv", cotangent, beta), jnp.einsum("cv,cv->c", cotangent, values)
+
+
+def _gdn_values_draw(seed, operands):
+    cotangent, values, beta = _arrays(seed, operands)
+    beta = np.abs(beta) * np.float32(0.25)
+    beta[0], values[1] = 0, 0
+    return cotangent, values, beta
+
+
+def _ssd_truth(x, b, c, a, state):
+    def token(previous, inputs):
+        value, write, read, decay = inputs
+        next_state = jnp.exp(decay) * previous + value[:, None] * write[None, :]
+        return next_state, next_state @ read
+
+    final, out = jax.lax.scan(token, state, (x, b, c, a))
+    return out, final
+
+
+def _ssd_pullback_truth(x, b, c, a, state, dy, dnext):
+    _, pull = jax.vjp(_ssd_truth, x, b, c, a, state)
+    return pull((dy, dnext))
+
+
+def _ssd_component_draw(seed, operands):
+    vals = _arrays(seed, operands)
+    x, b, c, a, state, *adjoints = vals
+    a = -np.abs(a) * np.float32(0.125)
+    a[0] = 0
+    x[1], b[1] = 0, 0
+    if seed == 1:
+        a[len(a) // 2] = -32
+    return x, b, c, a, state, *adjoints
+
+
+def _ssd_cases(*, reverse):
+    cases = []
+    for chunk, channels, states in ((64, 32, 32), (64, 64, 32)):
+        args = ((chunk, channels), (chunk, states), (chunk, states), (chunk,), (channels, states))
+        cases.append((*args, args[0], args[-1]) if reverse else args)
+    return dataclasses.replace(_cases(*cases), draw=_ssd_component_draw)
+
+
+def _gemm_scaled_truth(partial, rows, columns):
+    return partial * rows[:, None] * columns[None, :]
+
+
+def _gemm_scaled(partial, rows, columns):
+    return precision.scaled_partial(partial, rows[:, None], columns[None, :])
+
+
+def _gemm_scale_draw(seed, operands):
+    partial, rows, columns = _arrays(seed, operands)
+    rows, columns = np.abs(rows), np.abs(columns)
+    # Exercise row-first and column-first overflow avoidance as well as ordinary scales.
+    if seed == 1:
+        rows[0], columns[0], partial[0, 0] = 2.0 ** 127, 2.0 ** -80, 4
+        partial[0, 1:] = 0
+    elif seed == 2:
+        columns[0], rows[0], partial[0, 0] = 2.0 ** 127, 2.0 ** -80, 4
+        partial[1:, 0] = 0
+    return partial, rows, columns
+
+
+def _fp8_epilogue_truth(acc):
+    # The recipe first stores its rounded activation, then scales each 128 columns independently.
+    stored = acc.astype(jnp.bfloat16).astype(jnp.float64)
+    blocks = stored.reshape(acc.shape[0], -1, 128)
+    maximum = jnp.maximum(jnp.max(jnp.abs(blocks), axis=-1, keepdims=True), 1e-4)
+    fraction, exponent = jnp.frexp(maximum)
+    # The FP8 ceiling 448 is (7/8) × 2^9. Compare the exact fractions at a scale boundary.
+    power = jnp.ldexp(jnp.ones_like(maximum), exponent - 9 + (fraction > 0.875))
+    encoded = jnp.clip(blocks / power, -448, 448).astype(jnp.float8_e4m3fn).astype(jnp.float64)
+    return stored, encoded.reshape(acc.shape), jnp.broadcast_to(power, blocks.shape).reshape(acc.shape)
+
+
+def _fp8_epilogue_draw(seed, operands):
+    (acc,) = _arrays(seed, operands)
+    acc *= np.float32(4 ** (seed % 4))
+    acc[0, :128] = 0
+    acc[1, :4] = [448, -448, 224, -224]
+    return (acc,)
+
+
+SOFTCAP_TILE = declare(__name__, "softcap_tile", ComponentForm(_softcap_tile, _softcap_tile_truth, Cases(
+    tuple((jax.ShapeDtypeStruct(shape, jnp.float32), jax.ShapeDtypeStruct(shape, jnp.bool_))
+          for shape in ((32, 64), (64, 128))), _softcap_draw, seeds=8, policies=("default",))))
+SINK_STATE = declare(__name__, "sink_state", ComponentForm(
+    _sink_state, _sink_state_truth, _cases(((1, 32, 8),), ((2, 64, 16),))))
+SLIDING_VISIBILITY = declare(__name__, "sliding_visibility", ComponentForm(
+    _sliding_visibility, _sliding_visibility_truth, Cases(
+        tuple(tuple(jax.ShapeDtypeStruct((n,), jnp.int32) for n in (keys, rows, rows, rows, keys))
+              for rows, keys in ((32, 64), (64, 128))), _sliding_draw, seeds=8, policies=("default",))))
+SELECTIVE_ADJOINT = declare(__name__, "selective_adjoint", ComponentForm(
+    recurrence_algebra.selective_adjoint, _selective_adjoint_truth, dataclasses.replace(
+        _cases(*[((n,),) * 8 + ((),) for n in (128, 256)]), draw=_selective_adjoint_draw)))
+KDA_STRICT_BAND = declare(__name__, "kda_strict_band", ComponentForm(
+    _kda_strict_band, _kda_band_truth, dataclasses.replace(
+        _cases(((32, recurrence_algebra.SUB),), ((64, recurrence_algebra.SUB),)), draw=_kda_band_draw)))
+GDN_VALUE_PULLBACK = declare(__name__, "gdn_value_pullback", ComponentForm(
+    recurrence_algebra.gated_values_back, _gdn_values_truth, dataclasses.replace(
+        _cases(*[((c, v), (c, v), (c,)) for c, v in ((32, 64), (64, 128))]), draw=_gdn_values_draw)))
+SSD_CHUNK_FORWARD = declare(__name__, "ssd_chunk_forward", ComponentForm(
+    ssd._chunk_forward, _ssd_truth, _ssd_cases(reverse=False)))
+SSD_CHUNK_PULLBACK = declare(__name__, "ssd_chunk_pullback", ComponentForm(
+    ssd._chunk_backward, _ssd_pullback_truth, _ssd_cases(reverse=True)))
+GEMM_PARTIAL_SCALE = declare(__name__, "gemm_partial_scale", ComponentForm(
+    _gemm_scaled, _gemm_scaled_truth, dataclasses.replace(
+        _cases(*[((m, n), (m,), (n,)) for m, n in ((32, 128), (64, 128))]), draw=_gemm_scale_draw)))
+FP8_EPILOGUE = declare(__name__, "fp8_epilogue", ComponentForm(
+    quantized.blockwise_fp8_epilogue(), _fp8_epilogue_truth,
+    dataclasses.replace(_cases(((32, 128),), ((64, 256),)), draw=_fp8_epilogue_draw)))

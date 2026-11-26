@@ -11,10 +11,12 @@ from dew.algebra import printed
 
 _MIN_SHARED = 6
 """Smaller fragments would add a call and arguments for little source reduction."""
+_MAX_SHARED = 64
+"""Long repeats can share several readable helpers rather than one oversized body."""
 
 
 class _Fragment(ast.NodeTransformer):
-    """Alpha-rename a flat fragment. Only static broadcast shapes/axes may vary between copies."""
+    """Alpha-rename a fragment without changing its caller's geometry or logical shift direction."""
 
     def __init__(self, scope: set[str]):
         self.scope = scope
@@ -26,7 +28,7 @@ class _Fragment(ast.NodeTransformer):
         return ast.Name(id=slot, ctx=ast.Load())
 
     def visit_Name(self, node: ast.Name) -> ast.Name:
-        if node.id not in self.scope:
+        if node.id == "_" or node.id not in self.scope:
             return node
         if isinstance(node.ctx, ast.Store):
             self.bound[node.id] = f"v{len(self.bound)}"
@@ -34,8 +36,15 @@ class _Fragment(ast.NodeTransformer):
             return ast.Name(id=self.bound[node.id], ctx=node.ctx)
         return self._input(node.id)
 
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        # Both logical shifts have the same bind interface. The caller passes the original primitive.
+        if (node.attr in ("shift_left_p", "shift_right_logical_p")
+                and isinstance(node.value, ast.Name) and node.value.id == "lax"):
+            return self._input(ast.unparse(node))
+        return self.generic_visit(node)
+
     def visit_keyword(self, node: ast.keyword) -> ast.AST:
-        if node.arg in ("shape", "broadcast_dimensions") and _extent(node.value, self.bound):
+        if node.arg in ("shape", "broadcast_dimensions", "new_sizes") and _extent(node.value, self.bound):
             return ast.keyword(arg=node.arg, value=self._input(ast.unparse(node.value)))
         return self.generic_visit(node)
 
@@ -71,24 +80,45 @@ class _Copy:
     written: tuple[str, ...]
 
 
-def _assigns(node: ast.stmt) -> bool:
-    return (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "bind")
+def _assigns(node: ast.stmt, fragments: set[str]) -> bool:
+    if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        return False
+    call = node.value.func
+    if isinstance(call, ast.Name):
+        return call.id in fragments
+    if not isinstance(call, ast.Attribute):
+        return False
+    return call.attr == "bind" or (call.attr == "array" and isinstance(call.value, ast.Name)
+                                   and call.value.id == "np")
 
 
-def _copy(name: str, first: int, nodes: list[ast.stmt], scope: set[str]) -> _Copy:
-    normal = _Fragment(scope)
-    statements = []
-    for node in nodes:
-        # Visit the operands before allocating the SSA result names.
-        assert isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-        call = normal.visit(copy.deepcopy(node.value))
-        assert isinstance(call, ast.Call)
-        (target,) = node.targets
-        target = ast.unparse(normal.visit(copy.deepcopy(target)))
-        args = tuple(ast.unparse(arg) for arg in (*call.args, *call.keywords))
-        statements.append(_Assignment(target, ast.unparse(call.func), args))
-    return _Copy(name, first, tuple(statements), tuple(normal.inputs), tuple(normal.bound))
+@dataclasses.dataclass
+class _Span:
+    name: str
+    first: int
+    available: int
+    normal: _Fragment
+    statements: list[_Assignment] = dataclasses.field(default_factory=list)
+
+    def extend(self, nodes: list[ast.stmt], width: int) -> tuple[_Assignment, ...]:
+        for index in range(self.first + len(self.statements), self.first + width):
+            self.statements.append(_assignment(nodes[index], self.normal))
+        return tuple(self.statements)
+
+    def snapshot(self) -> _Copy:
+        return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.inputs),
+                     tuple(self.normal.bound))
+
+
+def _assignment(node: ast.stmt, normal: _Fragment) -> _Assignment:
+    # Visit the operands before allocating the SSA result names.
+    assert isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+    call = normal.visit(copy.deepcopy(node.value))
+    assert isinstance(call, ast.Call)
+    (target,) = node.targets
+    target = ast.unparse(normal.visit(copy.deepcopy(target)))
+    args = tuple(ast.unparse(arg) for arg in (*call.args, *call.keywords))
+    return _Assignment(target, ast.unparse(call.func), args)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,34 +139,41 @@ def _bodies(source: dict[str, str]) -> dict[str, _Body]:
     return bodies
 
 
-def _largest(bodies: dict[str, _Body]) -> tuple[_Copy, ...]:
-    """Find the shared region which saves the most source; only original primitive binds are eligible."""
+def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]:
+    """Find the shared region which saves the most source, including earlier emitted fragments."""
     candidates = []
     for name, body in bodies.items():
-        runs = itertools.groupby(enumerate(map(_assigns, body.statements)), key=lambda pair: pair[1])
+        eligible = (_assigns(node, fragments) for node in body.statements)
+        runs = itertools.groupby(enumerate(eligible), key=lambda pair: pair[1])
         for accepted, group in runs:
             if accepted:
                 indices = [index for index, _ in group]
-                candidates.extend((name, first, indices[-1] + 1 - first)
+                candidates.extend(_Span(name, first, indices[-1] + 1 - first, _Fragment(body.scope))
                                   for first in indices[:len(indices) - _MIN_SHARED + 1])
     best: tuple[_Copy, ...] = ()
     saved = 0
-    for width in itertools.count(_MIN_SHARED):
-        by_body: dict[tuple[_Assignment, ...], list[tuple[_Copy, int]]] = defaultdict(list)
-        for name, first, available in candidates:
-            if available >= width:
-                body = bodies[name]
-                duplicate = _copy(name, first, body.statements[first:first + width], body.scope)
-                by_body[duplicate.statements].append((duplicate, available))
+    for width in range(_MIN_SHARED, _MAX_SHARED + 1):
+        by_body: dict[tuple[_Assignment, ...], list[_Span]] = defaultdict(list)
+        for span in candidates:
+            if span.available >= width:
+                signature = span.extend(bodies[span.name].statements, width)
+                by_body[signature].append(span)
         candidates = []
         for entries in by_body.values():
-            copies = {found.name: found for found, _ in reversed(entries)}
+            # Every group's starts remain in source order. Earliest disjoint spans leave the
+            # most room for the next one of the same width in the same function.
+            stops: dict[str, int] = {}
+            copies = []
+            for span in entries:
+                if span.first >= stops.get(span.name, 0):
+                    copies.append(span)
+                    stops[span.name] = span.first + width
             if len(copies) < 2:
                 continue
-            candidates.extend((found.name, found.first, available) for found, available in entries)
+            candidates.extend(entries)
             avoided = width * (len(copies) - 1)
             if avoided > saved:
-                best, saved = tuple(reversed(tuple(copies.values()))), avoided
+                best, saved = tuple(span.snapshot() for span in copies), avoided
         if not candidates:
             return best
     return best
@@ -154,9 +191,10 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
     forms = dict(source)
     occupied = set(source).union(reserved)
     numbers = itertools.count()
+    fragments: set[str] = set()
     while True:
         bodies = _bodies(forms)
-        copies = _largest(bodies)
+        copies = _largest(bodies, fragments)
         if not copies:
             return forms
         first = copies[0]
@@ -167,13 +205,15 @@ def shared(source: dict[str, str], *, reserved: Collection[str] = ()) -> dict[st
         while (name := f"_shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
+        fragments.add(name)
         fragment_lines = printed.wrapped(f"def {name}(", [f"p{i}" for i in range(len(first.arguments))], "):")
         fragment_lines += [line for statement in first.statements for line in statement.printed()]
         if kept:
             tail = ",)" if len(kept) == 1 else ")"
             fragment_lines += printed.wrapped("    return (", [f"v{i}" for i in kept], tail)
         forms[name] = "\n".join(fragment_lines)
-        for found, reads in zip(copies, suffixes, strict=True):
+        # Later replacements cannot slide an earlier source range in the same function.
+        for found, reads in reversed(tuple(zip(copies, suffixes, strict=True))):
             nodes = bodies[found.name].statements
             begin, end = nodes[found.first].lineno - 1, nodes[found.first + width - 1].end_lineno
             outputs = ", ".join(found.written[index] if found.written[index] in reads else "_"
