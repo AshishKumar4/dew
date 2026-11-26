@@ -684,9 +684,10 @@ def dot_general(xla, path: tuple | None = None):
     and the bias's gradients formed, one barrier for both where the bias's own rule would add two (row
     6740). A `tensor_scale`, the rows' tensor scale under the run's delayed NVFP4 scaling, goes to the
     recipe's product (`recipe_general`); a product the recipe leaves reads none. A `formed` input
-    (`FormedInput`, its `operand` `lhs` itself) is multiplied as `gemm`'s formed operand where the plain product sees its
-    rows whole (`_formed_product`), each device's own rows where the call maps them per shard; every other
-    product of it (a recipe's, XLA's under a mesh the partitioner places) multiplies `lhs` as any."""
+    (`FormedInput`, its `operand` `lhs` itself) is multiplied as `gemm`'s formed operand where the plain
+    product sees its rows whole (`_formed_product`), each device's own rows where the call maps them per
+    shard; every other product of it (a recipe's, XLA's under a mesh the partitioner places) multiplies
+    `lhs` as any."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, bias=None,
                 tensor_scale=None, formed: FormedInput | None = None, **kwargs):
         def added(out):
