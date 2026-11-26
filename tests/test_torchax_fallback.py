@@ -1878,3 +1878,41 @@ def test_a_refused_recomputed_layer_leaves_no_trace_behind(tmp_path):
         return loaded.model.apply(variables, tokens, train=True, rngs={"dropout": key})
     first, second = (jax.jit(train)(loaded.variables, jax.random.key(seed)) for seed in (1, 2))
     assert not np.array_equal(np.asarray(first), np.asarray(second))
+
+
+def test_two_variants_of_one_source_trace_side_by_side_as_each_does_alone(tmp_path):
+    """Two variants of one tier-3 source sharing its torch graph (`PretrainedFallback.with_model`'s): a loop
+    over its first layer and its layers recomputed, each one's gradient traced (an unjitted call traces) four
+    times in a thread of its own, both threads at once. Each gives what it gives alone, bit for bit: a
+    trace's layer seam, training mode and parameter binding are its own (row 13139), where a seam installed
+    in place on the shared layers wrapped or removed the other trace's."""
+    import threading
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    variants = (loaded.model.with_loop(Loop(steps=3, layers=(0, 1), step_norm=False)),
+                loaded.model.clone(remat=True))
+    assert variants[0].graph is variants[1].graph is loaded.model.graph
+    (ids,) = token_draw(0x13139, LLAMA["vocab_size"], (2, 12))(0)
+
+    def gradient(model):
+        return jax.grad(lambda variables: jnp.sum(model.apply(variables, ids, train=True)))(loaded.variables)
+
+    alone = [gradient(model) for model in variants]
+    start, ran = threading.Barrier(len(variants)), {}
+
+    def run(index):
+        start.wait()
+        ran[index] = [gradient(variants[index]) for _ in range(4)]
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(len(variants))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(ran) == [0, 1]
+    for index, runs in ran.items():
+        for each in runs:
+            for got, wanted in zip(jax.tree.leaves(each), jax.tree.leaves(alone[index]), strict=True):
+                np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
