@@ -659,21 +659,20 @@ def divides_as_ieee_division_at_its_edges(divider: str = ""):
     """`correctly_rounded_divide` over `division_edges`, compiled for this backend: each quotient of normal
     operands IEEE division's, bit for bit (NumPy's float64 quotient rounded once to float32, which rounds as
     once: 53 >= 2 x 24 + 2), its overflows infinite and its subnormal quotients on their grid, ties to even,
-    over divisors given as arrays and as constants (which the backend's division approximates); and each
-    quotient of a zero, subnormal, infinite or NaN operand the backend's own division. Its arms' labels end in
+    over divisors given as arrays and as constants (which the backend's division approximates), a subnormal
+    operand's quotient its value's (row 13163); and each quotient of a zero, infinite or NaN operand IEEE
+    division's, beside a subnormal one too. Its arms' labels end in
     `divider`, a process's divider of its own (`APPROXIMATELY`), so one test's store holds both processes'."""
     from reference_error import ahead_arm
 
     from dew.nn.precision import correctly_rounded_divide
 
     numerator, denominator = division_edges()
-    normal = (np.abs(numerator) >= np.finfo(np.float32).tiny) & np.isfinite(numerator) & (
-        np.abs(denominator) >= np.finfo(np.float32).tiny) & np.isfinite(denominator)
+    # A finite nonzero operand, a subnormal one too: its quotient its value's (row 13163).
+    valued = (numerator != 0) & np.isfinite(numerator) & (denominator != 0) & np.isfinite(denominator)
     # Programs with no check-1 site, each prepared as an arm is in a GPU tier part (`ahead_arm`), every one
     # run before any is judged: a prepare's arm gives zeros.
     actual = np.asarray(ahead_arm(jax.jit(correctly_rounded_divide), EDGES + divider)(numerator, denominator))
-    past = f"the plain division of the edges past the normals{divider}"
-    plain = np.asarray(ahead_arm(jax.jit(jnp.divide), past)(numerator[~normal], denominator[~normal]))
     # A constant divisor, which XLA takes as a product by its rounded reciprocal (on a CPU and a GPU alike),
     # so the first quotient is off and the correction and the last move decide: the edges' normal numerators
     # over divisors just below a power of two, odd ones and the ones the callers divide by.
@@ -685,8 +684,11 @@ def divides_as_ieee_division_at_its_edges(divider: str = ""):
         for divisor in divisors]
     with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
         expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
-    np.testing.assert_array_equal(actual[normal].view(np.uint32), expected[normal].view(np.uint32))
-    np.testing.assert_array_equal(actual[~normal], plain)
+    np.testing.assert_array_equal(actual[valued].view(np.uint32), expected[valued].view(np.uint32))
+    # A zero, infinite or NaN operand's is IEEE division's, beside a subnormal one too, its sign included.
+    special = ~valued & ~np.isnan(expected)
+    np.testing.assert_array_equal(actual[~valued], expected[~valued])
+    np.testing.assert_array_equal(np.signbit(actual[special]), np.signbit(expected[special]))
     for divisor, quotient in zip(divisors, quotients, strict=True):
         with np.errstate(over="ignore", under="ignore"):
             wanted = (held.astype(np.float64) / np.float64(divisor)).astype(np.float32)
@@ -845,6 +847,21 @@ def test_a_correctly_rounded_divisions_denominator_derivative_holds_its_second_o
     zero = np.float32(0)
     assert np.isnan(float(jax.jvp(lambda d: divided(zero, d), (zero,), (np.float32(1),))[1]))
     assert np.isnan(float(jax.vjp(lambda d: divided(zero, d), zero)[1](np.float32(1))[0]))
+
+
+def test_a_correctly_rounded_divisions_reverse_over_forward_derivative_and_its_zero_seed():
+    """`2^50 / d` at `2^-40`: its tangent under a seed `2^-50` pulled back by a unit cotangent is `2^121`
+    (each order of its balanced derivative plain arithmetic JAX transposes), and differentiating only the
+    second of `[2^20, 1] / [2^-60, 1]` leaves the first denominator's gradient zero, not the NaN of `0`
+    times an infinite `(n / d) / d` (row 13163's review)."""
+    from dew.nn.precision import divided
+
+    numerator, seed = np.float32(2.0 ** 50), np.float32(2.0 ** -50)
+    _, pull = jax.vjp(lambda d: jax.jvp(lambda d: divided(numerator, d), (d,), (seed,))[1],
+                      np.float32(2.0 ** -40))
+    assert float(pull(np.float32(1))[0]) == 2.0 ** 121
+    gradient = jax.grad(lambda d: divided(np.float32([2.0 ** 20, 1]), d)[1])(np.float32([2.0 ** -60, 1]))
+    np.testing.assert_array_equal(np.asarray(gradient), np.float32([0, -1]))
 
 
 @pytest.mark.parametrize("lowered", [0, 3], ids=["plain", "lowered"])

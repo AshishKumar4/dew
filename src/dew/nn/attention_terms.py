@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from .binades import scaled_ratio
+from .binades import first_clean, orders
 from .derivatives import Protected, contracted, declared_tangent
 from .precision import at_least_fp32, computed_einsum
 
@@ -93,14 +93,20 @@ def _giant_primal(x: jax.Array, factor: jax.Array, threshold: float, eps: float)
     return jnp.where(gain >= tiny, x * gain, small)
 
 
+_GAIN_ORDERS = [lambda value, gain, *_: [gain, value * gain], *orders(((False, 1), (False, 2), (True, 3)))]
+"""A tangent times a giant head's gain (`_giant_jvp`): the gain whole where it is normal (its own step, so a
+subnormal one is not clean), else the threshold, the scale and the length in each order (its operands the
+gain, the threshold, the scale and the length)."""
+
+
 def _giant_jvp(threshold: float, eps: float, primals, tangents):
     """The clip's derivative, a symmetric map of the tangent (`_moved`, its own transpose, so reverse mode
     evaluates the same expression: `generation.linear_map`): unclipped, the tangent itself; else `g ((dx -
     u (u . dx)) + u (u . dx) ((1 - c) + c eps s / (|y| + eps s)))` of the head's direction `u = y / |y|`, the
     share `c` of the ratio's derivative `min` takes (JAX's: all where it clips, half at a tie), the radial
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
-    whole where it is normal, else as `v threshold / (|y| + eps s) s` with each factor's binade apart
-    (`binades.scaled_ratio`). The scale is constant (no
+    whole where it is normal, else as `v threshold / (|y| + eps s) s` in an order kept in range
+    (`binades.first_clean`). The scale is constant (no
     tangent). Exact to fp32's normal range: a component or a product of terms below it relative to the head
     (`2^-126` of its largest) flushes, as any fp32 norm of a scaled head does."""
     from .kernels.generation import linear_map
@@ -118,14 +124,12 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
         radial = direction * jnp.sum(direction * tangent, axis=-1, keepdims=True)
         kept = (tangent - radial) + radial * radial_share
         gain = jnp.minimum(ratio, 1)
-        # A subnormal gain's product with the binades apart (`scaled_ratio`): `kept threshold` overflows
-        # where the result is near one (four channels of 2^127 under 2, a tangent 2^127 across: row 13169).
-        normal = gain >= jnp.finfo(tangent.dtype).tiny
-        # Each branch's operands where the other is chosen held at one (`scaled_ratio` takes finite ones).
-        held = jnp.where(normal | ~jnp.isfinite(kept), 1, kept)
-        balanced = scaled_ratio((held, jnp.full_like(denominator, threshold), factor),
-                                (jnp.where(normal, 1, denominator),))
-        scaled_down = jnp.where(normal | ~jnp.isfinite(kept), kept * gain, balanced)
+        # The gain's product in the first clean order (`binades.first_clean`): `kept g` where `g` is
+        # normal, else `kept` times the threshold and the scale and over the length in an order kept in
+        # range (four channels of 2^127 under 2, a tangent 2^127 across: `kept threshold` overflows, row
+        # 13169).
+        operands = (gain, jnp.full_like(denominator, threshold), factor, denominator)
+        scaled_down = first_clean(kept, operands, _GAIN_ORDERS)
         return jnp.where(ratio > 1, tangent, scaled_down)
 
     return _giant(x, factor, threshold, eps), linear_map(moved, moved, residuals, tangent)
