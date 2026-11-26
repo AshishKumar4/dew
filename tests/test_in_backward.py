@@ -647,7 +647,7 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
                 compiled.append(built(exact=exact))
             steps = compiled[0]
             first = initial(int(drawn))
-            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            state = steps._as_step(wide(first) if exact else jax.tree.map(jnp.copy, first))
             placed = shard_batch(steps.device_mesh, batch)
             if len(compiled) == 1:
                 compiled.append(steps.compile(state, placed))
@@ -872,7 +872,7 @@ def test_a_scanned_step_whose_loss_casts_its_weights_keeps_them_unrounded():
                         advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
         steps.device_mesh = MeshSpec().build(jax.devices()[:1])
         steps.validate(steps=1)
-        state = steps.staged(steps.initial_state())
+        state = steps._as_step(steps.initial_state())
         batch = shard_batch(steps.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
         state, *_ = steps.compile(state, batch)(state, batch)
         return jax.device_get(steps.stored(state).variables["params"])
@@ -937,7 +937,7 @@ def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool,
                 compiled.append(built(exact=exact))
             steps = compiled[0]
             first = initial(int(drawn))
-            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            state = steps._as_step(wide(first) if exact else jax.tree.map(jnp.copy, first))
             placed = [shard_batch(steps.device_mesh, {"text": rows}) for rows in tokens]
             if len(compiled) == 1:
                 compiled.append(steps.compile(state, placed[0]))

@@ -707,12 +707,13 @@ def context() -> tuple:
     declaration holds (`derive`'s forms, beside the rule sets its numerics admit, `rules.admitted_names`;
     `scan.derive_scan`'s carry splits): forms traced under one abstract
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
-    and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
-    the extractor oracle on or off (`Passes.checked`), by every registered rule set but those the pass leaves
-    out (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm). Not
-    the whole trace context, whose identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are
-    new in each lowering: every lowering derived again and the cache grew without end."""
-    return (jax.sharding.get_abstract_mesh(), cost.target(), generation.numerics(),
+    and are priced for one target's pricing facts (`cost.pricing_key`), under one run's numerics and
+    precision.
+    The extractor oracle may be on or off (`Passes.checked`), and the pass may leave out a registered set
+    of rules (`Passes.without`, a receipt's arm, which shares no derivation or recognition with another arm).
+    Identity-keyed collections (`dew._cache.KERNEL_ROUTES`, `KERNEL_SEEN`) are not part of this key:
+    they are new in each lowering, which would derive again and grow the cache without end."""
+    return (jax.sharding.get_abstract_mesh(), cost.pricing_key(cost.target()), generation.numerics(),
             jax.config.jax_default_matmul_precision, ALGEBRA.value.checked, ALGEBRA.value.without,
             ALGEBRA.value.dev)
 
@@ -789,7 +790,8 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
                  tuple(_parts_of(value, accumulated, added)
                        for accumulated, added in zip(made.accumulated, made.added, strict=True)))
         steps = [value(form) if part is None else None for part, form in zip(parts, made.steps, strict=True)]
-        taken = (None,) * len(made.steps) if stepped is None else tuple(stepped(tuple(state), parts))
+        taken = ((None,) * len(made.steps) if stepped is None
+                 else tuple(stepped(tuple(state), parts, tuple(steps))))
         stepped = [own if own is not None else made_step if made_step is not None else value(form)
                    for own, made_step, form in zip(taken, steps, made.steps, strict=True)]
         return tuple(stepped) if not outputs else (tuple(stepped), tuple(along))
@@ -858,13 +860,12 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         return declaration.function(**dict(zip(names, values, strict=True)))
 
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
-    # The declaration is the algebra's statement, no model's products: traced inside a quantized model's
-    # method, a provider's interception would have quantized it, a form no rule writes (row 4858).
+    # A declaration is the algebra's statement, not a model's intercepted quantized products.
+    ranges = {index: declaration.ranges[name] for index, name in enumerate(names)
+              if name in declaration.ranges}
     with jax.disable_jit():
-        closed = jax.make_jaxpr(unintercepted(inlined(named)))(*avals)
-    # The ranges by input, as the region reads them (its constants apart).
-    region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
-                                   if name in declaration.ranges})
+        closed = jax.make_jaxpr(unintercepted(inlined(named, ranges=ranges)))(*avals)
+    region = terms.region(closed, ranges)
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
     walking = WALKING if declaration.rescale is None else WALKING_SCALED

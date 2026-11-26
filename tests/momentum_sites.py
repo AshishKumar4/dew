@@ -22,8 +22,11 @@ from dew.nn.kernels.recurrence_chunk import Chunk
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "fla" / "momentum_seeded.npz"
 """fla-core 0.6.0's recording at every site (tools/fla_momentum_reference.py)."""
 
-ROWS, LENGTH, HEADS, KEYS, VALUES = 2, 160, 2, 32, 16
-"""Two whole chunks of fla's 64 tokens and a part one, keys wider than values."""
+ROWS, LENGTH, HEADS, KEYS, VALUES = 4, 288, 4, 32, 16
+"""Four whole chunks of fla's 64 tokens and a part one, keys wider than values, over four rows and four
+heads: at two rows of 160 tokens over two heads, fla's reference against itself resolved no RMS ratio
+within 512 seeds at the write gates', the log decays', the entering pair's and the keys' gradients (its
+recorder's seed sizing, M-JS-265b on an A100)."""
 
 HOOKS = recurrence.Hooks(decay='scalar', coupled='momentum', erase='untied', write_bound=1.0,
                          scale=KEYS ** -0.5)

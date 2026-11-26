@@ -1121,6 +1121,35 @@ def test_a_compute_prologued_gemm_holds_every_order(edge):
                     f"compute prologued gemm {edge}", truth_fn=truth, plain_fn=plain)
 
 
+def test_an_fp8_codes_product_holds_every_order():
+    """`gemm.fp8_codes_product` (FP8 codes' product through the template's converting launch on an A100,
+    `linear_tangent`, row 8548): every order in its rows, each a draw cast to E4M3, against the codes'
+    exact values' plain product; the frozen matrix takes no cotangent."""
+    (raw,) = normal_draw(8548, (128, 256), scale=1.0)
+    matrix = raw.astype(jnp.float8_e4m3fn)
+    (x,) = normal_draw(8552, (64, 256), scale=1.0)
+    (dx,) = normal_draw(8553, (64, 256), scale=1.0)
+    (cotangent,) = normal_draw(8554, (64, 128))
+
+    from dew.nn.sharding import automatic_axes
+
+    def product(rows):
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with choose:
+            return gemm.fp8_codes_product(rows.astype(jnp.float8_e4m3fn), matrix, out_dtype=jnp.float32,
+                                          interpret_on_cpu=True)
+
+    def plain(rows):
+        return jax.lax.dot_general(rows.astype(jnp.float8_e4m3fn).astype(jnp.float32),
+                                   matrix.astype(jnp.float32), (((1,), (1,)), ((), ())),
+                                   precision=jax.lax.Precision.HIGHEST)
+
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
+    with generation.assumed("sm80"):
+        assert_contract(product, (x,), (dx,), cotangent, "fp8 codes product", truth_fn=plain, plain_fn=plain,
+                        without=without)
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_ternary_weight_product_holds_every_order(edge):
     """`gemm.ternary_weight_product` (2-bit packed BitNet b1.58 weights decoded inline, `linear_tangent`):

@@ -37,8 +37,8 @@ class Kernels:
     checked (api03)."""
 
     # The kernel choices, written by tools/kernel_choices.py from the selectors: edit none by hand.
-    attention: Literal['cudnn', 'flash', 'inference', 'reference', 'template', 'tpu', 'triton',
-                       'xla'] | None = None
+    attention: Literal['cudnn', 'flash', 'flash_inference', 'inference', 'reference', 'template', 'tpu',
+                       'triton', 'xla'] | None = None
     attention_mainloop: Literal['mosaic', 'portable', 'triton'] | None = None
     blockwise_fp8: Literal['mosaic', 'xla'] | None = None
     decode: Literal['cudnn', 'decode', 'reference', 'template', 'xla'] | None = None

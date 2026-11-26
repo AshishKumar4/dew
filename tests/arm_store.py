@@ -145,6 +145,7 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     programs: dict = {}
     held: dict = {}
     unlowered: dict[str, str] = {}
+    by_role: dict[str, tuple[set, set]] = {}
     # The arithmetic arms run in on the store's devices (`summed_as_run`, read where the store places its
     # calls: a GPU's own on a target's compile-only GPU, whatever the host the prepare runs on).
     with store.tracing(), summed_as_run():
@@ -161,22 +162,44 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
                 continue
             programs.update(arm_programs)
             held.update(arm_held)
+            by_role[role] = (set(arm_programs), set(arm_held))
     compiled = _arm_compile(compile, as_written(store.device().platform) if written else None)
-    for role, why in unlowered.items():
-        with summed_as_run():
-            store.compile_site(_unlowered_arm(armed(label, written), role), {}, {}, compiled=compiled,
-                               arms=True, at_run=why)
     if programs:
         from dew.nn.kernels.templates import report
 
         with summed_as_run():
-            try:
-                store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True)
-            except report.CompiledOnDevice as refused:
-                # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
-                # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
-                store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True,
-                                   at_run=str(refused))
+            at_run = None
+            while programs:
+                try:
+                    store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True,
+                                       at_run=at_run)
+                except report.CompiledOnDevice as refused:
+                    # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
+                    # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`),
+                    # their memory read offline as they lower, a refused one's dropped as below.
+                    if at_run is not None:
+                        raise
+                    at_run = str(refused)
+                    continue
+                except Unlowerable as refused:
+                    # A kernel staged for its run alone (`attention.unlowered_launch`: an arm whose trace
+                    # holds it, refused as it lowers): that arm compiles in its run, the others ahead.
+                    role = next((role for role, (names, _) in by_role.items() if refused.program in names),
+                                None)
+                    if role is None:
+                        raise
+                    unlowered[role] = str(refused)
+                    names, kept = by_role.pop(role)
+                    for name in names:
+                        programs.pop(name, None)
+                    for name in kept:
+                        held.pop(name, None)
+                    continue
+                break
+    for role, why in unlowered.items():
+        with summed_as_run():
+            store.compile_site(_unlowered_arm(armed(label, written), role), {}, {}, compiled=compiled,
+                               arms=True, at_run=why)
 
 
 def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference: bool,

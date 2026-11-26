@@ -83,8 +83,9 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
 def _scores_whole(attend, *operands) -> bool:
     """Whether `attend`'s program forms a whole score array of its operands' every row, head, query and key
     (`[..., Q, K]` of `B H Q K` entries) in the memory its kernels' launches read and write, at any depth
-    but a kernel's own (`reference_error.equations` past `programs.opaque`): the reference path's, which a
-    streamed kernel never holds; a key mask, `[B, 1, Q, K]`, holds no head's."""
+    but a kernel's own, its launch's outputs among them (`reference_error.equations` pruning
+    `programs.opaque`): the reference path's, which a streamed kernel never holds; a key mask, `[B, 1, Q,
+    K]`, holds no head's."""
     from reference_error import equations
 
     from dew.nn import programs
@@ -96,7 +97,32 @@ def _scores_whole(attend, *operands) -> bool:
         return tuple(shape[-2:]) == (queries, keys) and np.prod(shape) >= rows * heads * queries * keys
 
     return any(whole(getattr(var.aval, "shape", ())) for equation in equations(
-        jax.make_jaxpr(attend)(*operands).jaxpr, skip=programs.opaque) for var in equation.outvars)
+        jax.make_jaxpr(attend)(*operands).jaxpr, prune=programs.opaque) for var in equation.outvars)
+
+
+def test_the_whole_scores_witness_reads_a_kernels_launch_and_not_its_body():
+    """`_scores_whole` finds a whole score array a kernel's launch writes, as a native launch's outputs are
+    memory the program holds (`reference_error.equations` pruning `programs.opaque`), and none a kernel
+    forms within it: skipping the launch had let one writing `[B, H, Q, K]` pass (train 1320's review)."""
+    from jax.experimental import pallas as pl
+
+    query = jnp.zeros((1, 64, 2, 16), jnp.float32)
+
+    def writes(q, k, v):
+        def kernel(o_ref):
+            o_ref[...] = jnp.zeros(o_ref.shape, o_ref.dtype)
+
+        return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((1, 2, 64, 64), jnp.float32))()
+
+    def within(q, k, v):
+        def kernel(o_ref):
+            scores = jnp.zeros((1, 2, 64, 64), jnp.float32)
+            o_ref[...] = jnp.sum(scores, axis=-1)
+
+        return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((1, 2, 64), jnp.float32))()
+
+    assert _scores_whole(writes, query, query, query)
+    assert not _scores_whole(within, query, query, query)
 
 
 def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them():

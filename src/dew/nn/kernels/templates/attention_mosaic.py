@@ -22,6 +22,7 @@ from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     assembled,
     attention_algebra as algebra,
+    band,
     cost,
     emission,
     mosaic,
@@ -36,6 +37,7 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    TILED,
     AttentionLaunch,
     Gradients,
     Hooks,
@@ -270,6 +272,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
                 and whole_tiles(family, config, parts=self.parts if isinstance(self, MosaicForward) else 1)
+                and _band_held(self.score_kinds, config)
                 and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
@@ -342,6 +345,20 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         tmem = self.tmem_columns(ba, config, target)
         return max(1, resources.register_model(family, config.consumers, regs,
                                                shared=staged, target=target, tmem=tmem, joined=joined).most)
+
+def _band_held(kinds: tuple[Kind, ...], config: Tiles | BackwardTiles) -> bool:
+    """Whether every tile `config`'s launches read a band side of (`Kind.BAND`) lies within one of its
+    origins' groups and wholly within its band or wholly past it: a program's query rows (its consumers')
+    dividing `band.BAND_GROUP`, a tile's origin one scalar (`attention_mosaic_program._param`), and each key
+    tile dividing `band.BAND_ALIGN` (`band.band_column`: a 192-key tile from key 192 straddles an origin of
+    256, and read as past the band dropped keys 256 to 383's biases, head review), the forward's, the dQ
+    launch's and the dK/dV launch's own (`BackwardTiles.dkv`)."""
+    if Kind.BAND not in kinds:
+        return True
+    tiles = (config, config.dkv) if isinstance(config, BackwardTiles) else (config,)
+    return all(band.BAND_GROUP % (tile.consumers * tile.block_q) == 0 and band.BAND_GROUP % tile.block_q == 0
+               and band.BAND_ALIGN % tile.block_k == 0 for tile in tiles)
+
 
 @dataclasses.dataclass(frozen=True)
 class MosaicForward(_Mainloop[Tiles]):
@@ -2247,7 +2264,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             dkv_stages = min(config.stages, padded_q // config.dkv.block_q)
             launches = [(dkv_family, config.dkv, _dkv_allocations(
                 dkv_family, config.dkv, width, value_width, dtype, stages=dkv_stages, columns=config.columns,
-                tiled=Kind.TILE in self.score_kinds, params=self.score_types), True, True, config.fused)]
+                tiled=any(kind in TILED for kind in self.score_kinds), params=self.score_types), True, True,
+                         config.fused)]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k),

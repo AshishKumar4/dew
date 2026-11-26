@@ -20,6 +20,7 @@ from jax.scipy.linalg import solve_triangular
 
 from dew.algebra import scan
 from dew.nn.kernels.deltaformer import causal_masks, masked_softmax
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.precision import at_least_fp32, compensated_difference
 
 
@@ -58,7 +59,7 @@ def path_attention(query, key, value, w, beta, gate=None, *, scale: float | None
     work = at_least_fp32(dtype)
     batch, length, heads, width = query.shape
     scale = width ** -0.5 if scale is None else scale
-    padded = -(-length // chunk) * chunk
+    padded = whole(length, chunk)
     q, k, v, w = (_headed(t, heads, work) for t in (query, key, value, w))
     b = _headed(beta, heads, work)
     # Padded tokens' transforms the identity (beta zero), their scores masked.

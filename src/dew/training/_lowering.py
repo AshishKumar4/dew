@@ -17,7 +17,7 @@ generation's platform, and takes the GPU's path here. Attention's cuDNN and
 FlashAttention calls are CUDA libraries, not Pallas kernels: their trace asks
 this host for the library (cuDNN's, the FlashAttention wheel's code for the
 target), and a host without it refuses the step (`selection.Unlowerable`,
-`attention_kernels._unlowered`) rather than lowering another kernel in their
+`attention_kernels.unlowered`) rather than lowering another kernel in their
 place, which would not be the GPU's program.
 """
 

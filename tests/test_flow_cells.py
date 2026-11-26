@@ -545,12 +545,18 @@ def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, m
         assert store.at_run("a site calling the host") is not None
 
 
-def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others_ahead(tmp_path, monkeypatch):
-    """In a GPU tier part's prepare (its node an H100), a site whose Dew arm calls cuDNN's attention, which a
-    prepare's compile for any GPU of the generation refuses (`selection.Unlowerable`: a cuDNN plan holds to
-    its GPU's model), writes that arm alone to compile at its run and compiles the site's XLA reference
-    ahead: the refusal aborted the site's every arm, and an A100 tier named its cuDNN cells'
-    dew, reference and written arms unprepared, "compiled none of its arms" (MAINGPU-2b1b88c39)."""
+@pytest.mark.parametrize(("gpu", "kernel", "causal"),
+                         [("sm90", "cudnn", False), ("sm100", "flash_inference", True)],
+                         ids=["cudnn-traced", "flash-lowered"])
+def test_a_parts_prepare_writes_an_arm_it_cannot_lower_at_run_and_compiles_its_sites_others_ahead(
+        tmp_path, monkeypatch, gpu, kernel, causal):
+    """In a GPU tier part's prepare, a site whose Dew arm calls a kernel the prepare's compile refuses
+    (`selection.Unlowerable`) writes that arm alone to compile at its run and compiles the site's XLA
+    reference ahead: on an H100 node cuDNN's attention, refused as it traces (a cuDNN plan holds to its GPU's
+    model; the refusal aborted the site's every arm, an A100 tier naming its cuDNN cells' arms unprepared,
+    MAINGPU-2b1b88c39), and on a B200 node, a GPU FlashAttention's wheel holds no code for,
+    'flash_inference' undifferentiated, its forward staged and refused as it lowers
+    (`attention.unlowered_launch`; the refusal at lowering aborted the site, head review)."""
     import jax
     import jax.numpy as jnp
     import model_flows
@@ -564,18 +570,19 @@ def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others
     from dew.nn.attention import scaled_dot_product_attention
 
     def attend(implementation):
-        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation))
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=causal,
+                                                                    implementation=implementation))
 
     draw = normal_drawn(0xC0D, *((1, 128, 2, 64),) * 3, dtype=jnp.bfloat16)
-    cudnn, xla = attend("cudnn"), attend("xla")
-    label = "cuDNN beside XLA"
-    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    dew, xla = attend(kernel), attend("xla")
+    label = f"{kernel} beside XLA"
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu=gpu)))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
-        assert_as_exact(cudnn, xla, draw, label, seeds=8)
+        assert_as_exact(dew, xla, draw, label, seeds=8)
     store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
     arms = armed(label)
-    assert store.at_run(_unlowered_arm(arms, arm_role("dew", cudnn, label))) is not None
+    assert store.at_run(_unlowered_arm(arms, arm_role("dew", dew, label))) is not None
     assert store.at_run(_unlowered_arm(arms, arm_role("reference", xla, label))) is None
     assert store.holds(arms) and store.at_run(arms) is None
 

@@ -103,6 +103,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     modelled,
     output_stage_swizzle,
     param_types,
+    params_read,
     powered_in_kernel,
     query_swizzle,
     reducing,
@@ -121,6 +122,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     value_columns,
 )
 from dew.nn.kernels.templates.attention_mosaic_registers import ForwardRegisters
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.kernels.templates.hooks import NO_HOOK, Side
 from dew.nn.kernels.templates.rings import Ref
@@ -791,7 +793,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         # As long as the call's padded keys (a paged call's slots), which every walk's tiles lie within.
         keys = (call.key.shape[1] if call.table is None or call.page is None
                 else call.table.shape[1] * call.page)
-        keys = max(keys, -(-scales[0].shape[-1] // tiles.block_k) * tiles.block_k)
+        keys = max(keys, whole(scales[0].shape[-1], tiles.block_k))
         hooked = hooked._replace(scales=tuple(
             jnp.pad(array.astype(jnp.float32), ((0, 0), (0, 0), (0, keys - array.shape[-1])))
             for array in scales))
@@ -1106,11 +1108,11 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
-    streamed = riding(family, kinds_of(hooks.score.sides), "keys")
-    laid = zip(hooked.score, hooks.score.sides, params_held, strict=True)
-    params = tuple(_param(family, ref, kind_of(param), row, head, first, s, k_first, held=kept,
-                          slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
-                   for index, (ref, param, kept) in enumerate(laid))
+    kinds = kinds_of(hooks.score.sides)
+    streamed = riding(family, kinds, "keys")
+    params = params_read(hooked.score, kinds, lambda index, ref, kind, origins: _param(
+        family, ref, kind, row, head, first, s, k_first, held=params_held[index],
+        slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0), origins=origins))
     is_masked = jnp.logical_not(whole(index)) if masked is None else masked
     logits, products = algebra.logits_of(spec, s, coords, params, masked=is_masked)
     return k_first, coords, logits, products
@@ -2355,8 +2357,10 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, kv_head
         views = _parted_views(family, views, named, row, lax.div(head, group), batch=batch, parts=parts,
                               kv_heads=kv_heads)
     if riding(family, kinds, "keys"):
-        tile = program.query_tile(queries // (tiles.consumers * tiles.block_q), fresh=fresh)
-        views = {**views, **score_views(family, read.hooked.score, kinds, "keys", row, head, tile)}
+        held = tiles.consumers * tiles.block_q
+        tile = program.query_tile(queries // held, fresh=fresh)
+        views = {**views, **score_views(family, read.hooked.score, kinds, "keys", row, head, tile,
+                                        band=(held, tiles.block_k))}
     return row, head, column, views
 
 

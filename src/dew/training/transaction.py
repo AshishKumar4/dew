@@ -25,8 +25,9 @@ import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import struct
+from flax import linen, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.typing import DTypeLike
 from typing_extensions import TypeVar
 
 from dew._coordination import read_by_holders
@@ -50,7 +51,7 @@ from dew.nn.inspection import (
 )
 from dew.nn.kernels.options import abstract_signature, owned_program, program, trace_context
 from dew.nn.moe import fixed_routers
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import Numerics, at_least_fp32
 from dew.nn.programs import called, computed
 from dew.nn.sharding import constrained, rows_spec
 from dew.objectives.base import (
@@ -814,6 +815,44 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
         return dynamic_scale
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
+def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> str | None:
+    """The one compute dtype every module `objective` trains states as its own (a Flax module's `dtype`
+    field): a model computes in the dtype it was built with, a field of its own no trainer sets. None where
+    one states none (Flax's None, its compute inferred from its inputs and parameters together, or a
+    module that takes no dtype, computing as it is written), or they state several: no reading of a
+    module's own fields establishes what its submodules compute in."""
+    stated = {jnp.dtype(dtype).name if (dtype := _own(entry.module, "dtype")) is not None else None
+              for entry in objective.program_key() if entry.trained}
+    return next(iter(stated)) if len(stated) == 1 else None
+
+
+def _own(module: linen.Module, name: str) -> DTypeLike | None:
+    """The dtype `module` states in its own field `name` (`dtype`, `param_dtype`); None where it states
+    none."""
+    return next((getattr(module, field.name) for field in dataclasses.fields(module) if field.name == name),
+                None)
+
+
+def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                   numerics: Numerics) -> tuple[bool, str | None]:
+    """Whether a trainer under `numerics` scales its loss dynamically and the dtype it stores the parameters
+    it draws fresh in (`TrainerAdvanced.numerics`): the one resolution of both, a run config's among them
+    (`dew.config.RunConfig.trained_numerics`). Refused unless every module `objective` trains states the
+    numerics' compute dtype as its own (`stated_compute`): the trainer cannot set it, and the loss would be
+    scaled for a compute the model may not run."""
+    stated, compute = stated_compute(objective), jnp.dtype(numerics.dtypes.compute).name
+    if stated != compute:
+        raise ValueError(f"the run's numerics compute in {compute}, which every module it trains states as "
+                         f"its own dtype (dtype={compute}); "
+                         + ("they state none, or several" if stated is None else f"they compute in {stated}"))
+    # Each module's storage as its own field states it, unknown where it states none (a wrapper's, whose
+    # submodules draw as they are written): the numerics' dtype is applied to every fresh leaf then.
+    owned = [_own(entry.module, "param_dtype") for entry in objective.program_key() if entry.trained]
+    drawn = numerics.dtypes.params if None in owned else numerics.drawn_dtype(
+        [dtype for dtype in owned if dtype is not None])
+    return numerics.scales_loss(), drawn
 
 
 def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):

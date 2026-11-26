@@ -2058,6 +2058,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     measures = lane_measures(python, units, held, token)
     prepared = gpu_measures.prepared_needs(python, tests, tier_wire())  # No less than its programs' need.
     unheld = gpu_measures.unschedulable(prepared, budget, float(WHOLE_GPU) * total, held)  # Nor below it.
+    filed_needs(python, units, prepared, unheld, held, token)
     tests = [name for name in tests if name not in unheld]
     needed = {name: gpu_needs(measures[name], budget, prepared.get(name, 0.0)) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
@@ -2095,6 +2096,27 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
              for name, (file, group, variant) in units.items() if name in unheld]
     out.write_text(json.dumps({"rows": rows}))
     return 0
+
+
+def filed_needs(python: str, units: Mapping[str, tuple[str, str, str]], prepared: Mapping[str, float],
+                unheld: Container[str], held: str, token: str) -> None:
+    """Each GPU lane unit of `units` whose prepared need (`prepared`) the lane could not hold (`unheld`) filed
+    where a GPU tier sizes its next part by it (records.py's `need_key`, gpu_holds.py), and each one filed
+    before that it held filed again at its need now: a run's measured peak is no admission's need, so a held
+    unit's need stands while its programs do, and one shrunk is filed smaller; one no lane runs again retires
+    at `NEED_DAYS`. Each write tried once: one not made sizes the next part as before."""
+    if not prepared:
+        return
+    within = f"{CACHE_PREFIX}-need/{python}/{held}/"
+    try:
+        filed = set(listed(within, token))
+    except r2.R2Error:
+        filed = set()  # None read: only the unheld filed.
+    for name, need in prepared.items():
+        file, group, variant = units[name]
+        key = records.need_key(python, row(python, file, varied(group, variant)), held)
+        if name in unheld or key.removeprefix(within) in filed:
+            written(key, token, json.dumps({"need": need, "at": time.time()}).encode(), tries=1)
 
 
 def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
