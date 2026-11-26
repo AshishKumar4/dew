@@ -132,8 +132,8 @@ def as_plain(plain: Callable[..., jax.Array]) -> Callable:
             return jnp.zeros_like(value)
 
         def substituted(*moving):
-            return plain(*(dict(zip(live, moving, strict=True)).get(index, primal)
-                           for index, primal in enumerate(primals)))
+            given = dict(zip(live, moving, strict=True))
+            return plain(*(given.get(index, primal) for index, primal in enumerate(primals)))
         return jax.jvp(substituted, tuple(primals[index] for index in live),
                        tuple(tangents[index] for index in live))[1]
     return derivative
