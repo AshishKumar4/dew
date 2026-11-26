@@ -1322,26 +1322,24 @@ class RowPlan:
         """Return one key per placed row, folded from `key` by global row index.
 
         A pool of processes therefore draws the same values as one process does
-        for the same rows. On a mesh, `key` may be replicated over several
-        processes; the keys are folded from this process's copy on one device
-        and then sharded to their devices.
+        for the same rows. On a mesh the rows fold on the mesh itself, each device
+        its own rows from `key` replicated over it, so the fold runs under a mesh
+        in context as every other program of the request does (row 13493).
         """
         sharding = self.sharding
-        # A request key replicated over a multi-process mesh is not addressable,
-        # and folding it would hand `make_array_from_process_local_data` rows this
-        # process cannot place. Every replica holds the same key data, so the rows
-        # fold from this process's first replica, on its one device, and are sliced
-        # from there to their devices. Folded on every device of a replicated key,
-        # they went through the host to be split, because jax reshards a
-        # multi-device array whose shards hold no target slice by reading it.
-        local = key if sharding is None else key.addressable_data(0)
         start = self.process * self.rows
-        indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
+        indices = np.arange(start, start + self.count, dtype=np.uint32)
         if sharding is None:
-            return row_keys
-        sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
-        return jax.random.wrap_key_data(sharded, impl=jax.random.key_impl(key))
+            return jax.vmap(lambda row: jax.random.fold_in(key, row))(jax.device_put(indices, key.sharding))
+        # A request key replicated over a multi-process mesh is not addressable: every replica holds the
+        # same key data, so each process lays this process's copy over the mesh replicated, its rows'
+        # indices sharded as the rows are, and the fold reads no host and moves no key between devices.
+        replicated = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+        local = jax.random.key_data(key.addressable_data(0))
+        held = jax.random.wrap_key_data(jax.make_array_from_process_local_data(replicated, local),
+                                        impl=jax.random.key_impl(key))
+        placed = jax.make_array_from_process_local_data(sharding, indices)
+        return jax.jit(jax.vmap(jax.random.fold_in, in_axes=(None, 0)), out_shardings=sharding)(held, placed)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""

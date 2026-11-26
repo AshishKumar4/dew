@@ -321,16 +321,24 @@ def test_continuations_run_on_a_routed_expert_decoder(rng):
     assert not np.array_equal(np.asarray(two.tokens)[0, 4:], np.asarray(two.tokens)[1, 4:])
 
 
+@pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("site", ["feedforward", "mixer"])
-def test_generate_refuses_an_exchange_wherever_the_decoder_routes_it(rng, site):
-    """A decoder routes either in its feed-forward slot (its `mixture`) or in a
-    layer kind's mixer slot (Nemotron-H's `MLPMixer` with a mixture of its own);
-    either exchange reads its expert axis off a mesh in context, which `generate`
-    does not run under (row 13493), so the decoder reports it (`Generating`) and
-    `generate` refuses it, where the same layers under the global dispatch
-    generate."""
+def test_generate_runs_an_exchange_wherever_the_decoder_routes_it(rng, site):
+    """A decoder routes either in its feed-forward slot (its `mixture`) or in a layer kind's mixer slot
+    (Nemotron-H's `MLPMixer` with a mixture of its own). On an expert mesh, with its experts placed over
+    it and under it in context (its rows' keys folded on it, row 13493), generation over the exchange, a
+    shard_map each draw's device checks reach in the next step's model call (jax-ml/jax#40907, fixed in
+    Dew's pinned JAX build), draws what the global dispatch draws; and a draw whose transform leaves no
+    distribution from the second step on is refused by its check, through the exchange's next call."""
+    from jax.experimental import checkify
+
+    from dew.inference.loading import place
+    from dew.interop.decoder_parts import decoder_axes
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.mlp import MLPMixer
+    from dew.nn.sharding import boxed
+    from dew.sampling import decoding
+    from dew.training import Layout, MeshSpec
 
     def model(dispatch):
         mixture = Mixture(experts=4, top_k=2, dispatch=dispatch)
@@ -339,16 +347,25 @@ def test_generate_refuses_an_exchange_wherever_the_decoder_routes_it(rng, site):
         return tiny(layer_types=("moe", "full_attention"),
                     kinds={"moe": LayerKind(mixer=MLPMixer(intermediate_size=16, mixture=mixture))})
 
-    prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
+    prompt = jax.random.randint(rng, (4, 4), 0, VOCAB)
     params = model("global").init(rng, prompt)
     greedy = Sampling(temperature=0)
-    generate(model("global"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
-    # The refusal itself, not the expert layout an unrefused exchange would fail on downstream.
-    with pytest.raises(ValueError) as refused:
-        generate(model("exchange"), params, prompt, 2, key=jax.random.key(1), sampling=greedy)
-    assert type(refused.value) is ValueError
-    assert model("global").generation_refusal() is None
-    assert model("exchange").generation_refusal() is not None
+    alone = generate(model("global"), params, prompt, 3, key=jax.random.key(1), sampling=greedy)
+    spec = MeshSpec(expert=4)
+    with boxed(decoder_axes(model("global"))):
+        placed = place(params, spec, Layout(min_shard=1, tolerance=1.0))
+    assert model("exchange").generation_refusal() is None
+    key = jax.random.key(1)
+    with jax.set_mesh(spec.build()):
+        exchanged = generate(model("exchange"), placed, prompt, 3, key=key, sampling=greedy)
+        np.testing.assert_array_equal(np.asarray(exchanged.tokens), np.asarray(alone.tokens))
+
+        def undefined_after_the_first(state: decoding.StepState, scores):
+            return jnp.where(state.step >= 1, -jnp.inf, scores)
+
+        refusing = Sampling(temperature=0, logits=(jax.tree_util.Partial(undefined_after_the_first),))
+        with pytest.raises(checkify.JaxRuntimeError):
+            generate(model("exchange"), placed, prompt, 3, key=key, sampling=refusing)
 
 
 def copy_batch(rng, size):
