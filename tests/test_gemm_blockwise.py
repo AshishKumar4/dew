@@ -39,6 +39,34 @@ def test_a_blockwise_fp8_product_through_the_template_is_on_par(columns, groups)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
+def a_blockwise_fp8_product_at_large_finite_scales_is_finite(interpret_on_cpu: bool = False) -> None:
+    """A blockwise FP8 product through the template of codes 2^-3 (one a 128-deep block in each row and
+    column: each block's partial 2^-6) at row and column scales 2^64: each block's scaled partial is 2^122,
+    finite, so the product is its blocks' count times 2^122, exactly, though the two scales' own product
+    overflows
+    (`mosaic_gpu._step_scaling` scales the partial in `precision.twice_scaled`'s order; row 13257)."""
+    blocks = blockwise_matrix.DEPTH // 128
+    rows = np.zeros((blockwise_matrix.ROWS, blockwise_matrix.DEPTH), np.float32)
+    rows[:, 0::128] = 2.0 ** -3
+    matrices = np.zeros((1, blockwise_matrix.WIDTH, blockwise_matrix.DEPTH), np.float32)
+    matrices[:, :, 0::128] = 2.0 ** -3
+    row_scales = np.full((blocks, blockwise_matrix.ROWS), 2.0 ** 64, np.float32)
+    column_scales = np.full((1, blocks, blockwise_matrix.WIDTH), 2.0 ** 64, np.float32)
+    operands = (rows.astype(jnp.float8_e4m3fn), matrices.astype(jnp.float8_e4m3fn), row_scales, column_scales)
+    with generation.chosen(blockwise_fp8="mosaic"):
+        out = jax.jit(lambda *ops: gemm.blockwise_fp8_product(
+            *ops[:2], blockwise_matrix._sizes(1), *ops[2:], out_dtype=jnp.float32,
+            interpret_on_cpu=interpret_on_cpu))(*operands)
+    np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, blocks * 2.0 ** 122, np.float32))
+
+
+def test_a_blockwise_fp8_product_at_large_finite_scales_is_finite():
+    """`a_blockwise_fp8_product_at_large_finite_scales_is_finite` interpreted on a CPU as an H100 runs it
+    (the GPU's native cell, tests/test_gpu_gemm.py, runs it compiled)."""
+    with generation.assumed("sm90"):
+        a_blockwise_fp8_product_at_large_finite_scales_is_finite(interpret_on_cpu=True)
+
+
 def test_a_blockwise_fp8_products_launch_reads_its_pin():
     """The blockwise FP8 product through the template named on an H100 launches through its launch
     (`grouped_matmul.MosaicStepScaledGmm`, `tuning.KernelOp.__call__`): a pin of its kind is read, one it

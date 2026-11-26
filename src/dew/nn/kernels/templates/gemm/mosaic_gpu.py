@@ -1440,22 +1440,27 @@ def _gmm_scaling(scaled: bool, per: int, block_n: int, column_tile, mine_rows) -
 
 
 def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
-    """Dew: a step-scaled walk's multiplier of a step's exactly summed partial (`gmm`'s and `tgmm`'s
-    `step_scales`, `mosaic.Issuer.summed_apart`'s `scale`): this consumer's rows' scales (the step's row of
-    them streamed, `row_scales`) times the tile's columns' (streamed beside them, `column_scales`: the step's
-    row of them at the tile's columns, one a column, or the block holding the tile's one, at `offset`, `per`
-    columns a scale), in shared memory as the step's operands land: read from global memory, a step's
-    scaling waited on its load (M-NS-13: the blockwise FP8 template 1.24-1.42x its unscaled exact product).
-    `index` is the step's, whose scales are its streams'."""
+    """Dew: a step-scaled walk's scaling of a step's exactly summed partial (`gmm`'s and `tgmm`'s
+    `step_scales`, `mosaic.Issuer.summed_apart`'s `scale(start, columns, partial)`): the partial times this
+    consumer's rows' scales (the step's row of them streamed, `row_scales`) and the tile's columns' (streamed
+    beside them, `column_scales`: the step's row of them at the tile's columns, one a column, or the block
+    holding the tile's one, at `offset`, `per` columns a scale), each entry's two in the order that keeps
+    the intermediate normal (`precision.twice_scaled`, as XLA's arm, `xla_products.step_scaled`, scales):
+    the scales' own product overflows where both are near 2^64 though the scaled partial is finite (row
+    13257). Read in shared memory as the step's operands land: from global memory, a step's scaling waited
+    on its load (M-NS-13: the blockwise FP8 template 1.24-1.42x its unscaled exact product). `index` is the
+    step's, whose scales are its streams'."""
+    from dew.nn.precision import twice_scaled
+
     del index
     rows = slots['row_scales'].at[0, mine_rows][...]
     column_scales = slots['column_scales']
     if per == 1:
-        return lambda start, columns: rows[:, None] * column_scales.at[0, pl.ds(start, columns)][...][None, :]
-    # A weight block's one scale scales the rows' vector before it is broadcast over the columns: a multiply
-    # a row, not one an element of the partial beside its own (the same products, so the same bits).
-    scaled = rows * column_scales[0, offset]
-    return lambda start, columns: scaled[:, None]
+        return lambda start, columns, partial: twice_scaled(
+            partial, rows[:, None], column_scales.at[0, pl.ds(start, columns)][...][None, :])
+    # A weight block's one scale beside the rows' vector, each broadcast over the partial's entries.
+    block = column_scales[0, offset]
+    return lambda start, columns, partial: twice_scaled(partial, rows[:, None], block)
 
 
 def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, column_tile, *,
