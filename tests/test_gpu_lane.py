@@ -15,7 +15,7 @@ import jax
 import pytest
 import tier_wire
 import truths_ahead
-from armada_support import LANE_TEST, cached, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
+from armada_support import LANE_TEST, cached, commit, fetcher, gpu_driver, gpu_lane_at, interpreter, loaded
 from tool_support import load
 
 
@@ -267,6 +267,31 @@ def test_a_dry_prepare_runs_the_tiers_processes_for_one_compile_only_gpu_and_kee
     assert not log.exists(), "each row was reused from its record"
 
 
+def test_a_dry_prepare_tasks_rows_each_run_on_the_commits_checkout(ci, tmp_path, monkeypatch, cache_worker):
+    """A dry prepare task's rows (prepares.py's `run`) each run on the commit's checkout, not on what the row
+    before it left: a tracked file it changed is checked out again and a file it made removed
+    (`ci.restored`), so no later row's green, which publishes a prepare's baseline, ran on a checkout the
+    commit does not hold (row 13000)."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    dry_checkout(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/state.txt").write_text("good")
+    gpu = "import pytest\nfrom pathlib import Path\npytestmark = pytest.mark.gpu\ndef test_it():\n{}"
+    (tmp_path / "tests/test_gpu_writes.py").write_text(gpu.format(
+        "    Path('data/state.txt').write_text('bad')\n    Path('left.txt').write_text('x')\n"))
+    (tmp_path / "tests/test_gpu_reads.py").write_text(gpu.format(
+        "    assert Path('data/state.txt').read_text() == 'good' and not Path('left.txt').exists()\n"))
+    commit(tmp_path, "the commit")
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_writes.py", "prepare:tests/test_gpu_reads.py"],
+                    "@prepare-sm90", out, 600.0, "off")
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {f"3.12:tests/test_gpu_{name}.py#@prepare-sm90": 0 for name in ("writes", "reads")}
+
+
 def test_a_flows_deferred_cell_is_read_unprepared_and_a_row_left_no_time_is_stale(ci, tmp_path):
     """A dry prepare reads a flow's cell its prepare deferred to its run (tests/tier_wire.py's `DEFERRED`,
     which the run names unprepared) as unprepared, beside the tests recorded so (`UNPREPARED`), each with its
@@ -364,14 +389,36 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     red = graded([capped, lowered])
     assert (red["exitCode"], red["new_unprepared"]) == (1, [ci.prepares.identity(lowered)])
     assert graded([named])["new_unprepared"] == [ci.prepares.identity(named)]
+    # A test main's run skipped whole at its cap (its node id at the cap, unlabeled) was never tried there:
+    # this run's cells of it red nothing, fresh or reused, and a cell of another test still does. A cell
+    # main capped (labeled) exempts no sibling, nor does a node id merely holding the cap's words.
+    skipped = {"test": "tests/test_gpu_vae.py::test_flow", "where": wire.CAPPED, "error": "capped"}
+    other = {"test": "tests/test_gpu_vae.py::test_other", "where": "cell one", "error": "lowered"}
+    whole = {ci.prepares.identity(skipped)}
+    assert graded([lowered], before=whole)["exitCode"] == 0
+    assert graded([lowered, other], before=whole)["new_unprepared"] == [ci.prepares.identity(other)]
+    found = {"name": name, "exitCode": 0, "output": "", "unprepared": [ci.prepares.identity(lowered)]}
+    assert graded([], before=whole, found=found)["exitCode"] == 0
+    for masks in ({ci.prepares.identity(capped)}, {ci.prepares.identity(named)}):
+        assert graded([lowered], before=masks)["exitCode"] == 1
+    # Parameter ids sharing a start: main skipping test_flow[x] exempts no cell of test_flow[x] @ y] nor of
+    # test_flow[x] @ y [z], fresh or reused.
+    skipped_x = {ci.prepares.identity({**skipped, "test": "tests/test_gpu_vae.py::test_flow[x]"})}
+    for param in ("x] @ y", "x] @ y [z"):
+        sharing = {"test": f"tests/test_gpu_vae.py::test_flow[{param}]", "where": "a site", "error": "e"}
+        assert graded([sharing], before=skipped_x)["exitCode"] == 1
+        reused_sharing = {"name": name, "exitCode": 0, "output": "",
+                          "unprepared": [ci.prepares.identity(sharing)]}
+        assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
 
 
 @pytest.mark.parametrize("capped", [False, True])
 def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
     """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
-    `PREPARE_BY`, on the monotonic clock) its end's margin short of the time it has, past which it starts
-    nothing more; a GPU tier part's prepare (ci.py's `gpu_prepared`), whose run reads every program it
-    prepares, never."""
+    `PREPARE_BY`, on the monotonic clock) past which it starts nothing more (`cap_after`): its end's
+    `CAP_MARGIN` short of the time it has past its grace, settling and reader, 260 s into `PREPARE_WALL`'s
+    600 s, or half that time where the margin would take more; a GPU tier part's prepare (ci.py's
+    `gpu_prepared`), whose run reads every program it prepares, has all its caller gives it and no cap."""
     import time
 
     seen = {}
@@ -380,16 +427,40 @@ def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, cap
         seen["seconds"], seen["environ"] = seconds, args[3]
         return 0
     monkeypatch.setattr(ci, "tested", tested)
-    began = time.monotonic()
-    ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", 1500.0, unit="u",
-                        threads="1", users=False, variant="@prepare-sm90", capped=capped)
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
     wire = ci.tier_wire()
-    if not capped:
-        # Cleared, so a cap the caller's environment carries reaches no part's prepare.
-        assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
-        return
-    cap = float(seen["environ"][wire.PREPARE_BY])
-    assert began + seen["seconds"] - ci.prepares.CAP_MARGIN <= cap <= time.monotonic() + seen["seconds"]
+    for left, after in ((ci.prepares.PREPARE_WALL, 260.0), (200.0, 50.0)):
+        ci.prepares.process(ci, "3.12", "tests/test_gpu_vae.py", "", tmp_path / "v.json", left, unit="u",
+                            threads="1", users=False, variant="@prepare-sm90", capped=capped)
+        assert seen["seconds"] == left - ci.session.GRACE - ci.SETTLE - 10.0
+        if capped:
+            assert float(seen["environ"][wire.PREPARE_BY]) == 1000.0 + after
+        else:
+            # Cleared, so a cap the caller's environment carries reaches no part's prepare.
+            assert seen["environ"][wire.PREPARE_BY] == "" and not wire.past_cap(seen["environ"])
+
+
+def test_a_dry_prepare_task_runs_within_its_wall_whatever_its_deadline(ci, tmp_path, monkeypatch,
+                                                                       cache_worker):
+    """A dry prepare task (prepares.py's `run`) takes at most `PREPARE_WALL` whatever its deadline: its
+    topology, its baseline's lookup and its rows' processes all within it, so none sets a train's wall."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "mainline", lambda: "f" * 40)
+    interpreter(tmp_path, "3.12")
+    dry_checkout(tmp_path)
+    seen = []
+
+    def tested(python, files, group, verdict, seconds, *args, **kwargs):
+        seen.append(seconds)
+        verdict.write_text(json.dumps({"rows": []}))
+        return 0
+    monkeypatch.setattr(ci, "tested", tested)
+    # A fixed clock: its process is given the wall's whole budget but its end's.
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+    ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", tmp_path / "v.json",
+                    1680.0, "off")
+    assert seen == [ci.prepares.PREPARE_WALL - ci.session.GRACE - ci.SETTLE - 10.0]
 
 
 def cgroup_tree(root, levels):
@@ -474,11 +545,11 @@ def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_
     """A kept dry prepare's token (`kept_token`, its group a process variant's, `@prepare-<gen>`) reads back
     its file, its whole group and where its green run is kept (`kept_of`, the locator after the last `@`). The
     plan's dry prepares (`entries`) cut a file by its work, at the plan's target of 120 s each group within
-    480 s (`PREPARE_TARGETS` targets, under `PREPARE_SHARE` of a task's deadline): the rows `measured_cut`
-    sums (`measured_rows`), never an older cut's, and where the longest of them ran out of its time (past
-    `CUT_SHORT` of it) twice what they took, a floor of its work (train 1247: seven groups cut to their whole
-    deadline were killed at it, and timed so, would be cut alike again); never capped by a record's count of
-    its tests. Before any run is timed, one group a `gpu`-marked test of the record."""
+    260 s (`PREPARE_TARGETS` targets, under a dry prepare's cap, `cap_after` of `PREPARE_WALL`): the rows
+    `measured_cut` sums (`measured_rows`), never an older cut's, and where the longest of them ran out of its
+    time (past `CUT_SHORT` of the cap) twice what they took, a floor of its work (train 1247: seven groups cut
+    to their whole deadline were killed at it, and timed so, would be cut alike again); never capped by a
+    record's count of its tests. Before any run is timed, one group a `gpu`-marked test of the record."""
     token = ci.kept_token("tests/test_gpu_a.py", "1/2@prepare-sm90-users", "AuthenticAMD-25-17:feed")
     assert ci.kept_of([token]) == ([], {("tests/test_gpu_a.py", "1/2@prepare-sm90-users"):
                                         ("AuthenticAMD-25-17", "feed")})
@@ -492,11 +563,14 @@ def test_a_kept_prepare_rows_token_keeps_its_group_and_a_slow_prepare_is_cut_by_
                                                            for group, seconds in rows.items()}},
                                     120.0, "off", {})
         return [entry["split"] for entry in found if entry["tests"] == f"prepare:{name}"]
-    # Timed at two cuts: the two groups' 400 s, one group; the whole file's older 1,583 s, which ran out of
-    # its time, doubles nothing.
-    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == ["@prepare-sm90"]
-    # Two groups killed at their deadline: 6,332 s of work at least, fourteen groups of six tests' record.
-    assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 14
+    # Timed at two cuts: the two groups' 400 s, each past CUT_SHORT of the 260 s cap, so 800 s of work at
+    # least, four groups; the whole file's older 1,583 s, an older cut's, counts nothing.
+    assert planned({"": 1583.0, "1/2": 200.0, "2/2": 200.0}) == [f"{index}/4@prepare-sm90"
+                                                                 for index in range(1, 5)]
+    # Two groups past the cap: 6,332 s of work at least, twenty-five groups of six tests' record; two well
+    # within it, one group.
+    assert len(planned({"1/2": 1583.0, "2/2": 1583.0})) == 25
+    assert planned({"1/2": 100.0, "2/2": 100.0}) == ["@prepare-sm90"]
     assert planned({}) == [f"{index}/6@prepare-sm90" for index in range(1, 7)]
     text = ("import pytest\n@pytest.mark.gpu\ndef test_a(): pass\ndef test_cpu(): pass\n"
             "@pytest.mark.gpu(reason='x')\nclass TestB:\n"
@@ -774,29 +848,43 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
 
 @pytest.mark.parametrize(("exit_code", "taken"), [(0, True), (1, True), (0, False)])
 def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci, monkeypatch, tmp_path,
-                                                                          exit_code, taken):
-    """A row reused from its record is named the commit's (`named_at_commit`) only after it is graded, where
-    its grade leaves it green and its baseline is written (`baselined`): a reuse graded red publishes
-    nothing, and a green one whose baseline the store did not take is named nowhere and stands stale."""
-    row = {"name": "3.12:tests/test_gpu_a.py#@prepare-sm90", "exitCode": 0, "unprepared": ["a @ x"]}
-    calls = []
+                                                                          cache_worker, exit_code, taken):
+    """A dry prepare's row reused from its record (`tested` again on the same inputs, the cache Worker's) is
+    named the commit's (`named_at_commit`) only after it is graded, where its grade leaves it green and the
+    Worker takes its baseline (`baselined`): a reuse graded red publishes nothing, and a green one whose
+    baseline the Worker refused is named nowhere and stands stale (row 13005: through the Worker, not its
+    writers replaced)."""
+    url, stored, seen = cache_worker
+    cached(monkeypatch, url)
+    (tmp_path / "tests/test_gpu_a.py").write_text("def test_a():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    commit(tmp_path, "the commit")
+    out = tmp_path / "rows.json"
 
-    def reused_rows(python, tests, group, common, network, kept, named, reading):
-        named[row["name"]] = ("cls", "key")
-        return [{**row, "cached": "key"}]
+    def run(code: int) -> dict:
+        ci.tested("3.12", ["tests/test_gpu_a.py"], "", out, 60.0, "on", 5.0, "common", {},
+                  variant=ci.prepares.variant("sm90", users=False),
+                  judged=lambda rows: [{**each, "exitCode": code, "unprepared": ["a @ x"]} for each in rows])
+        [row] = json.loads(out.read_text())["rows"]
+        return row
 
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
-    monkeypatch.setattr(ci, "reused_rows", reused_rows)
-    monkeypatch.setattr(ci, "row", lambda python, name, group: row["name"])
-    monkeypatch.setattr(ci.run_keys, "baselined", lambda *args: taken)
-    monkeypatch.setattr(ci.run_keys, "named_at_commit", lambda *args: calls.append(args))
-    ci.tested("3.12", ["tests/test_gpu_a.py"], "", tmp_path / "rows.json", 60.0, "on", 5.0, "common", {},
-              judged=lambda rows: [{**found, "exitCode": exit_code} for found in rows])
-    named = [(row["name"], "cls", "key")] if exit_code == 0 and taken else []
-    assert [call[1:4] for call in calls] == named
-    [written] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert (written["exitCode"], written.get("kind")) == ((0, None) if exit_code == 0 and taken else
-                                                          (1, None) if exit_code else (1, ci.grading.STALE))
+    def published() -> set[str]:
+        return {key for key in stored if "-baseline/" in key or "-main/" in key}
+    first = run(0)
+    for key in published():
+        del stored[key]
+    if not taken:
+        seen.refusing.add("-baseline/")
+    row = run(exit_code)
+    named = exit_code == 0 and taken
+    # The second run reused the first's green record: a reuse graded green keeps it (`cached`), and one whose
+    # baseline the Worker refused stands stale in its place.
+    assert first["exitCode"] == 0 and first["name"] == row["name"]
+    assert ("cached" in row) == (exit_code != 0 or taken)
+    kinds = {key.split("-")[2].split("/")[0] for key in published()}
+    assert kinds == ({"baseline", "main"} if named else set())
+    assert (row["exitCode"], row.get("kind")) == ((0, None) if named else
+                                                  (1, None) if exit_code else (1, ci.grading.STALE))
 
 
 def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(

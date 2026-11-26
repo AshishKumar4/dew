@@ -1256,14 +1256,19 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+SIDECARS = ("lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid")
+"""What a task's pytest writes beside its verdict, each `<out>.<sidecar>` (`task_files`): the recorder's log
+(its children's in `<log>.children`), collection's record, pytest's report, the files the durations record
+does not wholly name, and its process id."""
+
+
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
     durations record does not wholly name (split.py); and its process id, whose stacks are read at its
     deadline (executed.py, `stalls.dumped`)."""
-    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
+    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in SIDECARS)
     for stale in (report, log, collection, unrecorded, pid):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1414,14 +1419,15 @@ def ran_in_processes(base: list[str], resumes: bool,
                      environment_of: Callable[[Path | None], dict[str, str]], recycle_at: int | None,
                      root: Path, ends: float, grace: float, files: tuple[Path, Path, Path],
                      named: tuple[str, list[str], str], began: float, aside: Path,
-                     done_before: Mapping[str, float]) -> Processes | None:
+                     done_before: Mapping[str, float], out: Path) -> Processes | None:
     """A task's pytest command (`base`, its set-aside and recycling plugins added), run again in a fresh
     process after each that recycle.py ended past `recycle_at` resident (its files beside the task's
     temporary ones in `root`, never in its checkout, whose writes a row's record weighs), the tests each
-    reported set aside from the next (progress.py's SET_ASIDE file, `aside`); None where its time ran out
-    before its first began. Only a process that ended as recycle.py ends one (pytest's interrupted exit,
-    its report holding the test it ended after) is run past: any other end (a crash after its report, a
-    kill) is the last."""
+    reported set aside from the next (progress.py's SET_ASIDE file, `aside`), each on the commit's checkout,
+    not what the one before it left (`restored`, beside the task's verdict `out`; row 13000); None where its
+    time ran out before its first began. Only a process that ended as recycle.py ends one (pytest's
+    interrupted exit, its report holding the test it ended after) is run past: any other end (a crash after
+    its report, a kill) is the last."""
     report, pid, collection = files
     python, tests, group = named
     # A resuming task's, or a dry prepare's, tests set aside as they pass; a dry prepare's run past a recycle.
@@ -1438,6 +1444,7 @@ def ran_in_processes(base: list[str], resumes: bool,
     last: tuple[int, str, bool, str, set[str] | None, set[str], dict] | None = None
     first_selected: list[str] = []
     recycles = 0
+    before = untracked() if recycle_at is not None else set()
     while True:
         # Each process's own sidecars: none an earlier one left reads as this one's.
         for sidecar in (recycled, report, pid, collection):
@@ -1465,6 +1472,7 @@ def ran_in_processes(base: list[str], resumes: bool,
         earlier += done
         outputs.append(output)
         recycles += 1
+        restored(last[5], before, out)
         aside.write_text(json.dumps(sorted({*done_before, *(grading.node_of(case) for case in earlier)})))
         environment = {**environment, recycle.CONTINUES: "1"}
     # Its last's result, its output every process's.
@@ -1535,7 +1543,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             session.pytest_command(run, tests, split), resumes, lambda aside_at: task_environment(
                 environ, site, root, (log, collection, unrecorded, pid), aside_at, group, network),
             recycle_at, Path(root), ends, grace, (report, pid, collection), (python, tests, group), began,
-            aside, done_before)
+            aside, done_before, out)
     if processes is None:
         return unstarted(out, rows, python, tests, group)
     returncode, output, expired, dump, opened, wrote, evidence = processes.last
@@ -1700,16 +1708,26 @@ def restored(wrote: set[str], before: set[str], out: Path) -> None:
     not hold): each tracked file it wrote checked out again, and each entry the checkout neither tracks nor
     ignores that was not there before it (`before`, `untracked`) removed, then each directory it made that
     this leaves empty (one imports as a namespace package), but the task's own outputs: its verdict `out`,
-    each process's beside it (`out.N` and theirs) and its artifacts (ARMADA_ARTIFACTS), which outlive it."""
+    each process's beside it (`out.N`), the runner's files beside each (`SIDECARS`) and its
+    artifacts (ARMADA_ARTIFACTS), which outlive it. Each module it checks out loses the bytecode cached for
+    it."""
     listed = subprocess.run(["git", "ls-files", "-z", "--", *sorted(wrote)], capture_output=True, text=True,
                             check=False) if wrote else None
     tracked = set(listed.stdout.split("\0")) - {""} if listed and listed.returncode == 0 else set()
     if tracked:
         subprocess.run(["git", "checkout", "-q", "--", *sorted(tracked)], check=True)
+    # A restored module's bytecode, which the process that rewrote it may have cached (its source's size and
+    # second matching the restored one's), gone too, so the next process compiles the commit's source.
+    for name in sorted(each for each in tracked if each.endswith(".py")):
+        for cached in (Path(name).parent / "__pycache__").glob(f"{Path(name).stem}.*.pyc"):
+            cached.unlink(missing_ok=True)
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     roots = [Path(artifacts).resolve()] if artifacts else []
     verdicts = out.resolve()
-    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+(\..+)?)?")
+    # Its verdict, each process's numbered one, and the runner's own files beside each (`SIDECARS`, the
+    # recorder's children, the set-aside list): no other file sharing the verdict's name (a `<out>.py`).
+    own = "|".join(re.escape(name) for name in (*SIDECARS, "lifetime.log.children", "set-aside.json"))
+    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+)*(\.({own}))?")
     checkout = Path.cwd().resolve()
     emptied: set[Path] = set()
     for made in sorted(untracked() - before):

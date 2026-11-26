@@ -3,6 +3,8 @@ whose process ended red set aside by no resumed attempt, and a report a killed p
 none."""
 
 import json
+import subprocess
+import sys
 
 import pytest
 from armada_support import commit, interpreter, lifetime_task, loaded, written
@@ -100,6 +102,63 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
     assert len(set((tmp_path / "pids").read_text().split())) == 3
     assert sorted(row["tests"]) == [f"tests/test_recycled.py::test_{name}" for name in "abc"]
     assert row["exitCode"] == (1 if failing else 0)
+
+
+def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path, monkeypatch):
+    """A dry prepare's later process of one row (past its recycle bound) runs on the commit's checkout, not on
+    what the process before it left: a tracked file it changed checked out again and a file it made removed
+    (`restored`), so the row's green, which publishes its baseline, never ran on a checkout the commit does
+    not hold (row 13000)."""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/state.txt").write_text("good")
+    written(tmp_path, {"test_recycled.py": (
+        "from pathlib import Path\ndef test_a():\n    Path('data/state.txt').write_text('bad')\n"
+        "    Path('left.txt').write_text('x')\ndef test_b():\n"
+        "    assert Path('data/state.txt').read_text() == 'good'\n"
+        "    assert not Path('left.txt').exists()\n")})
+    commit(tmp_path, "the commit")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.tested("3.12", ["tests/test_recycled.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=1,
+              recorded=True)
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+
+
+def test_a_restored_modules_cached_bytecode_goes_with_its_rewrite(ci, tmp_path):
+    """A module a process rewrote and imported, checked out again (`restored`), leaves none of the bytecode
+    that process cached for it: its rewrite's size and second may match the restored source's, so the next
+    process would run the rewrite (row 13000's review)."""
+    (tmp_path / "tests/helper.py").write_text("WORD = 'good'\n")
+    commit(tmp_path, "the commit")
+    (tmp_path / "tests/helper.py").write_text("WORD = 'evil'\n")
+    subprocess.run([sys.executable, "-c", "import helper"], cwd=tmp_path / "tests", check=True)
+    assert list((tmp_path / "tests/__pycache__").glob("helper.*.pyc"))
+    ci.restored({"tests/helper.py"}, ci.untracked(), tmp_path / "verdict.json")
+    assert (tmp_path / "tests/helper.py").read_text() == "WORD = 'good'\n"
+    assert not list((tmp_path / "tests/__pycache__").glob("helper.*.pyc"))
+
+
+def test_a_restore_keeps_the_runners_files_beside_the_verdict_and_no_other_of_its_name(ci, tmp_path):
+    """A checkout restored after a process (`restored`) keeps the task's verdict, each process's numbered one,
+    and the runner's own files beside each (`SIDECARS`, the recorder's children), and removes any other entry
+    the process made, one named as the verdict but for its suffix among them: a later process importing a
+    `<out>.py` would run a module the commit does not hold (row 13000's review)."""
+    written(tmp_path, {"test_kept.py": ""})
+    commit(tmp_path, "the commit")
+    before = ci.untracked()
+    out = tmp_path / "tests/result"
+    kept = [out.with_name(f"result.0.{name}") for name in ci.SIDECARS] + [tmp_path / "tests/result.0"]
+    for path in [*kept, out.with_name("result.py"), out.with_name("result.0.py")]:
+        path.write_text("")
+    (tmp_path / "tests/result.0.lifetime.log.children").mkdir()
+    (tmp_path / "tests/result.0.lifetime.log.children/1.log").write_text("")
+    ci.restored(set(), before, out)
+    assert all(path.exists() for path in kept)
+    assert (tmp_path / "tests/result.0.lifetime.log.children/1.log").exists()
+    assert not out.with_name("result.py").exists() and not out.with_name("result.0.py").exists()
 
 
 @pytest.mark.parametrize(("source", "hook"), [
