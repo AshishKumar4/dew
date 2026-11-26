@@ -34,7 +34,6 @@ from dew.nn.kernels.templates import (
     mosaic,
     outputs,
     persistent,
-    product,
     report,
     resources,
     rings,
@@ -42,6 +41,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.product import Support
 from dew.nn.programs import meshless
 
 
@@ -728,7 +728,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # base tile, every warp's 16 x 8 share of it issued together): one skipped is skipped for every warp.
         return self.m_warps * 16, self.atom_columns
 
-    def _supported(self, acc, lhs, rhs, support: product.Support):
+    def _supported(self, acc, lhs, rhs, support: Support):
         """`products` of `support`'s terms alone, `rhs` staged and `lhs` staged or in registers: each
         instruction issued where a term of the support falls in its tile and depth (`Support.tiles` on
         `term_tile`), each slice of either operand loaded where one reads it, none of a depth none takes. The

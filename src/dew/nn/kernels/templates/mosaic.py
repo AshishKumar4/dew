@@ -55,6 +55,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.cost import Stated
+from dew.nn.kernels.templates.product import Support
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Turn, besides, drain, loaded_once
 from dew.nn.kernels.templates.stores import Output, column_chunks, column_spans, written
 from dew.telemetry.instrumentation import MODEL_FLOPS
@@ -1308,7 +1309,7 @@ class Issuer[Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True,
-                 support: product.Support | None = None) -> Accumulator:
+                 support: Support | None = None) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
         done); of `support`'s terms alone where given, which only an issuer whose instructions each take a
@@ -1417,7 +1418,7 @@ class Issuer[Accumulator](abc.ABC):
         return value[:, first:first + (value.shape[1] - first if columns is None else columns)]
 
     def issued(self, acc: Accumulator, left: tuple, right: tuple, interpret: bool, *,
-               support: product.Support | None = None) -> Accumulator:
+               support: Support | None = None) -> Accumulator:
         """`acc` with the products of `left`'s and `right`'s parts (`product.formed`, each a part's
         shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
         (`products`), of `support`'s terms alone where given (a part of a zero is zero)."""
@@ -2165,7 +2166,7 @@ class Transport[Allocated, Opened](abc.ABC):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
 
-def whole_products(issuer: Issuer, support: product.Support | None) -> None:
+def whole_products(issuer: Issuer, support: Support | None) -> None:
     """Refuses a product of a `support` (`Issuer.register_products`') on `issuer`, whose instructions take
     its products whole (`Issuer.term_tile` None)."""
     if support is not None:
