@@ -10,17 +10,16 @@ memory is far off that math's at the bound.)"""
 
 import dataclasses
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU
-from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_stability import SITES, cotangents
 from test_recurrence_template_stability import bf16
 
-from dew.nn.kernels import recurrence_algebra as algebra
+from dew.nn.kernels import generation, recurrence_algebra as algebra
 
 CHUNK, KEYS, SUB = 64, 32, algebra.SUB
 BOUND = -5.0
@@ -115,33 +114,90 @@ UNBOUND_QUERIES = dataclasses.replace(SITES['vector delta'], decay_bound=BOUND, 
 its own pairs as anchored products (`anchored.anchoring`)."""
 
 
-@COMPILES_ON_CPU
-def test_a_query_gradient_of_cancelling_score_cotangents_keeps_their_last_bits():
-    """A query's gradient of two score cotangents that cancel to their 24th bit, through the template and its
-    own pairs' anchored backward (`anchored.back`), interpreted, the token-by-token recurrence's in float64
-    bit for bit: zero queries and decays, keys `e0` and `-e0` written whole, values `(1, 2^-9, 2^-20)` and
-    `(0, 0, -2^-20)`, so the corrected values are `(1, 2^-9, 2^-20)` and `(1, 2^-9, 0)`, and a unit cotangent
-    on the third token's three value columns: its score cotangents `1 + 2^-9 + 2^-20` and `1 + 2^-9`, its
-    query's first channel `scale (2^-20)` a value head: staged in two bf16 parts, both cotangents took
-    `(1, 2^-9)`, the gradient zero (a head review's P0 of 28c4e9f0f); in `anchored.BLOCK_PARTS`, kept."""
+EXACT_PAIRS = dataclasses.replace(UNBOUND_QUERIES, decay_bound=None)
+"""The same hooks with no bound declared: the template's own pairs each their own decay
+(`anchored.anchoring`), the reference the anchored backward is held to."""
+
+
+def _cancelling(seed):
+    """A draw whose third token's score cotangents cancel to their 24th bit (`(operands, cotangents)`): zero
+    queries, decays and memory, keys `e0` and `-e0` written whole, values `(a, 2^-9 b, 2^-20 m)` and
+    `(0, 0, -2^-20 m)` (`a`, `b`, `m` drawn in [1, 2) on bf16's grid), so the corrected values are
+    `(a, 2^-9 b, 2^-20 m)` and `(a, 2^-9 b, 0)`, and a unit cotangent on the third token's three value
+    columns: its score cotangents `a + 2^-9 b + 2^-20 m` and `a + 2^-9 b`, its query's first channel
+    `scale 2^-20 m` a value head."""
     operands, (out, final) = cotangents(UNBOUND_QUERIES, 'the decay bound', 0)
+    a, b, m = (1.0 + np.random.default_rng([13497, seed]).integers(0, 128, 3) / 128.0)
     writes = jnp.zeros_like(operands.beta).at[:, :2].set(1.0)
     key = jnp.zeros_like(operands.key).at[:, 0, :, 0].set(1.0).at[:, 1, :, 0].set(-1.0)
-    value = (jnp.zeros_like(operands.value).at[:, 0, :, :3].set(jnp.asarray([1.0, 2.0 ** -9, 2.0 ** -20]))
-             .at[:, 1, :, 2].set(-2.0 ** -20))
+    first = jnp.asarray([a, 2.0 ** -9 * b, 2.0 ** -20 * m])
+    value = jnp.zeros_like(operands.value).at[:, 0, :, :3].set(first).at[:, 1, :, 2].set(-2.0 ** -20 * m)
     zeroed = {name: jnp.zeros_like(getattr(operands, name)) for name in ('query', 'log_decay', 'state')
               if getattr(operands, name) is not None}
     operands = bf16(dataclasses.replace(operands, key=key, value=value, beta=writes, **zeroed),
                     UNBOUND_QUERIES)
-    cotangent = (jnp.zeros_like(out).at[:, 2, :, :3].set(1.0).astype(jnp.bfloat16), jnp.zeros_like(final))
-    found = with_gradients(lambda given: chunk_on('mosaic_gpu', UNBOUND_QUERIES, given))(operands, cotangent)
-    with jax.enable_x64(new_val=True):
-        truth = with_gradients(lambda given: token_by_token(UNBOUND_QUERIES, given))(
-            *widened((operands, cotangent)))
-    ours, theirs = (np.asarray(grads[1].query[:, 2, :, 0], np.float64) for grads in (found, truth))
-    assert np.all(theirs != 0) and np.array_equal(ours, theirs), (ours, theirs)
+    cotangent = jnp.zeros_like(out).at[:, 2, :, :3].set(1.0).astype(jnp.bfloat16)
+    return operands, (cotangent, jnp.zeros_like(final))
 
 
+def _through(hooks):
+    """The template's output, final memory and gradients for `hooks` (`chunk_on('mosaic_gpu')`)."""
+    return with_gradients(lambda given: chunk_on('mosaic_gpu', hooks, given))
+
+
+def _token_by_token(operands, cotangent):
+    return with_gradients(lambda given: token_by_token(UNBOUND_QUERIES, given))(operands, cotangent)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.check1_shards(seeds=8, per_task=8)
+def test_a_query_gradient_of_cancelling_score_cotangents_is_as_exact_as_the_exact_pairs():
+    """The cancelling draws' gradients through the template's anchored backward (`anchored.back`),
+    interpreted, on par from float64 with its pairs each their own decay (check 1, `EXACT_PAIRS`): staged in
+    two bf16 parts, both score cotangents took `(a, 2^-9 b)` and the query's gradient was zero (a head
+    review's P0 of 28c4e9f0f); in `anchored.BLOCK_PARTS`, kept (and check 1 rejects that zero,
+    `test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws`)."""
+    assert_as_exact(_through(UNBOUND_QUERIES), _through(EXACT_PAIRS), _cancelling,
+                    "the cancelling draws' anchored gradients", seeds=8, truth_fn=_token_by_token)
+
+
+def test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws():
+    """Check 1 over the cancelling draws rejects their query's gradient zeroed, the anchored backward's loss
+    in two parts, against the portable math's (`chunk_on('xla')`, every gradient its own and the query's
+    zeroed): the draws resolve the `scale 2^-20 m` element the loss would drop, so the template's check
+    above holds it."""
+    portable = with_gradients(lambda given: chunk_on('xla', EXACT_PAIRS, given))
+
+    def zeroed(operands, cotangent):
+        found, grads = portable(operands, cotangent)
+        return found, dataclasses.replace(grads, query=jnp.zeros_like(grads.query))
+
+    with pytest.raises(AssertionError):
+        assert_as_exact(zeroed, portable, _cancelling, "a zeroed query gradient", seeds=8,
+                        truth_fn=_token_by_token)
+
+
+@COMPILES_ON_CPU
+def test_the_cancelling_draws_reach_the_anchored_backward():
+    """The cancelling draws take the anchored backward: their call's plan on the interpreted target
+    anchors `key_pairs_own` (`mainloop.Launch.reducing`), and its guard holds on them: zero decays, so every
+    factor is one and no prefix leaves `OWN_REACH`; every operand element zero or within `2^+-OWN_BAND`
+    (`own_rows_failed` clear); and the pairs' gradients at most `a + 2^-9 b + 2^-20 m` below 4, the
+    scaled operands at most 2, their product far within `2^OWN_PRODUCT`."""
+    from dew.nn.kernels.recurrence_chunk import template_bind
+    from dew.nn.kernels.templates.recurrence import template
+
+    operands, _ = _cancelling(0)
+    facts = generation.interpreted_target()
+    with generation.assumed(facts, interpreted=True):
+        call, _ = template_bind(operands.query, operands.key, operands.value, operands.log_decay,
+                                operands.beta, operands.state, rounded=True, decay_bound=BOUND)
+        _, bound = call.bound['mosaic_gpu']
+        tiles = template.MOSAIC.derived(bound, facts)
+        planned = template.MOSAIC.launches(bound, tiles, facts, backward=True)
+    assert {launch.name: launch.reducing for launch in planned}["recurrence_key_pairs_own"] == 1
+    rows = [jnp.asarray(x, jnp.float32).reshape(-1, x.shape[-1]) for x in (operands.query, operands.key)]
+    assert all(np.all(np.asarray(algebra.own_rows_failed(None, [(x, x)])) == 0.0) for x in rows)
 @pytest.mark.parametrize("transposed", [False, True])
 def test_a_sub_chunks_compact_columns_are_its_square_strictly_before_or_after(transposed):
     """`own_columns` of a call's pairs `[R, H * C]`: row `i`'s column `c` the pair `(i, f + c)` strictly
@@ -190,3 +246,35 @@ def test_kimis_training_plan_anchors_its_own_pairs(target):
     reducing = {name: launches[name].reducing
                 for name in ("recurrence_intra_own", "recurrence_key_pairs_own")}
     assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 1}, reducing
+
+
+@pytest.mark.parametrize("target", ["sm86", "sm120"])
+def test_kimis_own_pairs_launches_fit_each_budget_they_are_planned_at(target):
+    """Kimi's bf16 training step planned at its device's shared budget and at budgets a block of 4 KiB and two
+    below it, down to the last the template derives at: each own pairs launch (`intra_own`,
+    `intra_own_scores`, `key_pairs_own`) fits the budget it is planned at with the scratch it launches with
+    (`mainloop.Launch.shared`, its `reducing` warpgroups' counted), as its fit priced it
+    (`own_pairs.anchored_plan`: fitted without the forward's scratch, its launch took more than it priced,
+    train 1337's review, row 13495). No budget the template derives at holds no anchored forward block (its
+    other launches need twice the forward's), so each stays anchored."""
+    from test_recurrence_mosaic import resource_operands
+
+    from dew.nn.kda import KimiDeltaAttention
+    from dew.nn.kernels.recurrence_chunk import template_bind
+    from dew.nn.kernels.templates.recurrence import template
+
+    operands = [jnp.zeros(shape.shape, shape.dtype) for shape in
+                resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 512)]
+    base = generation.gpu_target(target)
+    for budget in (generation.shared_budget(base) - 4096 * step for step in range(3)):
+        facts = dataclasses.replace(base, shared_limit=budget)
+        with generation.assumed(facts):
+            call, _ = template_bind(*operands, rounded=True, decay_bound=KimiDeltaAttention.lower_bound)
+            _, bound = call.bound['mosaic_gpu']
+            tiles = template.MOSAIC.derived(bound, facts)
+            if tiles is None:
+                break
+            own = [launch for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True)
+                   if "_own" in launch.name]
+        assert all(launch.shared <= budget and launch.reducing == 1 for launch in own), (
+            budget, [(launch.name, launch.shared, launch.reducing) for launch in own])
