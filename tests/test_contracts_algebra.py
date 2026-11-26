@@ -57,6 +57,25 @@ def test_a_decayed_pair_holds_its_derivatives():
     assert gradient == 2
 
 
+def test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative():
+    import numpy as np
+
+    from dew.algebra import bits
+
+    x = np.zeros((16, 1), np.float32)
+    x[0, 0] = 2688
+    direction = np.zeros_like(x)
+    direction[0, 0] = 1
+
+    def scale(tile):
+        return bits.nvfp4_coded(tile)[2]
+
+    value, tangent = jax.jit(lambda x, dx: jax.jvp(scale, (x,), (dx,)))(x, direction)
+    np.testing.assert_array_equal(value, np.float32(1))
+    np.testing.assert_array_equal(tangent, np.float32(1 / 2688))
+    np.testing.assert_array_equal(jax.jit(jax.grad(scale))(x), direction * np.float32(1 / 2688))
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_a_normal_draw_is_read_where_a_gpu_parts_prepare_places_its_calls(dtype):
     """`contract_support.normal_draw` made where a GPU tier part's prepare places its calls (a compile-only

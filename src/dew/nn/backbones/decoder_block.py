@@ -737,7 +737,10 @@ class DecoderBlock(nn.Module):
     reads it. A DSpark target layer
     (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
-    `prediction_inputs/draft_context`.
+    `prediction_inputs/draft_context`; under 'visits' a block drafter's target
+    layer (`dew.nn.block_draft`) appends the residual it receives at each of its
+    runs, a looped layer's once a pass (`prediction_inputs/visits`): the mean of
+    its streams, or under depth residuals the partial block it is handed.
     """
     # Upstream references. Mamba-2's mixer-only block: modeling_mamba2.py:608-632.
     # AltUp: Gemma3nTextDecoderLayer.forward. mHC's residuals:
@@ -783,8 +786,8 @@ class DecoderBlock(nn.Module):
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     cross: Callable[..., nn.Module] | None = None  # the layer's GatedCrossAttention factory
-    prediction_target: bool = False  # records its streams' mean for DSpark
-    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
+    prediction_target: bool = False  # records its streams' mean for DSpark or a block drafter
+    prediction_site: Literal['input', 'output', 'visits'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
@@ -1363,16 +1366,20 @@ class DecoderBlock(nn.Module):
                 # layer reading the call's rows as it masks them (`EngramLayer`, `PLELayer`).
                 streams = self.engram_layer(streams, attention_metadata.engram_ids[:, :, self.engram_index],
                                             MixerCall(attention_metadata, decode))
-            if self.prediction_site == 'input':
+            if self.prediction_site in ('input', 'visits'):
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
                 self._record_prediction(streams)
             return _Streams(constrain(streams, STREAMS), pre)
         if self.residual_site is not None:
+            if self.prediction_site == 'visits':
+                # The partial block the layer is handed, as Inkling 2's drafter reads a visit (vLLM's
+                # Inkling2LoopModel.forward `stack[num_blocks]`, `dew.nn.block_draft`).
+                self._record_prediction(residual[:, :, -1:])
             return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
         predictions = None if self.altup is None else self.altup_layer.predict(residual, train=train)
         x = residual if self.altup is None or predictions is None else predictions[self.altup.active_idx]
-        if self.prediction_site == 'input':
+        if self.prediction_site in ('input', 'visits'):
             self._record_prediction(x[:, :, None])
         # The residual stream sits where the batch does, before and after
         # each sublayer: fsdp gathers weights rather than sum partial
@@ -1506,15 +1513,18 @@ class DecoderBlock(nn.Module):
         return x
 
     def _record_prediction(self, streams):
-        """Sow a DSpark target layer's streams averaged over the copies, when
-        the caller collects `prediction_inputs`: a layer outside streams over a
-        range of layers (`HyperConnections.hc_layers`) its residual, the mean of
-        its one copy."""
+        """Sow a target layer's streams averaged over the copies, when the caller collects
+        `prediction_inputs`: a layer outside streams over a range of layers (`HyperConnections.hc_layers`)
+        its residual, the mean of its one copy. DSpark's (`draft_context`) holds the layer's last; a block
+        drafter's (`visits`) appends each run's, a looped layer's in pass order (`sows_appended`)."""
         if (self.prediction_target and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             mean = jnp.mean(streams, axis=2)
-            self.sow('prediction_inputs', 'draft_context', mean,
-                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+            if self.prediction_site == 'visits':
+                self.sow('prediction_inputs', 'visits', mean)
+            else:
+                self.sow('prediction_inputs', 'draft_context', mean,
+                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
              train: bool, routes: dict, depth=None, site_inputs=None):

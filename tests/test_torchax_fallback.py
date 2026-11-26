@@ -45,7 +45,7 @@ from dew.data.dataset import Loader
 from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
-from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.interop.torchax_fallback import TorchCausalLM, TorchLayout, TransformersTierWarning
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
@@ -1709,6 +1709,82 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
     assert identity.any() and not identity.all()
     assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
                     truth_fn=torch_arm(wide, float64))
+
+
+QWEN3_NEXT_GPU = {**QWEN3_NEXT, "hidden_size": 256, "head_dim": 64, "intermediate_size": 512,
+                  "linear_key_head_dim": 128, "linear_value_head_dim": 128}
+"""`QWEN3_NEXT` at widths the GPU's kernels take (the delta net's heads of 128, its port's), bf16."""
+
+DELTA_LAUNCHES = ("recurrence", "fla_")
+"""The delta rule's kernels' launch names: the recurrence template's (`templates.recurrence`) and fla's port's
+(`fla_gdn`)."""
+
+
+def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
+    """On a Hopper, a bf16 Qwen3-Next taken to tier 3 (`kernel_parts`, row 13044) steps through Dew's native
+    kernels where a native model's would: its RMSNorms' fused norm (`rms_norm_forward`, its backward), its
+    gated MLPs' fused SiLU product (`swiglu_forward`, its backward) and its delta net's chunked rule's
+    kernels (the recurrence template's or fla's port's, `DELTA_LAUNCHES`) forward and backward, over the
+    projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
+    parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
+    the CPU's float32 witness reaches XLA's arithmetic alone."""
+    from jax.core import ShapedArray
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.programs import equations
+
+    torch.manual_seed(0)
+    model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT_GPU)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="bfloat16", fallback="torchax")
+    params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
+    tokens = np.random.default_rng(0x13280).integers(0, QWEN3_NEXT["vocab_size"], (ROWS, SEQ + 1)).astype(
+        np.int32)
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+
+    def loss(params):
+        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
+
+    step = jax.jit(jax.grad(loss))
+    # The queries', keys' and values' dtypes each call of the delta rule takes in the source's traced
+    # forward, as the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`),
+    # before the step's replay inlines it (`TorchGraph.traced`), its parameters at the load's bf16 as its
+    # forward computes them.
+    assert isinstance(loaded.model, TorchCausalLM)
+    computed = {name: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+                for name, leaf in params.items()}
+    forward, _, _ = loaded.model.graph.traced(computed, loaded.variables["buffers"],
+                                              jnp.asarray(tokens[:, :-1]), None, train=False)
+    handed = [tuple(var.aval.dtype for var in eqn.invars[:3] if isinstance(var.aval, ShapedArray))
+              for eqn in equations(forward.jaxpr)
+              if eqn.primitive.name == "jit" and eqn.params["name"] == "delta_rule"]
+    # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's, the
+    # recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
+    names = sorted({call.name for call in kernel_calls(step.lower(params))
+                    if call.kind in ("triton", "mosaic_gpu")})
+    for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
+        assert any(name.startswith(kernel) for name in names), (kernel, names)
+    # The delta rule takes the projections' bf16 operands, as a native layer's port does, and its kernels
+    # run its step forward and backward (`DELTA_LAUNCHES`: fla's `*_bwd_*`, the template's `*_back*`).
+    assert handed and set(handed) == {(jnp.dtype(jnp.bfloat16),) * 3}, handed
+    delta = [name for name in names if name.startswith(DELTA_LAUNCHES)]
+    assert any("bwd" in name or "back" in name for name in delta), names
+    assert any(not ("bwd" in name or "back" in name) for name in delta), names
+    reference = copy.deepcopy(model).to(torch.bfloat16)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.bfloat16)
+
+    assert_as_exact(loss_and_gradients(loaded, reference, params),
+                    as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent, torch.bfloat16)),
+                    token_draws(tokens), "tier 3 bf16 Qwen3-Next LM step", seeds=UNREGISTERED_SEEDS,
+                    truth_fn=truth_fn)
 
 
 def a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path):

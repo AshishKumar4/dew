@@ -33,7 +33,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as fragments
 from jax.experimental.mosaic.gpu.mma import MMALayouts
 
-from dew.nn import derivatives, precision, programs
+from dew.nn import derivatives, division, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import inline_work, resources
 from dew.nn.kernels.templates.cost import (
@@ -193,7 +193,7 @@ _OPERATIONS = frozenset({
     lax.rem_p, lax.select_n_p, lax.shift_left_p, lax.shift_right_logical_p, lax.shift_right_arithmetic_p,
     lax.sign_p, lax.sub_p, lax.xor_p, lax.integer_pow_p, lax.square_p, lax.round_p,
     lax.one_minus_square_p, ad_util.add_jaxvals_p, lax.clz_p, lax.is_finite_p, lax.erf_p, lax.expm1_p,
-    lax.nextafter_p, precision.correctly_rounded_divide_p})
+    lax.nextafter_p, division.correctly_rounded_divide_p})
 """Elementwise operations of the CUDA cores, one an output element (a cotangent's sum, `add_any`, among
 them; a leading-zero count, `clz`, an integer instruction the finish's exponent reads a subnormal's by,
 `dew.nn.float_bits.binade_of`). A finiteness test is a magnitude's comparison (XLA's elemental emitter: fabs
@@ -315,10 +315,10 @@ and an FSETP. A tanh, a logistic, a sin, a cos and a pow branch to slow paths or
 static count misstates: one exponential an element, as before any was measured."""
 
 TRITON_FORMS: Mapping = {**{function: Work(exponentials=1) for function in APPROXIMATED},
-                         precision.correctly_rounded_divide_p: IEEE_DIVISION}
+                         division.correctly_rounded_divide_p: IEEE_DIVISION}
 """A Pallas Triton kernel's forms (`forms_of`): each special function one exponential an element, as a
 kernel of no measured forms; a correctly rounded fp32 division its native `div.rn.f32`
-(`precision.triton_lowerings`, `IEEE_DIVISION`; row 12886)."""
+(`division.triton_lowerings`, `IEEE_DIVISION`; row 12886)."""
 
 
 _FREE = frozenset({
@@ -1132,12 +1132,12 @@ def _platform_branch(platforms) -> int:
 
 @functools.lru_cache(maxsize=64)
 def _software_division(operands: tuple, target: generation.GpuTarget, forms: str | None) -> Work:
-    """A correctly rounded division's software form (`precision._correctly_rounded_divide`, XLA's and Mosaic
+    """A correctly rounded division's software form (`division.software_divide`, XLA's and Mosaic
     GPU's lowering) over operands of `(shape, dtype)` `operands`, traced for `target` (its platform's
     arithmetic chosen as its program's is) and counted as a kernel's body is, through its protected and
     marked calls, with a Mosaic GPU kernel's `forms` (by name) or none (row 12886); once an operand set."""
     with generation.assumed(target):
-        traced = jax.make_jaxpr(precision._correctly_rounded_divide)(
+        traced = jax.make_jaxpr(division.software_divide)(
             *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in operands))
         counted = emitted(traced.jaxpr, 1, None, forms=_KERNEL_FORMS.get(forms or "")).roles[0]
     return counted.fixed + sum(counted.walks, Work())
@@ -1399,13 +1399,13 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
     CUDA target issues its kernel's form (`MOSAIC_DIVISION`), XLA's own `div.rn.f32`'s (`IEEE_DIVISION`,
     M-FS-77); other widths' and a TPU's, unmeasured, an operation an element. A correctly rounded one issues
     its native form where a kernel's forms state one (a Triton kernel's, `TRITON_FORMS`), else the software
-    division it lowers to (XLA's and Mosaic GPU's, `precision._correctly_rounded_divide`), counted as a
+    division it lowers to (XLA's and Mosaic GPU's, `division.software_divide`), counted as a
     kernel's body is, through its calls (row 12886). An integer power issues its repeated squaring's
     multiplies, a negative one beside the division of one by them (row 12948). A kernel's fp32 erf and atan2
     issue the polynomials its forms state (`POLYNOMIAL_FORMS`); another's erf one operation and atan2
     unpriced, unmeasured (an fp64 one lowers to libdevice's own). Whether an operation is fp32 its results'
     dtypes say, or `fp32` where a caller states it (the algebra's terms hold no dtype)."""
-    if primitive is precision.correctly_rounded_divide_p:
+    if primitive is division.correctly_rounded_divide_p:
         if (native := (forms or {}).get(primitive)) is not None:
             return repeated(native, sum(_elements(aval) for aval in outputs))
         kind = next((name for name, table in _KERNEL_FORMS.items() if forms == table), None)

@@ -19,7 +19,7 @@ from dew.nn.float_bits import exact_power2, float_bits, lowered_rounded, raw_fie
 from dew.nn.programs import UNROUNDED
 
 
-def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
+def software_divide(numerator: jax.typing.ArrayLike,
                               denominator: jax.typing.ArrayLike) -> jax.Array:
     """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
@@ -59,7 +59,7 @@ def lowered_divide(numerator: jax.Array, denominator: jax.Array, lowered: jax.Ar
 def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
              lowered: jax.typing.ArrayLike = 0) -> jax.Array:
     """`correctly_rounded_divide`'s quotient times `2^-lowered`, rounded once
-    (`_correctly_rounded_divide`); a special operand's division lowered in integers (`lowered_rounded`)."""
+    (`software_divide`); a special operand's division lowered in integers (`lowered_rounded`)."""
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
     # Raw fields class a special operand; normalized ones divide a subnormal as its value, which XLA's
@@ -159,12 +159,12 @@ numerator `ct / d`. As `jnp.divide`'s, they divided as XLA does: by the divisor'
 is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 50% of quotients on a GPU, so
 a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
 5277). It is entrywise (`Primitive.elementwise`), which the analyses of a program's entries read."""
-correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
+correctly_rounded_divide_p.def_impl(software_divide)
 # Its result is typed as JAX types its own division's: the operands' broadcast shape, their dtype, and
 # their sharding and varying axes, which a mesh's Explicit axis carries in a value's type.
 correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
-                       mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
+                       mlir.lower_fun(software_divide, multiple_results=False))
 
 
 @functools.cache
@@ -194,7 +194,7 @@ UNROUNDED[correctly_rounded_divide_p] = jnp.divide
 
 @contracted("test_the_precision_seams_hold_every_order")
 def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
-    """The correctly rounded fp32 quotient `numerator / denominator` (`_correctly_rounded_divide`), IEEE
+    """The correctly rounded fp32 quotient `numerator / denominator` (`software_divide`), IEEE
     division's on every backend, differentiable at every order, each of its derivatives' divisions
     correctly rounded too (`correctly_rounded_divide_p`)."""
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),

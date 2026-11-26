@@ -163,6 +163,22 @@ def test_each_rewrites_right_side_holds_check_2():
         assert_certified(right, rows, name, seeds=2)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_exp2_check_2_does_not_admit_flushing_a_normal_or_landing_overflow_finite(dtype):
+    from certified import CONTRACTS, assert_certified
+    from op_certificates import FORMATS
+
+    fmt = FORMATS[jnp.dtype(dtype).name]
+    operands = (np.asarray([fmt.emin, fmt.emax + 1], dtype),)
+    contract = CONTRACTS[jax.lax.exp2_p]
+    exact = np.asarray([2.0 ** fmt.emin, np.inf], dtype)
+    lost = np.asarray([0, fmt.largest], dtype)
+    np.testing.assert_array_equal(contract({}, operands, exact, fmt), [True, True])
+    np.testing.assert_array_equal(contract({}, operands, lost, fmt), [False, False])
+    assert_certified(jax.lax.exp2, lambda _: (np.asarray([-2.5, -1, 0, 1, 3.125], dtype),),
+                     "exp2 of ordinary finite inputs", seeds=1)
+
+
 def test_every_registered_rule_set_is_qualified_by_instances_of_its_own():
     """The qualification inventory is the registry's (`rules.instances`): every registered set's instances
     name it, every set has some, and a set registered with none is refused, so no set enters the pass

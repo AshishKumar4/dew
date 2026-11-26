@@ -55,14 +55,13 @@ from dew.nn.derivatives import (
     with_tangents_formed,
 )
 
-# The division's names, which its callers read here as before it had a module of its own.
+# The division's public names, which its callers read here as before it had a module of its own; its
+# lowerings and software form its own module's (`dew.nn.division`).
 from dew.nn.division import (
-    _correctly_rounded_divide as _correctly_rounded_divide,
     correctly_rounded_divide as correctly_rounded_divide,
     correctly_rounded_divide_p as correctly_rounded_divide_p,
     divided as divided,
     lowered_divide as lowered_divide,
-    triton_lowerings as triton_lowerings,
 )
 from dew.nn.float_bits import exact_power2, split_bits, two_factor_reach, whole_power2, widened_exactly
 from dew.nn.nested import nested

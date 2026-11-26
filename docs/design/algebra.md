@@ -373,8 +373,9 @@ fitted to them, and a rule set ships only with measured receipts.
   a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
   product, a narrow float's correctly rounded arithmetic its float32 arithmetic rounded once, axes of one
-  element erased, equal equations once). Where a candidate's results are then its declaration's very values,
-  the region is that call's by identity and no e-graph is built. Otherwise the program enters one term
+  element erased, equal equations once). An explicit reduce-precision keeps its own operation; narrowing
+  and widening can change observable NaN payload bits. Identical canonical results match without an
+  e-graph. Otherwise the program enters one term
   region and saturates under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact
   sets alone under the accurate forms), and the region is the call's where each of its results shares its
   declaration's e-class. Either way the call's selector must give it a kernel of Dew's. A different constant, cast,
@@ -1282,6 +1283,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
   what it replaces in the same change: no switch keeps a hand form beside its derived one.
 - The coupled walk keeps its ordinary local dot when finite. If that dot exceeds the format, its
   scaled readout carries the score's exponent through the chunk weight and corrected value before landing.
+  A subnormal static reader scale stays in the scaled sum of its memory, momentum and local reads;
+  the token replay likewise carries it into the whole contraction.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;
@@ -1292,8 +1295,9 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
-    A subnormal static readout scale participates in the unlanded product of all factors, including in
-    transpose: multiplying it into one operand first can erase an otherwise normal read.
+    A subnormal static readout scale stays in the unlanded contraction, including in transpose:
+    the prepared chunk uses the token loop with each step's split decay applied to the live state,
+    rather than landing either its decay or its reader's scale early.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
@@ -1552,6 +1556,10 @@ signed integer digits and becomes a significand with its power of two; a large t
 words is normalized before joining a product. The evaluator visits the occupied bin combinations in bounded
 chunks and reduces the signed products before dividing and landing. This preserves lower terms when a
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
+Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
+directions. A finite observation at zero weight retains its one-sided weight derivative.
+Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
+or missing observations. Its covariance term centers and differentiates only pairs that are present.
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded
@@ -1679,9 +1687,10 @@ about it is an estimate.
   store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-
   order form is checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8
   steps: no cheaper program within the windows (none found within the search's budgets: windows of at most
-  three inputs, bounded rounds and solver timeouts; not a proof that none exists). `formats.MxFp8`'s
-  scale decoding uses `bits.e8m0_decoded` and its E8M0 form. A free-layout FP8 weight decoder is not
-  served by sm80's W8A8 GEMM yet (row 8548); the sm80 attention-cache path is separate (row 8549).
+  three inputs, bounded rounds and solver timeouts; not a proof that none exists). The exact portable
+  `formats.MxFp8` decode applies that stored exponent to each code's significand before rounding to
+  the destination format. A free-layout FP8 weight decoder is not served by sm80's W8A8 GEMM yet
+  (row 8548); the sm80 attention-cache path is separate (row 8549).
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
   must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
   byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the

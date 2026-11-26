@@ -22,10 +22,10 @@ from dew.nn.sharding import checked, computed_from, per_shard
 def _register_triton_lowerings() -> None:
     """Register Dew's primitive owners' Pallas Triton lowerings on first `pallas_call` (row 9794)."""
     from dew.algebra import scaled
-    from dew.nn import derivatives, precision
+    from dew.nn import derivatives, division
 
     derivatives.triton_lowerings()
-    precision.triton_lowerings()
+    division.triton_lowerings()
     scaled.triton_lowerings()
 
 
@@ -55,9 +55,9 @@ def _register_mosaic_gpu(prim: jax_core.Primitive, value: Callable) -> None:
 def _register_mosaic_gpu_lowerings() -> None:
     """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (rows 9795, 12330)."""
     from dew.algebra import scaled
-    from dew.nn import precision
+    from dew.nn import division
 
-    _register_mosaic_gpu(precision.correctly_rounded_divide_p, precision._correctly_rounded_divide)
+    _register_mosaic_gpu(division.correctly_rounded_divide_p, division.software_divide)
     for made, (value, _) in scaled.MADE.items():
         _register_mosaic_gpu(made, value)
 
