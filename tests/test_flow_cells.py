@@ -527,6 +527,42 @@ def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, m
         assert store.at_run("a site calling the host") is not None
 
 
+def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others_ahead(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), a site whose Dew arm calls cuDNN's attention, which a
+    prepare's compile for any GPU of the generation refuses (`selection.Unlowerable`: a cuDNN plan holds to
+    its GPU's model), writes that arm to compile at its run, its refusal its reason, and compiles the site's
+    XLA reference ahead: the refusal aborted the site's every arm, and an A100 tier named its cuDNN cells'
+    dew, reference and written arms unprepared, "compiled none of its arms" (MAINGPU-2b1b88c39)."""
+    import jax
+    import jax.numpy as jnp
+    import model_flows
+    import tier_wire
+    from arm_store import _unlowered_arm, armed
+    from generation_support import node_target
+    from reference_error import assert_as_exact
+    from truths_ahead import CompiledTruths, arm_role, prepared
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def attend(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation))
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return tuple(jax.random.normal(stream, (1, 128, 2, 64), jnp.bfloat16) for stream in streams)
+
+    cudnn, xla = attend("cudnn"), attend("xla")
+    label = "cuDNN beside XLA"
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        assert_as_exact(cudnn, xla, draw, label, seeds=8)
+    store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
+    why = store.at_run(_unlowered_arm(armed(label), arm_role("dew", cudnn, label)))
+    assert why is not None and "kernel 'cudnn' does not lower on this host" in why, why
+    assert store.holds(armed(label)) and store.at_run(armed(label)) is None
+
+
 def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (its node an H100), the numerics flows' cells placed on the host's CPU, a
     projection and the norm seams, are passed by, none recorded deferred: the prepare chooses every kernel as
