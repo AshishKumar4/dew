@@ -1169,8 +1169,9 @@ def _band_param(family: mosaic.Family, ref, origins, row, head, first, k_first, 
     places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "band": pl.ds(column, keys)}
     laid = Kind.BAND[:2] + Kind.BAND[2:][::-1] if keys_first else Kind.BAND
     tile = family.tile_of(ref.at[axes.placed(laid, places)])
-    # Zeros past the band, selected, not scaled: a clamped column's -inf bias times zero is NaN.
-    return jnp.where(inside, tile, jnp.zeros((), tile.dtype))
+    # Zeros past the band, selected (a splat predicate's, `mosaic.selected`), not scaled: a clamped column's
+    # -inf bias times zero is NaN.
+    return mosaic.selected(inside, tile, jnp.zeros(tile.shape, tile.dtype))
 
 
 def band_paired(refs: tuple, kinds: tuple[Kind, ...]) -> tuple:

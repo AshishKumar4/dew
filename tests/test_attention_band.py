@@ -113,19 +113,33 @@ def test_a_band_bias_on_the_template_writes_no_dense_bias():
 @pytest.mark.parametrize("mainloop", ["portable", "triton", "mosaic"])
 def test_a_band_of_masked_keys_leaves_the_keys_past_it_unbiased(mainloop):
     """A full call over 512 keys whose band (extent 1, origins at key 256) holds -inf at every column, on each
-    template mainloop interpreted as an H100: the keys past the band are biased by nothing, so the output is
-    their values' mean, 1, finite. A tile past the band read its clamped column's -inf and scaled it by zero,
-    NaN, on Mosaic (head review)."""
+    template mainloop (the portable one through the call, Triton's and Mosaic GPU's interpreted as an
+    H100): the keys past the band are biased by nothing, so the output is their values' mean, 1, finite. A
+    tile past the band read its clamped column's -inf and scaled it by zero, NaN, on Mosaic (head
+    review)."""
+    from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_triton
+    from dew.nn.kernels.templates.hooks import Hook, Side
+
     queries = keys = 512
     width = band.band_width(1)
     offset = jnp.int32(256 + 255)
+    origins = band.band_origins(offset, queries, 1)
+    assert int(origins[0, 0]) == 256
     query = jnp.zeros((1, queries, HEADS, WIDTH), jnp.float32)
     key = jnp.zeros((1, keys, KV_HEADS, WIDTH), jnp.float32)
     value = jnp.ones((1, keys, KV_HEADS, WIDTH), jnp.float32)
-    bias = BandBias(jnp.full((1, HEADS, queries, width), -jnp.inf, jnp.float32), offset, 1)
-    assert int(band.band_origins(offset, queries, 1)[0, 0]) == 256
-    with generation.assumed("sm90", interpreted=True), generation.chosen(attention_mainloop=mainloop):
-        out = scaled_dot_product_attention(query, key, value, bias=bias, implementation="template")
+    values = jnp.full((1, HEADS, queries, width), -jnp.inf, jnp.float32)
+    if mainloop == "portable":
+        with generation.chosen(attention_mainloop="portable"):
+            out = scaled_dot_product_attention(query, key, value, bias=BandBias(values, offset, 1),
+                                               implementation="template")
+    else:
+        hooks = template.Hooks(score=Hook(template.Banded(template.Biased()), (
+            Side(values, template.Kind.BAND), Side(origins[:, None, :], template.Kind.QUERY))))
+        spans = template.spans(queries, keys, 1)
+        run = attention_triton.forward if mainloop == "triton" else attention_mosaic.forward
+        with generation.assumed("sm90", interpreted=True):
+            out = run(query, key, value, spans, hooks, interpret=True)
     np.testing.assert_array_equal(np.asarray(out), 1.0)
 
 
