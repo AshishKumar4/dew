@@ -959,11 +959,11 @@ dew.nn.cross_pass.CrossPass
   rank: int = 64
   additive: bool = True
   normalize_values: bool = True
-  scaled: bool = False
-  gained: bool = True
   scale_by_input_rms: bool = True
   normalize_message: bool = True
   norm_eps: float | None = None
+  scaled: bool = False
+  gained: bool = True
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None
