@@ -419,10 +419,13 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     with generation.chosen(attention="template"):
         assert quadratic not in staged(MixerCall()) and quadratic in staged(stated)
     wide = stepped(layer.clone(ctx=dataclasses.replace(layer.ctx, dtype=jnp.float64)), stated)
+
+    def truth(params, x):
+        return wide(widened(params), np.asarray(x, np.float64))
+
     assert_as_exact(attending("template")(stepped(layer, MixerCall())),
                     attending("template")(stepped(layer, stated)), draw, "a relative bias as a band",
-                    seeds=SEEDS["terms"],
-                    truth_fn=attending("reference")(lambda params, x: wide(widened(params), np.asarray(x, np.float64))))
+                    seeds=SEEDS["terms"], truth_fn=attending("reference")(truth))
 
 
 def test_a_bidirectional_layer_holds_no_relative_bias():
