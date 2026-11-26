@@ -488,6 +488,14 @@ def typed_outputs(dtypes: tuple, out_forms: tuple | None, config, *, dense: bool
     return typed, forms
 
 
+def output_bytes(dtypes: tuple, out_forms) -> float:
+    """The bytes a call's outputs store an element of its output: each dtype's over the form its
+    `out_forms` names (`forms_of`: a packed output's two codes a byte, a reduced one's a value a block)."""
+    forms = forms_of(out_forms, tuple(jnp.dtype(dtype) for dtype in dtypes)) or (None,) * len(dtypes)
+    return sum(jnp.dtype(dtype).itemsize / (1 if form is None else form.divisor)
+               for dtype, form in zip(dtypes, forms, strict=True))
+
+
 def stored_all(outs, forms: tuple):
     """A call's outputs each as its form stores it (`stored`), the outputs as they are where none states
     one: a several-output call's alone (`forms_of`)."""

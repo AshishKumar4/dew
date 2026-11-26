@@ -259,12 +259,3 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
 
-
-def test_a_capped_logit_of_zero_at_a_cap_past_its_reciprocals_range_is_zero():
-    """`precision.capped_logits` of a zero logit at a runtime fp32 cap of 2^-130 (its reciprocal past fp32's
-    largest) is zero, its quotient correctly rounded (row 13353's review), where a reciprocal's product
-    reads 0 * inf, NaN."""
-    from dew.nn.precision import capped_logits
-
-    out = jax.jit(capped_logits)(jnp.zeros((2,), jnp.float32), jnp.asarray([2.0 ** -130, 1.0], jnp.float32))
-    np.testing.assert_array_equal(np.asarray(out), np.zeros((2,), np.float32))

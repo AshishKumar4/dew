@@ -75,18 +75,14 @@ def _stored_dtypes(ba) -> tuple:
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
-    (`pricing.split_walk`'s `stored`): each output's dtype's over the tile columns a stored value holds (its
-    form's divisor, `Hooks.out_forms`: a packed output's two codes a byte, a reduced one's a value a block, a
-    narrowed one's half the tile), and its epilogue operands' bytes over the output's elements (an [rows,
-    columns] operand's an element, a column vector's a row's share)."""
+    (`pricing.split_walk`'s `stored`): its outputs' as stored (`quantized.output_bytes`), and its epilogue
+    operands' bytes over the output's elements (an [rows, columns] operand's an element, a column vector's
+    a row's share)."""
     from .templates import cost
     from .templates.gemm import quantized
 
-    dtypes = _stored_dtypes(ba)
-    forms = quantized.forms_of(ba.arguments['hooks'].out_forms, dtypes) or (None,) * len(dtypes)
-    written = sum(jnp.dtype(dtype).itemsize / (1 if form is None else form.divisor)
-                  for dtype, form in zip(dtypes, forms, strict=True))
-    return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
+    return (quantized.output_bytes(_stored_dtypes(ba), ba.arguments['hooks'].out_forms)
+            + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1))
 
 def _matrix_extents(ba) -> tuple[int, int]:
     """A bound product call's depth and width as its matrix lies (`trans_rhs`'s `[width, depth]`), its width
