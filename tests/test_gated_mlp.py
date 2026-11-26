@@ -17,8 +17,8 @@ from dew.nn import activations
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import generation
 from dew.nn.mlp import GatedMLP
-from dew.nn.protocols import forward_only
 from dew.nn.precision import LowPrecision, Numerics, projection_role
+from dew.nn.protocols import forward_only
 
 SEEDS = 8
 ACTIVATIONS = [("swiglu", None), ("swiglu", 1.5), ("geglu", None)]
@@ -659,9 +659,9 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
     held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
             if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
 
-    def holds(value) -> bool:
+    def holds(value) -> bool:  # held as made, or reshaped (the packed pair `[..., 2, H]`)
         value = np.asarray(value)
-        return any(leaf.shape == value.shape and np.array_equal(leaf, value) for leaf in held)
+        return any(leaf.size == value.size and np.array_equal(leaf.ravel(), value.ravel()) for leaf in held)
 
     assert not holds(seen["down_proj"]), "the down projection's input is held"
     for name in ("gate_up_proj",) if packed else ("gate_proj", "up_proj"):
