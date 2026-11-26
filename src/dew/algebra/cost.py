@@ -148,13 +148,13 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
     for its primitive (`_operation_work`, the one rule: a product's FLOPs in its mode and passes, a
     reduction's operations an operand element, a special function's exponentials and a conversion's
     conversions, any other elementwise operation's operations, a clamp's two, a layout change none, a
-    primitive no rule prices its elements unpriced, `Work.unpriced_operations`), an equation outside the
-    language a leaf of the region reads (a derivative's `add_any`, `terms.OPERATIONS`) priced so where it is
-    entrywise, where it was work no comparison read (the audit of 2026-11-19pm, 8964); and XLA's fusion's
-    accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read from device memory
-    once however many values read it (extraction prices a shared node once), and nothing else of device
-    memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too) and keeps its fused
-    intermediates on chip; the bytes a product's operands are staged in (the tile walk's, at their dtypes'
+    primitive no rule prices its elements unpriced, `Work.unpriced_operations`); an equation outside the
+    language that a region reads as a leaf is still priced for the arithmetic it computes (row 8964).
+    XLA fusion's accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read
+    from device memory once however many values read it (extraction prices a shared node once), and
+    nothing else of device memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too)
+    and keeps its fused intermediates on chip; the bytes a product's operands are staged in (the tile walk's,
+    at their dtypes'
     sizes); a reduction and a product each a kernel of XLA's fusion, its root (elementwise work fuses into
     it); a contracted multiply nothing, its reader's fused multiply-add computing it (`rules._contracted`);
     a declaration's own rescale an exponential an element. What XLA's fusion keeps on chip
