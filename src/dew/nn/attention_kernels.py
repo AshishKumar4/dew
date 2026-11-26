@@ -721,6 +721,8 @@ class Timed:
     rows: tuple[int, ...] | None = None
     heads: tuple[tuple[int, int], ...] | None = None
     dtypes: tuple[str, ...] | None = None
+    pairs: tuple[tuple[int, int], ...] | None = None
+    """The (rows, tokens) pairs a sweep timed, queries and keys alike, exactly where given."""
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls: none holds a separable bias
@@ -738,13 +740,16 @@ class Timed:
                 and (case.documents is None or self.documents is True)
                 and (self.rows is None or case.rows in self.rows)
                 and (self.heads is None or (case.heads, case.kv_heads) in self.heads)
-                and (self.dtypes is None or case.dtype.name in self.dtypes))
+                and (self.dtypes is None or case.dtype.name in self.dtypes)
+                and (self.pairs is None or (case.queries == case.keys
+                                            and (case.rows, case.queries) in self.pairs)))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
-    # M-NA-44's A100 sweep, exactly: 1024 to 32768 tokens, widths 64 and 128, 32/8, causal and full.
-    ('sm80', CallKind.of(jnp.bfloat16)): Timed(1024, 32768, (64, 128), (4,), windows=False, documents=False,
-                                               dtypes=("bfloat16",)),
+    # M-NA-44's A100 sweep, exactly: its six (rows, tokens) pairs, widths 64 and 128, 32/8, causal and full.
+    ('sm80', CallKind.of(jnp.bfloat16)): Timed(
+        1024, 32768, (64, 128), (4,), windows=False, documents=False, heads=((32, 8),), dtypes=("bfloat16",),
+        pairs=((4, 1024), (2, 2048), (2, 4096), (1, 8192), (1, 16384), (1, 32768))),
     # Interim on an H100, until M-NA-44's GH200 rows land: up to 32768 tokens, cited from M-ET-51.
     ('sm90', CallKind.of(jnp.bfloat16)): Timed(0, 32768),
     **{(where, CallKind.of(jnp.float32)): Timed(0, 1024) for where in ('sm80', 'sm90')},

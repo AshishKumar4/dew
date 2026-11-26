@@ -338,6 +338,43 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     np.testing.assert_array_equal(np.asarray(by_hidden), 0.0)
 
 
+def test_msas_selection_keeps_its_slots_and_forces_no_block_past_the_query():
+    """MSA's selection (`msa_selection`) holds its `top_k` slots whatever its blocks: over one block of keys,
+    the query's own and 15 empty (-1); and forces no block a query does not reach: with the first two blocks
+    forced, a query of the first block takes the first alone, the second not yet past it."""
+    scores = jnp.where(jnp.tril(jnp.ones((16, 16), bool)), 0.0, -jnp.inf)[None, None]
+    one = np.asarray(block_sparse.msa_selection(scores, block=16, top_k=16))
+    assert one.shape == (1, 1, 16, 16)
+    assert all({int(b) for b in one[0, 0, at] if b >= 0} == {0} for at in range(16))
+    two = np.asarray(block_sparse.msa_selection(scores, block=8, top_k=4, initial=2, local=1))
+    assert {int(b) for b in two[0, 0, 0] if b >= 0} == {0}
+    assert {int(b) for b in two[0, 0, 8] if b >= 0} == {0, 1}
+
+
+def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense_call():
+    """InfLLM-V2's attention past its dense cut whose selection takes every block a query sees (its top as
+    many as the blocks) reads every key the dense causal call reads: its output and gradients are on par
+    with that call's (check 1), the two branches one function at the cut. A sink or a bias, laid by the
+    call's heads, is refused on both branches alike."""
+    rows, queries, heads, groups, width = 1, 128, 8, 2, 32
+    shape = {"block": 16, "top_k": queries // 16, "kernel": 8, "stride": 4}
+    draw = _drawn(rows, queries, heads, groups, width)
+
+    def selected(query, key, value):
+        return block_sparse.infllm_attention(query, key, value, dense_below=queries, **shape)
+
+    def dense(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="xla")
+
+    assert_as_exact(jax.jit(with_gradients(selected)), jax.jit(with_gradients(dense)), draw,
+                    "InfLLM-V2's attention over every block", seeds=SEEDS)
+    query, key, value, _ = draw(0)
+    for dense_below in (queries + 1, queries):
+        with pytest.raises(ValueError, match="sinks"):
+            block_sparse.infllm_attention(query, key, value, dense_below=dense_below,
+                                          sinks=jnp.zeros((heads,)), **shape)
+
+
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
     """NSA's attention (`nsa_attention`): the compressed branch (each compressed key `length` keys every
     `stride`, read once a query reaches its last), the selected blocks its weights pick (through the

@@ -236,12 +236,12 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
                   local: int = 1) -> jax.Array:
     """MSA's selection (arXiv 2606.13392 eq. 7, §A row 59) and MiniMax M3's (§A row 37a): index scores
     `[B, G, Q, K]` (-inf past each query) max-pooled onto blocks of `block` (eq. 6), each group's `top_k`
-    blocks a query, the first `initial` and the `local` ending at the query's own forced among them:
-    `[B, G, Q, top_k]`, -1 a slot past the blocks the query sees. MSA forces its own block alone (blocks of
-    128, the top 16); M3 the first block and the two ending at its own, its top 16 counting them, a single
-    index head every group shares (`G` 1; the M3 index kernels of github.com/dphnAI/sonar,
-    models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum, the forced pages
-    prioritized within `topk`)."""
+    blocks a query, the first `initial` and the `local` ending at the query's own forced among them (those
+    it reaches): `[B, G, Q, top_k]` whatever its blocks, -1 a slot past the blocks the query sees. MSA
+    forces its own block alone (blocks of 128, the top 16); M3 the first block and the two ending at its own,
+    its top 16 counting them, a single index head every group shares (`G` 1; the M3 index kernels of
+    github.com/dphnAI/sonar, models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum,
+    the forced pages prioritized within `topk`)."""
     rows, groups, queries, _ = index_scores.shape
     assert top_k > initial + local, "the selection counts its forced blocks among its top"
     pooled = block_maxima(index_scores, None, block)
@@ -249,8 +249,13 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     own = jnp.arange(queries)[:, None] // block
     forced = jnp.concatenate([jnp.broadcast_to(jnp.arange(initial)[None], (queries, initial)),
                               own - jnp.arange(local)[None, ::-1]], axis=-1)
-    forced = jnp.broadcast_to(jnp.where(forced >= 0, forced, -1), (rows, groups, *forced.shape))
-    return top_k_selection(pooled, keep, top_k - initial - local, forced=forced)
+    # A forced block the query reaches alone: none before the first, none past its own.
+    forced = jnp.where((forced >= 0) & (forced <= own), forced, -1)
+    forced = jnp.broadcast_to(forced, (rows, groups, *forced.shape))
+    ranked = top_k - initial - local
+    chosen = top_k_selection(pooled, keep, ranked, forced=forced)
+    # Its `top_k` slots whatever its blocks: -1 past those it holds.
+    return jnp.pad(chosen, ((0, 0),) * 3 + ((0, top_k - chosen.shape[-1]),), constant_values=-1)
 
 
 def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Array, *,
@@ -332,8 +337,14 @@ def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, bloc
     earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the `local`
     ending at its own forced) through the template's indexed form (`selected_attention`), reading those
     blocks' keys alone. `query` `[B, Q, G * h, D]`, `key` and `value` `[B, K, G, D]`, a causal call whose
-    queries are its keys; `options` the call's other arguments. The selection takes no gradient."""
+    queries are its keys; `options` the call's other arguments, none laid by its heads or rows (a sink, a
+    bias, a mask: refused on both branches alike). The selection takes no gradient."""
     keys = key.shape[1]
+    # Operands laid by the call's heads or rows (sinks, a bias, a mask) match the dense call's layout alone,
+    # not the selected branch's, which takes each group into the batch: neither branch takes them.
+    held = sorted(set(options) & {"sinks", "bias", "mask", "key_valid", "segment_ids"})
+    if held:
+        raise ValueError(f"InfLLM-V2's attention takes no per-head or per-row operand: {held}")
     if keys < dense_below:
         return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
                                             **options)
