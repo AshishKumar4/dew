@@ -17,6 +17,7 @@ from dew.nn import activations
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import generation
 from dew.nn.mlp import GatedMLP
+from dew.nn.protocols import forward_only
 from dew.nn.precision import LowPrecision, Numerics, projection_role
 
 SEEDS = 8
@@ -651,7 +652,8 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
             seen[context.module.name] = args[0] if context.module.name == "down_proj" else out
         return out
 
-    with nn.intercept_methods(read):
+    # Read for its forward alone (`forward_only`: no checkpoint of its own hides them), the same values.
+    with nn.intercept_methods(read), forward_only():
         apply_of(layer)(params, x)
     _, pull = jax.vjp(apply_of(layer), params, x)
     held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
