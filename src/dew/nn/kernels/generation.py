@@ -127,6 +127,9 @@ class Choice(enum.StrEnum):
     scanned body; "plain" runs every layer unrolled."""
     LINEAR_CE = 'linear_ce'
     LOW_RANK = 'low_rank'
+    MERGE = 'merge'
+    """How a split walk's slices merge (`dew.nn.kernels.templates.merged`), decided without a selector:
+    "mosaic", Mosaic GPU's launch, or "triton", Pallas Triton's (the default `merged._uses_mosaic` states)."""
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
     NVFP4 = 'nvfp4'
@@ -147,7 +150,8 @@ CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
 SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'}),
-                                               Choice.LAYER_SCAN: frozenset({'plain', 'scanned'})}
+                                               Choice.LAYER_SCAN: frozenset({'plain', 'scanned'}),
+                                               Choice.MERGE: frozenset({'mosaic', 'triton'})}
 """The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names
 among: a selector's are its op's own, which its selection refuses a name outside of (`selection.select`);
 one of these a site reads by name alone, a misspelt name read as not its kernel (`narrow_copies="of"`,

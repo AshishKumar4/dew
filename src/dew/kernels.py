@@ -53,6 +53,7 @@ class Kernels:
     layer_scan: Literal['plain', 'scanned'] | None = None
     linear_ce: Literal['mosaic', 'xla'] | None = None
     low_rank: Literal['fused', 'xla'] | None = None
+    merge: Literal['mosaic', 'triton'] | None = None
     mxfp8: Literal['mosaic', 'xla'] | None = None
     narrow_copies: Literal['off', 'on'] | None = None
     nvfp4: Literal['packed', 'xla'] | None = None

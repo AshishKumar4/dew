@@ -493,14 +493,15 @@ against 14.5 us, fp16 K32768 d128 84.0 against 21.8), an A100's 1.4 to 3.9 times
 
 def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None) -> bool:
     """Whether `target` lowers `merged_padded` on Mosaic GPU (NVIDIA sm80+ instruction families) rather than
-    the Pallas Triton launch, kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795) and for an unhooked
-    merge on the generations where Mosaic's measured slower (`MOSAIC_SLOWER`, a merge of no output hook)
-    unless a merge config is pinned (`tuning.pinned`, as a lab timing Mosaic there pins one)."""
+    the Pallas Triton launch, kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795) and, by default,
+    for an unhooked merge on the generations where Mosaic's measured slower (`MOSAIC_SLOWER`, a merge of no
+    output hook); `generation.chosen(merge=...)` names either on a Mosaic GPU family, as an A/B of the two
+    does (row 12480: a held config's pin flipped it unseen)."""
     family = generation.family(target.generation)
     if family is None or family == "tpu":
         return False
-    return (target.generation not in MOSAIC_SLOWER or output_mod is not None
-            or MergedPadded in dict(_cache.KERNEL_PINS.value))
+    default = "triton" if target.generation in MOSAIC_SLOWER and output_mod is None else "mosaic"
+    return generation.chosen_kernel(generation.Choice.MERGE, default) == "mosaic"
 
 
 @dataclasses.dataclass(frozen=True)
