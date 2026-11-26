@@ -307,6 +307,6 @@ def test_a_giant_heads_clip_holds_every_order(taken):
 
     x, direction, cotangent = normal_draw(13137, (4, 8), (4, 8), (4, 8))
     for edge, scale in {**EDGES, "past the bound": 2.0 ** 64}.items():
-        assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), (cotangent,),
+        assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), cotangent,
                         f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
 
