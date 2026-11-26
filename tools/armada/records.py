@@ -140,7 +140,8 @@ def need_key(python: str, row_name: str, held: str) -> str:
     """Where a GPU lane files what its unit `row_name` on class `held` needs by its prepared programs while no
     lane of its part could hold it (ci.py's `filed_needs`), which a GPU tier sizes the unit's next part by
     (gpu_holds.py): a unit never admitted is never measured, so its need is read nowhere else (rows 12893,
-    13042, 13112, 13148, 13272, 13316: one part sized short again each run). Cleared once a lane holds it."""
+    13042, 13112, 13148, 13272, 13316: one part sized short again each run). Filed again by each lane that
+    runs the unit, at its need then, while it is filed."""
     return f"{CACHE_PREFIX}-need/{python}/{row_place(row_name, held)}"
 
 

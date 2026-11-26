@@ -1615,10 +1615,18 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     past = time.time() - (ci.records.NEED_DAYS + 1) * 86400
     stored[old] = json.dumps({"need": 50 * gib, "at": past}).encode()
     assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
-    # Held by a lane, its filed need is cleared: its run is measured from then, so a need it no longer has
-    # sizes no part.
+    # Held by a lane given more of its GPU, its programs unchanged, its need stands, filed again: its run's
+    # measured peak is no admission's need, and the part after is sized by it still.
+    filed((gib, gib, 12 * gib))
+    need = admitted((gib, gib, 12 * gib))
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    assert need <= 0.5 * total and lane()[1]["exitCode"] == 0
+    assert json.loads(stored[key])["need"] == need
+    assert holds(["tests/test_flow.py"]) == {"tests/test_flow.py": need}
+    # Its programs shrunk, it is filed at what they need now.
     filed((gib, gib // 2, gib // 4))
-    assert lane()[1]["exitCode"] == 0 and key not in stored
+    assert lane()[1]["exitCode"] == 0
+    assert json.loads(stored[key])["need"] == admitted((gib, gib // 2, gib // 4))
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(

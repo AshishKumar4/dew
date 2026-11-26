@@ -11,6 +11,7 @@ A group (`<file>#G/N`) is its file's: a tier cuts a file's groups anew, so one's
 of its file held, which is what its lane admits it at."""
 
 import argparse
+import concurrent.futures
 import importlib.util
 import json
 import math
@@ -43,15 +44,18 @@ def holds(tests: list[str]) -> dict[str, float]:
 
 def filed(ci, files: list[str], token: str) -> dict[str, float]:
     """Each of `files` by the most a lane filed one of its units as needing, on any class, within
-    `NEED_DAYS` (records.py's `need_key`); read whole or not at all, as the measures are."""
+    `NEED_DAYS` (records.py's `need_key`); read whole or not at all, as the measures are, each record at once
+    (`largest`'s reads)."""
     prefix = f"{ci.CACHE_PREFIX}-need/{ci.PYTHONS[0]}/"
+    keys = [(key, file) for key in ci.listed(prefix, token)
+            if (file := ci.grading.owning(ci.key_parts(key)[1])) in files]
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        found = list(pool.map(lambda key: ci.store(token).get(prefix + key), [key for key, _ in keys]))
     most: dict[str, float] = {}
-    for key in ci.listed(prefix, token):
-        file = ci.grading.owning(ci.key_parts(key)[1])
-        if file in files and (found := ci.store(token).get(prefix + key)) is not None:
-            need = json.loads(found)
-            if time.time() - need["at"] <= ci.records.NEED_DAYS * 86400:
-                most[file] = max(most.get(file, 0.0), float(need["need"]))
+    for (_, file), body in zip(keys, found, strict=True):
+        need = None if body is None else json.loads(body)
+        if need is not None and time.time() - need["at"] <= ci.records.NEED_DAYS * 86400:
+            most[file] = max(most.get(file, 0.0), float(need["need"]))
     return most
 
 

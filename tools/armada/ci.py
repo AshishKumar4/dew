@@ -2101,24 +2101,22 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
 def filed_needs(python: str, units: Mapping[str, tuple[str, str, str]], prepared: Mapping[str, float],
                 unheld: Container[str], held: str, token: str) -> None:
     """Each GPU lane unit of `units` whose prepared need (`prepared`) the lane could not hold (`unheld`) filed
-    where a GPU tier sizes its next part by it (records.py's `need_key`, gpu_holds.py), and each filed one it
-    held now cleared: its run measures it from here (`gpu_needs`), so no need filed before its file shrank
-    sizes a part past it. Each write or deletion tried once: one not made sizes the next part as before."""
+    where a GPU tier sizes its next part by it (records.py's `need_key`, gpu_holds.py), and each one filed
+    before that it held filed again at its need now: a run's measured peak is no admission's need, so a held
+    unit's need stands while its programs do, and one shrunk is filed smaller; one no lane runs again retires
+    at `NEED_DAYS`. Each write tried once: one not made sizes the next part as before."""
+    if not prepared:
+        return
     within = f"{CACHE_PREFIX}-need/{python}/{held}/"
     try:
         filed = set(listed(within, token))
     except r2.R2Error:
-        filed = set()  # None read: none cleared.
+        filed = set()  # None read: only the unheld filed.
     for name, need in prepared.items():
         file, group, variant = units[name]
         key = records.need_key(python, row(python, file, varied(group, variant)), held)
-        if name in unheld:
+        if name in unheld or key.removeprefix(within) in filed:
             written(key, token, json.dumps({"need": need, "at": time.time()}).encode(), tries=1)
-        elif key.removeprefix(within) in filed:
-            try:
-                store(token).delete(key)
-            except r2.R2Error as error:
-                print(f"the test cache kept {key}: {error}", file=sys.stderr)
 
 
 def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
