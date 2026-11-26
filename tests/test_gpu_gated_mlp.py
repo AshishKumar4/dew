@@ -1,9 +1,11 @@
-"""Native Check 1 for named gated MLP routes at a published model width."""
+"""Native Check 1 for the gated MLP matrix and named routes at a published model width."""
 
 import generation_support
 import jax.numpy as jnp
+import kernel_matrix
 import pytest
 from contract_support import normal_draw, normal_drawn
+from gpu_flow import cells_of, in_parts, parted, run_cells
 from reference_error import assert_as_exact, with_gradients
 from test_algebra_fusion import gated_projection
 
@@ -13,6 +15,14 @@ from dew.nn.mlp import GatedMLP
 from tools.timing_cases import DENSE, TOKENS
 
 SEEDS = 8
+MATRIX_PARTS = 2
+
+
+@pytest.mark.gpu(reason="the gated MLP matrix must execute both fused forms on their native GPUs")
+@pytest.mark.generations("sm90", "sm100")
+@in_parts(MATRIX_PARTS)
+def test_the_gated_mlp_matrix_holds_on_this_gpu(part):
+    run_cells(parted(cells_of(kernel_matrix.check("gated_mlp")), part, MATRIX_PARTS))
 
 
 @pytest.mark.gpu(reason="the model-width wide and paired products must hold on their native launches")
