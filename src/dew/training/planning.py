@@ -502,6 +502,47 @@ def _stated(rung: Rung) -> RecomputeStatement | None:
     return next(iter(stated)) if len(stated) == 1 else None
 
 
+def predicted_short(rung: Rung, measured: Sequence[tuple[Rung, int]], start: Rung) -> int | None:
+    """What `rung`, a place of the ladder past the start's narrow copies (their drop, a head's tile, XLA's
+    defaults), is predicted to fall short by from what the search measured (`measured`: each rung asked and
+    the least it fell short by): its remat's shortfall at the start's copies, head and options, less what
+    each way it differs from those frees, as measured at another remat asked both ways. None where any of it
+    is unmeasured: the place is asked as the ladder orders it. A place predicted short is asked after every
+    other (`FitSearch.searched`), never dropped: XLA schedules each place anew, so a prediction orders the
+    search and decides nothing (row 12463: a 4B start's search asked 32 places, each 15-20 s, missing by 14
+    to 158 GiB, after the head's tile and the copies' drop had each been measured to free 26 and 4.5)."""
+    def short(at: Rung) -> int | None:
+        return next((bytes_ for asked, bytes_ in measured if asked == at), None)
+
+    plain = dataclasses.replace(start, modules=rung.modules, ns_group=rung.ns_group)
+    predicted = short(plain)
+    if predicted is None:
+        return None
+    resets: tuple[Callable[[Rung], Rung], ...] = (
+        lambda at: dataclasses.replace(at, narrow=start.narrow),
+        lambda at: dataclasses.replace(at, tile=start.tile, fused=start.fused),
+        lambda at: dataclasses.replace(at, xla_defaults=start.xla_defaults))
+    for undone in resets:
+        made = _changed(rung, undone)
+        if not made:
+            continue
+        # What the change frees: a rung asked with it, against the same rung asked without it.
+        found = next((other - bytes_ for asked, bytes_ in measured
+                      if _changed(asked, undone) == made and (other := short(undone(asked))) is not None),
+                     None)
+        if found is None:
+            return None
+        predicted -= max(found, 0)
+    return predicted
+
+
+def _changed(rung: Rung, undone: Callable[[Rung], Rung]) -> tuple[tuple[str, JSON], ...]:
+    """The fields `undone` resets on `rung`, as `rung` holds them: the change `rung` makes of that kind."""
+    back = undone(rung)
+    return tuple((name, getattr(rung, name)) for name in ("tile", "fused", "narrow", "xla_defaults")
+                 if getattr(rung, name) != getattr(back, name))
+
+
 @dataclasses.dataclass(frozen=True)
 class Planned:
     """A plan `FitSearch` found: the step reading its batch in `split`
@@ -1474,15 +1515,9 @@ class FitSearch[LossT, EffectsT]:
                 return split
         rungs = [rung for places in self.ladder(start, narrow, group, remat_set=self.remat_set,
                                                 defaults=self.own_defaults()) for rung in places]
-        for rung in rungs:
-            if rung in self.asked:
-                continue
-            split = ask(rung, "the step does not fit the devices; compiling it again at %s")
-            if split is None:
-                split = parted(rung)
-            if split is not None:
-                self.said(named)
-                return split
+        if (split := self.past_copies(rungs, start, named, ask, parted)) is not None:
+            self.said(named)
+            return split
         # Every rung asked joined missed: each parted variant a miss past the stacks' count, or parting
         # measured futile, deferred, in the climb's order, before the search gives up (the count and the
         # measure order, and rule none out: a refusal before the state is placed needs each measured,
@@ -1497,6 +1532,30 @@ class FitSearch[LossT, EffectsT]:
                 return split
         self.said(named)
         return None
+
+    def past_copies(self, rungs: list[Rung], start: Rung, named: list[str],
+                    ask: Callable[[Rung, str], int | None],
+                    parted: Callable[[Rung], int | None]) -> int | None:
+        """The split the first of `rungs` that fits fits at, in the ladder's order, each place the search's
+        measurements predict short (`predicted_short`) asked after the rest; None where none fits. `named`
+        names each rung asked so far (`asked`), `ask` asks one and `parted` its parted variant."""
+        deferred: list[Rung] = []
+
+        def tried(rung: Rung) -> int | None:
+            split = ask(rung, "the step does not fit the devices; compiling it again at %s")
+            return parted(rung) if split is None else split
+
+        for rung in rungs:
+            if rung in self.asked:
+                continue
+            measured = [(asked, short) for asked, name in zip(self.asked, named, strict=True)
+                        if (short := self.least_short(name)) is not None]
+            if (predicted := predicted_short(rung, measured, start)) is not None and predicted > 0:
+                deferred.append(rung)
+            elif (split := tried(rung)) is not None:
+                return split
+        return next((split for rung in deferred if rung not in self.asked
+                     if (split := tried(rung)) is not None), None)
 
     def below(self, candidates: Sequence[int], origin: Rung, plan: Rung) -> tuple[Probe, ...]:
         """Each rung the ladder reads before the plan's from `origin`, the rung the run was configured at,
@@ -1582,6 +1641,12 @@ class FitSearch[LossT, EffectsT]:
         """What the search fell short by at `rung` at `split`, None where it measured no miss there."""
         miss = self.misses.get((rung, split))
         return None if miss is None else miss.shortfall // self.factor
+
+    def least_short(self, rung: str) -> int | None:
+        """The least the search fell short by at `rung` (`MemoryMiss.shortfall`, in bytes) at any split, None
+        where it measured no miss there."""
+        missed = [miss.shortfall // self.factor for (at, _), miss in self.misses.items() if at == rung]
+        return min(missed, default=None)
 
     def short(self, rung: str) -> tuple[int, LiveSet] | None:
         """The least the search fell short by at `rung` (`MemoryMiss.shortfall`, in bytes) among its misses
