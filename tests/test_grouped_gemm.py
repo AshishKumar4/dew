@@ -37,7 +37,7 @@ from dew.nn.kernels import (
 from dew.nn.kernels.templates import tail as tail_of
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
-from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -1151,7 +1151,8 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
-    back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
+    back through it, a token's cotangent its routes' summed exactly and rounded once (row 12396); with
+    `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
     layer's matrices' projection, each stack's gradient that layer's, every other zero; and an unpaired one
     whose epilogue reads its accumulator through its rounding alone, the rounding a named output (`gemm`'s
     `named`, row 7131's residual), its reverse pass bitwise the gathered rows' (the saved output read back
@@ -1177,11 +1178,27 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
                      for operand in operands)
     cotangent = tuple(jnp.asarray(rng.integers(-2, 3, size=(72, matrices.shape[-1])), tokens.dtype)
                       for _ in range(2))
-    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents),
-                  lambda f: jax.vjp(f, *operands)[1](cotangent)):
+    for check in (lambda f: f(*operands), lambda f: jax.jvp(f, operands, tangents)):
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
-    unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
-    assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+    pulled, pulled_apart = (jax.vjp(f, *operands)[1](cotangent) for f in (fused, apart))
+    jax.tree.map(np.testing.assert_array_equal, pulled[1:], pulled_apart[1:])
+    # fp32 tokens: each route's cotangent as wide as its sum, so the rows gathered first's, bitwise.
+    # Narrow ones: each slot's products with both matrices, every route of a token summed exactly
+    # (integers: float64 holds each sum) and rounded once to the tokens' dtype (row 12396), where the rows
+    # gathered first round each route's before they add.
+    wide = jnp.dtype(tokens.dtype).itemsize >= 4
+    read = [np.asarray(c, np.float64) if slots is None else np.asarray(c, np.float64)[np.asarray(slots)]
+            for c in cotangent]
+    layered = [np.asarray(m, np.float64) if layer is None else np.asarray(m, np.float64)[int(layer)]
+               for m in matrices]
+    groups = np.repeat(np.arange(3), np.asarray(sizes))
+    routes = np.zeros((72, tokens.shape[1]))
+    for slot, group in enumerate(groups):
+        routes[slot] = sum(c[slot] @ m[group].T for c, m in zip(read, layered, strict=True))
+    want = np.zeros(tokens.shape)
+    np.add.at(want, np.asarray(table), routes)
+    np.testing.assert_array_equal(np.asarray(pulled[0]), np.asarray(pulled_apart[0]) if wide
+                                  else np.asarray(jnp.asarray(want, tokens.dtype)))
 
     def squared(acc):  # the accumulator read through its rounding alone, the named second output
         rounded = acc.astype(tokens.dtype)
@@ -1196,8 +1213,14 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         outs = gemm.gemm(tokens[table], first if layer is None else first[layer], sizes, **named)
         return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
-    jax.tree.map(np.testing.assert_array_equal, jax.vjp(named_fused, *operands[:2])[1](cotangent),
-                 jax.vjp(named_apart, *operands[:2])[1](cotangent))
+    # Its matrix's gradient bitwise the rows gathered first's, and its tokens' theirs gathered wide (each
+    # route's cotangent unrounded, summed in fp32, rounded once to the tokens' dtype: row 12396).
+    named_pulled, named_pulled_apart = (jax.vjp(f, *operands[:2])[1](cotangent) for f in (named_fused,
+                                                                                          named_apart))
+    _, widened = jax.vjp(lambda rows: named_apart(rows, operands[1]), operands[0].astype(jnp.float32))
+    np.testing.assert_array_equal(np.asarray(named_pulled[1]), np.asarray(named_pulled_apart[1]))
+    np.testing.assert_array_equal(np.asarray(named_pulled[0]),
+                                  np.asarray(widened(cotangent)[0].astype(operands[0].dtype)))
 
 
 @runs("sm100")
@@ -2429,3 +2452,40 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.parametrize("prologue", [None, "identity", "doubled"])
+def test_a_gathered_rows_cotangent_sums_its_routes_wide_before_it_rounds(prologue):
+    """A bf16 row read by two routes of a gathered projection (`gemm`'s `gather`), their cotangents 256 and
+    -255.5 times a unit matrix: the row's cotangent is the routes' fp32 sum, 0.5 (1.0 through a doubling
+    prologue), rounded once to bf16, where each route rounded first (256 and -256, 255.5 a bf16 tie) summed
+    0 (row 12396, as the packed kernel's pullback sums them), through a prologue's VJP too."""
+    tokens = jnp.ones((1, 64), jnp.bfloat16)
+    matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
+    table = jnp.zeros((2,), jnp.int32)
+    cotangent = jnp.zeros((2, 64), jnp.float32).at[:, 0].set(jnp.asarray([256.0, -255.5]))
+    hook = {None: NO_HOOK, "identity": Hook(lambda rows: rows), "doubled": Hook(lambda rows: rows * 2)}
+
+    def product(rows):
+        return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), prologue=hook[prologue],
+                         out_dtype=jnp.float32, gather=table)
+
+    (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
+    assert float(d_tokens[0, 0]) == (1.0 if prologue == "doubled" else 0.5)
+
+
+def test_a_gathered_rows_fp64_cotangent_sums_its_routes_in_fp64():
+    """fp64 cotangents of a bf16 gathered row's two routes, 1 + 2^-8 and 2^-40, sum in fp64 (the cotangents'
+    own width, row 12396's review): 1 + 2^-8 + 2^-40, past bf16's tie, rounds once to 1 + 2^-7, where an
+    fp32 sum (1 + 2^-8, the tie) rounds to 1."""
+    with jax.enable_x64(True):
+        tokens = jnp.ones((1, 64), jnp.bfloat16)
+        matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
+        table = jnp.zeros((2,), jnp.int32)
+        cotangent = jnp.zeros((2, 64), jnp.float64).at[:, 0].set(jnp.asarray([1 + 2.0 ** -8, 2.0 ** -40]))
+
+        def product(rows):
+            return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), out_dtype=jnp.float64, gather=table)
+
+        (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
+    assert d_tokens.dtype == jnp.bfloat16 and float(d_tokens[0, 0]) == 1 + 2.0 ** -7
