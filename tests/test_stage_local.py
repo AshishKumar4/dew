@@ -1124,11 +1124,17 @@ def test_a_fit_handed_a_scanned_runs_state_holds_it_once():
     state = trainer.fit(rows, steps=1, log_every=100)
     held = sum(leaf.nbytes for leaf in jax.tree.leaves(state))
     frozen = jax.tree.leaves(objective.variables[FROZEN])
+
+    def on_devices() -> int:
+        gc.collect()
+        return sum(array.nbytes for array in jax.live_arrays() if not array.is_deleted())
+
+    # Read against what the process holds beside the handed state (other cases' arrays in one worker).
+    beside = on_devices() - held
     seen = []
 
     def live(_) -> int:
-        gc.collect()
-        seen.append(sum(array.nbytes for array in jax.live_arrays() if not array.is_deleted()) / held)
+        seen.append((on_devices() - beside) / held)
         return 0
 
     trainer.fit(rows, state=state, steps=3, log_every=100, observe=Observe(1, live))
