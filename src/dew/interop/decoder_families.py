@@ -25,6 +25,7 @@ from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ, OPENAI_GPT
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
+from dew.interop.families.inkling import INKLING2
 from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.lfm3 import LFM3
@@ -64,6 +65,8 @@ ENTRIES = (
     # Its loop over a block under streams over it is its own: its layers would read as Qwen 3.5's, and
     # its loop as Ouro's, which matches any loop.
     SENSENOVA_LOOP_TEXT,
+    # Read from its release alone (`lambda fields: False`): matched by no model, its place moves none.
+    INKLING2,
     OURO,
     BLOOM,
     GPT_NEO,

@@ -23,7 +23,7 @@ import test_causal_transformer as causal
 import test_hf_modernbert as modernbert
 import tier_wire
 from arm_arithmetic import drawn_on_the_host, widened
-from arm_store import _Ahead, _compile_arms, _stored_arm, armed
+from arm_store import _Ahead, _compile_arms, _stored_arm, _unlowered_arm, armed
 from generation_support import node_target, node_topology
 from gpu_flow import Cell, run_cells
 from truths_ahead import (
@@ -102,19 +102,22 @@ m_dew_run = arm_role("dew", run_mb[0], m_label)
 assert m_dew_prep is not None, "ModernBERT dew arm has no statement"
 assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices: {m_dew_prep} != {m_dew_run}"
 
-# The causal site's sm90 programs: where its prepare compiled them ahead, both its arms' by the keys the run
-# looks them up by, never one arm's without its twin's; or its site marked compiled at run, each arm compiled
-# on the GPU (`CompiledTruths.at_run`: its cuDNN launch lowering on no deviceless prepare).
-# Or its cell deferred whole to its run, recorded so (`gpu_flow.run_cells`, `DEFERRED`: its cuDNN attention
-# lowering on no deviceless prepare), its arms' site never reached, each arm compiled on the GPU.
+# The causal site's sm90 programs: where its prepare compiled them ahead, each arm's by the key the run looks
+# it up by, an arm this deviceless prepare lowers none of (cuDNN's launch, `selection.Unlowerable`) marked
+# compiled at run apart, by the lookup the run reads (`_stored_arm`: `_unlowered_arm`), and its reference
+# arm, portable XLA, always stored; or its site marked compiled at run whole, each arm compiled on the GPU
+# (`CompiledTruths.at_run`). Or its cell deferred whole to its run, recorded so (`gpu_flow.run_cells`,
+# `DEFERRED`), its arms' site never reached, each arm compiled on the GPU.
 c_sample = drawn_on_the_host(run_causal[2], 0)
 if not ro.holds(armed(c_label)):
     deferred = json.loads((sm90_store / tier_wire.DEFERRED).read_text())
     assert any(reason["error"].startswith(CAUSAL_CELL) for reason in deferred["reasons"]), deferred
 elif ro.at_run(armed(c_label)) is None:
     c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
+    assert ro.at_run(_unlowered_arm(armed(c_label), c_ref_run)) is None, "the XLA reference arm went to run"
     for role_name in (c_dew_run, c_ref_run):
-        assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
+        if ro.at_run(_unlowered_arm(armed(c_label), role_name)) is None:
+            assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
 
 # Confirm ModernBERT's run-side program name matches what sm90 prepare stored.
 mb_sample = drawn_on_the_host(run_mb[2], 0)

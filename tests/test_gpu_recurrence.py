@@ -249,14 +249,14 @@ owner's "tf32 default") and its exponentials are ex2.approx's, which the interpr
 recurrence lane, 11-11): a cell each GPU kind runs, its family's own."""
 
 
-def template_stability_cells(site: str) -> list[Cell]:
-    """The template finite and on par where chunked forms break, one form's (`site`) every regime and
-    product."""
+def template_stability_cells(site: str, product: str) -> list[Cell]:
+    """The template finite and on par where chunked forms break, one form's (`site`) every regime, its
+    forward or its gradient (`product`)."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
     return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
                  f"{'' if forms is None else f' ({forms} forms)'}",
                  functools.partial(finite, name, regime, product, forms), fault=STRESS)
-            for name, regime, product, forms in template_stability.CASES if name == site]
+            for name, regime, taken, forms in template_stability.CASES if (name, taken) == (site, product)]
 
 
 def kimi_floor_cells() -> list[Cell]:
@@ -411,19 +411,22 @@ def lightning_cells() -> list[Cell]:
 
 
 FAMILIES = {"two-role walk": walk_cells,
-            **{f"template stability: {site}": functools.partial(template_stability_cells, site)
-               for site in dict.fromkeys(name for name, *_ in template_stability.CASES)},
+            **{f"template stability: {site} {product}":
+               functools.partial(template_stability_cells, site, product)
+               for site, product in dict.fromkeys((name, product) for name, _, product, _ in
+                                                  template_stability.CASES)},
             "template stability: Kimi at the floor": kimi_floor_cells, "lightning": lightning_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
             "forked template": forked_cells, "fp32 template": fp32_template_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
 family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). The
-template's stability a family a form: every form's in one held 10 GiB and 1431 s of an sm90 tier's dry
-prepare, past its container's memory (train 1269). A
-layer's port training and its decode run as one flow. The Mosaic mainloop's forward and gradient on a GPU are
-the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
-lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
+template's stability a family a form and product: every form's in one held 10 GiB and 1431 s of an sm90
+tier's dry prepare, past its container's memory (train 1269); a form's forward and gradient together up to
+706 s (the gated delta net's, scratch jsf-drytime-3 at eb9189cfc), two such in a prepare group 1,650 s (row
+12429). A layer's port training and its decode run as one flow. The Mosaic mainloop's forward and gradient
+on a GPU are the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net,
+MiniMax's lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
 
 USERS = {"portable", "fp32 template", "forked template"}
 """The families whose claim is what a user's process computes, run in a process computing as a user's does

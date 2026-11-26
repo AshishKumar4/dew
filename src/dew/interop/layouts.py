@@ -744,7 +744,7 @@ def unwritten_extension(model: nn.Module) -> str | None:
     if isinstance(decoder, Looped) and decoder.loop is not None and decoder.loop.messages is not None:
         return MESSAGES_UNWRITTEN
     residuals = decoder.attention_residuals if isinstance(decoder, MixesDepth) else None
-    if residuals is not None and residuals.normalize_values:
+    if residuals is not None and (residuals.normalize_values or residuals.scaled or not residuals.gained):
         return NORMALIZED_UNWRITTEN
     return None
 

@@ -857,15 +857,16 @@ def test_an_additive_erase_keeps_its_rows_on_an_explicit_axis():
         assert jax.typeof(got).sharding.spec[0] == jax.typeof(split.value).sharding.spec[0]
 
 
+@pytest.mark.parametrize('along', ['pulled back', 'pushed forward'])
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[4], ADDITIVE],
                          ids=['no decay', 'the delta rule', 'an additive erase'])
-def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
+def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks, along):
     """A forked call (`Chunk.loads`: documents taking their memories up from its table, entry writes) on the
     portable math, its operands' rows split over an Explicit mesh axis before it is differentiated: its
-    output, last memory, every operand's gradient and their tangent along its values on par from float64
-    with the same call whole (check 1), each placed as its rows are (row 9690: its walk's carries, seeded
-    within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a no-decay call's
-    gates, formed whole, its map's)."""
+    output, last memory and every operand's gradient (`pulled back`), or its tangent along its values, on
+    par from float64 with the same call whole (check 1), each placed as its rows are (row 9690: its walk's
+    carries, seeded within the rows' map whole, met the rows' token maps split in a gather JAX refuses; a
+    no-decay call's gates, formed whole, its map's). Both directions in one case took 151 to 186 s (12802)."""
     mesh = jax.make_mesh((2,), ('data',), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     rows = jax.sharding.NamedSharding(mesh, P('data'))
     run = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
@@ -876,28 +877,25 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
         return transitioned(hooks, operands, seed), seeded, tangent
 
     def arm(place):
-        # The draw's operands, cotangents and tangent placed as `place` places them before the call is
-        # differentiated, its documents laid within it (as `assert_forked_on_par`'s) and placed alike.
+        # The draw placed by `place` before the call is differentiated, its documents laid within it alike.
         def ran(operands):
             return run(place(entering_documents(operands)))
 
-        def both(operands, cotangents, tangent):
+        def differentiated(operands, cotangents, tangent):
             operands, cotangents, tangent = place((operands, cotangents, tangent))
+            if along == 'pulled back':
+                return with_gradients(ran)(operands, cotangents)
+            return jax.jvp(lambda value: ran(dataclasses.replace(operands, value=value)), (operands.value,),
+                           (tangent,))[1]
 
-            def along(value):
-                return ran(dataclasses.replace(operands, value=value))
+        return differentiated
 
-            pulled = with_gradients(ran)(operands, cotangents)
-            return pulled, jax.jvp(along, (operands.value,), (tangent,))[1]
-
-        return both
-
-    split = arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree))
+    split = jax.jit(arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree)))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
-                        f'forked {hooks} on an explicit row axis', seeds=FEWEST_SEEDS)
-        ((out, last), grads), tangents = jax.jit(split)(*drawn(0))
-    for placed in (out, last, grads.value, *tangents):
+        assert_as_exact(split, jax.jit(arm(lambda tree: tree)), drawn,
+                        f'forked {hooks} on an explicit row axis, {along}', seeds=FEWEST_SEEDS)
+        found = split(*drawn(0))
+    for placed in found if along != 'pulled back' else (*found[0], found[1].value):
         assert jax.typeof(placed).sharding.spec[0] == 'data'
 
 

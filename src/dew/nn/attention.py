@@ -61,7 +61,7 @@ from .attention_parallel import (
     tensor_shards,
     visibility_refused,
 )
-from .attention_sinks import sink_softmax
+from .attention_sinks import sink_column, sink_softmax
 from .attention_tpu import splash_mask_descriptor, tpu_attention
 from .decode_geometry import folded_attention, folds, grouped_query
 from .documents import (
@@ -404,8 +404,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     validity and places with
     their rows. Its requirements (`attention_kernels.TEMPLATE_SUPPORTS`) keep it off a sharded sequence axis.
     """
-    if sinks is not None and sinks.shape != (query.shape[2],):
-        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and sinks.shape not in ((query.shape[2],), query.shape[:3]):
+        raise ValueError(f"sinks hold one logit a query head, or one a query and head, got {sinks.shape}")
     quantized = quantized_rule(sinks is not None, bool(dropout_rate))
     if quantized == 'reference':
         raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
@@ -460,7 +460,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     separable = bias if isinstance(bias, SeparableBias) else None
     dense = None if isinstance(bias, SeparableBias) else bias
     return on_attention_shards(local, query, key, value, coordinates=dropout_seed is not None,
-                      sinks=(sinks, ("activation_heads",)),
+                      sinks=(sinks, ("activation_heads",) if sinks is None or sinks.ndim == 1
+                             else ("activation_batch", "activation_length", "activation_heads")),
                       segment_ids=(segment_ids, ("activation_batch", None)), lengths=(lengths, rows),
                       starts=(starts, rows), block_groups=(block_groups, ("activation_batch", None)),
                       image_groups=(image_groups, ("activation_batch", None)),
@@ -654,8 +655,8 @@ def _weights(logits: jax.Array, *, mask, mask_fill, skipped, sinks, logit_floor,
         rows_per_block = length // skipped.shape[-2]
         logits = jnp.where(jnp.repeat(skipped, rows_per_block, axis=-2), -jnp.inf, logits)
     walked = logit_floor is not None or skipped is not None
-    if sinks is not None and sinks.shape != (heads,):
-        raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    if sinks is not None and sinks.shape not in ((heads,), (*logits.shape[:-3], logits.shape[-2], heads)):
+        raise ValueError(f"sinks hold one logit a query head, or one a query and head, got {sinks.shape}")
     if sinks is not None and not walked:
         widest = jnp.promote_types(logits.dtype, sinks.dtype)
         return sink_softmax(logits, sinks, at_least_fp32(widest) if wide else None)
@@ -708,11 +709,11 @@ def _weighted(weights: jax.Array, value: jax.Array, *, skipped, sinks, precision
 
 def _floored_softmax(logits: jax.Array, floor, sinks: jax.Array | None = None) -> jax.Array:
     """The softmax of `logits` `[..., H, Q, K]` over the keys from a starting maximum `floor`
-    (`reference_attention`'s `logit_floor`) and each head's sink `[H]` beside them where given: `m = max(m,
+    (`reference_attention`'s `logit_floor`) and the sink beside them where given (`sink_column`): `m = max(m,
     floor, sink)`, each weight `exp(logit - m)` over their sum and the sink's `exp(sink - m)`, a row of no
     weight 0, its maximum -inf shifting by none."""
     most = jnp.maximum(jnp.max(logits, axis=-1, initial=-jnp.inf), jnp.asarray(floor, logits.dtype))
-    sink = None if sinks is None else sinks.astype(logits.dtype)[:, None]
+    sink = None if sinks is None else sink_column(sinks.astype(logits.dtype), logits.shape)[..., 0]
     if sink is not None:
         most = jnp.maximum(most, sink)
     shift = jnp.where(jnp.isfinite(most), most, 0.0)
@@ -1021,6 +1022,9 @@ def _unread(value, heads: int, fill: float, sinks, precision) -> jax.Array:
     values read by its query heads in place), so values whose sum overflows read their finite mean as that
     path reads them; NaN where `fill` is NaN, whose gradient is NaN at every value."""
     *rows, keys, kv_heads, width = value.shape
+    if sinks is not None and sinks.ndim != 1:
+        raise ValueError("a row seeing no key under a finite fill reads a head's sink, not a query's: "
+                         "fill a query's sinks' masked keys -inf")
     if fill != fill:
         share = jnp.full((heads,), jnp.nan, jnp.float32)
     elif sinks is None:
@@ -1212,6 +1216,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
     resolved = resolve_implementation(implementation, query, key, **facts).kernel
+    taking = ('template', 'inference', 'xla', 'reference')
+    if sinks is not None and sinks.ndim != 1 and resolved not in taking:
+        # A query's own sink is the template's initial state (`template.sinks`) or the portable softmax's
+        # column (`sink_column`); a kernel taking a head's sinks alone declines it, by name where named.
+        if implementation != 'auto':
+            raise ValueError(f"the {resolved} kernel takes a head's sinks, not a query's: attend a query's "
+                             "own sinks on the template or the reference")
+        resolved = 'template'
     if resolved != 'template' or FORWARD_MODE.get():
         # The template reads a separable bias as its two terms (`template_attention`); every other route,
         # 'inference''s two among them, adds it written out, as forward mode's reference and kernel do.

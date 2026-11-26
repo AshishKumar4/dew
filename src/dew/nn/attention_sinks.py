@@ -10,8 +10,9 @@ from dew.nn.derivatives import portable_formed
 
 def sink_softmax(logits: jax.Array, sinks: jax.Array, dtype: Dtype | None = None) -> jax.Array:
     """The softmax of `logits` `[..., heads, queries, keys]` over the keys with
-    each head's logit of `sinks` `[heads]` in its denominator and no value, so
-    a row sums to less than one. The softmax runs at `dtype`, the caller's
+    a sink's logit in its denominator and no value, so a row sums to less than
+    one: each head's of `sinks` `[heads]`, or each query's own `[batch, queries,
+    heads]` (`sink_column`). The softmax runs at `dtype`, the caller's
     precision policy, else at the type the logits and sinks promote to.
 
     The sink stays in logit space beside the keys, as the eager reference
@@ -33,9 +34,16 @@ def sink_softmax(logits: jax.Array, sinks: jax.Array, dtype: Dtype | None = None
 
 
 def _weights(logits: jax.Array, sinks: jax.Array, dtype: Dtype | None) -> jax.Array:
-    """`sink_softmax`'s weights, the softmax over the keys and each head's sink."""
-    sink = jnp.broadcast_to(sinks[:, None, None], (*logits.shape[:-1], 1))
+    """`sink_softmax`'s weights, the softmax over the keys and each row's sink."""
+    sink = sink_column(sinks, logits.shape)
     combined = jnp.concatenate((logits, sink), axis=-1)
     if dtype is not None:
         combined = combined.astype(dtype)
     return jax.nn.softmax(combined, axis=-1)[..., :-1]
+
+
+def sink_column(sinks: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """`sinks` as the column `[..., heads, queries, 1]` beside logits of `shape` `[..., heads, queries,
+    keys]`: a head's `[heads]` for every row and query, or each query's own `[batch, queries, heads]`."""
+    column = sinks[:, None, None] if sinks.ndim == 1 else jnp.swapaxes(sinks, -1, -2)[..., None]
+    return jnp.broadcast_to(column, (*shape[:-1], 1))

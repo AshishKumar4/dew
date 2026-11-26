@@ -228,7 +228,9 @@ class Loop:
     `exit_at` places the gate: on each pass's exit state after the coda
     (`'coda'`, Ouro's), or on the block's own output, normed as the stack's
     output is (`CausalTransformer.exit_states`: under attention residuals
-    the depth state collapsed through the output site), so a threshold's
+    the depth state collapsed through the output site; a loop passing
+    messages over attention residuals exits at its last pass alone,
+    `decoder_fields._messaged_blocks`), so a threshold's
     pass runs the coda once, on the states it selects (`'block'`), each
     token's coda reading its prefix's own selected states: by token, a
     prefix of mixed passes, which a coda trained on one pass's states at a

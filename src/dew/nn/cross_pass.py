@@ -51,14 +51,21 @@ class CrossPass:
     """How a looped block's passes pass messages (`Loop.messages`, the module doc): the layers a bank
     summary closes (`block_size`), the controller's rank, whether the message adds a term of its own
     (`additive`), whether the depth mixture sums the summaries at unit RMS (`normalize_values`), whether
-    the message joins at the input's RMS (`scale_by_input_rms`), and the merge's norm epsilon (None: the
-    decoder's `norm_eps`)."""
+    the message joins at the input's RMS (`scale_by_input_rms`), whether the message the gain scales is
+    the depth mixture at unit RMS or as it is (`normalize_message`: the controller reads it at unit RMS
+    either way; Inkling 2's merge scales it as it is, modeling_inkling2_loop.py:79-96), and the merge's
+    norm epsilon (None: the decoder's `norm_eps`)."""
 
     block_size: int = 4
     rank: int = 64
     additive: bool = True
     normalize_values: bool = True
+    scaled: bool = False
+    """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`)."""
+    gained: bool = True
+    """Whether each site's message query holds a gain (`AttentionResiduals.gained`; Inkling 2's none)."""
     scale_by_input_rms: bool = True
+    normalize_message: bool = True
     norm_eps: float | None = None
 
     def __post_init__(self):
@@ -95,7 +102,8 @@ class CrossPassMerge(nn.Module):
     def setup(self):
         width, rank = self.emb_features, self.spec.rank
         self.depth = DepthAttention(width, norm_eps=self.norm_eps,
-                                    normalize_values=self.spec.normalize_values, name='depth')
+                                    normalize_values=self.spec.normalize_values, scaled=self.spec.scaled,
+                                    gained=self.spec.gained, name='depth')
         down = declared(nn.initializers.normal(1 / math.sqrt(2 * width)), ('embed', None))
         up = declared(nn.initializers.zeros, (None, 'embed'))
         self.input_down = self.param('input_down', down, (width, rank), jnp.float32)
@@ -127,35 +135,40 @@ class CrossPassMerge(nn.Module):
         return merged_sites((self,), read, bank)[0]
 
 
-def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array, bank: jax.Array) -> tuple[jax.Array, ...]:
+def merged_sites(merges: Sequence[CrossPassMerge], read: jax.Array | tuple[jax.Array, ...], bank: jax.Array
+                 ) -> tuple[jax.Array, ...]:
     """Each of `merges`' merge of `bank` `[B, S, blocks, D]` into `read` `[B, S, D]` (a block's input sites
-    of one sublayer input, `DecoderBlock`'s), in `read`'s dtype: the bank read and normalized once for them
-    all and every site's depth query scored in one product (`depth_read`, row 12923), each site's controller
-    its own (`_merged`). Each merge's parameters are its own as `CrossPassMerge` declares them, so a saved
-    decoder loads as it is."""
+    of one sublayer input, `DecoderBlock`'s), or into each site's own of `read` given one a site (a layer
+    reading its depth a site at a time, `DecoderBlock.depth_sites`), in the reads' dtype: the bank read and
+    normalized once for them all and every site's depth query scored in one product (`depth_read`, row
+    12923), each site's controller its own (`_merged`). Each merge's parameters are its own as
+    `CrossPassMerge` declares them, so a saved decoder loads as it is."""
     first = merges[0]
     if any(merge.spec != first.spec or merge.norm_eps != first.norm_eps for merge in merges):
         raise ValueError("merges read one bank together only under one message spec and norm epsilon")
+    reads = read if isinstance(read, tuple) else (read,) * len(merges)
+    if len(reads) != len(merges):
+        raise ValueError(f"{len(reads)} reads for {len(merges)} sites' merges")
     spec, eps, depth = first.spec, first.norm_eps, first.depth
     if any(watched_or_owned(merge) or watched_or_owned(merge.depth) for merge in merges):
         # A merge a quantization may own or a caller watches runs through its module, each apart: its call
         # captured, intercepted and quantized as any module's (`CrossPassMerge.__call__`).
-        return tuple(merge(read, bank) for merge in merges)
+        return tuple(merge(each, bank) for each, merge in zip(reads, merges, strict=True))
 
     # The read's and the bank's cotangents leave only with the merges' parameters' gradients formed, their
     # states recomputed from their operands in the reverse mode (`portable_formed`): XLA otherwise puts the
     # controllers' low-rank products' and the depth queries' gradients off to the step's end, holding those
     # states live across layers and an exit-gated loop's unrolled passes (row 11713).
-    def merged(read, bank, parameters):
-        wide = at_least_fp32(read.dtype)
+    def merged(reads, bank, parameters):
+        wide = at_least_fp32(reads[0].dtype)
         queries = jnp.stack([scale.astype(wide) * kernel[:, 0].astype(wide)
                              for scale, kernel, *_ in parameters], axis=1)
-        mixed = depth_read(bank.astype(read.dtype), queries, norm_eps=depth.norm_eps,
-                           normalize_values=depth.normalize_values)
-        return tuple(_merged(read, mixed[:, :, site], controller, spec, eps)
-                     for site, (_, _, *controller) in enumerate(parameters))
+        mixed = depth_read(bank.astype(reads[0].dtype), queries, norm_eps=depth.norm_eps,
+                           normalize_values=depth.normalize_values, scaled=depth.scaled)
+        return tuple(_merged(each, mixed[:, :, site], controller, spec, eps)
+                     for site, (each, (_, _, *controller)) in enumerate(zip(reads, parameters, strict=True)))
     parameters = tuple((merge.depth.scale, merge.depth.kernel, *merge.controller()) for merge in merges)
-    return portable_formed(merged)(read, bank, parameters)
+    return portable_formed(merged)(reads, bank, parameters)
 
 
 def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps: float) -> jax.Array:
@@ -169,12 +182,13 @@ def _merged(read: jax.Array, mixed: jax.Array, controller, spec: CrossPass, eps:
     compute = read.dtype
     wide = at_least_fp32(compute)
     u = read.astype(wide)
-    message = unweighted_rmsnorm(mixed.astype(wide), eps, implementation='xla')
+    raw = mixed.astype(wide)
+    message = unweighted_rmsnorm(raw, eps, implementation='xla')
     sigma = jnp.sqrt(jnp.mean(jnp.square(u), axis=-1, keepdims=True) + jnp.asarray(eps, wide))
     state = computed_dot(jnp.concatenate([u / sigma, message], axis=-1),
                          jnp.concatenate([input_down, message_down], axis=0), dtype=compute)
     gates = jnp.tanh(computed_dot(state, jnp.concatenate(ups, axis=1), dtype=compute))
     gain, forget, *added = jnp.split(gates, len(ups), axis=-1)
-    sent = gain * message + (added[0] if added else 0)
+    sent = gain * (message if spec.normalize_message else raw) + (added[0] if added else 0)
     kept = (1 - forget) * u
     return (kept + (sigma * sent if spec.scale_by_input_rms else sent)).astype(read.dtype)

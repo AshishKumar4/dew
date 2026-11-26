@@ -740,10 +740,12 @@ class Initial:
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
-    """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
-    dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
+    """The `Initial` of one value-free logit a query head, `values` `[H]`, each head's gradient its rows'
+    terms summed once rounded (`_spread_sinks`), or one a query and head, `values` `[B, Q, H]` (a sink
+    projected from each query's input), in fp32 or their own wider dtype (`at_least_fp32`)."""
     wide = at_least_fp32(values.dtype)
-    m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
+    m = (_spread_sinks((batch, values.shape[0], queries))(values.astype(wide)) if values.ndim == 1
+         else jnp.swapaxes(values, -1, -2).astype(wide))
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide), valueless=True)
 
 

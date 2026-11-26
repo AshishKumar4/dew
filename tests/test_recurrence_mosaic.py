@@ -1565,10 +1565,10 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
     plans, refused, apart = {}, [], {}
     with report.refusals():
-        cases, found = stepped_down(target, group, plans, refused, apart)
-    # Every case compiles and reports; a required case's spill fails, and a case whose launches are held
-    # apart fails launch by launch.
-    failed = resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused)
+        cases, found, spilled = stepped_down(target, group, plans, refused, apart)
+    # Every case compiles and reports; a required case's spill fails, a held-apart one's launch by launch.
+    failed = resource_failures(cases, found, plans, apart) + production_refusals(target, group, refused,
+                                                                                 spilled)
     if target == 'sm100':
         failed += [f"{case}: no tiles derived" for case in refused
                    if case.startswith("a write gate bfloat16")]
@@ -1615,20 +1615,19 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
     assert not mosaic_failures([record]), mosaic_failures([record])
 
 
-def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
-    """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills or serializes its warpgroup MMAs (`assembled.refuses`, which a run's
-    certification reads too, `assembled.Binary.refused`) at a config not refused before, its launch refused
-    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
-    launch down through its derivation's configs (`report.settled`): a launch whose every config spills
-    derives none and leaves the template. `refused` holds the calls the template refuses, at its first
-    derivation or a retry's; the plans and launches held apart are those of the cases returned."""
+def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple:
+    """The gate's cases of `group` on `target` (`compiled_cases`), their records and the kernels refused for
+    spilling, compiled, then, for as long as a required launch spills or serializes its warpgroup MMAs
+    (`assembled.refuses`, which a run's certification reads too, `assembled.Binary.refused`) at a config not
+    refused before, its launch refused (`report.refuse_launch`) and the group derived and compiled again, as a
+    run's compile steps such a launch down through its derivation's configs (`report.settled`): a launch
+    whose every config spills derives none and leaves the template. `refused` holds the calls the template
+    refuses, at its first derivation or a retry's; the plans and launches held apart are the cases'."""
     from kernel_compile import compile_mosaic_kernels
 
-    launched: dict = {}
+    launched, stepped, spilled = {}, set(), set()
     cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
     found = compile_mosaic_kernels(cases, target)
-    stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
                                 if assembled.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
@@ -1642,6 +1641,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         if not spilling:
             break
         stepped |= {(name, launched[name][1]) for name in spilling}
+        spilled.update(*spilling.values())
         # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
         # reads.
         with generation.assumed(generation.gpu_target(target)):
@@ -1653,7 +1653,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         launched.clear()
         cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
-    return cases, found
+    return cases, found, spilled
 
 
 @pytest.mark.parametrize("first", [False, True], ids=["forward first", "gradient first"])
@@ -2271,7 +2271,7 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
             yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
-                                    residents=config.residents)
+                                    residents=config.residents, keys=mainloop.Keys())
             yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
@@ -2358,7 +2358,7 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
     rungs, rung = [], tiles
     while len(rungs) < LADDER_RUNGS and (
             up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
-        rung = template._limited(rung, producers=up, residents=rung.residents)
+        rung = template._limited(rung, producers=up, residents=rung.residents, keys=rung.keys)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
     return [tiles, *rungs]

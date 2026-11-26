@@ -1534,6 +1534,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
+    recycle_at = None if site is not None else recycle_at  # A site's task: one test, its draws its artifacts.
     rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline)
     if not tests:
         out.write_text(json.dumps({"rows": rows}))

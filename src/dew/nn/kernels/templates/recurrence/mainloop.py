@@ -50,7 +50,7 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -143,6 +143,28 @@ def block_of(family: mosaic.Family) -> int:
     return family.depths(jnp.bfloat16)[0]
 
 
+KEYED = frozenset({"recurrence_keys_back"})
+"""The launches that walk a key block of their own (`Keys`): each program one key block of a chunk and value
+head, its terms each key block's apart, which their caller sums (`mainloop_backward._keys_back`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Keys(resources.ByLaunch):
+    """The key block a config's launches of their own key block (`KEYED`) walk, where a compile found one
+    spilling with its producers' and residents' ladders run out (`template.Mosaic._narrowed`), every other
+    launch the call's (`Call.block`): a launch whose need sits at a thread's registers on a family whose
+    products read registers spills at some calls and holds at others with the same code (the gated delta
+    net's keys' backward at Qwen3.5-27B's packed training on an sm120, 8 bytes at 255 registers where one
+    row's held, row 13064), and half its key block halves its fp32 tiles."""
+
+    def halved(self, blocks: Mapping[str, int], narrowest: int) -> "Keys | None":
+        """These with each of `blocks`' launches at half the key block it walks now; None where one walks
+        `narrowest` already."""
+        if any(block // 2 < narrowest for block in blocks.values()):
+            return None
+        return self.held({name: block // 2 for name, block in blocks.items()})
+
+
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
@@ -169,6 +191,10 @@ class Tiles:
     """The most programs a multiprocessor holds of its launches where a compile found them spilling with
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
+    keys: Keys = dataclasses.field(default_factory=Keys, kw_only=True)
+    """The key block its launches of their own key block walk where a compile found them spilling with
+    their producers' and residents' ladders run out (`template.Mosaic._narrowed`), every other one the
+    call's."""
 
     @property
     def output_block(self) -> int:
@@ -180,7 +206,7 @@ class Tiles:
         producer's raise or a launch's program fewer leaves every other launch given what it was
         (`template.Mosaic.emitted`, `tuning.lowered_once`)."""
         return dataclasses.replace(self, producers=self.producers.only(kernels),
-                                   residents=self.residents.only(kernels),
+                                   residents=self.residents.only(kernels), keys=self.keys.only(kernels),
                                    forward=None if self.forward is None else self.forward.at(kernels))
 
 
@@ -390,6 +416,8 @@ class Call:
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
     """Its tiles' (`Tiles.residents`)."""
+    keys: Keys = dataclasses.field(default_factory=Keys)
+    """Its tiles' (`Tiles.keys`)."""
     alone: bool = False
     """Whether it is a forward no gradient follows, keeping nothing (`chunk_forward.kept_forward`'s `keeps`):
     its launches named apart (`named`), so a compile's refusal of one is the forward's alone and not a
@@ -404,7 +432,12 @@ class Call:
         """What a launch building `kernels` is given of it: all of it but the other launches' producers and
         residents (`Tiles.at`)."""
         return dataclasses.replace(self, producers=self.producers.only(kernels),
-                                   residents=self.residents.only(kernels))
+                                   residents=self.residents.only(kernels), keys=self.keys.only(kernels))
+
+    def key_block(self, name: str) -> int:
+        """The key block the launch `name` walks (`Tiles.keys`), the call's (`block`) where none narrowed
+        it."""
+        return self.keys.of(name) or self.block
 
     @property
     def gated_keys(self) -> bool:
@@ -1521,8 +1554,12 @@ def _weighted_held(call: Call, block: int) -> Held:
     # H100's ptxas asked 58 registers of the 48 its residency left with the gated copy unstated,
     # jsf-kdaintra6).
     vb = call.value_block
+    # The key block's last-token prefix, a column's vector a limb, read before the step's wait and held
+    # through its value block's product (`_weighted`): a column vector's lanes hold its columns as a
+    # 32-row tile's (`f32(32, n)`, the output's and the states' column vectors).
     valued = ([held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
-               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))]
+               + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))
+               + [f32(32, block)] * call.prefix_limbs]
               if call.per_key and call.delta else [])
     return Held(phases=(
         *valued,
@@ -1535,6 +1572,14 @@ def _weighted_held(call: Call, block: int) -> Held:
             product_fragments(call, (held, chunk, chunk),
                               (held, chunk, block if call.per_key else call.block)))
            if call.delta else []),))
+
+
+def _last_prefix(call: Call, prefix_refs: tuple, row, column, keyed: int) -> tuple:
+    """`_weighted`'s key block's last token's prefix, a column's vector a limb from `column` on, read from
+    global memory ahead of its step's slots' wait, its latency the wait's: read after the values' weights,
+    the next instruction waited on it, 3% of a GH200's Kimi Linear weighted launch's samples (M-JS-272)."""
+    ends = pl.ds(column, keyed)
+    return tuple(call.family.columns_of(ref.at[row + call.chunk - 1, ends]) for ref in prefix_refs)
 
 
 @building(lambda launch: ("recurrence_weighted", "recurrence_decayed_keys"))
@@ -1590,6 +1635,8 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         def step(index, slots, carry, accumulators, loaded=None, *, keys: bool = True, values: bool = True):
             """A step: under a decay a key dimension its value block (where `values`) and its key block
             (where `keys`), else every block of both."""
+            key_step = call.per_key and keys
+            last = _last_prefix(call, prefix_refs, row, h * width + index * keyed, keyed) if key_step else ()
             # Every slot waited for each step, the values' too, which the first step alone reads: a load no
             # step waits for leaves its barrier's phases unobserved (the interpreter refuses it).
             slots.acquire_all()
@@ -1620,8 +1667,6 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                 if call.per_key:
                     limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
                     decay = algebra.raised(*limbs)
-                    ends = pl.ds(h * width + c * keyed, keyed)
-                    last = tuple(family.columns_of(ref.at[row + chunk - 1, ends]) for ref in prefix_refs)
                     written = algebra.key_decayed_write(tile, limbs, last)
                     held.store(outs[-1], written, row, chunk, h * width + c * keyed, keyed,
                                family=family, smem=landing["keyed"])

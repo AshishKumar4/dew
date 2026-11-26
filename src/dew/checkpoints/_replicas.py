@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.checkpoints._state_trees import _UNSIGNED
-from dew.mesh import mesh_axes
+from dew.mesh import spec_axes
 from dew.nn.kernels.options import owned_program
 
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
     """The mesh axes `spec` splits an array over, sorted."""
-    return sorted(axis for entry in spec for axis in mesh_axes(entry))
+    return sorted(spec_axes(spec))
 
 
 @dataclasses.dataclass(frozen=True)

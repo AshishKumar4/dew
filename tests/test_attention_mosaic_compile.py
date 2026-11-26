@@ -1378,18 +1378,14 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
 
 
 @COMPILES_ON_CPU
-def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pending():
+def test_sm90_fused_and_coop_backward_pipeline_dq_dkv():
     """Row 5272: sm90 fused (d64, d128) and cooperative (d256) backward kernels stage P/dS under one
-    proxy fence and pipeline dQ/dV/dK WGMMAs via `product(..., pending=2)` with zero register spills, while
-    synchronous issuers (`MmaIssuer`) refuse nonzero `pending`."""
+    proxy fence and pipeline dQ/dV/dK WGMMAs, dQ read with dV's and dK's groups in flight
+    (`Issuer.product_with`), with zero register spills."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused, bundles
-
-    mma = bundles.named("mma.sync", jnp.bfloat16, None)
-    with pytest.raises(ValueError):
-        mma.product(jnp.zeros((16, 16), jnp.bfloat16), jnp.zeros((16, 16), jnp.bfloat16), (16, 16), pending=1)
+    from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused
 
     spans = template.spans(512, 512, 1, causal=True)
     with generation.assumed("sm90"):
