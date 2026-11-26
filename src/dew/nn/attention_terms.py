@@ -201,15 +201,21 @@ def relative_logits(states: jax.Array, bank: jax.Array, query_places: jax.Array,
     """The bias `[B, H, Q, K]` in at least fp32 of each query's relative states `states` `[B, Q, H, rank]`
     against `bank` `[rank, extent]`, read at the query's place less each key's (`query_places` `[B, Q]` or
     `[Q]`, `key_places` `[B, K]` or `[K]`) and zero outside `[0, extent)` (`RelativeBias`)."""
+    queries, keys = jnp.atleast_2d(query_places), jnp.atleast_2d(key_places)
+    return _relative_read(states, bank, (queries[:, :, None] - keys[:, None, :]).astype(jnp.int32))
+
+
+def _relative_read(states: jax.Array, bank: jax.Array, distance: jax.Array) -> jax.Array:
+    """Each query's relative states `states` `[B, Q, H, rank]` against `bank` `[rank, extent]` in at least
+    fp32, read at each of its columns' `distance` `[B or 1, Q, C]` (int32) and zero outside `[0, extent)`:
+    `[B, H, Q, C]`, the one projection and lookup `relative_logits` and `relative_band` share (row 13256)."""
     extent = bank.shape[-1]
     wide = at_least_fp32(jnp.result_type(states, bank))
     profile = computed_einsum("bqhr,re->bhqe", states, bank, dtype=wide)
-    queries, keys = jnp.atleast_2d(query_places), jnp.atleast_2d(key_places)
-    distance = (queries[:, :, None] - keys[:, None, :]).astype(jnp.int32)
     index = jnp.broadcast_to(jnp.clip(distance, 0, extent - 1)[:, None],
                              (profile.shape[0], profile.shape[1], *distance.shape[1:]))
     read = jnp.take_along_axis(profile, index, axis=-1)
-    return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, 0.0)
+    return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, jnp.zeros((), wide))
 
 
 def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
@@ -238,14 +244,11 @@ def relative_band(states: jax.Array, bank: jax.Array, offset: jax.Array):
     def banded(index):
         first = index * group
         rows = jax.lax.dynamic_slice_in_dim(padded, first, group, axis=1)
-        products = computed_einsum("bqhr,re->bhqe", rows, bank, dtype=wide)
         # Column c's distance: the query's place less its key's (`band_origins`' origin plus c).
         queries_at = first + jnp.arange(group, dtype=jnp.int32)
         lead = places + queries_at[None, :] - jax.lax.dynamic_slice_in_dim(origins, first, group, axis=1)
-        distance = lead[:, :, None] - jnp.arange(width, dtype=jnp.int32)[None, None, :]
-        read_at = jnp.broadcast_to(jnp.clip(distance, 0, extent - 1)[:, None], (batch, heads, group, width))
-        read = jnp.take_along_axis(products, read_at, axis=-1)
-        return jnp.where(((distance >= 0) & (distance < extent))[:, None], read, jnp.zeros((), wide))
+        columns = jnp.arange(width, dtype=jnp.int32)[None, None, :]
+        return _relative_read(rows, bank, lead[:, :, None] - columns)
 
     if groups == 0:
         return BandBias(jnp.zeros((batch, heads, 0, width), wide), offset, extent)

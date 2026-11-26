@@ -637,7 +637,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     # target verifies, read none.
     at = progressed(model, progress)
     blocks = (_block_drafting(model, params)
-              if depths is not None and isinstance(model, BlockDrafting) and model.dspark else None)
+              if depths is not None and isinstance(model, BlockDrafting) and model.drafts_blocks else None)
     depths = depths or 0
     recorded = [] if blocks is None else ["prediction_inputs"]
     original = rebuild_position(model)

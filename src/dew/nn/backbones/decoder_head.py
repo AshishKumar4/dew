@@ -99,7 +99,23 @@ def bounds(decoder: CausalTransformer, states) -> HeadTerms:
 
 
 def head_logits(decoder: CausalTransformer, x):
-    """The fp32 head over states past the continuum levels (`continuum_states`), or final states."""
+    """The fp32 head over states past the continuum levels (`continuum_states`), or final states: its
+    scores (`head_scores`) under the final logit cap, in the run's output dtype."""
+    logits, computed = _scored_logits(decoder, x)
+    # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
+    return capped_logits(logits, decoder.final_logit_softcap).astype(
+        output_dtype(computed if decoder.dtype is None else decoder.dtype))
+
+
+def head_scores(decoder: CausalTransformer, x) -> jax.Array:
+    """The head's scores of `x` before the final logit cap, in at least fp32: what a drafter sums its own
+    scores with before it caps them (`dew.nn.block_draft.draft`)."""
+    return _scored_logits(decoder, x)[0]
+
+
+def _scored_logits(decoder: CausalTransformer, x) -> tuple[jax.Array, jnp.dtype]:
+    """The head's scores of `x` with its gains and bias, before the cap, and the dtype its product
+    computed in."""
     # A stream-width transform reads the final states before `project_out` takes them to the table's.
     if decoder.head_transform is not None:
         x = decoder.head_norm(ungated_activation(decoder.head_transform, decoder.head_dense(x)))
@@ -124,12 +140,8 @@ def head_logits(decoder: CausalTransformer, x):
                                   precision=head.precision)
     # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
     computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
-    # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
-    return capped_logits(scaled_logits(logits, _scored(token_gains(decoder), width),
-                                       _scored(decoder.head_bias_value if decoder.head_bias else None,
-                                               width)),
-                         decoder.final_logit_softcap).astype(
-        output_dtype(computed if decoder.dtype is None else decoder.dtype))
+    return scaled_logits(logits, _scored(token_gains(decoder), width),
+                         _scored(decoder.head_bias_value if decoder.head_bias else None, width)), computed
 
 
 def _scored_alone(decoder: CausalTransformer) -> bool:

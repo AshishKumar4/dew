@@ -373,8 +373,9 @@ fitted to them, and a rule set ships only with measured receipts.
   a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
   product, a narrow float's correctly rounded arithmetic its float32 arithmetic rounded once, axes of one
-  element erased, equal equations once). Where a candidate's results are then its declaration's very values,
-  the region is that call's by identity and no e-graph is built. Otherwise the program enters one term
+  element erased, equal equations once). An explicit reduce-precision keeps its own operation; narrowing
+  and widening can change observable NaN payload bits. Identical canonical results match without an
+  e-graph. Otherwise the program enters one term
   region and saturates under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact
   sets alone under the accurate forms), and the region is the call's where each of its results shares its
   declaration's e-class. Either way the call's selector must give it a kernel of Dew's. A different constant, cast,
@@ -1295,7 +1296,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
     A subnormal static readout scale stays in the unlanded contraction, including in transpose:
-    the prepared chunk uses the token loop for that case instead of scaling its reader before a dot.
+    the prepared chunk uses the token loop with each step's split decay applied to the live state,
+    rather than landing either its decay or its reader's scale early.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
@@ -1554,6 +1556,8 @@ chunks and reduces the signed products before dividing and landing. This preserv
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
 directions. A finite observation at zero weight retains its one-sided weight derivative.
+Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
+or missing observations. Its covariance term centers and differentiates only pairs that are present.
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded

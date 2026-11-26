@@ -101,22 +101,28 @@ def _weighted_cov_with_total(
 def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`.
 
-    A mean whose operand broadcasts with the weights alone keeps that shape and its marginal mask.
-    The covariance excludes a missing pair, including its weight direction.
+    Each returned mean has its own marginal mask and shape. The covariance's centers and weight
+    derivatives exclude a missing pair.
     """
     present = _present(w, x, y)
     paired_x, paired_y, kept = _observed(present, x, y, w)
     denominator = _denominator(w, kept, present)
 
-    def marginal(value, paired):
-        if jnp.broadcast_shapes(value.shape, w.shape) == paired.shape:
-            return _mean(paired, kept, denominator)
+    def marginal(value):
         live = _present(w, value)
         observed, weights = _observed(live, value, w)
         return _mean(observed, weights, _denominator(w, weights, live))
 
-    mean_x, mean_y = marginal(x, paired_x), marginal(y, paired_y)
-    return mean_x, mean_y, _covariance(paired_x, paired_y, kept, mean_x, mean_y, denominator)
+    def paired_center(value, observed):
+        if jnp.broadcast_shapes(value.shape, w.shape)[-1] == observed.shape[-1]:
+            return _mean(observed, kept, denominator)
+        # A singleton walked extent keeps its original normalization even when its partner
+        # broadcasts it to more cells. Only a pair that is present can contribute its weight.
+        observed_slot, weights = _observed(jnp.any(present, axis=-1, keepdims=True), value, w)
+        return _mean(observed_slot, weights, denominator)
+
+    center_x, center_y = paired_center(x, paired_x), paired_center(y, paired_y)
+    return marginal(x), marginal(y), _covariance(paired_x, paired_y, kept, center_x, center_y, denominator)
 
 
 def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
@@ -384,6 +390,8 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
         out_dtype = _floating_dtype(x_arr)
         work = _working_dtype(out_dtype)
         tiled = _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile)
+        if not tiled["x"].size:
+            return _cast_back(masked_moments(tiled["x"][0], tiled["mask"][0]), work, out_dtype)
         finished = _eval_derived(derived("masked", tiled["x"].ndim - 1), tiled, mode)
         return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)

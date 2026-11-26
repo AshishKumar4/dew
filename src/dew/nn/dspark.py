@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.block_draft import Draft
 from dew.nn.dense import Dense
 
 from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
@@ -165,7 +166,7 @@ def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc: HyperC
     """One drafting pass (Transformer.forward_spec, v41:1274-1282,
     0731:928-936), with `CausalTransformer.draft`'s arguments and returns;
     `states` is the context `draft` reads, `hc` the trunk's streams, and the
-    logits carry the Markov bias.
+    logits carry the Markov bias (`dew.nn.block_draft.Draft`).
     """
     store = {}
     if states is not None:
@@ -194,4 +195,4 @@ def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc: HyperC
         embeds.append(embedded)
         scored.append(step)
     confidence = last.confident(hidden_state, jnp.stack(embeds, 1))
-    return jnp.stack(drafted, 1), jnp.stack(scored, 1), confidence
+    return Draft(jnp.stack(drafted, 1), jnp.stack(scored, 1), confidence)

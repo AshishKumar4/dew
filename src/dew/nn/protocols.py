@@ -65,7 +65,6 @@ if TYPE_CHECKING:
     from dew.nn.cross_pass import CrossPass
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
-    from dew.nn.dspark import DSpark
     from dew.nn.flops import ConditionWork
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.inputs import DenoisingCondition
@@ -1358,12 +1357,12 @@ class Predicting(Protocol):
 
 @runtime_checkable
 class BlockDrafting(Protocol):
-    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731),
-    which drafts a whole block per pass from the context its target layers
-    record instead of chaining prediction depths."""
+    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731) or a Markov
+    block drafter (Inkling 2's, `dew.nn.block_draft`), which drafts a whole block per pass from the context
+    its target layers record instead of chaining prediction depths."""
 
     @property
-    def dspark(self) -> DSpark | None: ...
+    def drafts_blocks(self) -> bool: ...
 
 
 @runtime_checkable

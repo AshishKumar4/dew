@@ -736,6 +736,22 @@ def attention_draw(salt: int):
     return draw
 
 
+def test_the_normal_form_keeps_payload_bits_observed_after_reduce_precision():
+    from jax.extend import core
+
+    from dew.algebra import normal_form
+
+    def read(words):
+        source = jax.lax.bitcast_convert_type(words, jnp.float32)
+        rounded = jax.lax.reduce_precision(source, exponent_bits=8, mantissa_bits=7)
+        return jax.lax.bitcast_convert_type(rounded, jnp.uint32)
+
+    words = np.asarray([0x7FC12345, 0xFFC12345, 0x80000000, 0x00400000, 0x7F800000, 0x3F812345], np.uint32)
+    canonical = normal_form.canonical(jax.make_jaxpr(read)(words))
+    got = jax.jit(core.jaxpr_as_fun(canonical))(words)[0]
+    np.testing.assert_array_equal(got, jax.jit(read)(words))
+
+
 def test_an_attention_closing_over_a_typed_key_compiles_through_the_pass():
     """A multi-head attention whose logits add a bias drawn from a typed PRNG key the function closes over,
     compiled through Dew's seam: the pass recognizes the attention, its bias's draw inside the candidate
