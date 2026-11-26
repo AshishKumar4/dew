@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -90,6 +90,9 @@ from dew.nn.sparse_selection import (
 )
 from dew.quantization import LinearProducts
 
+if TYPE_CHECKING:
+    from dew.nn.protocols import IndexedMixer
+
 INDEX_KEYS = "cached_index"
 """A sparse latent attention's cached indexer keys, one compact row a token beside its keys."""
 
@@ -145,25 +148,17 @@ INDEXER_EPS = 1e-8
 logarithms of the KL."""
 
 
-def indexer_kl(scores, query, key, keep, scale: float):
-    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, at least fp32 (float64
-    for float64 inputs, so a float64 truth computes it in float64).
-
-    The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
-    `calculate_indexer_loss`): the target is the main attention's distribution
-    summed over heads and L1-normalised, the indexer's the softmax of its
-    `[B, S, T]` `scores`, both over the keys `keep` allows (the causal mask in
-    the dense warm-up, the top-k selection in sparse training). `query` and
-    `key` are the main heads, `scale` the kernel's logit scale. The target is
-    detached as the reference detaches it, and heads are summed one at a time
-    to keep the footprint at `[B, S, T]`. MaxText's `EPS` (1e-8) guards the
-    L1 normalisation and both logarithms, as the reference adds it: a key the
-    target gives no mass contributes zero, and the gradient is the
-    reference's, which the epsilon moves beyond float32 rounding.
-    """
-    wide = at_least_fp32(jnp.result_type(scores, query, key))
+def indexer_target(query, key, keep, scale: float, *, dtype=None):
+    """The indexer's teacher's unnormalized mass per key, `[B, S, T]` at least fp32 (float64 for float64
+    inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads, detached as
+    the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9). `query` `[B, S, H, D]`
+    and `key` `[B, T, H, D]` are the main heads, `scale` the kernel's logit scale. Heads are summed one at a
+    time to keep the footprint at `[B, S, T]`, rounded once (`compensated_add`): plain sums biased the KL
+    upward, 1.67 times MaxText's error from float64, which sums its heads at once at H times this
+    footprint. It sums in `dtype` where given (at least fp32), its operands' otherwise."""
+    wide = at_least_fp32(jnp.result_type(query, key) if dtype is None else dtype)
     masked = jnp.finfo(wide).min
-    batch, length, total = scores.shape
+    batch, length, total = query.shape[0], query.shape[1], key.shape[1]
     keep = jnp.broadcast_to(keep, (batch, length, total))
     query = jax.lax.stop_gradient(query).astype(wide) * scale
     key = jax.lax.stop_gradient(key).astype(wide)
@@ -174,14 +169,30 @@ def indexer_kl(scores, query, key, keep, scale: float):
         probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
         return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 
-    # The heads, the target's normalization over the keys and each query's KL over them all sum
-    # rounded once (`compensated_add`, `compensated_sum`): plain sums biased the KL upward, 1.67
-    # times MaxText's error from float64, which sums its heads at once at H times this footprint.
     zeros = jnp.zeros((batch, length, total), wide)
     (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
-    summed = high + low
+    return high + low
+
+
+def indexer_kl(scores, query, key, keep, scale: float):
+    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, at least fp32 (float64
+    for float64 inputs, so a float64 truth computes it in float64).
+
+    The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
+    `calculate_indexer_loss`): the target is the main attention's distribution
+    summed over heads and L1-normalised (`indexer_target`), the indexer's the
+    softmax of its `[B, S, T]` `scores`, both over the keys `keep` allows (the
+    causal mask in the dense warm-up, the top-k selection in sparse training).
+    MaxText's `EPS` (1e-8) guards the L1 normalisation and both logarithms, as
+    the reference adds it: a key the target gives no mass contributes zero,
+    and the gradient is the reference's, which the epsilon moves beyond
+    float32 rounding.
+    """
+    wide = at_least_fp32(jnp.result_type(scores, query, key))
+    summed = indexer_target(query, key, keep, scale, dtype=wide)
+    keep = jnp.broadcast_to(keep, summed.shape)
     target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
-    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
+    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), jnp.finfo(wide).min), axis=-1)
     divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
     return compensated_sum(divergence, (divergence.ndim - 1,))
 
@@ -1175,7 +1186,7 @@ class MLAMixer(MixerBase):
         return self.index_n_heads is not None
 
     @property
-    def indexed_mixers(self) -> tuple["MLAMixer", ...]:
+    def indexed_mixers(self) -> tuple["IndexedMixer", ...]:
         return (self,) if self.indexed else ()
 
     @property

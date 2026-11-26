@@ -1666,8 +1666,9 @@ def _whole_product_kernels() -> set[str]:
 
 @pytest.mark.parametrize("target", ["sm100", "sm90"])
 def test_an_int8_attention_blocks_auto_attention_is_its_rules_where_a_cell_declares_a_fused_kernel(target):
-    """A causal bf16 attention block of 4 query heads over 1, 64 wide, at 256 tokens, its attention 'auto',
-    traced for a B200 and an H100: plain, its attention runs the kernel its call's cell declares
+    """A causal bf16 attention block of 32 query heads over 8, 64 wide, 4 rows of 1024 tokens (a call both
+    devices' receipts timed, `attention_kernels.MEASURED`), its attention 'auto', traced for a B200 and an
+    H100: plain, its attention runs the kernel its call's cell declares
     (`attention_kernels.DECLARED`, a fused kernel of whole products on both today); under Qwix's int8 rule
     (`Quantization`), which owns its products (`attention_quantized.owner`), no kernel forming its products
     past the rule, whatever any cell measured of other arithmetic (the complexity audit's A1: cuDNN returned
@@ -1681,12 +1682,12 @@ def test_an_int8_attention_blocks_auto_attention_is_its_rules_where_a_cell_decla
     from dew.nn.mixers import MixerContext
     from dew.nn.mixers.attention import CausalSelfAttention
 
-    context = MixerContext(emb_features=256, num_heads=4, num_kv_heads=1, head_dim=64, max_seq_len=256,
+    context = MixerContext(emb_features=2048, num_heads=32, num_kv_heads=8, head_dim=64, max_seq_len=1024,
                            dtype=jnp.bfloat16)
-    x = jax.ShapeDtypeStruct((1, 256, 256), jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((4, 1024, 2048), jnp.bfloat16)
     with generation.assumed(target):
-        cell = attention_case(jax.ShapeDtypeStruct((1, 256, 4, 64), jnp.bfloat16),
-                              jax.ShapeDtypeStruct((1, 256, 1, 64), jnp.bfloat16), causal=True).cell
+        cell = attention_case(jax.ShapeDtypeStruct((4, 1024, 32, 64), jnp.bfloat16),
+                              jax.ShapeDtypeStruct((4, 1024, 8, 64), jnp.bfloat16), causal=True).cell
     assert cell in DECLARED, f"no declared cell holds this call on {target}: the plain arm tests nothing"
 
     def kernels(block: nn.Module) -> set[str]:
