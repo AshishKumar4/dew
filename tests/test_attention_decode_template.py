@@ -1021,10 +1021,11 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     """A decode step's walk whose launch a compile refused (its kernel spilled, `report.refuse_launch`) plans
     that walk again at a config its own launch pins: each walk's plan is its launched op's (`WALKS`), so the
     refusal of the scaled walk's launch steps it down, never pinning it to the config refused (row 5420)."""
-    # 8 rows of 32 heads, 256 programs, past an H100's 132: one slice whatever its dtype.
-    query = jnp.zeros((8, 1, 32, 64), dtype)
-    key = value = jnp.zeros((8, KEYS, 8, 64), dtype)
-    spans = template.spans(1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32))
+    # 24 rows of 8 key heads, a step's 192 programs (each a key head's packed query rows), past an H100's
+    # 132: one slice whatever its dtype.
+    query = jnp.zeros((24, 1, 16, 64), dtype)
+    key = value = jnp.zeros((24, KEYS, 8, 64), dtype)
+    spans = template.spans(1, KEYS, 24, lengths=jnp.full((24,), KEYS, jnp.int32))
     with generation.assumed("sm90"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
@@ -1324,15 +1325,16 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
 
 
 def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
-    """An fp32 decode step of 96 heads over 32768 keys on an H100 (132 multiprocessors) launches 96 programs,
-    its parts stacked within their rows (`MosaicForward.parts`), short of the device: its plan splits the
-    keys. Counted as parts times programs (2026-11-26 audit), the step filled the device on paper and walked
-    its keys in one slice."""
-    query = jnp.zeros((1, 1, 96, 128), jnp.float32)
-    key = jnp.zeros((1, 32768, 8, 128), jnp.float32)
+    """An fp32 decode step of 8 rows of 16 query heads over 8 key heads and 4096 keys on an H100 (132
+    multiprocessors) launches 64 programs (a row's key head's packed query rows each), its parts stacked
+    within their rows (`MosaicForward.parts`), short of the device: its plan splits the keys. Counted as
+    parts times programs (2026-11-26 audit), the step filled the device on paper (192) and walked its keys
+    in one slice."""
+    query = jnp.zeros((8, 1, 16, 64), jnp.float32)
+    key = jnp.zeros((8, KEYS, 8, 64), jnp.float32)
     with generation.assumed("sm90"):
-        work, *_ = attention_decode.planned(query, key, key, attention_decode.key_spans(1, 32768, 1),
-                                            template.Hooks())
+        work, *_ = attention_decode.planned(query, key, key, template.spans(
+            1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32)), template.Hooks())
     assert work and all(plan.slices > 1 for plan in work.values()), work
 
 
