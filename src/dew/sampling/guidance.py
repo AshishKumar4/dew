@@ -190,15 +190,17 @@ def _guided_derivative(primals, tangents, value):
     del value
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
-    # The predictions' direction as each weighs it, scale along the conditional's and one less the scale along
-    # the unconditional's: the conditional's own exactly at a unit scale (0 times a finite direction), and
-    # differentiable there as the affine combination is (a derivative of it along the scale and the
-    # conditional is one at every scale, which a branch on the unit scale made zero there: 512 of 1024
-    # unit-scale elements of a mixed derivative missed). No difference of the two directions is formed, so
-    # none overflows; an unconditional direction that is not finite, which a unit scale weighs nothing of,
-    # is taken as none there rather than 0 times infinity.
-    unweighed = jnp.where((scale == 1) & ~jnp.isfinite(along_unconditional), 0, along_unconditional)
-    predicted = scale * along_conditional + (1 - scale) * unweighed
+    # The predictions' direction in the affine order, which forms their difference first (two directions of
+    # 1e38 at a scale of 4 differ by 0, where 4 times one less 3 times the other overflows); at a unit scale
+    # each weighed apart, scale along the conditional's and one less the scale along the unconditional's: the
+    # conditional's own exactly (0 times a finite direction), differentiable there as the affine combination
+    # is (a derivative of it along the scale and the conditional is one at every scale, which the
+    # conditional's direction alone made zero there: 512 of 1024 unit-scale elements of a mixed derivative
+    # missed); an unconditional direction that is not finite, which a unit scale weighs nothing of, taken as
+    # none there rather than 0 times infinity.
+    unweighed = jnp.where(jnp.isfinite(along_unconditional), along_unconditional, 0)
+    predicted = jnp.where(scale == 1, scale * along_conditional + (1 - scale) * unweighed,
+                          along_unconditional + scale * (along_conditional - along_unconditional))
     # The scale's: the predictions' difference, formed `_spread` as the value is.
     held, unheld, half = _spread(conditional, unconditional)
     along = ((half * held - half * unheld) * along_scale.astype(held.dtype) / half).astype(conditional.dtype)
