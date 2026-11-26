@@ -4,6 +4,7 @@ MMA's), interpreted: each record the launches keep inside its step's enclosure (
 
 import dataclasses
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -102,3 +103,26 @@ def test_a_key_decays_solve_is_enclosed_as_its_own_bundle_rounds_it():
     native = np.full(pairs.shape, -1.0)
     assert within(native, stored(lane.solving()))[1, 0]
     assert not within(native, stored(lane))[1, 0]
+
+
+def test_the_decay_prefix_sums_its_terms_by_the_one_compensated_reduction():
+    """The decay's base-2 prefix (`recurrence_algebra.prefix`), its terms fenced once and summed by the one
+    compensated pair reduction's combine (`renormalized_add`), is, bit for bit, the sum whose combine fenced
+    its operands at every step (`compensated_add`) over drawn decays of 1e-3 to 30 a token, jitted (row
+    10722): one way of the same sum."""
+    from dew.nn.kernels.recurrence_algebra import prefix, prefix_terms
+    from dew.nn.precision import compensated_add
+
+    rng = np.random.default_rng(0x10722)
+    g = -jnp.asarray(np.exp(rng.uniform(np.log(1e-3), np.log(30.0), (3, 64, 4))), jnp.float32)
+
+    def fenced_each_step(g):
+        terms = prefix_terms(g)
+        size = g.shape[-2]
+        window = (1, size, 1)
+        zero = jnp.zeros((), g.dtype)
+        return jax.lax.reduce_window(terms, (zero, zero), compensated_add, window, (1, 1, 1),
+                                     ((0, 0), (size - 1, 0), (0, 0)))
+
+    for got, wanted in zip(jax.jit(prefix)(g), jax.jit(fenced_each_step)(g), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
