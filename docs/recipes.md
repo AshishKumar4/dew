@@ -63,10 +63,10 @@ The recipe's data is a chain, which it records with the run, and its model a `Mo
 # byte_demo.py
 from dew.config import TrainerConfig
 from dew.config.trainer import Diagnostics
-from dew.training import Horizon
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources import TokenFiles
+from dew.kernels import Kernels
 from dew.registry import ModelConfig
 
 loading = Loading(workers=0, threads=1, read_buffer=2)
@@ -77,8 +77,8 @@ run = LMRunConfig(
     validation=TokenFiles("tokens/val").pipe(presets.token_windows, **windows, records=16).loading(loading),
     model=ModelConfig("causal_transformer", {"dtype": "float32", "emb_features": 16, "num_layers": 1,
                                              "num_heads": 2, "mlp_features": 32}),
-    diagnostics=Diagnostics(kernels={"attention": "reference"}),
-    trainer=TrainerConfig(horizon=Horizon(steps=2), log_every=1, eval_every=2, checkpoint_every=2,
+    diagnostics=Diagnostics(kernels=Kernels(attention="reference")),
+    trainer=TrainerConfig(steps=2, log_every=1, eval_every=2, checkpoint_every=2,
                           checkpoint_dir="runs", name="byte-demo", multi_host=False),
     max_new_tokens=0,
 )
@@ -126,8 +126,8 @@ Each setting's default is the recipe's own, which can differ from the configurat
 |---|---|
 | model `dtype` | The model's compute dtype, which each recipe's default model states (`ModelConfig` fields). Parameters are stored in float32. A run-wide matmul precision is `--trainer.precision`; a model's own is its `precision` field. |
 | `--diagnostics.kernels` | The kernel the run runs for each op it names, its attention's a name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example names `reference` so no device-specific kernel runs. |
-| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop` at its defaults, or its record with its settings as JSON (`'{"class": "adamw", "fields": {"b2": 0.95}}'`). |
-| `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
+| `optim.optimizer:<name>` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop` at its defaults, its settings after it (`optim.optimizer:adamw --optim.optimizer.b2 0.95`). |
+| `--optim.lr`, `optim.schedule:<kind>` | The learning rate, and the schedule it follows (`optim.schedule:cosine` with its settings after it); none named, a constant rate. |
 | `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
 | the preset's `batch` | Global batch across all JAX processes, the data chain's preset's (`presets.token_windows(batch=...)`, `presets.images(batch=...)`). |
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, `passes` (the default), a share such as `5%`, or `None`. |
