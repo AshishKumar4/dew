@@ -39,13 +39,13 @@ def additive_gate(x: jax.Array, entering: tuple[jax.Array, jax.Array] | None = N
     written = jnp.concatenate([seed_top[:, None], x], axis=1)
     masses = jnp.concatenate([seed_mass[:, None], jnp.zeros_like(x)], axis=1)
     largest, mass = jax.lax.associative_scan(_mass, (written, masses), axis=1)
-    started = largest > -jnp.inf
+    started = largest != -jnp.inf
     # Each token's normalizer's largest write and relative mass, and the prefix's before it.
     top, log_mass = largest[:, 1:], mass[:, 1:]
     before, before_mass = largest[:, :-1], mass[:, :-1]
     shift = jnp.where(started[:, :-1], jnp.where(started[:, :-1], before, 0.0) - top, 0.0)
     log_decay = jnp.where(started[:, :-1], shift + (before_mass - log_mass), 0.0)
-    present = started[:, 1:] & (x > -jnp.inf)
+    present = started[:, 1:] & (x != -jnp.inf)
     relative = jnp.where(present, x - jnp.where(present, top, 0.0), 0.0) - log_mass
     weights = jnp.where(present, jnp.exp(jnp.where(present, relative, 0.0)), 0.0)
     return weights, log_decay, (largest[:, -1], mass[:, -1])
@@ -55,7 +55,7 @@ def log_normalizer(normalizer: tuple[jax.Array, jax.Array]) -> jax.Array:
     """A normalizer's (`additive_gate`'s) log in absolute scale, `largest + mass`: a diagnostic, not the
     state a call continues from (rounded where the writes are large)."""
     largest, mass = normalizer
-    return jnp.where(largest > -jnp.inf, largest + mass, -jnp.inf)
+    return jnp.where(largest != -jnp.inf, largest + mass, -jnp.inf)
 
 
 def _mass(a: tuple, b: tuple) -> tuple:
@@ -64,11 +64,12 @@ def _mass(a: tuple, b: tuple) -> tuple:
     `(-inf, 0)`, each leaf a constant with no derivative into either."""
     (top_a, mass_a), (top_b, mass_b) = a, b
     top = jnp.maximum(top_a, top_b)
-    started = top > -jnp.inf
+    # Only `-inf` is absent: a NaN write propagates (it compares unequal to everything).
+    started = (top_a != -jnp.inf) | (top_b != -jnp.inf)
     frame = jnp.where(started, top, 0.0)
 
     def relative(largest, mass):
-        here = largest > -jnp.inf
+        here = largest != -jnp.inf
         return jnp.where(here, jnp.where(here, largest, 0.0) - frame + mass, -jnp.inf)
 
     ends = (relative(top_a, mass_a), relative(top_b, mass_b))

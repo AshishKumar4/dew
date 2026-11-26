@@ -223,6 +223,16 @@ def test_the_additive_gate_takes_an_unseeded_absent_write_with_no_gradient():
         assert np.all(np.asarray(d_x) == 0.0), leaf
 
 
+def test_the_additive_gate_carries_a_nan_write_on():
+    """Unseeded writes `[NaN, 0]`: the NaN is no absent write (only `-inf` is), so the second token's weight
+    and the normalizer returned are NaN, not a fresh start's one and a finite carry (a review's P0 of
+    12a1ac57c, its combine taking a NaN largest for an empty prefix)."""
+    x = jnp.asarray([[[np.nan], [0.0]]], jnp.float32)
+    weights, _, (largest, mass) = slots.additive_gate(x)
+    assert np.isnan(np.asarray(weights)[0, 1, 0])
+    assert np.isnan(np.asarray(largest)[0, 0]) or np.isnan(np.asarray(mass)[0, 0])
+
+
 def test_the_additive_gate_keeps_a_faint_increment():
     """Unseeded writes `[0, -20]`: the normalizer's relative mass `log(1 + e^-20)`, about `2.061e-9`, and the
     second token's log decay its negation, each exactly as `jnp.logaddexp` (its `log1p`) forms them, where
