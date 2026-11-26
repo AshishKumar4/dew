@@ -34,6 +34,7 @@ import functools
 import math
 import weakref
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -67,25 +68,46 @@ which keys a query reads is the caller's, so the walk holds each position to its
 
 TOKENWISE = "token-wise"
 """The rule of a program Dew computes token by token (tier 3's experts' dispatch,
-`torchax_fallback.functional_experts`; `attested`), whose outputs at a token read that token's inputs
-alone."""
+`torchax_fallback.functional_experts`, and its kernel parts' norms and gated products,
+`torchax_fallback.kernel_parts`; `attested`), whose outputs at a token read that token's inputs alone,
+its tokens on one axis of every operand and output."""
 
-_ATTESTED: weakref.WeakKeyDictionary[core.Jaxpr, str] = weakref.WeakKeyDictionary()
-"""Each program Dew's own code bound under a rule (`attested`), by that rule: the walk reads a call by
-its rule where the call's program is one of these objects, as the program alone identifies what it
+@dataclass(frozen=True)
+class Attested:
+    """A program Dew's code bound under a rule (`attested`): the rule, and for an attention's its roles, the
+    count of its first operands on the queries' positions (`inputs`: its queries first, then its keys,
+    values and any per-position operand) and of its first outputs on them (`outputs`), every other operand
+    (a cache, an entering memory) read whole by every output and every other output (a cache it writes, a
+    final memory) reading every position any operand reads, whatever their shapes."""
+
+    rule: str
+    inputs: int = 0
+    outputs: int = 0
+
+
+_ATTESTED: weakref.WeakKeyDictionary[core.Jaxpr, Attested] = weakref.WeakKeyDictionary()
+"""Each program Dew's own code bound under a rule (`attested`), by its attestation: the walk reads a call
+by it where the call's program is one of these objects, as the program alone identifies what it
 computes; a name any program may take."""
 
 
-def attested[**P, R](function: Callable[P, R], rule: str) -> Callable[P, R]:
+def attested[**P, R](function: Callable[P, R], rule: str, *, inputs: int = 0, outputs: int = 0
+                     ) -> Callable[P, R]:
     """`function`, which Dew states computes as `rule` (`CAUSAL_ATTENTION`, `STATED_ATTENTION` or
     `TOKENWISE`) says, as a nested program (`dew.nn.nested.nested`) whose every staged call's program is
-    recorded as `rule`'s, so a walk of the enclosing program reads that call by the rule."""
+    recorded as attested (`Attested`), so a walk of the enclosing program reads that call by the rule. An
+    attention states its roles: the first `inputs` operands and `outputs` outputs on its queries'
+    positions."""
     assert rule in (CAUSAL_ATTENTION, STATED_ATTENTION, TOKENWISE), rule
+    assert (inputs == outputs == 0) if rule == TOKENWISE else (inputs > 0 and outputs > 0), (rule, inputs,
+                                                                                               outputs)
+    record = Attested(rule, inputs, outputs)
 
-    def record(program: core.Jaxpr) -> None:
-        _ATTESTED[program] = rule
+    def recorded(program: core.Jaxpr) -> None:
+        _ATTESTED[program] = record
 
-    return nested(function, traced=record)
+    return nested(function, traced=recorded)
+
 
 CONCRETE = 1 << 20
 """The most entries of an integer value the walk evaluates while it walks (a gather's indices, a
@@ -420,17 +442,24 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     """A call of a program of its own: a jit of a program Dew's code bound under a rule (`attested`) by
     that rule, any other walked inside."""
     program = called(eqn)
-    rule = _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
+    record = _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
+    rule = None if record is None else record.rule
     if rule is not None or program is None:
         given = [_reads(value) for value in given]
-    if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
-        return _attended(eqn, given, causal=rule == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
+    if record is not None and rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(
+            isinstance(value, Reads) for value in given):
+        return _attended(eqn, given, record), [None] * len(eqn.outvars)
     if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
         out = _shape(eqn.outvars[0])
         aligned = [value for value in given if isinstance(value, Reads)]
-        if all(value.axis == 0 and len(value.latest) == out[0] for value in aligned):
+        # Its tokens on one axis every operand the tokens reach holds them on: the flattened tokens' 0
+        # (tier 3's experts), a `[B, S, ...]` value's 1 (a token's norm or gated product).
+        # Never the last axis, which a token's norm reduces over: tokens there are read joined.
+        axis = aligned[0].axis
+        if axis is not None and axis < len(out) - 1 and all(
+                value.axis == axis and len(value.latest) == out[axis] for value in aligned):
             latest = np.maximum.reduce([value.latest for value in aligned])
-            return [Reads(0, latest)] * len(eqn.outvars), [None] * len(eqn.outvars)
+            return [Reads(axis, latest)] * len(eqn.outvars), [None] * len(eqn.outvars)
         return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
     if program is None:
         return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)
@@ -438,17 +467,19 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
     return walk.run(program, given, operands, consts)
 
 
-def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[Held]:
-    """Dew's attention's outputs, its queries `[B, S, H, D]` its first operand: an output of the
-    queries' positions (`[B, S, ...]`) reads at each position its own query's positions and its keys'
-    and values' up to its own (`causal`), or its own (a visibility its caller states); any other output
-    (a cache it writes) every position any operand reads."""
+def _attended(eqn: core.JaxprEqn, given: list[Held], record: Attested) -> list[Held]:
+    """Dew's attention's outputs, its queries `[B, S, H, D]` its first operand: an output on the queries'
+    positions (`record.outputs`) reads at each position its own query's positions and its keys' and values'
+    up to its own (causal attention), or its own (a visibility its caller states), and every position any
+    other operand reads (a cache, an entering memory: `record.inputs`); any other output (a cache it writes,
+    a final memory) every position any operand reads."""
+    causal = record.rule == CAUSAL_ATTENTION
     length = _shape(eqn.invars[0])[1]
     own, keyed, extra = _none(length), _none(length), NONE
     for index, value in enumerate(given):
         if not isinstance(value, Reads):
             continue
-        if value.axis == 1 and len(value.latest) == length:
+        if index < record.inputs and value.axis == 1 and len(value.latest) == length:
             if index == 0 or not causal:
                 own = np.maximum(own, value.latest)
             else:
@@ -457,8 +488,7 @@ def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[He
             extra = max(extra, value.last)
     rows = np.maximum(np.maximum(own, np.maximum.accumulate(keyed)), extra)
     flat = _flat(given)
-    return [Reads(1, rows) if len(_shape(var)) > 1 and _shape(var)[1] == length else flat
-            for var in eqn.outvars]
+    return [Reads(1, rows) if index < record.outputs else flat for index in range(len(eqn.outvars))]
 
 
 def _paired(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
