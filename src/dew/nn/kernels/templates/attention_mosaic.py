@@ -346,7 +346,6 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         return max(1, resources.register_model(family, config.consumers, regs,
                                                shared=staged, target=target, tmem=tmem, joined=joined).most)
 
-@dataclasses.dataclass(frozen=True)
 def _band_held(kinds: tuple[Kind, ...], config) -> bool:
     """Whether every query tile `config`'s launches read a band side of (`Kind.BAND`) lies within one of its
     origins' groups (`band.BAND_GROUP`), a tile's origin one scalar (`attention_mosaic_program._param`): a
@@ -359,6 +358,7 @@ def _band_held(kinds: tuple[Kind, ...], config) -> bool:
     return all(band.BAND_GROUP % each == 0 for each in rows)
 
 
+@dataclasses.dataclass(frozen=True)
 class MosaicForward(_Mainloop[Tiles]):
     """The template's forward on this mainloop over the call's own arrays (`forward` gives them): queries
     `[B, Q, H, D]` over keys `[B, K, Hk, D]` and values `[B, K, Hk, Dv]`, each query's keys `start` to `end`

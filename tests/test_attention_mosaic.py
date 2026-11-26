@@ -32,6 +32,7 @@ from test_attention_triton import (
     HOOKS,
     SCORE_HOOKS,
     bucketed,
+    floating,
     gate_of,
     hooks_for,
     score_hooks,
@@ -359,7 +360,7 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
             pulled = attention_route.backward if routed else attention_mosaic.backward
             grads = pulled(query, key, value, built_spans, hooks, dout, residuals=residuals,
                            accurate=accurate, interpret=interpret)
-        return grads.query, grads.key, grads.value, grads.score_params, grads.initial
+        return grads.query, grads.key, grads.value, floating(grads.score_params, params), grads.initial
 
     def reference(query, key, value, dout, params, initial):
         built_spans = make_spans()
@@ -370,7 +371,8 @@ def _check_spans(label: str, spans: template.KeySpans | Callable[[], template.Ke
             return template.reference(query, key, value, built_spans, hooked(params, initial))
 
         _, pull = jax.vjp(attend, query, key, value, params, initial)
-        return pull(dout)
+        dq, dk, dv, dparams, dinitial = pull(dout)
+        return dq, dk, dv, floating(dparams, params), dinitial
 
     name = (f"mosaic {'backward' if backward else 'forward'} {label} {score}{' gate' if gate else ''} "
             f"{jnp.dtype(dtype).name}{f' {form}' if backward else ''}{' natural' if natural else ''}")

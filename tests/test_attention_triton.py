@@ -408,6 +408,13 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
     return (score_mod if scoring else None), tuple(kinds), draw
 
 
+def floating(grads: tuple, params: tuple) -> tuple:
+    """`grads` of the hook parameters `params` that are floating, the ones a gradient is taken along: an
+    integer parameter's (a band's origins, `template.Kind.BAND`) is none, `float0` to `jax.vjp`."""
+    return tuple(grad for grad, param in zip(grads, params, strict=True)
+                 if jnp.issubdtype(param.dtype, jnp.floating))
+
+
 def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | None = None):
     """The backward's config of the dQ launch's `config` and the dK/dV launch's warps and stages, from
     `dkv_config` (`config` by default)."""
@@ -454,7 +461,7 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
             with tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)}):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
                                                   natural=natural, accurate=accurate, interpret=not ON_GPU)
-        return grads.query, grads.key, grads.value, grads.score_params, grads.initial
+        return grads.query, grads.key, grads.value, floating(grads.score_params, params), grads.initial
 
     def ours(*inputs):
         spans = template.spans(queries, keys, ROWS, **arguments(case))
@@ -467,7 +474,8 @@ def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int 
             return template.reference(query, key, value, spans, hooked(params, initial))
 
         _, pull = jax.vjp(attend, query, key, value, params, initial)
-        return dict.fromkeys(map(str, configs), pull(dout.astype(query.dtype)))
+        dq, dk, dv, dparams, dinitial = pull(dout.astype(query.dtype))
+        return dict.fromkeys(map(str, configs), (dq, dk, dv, floating(dparams, params), dinitial))
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"{mainloop} backward {case} {names} {jnp.dtype(dtype).name} {list(configs)} "
                     f"{width}/{value_width} natural {natural} accurate {accurate}",
