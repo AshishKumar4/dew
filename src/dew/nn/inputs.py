@@ -1332,31 +1332,30 @@ class RowPlan:
         if sharding is None:
             return jax.vmap(lambda row: jax.random.fold_in(key, row))(jax.device_put(indices, key.sharding))
         # Each process's rows fold from its own root (processes may hold different seeds, which a request
-        # does not agree on): each device holds its process's root's words for each of its rows, moved from
-        # the root's own device (no host read), beside the rows' global indices laid out as the rows are,
-        # and folds its own rows.
+        # does not agree on): each row shard's device holds its process's root's words, put there from the
+        # root's own device with no computation outside the fold (none runs on one device under the mesh in
+        # context) and no host read, and the fold repeats each shard's root over its rows.
         from dew.nn.kernels.options import program
 
         words = jax.random.key_data(key.addressable_data(0))
-        shape = (self.global_rows, *words.shape)
-        held = sharding.addressable_devices_indices_map(shape)
-        roots = jax.make_array_from_single_device_arrays(shape, sharding, [
-            jax.device_put(jnp.broadcast_to(words, (len(range(*rows.indices(shape[0]))), *words.shape)),
-                           device)
-            for device, (rows, *_) in held.items()])
+        shards = math.prod(sharding.mesh.shape[axis] for axis in request_axes(sharding.mesh))
+        laid = (shards * words.shape[0],)
+        roots = jax.make_array_from_single_device_arrays(laid, sharding, [
+            jax.device_put(words, device) for device in sharding.addressable_devices_indices_map(laid)])
         placed = jax.make_array_from_process_local_data(sharding, indices)
-        return program(_row_keys, static_argnames=("impl",), out_shardings=sharding)(
-            roots, placed, impl=jax.random.key_impl(key))
+        return program(_row_keys, static_argnames=("impl", "shards"), out_shardings=sharding)(
+            roots, placed, impl=jax.random.key_impl(key), shards=shards)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
         return host_rows(leaf, self.rows)
 
 
-def _row_keys(roots: jax.Array, rows: jax.Array, impl) -> jax.Array:
-    """Each row's root key (its key data `roots`, of `impl`) folded by its index in `rows`
-    (`RowPlan.keys`)."""
-    return jax.vmap(jax.random.fold_in)(jax.random.wrap_key_data(roots, impl=impl), rows)
+def _row_keys(roots: jax.Array, rows: jax.Array, impl, shards: int) -> jax.Array:
+    """Each row's root key folded by its index in `rows` (`RowPlan.keys`): `roots` the key words of `impl`
+    for each of the `shards` row shards in turn, each shard's rows taking its root."""
+    words = jnp.repeat(roots.reshape(shards, -1), rows.shape[0] // shards, axis=0)
+    return jax.vmap(jax.random.fold_in)(jax.random.wrap_key_data(words, impl=impl), rows)
 
 
 @dataclass(frozen=True)
