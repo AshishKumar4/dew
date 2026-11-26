@@ -1421,7 +1421,8 @@ PLAIN_RECYCLE_AT = 4 << 30
 (recycle.py, `ran_in_processes`), a dry prepare's aside (prepares.py's `RECYCLE_AT`): a 10 GiB container
 holds 4 GiB a process kept beside its next test's 5.2 GiB at most (row 13063's cold cases: 3.5 to 5.2 GiB
 each; train 1299's test_contracts_algebra.py#1/5 killed for memory beside its own earlier tests, green
-alone). A test that needs more is marked `fresh_process` (recycle.py's `FRESH`). A row run past a recycle is
+alone), what it holds after glibc returns its free pages (recycle.py's `trimmed`). A test that needs more is
+marked `fresh_process` (recycle.py's `FRESH`). A row run past a recycle is
 recorded as a blind watch's (`run_keys.record`), so a train runs it again; one that never passes the bound
 is one process's, as before. Coverage's runs are one process each, its data file whole."""
 

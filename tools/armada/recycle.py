@@ -6,6 +6,8 @@ past its release, scratch pk-rsstrace; eight higher-order algebra compiles 5.3 t
 only its end returns it. It writes the test it ended after to `RECYCLED`, which its task reads as its word to
 run again. This module imports no pytest: ci.py reads its names."""
 
+import ctypes
+import ctypes.util
 import json
 import os
 from pathlib import Path
@@ -37,6 +39,16 @@ def resident() -> int:
     return 0
 
 
+def trimmed() -> int:
+    """`resident` after glibc returns its arenas' free pages to the system (`malloc_trim(0)`): what a process
+    keeps past a test is largely freed native memory its allocator still holds (row 13063: 5.02 GB resident
+    after the first orders' compiles, 0.93 GB trimmed, JAX's caches' release returning none of it)."""
+    libc = ctypes.util.find_library("c")
+    if libc is not None:
+        ctypes.CDLL(libc).malloc_trim(0)
+    return resident()
+
+
 def pytest_sessionstart(session) -> None:
     _session["it"] = session
 
@@ -56,7 +68,8 @@ def pytest_runtest_logfinish(nodeid: str, location) -> None:
     at_item = next((index for index, item in enumerate(session.items) if item.nodeid == nodeid), None)
     fresh = at_item is not None and any(item.get_closest_marker(FRESH) is not None
                                         for item in session.items[at_item:at_item + 2])
-    if fresh or resident() > int(at):
+    # Past the bound only what the allocator cannot return: a process recycled is a row run again by each train.
+    if fresh or (resident() > int(at) and trimmed() > int(at)):
         Path(recycled).write_text(nodeid)
         why = ("a test beside it runs in a fresh process" if fresh
                else f"this process holds more than {at} bytes")
