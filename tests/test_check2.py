@@ -1566,10 +1566,10 @@ def test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_th
 def test_the_recurrence_step_witness_holds_the_fast_backward(form):
     """The step witness (row 2084 (e)) of the fast backward in one of its forms
     (`rw.assert_backward_form_witnessed`): every record each of its launches keeps, for a call of three
-    chunks, inside its step's enclosure. A form a cell, each under the group target (together 179 s, row
+    chunks, inside its step's enclosure; a form the template stops training on the interpreted target fails,
+    never skips (`rw.UNTRAINED`, row 13550). A form a cell, each under the group target (together 179 s, row
     5543)."""
-    if not rw.assert_backward_form_witnessed(rw.interpreted_lane(), form):
-        pytest.skip(f"the template trains no {form} call on this device")
+    rw.assert_backward_form_witnessed(rw.interpreted_lane(), form)
 
 
 @INTERPRETS

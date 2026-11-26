@@ -10,6 +10,7 @@ memory is far off that math's at the bound.)"""
 
 import dataclasses
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -248,15 +249,19 @@ def test_kimis_training_plan_anchors_its_own_pairs(target):
     assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 1}, reducing
 
 
+OWN_LAUNCHES = {"recurrence_intra_own", "recurrence_intra_own_scores", "recurrence_key_pairs_own"}
+"""Kimi's training step's own pairs launches: the forward's (scores and system, then scores) and the
+backward's."""
+
+
 @pytest.mark.parametrize("target", ["sm86", "sm120"])
 def test_kimis_own_pairs_launches_fit_each_budget_they_are_planned_at(target):
-    """Kimi's bf16 training step planned at its device's shared budget and at budgets a block of 4 KiB and two
-    below it, down to the last the template derives at: each own pairs launch (`intra_own`,
-    `intra_own_scores`, `key_pairs_own`) fits the budget it is planned at with the scratch it launches with
-    (`mainloop.Launch.shared`, its `reducing` warpgroups' counted), as its fit priced it
+    """Kimi's bf16 training step planned at its device's shared budget and at a budget 4 KiB below it (an
+    RTX PRO 6000's 8 KiB below derives none): the template derives at each, and each own pairs launch
+    (`OWN_LAUNCHES`, every one of them planned) fits the budget it is planned at with the scratch it
+    launches with (`mainloop.Launch.shared`, its `reducing` warpgroups' counted), as its fit priced it
     (`own_pairs.anchored_plan`: fitted without the forward's scratch, its launch took more than it priced,
-    train 1337's review, row 13495). No budget the template derives at holds no anchored forward block (its
-    other launches need twice the forward's), so each stays anchored."""
+    train 1337's review, row 13495)."""
     from test_recurrence_mosaic import resource_operands
 
     from dew.nn.kda import KimiDeltaAttention
@@ -266,15 +271,51 @@ def test_kimis_own_pairs_launches_fit_each_budget_they_are_planned_at(target):
     operands = [jnp.zeros(shape.shape, shape.dtype) for shape in
                 resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 512)]
     base = generation.gpu_target(target)
-    for budget in (generation.shared_budget(base) - 4096 * step for step in range(3)):
+    for budget in (generation.shared_budget(base) - 4096 * step for step in range(2)):
         facts = dataclasses.replace(base, shared_limit=budget)
         with generation.assumed(facts):
             call, _ = template_bind(*operands, rounded=True, decay_bound=KimiDeltaAttention.lower_bound)
             _, bound = call.bound['mosaic_gpu']
             tiles = template.MOSAIC.derived(bound, facts)
-            if tiles is None:
-                break
-            own = [launch for launch in template.MOSAIC.launches(bound, tiles, facts, backward=True)
-                   if "_own" in launch.name]
-        assert all(launch.shared <= budget and launch.reducing == 1 for launch in own), (
-            budget, [(launch.name, launch.shared, launch.reducing) for launch in own])
+            assert tiles is not None, budget
+            own = {launch.name: launch for launch in template.MOSAIC.launches(bound, tiles, facts,
+                                                                             backward=True)
+                   if launch.name in OWN_LAUNCHES}
+        assert set(own) == OWN_LAUNCHES, (budget, sorted(own))
+        assert all(launch.shared <= budget for launch in own.values()), (
+            budget, {name: (launch.shared, launch.reducing) for name, launch in own.items()})
+
+
+def test_kimis_forward_own_pairs_fall_back_where_no_anchored_block_fits():
+    """Kimi's forward own pairs (`own_pairs.own_plan`, the scores' and the system's) planned directly on an
+    RTX A6000 whose shared budget is the least its anchored products take, and a byte below it: there
+    anchored, here each pair its own decay at a key block that holds a program (`mainloop.key_block_holds`
+    of the exact plan), the anchored scratch and staging no longer fitting. (The template's other launches
+    need about twice the forward's own pairs', so no budget the whole template derives at reaches this
+    boundary.)"""
+    from test_recurrence_chunk import chunk_on
+    from test_recurrence_mosaic import resource_operands
+
+    from dew.nn.kernels.recurrence_chunk import Chunk
+    from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, own_pairs
+
+    q, k, v, g, beta, h0 = (jnp.zeros(shape.shape, shape.dtype) for shape in
+                            resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 512))
+    base = generation.gpu_target("sm86")
+    with generation.assumed(base), chunk_forward.observed() as calls:
+        jax.eval_shape(lambda *x: chunk_on('mosaic_gpu', UNBOUND_QUERIES, Chunk(
+            x[0], x[1], x[2], log_decay=x[3], beta=x[4], state=x[5])), q, k, v, g, beta, h0)
+    products = ("scores", "system")
+
+    def planned(budget):
+        call = dataclasses.replace(calls[0], target=dataclasses.replace(base, shared_limit=budget))
+        return call, own_pairs.own_plan(call, products)
+
+    low, high = 0, generation.shared_budget(base)
+    assert planned(high)[1][0], "anchored at the device's budget"
+    while high - low > 1:
+        middle = (low + high) // 2
+        low, high = (low, middle) if planned(middle)[1][0] else (middle, high)
+    call, (anchors, keys) = planned(low)
+    plan = own_pairs.own_plans(call, products)
+    assert not anchors and mainloop.key_block_holds(call, *plan(anchors=False), contracted=True), (low, keys)

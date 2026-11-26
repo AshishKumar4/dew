@@ -1757,15 +1757,28 @@ keys' sums and its values' gradient stored once in bf16: rows 11849, 11873), and
 rule (its values in parts)."""
 
 
+UNTRAINED = {("sm80", "fp32 under the delta rule"), ("sm80", "bf16 under the accurate forms")}
+"""The fast backward's forms (`BACKWARD_FORMS`) the template trains on no target of a generation
+(`Mosaic.trains`), whose training step takes another kernel there: on an A100, an fp32 call's (its registers
+264 to 328 a thread) and a bf16 call's under the accurate forms, its values in three parts (at 9827af608,
+the witness's draw of two heads, which its native cells take). Every other form is trained wherever the
+witness runs it and a declared one refused, so a form the template stops training fails its witness rather
+than passing it unwitnessed, and a declared one it trains again fails until struck (row 13550)."""
+
+
 def backward_form_held(lane: Lane, form: str, heads: int = 1) -> tuple[BackRun, dict] | None:
     """The fast backward's records in one of its forms (`BACKWARD_FORMS`) and whether each lies inside its
-    step's enclosure (`back_witnessed`), where the template trains the form on the device (`Run.trained`: an
-    A100's registers hold no fp32 call's, 264 to 328 a thread, whose training step takes another kernel);
-    None where it does not."""
+    step's enclosure (`back_witnessed`); None where the form is declared untrained on the target its
+    launches run for (`UNTRAINED`, `template.Mosaic.launched`), whose call the template must then refuse to
+    train (`Run.trained`), as it must train every other."""
     held = BACKWARD_FORMS[form]
     operands = draw(0, "mild", heads=heads, dtype=held.dtype)
     run = recorded(*operands, delta=held.delta, rounded=held.rounded)
-    if not run.trained:
+    target = template.Mosaic.launched().generation
+    untrained = (target, form) in UNTRAINED
+    assert run.trained != untrained, (f"the template trains {'a' if run.trained else 'no'} {form} call on "
+                                      f"{target}, declared otherwise (UNTRAINED)")
+    if untrained:
         return None
     back = recorded_backward(operands, delta=held.delta, run=run)
     return back, back_witnessed(back, lane)
@@ -1790,25 +1803,24 @@ def dropped_gate_held(back: BackRun, lane: Lane) -> np.ndarray:
     return back_witnessed(back._replace(records={**back.records, "dv": dropped}), lane)["dv"]
 
 
-def assert_backward_held(held: tuple[BackRun, dict] | None, lane: Lane) -> bool:
+def assert_backward_held(held: tuple[BackRun, dict] | None, lane: Lane) -> None:
     """A form's fast backward (`backward_form_held`'s) witnessed: every record each launch keeps inside its
     step's enclosure (row 2084 (e)), and where it gates the values, a walk that dropped the gate refused
-    (`dropped_gate_held`, `DROPPED_GATE_SHARE`). Whether the template trains it, so the form was witnessed."""
+    (`dropped_gate_held`, `DROPPED_GATE_SHARE`); none of a form declared untrained there (`UNTRAINED`)."""
     if held is None:
-        return False
+        return
     back, inside = held
     for name, found in inside.items():
         assert np.all(found), (back.run.write, back.run.held, name, np.mean(found))
     if back.run.write == "values":
         refused = np.mean(~dropped_gate_held(back, lane))
         assert refused >= DROPPED_GATE_SHARE, ("a dropped write gate", refused)
-    return True
 
 
-def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> bool:
-    """The step witness of the fast backward (`back_enclosures`) in one of its forms where the template
-    trains it (`backward_form_held`, `assert_backward_held`); whether it does."""
-    return assert_backward_held(backward_form_held(lane, form, heads), lane)
+def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> None:
+    """The step witness of the fast backward (`back_enclosures`) in one of its forms, trained unless declared
+    untrained on the target (`backward_form_held`, `assert_backward_held`)."""
+    assert_backward_held(backward_form_held(lane, form, heads), lane)
 
 
 def claimed_gradients_held(lane: Lane, heads: int = 1) -> dict:
