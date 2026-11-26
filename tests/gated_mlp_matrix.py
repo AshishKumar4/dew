@@ -6,13 +6,10 @@ output and the gradients of its input and every parameter (`reference_error.with
 cotangent) held to the layer with the fused MLP named apart (`generation.chosen`, check 1) from the layer in
 float64.
 
-The kernel under test is the fused MLP's, named `fused` where the cells run it (its selector's own pick is the
-products apart where no receipt declares the fused MLP faster, `dew.nn.gated_mlp.FUSED_CELLS`), its products
-on the GEMM template (`grouped_matmul` named `mosaic`, which the fused MLP needs: `gated_mlp.GatedCase`'s
-`launched`) and the gated product's own kernel at XLA (`swiglu`, the products-apart arm's).
-
-What the route serves is read from the fused MLP's own selector: the layer traced for its shapes as the case's
-generation with it named, the route its choice reports the `fused` kernel.
+Each cell names its fused form (`fused` or `wide`); the selector's own pick stays apart until a receipt
+declares a faster form (`gated_mlp.FUSED_CELLS`). The products take the GEMM template
+(`grouped_matmul="mosaic"`); the products-apart arm takes the gated product's XLA kernel.
+The matrix reads support from the layer's route at its actual case and named form.
 """
 
 
@@ -36,8 +33,8 @@ LIMIT = 1.5
 """A clamped gated product's limit (`GatedMLP.swiglu_limit`), which drawn projections cross."""
 CHOICES = frozenset({"gated_mlp"})
 """The `generation.CHOICES` entries the cells run."""
-KERNELS = {"gated_mlp": frozenset({"fused"})}
-"""The kernels under test of each choice the cells run: the three products fused."""
+KERNELS = {"gated_mlp": frozenset({"fused", "wide"})}
+"""The paired and wide-accumulator forms, each exercised against the projections apart."""
 NAMED = {"grouped_matmul": "mosaic", "swiglu": "xla"}
 """The layer's other choices as every cell names them."""
 
@@ -55,16 +52,14 @@ def _input(case: dict[str, str]):
 
 
 def supported(case: dict[str, str]) -> bool:
-    """Whether the route serves `case` (tests/kernel_matrix.py): its layer traced for its shapes as its
-    generation within an abstract mesh of one of its devices, the fused MLP named, reports the `fused`
-    kernel."""
+    """Whether the named form serves `case` after tracing the layer on a mesh of its generation."""
     layer = _layer(case)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     params = jax.eval_shape(layer.init, jax.random.key(0), _input(case))
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
-          generation.chosen(**NAMED, gated_mlp="fused"), generation.routes() as routes):
+          generation.chosen(**NAMED, gated_mlp=case["kernel"]), generation.routes() as routes):
         jax.eval_shape(layer.apply, params, _input(case))
-    return [route.kernel for route in routes if route.choice == "gated_mlp"] == ["fused"]
+    return [route.kernel for route in routes if route.choice == "gated_mlp"] == [case["kernel"]]
 
 
 def _drawing(layer: GatedMLP, dtype):
@@ -78,25 +73,30 @@ def _drawing(layer: GatedMLP, dtype):
     return draw
 
 
-CASES = (
+_COVERED = (
     ('sm90', 'swiglu', 'none', 'bfloat16'),
     ('sm90', 'geglu', 'clamped', 'float16'),
     ('sm100', 'swiglu', 'clamped', 'float16'),
     ('sm100', 'geglu', 'none', 'float16'),
     ('sm100', 'geglu', 'clamped', 'bfloat16'),
 )
+CASES = tuple((*case, kernel) for kernel in ("fused", "wide") for case in _COVERED)
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("gated_mlp")`, regenerated where the axes or the route's support change)."""
 
 
+def _case_name(case: tuple[str, ...]) -> str:
+    """Keep the existing paired cells' names and distinguish the new wide cells."""
+    return "-".join(case[:-1] if case[-1] == "fused" else case)
+
+
 @cell("gated_mlp", covers=lambda case: dict(zip(AXES["gated_mlp"], case, strict=True)))
 @pytest.mark.parametrize("case", [pytest.param(case, marks=generation_support.pinned(case[0]))
-    for case in CASES], ids="-".join)
+    for case in CASES], ids=_case_name)
 def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
     """The layer's training step of `case` on its GPU with its products fused on par with the products apart
     (check 1): the output and the gradients of the input and every parameter, from the layer apart in
-    float64 (XLA's products, which a float64 product runs on). The routes it records run the fused MLP
-    `fused`."""
+    float64 (XLA's products, which a float64 product runs on). The reported route is the named form."""
     combination = dict(zip(AXES["gated_mlp"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
@@ -110,9 +110,9 @@ def a_fused_mlps_training_step_is_on_par(case: tuple[str, ...]) -> None:
 
     run, truth = with_gradients(layer.apply), with_gradients(layer.clone(dtype=jnp.float64).apply)
     with generation.routes() as routes:
-        assert_as_exact(under("fused", run), under("apart", run), draw, "-".join(case), seeds=SEEDS,
-                        truth_fn=truth)
-    assert ("gated_mlp", "fused") in {(found.choice, found.kernel) for found in routes}
+        assert_as_exact(under(combination["kernel"], run), under("apart", run), draw, _case_name(case),
+                        seeds=SEEDS, truth_fn=truth)
+    assert ("gated_mlp", combination["kernel"]) in {(found.choice, found.kernel) for found in routes}
 
 
 def per_shard(choice: str, kernel: str) -> dict:
@@ -125,8 +125,9 @@ def per_shard(choice: str, kernel: str) -> dict:
     from sharded import Shard, layer_scope
 
 
-    del choice, kernel
-    case = dict(zip(AXES["gated_mlp"], next(case for case in CASES if case[0] == "sm90"), strict=True))
+    del choice
+    shapes = next(case for case in CASES if case[0] == "sm90" and case[-1] == kernel)
+    case = dict(zip(AXES["gated_mlp"], shapes, strict=True))
     layer = _layer(case)
     draw = _drawing(layer, jnp.dtype(case["dtype"]))
 

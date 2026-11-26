@@ -110,6 +110,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "activation": ("swiglu", "geglu"),
         "limit": ("none", "clamped"),
         "dtype": ("bfloat16", "float16"),
+        "kernel": ("fused", "wide"),
     },
     "recurrence": {
         "generation": ("sm90", "sm80"),
