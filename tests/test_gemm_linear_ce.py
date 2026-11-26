@@ -260,20 +260,46 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
 
 
-def test_a_capped_linear_cross_entropy_launch_caps_as_its_reference_does():
-    """The fused linear cross entropy's launch at a softcap of 20, interpreted as an H100's, gives each row's
-    loss of the logits its reference caps (`precision.capped_logits`: the quotient correctly rounded on every
-    backend, row 13353) within fp32's sum-order rounding: dyadic inputs, each logit exact before its cap."""
+def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
+    """The fused linear cross entropy's launch at a softcap of 20, interpreted as an H100's, on par (check 1)
+    with the portable arm's loss of its capped logits (`precision.capped_logits`), each from an independent
+    float64 cross entropy of `cap * tanh(z / cap)` (row 13353)."""
     from dew.nn.precision import capped_logits
 
-    rng = np.random.default_rng(13353)
-    x = jnp.asarray(rng.integers(-4, 5, size=(64, 64)) / 4, jnp.bfloat16)
-    w = jnp.asarray(rng.integers(-4, 5, size=(256, 64)) / 4, jnp.bfloat16)
-    t = jnp.asarray(rng.integers(0, 256, size=(64,)), jnp.int32)
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        tile = linear_ce.derive_linear_ce((64, 256, 64), jnp.bfloat16, target, interpret=True)
-        loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1, interpret=True)
-    capped = capped_logits(jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32).T), 20.0)
-    want = jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
-    np.testing.assert_allclose(np.asarray(loss), np.asarray(want), rtol=2e-6, atol=2e-6)
+    def draw(seed):
+        rng = np.random.default_rng(13353 + seed)
+        return (jnp.asarray(rng.normal(size=(64, 64)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(256, 64)), jnp.bfloat16),
+                jnp.asarray(rng.integers(0, 256, size=(64,)), jnp.int32))
+
+    def fused(x, w, t):
+        with generation.assumed("sm90"):
+            tile = linear_ce.derive_linear_ce((64, 256, 64), jnp.bfloat16, generation.gpu_target(),
+                                              interpret=True)
+            loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1, interpret=True)
+            return loss
+
+    def portable(x, w, t):
+        capped = capped_logits(jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32).T), 20.0)
+        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
+
+    def truth(x, w, t):
+        logits = np.asarray(x, np.float64) @ np.asarray(w, np.float64).T
+        capped = 20.0 * np.tanh(logits / 20.0)
+        peak = capped.max(axis=1, keepdims=True)
+        return (np.log(np.exp(capped - peak).sum(axis=1)) + peak[:, 0]) - capped[np.arange(64), np.asarray(t)]
+
+    label = "capped linear_ce"
+    dew_fn, ref_fn = jax.jit(fused), jax.jit(portable)
+    assert_as_exact(dew_fn, ref_fn, draw, label, seeds=seeds_for(ref_fn, draw, label, truth_fn=truth,
+                                                                  dew_fn=dew_fn), truth_fn=truth)
+
+
+def test_a_capped_logit_of_zero_at_a_cap_past_its_reciprocals_range_is_zero():
+    """`precision.capped_logits` of a zero logit at a runtime fp32 cap of 2^-130 (its reciprocal past fp32's
+    largest) is zero, its quotient correctly rounded (row 13353's review), where a reciprocal's product
+    reads 0 * inf, NaN."""
+    from dew.nn.precision import capped_logits
+
+    out = jax.jit(capped_logits)(jnp.zeros((2,), jnp.float32), jnp.asarray([2.0 ** -130, 1.0], jnp.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((2,), np.float32))
