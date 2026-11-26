@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A generated surrogate now uses its written value and derivative when an unhashable static argument
+  cannot select a generated case.
+
 - A run's surface names its everyday settings plainly and once (API03). `Trainer(objective, Muon(), lr=3e-4)`
   takes an optimizer's spec with its rate, its schedule (`schedule=`, whose peak is `lr` where it names none)
   and its clip beside it, and `accumulation`, `update_tokens`, `split`, `remat` and `microbatches` as its own

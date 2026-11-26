@@ -121,6 +121,13 @@ class SurrogateBodies:
                 declare(module, case.tangent_name(inactive), form)
         return self
 
+    def _case(self, fixed: tuple) -> SurrogateCase | None:
+        # JAX permits written nondifferentiable arguments that cannot key a generated case.
+        try:
+            return self.cases.get(fixed)
+        except TypeError:
+            return None
+
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
         """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
         from jax.custom_derivatives import SymbolicZero
@@ -132,7 +139,7 @@ class SurrogateBodies:
         @functools.wraps(self.forward)
         def forward(*values):
             fixed = tuple(values[index] for index in fixed_at)
-            case = self.cases.get(fixed)
+            case = self._case(fixed)
             dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
             if (case is not None and (flat := _case_leaves(case, dynamic)) is not None
                     and _case_admitted(case.forward.cases, flat, policy, target)):
@@ -141,7 +148,7 @@ class SurrogateBodies:
 
         def tangent(*values):
             *fixed, primals, directions, value = values
-            case = self.cases.get(tuple(fixed))
+            case = self._case(tuple(fixed))
             leaves = jax.tree.leaves(directions, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
             inactive = tuple(i for i, leaf in enumerate(leaves) if isinstance(leaf, SymbolicZero))
             if case is None or jax.tree.structure(value) != case.output_tree[0]:

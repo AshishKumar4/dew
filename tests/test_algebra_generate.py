@@ -4,6 +4,7 @@ declaration (check 1), a printed program computes what its jaxpr does bit for bi
 keeps what its sums round away (`dew.algebra.printed`), and §1.5's acceptance cases are generated as their
 error decides (`dew.algebra.acceptance`)."""
 
+import dataclasses
 import functools
 import importlib
 import subprocess
@@ -328,6 +329,36 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
         return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
 
     assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
+
+
+def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
+    from dew.algebra import component_cases_derived as emitted
+    from dew.nn import precision
+
+    def dtype_of(spec):
+        return spec["dtype"] if isinstance(spec, dict) else spec
+
+    def forward(value, spec):
+        return precision._rounded(value, dtype_of(spec))
+
+    def tangent(spec, primals, directions, value):
+        return precision._rounded_tangent(dtype_of(spec), primals, directions, value)
+
+    paired = dataclasses.replace(component_cases.ROUNDED, forward=forward, tangent=tangent)
+    composed = paired.assembled(lambda name: getattr(emitted, name))
+    options = {"dtype": jnp.bfloat16}
+    x = jnp.full((16, 32), 1.003, jnp.float32)
+    dx = jnp.full_like(x, 1.007)
+
+    def fallback(value):
+        return composed(value, options)
+
+    primal = jax.jit(fallback)(x)
+    value, direction = jax.jit(lambda x, dx: jax.jvp(fallback, (x,), (dx,)))(x, dx)
+    expected = precision.rounded_operand(x, jnp.bfloat16)
+    np.testing.assert_array_equal(primal, expected)
+    np.testing.assert_array_equal(value, expected)
+    np.testing.assert_array_equal(direction, dx)
 
 
 def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_value():
