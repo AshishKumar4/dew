@@ -16,6 +16,7 @@ from dew.nn.kernels.templates import (
     attention_gradient as gradient,
     attention_program,
     axes,
+    band,
 )
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -65,10 +66,7 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
         row, head = shared_place(value.shape, row, head)
     if kind is Kind.BAND:
         assert origins is not None and origin_row is not None, "a band is read by its origins, after it"
-        column = keys[None, :] - origins[origin_row, 0, rows][:, None].astype(jnp.int32)
-        inside = (column >= 0) & (column < value.shape[-1])
-        read = jnp.take_along_axis(value[row, head, rows], jnp.clip(column, 0, value.shape[-1] - 1), axis=-1)
-        return jnp.where(inside, read, jnp.zeros((), read.dtype))
+        return band.band_read(value[row, head, rows], origins[origin_row, 0, rows], keys)
     places = {"batch": row, "heads": head, "queries": rows[:, None], "keys": keys[None, :]}
     return value[axes.named(kind, places)]
 

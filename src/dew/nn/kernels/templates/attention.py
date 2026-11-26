@@ -43,7 +43,7 @@ from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import scaled_contraction
+from dew.nn.kernels.templates import band, scaled_contraction
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
 from dew.nn.precision import (
     at_least_fp32,
@@ -1211,13 +1211,9 @@ def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = N
         row, head = shared_place(value.shape, row, head)
     if kind_of(param) is Kind.BAND:
         assert origins is not None and origin_row is not None, "a band is read by its origins, after it"
-        bands = value[row, head]
-        # Its origins whole keys whatever dtype a truth's draw widened them to.
-        origin = origins.value[origin_row, 0][:, None].astype(jnp.int32)
-        column = jnp.arange(keys, dtype=jnp.int32)[None, :] - origin
-        inside = (column >= 0) & (column < bands.shape[-1])
-        read = jnp.take_along_axis(bands, jnp.clip(column, 0, bands.shape[-1] - 1), axis=-1)
-        return jnp.where(inside, read, jnp.zeros((), bands.dtype))
+        # Its origins whole keys whatever dtype a truth's draw widened them to (`band_read`'s).
+        return band.band_read(value[row, head], origins.value[origin_row, 0],
+                              jnp.arange(keys, dtype=jnp.int32))
     match kind_of(param):
         case Kind.HEAD:
             return value[head]

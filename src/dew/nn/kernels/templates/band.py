@@ -32,18 +32,29 @@ def band_origins(offset: jax.Array, queries: int, extent: int) -> jax.Array:
     return jnp.floor_divide(start, BAND_ALIGN) * BAND_ALIGN
 
 
+def band_read(rows: jax.Array, origins: jax.Array, keys: jax.Array) -> jax.Array:
+    """A band's entries at `keys` (int32 key indices `[..., K]`): each query's `rows` `[..., Q, Kb]` read at
+    each key's column from its origin (`origins` `[..., Q]`, column 0's key), zero for a key past its band.
+    Every reader that writes a band out over keys reads it so: the dense call's (`band_dense`), the
+    reference's per head and the portable mainloop's tiles."""
+    width = rows.shape[-1]
+    column = keys[..., None, :] - origins[..., :, None].astype(jnp.int32)
+    inside = (column >= 0) & (column < width)
+    read = jnp.take_along_axis(rows, jnp.clip(column, 0, width - 1), axis=-1)
+    return jnp.where(inside, read, jnp.zeros((), read.dtype))
+
+
 def band_dense(values: jax.Array, offset: jax.Array, extent: int, keys: int) -> jax.Array:
     """A band's `values` `[B or 1, H or 1, Q, band_width(extent)]` (`band_origins`) written out over `keys`,
-    `[B or 1, H or 1, Q, K]`: each key in a query's band its column's value, every other key's zero."""
+    `[B or 1, H or 1, Q, K]`: each key in a query's band its column's value, every other key's zero
+    (`band_read`)."""
     rows, heads, queries, width = values.shape
     origins = band_origins(offset, queries, extent)
-    column = jnp.arange(keys, dtype=jnp.int32)[None, None, :] - origins[:, :, None]
-    inside = (column >= 0) & (column < width)
     # The rows the values and the origins broadcast to: a row of either broadcasts, none of either is none.
     batch = jnp.broadcast_shapes((rows,), (origins.shape[0],))[0]
-    index = jnp.broadcast_to(jnp.clip(column, 0, width - 1)[:, None], (batch, heads, queries, keys))
-    read = jnp.take_along_axis(jnp.broadcast_to(values, (batch, heads, queries, width)), index, axis=-1)
-    return jnp.where(inside[:, None], read, jnp.zeros((), values.dtype))
+    return band_read(jnp.broadcast_to(values, (batch, heads, queries, width)),
+                     jnp.broadcast_to(origins[:, None], (batch, heads, queries)),
+                     jnp.arange(keys, dtype=jnp.int32))
 
 
 def band_column(origin: jax.Array, k_first, keys: int | jax.Array, width: int) -> tuple[jax.Array, jax.Array]:
