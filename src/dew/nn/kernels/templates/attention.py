@@ -814,12 +814,26 @@ class Capped(tuning.FieldHook):
     """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
     `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
     its static facts serves every layer of one cap (`tuning.lowered_once`), and its call reads its cap
-    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`)."""
+    alone, so one rebuilt each call shares its analysis (`tuning.FieldHook`). Of fp32 logits the quotient
+    is the logits times the cap's fp32 reciprocal (`reciprocal`), the arithmetic every backend runs alike
+    and its gradient's too: a division by a constant is XLA:CPU's multiply by its reciprocal, not correctly
+    rounded (ledger 1402), and a kernel's division has no correctly rounded form every body lowers. Of any
+    other dtype, or a cap whose fp32 reciprocal is no finite nonzero number (a cap past fp32's range), the
+    logits are divided by the cap in their own dtype."""
 
     softcap: float
 
+    @property
+    def reciprocal(self) -> float:
+        """The fp32 cap's reciprocal, an fp32 division's (rounded once, where a float64 quotient rounded to
+        fp32 rounds twice), which its logits are multiplied by, the forward's fold
+        (`attention_algebra.folds`) reading the same."""
+        return float(np.float32(1) / np.float32(self.softcap))
+
     def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
         del q_pos, k_pos
+        if logits.dtype == jnp.float32 and 0 < abs(self.reciprocal) < math.inf:
+            return self.softcap * jnp.tanh(logits * self.reciprocal)
         return self.softcap * jnp.tanh(logits / self.softcap)
 
 
