@@ -33,7 +33,7 @@ from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
 from dew.nn.mla import SELECTIONS
-from dew.nn.precision import float32_einsum
+from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import SELECTING, block_maxima, block_runs, selected_attention, top_k_selection
 
@@ -265,11 +265,13 @@ def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Arr
     place = jnp.arange(keys)
     chosen = jnp.any(selected[..., None] == (place // block), axis=-2)
     tokens = chosen & (place[None, :] <= jnp.arange(queries)[:, None])
+    # At least fp32 (float64 a truth's run).
+    wide = at_least_fp32(jnp.result_type(index_scores, logits))
     teacher = jax.nn.softmax(jnp.where(tokens[:, :, None], logits.reshape(rows, groups, per, queries, keys
-                                                                          ).astype(jnp.float32), -jnp.inf),
+                                                                          ).astype(wide), -jnp.inf),
                              axis=-1)
     teacher = jax.lax.stop_gradient(jnp.where(tokens, teacher.mean(axis=2), 0.0))
-    student = jax.nn.log_softmax(jnp.where(tokens, index_scores.astype(jnp.float32), -jnp.inf), axis=-1)
+    student = jax.nn.log_softmax(jnp.where(tokens, index_scores.astype(wide), -jnp.inf), axis=-1)
     divergence = jnp.where(tokens & (teacher > 0), teacher * (jnp.log(jnp.where(teacher > 0, teacher, 1.0))
                                                                - student), 0.0)
     return divergence.sum() / (rows * queries * groups)

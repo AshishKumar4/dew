@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 from attention_oracle import qkv
 from flax import linen as nn
-from reference_error import assert_as_exact, with_gradients
+from reference_error import (
+    assert_as_exact,
+    assert_computes_the_oracle,
+    assert_fp32_reduction_bound,
+    with_gradients,
+)
 from test_mixers import VOCAB, tiny
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
@@ -283,8 +288,12 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     key = np.asarray(hidden, np.float64) @ wk
     expected = np.einsum("bngd,bmd->bgnm", query, key) / np.sqrt(width)
     causal = np.tril(np.ones((length, length), bool))
-    np.testing.assert_allclose(np.where(causal, scores, 0.0), np.where(causal, expected, 0.0), rtol=1e-4,
-                               atol=1e-4)
+    # Each score's products' magnitudes through both projections' (their own reductions' rounding carried).
+    absolute = np.abs(np.asarray(hidden, np.float64))
+    magnitudes = np.einsum("bngd,bmd->bgnm", (absolute @ np.abs(wq)).reshape(query.shape),
+                           absolute @ np.abs(wk)) / np.sqrt(width)
+    assert_fp32_reduction_bound(np.where(causal, scores, 0.0), np.where(causal, expected, 0.0),
+                                np.where(causal, magnitudes, 0.0), embed + width + 1)
     assert np.all(np.isneginf(scores[..., ~causal]))
 
     for initial, local, forcing in ((0, 1, "MSA's own block"), (1, 2, "M3's first and two local")):
@@ -302,7 +311,10 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k))
 
     logits = jnp.asarray(rng.standard_normal((rows, heads * groups, length, length)), jnp.float32)
-    loss = float(block_sparse.msa_indexer_kl(jnp.asarray(scores), logits, jnp.asarray(selected), block=block))
+    with jax.enable_x64(new_val=True):
+        loss = np.asarray(block_sparse.msa_indexer_kl(jnp.asarray(scores, jnp.float64),
+                                                      jnp.asarray(logits, jnp.float64), jnp.asarray(selected),
+                                                      block=block))
     total = 0.0
     for row, group, at in np.ndindex(rows, groups, length):
         blocks = {int(b) for b in selected[row, group, at] if b >= 0}
@@ -313,7 +325,9 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
         student = scores[row, group, at, tokens].astype(np.float64)
         student = student - student.max() - np.log(np.exp(student - student.max()).sum())
         total += float(np.sum(teacher * (np.log(teacher) - student)))
-    np.testing.assert_allclose(loss, total / (rows * groups * length), rtol=1e-4)
+    # The loss run in float64 is the oracle's, to float64 rounding over a row's softmaxes and the sum.
+    assert_computes_the_oracle(loss, np.asarray(total / (rows * groups * length)), "MSA's indexer loss",
+                               roundings=rows * groups * length * length)
 
     def trained(params, hidden):
         return block_sparse.msa_indexer_kl(indexer.apply(params, hidden), logits, jnp.asarray(selected),
