@@ -1,8 +1,9 @@
 """A sub-chunk's own pairs under a decay a key dimension as anchored products (`recurrence_algebra`'s
-`own_anchors`, `own_anchored`, `own_compact`; the forward kernel's `anchored.step`): where the guard holds,
-the pairs each its own decay (check 1); the guard failing at each edge of its range, where the kernel takes
-the pairs each its own decay instead; and a query's gradient through the template, interpreted, of two score
-cotangents that cancel to their 24th bit, bit for bit. (Kimi's template under its declared bound on par with
+`own_anchors`, `own_anchored`, `own_compact`, `own_columns`; the kernels' `anchored.step`, `anchored.back`):
+where the guard holds, the pairs each its own decay (check 1); the guard failing at each edge of its range,
+where the kernels take the pairs each its own decay instead; the backward's compact blocks' layout; and a
+query's gradient through the template, interpreted, of two score cotangents that cancel to their 24th bit,
+bit for bit. (Kimi's template under its declared bound on par with
 the portable math, either side of the guard, waits on row 13271: before any anchored product its final
 memory is far off that math's at the bound.)"""
 
@@ -117,12 +118,12 @@ its own pairs as anchored products (`anchored.anchoring`)."""
 @COMPILES_ON_CPU
 def test_a_query_gradient_of_cancelling_score_cotangents_keeps_their_last_bits():
     """A query's gradient of two score cotangents that cancel to their 24th bit, through the template and its
-    own pairs' backward (`own_pairs.key_pairs_own`), interpreted, the token-by-token recurrence's in float64
+    own pairs' anchored backward (`anchored.back`), interpreted, the token-by-token recurrence's in float64
     bit for bit: zero queries and decays, keys `e0` and `-e0` written whole, values `(1, 2^-9, 2^-20)` and
     `(0, 0, -2^-20)`, so the corrected values are `(1, 2^-9, 2^-20)` and `(1, 2^-9, 0)`, and a unit cotangent
     on the third token's three value columns: its score cotangents `1 + 2^-9 + 2^-20` and `1 + 2^-9`, its
-    query's first channel `scale (2^-20)` a value head: an anchored backward staging the cotangents in two
-    bf16 parts took both as `(1, 2^-9)`, the gradient zero (a head review's P0 of 28c4e9f0f)."""
+    query's first channel `scale (2^-20)` a value head: staged in two bf16 parts, both cotangents took
+    `(1, 2^-9)`, the gradient zero (a head review's P0 of 28c4e9f0f); in `anchored.BLOCK_PARTS`, kept."""
     operands, (out, final) = cotangents(UNBOUND_QUERIES, 'the decay bound', 0)
     writes = jnp.zeros_like(operands.beta).at[:, :2].set(1.0)
     key = jnp.zeros_like(operands.key).at[:, 0, :, 0].set(1.0).at[:, 1, :, 0].set(-1.0)
@@ -139,3 +140,25 @@ def test_a_query_gradient_of_cancelling_score_cotangents_keeps_their_last_bits()
             *widened((operands, cotangent)))
     ours, theirs = (np.asarray(grads[1].query[:, 2, :, 0], np.float64) for grads in (found, truth))
     assert np.all(theirs != 0) and np.array_equal(ours, theirs), (ours, theirs)
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_a_sub_chunks_compact_columns_are_its_square_strictly_before_or_after(transposed):
+    """`own_columns` of a call's pairs `[R, H * C]`: row `i`'s column `c` the pair `(i, f + c)` strictly
+    before `i` (`f` its sub-chunk's first token), and `transposed` row `j`'s column `r` the pair `(f + r, j)`
+    strictly after `j`, zero elsewhere: each sub-chunk's own square, the anchored backward's operands."""
+    rows, heads = 2 * CHUNK, 3
+    pairs = np.random.default_rng(3).standard_normal((rows, heads * CHUNK)).astype(np.float32)
+    found = np.asarray(algebra.own_columns(jnp.asarray(pairs), chunk=CHUNK, transposed=transposed))
+    expected = np.zeros((rows, heads * SUB), np.float32)
+    for token in range(rows):
+        start, place = token - token % CHUNK, token % CHUNK
+        first = place - place % SUB
+        for h in range(heads):
+            for c in range(SUB):
+                other = first + c
+                if transposed and other > place:
+                    expected[token, h * SUB + c] = pairs[start + other, h * CHUNK + place]
+                elif not transposed and other < place:
+                    expected[token, h * SUB + c] = pairs[token, h * CHUNK + other]
+    assert np.array_equal(found, expected)

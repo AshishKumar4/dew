@@ -1409,7 +1409,8 @@ def fitting_block(call: Call, held: Callable[[int], Held], staged: Callable[[int
 
 
 def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
-              streamed: Callable[[int], dict] | None = None, *, contracted: bool = False) -> int:
+              streamed: Callable[[int], dict] | None = None, *, contracted: bool = False,
+              reducing: int = 0, widest: bool = False) -> int:
     """A launch's key block under a decay a key dimension, whose prefix, decays and gated keys it
     holds a block at a time in fp32: from the widest of the family's depths for 16-bit operands
     (`Family.depths`) down to the narrowest columns a staged operand takes (`key_blocks`: its depth's where
@@ -1419,14 +1420,19 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     most programs of (`_planned_launch`, at its register model and its shared memory), the widest of those.
     Its walks wait on their products' latency: the intra launch's 248 registers a thread and 143 KB held an
     H100 at one program a multiprocessor, its schedulers without a warp to issue 64% of its cycles
-    (kda-ncu2-h100-bc481d7de)."""
+    (kda-ncu2-h100-bc481d7de). A launch whose roles reduce across their warps implicitly counts their
+    `reducing` share of scratch (`resources.Scope.reducing_warpgroups`); one whose work a step is fixed
+    (`widest`: a guard, its factors and its staging a key block) takes the widest block holding a program."""
     if streamed is None:
         return fitting_block(call, held, staged, call.family.depths(jnp.bfloat16)[0],
                              _key_unit(call, contracted=contracted))
-    resident = functools.partial(_resident, call, held, staged, streamed)
+    resident = functools.partial(_resident, call, held, staged, streamed, reducing=reducing)
     # Where no block holds a program, the narrowest, as `fitting_block` falls back: the widest, which the
     # register-unchecked gate compiled, spilled 2784 bytes where the narrowest's need was the question
     # (row 5298, jsf-sm100-redgreen).
+    if widest:
+        return max(key_blocks(call, contracted=contracted),
+                   key=lambda block: (resident(block) > 0, block if resident(block) else -block))
     return max(key_blocks(call, contracted=contracted),
                key=lambda block: (resident(block), block if resident(block) else -block))
 
@@ -1464,18 +1470,28 @@ def launch_fits(call: Call, held: Held, staged: tuple, blocks: dict) -> bool:
             and registers <= call.family.registers(1))
 
 
+def key_block_holds(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
+                    streamed: Callable[[int], dict], *, contracted: bool = False, reducing: int = 0) -> bool:
+    """Whether a walk under a decay a key dimension holds a program a multiprocessor at any of its key
+    blocks (`key_block`'s, `_resident`, its roles' `reducing` share of scratch counted): a launch's form a
+    plan may take only where it does (the KDA backward's anchored own pairs, `anchored.back`)."""
+    return any(_resident(call, held, staged, streamed, block, reducing=reducing)
+               for block in key_blocks(call, contracted=contracted))
+
+
 def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
-              streamed: Callable[[int], dict], block: int) -> int:
+              streamed: Callable[[int], dict], block: int, *, reducing: int = 0) -> int:
     """The programs a multiprocessor holds of a walk at key block `block` (`_planned_launch`, at its register
-    model and its shared memory), none past a thread's registers."""
+    model and its shared memory, its `reducing` warpgroups' scratch counted), none past a thread's registers
+    or the device's block budget."""
     family = call.family
     staging, landing = staged(block)
     registers = held(block).registers(family, addressed(staging, landing))
     if registers > family.registers(1):
         return 0
-    _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing)
+    _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing, reducing=reducing)
     found = _planned_launch(call, resources.Launch(scope, 1, registers, floor=1, most=1))
-    return found.programs if found else 0
+    return found.programs if found and found.shared <= generation.shared_budget(call.target) else 0
 
 
 def _doubling_held(call: Call) -> list:
