@@ -46,6 +46,7 @@ def pytest_collection_modifyitems(config, items):
     # The plan's groups of each file's recorded tests (`cut`, ci.py's `members`), which this task keeps.
     kept_nodes: set[str] = set()
     discrepant: set[str] = set()
+    unrecorded_groups: set[str] = set()
     for name in sorted({grading.owning(node) for node in nodes}):
         path = Path(name)
         sites = session.declared_marks(name, path.read_text()) if path.is_file() else {}
@@ -67,10 +68,14 @@ def pytest_collection_modifyitems(config, items):
             raise pytest.UsageError(f"{name}: its {count} groups do not hold each of its {len(collected)} "
                                     "collected tests once (session.kept)")
         kept_nodes |= set(groups[index - 1])
+        # Its group keeps no key where it holds a test the record lacks: the plan, which cuts by the record
+        # alone, places that one otherwise. A group of only recorded tests is the plan's group whole
+        # (`session.kept`), keyed, whatever another group of its file holds (2026-11-25: one new test kept
+        # every group of its file from reuse, 15-20% of a suite's rows).
+        unrecorded_groups |= {name} if any(node not in recorded for node in groups[index - 1]) else set()
     if unrecorded := os.environ.get("DEW_UNRECORDED"):
         with open(unrecorded, "w") as out:
-            json.dump(sorted({grading.owning(node) for node in nodes if node not in recorded} | discrepant),
-                      out)
+            json.dump(sorted(unrecorded_groups | discrepant), out)
     kept = {id(item) for item in items if item.nodeid in kept_nodes}
     config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
     items[:] = [item for item in items if id(item) in kept]

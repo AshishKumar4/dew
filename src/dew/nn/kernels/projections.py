@@ -17,7 +17,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew import _cache
 from dew._facts import Held
-from dew.mesh import mesh_axes
+from dew.mesh import mesh_axes, spec_axes
 from dew.nn.derivatives import (
     Protected,
     Surrogate,
@@ -40,7 +40,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_product,
 )
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
-from dew.nn.precision import biased, biased_value
+from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
 from dew.nn.sharding import (
     RESIDUAL,
     automatic_axes,
@@ -582,9 +582,10 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
     rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
+    # An FP4 backward's exact fp32 products: the decoded codes times their scales, held whole.
     d_w = gemm_t((rows.decoded() * rows.scale).T.astype(jnp.float32),
                  (cotangents.decoded() * cotangents.scale).T.astype(jnp.float32), sizes, out_dtype=w.dtype,
-                 precision=jax.lax.Precision.HIGHEST, interpret_on_cpu=interpret)
+                 precision=EXACT_FLOAT32, interpret_on_cpu=interpret)
     return (*with_gradients_formed(d_x, d_w), None, None)
 
 # The NVFP4 recipe's gradient (`nvfp4_projection`): a derivative of Dew's choosing (`Surrogate`); its tensor
@@ -734,7 +735,7 @@ def rows_split(lhs: jax.Array) -> jax.sharding.PartitionSpec | None:
         return None
     lead = min(lhs.ndim - 1, 2)
     rows = logical_spec(RESIDUAL[:lead], lhs.shape[:lead])
-    named = {axis for entry in rows for axis in ((entry,) if isinstance(entry, str) else entry or ())}
+    named = spec_axes(rows)
     return jax.sharding.PartitionSpec(*rows) if named == automatic else None
 
 

@@ -56,7 +56,7 @@ from .grouped_cells import (
 from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
-from .templates import base
+from .templates import base, copies
 from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
@@ -942,8 +942,9 @@ class MosaicGmm(_Mosaic):
         family whose loads past an operand are bounded (`Family.bounded_loads`, TMA's) and whose products
         read its blocks by descriptor (`mosaic_gpu.partial_runs`), compiled, not swapped
         (`_swapped`), each axis at least a swizzled tile long where every operand and output along it lies in
-        rows of whole 16 bytes, as a TMA descriptor's strides must (a 100-wide bf16 matrix's 200-byte rows are
-        padded: "Async copies require all GMEM strides except the last one to be a multiple of 16 bytes"), and
+        rows of whole 16 bytes (`copies.whole_rows`), as a TMA descriptor's strides must (a 100-wide bf16
+        matrix's 200-byte rows are padded: "Async copies require all GMEM strides except the last one to be a
+        multiple of 16 bytes"), and
         no side tile runs along it (a side's copy spans its own dtype's tiles, which the fork's untiled view
         of a partial extent takes one of: a float32 side's 64 columns are two); the depth's where the rows are
         not gathered and the width's where they are not scattered (a gather's and a scatter's piecewise copies
@@ -963,7 +964,7 @@ class MosaicGmm(_Mosaic):
             # A call no narrower than a swizzled tile (`mosaic_gpu.partial_step`), which its last tile
             # spans partial; a narrower one is padded to its tile, as a whole tile's rows are.
             return (extent >= mosaic_gpu.partial_step(tokens.dtype)
-                    and all(extent * jnp.dtype(dtype).itemsize % 16 == 0 for dtype in dtypes))
+                    and all(copies.whole_rows(extent, dtype) for dtype in dtypes))
 
         def tiled(operands: tuple, axes_of: tuple, axis: str) -> bool:
             # A side tile along the axis (a vector's copy is one tile of its own, its load past it zeros).

@@ -2054,7 +2054,7 @@ def gpu_placed() -> bool:
 @functools.cache
 def host_memory_share() -> int:
     """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
-    memory, its control groups' limits (`cgroup_memory_limits`: a container's, a service's) and its address
+    memory, its control groups' limits (`_cgroups.memory_limits`: a container's, a service's) and its address
     space's (`RLIMIT_AS`), over the process's CPU devices, which share it (a forced count of them). Read once
     a process, which none of them changes in, where every attention call a trace sized read the files again
     (a U-Net layout cell's draws, 15 s of 178)."""
@@ -2062,40 +2062,13 @@ def host_memory_share() -> int:
 
     import jax
 
-    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *cgroup_memory_limits()]
+    from dew import _cgroups
+
+    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *_cgroups.memory_limits()]
     address, _ = resource.getrlimit(resource.RLIMIT_AS)
     if address != resource.RLIM_INFINITY:
         limits.append(address)
     return min(limits) // max(1, jax.local_device_count('cpu'))
-
-
-CGROUP_MEMORY = {2: ("sys/fs/cgroup", "memory.max"), 1: ("sys/fs/cgroup/memory", "memory.limit_in_bytes")}
-"""Each cgroup version's memory hierarchy, its mount under the root, and the file a group states its limit in
-(the kernel's cgroup-v2 and cgroup-v1 memory documentation)."""
-
-
-def cgroup_memory_limits(root: str = "/") -> list[int]:
-    """The memory limits on the control groups this process runs in (`/proc/self/cgroup`: v2's unified
-    group, v1's memory controller's), each group's own and every ancestor's up to its hierarchy's mount
-    (`CGROUP_MEMORY`), any of which bounds it; a group its mount does not show (a container's, whose own group
-    is its mount's root) states its limit at that root. `root` is the filesystem's, which a test builds."""
-    limits = []
-    with contextlib.suppress(OSError):
-        with open(os.path.join(root, "proc/self/cgroup")) as groups:
-            listed = groups.read().splitlines()
-        for line in listed:
-            _, controllers, group = line.split(":", 2)
-            version = 2 if not controllers else 1 if "memory" in controllers.split(",") else None
-            if version is None:
-                continue
-            mount, name = CGROUP_MEMORY[version]
-            parts = [part for part in group.split("/") if part]
-            for depth in range(len(parts), -1, -1):
-                # 'max' (v2's none) reads as no number.
-                with (contextlib.suppress(OSError, ValueError),
-                      open(os.path.join(root, mount, *parts[:depth], name)) as limit):
-                    limits.append(int(limit.read().strip()))
-    return limits
 
 
 @_fact

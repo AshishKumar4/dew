@@ -61,6 +61,7 @@ from dew.nn.float_bits import (
     raw_fields,
     split_bits,
     two_factor_reach,
+    whole_power2,
     widened_exactly,
 )
 from dew.nn.nested import nested
@@ -70,6 +71,7 @@ from dew.nn.sharding import explicit_spec
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
+    "EXACT_FLOAT32",
     "FP8",
     "FP32_SUMS",
     "L2NORM_EPS",
@@ -102,6 +104,8 @@ __all__ = [
     "compensated_sum",
     "compensated_total",
     "compensates_loops",
+    "computed_dot",
+    "computed_einsum",
     "configurable_precision",
     "configured_precision",
     "correctly_rounded_divide",
@@ -488,7 +492,8 @@ def _exp_value(base2: bool, x) -> jax.Array:
     return power2(summed, n, reach=150)
 
 
-def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None) -> jax.Array:
+def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None = None, *,
+           integral: bool = False) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever `x` and the result are normal values of
     its format (`x`'s, at least float32's, `at_least_fp32`), by exact powers of two of `k`'s sign
     (`exact_power2`), `k` held within `reach` (by default the format's saturating bound, 279 in float32):
@@ -502,7 +507,12 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     pullback, which applies the same factors in reverse before it sums a broadcast operand's cotangent
     (base review 44e282c4f F1).
     Within it, a caller stating its `reach` takes `k`'s two halves, each built as its product takes it, one
-    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half."""
+    integer tile live, not two (row 2519's register measurements), a subnormal result rounded at each half.
+    One stating `k` `integral` too (a floor's, `recurrence_algebra.raised`) in float32 takes them as floats,
+    `floor(k / 2)` and the rest, each set in its exponent bits by `whole_power2`, no integer conversion, the
+    rest first: below zero it is the truncated half the conversions take first, above it no factor rounds
+    short of an overflow either factor's order reaches, so the value is theirs bit for bit (a NaN `k`, no
+    integer, aside); a non-integral `k` keeps the conversions' truncation."""
     # Held at least in float32: an 8-bit float promotes implicitly to nothing.
     dtype = at_least_fp32(jnp.asarray(x).dtype)
     x = jnp.asarray(x, dtype)
@@ -513,8 +523,15 @@ def power2(x: jax.typing.ArrayLike, k: jax.typing.ArrayLike, reach: float | None
     # A Python integer held before it converts: one past float32's range raised in its host conversion.
     if isinstance(k, int):
         k = min(max(k, -held), held)
+    # An integral `k`'s float halves where its bound is an integer, so a clipped `k` stays one, in whatever
+    # dtype the clip promotes to; a fractional bound's, which the integer halves truncate, theirs.
+    halves = (held <= two_factor_reach(dtype) and integral and dtype == jnp.float32
+              and float(held).is_integer())
     # Held as float32, which holds every exponent within the bound exactly: no narrow integer `k` wraps.
     k = jnp.clip(jnp.asarray(k, jnp.float32), -held, held)
+    if halves:
+        half = jnp.floor(k * np.float32(0.5))
+        return x * whole_power2(k - half) * whole_power2(half)
     if held <= two_factor_reach(dtype):
         # The half truncated by its conversion, an integer only at each factor's bias: an int32 half or a
         # float `trunc` spilled the A100's recurrence and attention launches (row 2519).
@@ -1094,6 +1111,29 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
                        preferred_element_type=preferred_element_type)
 
 
+def computed_einsum(subscripts: str, *operands, dtype: DTypeLike) -> jax.Array:
+    """`jnp.einsum` of `operands` cast to `dtype`, the compute dtype the run computes the layer in, summed in
+    at least fp32 at the precision the run's policy gives such operands (`operand_precision`: a bf16 run's
+    Tensor Core product at the `BF16_BF16_F32` algorithm, `Numerics.matmul`'s configured level otherwise,
+    `ACCURATE`'s exact float32): the product a model layer's small contractions take (a cross-pass merge's
+    controller and its depth read, `dew.nn.cross_pass`; `DepthAttention`'s; a decision readout's), in the
+    run's numerics and no level of their own (row 12918)."""
+    compute = jnp.dtype(dtype)
+    return float32_einsum(subscripts, *(operand.astype(compute) for operand in operands),
+                          precision=operand_precision(compute), preferred_element_type=at_least_fp32(compute))
+
+
+def computed_dot(x: jax.Array, kernel: jax.Array, *, dtype: DTypeLike) -> jax.Array:
+    """`x`'s last axis contracted with `kernel`'s first, as `computed_einsum` contracts: a layer's projection
+    in the run's numerics (a cross-pass merge's controller, `dew.nn.cross_pass`), a dot product as a dense
+    layer's is, so a quantization rule over its products' ops reads it as one (row 12918)."""
+    compute = jnp.dtype(dtype)
+    contracted = (((x.ndim - 1,), (0,)), ((), ()))
+    return float32_dot_general(x.astype(compute), kernel.astype(compute), contracted,
+                               precision=operand_precision(compute),
+                               preferred_element_type=at_least_fp32(compute))
+
+
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
     """Whether `precision` names XLA's `BF16_BF16_F32` dot algorithm, which Dew's products run as
     `bf16_dot_general`."""
@@ -1324,6 +1364,11 @@ def numerics_of(given: Numerics | str) -> Numerics:
         return Numerics(DTYPE_PRESETS[given])
     raise ValueError(f"a run's precision is a Numerics record, 'default', one of {sorted(NUMERICS_PRESETS)} "
                      f"or a dtype preset of {sorted(DTYPE_PRESETS)}, not {given!r}")
+
+
+EXACT_FLOAT32 = jax.lax.Precision.HIGHEST
+"""The precision a genuinely exact boundary names, IEEE float32 whatever JAX's configured precision
+(`exact_float32`'s where its call states none): each user names its reason where it reads it (row 12921)."""
 
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
@@ -1567,7 +1612,11 @@ def uncontracted(*values):
 
     if interpreting() is not None or not _MARKING.get():
         return jax.lax.optimization_barrier(values)
-    return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
+    from dew._cache import unrecorded
+
+    # Its branches dispatch no kernel and route none: one trace under every receipt around it (row 10524).
+    with unrecorded():
+        return jax.lax.platform_dependent(values, default=jax.lax.optimization_barrier, **_UNBARRIERED)
 
 
 def _odd(dtype) -> bool:

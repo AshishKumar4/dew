@@ -28,6 +28,7 @@ from arm_arithmetic import float64_held
 from export_support import Stalled
 from jax.extend.backend import get_backend
 from map_judge import marked_seeds, sharded
+from placement_parity import assert_same_leaf
 from port_support import row_names_port
 from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact
@@ -1377,11 +1378,6 @@ def test_a_split_must_cut_every_batch_the_run_reads_into_whole_rows():
         splits(rows, BATCH, one, 1, 4)
 
 
-def raw(leaf):
-    """A leaf's bits, a key's included."""
-    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-
-
 def token_files(directory):
     """A token corpus written once, so a resume reads the files its checkpoint names: the same
     tokens to train and to validate on."""
@@ -1422,7 +1418,7 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
     actual = resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
     assert resumed.plan["split"] == 2
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-        assert raw(left).tobytes() == raw(right).tobytes()
+        assert_same_leaf(left, right)
     windowed(tmp_path / "finer", 2).fit(windows(corpus), steps=2, checkpoint_every=2)
     finer = windowed(tmp_path / "finer", 4)
     landed = finer.fit(windows(corpus), steps=4, checkpoint_every=2)
@@ -1956,14 +1952,14 @@ def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
     trainer = lm(split=1)
     state, _, _ = trainer.place()
     step = trainer.compile(state, BATCH)
-    before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
+    before = [jnp.copy(leaf) for leaf in jax.tree.leaves(state)]
     trials = Trials(state, BATCH, owned=owned)
     for _ in range(2):
         advanced = trials.run(lambda current: jax.block_until_ready(step(current, BATCH)[0]))
         assert int(advanced.step) == int(trials.state.step) + 1
     assert all(leaf.is_deleted() == owned for leaf in jax.tree.leaves(state))
-    assert all(np.array_equal(raw(left), right)
-               for left, right in zip(jax.tree.leaves(trials.state), before, strict=True))
+    for left, right in zip(jax.tree.leaves(trials.state), before, strict=True):
+        assert_same_leaf(left, right)
 
 
 def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeypatch, tmp_path):
@@ -1986,7 +1982,8 @@ from test_plan import BATCH, lm
 from dew.training.rungs import rung_key
 trainer = lm()
 state, _, _ = trainer.place()
-print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)))
+print(json.dumps(rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                          settings=trainer._settings())))
 """
 
 
@@ -2029,7 +2026,7 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     state, _, _ = trainer.place()
 
     def key(module):
-        return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh)
+        return rung_key([module], (state, BATCH), [1, 2], trainer.device_mesh, settings=trainer._settings())
 
     assert key(Displayed(4)) == key(Displayed(4)) != key(Displayed(8))
     zeros, ones = (key(Displayed(4, held=values)) for values in (jnp.zeros(2), jnp.ones(2)))
@@ -2053,7 +2050,8 @@ def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
 
     def key(*settings):
         monkeypatch.setenv("XLA_FLAGS", " ".join((flags, *settings)))
-        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh)
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                          settings=trainer._settings())
 
     autotune_on, autotune_off = "--xla_gpu_autotune_level=4", "--xla_gpu_autotune_level=0"
     first = key(autotune_on, autotune_off)

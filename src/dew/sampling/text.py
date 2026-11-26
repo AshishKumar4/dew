@@ -80,6 +80,7 @@ from dew.nn.protocols import (
     ProjectionGroup,
     Selective,
     Serving,
+    logits_width,
     refuse_prefix,
 )
 from dew.nn.visibility import with_served_blocks
@@ -894,13 +895,15 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     cache_len = capacity if capacity is not None or not isinstance(model, Bounded) else model.max_seq_len
     if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
-    vocab = model.vocab_size if isinstance(model, Bounded) else None
+    # A pad is an input, inside the table; a stop is a draw, inside the ids the head scores (`logits_width`).
+    vocab, width = (model.vocab_size, logits_width(model)) if isinstance(model, Bounded) else (None, None)
     if np.any(ids < 0):
         raise ValueError("token ids must be non-negative")
     # A media slot's id is its tower's where its model says so (`TokenTable.media`), never the table's.
     held = ModelInputs(*jax.tree.map(np.asarray, (ids, fields)))
     Field.indexing("tokens", (), model).bounded(held, spelling)
-    if vocab is not None and (sampling.pad >= vocab or any(token >= vocab for token in sampling.stops)):
+    if vocab is not None and width is not None and (
+            sampling.pad >= vocab or any(token >= width for token in sampling.stops)):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid
 

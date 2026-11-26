@@ -11,7 +11,7 @@ Arms, each on the same operands:
 - `hand`: the kernel the template replaces, called directly: the delta rule's port (`fla_rule`,
   `fla_gdn` or `fla_kda`), mamba_ssm's port (`mamba_ssd.ssd_scan`, a refusal where it does not take
   the shape), the short conv's kernel (`linear.causal_conv1d`);
-- `xla`: the portable math in XLA (`chunk` with `generation.chosen`'s 'xla', `linear.xla_conv1d`);
+- `xla`: the portable math in XLA (`chunk` with `generation.chosen`'s 'xla', `short_conv.xla_conv1d`);
 - `fla`: fla's own torch/Triton kernels (`chunk_gated_delta_rule` on the queries and keys repeated
   over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`,
   `chunk_log_linear_attn`, `chunk_lightning_attn`);
@@ -190,7 +190,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
     import jax.numpy as jnp
 
     from dew.nn import linear
-    from dew.nn.kernels import generation
+    from dew.nn.kernels import generation, short_conv
 
     given = {key: (np.asarray if host else jnp.asarray)(value) for key, value in operands(shape).items()}
     bf16 = jnp.bfloat16
@@ -198,7 +198,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
     if shape.kind == 'conv':
         x, taps = given['x'].astype(bf16), given['taps'].astype(bf16)
         arms = {'hand': lambda x, taps: linear.causal_conv1d(x, taps),
-                'xla': lambda x, taps: linear.xla_conv1d(x, taps, activation=True)}
+                'xla': lambda x, taps: short_conv.xla_conv1d(x, taps, activation=True)}
         inputs, cotangents = (x, taps), given['dy'].astype(bf16)
     else:
         builder = {'ssd': _ssd_parts, 'loglinear': _loglinear_parts, 'lightning': _lightning_parts,
@@ -308,14 +308,24 @@ def _lightning_parts(shape: Shape, given: dict) -> tuple:
 
 
 def gated_hooks(shape: Shape):
-    """A gated delta rule's or KDA's shape's hooks: the draws' sigmoid write gates of unit keys and queries
-    (`recurrence.Hooks.write_bound`, `unit_queries`), as layers declare, so an arm runs the own pairs folded
-    as Kimi Linear's layer runs them (`recurrence_chunk._unit_pairs`); this and
-    tools/benchmark_recurrence_mosaic.py's arms alike (row 12214)."""
+    """A gated delta rule's or KDA's shape's hooks as its layer declares them (`GatedDeltaNet.declared`,
+    `KimiDeltaAttention.declared`: a sigmoid's write gates; Kimi's unit queries and least log decay a token),
+    so an arm times the program its layer runs; this and tools/benchmark_recurrence_mosaic.py's arms alike.
+    Built here, the gated delta nets' arms timed unit queries their layers never declare and Kimi's no
+    decay bound, its clamped prefix (row 12263)."""
+    from dew.nn import kda, linear
     from dew.nn.kernels import recurrence
 
+    features = shape.value_heads * shape.value_width
+    if shape.kind == 'kda':
+        layer = kda.KimiDeltaAttention(emb_features=features, num_heads=shape.value_heads,
+                                       head_dim=shape.key_width)
+    else:
+        layer = linear.GatedDeltaNet(emb_features=features, num_k_heads=shape.key_heads,
+                                     num_v_heads=shape.value_heads, head_k_dim=shape.key_width,
+                                     head_v_dim=shape.value_width)
     return recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                            scale=shape.key_width ** -0.5, write_bound=1.0, unit_queries=True)
+                            scale=shape.key_width ** -0.5, **layer.declared)
 
 
 def _gated_parts(shape: Shape, given: dict) -> tuple:

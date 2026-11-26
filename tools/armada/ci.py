@@ -124,6 +124,7 @@ cut short is refused (`report`), its coverage partial. A target well under CI's 
 import argparse
 import ast
 import concurrent.futures
+import dataclasses
 import functools
 import hashlib
 import heapq
@@ -143,6 +144,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable, Container, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -186,6 +188,7 @@ coverage_report = _loaded(HERE / "coverage_report.py")
 r2 = records.r2
 watched = _loaded(HERE / "watched.py")
 progress = _loaded(HERE / "progress.py")
+recycle = _loaded(HERE / "recycle.py")
 natives = _loaded(HERE / "natives.py")
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 partition = _loaded(HERE / "partition.py")
@@ -1148,7 +1151,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         spent = "in " + " ".join(left_tests) + (f" ({group})" if group else "")
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, left_tests, group, part, left, "off", grace, common, environ,
-                                coverage, written=written))
+                                coverage, written=written,
+                                recycle_at=None if coverage is not None or census else PLAIN_RECYCLE_AT))
         rows += json.loads(part.read_text())["rows"]
         # The next process sees the commit's checkout, not what this one left in it (row 3932's review).
         if later:
@@ -1254,14 +1258,19 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+SIDECARS = ("lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid")
+"""What a task's pytest writes beside its verdict, each `<out>.<sidecar>` (`task_files`): the recorder's log
+(its children's in `<log>.children`), collection's record, pytest's report, the files the durations record
+does not wholly name, and its process id."""
+
+
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
     durations record does not wholly name (split.py); and its process id, whose stacks are read at its
     deadline (executed.py, `stalls.dumped`)."""
-    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
+    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in SIDECARS)
     for stale in (report, log, collection, unrecorded, pid):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
@@ -1365,7 +1374,8 @@ def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None,
         tests, stale_rows = afforded(python, tests, group, kept, deadline - (time.monotonic() - began))
         rows += stale_rows
     rows = judged(rows) if judged else rows
-    if token := os.environ.get("DEW_XLA_CACHE_TOKEN"):
+    # A reused row named main's commit's only where the run keeps records (`RECORDS`).
+    if (token := os.environ.get("DEW_XLA_CACHE_TOKEN")) and os.environ.get(RECORDS) != "off":
         unnamed = {found["name"] for found in rows if found["name"] in named and found["exitCode"] == 0
                    and not run_keys.baselined(python, found["name"], named[found["name"]][0], token, found)}
         for found in rows:
@@ -1391,11 +1401,127 @@ def epochs_first(python: str, tests: list[str], group: str, common: str, network
                      run_keys.device_class(network), min(time.monotonic() + EPOCH_SECONDS, ends))
 
 
+@dataclasses.dataclass
+class Processes:
+    """A task's pytest runs (`ran_in_processes`): its last's `watched_pytest` result, each earlier one's
+    reported cases and output, how many ran, and what its first selected (recycle.py's `SELECTED`)."""
+    last: tuple[int, str, bool, str, set[str] | None, set[str], dict]
+    earlier: list[ET.Element]
+    outputs: list[str]
+    segments: int
+    first_selected: list[str]
+
+
+RECORDS = "DEW_RECORDS"
+"""Where a task's run is told to keep no record ("off"): a suspect's (ops queue/suspect.sh), whose cache-off
+and repeated runs wrote each row's records again on keys a train's run holds."""
+
+
+PLAIN_RECYCLE_AT = 4 << 30
+"""The resident bytes past which a task's pytest ends between two tests and runs the rest in a fresh process
+(recycle.py, `ran_in_processes`), a dry prepare's aside (prepares.py's `RECYCLE_AT`): a 10 GiB container
+holds 4 GiB a process kept beside its next test's 5.2 GiB at most (row 13063's cold cases: 3.5 to 5.2 GiB
+each; train 1299's test_contracts_algebra.py#1/5 killed for memory beside its own earlier tests, green
+alone), what it holds after glibc returns its free pages (recycle.py's `trimmed`). A test that needs more is
+marked `fresh_process` (recycle.py's `FRESH`). A row run past a recycle is
+recorded as a blind watch's (`run_keys.record`), so a train runs it again; one that never passes the bound
+is one process's, as before. Coverage's runs are one process each, its data file whole, and the census's,
+whose files' selections a recycle would read as their own."""
+
+
+def ran_in_processes(base: list[str], resumes: bool,
+                     environment_of: Callable[[Path | None], dict[str, str]], recycle_at: int | None,
+                     root: Path, ends: float, grace: float, files: tuple[Path, Path, Path],
+                     named: tuple[str, list[str], str], began: float, aside: Path,
+                     done_before: Mapping[str, float], out: Path) -> Processes | None:
+    """A task's pytest command (`base`, its set-aside and recycling plugins added), run again in a fresh
+    process after each that recycle.py ended past `recycle_at` resident (its files beside the task's
+    temporary ones in `root`, never in its checkout, whose writes a row's record weighs), the tests each
+    reported set aside from the next (progress.py's SET_ASIDE file, `aside`), each on the commit's checkout,
+    not what the one before it left (`restored`, beside the task's verdict `out`; row 13000); None where its
+    time ran out before its first began. Only a process that ended as recycle.py ends one (pytest's
+    interrupted exit, its report holding the test it ended after) is run past: any other end (a crash after
+    its report, a kill) is the last."""
+    report, pid, collection = files
+    python, tests, group = named
+    # A resuming task's, or a dry prepare's, tests set aside as they pass; a dry prepare's run past a recycle.
+    sets_aside = resumes or recycle_at is not None
+    command = [*base, *(["-p", "progress"] if sets_aside else []),
+               *(["-p", "recycle"] if recycle_at is not None else [])]
+    environment = environment_of(aside if sets_aside else None)
+    recycled, selected = root / "recycled", root / "recycle-selected.json"
+    if recycle_at is not None:
+        environment = {**environment, recycle.RECYCLE_AT: str(recycle_at), recycle.RECYCLED: str(recycled),
+                       recycle.SELECTED: str(selected)}
+    earlier: list[ET.Element] = []
+    outputs: list[str] = []
+    last: tuple[int, str, bool, str, set[str] | None, set[str], dict] | None = None
+    first_selected: list[str] = []
+    recycles = 0
+    before = untracked() if recycle_at is not None else set()
+    while True:
+        # Each process's own sidecars: none an earlier one left reads as this one's.
+        for sidecar in (recycled, report, pid, collection):
+            sidecar.unlink(missing_ok=True)
+        # What is left of the task's end, read once as its pytest starts.
+        if (left := ends - time.monotonic()) <= 0:
+            if last is None:
+                return None
+            # Its time spent before the tests left could start: they are the deadline's, its last report
+            # (cleared above) none.
+            returncode, output, _, dump, opened, wrote, evidence = last
+            last = (returncode, output, True, dump, opened, wrote, evidence)
+            outputs.pop()
+            break
+        last = watched_pytest(command, environment, left, grace, pid, python,
+                              evidence_name(python, tests, group), began)
+        returncode, output, expired = last[0], last[1], last[2]
+        if not recycles:
+            first_selected = (read_json(selected) or {}).get("selected", [])
+        done, _ = reported_cases(report)
+        stopped = recycled.read_text() if recycled.is_file() else None
+        if (expired or stopped is None or returncode != INTERRUPTED
+                or stopped not in {grading.node_of(case) for case in done}):
+            break
+        earlier += done
+        outputs.append(output)
+        recycles += 1
+        restored(last[5], before, out)
+        aside.write_text(json.dumps(sorted({*done_before, *(grading.node_of(case) for case in earlier)})))
+        environment = {**environment, recycle.CONTINUES: "1"}
+    # Its last's result, its output every process's.
+    returncode, output, expired, dump, opened, wrote, evidence = last
+    last = (returncode, "\n".join([*outputs, output]), expired, dump, opened, wrote, evidence)
+    return Processes(last, earlier, outputs, recycles + 1, first_selected)
+
+
+def graded_across(name: str, red: list[str], failed: list, own: list[ET.Element],
+                  processes: Processes, done_before: Mapping[str, float] = MappingProxyType({})
+                  ) -> tuple[list[str], list, list[ET.Element]]:
+    """Row `name`'s grade (`red`, `failed`) by its last process's own cases (`own`), joined by its earlier
+    processes' (`ran_in_processes`, run past a recycle): red unless every test its first process selected
+    (recycle.py's `SELECTED`) was reported by one of them, whatever a later collection found (a test a later
+    import no longer defines, or one a later collection dropped unreported, never ran); each earlier one's
+    failures its too, and their cases its tests, timings and cells beside the last's."""
+    file = grading.owning(name)
+    before = [case for case in processes.earlier if grading.of(case, name)]
+    chosen = {node for node in processes.first_selected if grading.owning(node) == file}
+    # A test a recalled attempt passed, which this attempt set aside (`progress.resumed`), ran.
+    never_ran = sorted(chosen - {grading.node_of(case) for case in [*before, *own]} - set(done_before))
+    if not chosen or never_ran:
+        red = [*red, "its processes, run past a recycle, reported not every test its first selected: "
+               + (", ".join(never_ran[:6]) if chosen else "its first process's selection unread")]
+    if not before:
+        return red, failed, own
+    red_before, failed_before, _ = grading.graded(name, before, processes.earlier, {}, True, 0, None, None)
+    return red_before + red, failed_before + failed, before + own
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
            variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None,
-           written: list[set[str]] | None = None) -> int:
+           written: list[set[str]] | None = None, recycle_at: int | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`). A check-1
@@ -1408,6 +1534,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
+    recycle_at = None if site is not None else recycle_at  # A site's task: one test, its draws its artifacts.
     rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline)
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
@@ -1426,21 +1553,22 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed one's,
     # whose earlier attempt's opens no record holds; no other read their epochs (`epochs_first`).
     recording = (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
-                 and not done_before)
+                 and not done_before and os.environ.get(RECORDS) != "off")
     began_in = epochs_first(python, tests, group, common, network, ends, recording)
-    command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
     with temp_roots.temp_root() as root:
-        environment = task_environment(environ, site, root, (log, collection, unrecorded, pid),
-                                       aside if resumes else None, group, network)
-        # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
-        if (left := ends - time.monotonic()) <= 0:
-            return unstarted(out, rows, python, tests, group)
-        returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
-            command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
+        processes = ran_in_processes(
+            session.pytest_command(run, tests, split), resumes, lambda aside_at: task_environment(
+                environ, site, root, (log, collection, unrecorded, pid), aside_at, group, network),
+            recycle_at, Path(root), ends, grace, (report, pid, collection), (python, tests, group), began,
+            aside, done_before, out)
+    if processes is None:
+        return unstarted(out, rows, python, tests, group)
+    returncode, output, expired, dump, opened, wrote, evidence = processes.last
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
-    peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
-    peak = max(peaks, default=None)
-    cases, reported = reported_cases(report)
+    peak = max((found for found in (progress.task_peak(host), peak_before) if found is not None),
+               default=None)
+    terminal, reported = reported_cases(report)
+    cases = processes.earlier + terminal
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = read_json(collection) or {}
@@ -1459,10 +1587,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
     # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
     for name in tests:
-        own = [case for case in cases if grading.of(case, name)]
-        red, failed, cause = grading.graded(name, own, cases, counts.get(grading.owning(name), {}),
+        own = [case for case in terminal if grading.of(case, name)]
+        red, failed, cause = grading.graded(name, own, terminal, counts.get(grading.owning(name), {}),
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
+        if processes.segments > 1:
+            red, failed, own = graded_across(name, red, failed, own, processes, done_before)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1503,14 +1633,34 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     out.write_text(json.dumps({"rows": rows + ran}))
     if resumes:  # Sealed once graded: a recall sets a whole file's passes aside where it graded green alone.
         progress.ended(read_text(pid), int(any(found["exitCode"] for found in ran)))
-    unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
-    carried = set(wrote).union(*(written or []))
-    if written is not None:
-        written.append(set(wrote))
-    if recording and (unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried,
-                                                 began_in)):
-        out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
+    kept_records(python, rows, ran, out, (log, unrecorded), common, network, began_in, recording,
+                 (opened if processes.segments == 1 else None, set(wrote), written))
     return 0
+
+
+def kept_records(python: str, rows: list[dict], ran: list[dict], out: Path, files: tuple[Path, Path],
+                 common: str, network: bool, began_in: Mapping[str, str | None] | None, recording: bool,
+                 reads: tuple[set[str] | None, set[str], list[set[str]] | None]) -> None:
+    """A task's graded rows `ran`, where it is `recording`, recorded (`run_keys.record`) with what its pytest
+    read (`files`: its executed log and its unrecorded files' list; `reads`: what it opened, what it wrote,
+    and each earlier process's checkout writes, `written`, which it adds its own to whether it records or
+    not), `out` written again where a green row's baseline was not taken (`unbaselined`). A row run in more
+    than one process (what it opened None, as a blind watch's) keeps no key, what each read being no one
+    record's; its red still begins its next epoch and its green still writes its baseline."""
+    opened, wrote, written = reads
+    carried = wrote.union(*(written or []))
+    if written is not None:
+        written.append(wrote)
+    if not recording:
+        return
+    log, unrecorded = files
+    unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
+    if unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in):
+        out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
+
+
+INTERRUPTED = 2
+"""pytest's exit where a plugin stopped its session (`session.shouldstop`, pytest's ExitCode.INTERRUPTED)."""
 
 
 def task_environment(environ: Mapping[str, str], site: re.Match[str] | None, root: str,
@@ -1575,16 +1725,26 @@ def restored(wrote: set[str], before: set[str], out: Path) -> None:
     not hold): each tracked file it wrote checked out again, and each entry the checkout neither tracks nor
     ignores that was not there before it (`before`, `untracked`) removed, then each directory it made that
     this leaves empty (one imports as a namespace package), but the task's own outputs: its verdict `out`,
-    each process's beside it (`out.N` and theirs) and its artifacts (ARMADA_ARTIFACTS), which outlive it."""
+    each process's beside it (`out.N`), the runner's files beside each (`SIDECARS`) and its
+    artifacts (ARMADA_ARTIFACTS), which outlive it. Each module it checks out loses the bytecode cached for
+    it."""
     listed = subprocess.run(["git", "ls-files", "-z", "--", *sorted(wrote)], capture_output=True, text=True,
                             check=False) if wrote else None
     tracked = set(listed.stdout.split("\0")) - {""} if listed and listed.returncode == 0 else set()
     if tracked:
         subprocess.run(["git", "checkout", "-q", "--", *sorted(tracked)], check=True)
+    # A restored module's bytecode, which the process that rewrote it may have cached (its source's size and
+    # second matching the restored one's), gone too, so the next process compiles the commit's source.
+    for name in sorted(each for each in tracked if each.endswith(".py")):
+        for cached in (Path(name).parent / "__pycache__").glob(f"{Path(name).stem}.*.pyc"):
+            cached.unlink(missing_ok=True)
     artifacts = os.environ.get("ARMADA_ARTIFACTS")
     roots = [Path(artifacts).resolve()] if artifacts else []
     verdicts = out.resolve()
-    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+(\..+)?)?")
+    # Its verdict, each process's numbered one, and the runner's own files beside each (`SIDECARS`, the
+    # recorder's children, the set-aside list): no other file sharing the verdict's name (a `<out>.py`).
+    own = "|".join(re.escape(name) for name in (*SIDECARS, "lifetime.log.children", "set-aside.json"))
+    ours = re.compile(rf"{re.escape(verdicts.name)}(\.\d+)*(\.({own}))?")
     checkout = Path.cwd().resolve()
     emptied: set[Path] = set()
     for made in sorted(untracked() - before):
@@ -2212,6 +2372,15 @@ def pinned(argv: list[str]) -> None:
                          str(Path(__file__).resolve()), *argv])
 
 
+def entry() -> int:
+    """`main` as armada's task process runs it: a task's (`task`) ends leaving its progress out of its
+    artifacts (`progress.finished`), as nothing reads it once the task has ended."""
+    code = main()
+    if sys.argv[1:2] == ["task"]:
+        progress.finished()
+    return code
+
+
 if __name__ == "__main__":
     pinned(sys.argv[1:])
-    raise SystemExit(main())
+    raise SystemExit(entry())

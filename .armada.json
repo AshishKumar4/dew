@@ -21,6 +21,7 @@
                 "--out={out}", "--cache={cache}", "--census={census}", "--main={main}"],
     "timeout": 1800,
     "redExit": 3,
+    "logs": "failed",
     "mode": "efficient",
     "speculative": true,
     "cpu": [{ "vendor": "AuthenticAMD", "family": 25, "model": 17 }],

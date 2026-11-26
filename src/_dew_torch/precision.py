@@ -97,14 +97,21 @@ def widened_to(to: Callable) -> Callable:
     return converted
 
 
+CONSTRUCTORS = ("tensor", "full", "zeros", "ones", "empty", "full_like", "zeros_like", "ones_like",
+                "empty_like")
+"""torch's constructors of a tensor of a dtype named by keyword, each a float32 pin `widened` widens: from
+Python numbers or a shape, or the shape of a tensor beside them (`*_like`: Inkling 2's experts accumulate
+into `zeros_like(hidden, dtype=torch.float32)`, modeling_inkling2_loop.py:787)."""
+
+
 @contextlib.contextmanager
 def widened():
     """The reference in float64: every float32 pin a model's code carries widened, which are its
     `.float()`, `.to(torch.float32)` and `.type(torch.float32)` casts (Nemotron-H's router pins the
     last), a float32 `arange` or `linspace` (the sinusoids', a rotary table's, a schedule's), a float32
-    `torch.tensor`, `torch.full`, `torch.zeros`, `torch.ones` or `torch.empty` (the tables a model builds
-    from Python numbers, Phi-3's LongRoPE factors among them, and the buffers generation adds a bias or a
-    penalty into, which must match the widened scores they meet), and float64 the default dtype."""
+    constructor (`CONSTRUCTORS`: the tables a model builds from Python numbers, Phi-3's LongRoPE factors
+    among them, the buffers generation adds a bias or a penalty into, which must match the widened scores
+    they meet, and an accumulator shaped as its operand), and float64 the default dtype."""
     type_ = torch.Tensor.type
 
     def widened_type(self, dtype=None, *args, **kwargs):
@@ -113,8 +120,7 @@ def widened():
     with (replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
                    (torch.Tensor, "type", widened_type), (torch, "arange", dtype_widened(torch.arange)),
                    (torch, "linspace", dtype_widened(torch.linspace)),
-                   *((torch, name, dtype_widened(getattr(torch, name)))
-                     for name in ("tensor", "full", "zeros", "ones", "empty"))),
+                   *((torch, name, dtype_widened(getattr(torch, name))) for name in CONSTRUCTORS)),
           default_dtype(torch.float64)):
         yield
 
@@ -131,8 +137,7 @@ def widened_softmax():
 
 NATIVE = (*((torch.Tensor, name, inspect.getattr_static(torch.Tensor, name))
              for name in ("float", "to", "type", "softmax")),
-          *((torch, name, getattr(torch, name))
-            for name in ("arange", "linspace", "tensor", "full", "zeros", "ones", "empty")),
+          *((torch, name, getattr(torch, name)) for name in ("arange", "linspace", *CONSTRUCTORS)),
           (torch.nn.functional, "softmax", torch.nn.functional.softmax))
 """torch's own casts, constructors and softmax, as the process imported them: every one `float64` replaces."""
 

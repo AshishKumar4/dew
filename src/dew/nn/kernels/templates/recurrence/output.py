@@ -59,10 +59,11 @@ def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
 def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> None:
     """Each key block's queries gated by their decays to the chunk's start and scaled (`algebra.key_gated`)
     into its staging tile of `staged`, a decay a key dimension's at the first step: the queries and the
-    prefix (`refs`, the launch's queries and its prefix, `intra._prefix`'s) read from global memory a key
-    block at a time in the accumulator's layout (`Family.tile_of`), each operand's parts summed as its tiles'
-    (`Parts.value`), no slot held past the step, and staged as the parts the products read (`operands.staged`:
-    an fp32 call's two under the fast forms, whose first alone staged left the second's buffer unwritten)."""
+    prefix (`refs`, the launch's queries and its prefix, `intra._prefix`'s) read from global memory in the
+    accumulator's layout (`Family.tile_of`), every key block's before any is staged, each operand's parts
+    summed as its tiles' (`Parts.value`), no slot held past the step, and staged as the parts the products
+    read (`operands.staged`: an fp32 call's two under the fast forms, whose first alone staged left the
+    second's buffer unwritten)."""
     family, width, chunk = call.family, call.width, call.chunk
     q_ref, *prefix_refs = refs
 
@@ -70,11 +71,13 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
         tiles = [family.tile_of(view) for view in operand.views(ref, row, chunk, column, call.block)]
         return tiles[0] if len(tiles) == 1 else product.whole(tiles)
 
-    for c, tile in enumerate(staged):
-        column = c * call.block
-        query = read(call.given, q_ref, h // call.group * width + column)
-        decays = tuple(read(call.gates, ref, h * width + column) for ref in prefix_refs)
-        operands.staged(family, algebra.key_gated(query, decays, scale), tile)
+    # Every key block's reads issued before any is gated and staged, so their latencies overlap: a block at a
+    # time, each waited on its own, 15% of a GH200's Kimi Linear output launch's samples (M-JS-272).
+    read_blocks = [(read(call.given, q_ref, h // call.group * width + c * call.block),
+                    tuple(read(call.gates, ref, h * width + c * call.block) for ref in prefix_refs))
+                   for c in range(len(staged))]
+    for (query, decays), tile in zip(read_blocks, staged, strict=True):
+        operands.staged(call, algebra.key_gated(query, decays, scale), tile)
 
 
 def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
@@ -122,7 +125,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
         values = [f32(chunk, bv), *held_tile(held, chunk, bv), f32(chunk, chunk),
                   *held_tile(held, chunk, chunk),
                   *products]
-        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs)))
+        # Every key block's queries (their parts joined in fp32) and prefix read before any is gated
+        # (`_gated_queries`), one block's gating at a time beside them.
+        query = held_tile(given, chunk, call.block) if given.parts == 1 else [f32(chunk, call.block)]
+        read = (query + [f32(chunk, call.block)] * call.prefix_limbs) * (call.width // call.block - 1)
+        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs) + read))
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
@@ -252,7 +259,7 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
                         Issuer(call), laid=laid, column_scale=gated, apart=call.apart)
-                    operands.staged(family, scored, staged)
+                    operands.staged(call, scored, staged)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            Parts(staged, held.dtype), value, scale, Issuer(call))

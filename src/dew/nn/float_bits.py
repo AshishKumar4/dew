@@ -42,6 +42,24 @@ def exact_power2(n: jax.typing.ArrayLike, dtype: DTypeLike = jnp.float32) -> jax
     return jax.lax.bitcast_convert_type(bits, dtype)
 
 
+WHOLE_POWERS = (-127, 128)
+"""The float32 exponents `whole_power2` takes, its least `+0`'s and its largest infinity's."""
+
+
+def whole_power2(n: jax.Array) -> jax.Array:
+    """`2^n` in float32 for an integral float32 `n` from -127 to 128 (`WHOLE_POWERS`), `exact_power2`'s value
+    there (+0 at -127, infinity at 128), from no integer conversion: `n + 2^23 + 127` is an integer in
+    [2^23, 2^24) and so exact, its significand's low bits `n + 127`, which a left shift sets in the
+    exponent field (the leading bits shift out). A float's conversion to an integer lowers in a Mosaic GPU
+    kernel to two clamps and a conversion (FS-CONV-SASS1), and `exact_power2` takes an integer; this is an
+    add and a shift. Its domain is the caller's to hold, by a clip or a bound of its own
+    (`precision.power2`'s integral halves): a non-integral `n` rounds to the nearest power, and one past
+    either end, or a NaN, sets the shifted bits in the sign or the exponent field as they fall, no power."""
+    biased = jnp.asarray(n, jnp.float32) + np.float32(2.0 ** 23 - WHOLE_POWERS[0])
+    bits = jax.lax.bitcast_convert_type(biased, jnp.int32)
+    return jax.lax.bitcast_convert_type(jax.lax.shift_left(bits, jnp.full_like(bits, 23)), jnp.float32)
+
+
 def two_factor_reach(dtype: DTypeLike) -> int:
     """The largest `reach` `precision.power2` takes as two factors in `dtype`, both halves of any `k` within
     it normal powers."""

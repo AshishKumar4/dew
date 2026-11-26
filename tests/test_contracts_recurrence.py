@@ -714,14 +714,17 @@ def test_the_short_conv_holds_every_order(edge):
                           plain_fn=plain, without=INTERPRETED_REMAT)
 
 
+@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_diagonal_scan_holds_its_orders(edge):
+def test_the_diagonal_scan_holds_its_orders(edge, taken):
     """The diagonal scan on the template's kernels (`templates.recurrence.diagonal`, a custom VJP over its
     launches, interpreted off a GPU) as every caller reaches it (`kernels.diagonal.diagonal_scan` with the
     kernels named, whose products' wrapper takes every order through the portable math, `_per_product`),
     over two spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
-    final state finite at every order wherever float64 is a normal float32 and the recurrence a token at a
-    time is, at writes and states scaled to the edge, the log forget gates HGRN's."""
+    final state finite at every order of the set `taken` (`ORDER_SETS`) wherever float64 is a normal
+    float32 and the recurrence a token at a time is, at writes and states scaled to the edge, the log forget
+    gates HGRN's. A case an order set: every order in one, each compiled interpreted, took 156 to 215 s at
+    the normal edge (row 12779)."""
     def draw(seed, scale):
         x, g, state = normal_draw(1453 + 4096 * seed, (2, 70, 128), (2, 70, 128), (2, 128))
         primals = (x * scale, -jax.nn.softplus(-(g + 2.0)), state * scale)
@@ -746,7 +749,8 @@ def test_the_diagonal_scan_holds_its_orders(edge):
         return joined(jnp.moveaxis(out, 0, 1), final)
 
     assert_drawn_contract(kernel, draw, EDGES[edge], f"the diagonal scan {edge}", truth_fn=plain,
-                          plain_fn=plain, without=INTERPRETED_REMAT)
+                          plain_fn=plain, taking=order_set(taken, INTERPRETED_REMAT),
+                          without=INTERPRETED_REMAT)
 
 
 @pytest.mark.parametrize("edge", EDGES)

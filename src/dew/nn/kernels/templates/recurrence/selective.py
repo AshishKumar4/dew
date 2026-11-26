@@ -371,25 +371,30 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
 def backward_plan(target: generation.GpuTarget, *, forked: bool = False) -> tuple[int, int]:
     """The backward's tokens a thread and the programs a multiprocessor holds of it at their registers
     (`backward_registers`, `backward_programs`), which its compile caps a thread's registers at
-    (`mosaic.compiler_params`' `resident`): of the token counts whose registers a thread holds, the one whose
-    dependent steps a token, its own two and its block's scans' `2 * SCAN_STEPS` shared by the thread's
-    tokens, take the least time across the programs a multiprocessor holds at once, ties to more programs
-    (a family whose threads issue their own steps hides their latency by resident warps first,
-    `resources.hidden`). On an H100 the derived 8 tokens at three programs took Mamba-1's bf16 training step
-    at 8x2048x5120 in 6.43 ms, 16 at two 6.48, 4 at four 7.48, and fewer programs than the registers hold
-    longer at each (8 at two 8.10, 4 at three 8.53): ptxas filled the registers a cap left it, and the step
-    slowed (sel-sweep-sxm at f3040b154)."""
+    (`mosaic.compiler_params`' `resident`): the first of `backward_plans`."""
+    return backward_plans(target, forked=forked)[0]
+
+
+def backward_plans(target: generation.GpuTarget, *, forked: bool = False) -> list[tuple[int, int]]:
+    """The backward's plans (`backward_fits`), fastest first: of the token counts whose registers a thread
+    holds, the dependent steps a token, its own two and its block's scans' `2 * SCAN_STEPS` shared by the
+    thread's tokens, across the programs a multiprocessor holds at once, ties to more programs (a family
+    whose threads issue their own steps hides their latency by resident warps first, `resources.hidden`).
+    On an H100 the derived 8 tokens at three programs took Mamba-1's bf16 training step at 8x2048x5120 in
+    6.43 ms, 16 at two 6.48, 4 at four 7.48, and fewer programs than the registers hold longer at each (8 at
+    two 8.10, 4 at three 8.53): ptxas filled the registers a cap left it, and the step slowed
+    (sel-sweep-sxm at f3040b154)."""
     def steps(fit):
         positions, programs = fit
         return (2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs
 
-    return min(backward_fits(target, forked=forked), key=steps)
+    return sorted(backward_fits(target, forked=forked), key=steps)
 
 
 def backward_fits(target: generation.GpuTarget, *, forked: bool = False) -> list[tuple[int, int]]:
     """Each backward token count a thread of `target` holds the registers of, from one doubling
     (`backward_registers`), with the programs a multiprocessor holds of it (`backward_programs`), those
-    holding one at least: the plans `backward_plan` weighs and the tuner times (`Selective.neighbours`)."""
+    holding one at least: the plans `backward_plans` ranks and the tuner times (`Selective.neighbours`)."""
     fits = []
     positions = 1
     while backward_registers(positions, forked=forked) <= target.multiprocessor.thread_registers:
@@ -918,33 +923,34 @@ class Selective(base.Template[Tiles]):
                               forked=forked), None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
-        """The call's config on `target`: the backward's tokens a thread and residency from its register model
-        (`backward_plan`), past the token counts a compile found spilling (`report.refused_at`), each a step
-        down to half its tokens (None where a spill no token count clears); and the forward's chunk, from
+        """The call's config on `target`: the backward's tokens a thread and residency, its register model's
+        fastest plan a compile has not found spilling (`backward_plans`, `report.refused_at`; None where none
+        holds): stepped down to half its tokens, an A100's Mamba-1 2.8B training ran 4 tokens at four
+        programs, its model's third, where 16 at two, its second, compiles spill-free at 255 registers past 8
+        at three's 48 bytes (jsf-selvariants3 at d7cc40b2712); and the forward's chunk, from
         `CHUNK` the longest whose ring a block's shared memory holds (`staged_bytes`), up to a warpgroup's
         tokens (a chunk dividing every backward block), dividing the call's tokens padded to `CHUNK`'s (a
         longer chunk walks no more padding): on an H100 Mamba-1's bf16 forward at 8x2048x5120 took 1.21 ms at
         16 tokens a chunk, 1.14 at 32 and 1.12 to 1.14 at 64 and 128, its training step 6.51, 6.39 to 6.43 and
         6.34 to 6.40 (sel-chunk-sxm at 5bf70d36b)."""
         facts, forked = self._facts(ba, target), ba.arguments.get("forked") is not None
-        positions, resident = backward_plan(facts, forked=forked)
+        plans = backward_plans(facts, forked=forked)
         chunk, length = CHUNK, ba.arguments["x"].shape[1]
         padded = -(-length // CHUNK) * CHUNK
         while (2 * chunk <= block_scan.THREADS and padded % (2 * chunk) == 0 and self.staged_bytes(
-                ba, Tiles(2 * chunk, positions, resident), facts) <= generation.shared_budget(facts)):
+                ba, Tiles(2 * chunk, *plans[0]), facts) <= generation.shared_budget(facts)):
             chunk *= 2
-        tiles = Tiles(chunk, positions, resident)
-        # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
-        # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
-        # a forward spill, or a backward's at one token, leaves no config.
-        while spilled := report.refused_at(self, ba, tiles, target):
-            backward = all(name.startswith("selective_scan_backward") for name in spilled)
-            if not backward or tiles.positions == 1:
+        # A launch whose compile found a kernel spilling steps the plan that sets that kernel's registers: the
+        # backward's. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so a
+        # forward spill leaves no config.
+        for positions, resident in plans:
+            tiles = Tiles(chunk, positions, resident)
+            spilled = report.refused_at(self, ba, tiles, target)
+            if not spilled:
+                return tiles
+            if not all(name.startswith("selective_scan_backward") for name in spilled):
                 return None
-            fewer = tiles.positions // 2
-            held = backward_registers(fewer, forked=forked)
-            tiles = Tiles(tiles.chunk, fewer, backward_programs(held, facts))
-        return tiles
+        return None
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> list[Tiles]:
         """The configs the opt-in tuner times beside the derived `config` (`variants`, which keeps the legal

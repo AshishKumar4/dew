@@ -8,15 +8,15 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12898]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12898, 12972]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12426]
 - The kernel challenge's lessons in the templates. [5271]
 - 4B Real-Token MFU Breakthrough from Existing Profiles. [11941, 11942]
 - Cached and block visibility on the template's spans. [245]
 - Performance measurements. [569, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
-- The template beats FA2 and FA3, its resources the model's. [1299, 12752, 5284, 5285, 5293]
+- The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - Inference through the templates. [3424, 3602]
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848, 10742]
 - Convolution repairs above their owner. [5665]
@@ -24,6 +24,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12780, 12873]
+- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
+- The recurrence template refuses the gated delta net's training on sm120. [13064]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -34,14 +36,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
-- test_plan's second-trainer witness asserts no backend compile of jit(step). [12386]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - The chunked op's portable math (recurrence_chunk's xla mainloop) loses a faint pair under a decay a key dimension that the token recurrence keeps. [12888]
-- The key memory backward launch's register model under-counts a read erase's reads. [12890]
-- A learned relative-position bias. [12933]
-- Per-head L2 clipping with a learned scale for queries and relative states, keys clipped unscaled, values RMS-normalized without a gain, and global layers'…. [12934]
-- A per-token, per-head sink logit projected from the query input (an extra softmax slot of zero value), beside the learned per-head sinks Dew holds, and the…. [12935]
-- Block attention residuals as the checkpoint computes them. [12937]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
 - Mosaic GPU async_copy's 1D bulk shortcut (jax fork, launch_context.py is_simple_contiguous_copy) clips a contiguous slice at the whole buffer's end, linearly. [12692]
@@ -57,19 +53,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1458, 1459, 1460, 1646]
 - The suite's wall. [5478, 12431, 12433, 12644]
-- `CrossPassMerge` (src/dew/nn/cross_pass.py:140-152) and `DepthAttention` (src/dew/nn/attention_residuals.py:131-147) widen their operands to fp32 and contract…. [12918]
-- A `CrossPassMerge` runs two down products (`input_down`, `message_down`) and two or three up products (`gain`, `forget`, `added`) per site. [12922]
-- Under `Loop.exit_threshold` scoring runs all k passes and only then gathers each token's exit state. [12924]
-- The exit gate reads the state after the coda, so every pass runs its own coda. [12925]
-- Add a row-level exit policy: a row exits at the first pass where its valid tokens' cumulative exit probability clears the threshold (stated rule), every token…. [12926]
-- `_polyphase_depthwise_3x3` (src/dew/nn/conv.py:143), the CUDA bf16 training route for dilation-2/3 depthwise convolutions, hardcodes `Precision.HIGHEST` on…. [12920]
-- Every remaining raw `Precision.HIGHEST` outside `dew.nn.precision` (src/dew/nn/ssm.py:137, kv_cache.py:478, blocks.py:393, quantizers.py:24, lora.py:755,…. [12921]
-- Register HF `transformers`' `inkling2_loop` (text `inkling2_loop_text`, vision `inkling2_vision`, `loop_config`) as a Dew family. [12932]
-- Sigmoid top-k routing whose correction bias selects but does not weigh, weights normalized with an epsilon and scaled by `route_scale`, and the soft-capped…. [12938]
-- A loop whose passes restart from the prelude's output and block states, each later core layer reading its four messages (attention or Q, K, V and MLP inputs)…. [12939]
-- Embedding, embedding norm, an untied unpadded LM head over the padded vocabulary, final logit soft-cap, and the checkpoint's raw weight names (`model.llm.*`,…. [12941]
+- Src/dew/interop/parts.py KNOWN covers Mamba, Mamba-2 and LFM2 ShortConv, but omits GatedDeltaNet (Qwen3.5), KDA (Kimi) and newer registered mixers, so…. [13043]
 - The image tower: 23-layer ViT with axial RoPE, a class token, learned 32x32 position embeddings interpolated bilinearly, 20-pixel patches in 40x40 cells, a 2x2…. [12943]
-- A variable-loop checkpoint (`is_varloop`) run at a pass count chosen at inference, its per-pass caches sized by the count. [12944]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -99,17 +84,9 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## RL and serving
 
-- Each cross-pass input site of an attention layer (`cross_pass_q/depth`, `_k/depth`, `_v/depth`, src/dew/nn/backbones/decoder_block.py:1141-1198) reads and…. [12923]
-- Batched scoring and prefill (src/dew/inference/scoring.py:222-277, src/dew/decision/task.py:1144-1216, sampling/text.py prefill) run every row through every…. [12927]
-- Cached decode runs every pass for every token. [12928]
-- `_messaged_blocks` refuses any key-sharing or publishing mixer (src/dew/nn/backbones/decoder_fields.py:168-174) and explicit spans refuse any shared KV…. [12929]
-- Gemma 4 (`gemma4_text` and multimodal `gemma4`) under `Loop`, `CrossPass` and early exit. [12930]
+- Src/dew/interop/torchax_fallback.py traces the whole PyTorch model.forward as one opaque TorchGraph with no per-layer jax.checkpoint / remat boundaries, so Dew…. [13045]
+- TorchCausalLM (src/dew/interop/torchax_fallback.py) exposes DecisionModel hidden_states/logits_from_hidden seams but does not implement Dew's Looped protocol…. [13046]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
-- Attention residuals with an exiting loop are refused. [12931]
-- Four causal depthwise short convolutions per layer (keys and values before their heads, the attention output and the MoE output), each `(conv(x) + x) / sqrt(k…. [12936]
-- Per-pass KV and conv caches for every core layer (HF modular_inkling2_loop.py:465-552) under Dew's per-pass cache, cached decode bit-equal to the uncached…. [12940]
-- The released checkpoint's mixed precision. [12942]
-- Behavioral parity of tiny random `inkling2_loop` configs against HF's modeling file under the float64 gate (logits and gradients), cached decode per pass,…. [12946]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
@@ -119,6 +96,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Algebra
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
+- algebra.md and the engine agree. [13063]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
@@ -127,10 +105,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - One token layout, and every layout and placement trains and serves. [1903]
 - Every model comparison on check 1. [2300, 3722, 5212]
 - TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
-
-## Decision
-
-- The decision readouts `LabelReadout.__call__` (src/dew/decision/head.py:607) and `SlotReadout.__call__` (:688-693) widen to fp32 and hardcode…. [12919]
 
 ## Tutorials and docs
 

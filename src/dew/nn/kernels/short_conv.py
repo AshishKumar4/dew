@@ -19,14 +19,15 @@ conv (tests/test_short_conv.py).
 
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.activations import silu
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed
-from dew.nn.precision import compensated_sum
+from dew.nn.precision import at_least_fp32, compensated_sum, l2_normed
 
 from . import generation
 from .generation import INHERENT, Choice
@@ -86,7 +87,7 @@ def _fit(width: int, head: int | None) -> bool:
 CONV: Op[ConvCase] = Op(Choice.SHORT_CONV, (Kernel('mosaic_gpu', SUPPORTS), Kernel('xla', (), generic=True)),
                         lambda case: 'mosaic_gpu' if generation.backend() == 'gpu' else 'xla')
 """The conv selector: the template's kernels on a GPU where their requirements hold, else XLA's conv
-(`dew.nn.linear.xla_conv1d`)."""
+(`xla_conv1d`)."""
 
 
 def preactivation(window, taps, bias):
@@ -103,7 +104,7 @@ def preactivation(window, taps, bias):
 def conv_bias(bias: jax.Array, leading: tuple[int, ...]) -> jax.Array:
     """A conv's bias `[C]` added at every row and token of `leading` `[B, S]` (`_spread_bias`): its gradient
     the wide pre-activation cotangent summed over them in one compensated reduction, rounded once, the one
-    rule of a conv's bias, XLA's conv's (`dew.nn.linear.xla_conv1d`), a decode step's (`recurrence`) and
+    rule of a conv's bias, XLA's conv's (`xla_conv1d`), a decode step's (`recurrence`) and
     the kernels' (their partials, the split conv's shards)."""
     return _spread_bias((*leading, bias.shape[0]))(bias)
 
@@ -171,10 +172,9 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
     `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
     l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
     outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
-    its output token's. Differentiated at every order through XLA's conv (`linear.xla_conv1d`, the same
+    its output token's. Differentiated at every order through XLA's conv (`xla_conv1d`, the same
     arithmetic; `generation.linear_tangent`): reverse mode runs the backward kernels, and forward mode takes
     XLA's tangent however a jit, a scan or a remat staged the call (row 2395)."""
-    from dew.nn.linear import xla_conv1d
 
     def forward(x, taps, bias, valid, documents):
         return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret), ()
@@ -196,3 +196,47 @@ def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float
         generation.linear_tangent(forward, backward, portable,
                                   kind=KernelGlue()))(x, taps, bias, valid, documents)
 
+
+def xla_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, segments=None,
+               parts: Sequence[tuple[int, int | None]] | None = None,
+               dtype=None) -> jax.Array | tuple[jax.Array, ...]:
+    """`causal_conv1d`'s arithmetic in XLA: a CPU's and a TPU's, and the oracle of the GPU's kernels."""
+    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
+    _, taps_width = kernel.shape
+    length = x.shape[1]
+    wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
+    padded = jnp.pad(x, ((0, 0), (taps_width - 1, 0), (0, 0))).astype(wide)
+    taps = kernel.astype(wide)
+
+    def read(tap):
+        """The tokens `taps_width - 1 - tap` before each, those of its own document."""
+        window = padded[:, tap:tap + length]
+        if segments is None:
+            return window
+        before = jnp.pad(segments, ((0, 0), (taps_width - 1, 0)))[:, tap:tap + length]
+        return jnp.where((before == segments)[..., None], window, 0)
+
+    spread_bias = None if bias is None else conv_bias(bias.astype(wide), x.shape[:2])
+    windows = preactivation([read(tap) for tap in range(taps_width)],
+                            [taps[:, tap] for tap in range(taps_width)], spread_bias)
+    if activation:
+        windows = silu(windows)
+    if valid is not None:
+        windows = jnp.where(valid[:, :, None], windows, 0)
+    return conv_pieces(windows, parts, dtype)
+
+
+def conv_pieces(convolved, parts, dtype):
+    """`convolved` `[B, S, D]` as `causal_conv1d` returns it for `parts` (the whole, where None), in `dtype`:
+    each piece split off in order and the `head`-wide groups of a normalised one l2-normalised, rounded once
+    to `dtype` (`l2_normed`, its tangent free of cancellation under a checkpointed scanned backward)."""
+    if parts is None:
+        return convolved.astype(dtype)
+    pieces, first = [], 0
+    for width, head in parts:
+        piece = convolved[..., first:first + width]
+        first += width
+        if head is not None:
+            piece = l2_normed(piece.reshape(*piece.shape[:-1], -1, head), dtype).reshape(piece.shape)
+        pieces.append(piece.astype(dtype))
+    return tuple(pieces)

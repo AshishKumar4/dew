@@ -1022,10 +1022,10 @@ def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
                                                              template.Kind.KEY),))
 
 
-def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype():
     """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
-    batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
-    and `launch_work` keys hook pricing on the active JAX trace context."""
+    batch extent, and `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed
+    in-kernel."""
     spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
     queries, out_heads = tokens * group, kv_heads * group
@@ -1084,6 +1084,13 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     op_b = dataclasses.replace(op_a, output_mod=branch_b)
     assert op_a.traced("output_mod", op_a.output_mod) != op_b.traced("output_mod", op_b.output_mod)
 
+
+def test_a_merges_price_is_held_by_its_hook_as_its_epilogue_calls_it_for_its_target():
+    """Row 12420: a merge's priced work (`launch_work`) is held by its output hook as its epilogue calls it on
+    the launch's target (`merged._epilogue_programs`): its 16-bit gate widened to fp32, at each candidate
+    block, traced for the B200 it is priced for whatever the ambient GPU, under the trace context a hook
+    reads; a hook closing over an array held once for its program."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
     def ctx_hook(o, g):
         return o * jax.nn.sigmoid(g) if _CTX_HOOK_MODE.get() == "sigmoid" else o + g
 
@@ -1103,17 +1110,58 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     finally:
         _CTX_HOOK_MODE.reset(token)
     assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
+    # A merge's plan is held by its hook as the epilogue calls it: its 16-bit gate widened to fp32 (a bf16 key
+    # held the gated hook's plan for the subtracting one, its exponentials unpriced; a hook holding its gate
+    # to fp32 raised as it was priced).
+
+    def strict(o, g):
+        assert g.dtype == jnp.float32, g.dtype
+        return o * g
+
+    def gating(o, g):
+        return o * jax.nn.sigmoid(g) if g.dtype == jnp.float32 else o + g
+
+    def subtracting(o, g):
+        return o - g if g.dtype == jnp.float32 else o + g
+
+    worked = {hook: merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                                       output_mod=hook, output_kinds=(template.Kind.OUTPUT,),
+                                       output_specs=(g_s,))
+              for hook in (strict, gating, subtracting)}
+    assert worked[gating].exponentials > worked[subtracting].exponentials, worked
+    # Keyed as traced for the launch's target, not the ambient one: hooks alike on an A100 and apart on a
+    # B200 hold their own B200 plans.
+
+    def on_b200(alike, apart):
+        def hook(o, g):
+            return apart(o, g) if generation.gpu_target().generation == "sm100" else alike(o, g)
+        return hook
+
+    with generation.assumed("sm80"):
+        gated, subtracted = (merged.launch_work(
+            spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+            output_mod=on_b200(lambda o, g: o + g, apart), output_kinds=(template.Kind.OUTPUT,),
+            output_specs=(g_s,)) for apart in (lambda o, g: o * jax.nn.sigmoid(g), lambda o, g: o - g))
+    assert gated.exponentials > subtracted.exponentials, (gated, subtracted)
+    # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
+    # array is planned once for its program, as one that holds none is.
     captured = jnp.ones((), jnp.float32)
 
-    def unholdable(o, g):
+    def closing(o, g):
         return o + g + captured
 
-    assert not tuning.holdable(unholdable)
-    cached_before = merged._planned_block_cached.cache_info().currsize
-    merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
-                       output_mod=unholdable, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
-    assert merged._planned_block_cached.cache_info().currsize == cached_before
-    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; pricing must still cache-hit.
+    def newest():
+        # The plan last read and what holds it: a plan made again is held anew.
+        key = next(reversed(merged._PLANNED))
+        return key, merged._PLANNED[key]
+
+    held = []
+    for _ in range(2):
+        merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                           output_mod=closing, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
+        held.append(newest())
+    assert held[0][0] == held[1][0] and held[0][1] is held[1][1]
+    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; its pricing reads the held plan.
     op_prep = merged.MergedPadded(
         units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
         output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
@@ -1121,9 +1169,9 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     with generation.assumed("sm100"):
         ba_prep = op_prep.bind(p_s, s_s, (g_s,))
         op_prep._get_heuristics_config(ba_prep)
-        hits_before = merged._planned_block_cached.cache_info().hits
+        made = newest()
         op_prep._get_heuristics_config(ba_prep)
-    assert merged._planned_block_cached.cache_info().hits > hits_before
+        assert newest()[0] == made[0] and newest()[1] is made[1]
 
 
 @COMPILES_ON_CPU

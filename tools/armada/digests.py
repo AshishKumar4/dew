@@ -192,6 +192,10 @@ def contents(name: str) -> bytes:
             return MISSING
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     path = Path(name)
+    # A fetched fixture's store holds each file under its sha256 (tools/fetched_fixtures.py's LOCAL): such a
+    # file is its name, there or not, as a planner holds no store; and the store's directory no input.
+    if (stored := Path(os.path.normpath(name))).is_relative_to(fetched.LOCAL):
+        return hashlib.sha256(stored.as_posix().encode()).digest()
     manifest = fetched.manifest(path) if path.name else None
     if manifest is not None and manifest.is_file():
         return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
@@ -199,7 +203,8 @@ def contents(name: str) -> bytes:
         return hashlib.sha256(path.read_bytes()).digest()
     if path.is_dir():
         entries = sorted(entry.name for entry in path.iterdir()
-                         if not entry.name.startswith(".") and not built(entry))
+                         if not entry.name.startswith(".") and not built(entry)
+                         and Path(os.path.normpath(entry)) != Path(fetched.LOCAL))
         return hashlib.sha256("\n".join(entries).encode()).digest()
     return MISSING
 

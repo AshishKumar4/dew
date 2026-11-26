@@ -16,6 +16,7 @@ otherwise, as `GatedMLP` ran them.
 """
 
 import dataclasses
+import math
 from collections.abc import Callable, Sequence
 from typing import TypeGuard
 
@@ -45,9 +46,13 @@ class GatedCase:
     """A gated MLP's three projections (gate, up, down) as the fused MLP's selector reads them (`GATED_MLP`):
     their `joined.Projections`, whether they agree in dtype, precision and promotion (`uniform`), whether any
     adds a bias (`biased`), the rows the products multiply in the dtype they run at (`rows`, flattened,
-    `fused_products`'), the gate's and the down projection's kernels in it (`kernels`, None where a projection
-    holds none), whether a launch sees the rows and kernels whole (`whole`: no automatic mesh axis splits
-    them) and the products' `precision`."""
+    `fused_products`'), the gate's and the down projection's kernels in it (`kernels`, `[in, hidden]` /
+    `[hidden, out]` for dense or `[experts, in, hidden]` / `[experts, hidden, out]` for grouped, None where
+    unavailable), whether a launch sees the rows and kernels whole (`whole`: no automatic mesh axis splits
+    them), the products' `precision`, the gated product's elementwise `hook` (None where the activation has
+    none, e.g. `Situ`), whether the call is grouped (`grouped`: expert-sorted rows in `moe.gated_experts`,
+    measured in its own `(dtype, 'grouped')` cell), whether the gate and up projections pair (`paired`), and
+    whether the down projection accepts a prologue (`down_prologue`)."""
 
     projections: Projections
     uniform: bool
@@ -56,9 +61,16 @@ class GatedCase:
     kernels: tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct] | None
     whole: bool
     precision: PrecisionLike
-    hook: Callable[[jax.Array, jax.Array], jax.Array]
+    hook: Callable[[jax.Array, jax.Array], jax.Array] | None
     """The gated product's hook (`activations.gated_hook` of the activation and its limit), which the paired
-    product's epilogue and the down product's prologue trace."""
+    product's epilogue and the down product's prologue trace; None where the activation has no hook."""
+    grouped: bool = False
+    paired: bool = True
+    down_prologue: bool = True
+    group_sizes: jax.ShapeDtypeStruct | None = None
+    gather: jax.ShapeDtypeStruct | None = None
+    scatter: jax.ShapeDtypeStruct | None = None
+    layer: jax.ShapeDtypeStruct | None = None
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -66,23 +78,107 @@ class GatedCase:
         return jnp.dtype(self.rows.dtype)
 
     @property
-    def cell(self) -> tuple[str, jnp.dtype]:
+    def cell(self) -> tuple[str, jnp.dtype | tuple[jnp.dtype, str]]:
         """The cell a receipt measures (`selection.Celled`): the device's generation and the products'
-        dtype."""
-        return device_generation(), self.dtype
+        dtype (or `(dtype, 'grouped')` for grouped expert MLPs, whose receipts are measured apart)."""
+        return device_generation(), (self.dtype, 'grouped') if self.grouped else self.dtype
 
     def launched(self) -> bool:
-        """Whether the template launches the up product and the down product (`projections.launches`), asked
-        only where the fused MLP is being chosen (its last requirement), so a call that runs its products
-        apart reports no route of a product it never launches."""
-        if self.kernels is None:
+        """Whether the template launches the up product and the down product (`projections.launches` for
+        dense, or the paired-epilogue and down-prologue grouped launches via `_grouped_launched` for grouped
+        experts), asked only where the fused MLP is being chosen (its last requirement), so a call that runs
+        its products apart reports no route of a product it never launches."""
+        from dew.nn.kernels.selection import KernelRefused
+
+        if self.kernels is None or self.hook is None:
             return False
         gate, down = self.kernels
-        hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[1]), self.dtype)
+        if self.grouped:
+            return _grouped_launched(
+                self.rows, gate, down, self.dtype, self.precision, self.hook, whole=self.whole,
+                group_sizes=self.group_sizes, gather=self.gather, scatter=self.scatter, layer=self.layer)
+        hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[-1]), self.dtype)
+        try:
+            launched = all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
+                           for rows, kernel in ((self.rows, gate), (hidden, down)))
+        except KernelRefused:
+            return False
+        if not launched:
+            return False
         tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
-        return (all(projections.launches(rows, kernel, self.dtype, self.precision, whole=self.whole)
-                    for rows, kernel in ((self.rows, gate), (hidden, down)))
-                and hook_lowers(self.hook, (tile, tile), gpu_target()))
+        return hook_lowers(self.hook, (tile, tile), gpu_target())
+
+
+def _grouped_stack(matrix: jax.ShapeDtypeStruct, dtype: jnp.dtype,
+                   layered: bool) -> jax.ShapeDtypeStruct | None:
+    """Flatten a 4D stacked expert bank `[layers, experts, in, out]` to 3D when `layered`, or keep 3D."""
+    if layered and matrix.ndim == 4:
+        return jax.ShapeDtypeStruct((matrix.shape[0] * matrix.shape[1], *matrix.shape[2:]), dtype)
+    return matrix if matrix.ndim == 3 else None
+
+
+def _grouped_launched(rows: jax.ShapeDtypeStruct, gate: jax.ShapeDtypeStruct, down: jax.ShapeDtypeStruct,
+                      dtype: jnp.dtype, precision: PrecisionLike,
+                      hook: Callable[[jax.Array, jax.Array], jax.Array], *, whole: bool,
+                      group_sizes: jax.ShapeDtypeStruct | None = None,
+                      gather: jax.ShapeDtypeStruct | None = None,
+                      scatter: jax.ShapeDtypeStruct | None = None,
+                      layer: jax.ShapeDtypeStruct | None = None) -> bool:
+    """Whether `grouped_matmul.GROUPED` selects Mosaic's fused launch (`MOSAIC`, never CUTLASS/XLA which
+    form the down prologue in XLA) for both the paired gate+up epilogue and down-projection prologue,
+    building each call through `gemm._gemm_call` with the actual group sizes, gather/scatter tables, and
+    layer offset (row 12847)."""
+    from dew.nn.kernels import generation, grouped_matmul, selection
+    from dew.nn.kernels.selection import KernelRefused
+
+    layered = layer is not None
+    gate_3d = _grouped_stack(gate, dtype, layered)
+    down_3d = _grouped_stack(down, dtype, layered)
+    if gate_3d is None or down_3d is None:
+        return False
+    sizes = (jax.ShapeDtypeStruct((gate.shape[1 if layered and gate.ndim == 4 else 0],), jnp.int32)
+             if group_sizes is None else jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32))
+    if sizes.ndim != 1:
+        return False
+    sorted_rows = rows.shape[0] if gather is None else gather.shape[0]
+    hidden = jax.ShapeDtypeStruct((sorted_rows, gate_3d.shape[-1]), dtype)
+    first = jax.ShapeDtypeStruct((), jnp.int32) if layered else None
+
+    def selected_name(call, product) -> str:
+        case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
+        return selection.selected(grouped_matmul.GROUPED, case).name
+
+    def pair_name(lhs: jax.ShapeDtypeStruct, table: jax.ShapeDtypeStruct | None) -> str:
+        call, product = gemm._gemm_call(
+            lhs, gate_3d, sizes, None, (), (), activations.rounded_gated(hook, dtype), (), (), (dtype,) * 3,
+            several=True, transpose_rhs=False, interpret=False, precision=precision, dense=False,
+            paired=gate_3d, first=first, gather=table, scatter=None, summed_as=())
+        return selected_name(call, product)
+
+    def down_name(table: jax.ShapeDtypeStruct | None) -> str:
+        call, product = gemm._gemm_call(
+            hidden, down_3d, sizes, hook, (hidden,), (('rows', 'depth'),), None, (), (), (dtype,),
+            several=False, transpose_rhs=False, interpret=False, precision=precision, dense=False,
+            paired=None, first=first, gather=None, scatter=table, summed_as=())
+        return selected_name(call, product)
+
+    mosaic, xla = grouped_matmul.MOSAIC.name, grouped_matmul.XLA.name
+    with generation.routes(alone=True):
+        try:
+            # Mirror `gemm._gemm`: only when no tabled launch takes `gather`/`scatter` (`XLA`), `gemm._gemm`
+            # gathers/scatters around the untabled grouped launch; CUTLASS runs with an XLA-formed prologue.
+            pair_picked = pair_name(rows, gather)
+            if pair_picked != mosaic and (
+                    pair_picked != xla or gather is None or pair_name(
+                        jax.ShapeDtypeStruct((sorted_rows, rows.shape[-1]), dtype), None) != mosaic):
+                return False
+            down_picked = down_name(scatter)
+            if down_picked != mosaic and (
+                    down_picked != xla or scatter is None or down_name(None) != mosaic):
+                return False
+        except KernelRefused:
+            return False
+    return True
 
 
 FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
@@ -91,6 +187,15 @@ FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
                 "the projections differ in dtype, precision or promotion", row=INHERENT, kind='handoff'),
     Requirement('biased', lambda case: not case.biased,
                 "a projection adds a bias, which no hook of the fused MLP adds yet", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('paired', lambda case: case.paired,
+                "the gate and up projections cannot run as one paired product", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('down_prologue', lambda case: case.down_prologue,
+                "the down projection takes no prologue (an NVFP4 bank, a recipe taking the experts, or "
+                "another layer stack)", row=FUSION_ROW, kind='handoff'),
+    Requirement('hook', lambda case: case.hook is not None,
+                "the gated activation has no elementwise hook to lower on the template", row=FUSION_ROW,
                 kind='handoff'),
     Requirement('launched', lambda case: case.launched(),
                 "no launch of the GEMM template takes the up or the down product here (a mesh axis splitting "
@@ -103,10 +208,11 @@ them runs its projections apart even where the fused MLP is named."""
 FUSED = Kernel[GatedCase]('fused', FUSED_SUPPORTS)
 """The three products on the template's hooks (`gated_mlp`)."""
 
-FUSED_CELLS: dict[tuple[str | None, jnp.dtype], tuple[Kernel[GatedCase], str]] = {}
-"""The fused MLP's declared cells, (device generation, activations' dtype) to the fused kernel and its
-receipt: none yet. Where the fused Pallas SiLU product holds a cell (`norm_swiglu.SWIGLU_CELLS`), a cell here
-is declared only from the fused MLP's own receipt on that generation."""
+FUSED_CELLS: dict[tuple[str | None, jnp.dtype | tuple[jnp.dtype, str]], tuple[Kernel[GatedCase], str]] = {}
+"""The fused MLP's declared cells, `(device generation, dtype)` for dense or `(device generation, (dtype,
+'grouped'))` for grouped experts to the fused kernel and its receipt: none yet. Where the fused Pallas SiLU
+product holds a cell (`norm_swiglu.SWIGLU_CELLS`), a cell here is declared only from the fused MLP's own
+receipt on that generation."""
 
 GATED_MLP: Op[GatedCase] = Op(Choice.GATED_MLP, (FUSED, Kernel('apart', (), generic=True)),
                               lambda case: 'apart', declared=FUSED_CELLS)
@@ -159,6 +265,74 @@ def fuses(projections_: Sequence[nn.Module], rows: jax.Array, activation: str,
     if projections_[0].is_initializing():
         return False
     return select(GATED_MLP, gated_case(rows, projections_, activation, limit)).kernel == 'fused'
+
+
+_GROUPED_PROJECTIONS = Projections(
+    dense=True, dot_general=True, intercepted=False, held=True, recipe=False, observed=False)
+"""`Projections` stand-in for grouped expert banks (`moe.gated_experts`), which hold no Flax `Dense` modules
+and validate pairing, recipes, and down-projection prologue eligibility directly via `GatedCase`."""
+
+
+def _shape_struct(value: jax.Array | jax.ShapeDtypeStruct | None,
+                  dtype=None) -> jax.ShapeDtypeStruct | None:
+    """Normalize an array or `ShapeDtypeStruct` operand descriptor for `GatedCase`."""
+    if value is None:
+        return None
+    return jax.ShapeDtypeStruct(value.shape, value.dtype if dtype is None else dtype)
+
+
+def grouped_case(rows: jax.Array | jax.ShapeDtypeStruct,
+                 kernels: tuple[jax.Array | jax.ShapeDtypeStruct, jax.Array | jax.ShapeDtypeStruct] | None,
+                 precision: PrecisionLike,
+                 hook: Callable[[jax.Array, jax.Array], jax.Array] | None, *,
+                 paired: bool = True, down_prologue: bool = True,
+                 whole: bool | None = None,
+                 group_sizes: jax.Array | jax.ShapeDtypeStruct | None = None,
+                 gather: jax.Array | jax.ShapeDtypeStruct | None = None,
+                 scatter: jax.Array | jax.ShapeDtypeStruct | None = None,
+                 layer: int | jax.Array | jax.ShapeDtypeStruct | None = None) -> GatedCase:
+    """The `GatedCase` of a grouped gated expert MLP (`moe.gated_experts`, row 12847) over `rows` in its
+    compute dtype and `(gate, down)` expert kernel shapes (`[experts, in, hidden]` / `[experts, hidden, out]`
+    or stacked `[layers, experts, ...]` with `layer`, None where unavailable), plus optional `group_sizes`,
+    `gather`, `scatter`, and `layer` launch descriptors."""
+    dtype = jnp.dtype(rows.dtype)
+    flat_rows = jax.ShapeDtypeStruct((math.prod(rows.shape[:-1]), rows.shape[-1]), dtype)
+    typed_kernels = (None if kernels is None else (
+        jax.ShapeDtypeStruct(kernels[0].shape, dtype),
+        jax.ShapeDtypeStruct(kernels[1].shape, dtype)))
+    return GatedCase(
+        projections=_GROUPED_PROJECTIONS,
+        uniform=True,
+        biased=False,
+        rows=flat_rows,
+        kernels=typed_kernels,
+        whole=not automatic_axes() if whole is None else whole,
+        precision=precision,
+        hook=hook,
+        grouped=True,
+        paired=paired,
+        down_prologue=down_prologue,
+        group_sizes=_shape_struct(group_sizes, jnp.int32),
+        gather=_shape_struct(gather, jnp.int32),
+        scatter=_shape_struct(scatter, jnp.int32),
+        layer=None if layer is None else jax.ShapeDtypeStruct((), jnp.int32))
+
+
+def fuses_grouped(rows: jax.Array | jax.ShapeDtypeStruct,
+                  kernels: tuple[jax.Array | jax.ShapeDtypeStruct, jax.Array | jax.ShapeDtypeStruct] | None,
+                  precision: PrecisionLike,
+                  hook: Callable[[jax.Array, jax.Array], jax.Array] | None, *,
+                  paired: bool = True, down_prologue: bool = True,
+                  whole: bool | None = None,
+                  group_sizes: jax.Array | jax.ShapeDtypeStruct | None = None,
+                  gather: jax.Array | jax.ShapeDtypeStruct | None = None,
+                  scatter: jax.Array | jax.ShapeDtypeStruct | None = None,
+                  layer: int | jax.Array | jax.ShapeDtypeStruct | None = None) -> bool:
+    """Whether a grouped gated expert MLP (`moe.gated_experts`) runs fused on the GEMM template's hooks, as
+    `GATED_MLP` selects it."""
+    return select(GATED_MLP, grouped_case(
+        rows, kernels, precision, hook, paired=paired, down_prologue=down_prologue, whole=whole,
+        group_sizes=group_sizes, gather=gather, scatter=scatter, layer=layer)).kernel == 'fused'
 
 
 def gated_mlp(x: jax.Array, projections_: Sequence[nn.Dense], activation: str, *,

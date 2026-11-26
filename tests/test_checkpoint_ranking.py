@@ -17,6 +17,7 @@ import optax
 import pytest
 from affine_run import Counting, dataset, val_batches
 from model_support import attending
+from placement_parity import assert_same_leaf
 from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
@@ -323,11 +324,6 @@ def test_each_suites_best_policy_ranks_that_suites_instance_of_a_metric_two_suit
     assert run.checkpoints.resolve('best:rare/value') == 1
 
 
-def leaf_values(leaf) -> np.ndarray:
-    """A state leaf's values, a random key's as its key data."""
-    return np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
-
-
 def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_path):
     """A trainer that writes no checkpoints keeps its best state in host memory as it evaluates, so
     restore_best returns the state a checkpointed run restores as its best, every leaf of it: by the
@@ -340,7 +336,7 @@ def test_restore_best_without_checkpoints_returns_the_best_state_it_held(tmp_pat
             data(), steps=8, log_every=1, eval_every=1, restore_best=True, **policy)
         assert int(unsaved.step) == int(saved.step) == (3 if name == 'loss' else 8)
         for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
-            np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+            assert_same_leaf(left, right)
 
 
 def test_a_run_ranks_and_stops_by_its_validation_loss_by_name_with_no_metric(tmp_path):
@@ -396,7 +392,7 @@ def test_restore_best_without_checkpoints_ranks_by_the_training_loss_without_val
         stream, steps=8, log_every=1, eval_every=1, restore_best=True)
     assert int(unsaved.step) == int(saved.step)
     for left, right in zip(jax.tree.leaves(unsaved), jax.tree.leaves(saved), strict=True):
-        np.testing.assert_array_equal(leaf_values(left), leaf_values(right))
+        assert_same_leaf(left, right)
 
 
 def test_a_held_best_no_evaluation_ranks_ends_the_run_failed():

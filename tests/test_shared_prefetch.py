@@ -73,8 +73,9 @@ def test_a_traced_empty_common_segment_prefetches_nothing():
     """Interpreted: two consumers' common segments, their bounds traced, of no step, one step and three steps
     each prefetch once a step: the first step's as they start, each later one's at the step before's
     boundary, none past the last step (whose slot no copy fills), so the one-step and three-step segments
-    prefetch 1 and 3 times; the empty one, its pipeline not run, none (where it prefetched its first slot,
-    which no copy filled). Each consumer's sum is every walked step's tile."""
+    prefetch 1 and 3 times; the empty one, its pipeline run over no step, none (Dew's fork at post131, row
+    12695: it had prefetched its first slot, which no copy filled). Each consumer's sum is every walked
+    step's tile."""
     x = jnp.asarray(np.arange(STEPS * ROWS * WIDTH).reshape(STEPS * ROWS, WIDTH) % 7, jnp.bfloat16)
     sums, counts = _prefetched_walk(x, ((0, 0), (0, 1), (1, STEPS)))
     np.testing.assert_array_equal(np.asarray(counts), [1 + 3] * CONSUMERS)
@@ -84,8 +85,8 @@ def test_a_traced_empty_common_segment_prefetches_nothing():
 
 
 def test_a_prefetching_common_walk_lowers_for_an_a100():
-    """The prefetching walk's mma.sync products and fragments, its traced segments' pipelines each under a
-    branch on its trips, lower for an A100 on any host."""
+    """The prefetching walk's mma.sync products and fragments, its traced segments' pipelines whatever their
+    trips, lower for an A100 on any host."""
     x = jax.ShapeDtypeStruct((STEPS * ROWS, WIDTH), jnp.bfloat16)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     walked = functools.partial(_prefetched_walk, segments=((0, 0), (0, 1), (1, STEPS)), interpret=False)

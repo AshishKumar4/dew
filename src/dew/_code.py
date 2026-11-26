@@ -188,14 +188,31 @@ def _contents_at(relative: str) -> str:
 def provenance(values: Sequence[object]) -> frozenset[str] | None:
     """The modules of Dew's defining `values` and every value they hold (a dataclass's fields', a
     collection's members): a class's own module, any other value's class's, none for a library's or the
-    user's own, whose release or source states it. None, the whole package, where any is a function (a
-    hook, a prepared one): a kernel's identity traces a hook at one tile alone
-    (`attention.hook_program`), and no value names the code a wrapper calls (row 10743)."""
-    held = [part for value in values for part in _held(value)]
-    if any(callable(part) and not isinstance(part, type) for part in held):
+    user's own, whose release or source states it. None, the whole package, where any is a callable no class
+    of Dew's states (`stated_class`): a function (a hook, a prepared one), a bound method, a library's
+    wrapper (a `functools.partial`) or an instance of a class made in a function. A kernel's identity traces
+    a hook at one tile alone (`attention.hook_program`), and no value names the code a wrapper calls (row
+    10743). A callable instance of a class of Dew's at its module's top level (a Flax module, a template's
+    hook such as `Capped`) is its class's code, as any other instance is, its fields walked as theirs are."""
+    parts = [part for value in values for part in _held(value)]
+    if any(callable(part) and not isinstance(part, type) and not stated_class(type(part)) for part in parts):
         return None
-    modules = {(part if isinstance(part, type) else type(part)).__module__ for part in held}
+    modules = {(part if isinstance(part, type) else type(part)).__module__ for part in parts}
     return frozenset(module for module in modules if _path(module) is not None)
+
+
+def _slots(kind: type) -> tuple[str, ...]:
+    """The attribute slots `kind` and its bases declare (`__slots__`), their own `__dict__` and weak
+    reference slots left out."""
+    declared = (vars(klass).get("__slots__", ()) for klass in kind.__mro__)
+    return tuple(name for names in declared for name in ((names,) if isinstance(names, str) else names)
+                 if name not in ("__dict__", "__weakref__"))
+
+
+def stated_class(kind: type) -> bool:
+    """Whether `kind`'s code is a module of Dew's, which defines it at its top level, so an instance's code is
+    that module's and what it imports (`code_digest`)."""
+    return _path(kind.__module__) is not None and "<locals>" not in kind.__qualname__
 
 
 def op_provenance(op, arguments: Mapping[str, object]) -> frozenset[str] | None:
@@ -215,9 +232,23 @@ def provenance_code(root: str, provenance: frozenset[str] | None) -> list[str]:
     return [code_digest(module) for module in (root, *sorted(provenance))]
 
 
+DATA_PACKAGES = frozenset({"builtins", "numpy", "jax", "jaxlib", "ml_dtypes"})
+"""The packages whose instances a value holds as data, no code of their own run as Dew's code reads them."""
+
+
+def states_its_code(values: Sequence[object]) -> bool:
+    """Whether every value `values` hold (`_held`) is a class, data (`DATA_PACKAGES`) or an instance of a
+    class of Dew's (`stated_class`): none a function, a library's wrapper or an instance of a user's class,
+    whose code no module of Dew's states."""
+    return not any(not isinstance(part, type) and not stated_class(type(part))
+                   and type(part).__module__.partition(".")[0] not in DATA_PACKAGES
+                   for value in values for part in _held(value))
+
+
 def _held(value) -> Sequence[object]:
-    """`value` and every value it holds: a dataclass's fields', a sequence's or a set's members, a mapping's
-    values, each once however often it is held, so a graph that holds itself (a cyclic hook graph's) ends."""
+    """`value` and every value it holds: a dataclass's fields', a plain class of Dew's attributes, a
+    sequence's or a set's members, a mapping's values, each once however often it is held, so a graph that
+    holds itself (a cyclic hook graph's) ends."""
     found: list[object] = []
     seen: set[int] = set()
     pending = [value]
@@ -233,6 +264,12 @@ def _held(value) -> Sequence[object]:
             pending.extend(current)
         elif isinstance(current, Mapping):
             pending.extend(current.values())
+        elif not isinstance(current, type) and stated_class(type(current)):
+            # A plain class of Dew's holds its values as attributes (an objective's criterion, its model): in
+            # its `__dict__`, and in the slots its classes declare where they do (a slotted class has none).
+            if type(current).__dictoffset__:
+                pending.extend(vars(current).values())
+            pending.extend(getattr(current, name) for name in _slots(type(current)) if hasattr(current, name))
     return found
 
 

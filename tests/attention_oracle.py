@@ -27,10 +27,11 @@ def qkv(shape, dtype=jnp.bfloat16, seed=0, kv_shape=None):
 
 def packed_ids(*rows, length=256):
     """`[B, S]` segment ids, one row per tuple of document lengths, 1-based,
-    with the rest of each row padding (0)."""
+    with the rest of each row padding (0): host int32, which a GPU tier part's
+    prepare, computing nothing on its compile-only device, takes as a call's."""
     packed = [np.pad(np.repeat(np.arange(1, len(lengths) + 1), lengths),
                      (0, length - sum(lengths))) for lengths in rows]
-    return jnp.asarray(np.stack(packed), jnp.int32)
+    return np.stack(packed).astype(np.int32)
 
 
 def attention_and_grads(implementation, *, has_sinks=False, live=None, **kwargs):

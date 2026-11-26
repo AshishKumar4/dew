@@ -182,13 +182,15 @@ def _rows_of(ref, keys: int) -> jax.Array:
     return plgpu.load(ref, layout=layout, optimized=False)
 
 
-def intra_block_stored(call: Call, name: str, block, ref, landing: dict, *, row, head) -> None:
+def intra_block_stored(call: Call, name: str, block, ref, landing: dict, *, row, head,
+                       wait: bool = True) -> None:
     """The intra walk's sub-chunk row block `[SUB, C]` of output `name` (the scores, or the system's inverse)
-    at `row`, a sub-chunk's rows of the chunk's square, as `call.held`, each through its own landing."""
+    at `row`, a sub-chunk's rows of the chunk's square, as `call.held`, each through its own landing, its
+    last copy left in flight unless `wait` (`Family.stored`)."""
     chunk = call.chunk
     form = dataclasses.replace(call.held, rows=call.rows)
     form.store(ref, block, row, algebra.SUB, head * chunk, chunk, family=call.family,
-               smem=landing["square" if name == "scores" else "inverse"])
+               smem=landing["square" if name == "scores" else "inverse"], wait=wait)
 
 
 def _sum_index(call: Call, output: int, later: int) -> int:
@@ -426,7 +428,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
                 # buffer the last's products still read (`_sub_chunk_staged`).
                 batch = [(gated_up(j + 1), raised[j % len(raised)]),
                          *([] if held else [(value, lefts[r]) for r, value in enumerate(gated)])]
-                staged = operands.staged_all(family, batch)
+                staged = operands.staged_all(call, batch)
                 keyed, held = staged[0].T, held or staged[1:]
                 for r, tile in enumerate(held):
                     at = _sum_index(call, r, j)
@@ -469,11 +471,14 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
     sub-chunk (`algebra.columns_before`: a row whose write gate overflows times a zero factor is a NaN past
     them), `X` the rows of blocks before it (staged, zero past them), `E_b` the identity's rows: fla_kda's
     merges, each stored less its unit diagonal, as `mainloop._weighted` takes it. The own blocks `owned`
-    (their views, a form's parts each) are read into their tiles, each thread its run of words
-    (`own_loaded`)."""
+    (their views, a form's parts each) are read into their tiles at once, each thread its run of words
+    (`own_loaded`): every sub-chunk's own scores in its columns of one row block's tile, which each row block
+    reads its columns of. Each row block's stores stay in flight past it, its landing's reads waited for
+    before the next writes it (`Family.store_wait`): a copy a sub-chunk and its stores waited out each were
+    an H100's Kimi Linear intra launch's longest stalls past its walk (M-JS-272)."""
     sub, chunk, family = algebra.SUB, call.chunk, call.family
     (scores_view,), *inverse_views = owned
-    wide, own_tiles, lower, solved, stacked = solve
+    wide, own_tiles = solve[:2]
     rows_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 0)
     columns_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 1)
 
@@ -484,20 +489,22 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
         of layouts")."""
         return family.as_tile(jnp.where(columns_of == rows_of + b * sub, 1.0, 0.0))
 
-    def rows_at(tile, b):
-        return operands.Parts(tuple(ref.at[pl.ds(b * sub, sub)] for ref in tile.refs), tile.dtype)
-
     def stored(name, block, b):
+        family.store_wait(0)
         intra_block_stored(call, name, block, sums[0 if name == "scores" else 1], landing,
-                           row=row + b * sub, head=head)
+                           row=row + b * sub, head=head, wait=False)
 
-    for b in range(chunk // sub):
-        # The own block copied into its columns of the row block's tile, read in the sums' layout, the tile
-        # free of the last row block's reads first.
-        mosaic.synced(call.interpret)
-        own_loaded(call, (scores_view.at[pl.ds(b * sub, sub)],), (wide.at[:, pl.ds(b * sub, sub)],))
-        mosaic.synced(call.interpret)
-        own = (wide[...] if call.interpret else family.tile_of(wide)).astype(jnp.float32)
+    blocks = chunk // sub
+    solving = "system" in products
+    # Each sub-chunk's own block in its columns of the row block's tile, and the own inverses' tiles.
+    own_loaded(call, (*(scores_view.at[pl.ds(b * sub, sub)] for b in range(blocks)),
+                      *(inverse_views[0] if solving else ())),
+               (*(wide.at[:, pl.ds(b * sub, sub)] for b in range(blocks)),
+                *(own_tiles[0] if solving else ())))
+    mosaic.synced(call.interpret)
+    own = (wide[...] if call.interpret else family.tile_of(wide)).astype(jnp.float32)
+    for b in range(blocks):
+        # The row block's own block in its columns, the later ones' past them masked.
         placed = jnp.where(columns_of < (b + 1) * sub, own, 0.0)
         if b:
             # The walk's sums before the sub-chunk alone, scaled past one; its own block and the rest of the
@@ -505,18 +512,28 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
             walked = totals[_sum_index(call, 0, b - 1)] * growing
             placed = jnp.where(columns_of < b * sub, walked, placed)
         stored("scores", placed, b)
-    if "system" not in products:
-        return
+    if solving:
+        _solved(call, totals, own_tiles[0], solve[2:], stored, identity)
+    family.store_wait(0)
+
+
+def _solved(call: Call, totals, inverse_tiles: tuple, solve: tuple, stored: Callable,
+            identity: Callable) -> None:
+    """`_read_out`'s system's inverse, a row block of blocks at a time by forward substitution, each stored
+    (`stored(name, block, b)`)."""
+    sub, chunk, family = algebra.SUB, call.chunk, call.family
+    lower, solved, stacked = solve
     inverted = inverse_form(call)
-    (inverse_tiles,) = own_tiles
-    own_loaded(call, inverse_views[0], inverse_tiles)
-    mosaic.synced(call.interpret)
+
+    def rows_at(tile, b):
+        return operands.Parts(tuple(ref.at[pl.ds(b * sub, sub)] for ref in tile.refs), tile.dtype)
+
     own_inverses = operands.Parts(inverse_tiles, inverted.dtype)
     issuer = Issuer(call, {"lower": lower, "solve": solved})
     # The rows of blocks staged zero, so a row block's sum over those not yet solved reads zero.
     for b in range(chunk // sub):
         zero = family.as_tile(family.zeros((sub, chunk)))
-        operands.staged(family, zero, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
+        operands.staged(call, zero, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
     for b in range(chunk // sub):
         unit = identity(b)
         right = unit
@@ -527,19 +544,17 @@ def _read_out(call: Call, products: tuple[str, ...], totals, owned: list, solve:
         stored("inverse", found - unit, b)
         if b + 1 < chunk // sub:
             family.settled(0)
-            operands.staged(family, found, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
+            operands.staged(call, found, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
 
 
 def _pair_swizzles(call: Call, blocks: dict, keys: int) -> dict[str, int]:
     """The intra walk's streams' swizzles: each its widest at `keys` columns (`resources.widest_swizzle`), or
-    unswizzled (`swizzling.UNSWIZZLED`) where an fp32 call with a decay a key dimension (its prefix's limbs,
-    `Call.prefix_limbs`) takes mma.sync's products (its issuer's, `mosaic_sm80.MmaIssuer`, an A100's and a
-    consumer Blackwell's alike): Mosaic GPU synthesizes no shared-memory transfer from a
-    128-byte swizzled fp32 tile into the register layout a TF32 product's operand takes beside that decay, so
-    an A100's fast fp32 Kimi delta attention lowered no intra launch (row 12647); a decay a head's fp32 call
-    lowers swizzled."""
-    plain = (isinstance(call.family, mosaic_sm80.MmaIssuer) and call.given.stored == jnp.float32
-             and call.prefix_limbs > 0)
+    unswizzled (`swizzling.UNSWIZZLED`) where an fp32 call takes mma.sync's products (its issuer's,
+    `mosaic_sm80.MmaIssuer`, an A100's and a consumer Blackwell's alike): Mosaic GPU synthesizes no
+    shared-memory transfer from a 128-byte swizzled fp32 tile into the register layout a TF32 product's
+    operand takes, so an A100's fast fp32 Kimi delta attention lowered no intra launch (row 12647). The walk
+    serves a decay a key dimension alone, so no term of it states one (row 12853)."""
+    plain = isinstance(call.family, mosaic_sm80.MmaIssuer) and call.given.stored == jnp.float32
     return {name: swizzling.UNSWIZZLED if plain else resources.widest_swizzle(dtype, keys)
             for name, (_, dtype) in blocks.items()}
 
@@ -564,47 +579,56 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
 
 
 def own_loaded(call: Call, views: tuple, tiles: tuple) -> None:
-    """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`) read into their plain
-    `tiles`, each thread its run of words (`copied_by_thread`): a launch's tile read once, after its walk.
-    The walk's products are mma.sync's (`sub_chunked`), whose operands load through the threads' own reads,
-    so the warpgroup's barrier after the copy (`mosaic.synced`) is all their reads wait on. A load of the
-    views into registers is no copy of them: a 16-column bf16 row is half of each 32-byte sector a warp's
-    tiled load reads ("GMEM transfer does not access a whole number of complete 32 byte sectors", every
-    Kimi Linear cell of the resource gate)."""
-    for view, tile in zip(views, tiles, strict=True):
-        if call.interpret:
+    """The own blocks' compact views (`own_pairs.intra_own`'s, a part each `[C, SUB]`, or a sub-chunk's rows
+    of one) read into their plain `tiles`, each thread its run of words (`copied_by_thread`), every view's
+    words read before any is written: a launch's tiles read once, after its walk. The walk's products are
+    mma.sync's (`sub_chunked`), whose operands load through the threads' own reads, so the warpgroup's
+    barrier after the copy (`mosaic.synced`) is all their reads wait on. A load of the views into registers is
+    no copy of them: a 16-column bf16 row is half of each 32-byte sector a warp's tiled load reads ("GMEM
+    transfer does not access a whole number of complete 32 byte sectors", every Kimi Linear cell of the
+    resource gate)."""
+    if call.interpret:
+        for view, tile in zip(views, tiles, strict=True):
             tile[...] = view[...]
-        else:
-            copied_by_thread(view, tile)
+    else:
+        copied_by_thread(views, tiles)
 
 
-def copied_by_thread(source, target, *, scale: float | None = None) -> None:
-    """`source` `[rows, columns]` copied to `target` of its shape, each thread its run of entries, row by row:
-    as it is, or, given `scale`, each entry an fp32 scaled by it and rounded once to `target`'s dtype (the
-    own pairs' scores, `own_pairs.intra_own`). Natively alone: a Mosaic GPU program's threads' own words."""
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(
-        lambda ctx, from_ref, to_ref: _thread_copied(from_ref, to_ref, scale=scale))(source, target)
+def copied_by_thread(sources: tuple, targets: tuple, *, scale: float | None = None) -> None:
+    """Each of `sources` (`[rows, columns]`) copied to its of `targets` (its shape), each thread its run of
+    entries, row by row, every source's entries read before any target's written, so their loads wait once:
+    as they are, or, given `scale`, each entry an fp32 scaled by it and rounded once to its target's dtype
+    (the own pairs' scores, `own_pairs.intra_own`). Natively alone: a Mosaic GPU program's threads' own
+    words."""
+    refs = (plgpu.RefType(),) * (2 * len(sources))
+    plgpu.inline_mgpu(arg_types=refs, return_type=())(
+        lambda ctx, *refs: _thread_copied(refs[:len(sources)], refs[len(sources):], scale=scale))(
+        *sources, *targets)
 
 
-def _thread_copied(source_ref, target_ref, *, scale: float | None) -> None:
-    """`copied_by_thread` in Mosaic GPU's terms: a thread's `rows * columns / THREADS` entries."""
+def _thread_copied(source_refs: tuple, target_refs: tuple, *, scale: float | None) -> None:
+    """`copied_by_thread` in Mosaic GPU's terms: a thread's `rows * columns / THREADS` entries of each."""
     index, i32, f32 = ir.IndexType.get(), ir.IntegerType.get_signless(32), ir.F32Type.get()
-    rows, columns = ir.MemRefType(source_ref.type).shape
-    stored = ir.MemRefType(target_ref.type).element_type
-    run = rows * columns // scan.THREADS
 
     def const(value):
         return arith.constant(i32, value)
 
     thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
-    for step in range(run):
-        entry = arith.addi(arith.muli(thread, const(run)), const(step))
-        at = [arith.index_cast(index, value)
-              for value in (arith.divui(entry, const(columns)), arith.remui(entry, const(columns)))]
-        value = memref.load(source_ref, at)
-        if scale is not None:
-            value = arith.mulf(value, arith.constant(f32, scale))
-            value = value if stored == value.type else arith.truncf(stored, value)
+    loaded = []
+    for source_ref, target_ref in zip(source_refs, target_refs, strict=True):
+        rows, columns = ir.MemRefType(source_ref.type).shape
+        stored = ir.MemRefType(target_ref.type).element_type
+        run = rows * columns // scan.THREADS
+        for step in range(run):
+            entry = arith.addi(arith.muli(thread, const(run)), const(step))
+            at = [arith.index_cast(index, value)
+                  for value in (arith.divui(entry, const(columns)), arith.remui(entry, const(columns)))]
+            value = memref.load(source_ref, at)
+            if scale is not None:
+                value = arith.mulf(value, arith.constant(f32, scale))
+                value = value if stored == value.type else arith.truncf(stored, value)
+            loaded.append((value, target_ref, at))
+    for value, target_ref, at in loaded:
         memref.store(value, target_ref, at)
 
 

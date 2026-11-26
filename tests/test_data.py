@@ -267,6 +267,68 @@ def test_a_training_read_in_automatic_workers_reads_in_them_where_they_pay_for_t
             resumed.close()
 
 
+
+def test_a_loader_explains_the_read_its_readers_run():
+    """A compiled loader states how its training read reads (`Loader.reading`) and explains it
+    (`Loader.explain`): the read and who chose it, the sources, the chain or the compile; the workers its
+    batches are made in, as many as the processes that make them; and a faster read, memory, where
+    another was asked of sources that can all be read into memory and a chain that lowers there, which
+    reads the same batches and names none faster, and none where the training or the validation branch
+    interleaves a stream's shards, which a memory read refuses. Its explanation names each of these and
+    each fact its plan's order records (row 1563)."""
+    rows = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered()).map(_Where()).batch(4)
+    auto = Loading(workers="auto", host=TWO_CPUS)
+
+    def batches(loader, count: int = 6) -> list:
+        reader = loader.train(DataPartition())
+        try:
+            return listed(reader, count)
+        finally:
+            reader.close()
+
+    chosen = compile(rows, seed=5, steps=10**6, loading=auto)
+    reading = chosen.reading
+    assert (reading.read, reading.chooser, reading.faster) == ("memory", "sources", None)
+    made = batches(chosen)
+    assert reading.workers.count == len({int(pid) for batch in made for pid in batch["pid"]}) == 2
+    text = chosen.explain()
+    assert all(fact in text for fact in (reading.read, str(reading.workers.count), *chosen.plan.order))
+    assert compile(rows.read("memory"), seed=5, loading=auto).reading.chooser == "chain"
+    indexed = compile(rows, seed=5, steps=10**6, loading=auto, read="indexed")
+    assert (indexed.reading.chooser, indexed.reading.faster) == ("compile", "memory")
+    assert "memory" in indexed.explain()
+    faster = compile(rows, seed=5, steps=10**6, loading=auto, read=indexed.reading.faster)
+    assert faster.reading.faster is None
+
+    def drawn(made: list) -> list:
+        return [{field: np.asarray(value).tolist() for field, value in batch.items() if field != "pid"}
+                for batch in made]
+
+    assert drawn(batches(faster)) == drawn(batches(indexed))
+    # A worker stage the chain writes is read as its reader is built: its count and its buffer, which the
+    # loading's own does not state (row 13018).
+    from dew.data.pipeline import Workers
+
+    written = compile(rows.workers(2, buffer=4), seed=5, steps=10**6, loading=auto)
+    assert written.reading.workers == Workers(2, 4) and "each holding 4 batches" in written.explain()
+    # One read serves every phase: a later phase the memory read refuses names none (review of row 1563), a
+    # corpus of its own (24 records), which the phases share no stream of.
+    from dew.data.pipeline import Phase, Steps, phases
+
+    phased = phases(Phase(Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4), Steps(2)),
+                    Phase(Pipeline(Memory(_Indexed(24), shard_rows=8)).interleave(2).repeat().batch(4)))
+    assert compile(phased, steps=10**6, loading=Loading(workers=0), read="streamed").reading.faster is None
+    interleaved = Pipeline(Memory(_Indexed(30), shard_rows=8)).interleave(2)
+    plain = Pipeline(Memory(_Indexed(30), shard_rows=8)).repeat().batch(4)
+    streamed = {"alone": compile(plain, steps=10**6, loading=Loading(workers=0), read="streamed"),
+                "training": compile(interleaved.repeat().batch(4), steps=10**6, loading=auto,
+                                    read="streamed"),
+                "validation": compile(plain, validation=interleaved.batch(4), steps=10**6,
+                                      loading=Loading(workers=0), read="streamed")}
+    assert {name: loader.reading.faster for name, loader in streamed.items()} == {
+        "alone": "memory", "training": None, "validation": None}
+
+
 @dataclasses.dataclass(frozen=True)
 class _Spread:
     """An expansion of each record into as many rows as its index modulo three, none for every third."""
