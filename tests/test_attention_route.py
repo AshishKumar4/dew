@@ -1168,9 +1168,9 @@ def _launches(fn, *operands) -> set[str]:
 def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
     """A bf16 causal call named onto 'flash_inference' on an A100: undifferentiated, it launches
     FlashAttention's forward alone where this host lowers it for the target
-    (`attention_kernels.flash_lowered`) and is refused, named (`selection.Unlowerable`, its kernel 'flash'), where it does not, never another
-    kernel nor an import error (head review); differentiated, the template's kernels alone, forward and
-    derivatives, which lower for the target on any host (row 13288)."""
+    (`attention_kernels.flash_lowered`) and is refused, named (`selection.Unlowerable`, its kernel 'flash'),
+    where it does not, never another kernel nor an import error (head review); differentiated, the template's
+    kernels alone, forward and derivatives, which lower for the target on any host (row 13288)."""
     from dew.nn import attention_kernels
     from dew.nn.kernels import selection
 
