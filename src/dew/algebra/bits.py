@@ -749,18 +749,21 @@ E4M3_SCALE_OWED = 2.0 ** 120
 2^120, restored exactly by integer exponent arithmetic (`float_bits.raised_exactly`)."""
 
 
+def _quiet_nan(sign: jax.Array) -> jax.Array:
+    return jax.lax.bitcast_convert_type(sign | np.uint32(0x7FC00000), jnp.float32)
+
+
 def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx_registers`,
     where inline assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed
     2^120 from its bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing
-    lane); E4M3's two
-    NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
-    decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
+    lane). E4M3's two NaN codes, 0x7F and 0xFF, retain their sign with a quiet NaN payload, as the cast
+    does. The linear fields alone would read them as 480 and -480 (the review of 3580, F1)."""
     held = codes.astype(jnp.uint32)
     (pattern,) = E4M3_SCALE_FORM.traced(held)
     value = raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
-    return jnp.where(held & 0x7F == 0x7F, jnp.float32(jnp.nan), value)
+    return jnp.where(held & 0x7F == 0x7F, _quiet_nan((held & np.uint32(0x80)) << np.uint32(24)), value)
 
 
 E8M0_SCALE_FORM = BitForm(
@@ -885,7 +888,7 @@ def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
         if inf_code > minifloat.largest:
             inf = jax.lax.bitcast_convert_type(sign | word(0x7F800000), jnp.float32)
             value = jnp.where(magnitude == word(inf_code), inf, value)
-        value = jnp.where(magnitude > word(max(minifloat.largest, inf_code)), jnp.float32(jnp.nan), value)
+        value = jnp.where(magnitude > word(max(minifloat.largest, inf_code)), _quiet_nan(sign), value)
     return value
 
 
