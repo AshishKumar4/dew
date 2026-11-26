@@ -541,16 +541,15 @@ def _refuse_reshaped(template, stored, where: str) -> None:
 
 
 def _packed_checked(tree) -> None:
-    """Refuse a restored tree holding a packed bank (`NvFp4`/`TernaryWeights`) whose form
-    version or scale shape fails `.checked`, gathering forms in one collective (rows 8958, 12161)."""
+    """Refuse a restored tree holding a packed matrix (`formats.PACKED_FORMATS`) whose form
+    version or scale shape fails `.checked`, gathering forms in one collective (rows 8958, 12161, 5387)."""
     from dew._coordination import collective_host
-    from dew.nn.kernels.formats import NvFp4, TernaryWeights
+    from dew.nn.kernels.formats import PACKED_FORMATS
 
-    kinds = (NvFp4, TernaryWeights)
     packed = [(jax.tree_util.keystr(path, simple=True, separator="/"), leaf)
               for path, leaf in jax.tree_util.tree_flatten_with_path(
-                  tree, is_leaf=lambda node: isinstance(node, kinds))[0]
-              if isinstance(leaf, kinds)]
+                  tree, is_leaf=lambda node: isinstance(node, PACKED_FORMATS))[0]
+              if isinstance(leaf, PACKED_FORMATS)]
     if not packed:
         return
     forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")

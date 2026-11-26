@@ -9,7 +9,7 @@ import pytest
 
 from dew import quantization
 from dew.nn.dense import Dense
-from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window
+from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window, WindowRefused
 
 
 def _bits(values) -> np.ndarray:
@@ -46,8 +46,10 @@ def test_a_group_past_its_escapes_is_refused_by_its_sites_name():
     near 2^0 beside five tiny ones, 2^-20 and less) is refused, naming its site, where no window holds it."""
     weights = np.full((128, 4), 0.25, jnp.bfloat16)
     weights[: WINDOW_ESCAPES + 1, 3] = np.asarray([2.0 ** -20] * (WINDOW_ESCAPES + 1), jnp.bfloat16)
-    with pytest.raises(ValueError, match=r"layers/q_proj's column 3"):
+    with pytest.raises(WindowRefused) as refused:
         Bf16Window.of(weights, site="layers/q_proj")
+    assert (refused.value.site, refused.value.column, refused.value.group) == ("layers/q_proj", 3, 0)
+    assert refused.value.count == WINDOW_ESCAPES + 1
 
 
 def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_back():

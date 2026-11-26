@@ -1465,8 +1465,10 @@ def _products_dtype(lhs, matrices: dict, packed_rows: bool):
     """Dew: the dtype `gmm`'s products take, which names its family: its rows', or its matrix's where the
     rows are a packed matrix's words (`packed_rows`) or codes each stage converts into its dtype
     (`packed.converted`)."""
-    matrix = matrices['matrix'].dtype
-    return matrix if packed_rows or packing.converted(matrix, lhs.dtype) else lhs.dtype
+    matrix = matrices['matrix']
+    codes = jnp.dtype(lhs.dtype).itemsize == 1 and not isinstance(matrix, BesideRefs)
+    converted = codes and packing.converted(matrix.dtype, lhs.dtype)
+    return matrix.dtype if packed_rows or converted else lhs.dtype
 
 
 def _reads(prologue_gmems, prologue_axes: tuple, read: tuple, group, groups: int) -> dict:

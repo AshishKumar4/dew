@@ -444,6 +444,13 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             return (settled != producers.started(self, ba, config, target)
                     and not self.legal(ba, settled, target))
 
+    def _priced_operands(self, ba) -> Callable | None:
+        """The bytes and decoded forms of a tile's operands the derivation prices its tiles by
+        (`derivation.derived`'s `operands`), the launch's own where it states them (`MosaicGmm`); None: the
+        call's dtype's."""
+        del ba
+        return None
+
     def _derived(self, ba, target, admits=None, *, programs: int | None = None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
@@ -476,7 +483,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       units=self._vector_units(ba, tried[0]), programs=programs,
                                       outputs=_stored_dtypes(ba),
                                       hooked=(hooks.column_local(ba.arguments['hooks'].epilogue)
-                                              and not ba.arguments['hooks'].out_forms))
+                                              and not ba.arguments['hooks'].out_forms),
+                                      operands=self._priced_operands(ba))
             if tile is not None:
                 return formed(tile)
         return None
@@ -1138,6 +1146,9 @@ class MosaicGmm(_Mosaic):
         if config.swapped:
             return walked(width) * -(-rows // config.block_n) * config.block_n * 4
         return walked(rows) * width * 4
+
+    def _priced_operands(self, ba) -> Callable | None:
+        return functools.partial(self._operand_bytes, ba)
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         """The bytes an element of the products' left and right operands moves from device memory at `tile`

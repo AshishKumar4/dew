@@ -540,6 +540,18 @@ def window_form_version() -> np.ndarray:
                         np.concatenate([window_byte_rows(group), window_nibble_rows(group)]))
 
 
+class WindowRefused(ValueError):
+    """A matrix no `Bf16Window` holds: a 128-deep group of `site`'s `column` holding more nonzeros below its
+    window than it stores escapes (`WINDOW_ESCAPES`), its weights then served as they are."""
+
+    def __init__(self, site: str, column: int, group: int, count: int):
+        self.site, self.column, self.group, self.count = site, column, group, count
+        depths = (group * packed.WINDOW_GROUP, (group + 1) * packed.WINDOW_GROUP)
+        super().__init__(f"{site}'s column {column}, depths {depths[0]} to {depths[1]}, holds {count} "
+                         f"weights below its window of {WINDOW_BINADES} binades, past the {WINDOW_ESCAPES} "
+                         "exact escapes a group stores: serve it as its bfloat16 weights")
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Bf16Window:
@@ -580,11 +592,8 @@ class Bf16Window:
         escape = ~zero & ~window
         count = escape.sum(-1)
         if (count > WINDOW_ESCAPES).any():
-            column, at = np.argwhere(count > WINDOW_ESCAPES)[0][-2:]
-            raise ValueError(f"{site}'s column {column}, depths {at * group} to {(at + 1) * group}, holds "
-                             f"{count.max()} weights below its window of {WINDOW_BINADES} binades, past "
-                             f"the {WINDOW_ESCAPES} exact escapes a group stores: serve it as its bfloat16 "
-                             "weights")
+            column, at = (int(index) for index in np.argwhere(count > WINDOW_ESCAPES)[0][-2:])
+            raise WindowRefused(site, column, at, int(count[..., column, at].max()))
         slot = np.cumsum(escape, axis=-1) * escape
         byte = np.where(escape, slot, (sign << 7) | np.where(window, mantissa, 0))
         offset = np.where(window, exponent - base + 1, 0)
@@ -642,3 +651,9 @@ class Bf16Window:
         values = jax.lax.bitcast_convert_type(held.astype(jnp.uint16).reshape(*lead, width, depth),
                                               jnp.bfloat16)
         return jnp.swapaxes(values, -1, -2).astype(dtype)
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights, Bf16Window)
+"""The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
+codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
+(`checkpoints._packed_checked`)."""
