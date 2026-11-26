@@ -82,8 +82,9 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     and the binades' sum set back last (`_scaled_by`), so no intermediate leaves the range where the result
     does not (`2^-12 * 2^-149 / 2^-140 / 2^-140` is `2^119`, where `2^-12 / 2^-140` overflows and
     `2^-12 * 2^-149` flushes). Each step a product or a division by a significand or an exact power, held
-    constant, so JAX differentiates and transposes it at every order. A float64 subnormal is its value only
-    where the backend keeps one."""
+    constant: exact to the result's range as a map of `value`; its derivatives in the other operands are JAX's
+    of this expression, whose terms may leave the range at its edges (row 13232). A float64 subnormal is its
+    value only where the backend keeps one."""
     exponent = _binade(value)
     result = _over_power(value, exponent)
     for multiplier in multipliers:
@@ -105,8 +106,9 @@ def over_denominator(tangent: jax.Array, numerator: jax.Array, denominator: jax.
     d))` (2^20 / 2^-60 under 2^-60 is 2^80; 4 / 2^-128 under 2^-149 is 2^109; 2^-149 / 2^-140 under 2^-12
     is 2^119 and pulls 2^-145 back to 2^-14; 2^-100 / 2^30 under 2^100 is 2^-60, where `n / d` underflows;
     a zero seed is zero beside an infinite `(n / d) / d`: the 2026-11-26 audit and its review). Each branch
-    is plain arithmetic, so its derivatives in `n` and `d` are JAX's at every order; a derivative whose terms
-    overflow apart where their sum need not is outside it."""
+    is plain arithmetic. Its contract: every first derivative (the tangent and its pullback) exact across
+    fp32's full range; higher orders are JAX's derivatives of the balanced expression, which may overflow or
+    flush a term at the range's edges (row 13232)."""
     from .kernels.generation import linear_map
 
     def apply(residuals, moving):

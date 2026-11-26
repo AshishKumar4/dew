@@ -101,8 +101,10 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
     whole where it is normal, else as `v threshold / (|y| + eps s) s` over the operands' significands
     (`binades.balanced`). The scale is constant (no
-    tangent). Exact to fp32's normal range: a component or a product of terms below it relative to the head
-    (`2^-126` of its largest) flushes, as any fp32 norm of a scaled head does."""
+    tangent). Its contract: the first derivative exact across the format's range but for a component or a
+    product of terms below its normal range relative to the head (`2^-126` of its largest in fp32), which
+    flushes as any norm of a scaled head does (row 13152); higher orders are JAX's derivatives of this
+    expression, which may leave the range at its edges (row 13232)."""
     from .kernels.generation import linear_map
 
     (x, factor), (tangent, _) = primals, tangents
