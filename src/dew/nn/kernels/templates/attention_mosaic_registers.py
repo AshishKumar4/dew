@@ -169,7 +169,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                       runs: int = 1,
                       merged: bool = False, started: bool = False, dropped: bool = False,
                       weight_parts: int = 1, scaled_products: bool = False,
-                      block_plan: BlockPlan | None = None, masked: bool = False) -> int:
+                      block_plan: BlockPlan | None = None, masked: bool = False,
+                      documents: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -279,8 +280,31 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                                    plan=block_plan, masked=masked)
     held = _held_registers(family, block_q, params, residuals=residuals, natural=natural) + (
         _started_rows(family, block_q) if started else 0) + _runs_bounds(family, block_q, runs)
+    held += _measured_training(family, value_width, residuals=residuals, documents=documents)
     walked = max(max(resources.live_registers(family, carried, *phases, *products), scored) + held, epilogue)
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
+
+
+DOCUMENT_REGISTERS = 21
+"""What a training walk over packed documents holds beside its plain walk on a warpgroup-MMA consumer, the
+least ptxas measured (sm90, causal, 4096 tokens in four documents against one, 64 x 64 and 64 x 128, one
+consumer: d64 163 to 187, d128 194 to 215, natural forms 18 to 20 more; probe 5a7df78db at d9ca179d0,
+row 12844): its rows' document ids and the comparisons' predicates beside its masks."""
+
+WIDE_TRAINING_REGISTERS = 35
+"""What a training walk over values 256 wide holds past its tiles priced, the least ptxas measured (sm90,
+64 x 64, one consumer, 16/4: 253 against 218 priced, with or without documents; probe 5a7df78db, row
+12844)."""
+
+
+def _measured_training(family: mosaic.Family, value_width: int, *, residuals: bool, documents: bool) -> int:
+    """The registers a warpgroup-MMA training walk holds past its priced tiles, as ptxas measured them
+    (`DOCUMENT_REGISTERS`, `WIDE_TRAINING_REGISTERS`): Qwen3.5-4B's packed training forward priced 188 on two
+    consumers and 218 on one where ptxas spilled within their 240 and 255 (row 12844: three certification
+    step-downs at its cold start). None off a training walk or a family of no warpgroup MMA, none measured."""
+    if not residuals or not family.name.startswith("wgmma"):
+        return 0
+    return (DOCUMENT_REGISTERS if documents else 0) + (WIDE_TRAINING_REGISTERS if value_width > 128 else 0)
 
 
 def _scaled_step(family: mosaic.Family, step: list, logits: tuple, weights: tuple, accumulator: tuple, *,
@@ -422,6 +446,8 @@ class ForwardRegisters:
     rewalk_prescaled: bool = False
     out_dtype: Any = None
     has_output_mod: bool = False
+    documents: bool = False
+    """Whether its walk compares document ids (a packed call's spans, `KeySpans.query_ids`)."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None, masked: bool = False) -> int | None:
@@ -453,7 +479,7 @@ class ForwardRegisters:
             positions=self.positions, per_span=self.per_span, runs=self.runs, merged=self.merged,
             started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
-            scaled_products=self.scaled_products, block_plan=plan, masked=masked))
+            scaled_products=self.scaled_products, block_plan=plan, masked=masked, documents=self.documents))
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,
