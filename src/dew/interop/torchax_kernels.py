@@ -192,10 +192,11 @@ def _dew_chunk_rule(original: Callable) -> Callable:
             q, k = l2norm(q, 1e-6), l2norm(k, 1e-6)
         state = None if initial_state is None else jax_view(initial_state).astype(jnp.float32)
         # Attested causal over the queries' positions (`sequence_causality.CAUSAL_ATTENTION`): each token's
-        # output reads its own and earlier tokens, the final memory every token.
+        # output reads its own and earlier tokens' queries, keys, values, decays and writes and the whole
+        # entering memory, the final memory every token.
         out, final = attested(lambda q, k, v, decay, write, state: chunk_gated_delta_rule(
             q, k, v, decay, write, state, chunk_size, unit_queries=use_qk_l2norm_in_kernel),
-            CAUSAL_ATTENTION, sequenced=1)(q, k, v, decay, write, state)
+            CAUSAL_ATTENTION, inputs=5, outputs=1)(q, k, v, decay, write, state)
         return (torch_view(out.astype(jax_view(query).dtype)),
                 torch_view(final) if output_final_state else None)
     return rule

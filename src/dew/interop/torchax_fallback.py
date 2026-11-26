@@ -591,9 +591,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
         if held is None:
             # A cache being opened: its layer's keys and values give its shape, and nothing is held.
             held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
-        out, keys, values = attested(cached, CAUSAL_ATTENTION)(q, k, v, held["cached_key"],
-                                                               held["cached_value"], call.cache.slots,
-                                                               call.cache.filled, sinks, rng)
+        out, keys, values = attested(cached, CAUSAL_ATTENTION, inputs=3, outputs=1)(
+            q, k, v, held["cached_key"], held["cached_value"], call.cache.slots, call.cache.filled, sinks, rng)
         call.cache.written[entry] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
@@ -604,9 +603,10 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                       else call.places)
             reach = windowed(places[:, :, None], call.key_places[:, None, :], window, causal=False)
             visible = visible & reach
-        out = attested(stated, STATED_ATTENTION)(q, k, v, visible, sinks, rng)
+        out = attested(stated, STATED_ATTENTION, inputs=4, outputs=1)(q, k, v, visible, sinks, rng)
     else:
-        out = attested(causal, CAUSAL_ATTENTION)(q, k, v, call.documents, call.valid, sinks, rng)
+        out = attested(causal, CAUSAL_ATTENTION, inputs=5, outputs=1)(q, k, v, call.documents, call.valid,
+                                                                      sinks, rng)
     return torch_view(out.astype(q.dtype)), None
 
 
