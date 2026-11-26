@@ -1728,7 +1728,7 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
     parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
     the CPU's float32 witness reaches XLA's arithmetic alone."""
-    from dew.nn.programs import equations
+    from dew.nn.kernels.lowered import kernel_calls
 
     torch.manual_seed(0)
     model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT_GPU)).eval()
@@ -1743,20 +1743,22 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
         return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
 
     def launches(function) -> list:
-        return [eqn for eqn in equations(jax.make_jaxpr(function)(params).jaxpr)
-                if eqn.primitive.name == "pallas_call"]
+        # The kernels a lowered program calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's,
+        # the recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
+        return [call for call in kernel_calls(jax.jit(function).lower(params))
+                if call.kind in ("triton", "mosaic_gpu")]
 
     stepped = launches(jax.grad(loss))
-    names = sorted({str(eqn.params["name"]) for eqn in stepped})
+    names = sorted({call.name for call in stepped})
     for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
-        assert kernel in names, (kernel, names)
+        assert any(name.startswith(kernel) for name in names), (kernel, names)
     # The delta rule's launches: the step's beyond its forward's are its backward's, each over the bf16
     # queries, keys and values a native layer's port takes, where float32 ones took the portable math.
-    delta = [eqn for eqn in stepped if str(eqn.params["name"]).startswith(DELTA_LAUNCHES)]
-    forward = [eqn for eqn in launches(loss) if str(eqn.params["name"]).startswith(DELTA_LAUNCHES)]
+    delta = [call for call in stepped if call.name.startswith(DELTA_LAUNCHES)]
+    forward = [call for call in launches(loss) if call.name.startswith(DELTA_LAUNCHES)]
     assert forward and len(delta) > len(forward), (len(forward), len(delta), names)
-    assert any(var.aval.dtype == jnp.bfloat16 for eqn in forward for var in eqn.invars), [
-        [var.aval.dtype for var in eqn.invars] for eqn in forward]
+    assert any(kind == "bf16" for call in forward for _, kind in call.signature[0]), [
+        call.signature[0] for call in forward]
     reference = copy.deepcopy(model).to(torch.bfloat16)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
