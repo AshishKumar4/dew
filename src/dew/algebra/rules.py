@@ -829,6 +829,7 @@ def _joined() -> tuple[RuleFamily, ...]:
     x, y, t = vars_("x y t", Term)
     axes = var("axes", Vec[i64])
     params, added = vars_("params added", i64)
+    length = var("length", i64)
     power = i64(1)
     new = x.binary("add", y, added)
     reduced = new.reduce("sum", axes, params)
