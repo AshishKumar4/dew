@@ -52,7 +52,6 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME, folded_form
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.precision import power2
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -494,10 +493,12 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # (`MosaicForward.cached`).
         chosen, at = WALKS[walk], work[walk]
         defer_merge = hooks.output_mod is not None and whole.output_mod is None
-        if at.slices == 1 and finished and not defer_merge:
+        resumed = initial is not None and initial.normalized
+        if at.slices == 1 and finished and not defer_merge and not resumed:
             # A row's walk from the initial state, finished in the query's dtype with any output hook fused
             # in-kernel, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at 4096
-            # keys, ET-DECODE6-h100; row 5385).
+            # keys, ET-DECODE6-h100; row 5385). A resumed state's output (`Initial.normalized`) the merge
+            # takes as it is, past the walk, which would hold its numerator.
             with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
                 out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
                              bounded=chosen.bounded, masked=hooks.output_mod is None)
@@ -657,22 +658,13 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
 
 def resumable(spec: algebra.Forward, state: algebra.Partial) -> algebra.Partial:
     """A finished state (`algebra.finished_merged`'s: its output normalized, its maximum in `spec`'s units)
-    as a call's initial state takes it (`algebra.initial_state`'s inverse): its sums unnormalized at its
-    natural maximum, a state of no mass the walk's start, which adds nothing to a merge. A row whose sums
-    pass fp32's largest (an output near it over a total past one: 2^127 over two keys) holds its total and
-    sums a power of two down, the total's binade (`frexp`), and its maximum as far up: the same softmax,
-    its output `algebra.initial_state` gives back as it was, where its sums at the maximum were infinite and
-    two finite outputs resumed as one (2^127 and 1.5 x 2^127 each +inf)."""
+    as a call's initial state takes it, normalized (`Initial.normalized`): its output, total and natural
+    maximum, a state of no mass the walk's start, which adds nothing to a merge. Its numerator, the output
+    times its total, passes fp32's range where the output nears its largest (2^127 over two keys): held so,
+    two finite outputs resumed as one (2^127 and 1.5 x 2^127 each +inf), a power of two taken off it lost a
+    small channel beside a large one, and one folded into its maximum lost its mass beside another slice's."""
     held = means.holding(state.total)
-    acc = means.resumed(state.acc, state.total)
-    whole = jnp.all(jnp.isfinite(state.acc), axis=-1) & jnp.isfinite(state.total)
-    over = held & whole & ~jnp.all(jnp.isfinite(acc), axis=-1)
-    shift = jnp.where(over, jnp.frexp(state.total)[1], 0)
-    total = jnp.where(over, power2(state.total, -shift), state.total)
-    acc = jnp.where(over[..., None], means.resumed(state.acc, total), acc)
-    maximum = spec.naturalized(state.m)
-    maximum = jnp.where(over, maximum + shift.astype(maximum.dtype) * jnp.float32(math.log(2.0)), maximum)
-    return algebra.Partial(acc, jnp.where(held, maximum, algebra.LEAST), total)
+    return algebra.Partial(state.acc, jnp.where(held, spec.naturalized(state.m), algebra.LEAST), state.total)
 
 
 def _unpacked_state(state: algebra.Partial, heads: int) -> Initial:
@@ -681,7 +673,7 @@ def _unpacked_state(state: algebra.Partial, heads: int) -> Initial:
     acc = jnp.swapaxes(ungrouped_rows(state.acc, heads), 1, 2)
     m, total = (jnp.swapaxes(ungrouped_rows(rows[..., None], heads)[..., 0], 1, 2)
                 for rows in (state.m, state.total))
-    return Initial(m, total, acc)
+    return Initial(m, total, acc, normalized=True)
 
 
 def _held(leaf: jax.Array, table: jax.Array | None, sources: jax.Array | None) -> jax.Array:

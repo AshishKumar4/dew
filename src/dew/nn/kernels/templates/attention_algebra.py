@@ -597,18 +597,19 @@ def slice_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arra
 
 
 def initial_state(spec: Forward | windows.Units, initial: Partial, *,
-                  raw_scale: float | None = None) -> Partial:
+                  raw_scale: float | None = None, normalized: bool = False) -> Partial:
     """A call's initial state (its sums unnormalized, its maximum natural) as a finished slice's
     (`slice_state`): normalized where it holds mass, its maximum in `spec`'s units, saturated where a raw
     fold's passes fp32's largest (`raw_maximum`, as `resumed` takes it: a finite maximum of 1e38 at a scale
     of 1/8 was infinite, and its merge's mass NaN). Where it holds mass the law's reading says
     (`means.holding`: a subnormal total's too, which a comparison on a lane that flushes it read as none
-    while the law's merge weighed it, an output of 1 merged to 2/3, the merge P0's head review 3)."""
+    while the law's merge weighed it, an output of 1 merged to 2/3, the merge P0's head review 3). A
+    `normalized` state's output is its `acc` as it is (`Initial.normalized`)."""
     held = means.holding(initial.total)
     # The law's finish (`means.finished`): a division by a broadcast total flushed past 2^126 (a total of
     # 1.5 x 2^126 left its output 0, train 931's review).
     laid_held = held if initial.acc.ndim == held.ndim else held[..., None]
-    out = jnp.where(laid_held, means.finished(initial.acc, initial.total), 0.0)
+    out = jnp.where(laid_held, initial.acc if normalized else means.finished(initial.acc, initial.total), 0.0)
     raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
     maximum = raw_maximum(initial.m, raw) if raw is not None else initial.m
     return slice_state(spec, out, maximum, initial.total)
@@ -626,7 +627,8 @@ def merged_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arr
     state = slice_state(spec, out, *(jnp.transpose(array, (0, 2, 3, 1)) for array in (maximum, total)))
     if initial is not None:
         own = initial_state(spec, Partial(jnp.swapaxes(initial.acc, 1, 2), jnp.swapaxes(initial.m, 1, 2),
-                                          jnp.swapaxes(initial.total, 1, 2)), raw_scale=raw_scale)
+                                          jnp.swapaxes(initial.total, 1, 2)), raw_scale=raw_scale,
+                            normalized=initial.normalized)
         acc, m, total = (jnp.concatenate([mine, theirs[:, None]], axis=1)
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)

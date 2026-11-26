@@ -740,6 +740,19 @@ class Initial:
     total: jax.Array
     acc: jax.Array
     valueless: bool = dataclasses.field(default=False, metadata={"static": True})
+    normalized: bool = dataclasses.field(default=False, metadata={"static": True})
+    """Whether `acc` holds the state's output, its numerator over `total` (a resumed decode step's,
+    `attention_decode.resumable`), where its numerator would pass fp32's range: a merge reads it as it is
+    (`attention_algebra.initial_state`), a walk resuming from it its numerator (`unnormalized`)."""
+
+
+def unnormalized(initial: "Initial | None") -> "Initial | None":
+    """`initial` as a walk resumes from it, its numerator in `acc` (`Initial.normalized`'s output times its
+    total), within fp32's range as the walk's own sums are; as it is where it holds its numerator."""
+    if initial is None or not initial.normalized:
+        return initial
+    return dataclasses.replace(initial, acc=initial.acc * initial.total[..., None].astype(initial.acc.dtype),
+                               normalized=False)
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -1290,6 +1303,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
     starts such a query from `m = -inf`. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
+    hooks = dataclasses.replace(hooks, initial=unnormalized(hooks.initial))
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
