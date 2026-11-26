@@ -1147,6 +1147,36 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
     assert (cell in attention_kernels.DECLARED) == declared
 
 
+def test_an_a100s_16_bit_call_infers_on_flashattention_and_trains_on_the_template(monkeypatch):
+    """A bf16 causal call on an A100 in its declared cell ('flash_inference', M-NA-44's receipt: the forward
+    of FlashAttention-2 holds check 1 and its backward does not): a call no derivative is taken of runs
+    FlashAttention, a differentiated one the template, its forward and derivatives, and FlashAttention none
+    of them (row 13288)."""
+    from dew.nn import attention
+    from dew.nn.attention import attention_case
+
+    ran = []
+
+    def kernel(query, key, value, *, implementation, **options):
+        ran.append(implementation)
+        return query * value.mean()
+
+    monkeypatch.setattr(attention, "_attention_kernel", kernel)
+    query = jnp.zeros((2, 4096, 32, 128), jnp.bfloat16)
+    key = jnp.zeros((2, 4096, 8, 128), jnp.bfloat16)
+
+    def call(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True)
+
+    with generation.assumed("sm80"):
+        assert attention_case(query, key, causal=True).cell in attention.attention_kernels.DECLARED
+        jax.eval_shape(call, query, key, key)
+        inferred, ran[:] = set(ran), []
+        jax.eval_shape(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
+                       query, key, key)
+    assert inferred == {"flash"} and set(ran) == {"template"}, (inferred, ran)
+
+
 @pytest.mark.parametrize(("rows", "heads", "kv_heads", "dtype", "causal", "declared"), [
     (1, 32, 8, jnp.bfloat16, True, True), (2, 32, 8, jnp.bfloat16, True, False),
     (1, 8, 2, jnp.bfloat16, True, False), (1, 32, 8, jnp.float16, True, False),

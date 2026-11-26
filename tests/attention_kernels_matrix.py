@@ -4,9 +4,10 @@ call on each kernel the op serves on par with the reference path.
 Each cell runs `attention.scaled_dot_product_attention` as a model's layer does, its forward and its reverse
 mode in one program, with its kernel named (`implementation`): FlashAttention's (`flash`), tokamax's Triton
 kernel (`triton`), cuDNN's fused attention (`cudnn`) and the template (`template`) on a GPU, splash
-(`tpu`) on a TPU; and the template's forward beside xla's training (`inference`, no implementation's name:
-chosen, `generation.chosen`), whose training step is xla's attention, forward and derivatives, through its
-own seam (`attention.forward_differentiable`'s `primal_alone`). The output and the gradients of the query,
+(`tpu`) on a TPU; the template's forward beside xla's training (`inference`) and FlashAttention's forward
+beside the template's training (`flash_inference`), whose training steps are xla's attention's and the
+template's, forward and derivatives, through their own seam (`attention.forward_differentiable`'s
+`primal_alone`). The output and the gradients of the query,
 key and value are held to the reference path's (check 1) with their float64 terms
 (`attention_oracle.attention_terms`), as tests/attention_matrix.py holds the template's route, whose launch
 forms that family pins.
@@ -137,24 +138,25 @@ CASES = (
     ('sm90', 'flash', '64', 'mha', 'causal', 'bfloat16'),
     ('sm90', 'triton', '128', 'gqa-8-2', 'full', 'float32'),
     ('sm80', 'flash', '256', 'gqa-8-2', 'documents', 'float16'),
-    ('sm80', 'cudnn', '128', 'mha', 'documents', 'bfloat16'),
-    ('v5e', 'inference', '256', 'mha', 'causal', 'float32'),
-    ('v5e', 'tpu', '64', 'gqa-8-2', 'documents', 'bfloat16'),
-    ('sm90', 'cudnn', '128', 'gqa-8-2', 'causal', 'float16'),
-    ('sm90', 'template', '256', 'gqa-8-2', 'full', 'bfloat16'),
-    ('sm80', 'triton', '64', 'mha', 'causal', 'float32'),
-    ('sm90', 'inference', '64', 'gqa-8-2', 'documents', 'bfloat16'),
-    ('sm80', 'template', '128', 'mha', 'documents', 'float32'),
-    ('sm80', 'inference', '128', 'mha', 'full', 'float16'),
-    ('v5e', 'tpu', '256', 'mha', 'full', 'float32'),
+    ('v5e', 'template', '64', 'mha', 'documents', 'float32'),
+    ('sm80', 'cudnn', '64', 'mha', 'full', 'float16'),
+    ('v5e', 'inference', '128', 'gqa-8-2', 'causal', 'bfloat16'),
+    ('v5e', 'tpu', '256', 'mha', 'full', 'bfloat16'),
+    ('sm90', 'flash_inference', '128', 'mha', 'documents', 'float16'),
+    ('sm80', 'triton', '256', 'mha', 'causal', 'float32'),
+    ('sm90', 'cudnn', '256', 'gqa-8-2', 'documents', 'bfloat16'),
+    ('sm80', 'template', '128', 'gqa-8-2', 'causal', 'bfloat16'),
+    ('sm80', 'flash_inference', '64', 'gqa-8-2', 'causal', 'bfloat16'),
+    ('sm90', 'inference', '64', 'mha', 'causal', 'float16'),
+    ('sm90', 'template', '256', 'mha', 'full', 'float16'),
+    ('sm80', 'inference', '256', 'mha', 'full', 'float32'),
+    ('v5e', 'tpu', '64', 'gqa-8-2', 'causal', 'float32'),
     ('sm90', 'flash', '128', 'mha', 'full', 'bfloat16'),
-    ('sm90', 'triton', '256', 'mha', 'causal', 'bfloat16'),
-    ('sm90', 'cudnn', '64', 'mha', 'full', 'bfloat16'),
-    ('sm90', 'cudnn', '256', 'mha', 'causal', 'bfloat16'),
-    ('sm90', 'template', '64', 'mha', 'causal', 'bfloat16'),
-    ('v5e', 'tpu', '128', 'mha', 'causal', 'bfloat16'),
-    ('sm90', 'template', '64', 'mha', 'causal', 'float16'),
-    ('v5e', 'template', '64', 'mha', 'causal', 'float32'),
+    ('sm90', 'triton', '64', 'mha', 'causal', 'bfloat16'),
+    ('sm90', 'cudnn', '128', 'mha', 'causal', 'bfloat16'),
+    ('sm90', 'flash_inference', '256', 'mha', 'full', 'bfloat16'),
+    ('v5e', 'tpu', '128', 'mha', 'documents', 'bfloat16'),
+    ('sm90', 'inference', '64', 'mha', 'documents', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the op serves
 (`kernel_matrix.covering("attention_kernels")`, regenerated where the axes or the op's support change)."""

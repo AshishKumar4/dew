@@ -848,7 +848,7 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
         "full, CUPTI, 11 interleaved rounds); at that shape its forward holds check 1 and faster (1.15 to "
         "1.64 times), its backward does not (dK's RMS 1.74 to 1.78 times the reference's error, causal dV's "
         "1.537, past 1.5; M-NA-44-a100-s4096), so a differentiated call trains on the template, 1.59 to 2.39 "
-        "times FlashAttention's time (row 13277)"),
+        "times FlashAttention's time (row 13288)"),
     ('sm80', CallKind.of(jnp.float32)): (
         XLA, "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
                "Qwen3-8B's widths (32/8 heads x 128, CUPTI medians, one warm process, W76-a100, M-ET-28): a "
