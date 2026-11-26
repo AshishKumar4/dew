@@ -266,27 +266,30 @@ def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
     float64 cross entropy of `cap * tanh(z / cap)` (row 13353)."""
     from dew.nn.precision import capped_logits
 
+    rows, depth, vocab = 256, 128, 1024  # a loss a row: enough rows a seed that the gate resolves its ratio
+
     def draw(seed):
         rng = np.random.default_rng(13353 + seed)
-        return (jnp.asarray(rng.normal(size=(64, 64)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(256, 64)), jnp.bfloat16),
-                jnp.asarray(rng.integers(0, 256, size=(64,)), jnp.int32))
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(vocab, depth)), jnp.bfloat16),
+                jnp.asarray(rng.integers(0, vocab, size=(rows,)), jnp.int32))
 
     def fused(x, w, t):
         with generation.assumed("sm90"):
-            tile = linear_ce.derive_linear_ce((64, 256, 64), jnp.bfloat16, generation.gpu_target(),
+            tile = linear_ce.derive_linear_ce((rows, vocab, depth), jnp.bfloat16, generation.gpu_target(),
                                               interpret=True)
-            loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1, interpret=True)
+            loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1,
+                                           interpret=True)
             return loss
 
     def portable(x, w, t):
         capped = capped_logits(jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32).T), 20.0)
-        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
+        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(rows), t]
 
     def truth(x, w, t):
         # Its operands widened to float64 by the gate (`assert_as_exact`): the cap's quotient exact there.
         capped = 20.0 * jnp.tanh(jnp.dot(x, w.T) / 20.0)
-        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
+        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(rows), t]
 
     label = "capped linear_ce"
     dew_fn, ref_fn = jax.jit(fused), jax.jit(portable)
