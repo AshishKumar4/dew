@@ -55,6 +55,7 @@ from dew.algebra.forms import Derived, Refused
 from dew.algebra.scan import (
     _carry_type,
     _exp,
+    _read as _read_token,
     _replay_backward,
     _traced,
     _walked_tokens,
@@ -94,11 +95,6 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
 
         return _cache.holding(decomposed, key, made, derive.FORMS_HELD)
 
-    def tokens(chunk: Mapping) -> tuple:
-        along, every = _walked_tokens(declaration, chunk)
-        parts = affine_of(chunk)
-        return jax.vmap(lambda token: _chunk_parts(declaration, names, parts, {**token, **every}))(along)
-
     def init(shapes):
         del shapes
         return jnp.zeros((shape[0],), carried), jnp.zeros((2, *shape), carried)
@@ -106,7 +102,10 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
     def prepare(chunk, issue=None, transition: bool = False, window=None):
         if issue is not None or transition or window is not None:
             raise Refused("a pair's chunk takes no mainloop's issuer, transfer or document window here")
-        return _prepared(*tokens(chunk), base2=affine_of(chunk).base2)
+        along, every = _walked_tokens(declaration, chunk)
+        parts = affine_of(chunk)
+        tokens = jax.vmap(lambda token: _chunk_parts(declaration, names, parts, {**token, **every}))(along)
+        return _prepared(*tokens, base2=parts.base2, reader_scale=parts.reader_scale)
 
     def merge(a, b, operands, issue=None):
         del a, b, operands, issue
@@ -128,7 +127,7 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
 
 def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
     """One token's parts at its values (`linear_scan.Coupled`'s), each in float32 at least: the two
-    exponents and `lam`, scalars, the input `B` and `U`, the correction `C`, the reader `Q` (its scale on it)
+    exponents and `lam`, scalars, the input `B` and `U`, the correction `C`, the unscaled reader `Q`
     and the free readout `R`; refused where an exponent or `lam` is a key's own."""
     shape, along = token_terms(parts, token, states=2)
 
@@ -141,7 +140,7 @@ def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
         return value if jnp.ndim(value) == 0 else jnp.reshape(value, ())
 
     keys, values = shape
-    reader = parts.reader_scale * along(parts.reader, keys)
+    reader = along(parts.reader, keys)
     return (scalar(parts.first), scalar(parts.second), scalar(parts.lam), along(parts.left, keys),
             along(parts.right, values), along(parts.correction, keys), reader, along(parts.free, values))
 
@@ -388,6 +387,11 @@ LOCAL_REACH = SUMS_REACH + 2048
 (`SUMS_REACH`) beside a float64 product's range and the chunk's tokens."""
 
 
+class _UnlandedRead(NamedTuple):
+    dots: scaled.Scaled
+    scale: scaled.Scaled
+
+
 class Chunked(NamedTuple):
     """A chunk's values that read no state (`_prepared`), its decayed sums scaled values (`_decayed_sums`)
     each brought into its term once, none divided by another's factor: the system's strictly lower part `L`
@@ -403,7 +407,7 @@ class Chunked(NamedTuple):
     corrections: jax.Array
     kept_before: scaled.Scaled
     momentum_before: scaled.Scaled
-    dots: jax.Array
+    dots: jax.Array | _UnlandedRead
     sums: scaled.Scaled
     kept_to: scaled.Scaled
     queries: jax.Array
@@ -417,7 +421,15 @@ class Chunked(NamedTuple):
     momentum_kept: scaled.Scaled
 
 
-def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked:
+def _reader(query, scale):
+    """Hold a subnormal scale apart; an ordinary scale still belongs to the query."""
+    dtype = jnp.result_type(scale, query)
+    if 0 < abs(float(scale)) < float(jnp.finfo(dtype).tiny):
+        return query, dtype.type(scale)
+    return scale * query, None
+
+
+def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool, reader_scale=1.0) -> Chunked:
     """A chunk's values that read no state (`Chunked`), from its tokens' parts (`_chunk_parts`)."""
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
@@ -427,9 +439,11 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
     overlaps = _summed(_outer, (c.T, b.T), (c.shape[0], b.shape[0]))
     lower = scaled.mul(overlaps, _sliced(before, (..., slice(1, None))))
     ends = _sliced(g, -1)
+    q, scale = _reader(q, reader_scale)
+    dots = q @ b.T if scale is None else _UnlandedRead(_read(q, b.T), scaled.scaled(jnp.asarray(scale)))
     return Chunked(
         lower=lower, inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
-        momentum_before=_sliced(before, (..., 0)), dots=q @ b.T, sums=_sliced(g, (..., slice(1, None))),
+        momentum_before=_sliced(before, (..., 0)), dots=dots, sums=_sliced(g, (..., slice(1, None))),
         kept_to=kept, queries=q, momentum=_sliced(g, (..., 0)), free=r, keys=b,
         memory_sums=_sliced(ends, slice(1, None)), momentum_sums=_sliced(last, slice(1, None)),
         kept=_sliced(kept, -1), entering_momentum=_sliced(ends, 0), momentum_kept=_sliced(last, 0))
@@ -564,6 +578,13 @@ def _stepped(state, chunk: Chunked, issue=None):
     return (decay, jnp.stack([memory, momentum])), w
 
 
+def _weighted_dots(dots: scaled.Scaled, values, weights: scaled.Scaled) -> scaled.Scaled:
+    transposed = scaled.Scaled(dots.significand.T[..., None], dots.exponent.T[..., None], dots.reach)
+    crossed = scaled.mul(weights, transposed)
+    shape = dots.significand.shape[0], values.shape[-1]
+    return _summed(lambda v: (None, v[None, :]), (values,), shape, crossed)
+
+
 @custom_vmap
 def _scored(queries, keys, dots, values, weights):
     """Keep the scaled recovery conditional even when chunks and heads are vmapped."""
@@ -575,9 +596,7 @@ def _scored(queries, keys, dots, values, weights):
         # The ordinary score may overflow before its decay and corrected value bring it into range.
         made = _read(q, k.T)
         kept = scaled.where(jnp.isfinite(local), scaled.scaled(local), made)
-        transposed = scaled.Scaled(kept.significand.T[..., None], kept.exponent.T[..., None], kept.reach)
-        factors = scaled.mul(factors, transposed)
-        return _summed(lambda v: (None, v[None, :]), (inputs,), (q.shape[0], inputs.shape[-1]), factors)
+        return _weighted_dots(kept, inputs, factors)
 
     for _ in range(dots.ndim - 2):
         ordinary, recover = jax.vmap(ordinary), jax.vmap(recover)
@@ -601,10 +620,15 @@ def _mapped(chunk: Chunked, state, w, issue=None):
     pair = state[1]
     weights = scaled.Scaled(chunk.sums.significand.T[..., None], chunk.sums.exponent.T[..., None],
                             chunk.sums.reach)
-    scored = _scored(chunk.queries, chunk.keys, chunk.dots, w, weights)
     memory = scaled.mul(_read(chunk.queries, pair[0]), _column(chunk.kept_to))
     momentum = scaled.mul(_read(chunk.queries, pair[1]), _column(chunk.momentum))
-    scores, flushed = _weighed(chunk.dots, chunk.sums)
+    local = chunk.dots
+    if isinstance(local, _UnlandedRead):
+        scored = _weighted_dots(local.dots, w, weights)
+        against = scaled.mul(_sum(memory, momentum, scored), local.scale)
+        return scaled.landed(_sum(against, chunk.free))
+    scored = _scored(chunk.queries, chunk.keys, local, w, weights)
+    scores, flushed = _weighed(local, chunk.sums)
     running = (scaled.applied(chunk.queries @ pair[0], _column(chunk.kept_to))
                + scaled.applied(chunk.queries @ pair[1], _column(chunk.momentum)) + scores @ w + chunk.free)
     reached = _reached(flushed @ (w != 0).astype(w.dtype))
@@ -630,7 +654,10 @@ def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chu
         alpha, faint_first = _decayed(first, first_exponent, parts.base2, cut)
         second = mu * second + b[:, None] * w[None, :] + faint_second
         first = alpha * first + lam * second + faint_first
-        return (first, second), jnp.sum(q[:, None] * first, axis=0) + r
+        q, scale = _reader(q, parts.reader_scale)
+        read = jnp.sum(q[:, None] * first, axis=0) if scale is None else _read_token(
+            first, q, values_read=False, scale=scale)
+        return (first, second), read + r
 
     # The pair carried in the type its update's parts widen it to (`scan._carry_type`, the single state's
     # walk's): a float32 pair over float64 tokens (x64's) widens once.
