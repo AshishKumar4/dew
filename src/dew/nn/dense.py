@@ -502,13 +502,13 @@ class Dense(_LinearEnvelope, nn.Dense):
         times its block's scale exact, the sums in fp32 and the matrix's tensor scale after) or a BitNet
         b1.58 ternary matrix's (`gemm.ternary_weight_product`, row 1464: the inputs quantized a token at a
         time to int8, each {-1, 0, 1} code's product exact, the scales after) or a lossless bfloat16
-        window's (`formats.Bf16Window`, row 5387: the inputs rounded to bfloat16 times its weights, each
-        decoded exactly, `gemm.decoded_product`), its fp32 sum plus its bias
+        window's (`gemm.window_product`, row 5387: the inputs rounded to bfloat16 times its weights, each
+        decoded exactly, in the template's stages where it runs), its fp32 sum plus its bias
         rounded once to the layer's dtype. Frozen, as the codes are a
         checkpoint's; a quantization rule over the site (Qwix's) quantizes a kernel, which a packed one is
         not, and is refused. An input quantization of other sites (a source's stored input scales) leaves
         it as it is: a packed weight's source stores none for it (`codecs.SourceQuantization.as_nvfp4`)."""
-        from dew.nn.kernels.gemm import decoded_product, nvfp4_product, ternary_weight_product
+        from dew.nn.kernels.gemm import nvfp4_product, ternary_weight_product, window_product
 
         if _ruled():
             raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's codes, served as they "
@@ -524,8 +524,7 @@ class Dense(_LinearEnvelope, nn.Dense):
         # The rows counted, not inferred: a packed matrix of no depth takes inputs of no width.
         rows = jnp.reshape(inputs, (math.prod(jnp.shape(inputs)[:-1]), width))
         if isinstance(matrix, Bf16Window):
-            summed = decoded_product(rows.astype(jnp.bfloat16), matrix.decoded(), None,
-                                     interpret_on_cpu=False)
+            summed = window_product(rows, matrix, out_dtype=jnp.float32)
         elif isinstance(matrix, TernaryWeights):
             # Frozen, its scale too: the product differentiates in its scale (`ternary_weight_product`).
             frozen = dataclasses.replace(matrix, scale=jax.lax.stop_gradient(matrix.scale))

@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 
 from . import generation
-from .formats import TernaryWeights
+from .formats import Bf16Window, TernaryWeights
 from .grouped_launch import INTERPRETED
 from .grouped_matmul import MosaicGmm, MosaicTgmm, _beside, _stored_dtypes
 from .templates.gemm import packed, tiling
@@ -157,8 +157,9 @@ class MosaicPackedGmm(MosaicGmm):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicWordPackedGmm(MosaicPackedGmm):
-    """`MosaicPackedGmm` of inline-decoded scale-free word-packed weights (`TernaryWeights`, rows 1464, 5387),
-    driven by `packed.PackedWeightFormat`."""
+    """`MosaicPackedGmm` of inline-decoded scale-free word-packed weights (`TernaryWeights`, `Bf16Window`;
+    rows 1464, 5387), driven by `packed.PackedWeightFormat`: a format whose decode reads its columns' meta
+    halves (a window's bases and escapes) streams them as `gmm`'s `scales`, and runs no swapped call."""
     DEFAULT_FMT: ClassVar[str] = 'ternary'
 
     @property
@@ -171,15 +172,24 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
     def _desc(self, ba) -> packed.PackedWeightFormat:
         kernel = ba.arguments['kernel']
         return packed.weight_format(
-            kernel.fmt if isinstance(kernel, TernaryWeights) else self.DEFAULT_FMT)
+            kernel.fmt if isinstance(kernel, (TernaryWeights, Bf16Window)) else self.DEFAULT_FMT)
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
-        assert isinstance(kernel, TernaryWeights)
-        return kernel.words, True, {'packed_format': kernel.fmt}
+        return kernel.words, True, self._formats(kernel)
+
+    def _formats(self, kernel: TernaryWeights | Bf16Window) -> dict:
+        """`gmm`'s keywords for its packed matrix: its format's name, and a window's meta halves."""
+        assert isinstance(kernel, (TernaryWeights, Bf16Window))
+        meta = {'scales': kernel.meta_halves} if isinstance(kernel, Bf16Window) else {}
+        return {'packed_format': kernel.fmt, **meta}
+
+    def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
+        # A format reading its columns' meta halves decodes a staged matrix alone (`packed.word_taken`).
+        return packed.weight_format(self.DEFAULT_FMT).meta is False and super()._swaps_on(family, dtype)
+
     def _swapped_extra(self, kernel, formats: dict) -> dict:
-        assert isinstance(kernel, TernaryWeights)
-        return {'packed_format': kernel.fmt, **formats}
+        return {**self._formats(kernel), **formats}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu
         dtype, rows, hooks = ba.arguments['tokens'].dtype, ba.arguments['packed_rows'], ba.arguments['hooks']
@@ -201,10 +211,14 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
         from .templates import resources
         share = config.block_m // config.warpgroups
+        desc = self._desc(ba)
+        # A group's blocks and the lane being decoded, a `[columns, 16]` tile each, and a window's meta
+        # halves beside them.
+        tiles = desc.blocks + 1 + desc.meta
         decoded = (2 * share * 16 + share * config.block_k // 2 if ba.arguments['packed_rows']
-                   else 2 * config.block_n * 16)
+                   else tiles * config.block_n * 16)
         return _beside(MosaicGmm._registers(self, ba, config, merging=merging, target=target),
-                       decoded // resources.THREADS + self._desc(ba).decode_live)
+                       decoded // resources.THREADS + desc.decode_live)
 
 
 @dataclasses.dataclass(frozen=True)

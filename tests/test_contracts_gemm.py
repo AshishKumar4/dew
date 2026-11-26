@@ -1224,6 +1224,35 @@ def _check_ternary_weight_product_contract(edge: str) -> None:
                         truth_fn=plain, plain_fn=plain, without=without)
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_window_product_holds_every_order(edge):
+    """`gemm.window_product` (a lossless bfloat16 window decoded in the template's stages, `linear_tangent`,
+    row 5387): every order in its rows finite against the decoded matrix's plain product, interpreted on the
+    template's route (its frozen weights take no tangent)."""
+    from dew.nn.kernels import formats
+    from dew.nn.sharding import automatic_axes
+
+    depth = 256
+    weights = normal_draw(5387, (depth, 64), scale=0.02)[0].astype(jnp.bfloat16)
+    window = formats.Bf16Window.of(np.asarray(weights))
+    (x,) = normal_draw(5388, (64, depth), scale=EDGES[edge])
+    (dx,) = normal_draw(5389, (64, depth), scale=EDGES[edge])
+    (cotangent,) = normal_draw(5390, (64, 64))
+
+    def product(rows):
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with choose:
+            return gemm.window_product(rows, window, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(rows):
+        return jax.lax.dot(rows.astype(jnp.bfloat16), weights, preferred_element_type=jnp.float32)
+
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
+    with generation.assumed("sm90"):
+        assert_contract(product, (x,), (dx,), cotangent, f"window product {edge}", truth_fn=plain,
+                        plain_fn=plain, without=without)
+
+
 def test_a_scaled_partial_keeps_the_plain_products_overflow_and_non_finite_values():
     """`precision.scaled_partial` picks the order of its three products, never the value: a product whose true
     value overflows still overflows (one rounding past the overflow midpoint whose scales' product first

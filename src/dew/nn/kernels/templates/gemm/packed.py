@@ -68,44 +68,101 @@ def ternary_staged_depth(group, word, code):
     return TERNARY_GROUP * group + 16 * code + word
 
 
-def _decode_ternary_lanes(loaded: jax.Array, active) -> list[jax.Array]:
+WINDOW_STEP = 256
+"""The depth a bfloat16 window matrix's step decodes (`formats.Bf16Window`, row 5387): two groups, so each
+column's meta halves (`Bf16Window.meta_halves`, eight a group) are a `[columns, 16]` register tile, as an
+NVFP4 step's block scales are."""
+
+
+def _decode_ternary_lanes(blocks: list[jax.Array], meta, group: int, active) -> list[jax.Array]:
     from dew.nn.kernels import formats
 
-    del active
+    del meta, group, active
+    [loaded] = blocks
     return [formats.ternary_code_value((loaded >> jnp.uint32(2 * code)) & jnp.uint32(3), jnp.bfloat16)
             for code in range(16)]
 
 
+def _decode_window_lanes(blocks: list[jax.Array], meta: jax.Array, group: int, active) -> list[jax.Array]:
+    """A `formats.Bf16Window` group's eight sixteen-depth slices (`[columns, 16]` bfloat16): slice `s`'s
+    bytes the `s % 4`-th of its `s // 4`-th byte block's words (`window_byte_depth`), its offsets the `s`-th
+    nibble of its nibble block's (`window_nibble_depth`), its group's base and escapes a column each, picked
+    from the stage's meta halves (`meta`, `[columns, depth / 16]`, the group's eight from `8 * group`) by a
+    mask (a column slice of a register tile has no layout), each weight's bits `formats.window_bits`' and
+    the lane their bfloat16 (a 16-bit integer's bits, no arithmetic)."""
+    from dew.nn.kernels import formats
+
+    del active
+    first, second, nibbles = blocks
+    which = jax.lax.broadcasted_iota(jnp.int32, meta.shape, 1)
+    halves = meta.astype(jnp.int32)
+
+    def column(half: int) -> jax.Array:
+        picked = jnp.sum(jnp.where(which == 8 * group + half, halves, 0), axis=1)
+        return picked.astype(jnp.uint32)[:, None]
+
+    base, escapes = column(0), tuple(column(half) for half in range(2, 6))
+    lanes = []
+    for slice_ in range(packed_depth_slices(WINDOW_GROUP)):
+        word = (first, second)[slice_ // 4]
+        byte = (word >> jnp.uint32(8 * (slice_ % 4))) & jnp.uint32(0xFF)
+        offset = (nibbles >> jnp.uint32(4 * slice_)) & jnp.uint32(0xF)
+        held = formats.window_bits(byte, offset, base, escapes)
+        lanes.append(jax.lax.bitcast_convert_type(held.astype(jnp.uint16), jnp.bfloat16))
+    return lanes
+
+
+def packed_depth_slices(group_depth: int) -> int:
+    """The sixteen-depth slices a packed group of `group_depth` depths decodes into, a lane each."""
+    return group_depth // 16
+
+
 @dataclasses.dataclass(frozen=True)
 class PackedWeightFormat:
-    """Descriptor for inline-decoded scale-free packed weights (`ternary`, rows 1464, 5387): word geometry,
-    steps, byte cost, live-register cost, and lane decoder."""
+    """Descriptor for inline-decoded scale-free packed weights (`ternary`, `window`; rows 1464, 5387): a
+    group of `group_depth` depths a column streams `blocks` blocks of sixteen uint32 words (a 64-byte row
+    each, `words_{q}`), beside each step's meta halves where `meta` (`[columns, depth / 16]` uint16, `gmm`'s
+    `scales` stream: a window's bases and escapes); its steps, byte cost, live-register cost and lane decoder
+    (`decode_lanes(blocks, meta, group, layout)`: the group's sixteen-depth slices in depth order)."""
     name: str
-    codes_per_word: int
     group_depth: int
     weight_bytes: float
     steps: tuple[int, ...]
     decode_live: int
-    decode_lanes: Callable[[jax.Array, Any], list[jax.Array]]
+    decode_lanes: Callable[[list[jax.Array], Any, int, Any], list[jax.Array]]
+    blocks: int = 1
+    meta: bool = False
+
+    @property
+    def words_per_group(self) -> int:
+        """The uint32 words a group holds a column."""
+        return 16 * self.blocks
 
 
 def weight_format(name: str) -> PackedWeightFormat:
-    """Resolve a scale-free packed weight format name (`'ternary'`) to its descriptor."""
+    """Resolve a scale-free packed weight format name (`'ternary'`, `'window'`) to its descriptor."""
     if name == "ternary":
         return PackedWeightFormat(
-            name="ternary", codes_per_word=16, group_depth=TERNARY_GROUP, weight_bytes=0.25,
+            name="ternary", group_depth=TERNARY_GROUP, weight_bytes=0.25,
             steps=(TERNARY_STEP,), decode_live=4, decode_lanes=_decode_ternary_lanes)
-    raise ValueError(f"unsupported packed weight format {name!r}; expected 'ternary'")
+    if name == "window":
+        # A weight's 13 bits; a slice's decode holds its byte and nibble words, its group's base and four
+        # escapes a column, and a weight's bits in flight.
+        return PackedWeightFormat(
+            name="window", group_depth=WINDOW_GROUP, weight_bytes=13 / 8, steps=(WINDOW_STEP,),
+            decode_live=10, decode_lanes=_decode_window_lanes, blocks=3, meta=True)
+    raise ValueError(f"unsupported packed weight format {name!r}; expected 'ternary' or 'window'")
 
 
 def packed_group_depth(fmt: str) -> int:
-    """Depth covered by one 16-word group of packed format `fmt` (`'ternary'`)."""
+    """Depth covered by one group of packed format `fmt`."""
     return weight_format(fmt).group_depth
 
 
-def packed_codes_per_word(fmt: str) -> int:
-    """Number of weight codes packed in one uint32 word of packed format `fmt`."""
-    return weight_format(fmt).codes_per_word
+def packed_blocks(fmt: str, depth: int) -> int:
+    """The sixteen-word blocks `depth` depths of packed format `fmt` stream a column (`words_{q}`)."""
+    desc = weight_format(fmt)
+    return depth // desc.group_depth * desc.blocks
 def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool, depth: int,
           width: int) -> None:
     """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
@@ -127,6 +184,9 @@ def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, t
     decode cannot take: staged as matrix (`rhs` `[G, width, depth // per]`) or swapped directly into `wgmma`
     register operand A (`packed_rows=True`, `lhs` `[rows, depth // per]`, dense, 64 rows/consumer)."""
     desc = weight_format(fmt)
+    if packed_rows and desc.meta:
+        raise ValueError(f"packed({fmt}) rows decode only as a staged matrix: its meta halves are its "
+                         "columns', which no swapped call's rows stream")
     if packed_rows:
         if (not dense or lhs is None or lhs.dtype != jnp.uint32 or not transpose_rhs
                 or tiles.block_k % desc.group_depth or tiles.block_m // tiles.warpgroups != 64
@@ -137,7 +197,7 @@ def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, t
                              f"{desc.group_depth}-deep steps, 64 rows/consumer on wgmma, not {tiles}")
         return
     if (not transpose_rhs or rhs.dtype != jnp.uint32
-            or rhs.shape[1:] != (width, depth // desc.codes_per_word)
+            or rhs.shape[1:] != (width, depth // desc.group_depth * desc.words_per_group)
             or depth % desc.group_depth or tiles.block_k % desc.group_depth or tiles.block_n % 64
             or prologue is not None or paired is not None or transpose_lhs
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
@@ -148,13 +208,19 @@ def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, t
 def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scales,
                  packed_format: str | None, transpose_rhs: bool, prologue, paired,
                  transpose_lhs: bool, lhs=None, family=None, dense: bool = False) -> tuple[int, int]:
-    """Resolve logical contraction depth `(k, k2)` for packed NVFP4/ternary calls and validate."""
-    per = packed_codes_per_word(packed_format) if packed_format is not None else 8
-    k, k2 = ((per * k, k2) if packed_rows
-             else (k, 8 * k2 if scales is not None else (per if packed_format is not None else 1) * k2))
-    if packed_format is not None:
-        if scales is not None:
-            raise ValueError("packed_format cannot combine with NVFP4 scales")
+    """Resolve logical contraction depth `(k, k2)` for packed NVFP4/word-packed calls and validate."""
+    desc = weight_format(packed_format) if packed_format is not None else None
+
+    def depth(words: int) -> int:
+        return (8 * words if desc is None
+                else words // desc.words_per_group * desc.group_depth)
+
+    k, k2 = ((depth(k), k2) if packed_rows
+             else (k, depth(k2) if scales is not None or desc is not None else k2))
+    if desc is not None:
+        if (scales is not None) != desc.meta:
+            raise ValueError(f"packed({packed_format}) takes {'its meta halves as' if desc.meta else 'no'} "
+                             "scales")
         word_taken(rhs, packed_format, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
                    paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
                    lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
@@ -279,8 +345,10 @@ class Decoding:
                 mosaic.synced(interpret)
         elif self.weight_fmt is not None:
             desc = weight_format(self.weight_fmt)
-            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // desc.group_depth)]
-            stage_decoded_words(words, buffer.at[mine], desc, interpret, layout=layout)
+            words = [slots[f'words_{q}'].at[mine]
+                     for q in range(buffer.shape[-1] // desc.group_depth * desc.blocks)]
+            meta = slots['scales'].at[mine] if desc.meta else None
+            stage_decoded_words(words, buffer.at[mine], desc, interpret, layout=layout, meta=meta)
         else:
             words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // NVFP4_GROUP)]
             stage_decoded(words, slots['scales'].at[mine], buffer.at[mine], interpret, layout=layout)
@@ -351,22 +419,28 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
-def packed_lanes(words, desc: PackedWeightFormat | str, interpret: bool, *, layout=None):
+def packed_lanes(words, desc: PackedWeightFormat | str, interpret: bool, *, layout=None, meta=None):
     """Yield `(group, code, lane)` (`[columns, 16]` bfloat16) for a scale-free word-packed weight format
-    (`PackedWeightFormat` or its name), shared by staged and direct in-register decoders (rows 1464,
-    5387)."""
+    (`PackedWeightFormat` or its name): `words` its stage's sixteen-word blocks in order, `desc.blocks` a
+    group, beside its step's `meta` halves where the format reads them; shared by staged and direct
+    in-register decoders (rows 1464, 5387)."""
     resolved = weight_format(desc) if isinstance(desc, str) else desc
     active = None if interpret else layout
-    for group, group_words in enumerate(words):
-        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
-                                                                    optimized=False)
-        for code, lane in enumerate(resolved.decode_lanes(loaded, active)):
+
+    def loaded(ref):
+        return ref[...] if active is None else plgpu.load(ref, layout=active, optimized=False)
+
+    halves = None if meta is None else loaded(meta)
+    for group in range(len(words) // resolved.blocks):
+        blocks = [loaded(block) for block in words[group * resolved.blocks:(group + 1) * resolved.blocks]]
+        for code, lane in enumerate(resolved.decode_lanes(blocks, halves, group, active)):
             yield group, code, lane
 
 
-def stage_decoded_words(words, out, desc: PackedWeightFormat, interpret: bool, *, layout=None) -> None:
+def stage_decoded_words(words, out, desc: PackedWeightFormat, interpret: bool, *, layout=None,
+                        meta=None) -> None:
     """Decode a stage of word-packed weight groups (`desc`) into `out` (`[columns, depth]` bfloat16)."""
-    for group, code, lane in packed_lanes(words, desc, interpret, layout=layout):
+    for group, code, lane in packed_lanes(words, desc, interpret, layout=layout, meta=meta):
         out[:, pl.ds(desc.group_depth * group + 16 * code, 16)] = lane
 
 

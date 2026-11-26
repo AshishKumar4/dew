@@ -6,9 +6,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from fla_gdn_support import KernelCase
+from generation_support import lowers
+from kernel_compile import compile_mosaic_kernels
 
 from dew import quantization
 from dew.nn.dense import Dense
+from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window
 
 
@@ -37,7 +41,7 @@ def test_a_bf16_window_decodes_every_weight_to_its_bits():
     window = Bf16Window.of(weights).checked()
     assert window.shape == weights.shape
     np.testing.assert_array_equal(np.asarray(window.decoded()).view(np.uint16), weights.view(np.uint16))
-    stored = sum(np.asarray(plane).size * 32 for plane in (window.low, window.offsets, window.meta))
+    stored = sum(np.asarray(plane).size * 32 for plane in (window.words, window.meta))
     assert stored / weights.size == 13
 
 
@@ -72,3 +76,70 @@ def test_a_dense_served_its_window_is_its_kernels_product_and_its_kernel_comes_b
     assert set(back) == {"params"}
     np.testing.assert_array_equal(np.asarray(back["params"]["kernel"]).view(np.uint16),
                                   kernel.view(np.uint16))
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
+def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
+    """A window of the edges `_drawn` codes (signed zeros, subnormals, escapes, a group's floor, weights near
+    the largest finite) beside rows of small integers: its product on the template's route, each stage
+    decoded in place (interpreted), and on XLA's, the decoded matrix's, each the float64 product of its
+    weights rounded once to fp32 (each product exact, its sums exact in fp32), dense and grouped (two groups
+    of 3 and 5 rows); the route each took reported."""
+    weights = _drawn((256, 64))
+    finite = np.isfinite(np.asarray(weights, np.float32))
+    # Its infinities and NaNs read through their own column, apart, as no finite sum holds them.
+    weights = np.where(finite, weights, np.asarray(0.0, jnp.bfloat16))
+    window = Bf16Window.of(weights)
+    rows = np.random.default_rng(5387).integers(-3, 4, (8, 256)).astype(jnp.bfloat16)
+    sizes = np.asarray([3, 5], np.int32)
+    if grouped:
+        window = Bf16Window.of(np.stack([weights, weights[:, ::-1]]))
+        held = np.stack([weights, weights[:, ::-1]]).astype(np.float64)
+        want = np.concatenate([rows[:3].astype(np.float64) @ held[0], rows[3:].astype(np.float64) @ held[1]])
+    else:
+        want = rows.astype(np.float64) @ weights.astype(np.float64)
+    for kernel in ("mosaic", "xla"):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              generation.routes() as seen):
+            got = jax.jit(lambda rows: gemm.window_product(
+                rows, window, jnp.asarray(sizes) if grouped else None, out_dtype=jnp.float32,
+                interpret_on_cpu=True))(jnp.asarray(rows))
+        assert any(route.kernel == kernel for route in seen), (kernel, seen)
+        np.testing.assert_array_equal(np.asarray(got), want.astype(np.float32), err_msg=kernel)
+
+
+def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
+    """A window's launch reads its columns' meta halves beside its words (`gmm`'s `scales`): a staged
+    matrix of a 256-deep step is taken, and a call swapping its matrix into the products' rows, which stream
+    no columns' meta, is refused by name."""
+    from dew.nn.kernels.templates.gemm import packed, tiling
+
+    tiles = tiling.Tiles(64, 64, 256, 2, 1, family="wgmma")
+    words = jax.ShapeDtypeStruct((1, 64, 256 // 128 * 48), jnp.uint32)
+    packed.word_taken(words, "window", tiles, transpose_rhs=True, prologue=None, paired=None,
+                      transpose_lhs=False, depth=256, width=64)
+    with pytest.raises(ValueError, match="staged matrix"):
+        packed.word_taken(words, "window", tiles, transpose_rhs=True, prologue=None, paired=None,
+                          transpose_lhs=False, depth=256, width=64, packed_rows=True)
+
+
+@pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
+                                 pytest.param("sm90", marks=lowers("sm90"))])
+def test_a_window_product_compiles_spill_free(gpu: str):
+    """A window's Mosaic launch, each stage decoded in place, compiles spill-free on a compile-only sm80
+    and sm90 at a Qwen3-4B projection's shape (row 5387)."""
+    if generation.compile_only_gpus(gpu):
+        rows = jax.ShapeDtypeStruct((4096, 2560), jnp.bfloat16)
+        sample = Bf16Window.of(np.ones((2560, 9728), jnp.bfloat16))
+        spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), sample)
+
+        def compiled(a, w):
+            return gemm.window_product(a, w, out_dtype=jnp.bfloat16)
+
+        with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
+            records = compile_mosaic_kernels(
+                [KernelCase(f"window_{gpu}", lambda fn=compiled, x=rows, w=spec: (fn, (x, w)))], gpu)
+        for record in records:
+            assert not record.get("error"), record
+            assert record["kernels"], record
+            assert all(kernel.get("spilled") == 0 for kernel in record["kernels"]), record
