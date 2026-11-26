@@ -1367,25 +1367,13 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 4096 keys", seeds=SEEDS)
 
 
-def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave(monkeypatch):
-    """An A100's B1 decode step over 32768 keys at width 128, 32/8 heads: among the slice counts its plan
-    prices (`attention_decode._priced_slices`) is the one filling its 108 multiprocessors' one wave of its 8
-    key heads' programs, 13, not a power of two (its fastest walk, M-NA-27c-a100), beside the powers."""
-    priced = []
-    real = attention_decode._priced_slices
-
-    def spy(*args, **kwargs):
-        priced.append(args[6])
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(attention_decode, "_priced_slices", spy)
-    query = jax.ShapeDtypeStruct((1, 1, 32, 128), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, 32768, 8, 128), jnp.bfloat16)
-    with generation.assumed("sm80"):
-        attention_decode.planned(jnp.zeros(query.shape, query.dtype), key, key,
-                                 template.spans(1, 32768, 1, causal=False), template.Hooks())
-    [counts] = priced
-    assert {108 // 8, 2, 4, 8} <= set(counts), counts
+def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave():
+    """The slice counts an A100's B1 decode step over 32768 keys at width 128, 32/8 heads, prices
+    (`attention_decode._slice_counts`: 108 multiprocessors, 8 key heads' programs a slice, at most 54): the
+    one filling its one wave, 13, not a power of two (its fastest walk, M-NA-27c-a100), and the powers of
+    two beside it, none past the most it takes."""
+    counts = attention_decode._slice_counts(108, 8, 54)
+    assert {13, 27, 2, 4, 8, 16, 32} <= set(counts) and max(counts) <= 54 and min(counts) >= 2, counts
 
 
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
