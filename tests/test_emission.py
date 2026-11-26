@@ -1,6 +1,7 @@
 """A launch's work counted from its kernel's emission (`templates.emission`, row 5895): a step of its walk
 counted from its body, as each warpgroup runs it."""
 
+import contextlib
 import math
 
 import jax
@@ -1007,11 +1008,16 @@ def test_a_replicated_rows_reduction_combines_each_copy(target):
     butterfly = Work(operations=128 * (1 + 5), shuffles=128 * 5)
     generation_named = target.split()[0]
 
+    @contextlib.contextmanager
     def placed():
         if target.endswith("placed"):
-            mesh = jax.sharding.AbstractMesh((1,), ("data",))
-            return jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, generation_named))
-        return generation.assumed(generation_named)
+            # Unassumed, whatever the process assumes around it (a GPU tier's prepare, its own generation).
+            abstract = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("data",)), generation_named)
+            with generation.assumed(None), jax.sharding.use_abstract_mesh(abstract):
+                yield
+        else:
+            with generation.assumed(generation_named):
+                yield
 
     for reduce, work in ((jnp.sum, butterfly),
                          (jnp.max, Work(operations=64) if generation_named == "sm100" else butterfly)):
