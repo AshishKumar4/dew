@@ -144,6 +144,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable, Container, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -1150,7 +1151,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         spent = "in " + " ".join(left_tests) + (f" ({group})" if group else "")
         part = out.with_name(f"{out.name}.{index}")
         code = max(code, tested(python, left_tests, group, part, left, "off", grace, common, environ,
-                                coverage, written=written))
+                                coverage, written=written,
+                                recycle_at=None if coverage is not None or census else PLAIN_RECYCLE_AT))
         rows += json.loads(part.read_text())["rows"]
         # The next process sees the commit's checkout, not what this one left in it (row 3932's review).
         if later:
@@ -1415,6 +1417,18 @@ RECORDS = "DEW_RECORDS"
 and repeated runs wrote each row's records again on keys a train's run holds."""
 
 
+PLAIN_RECYCLE_AT = 4 << 30
+"""The resident bytes past which a task's pytest ends between two tests and runs the rest in a fresh process
+(recycle.py, `ran_in_processes`), a dry prepare's aside (prepares.py's `RECYCLE_AT`): a 10 GiB container
+holds 4 GiB a process kept beside its next test's 5.2 GiB at most (row 13063's cold cases: 3.5 to 5.2 GiB
+each; train 1299's test_contracts_algebra.py#1/5 killed for memory beside its own earlier tests, green
+alone), what it holds after glibc returns its free pages (recycle.py's `trimmed`). A test that needs more is
+marked `fresh_process` (recycle.py's `FRESH`). A row run past a recycle is
+recorded as a blind watch's (`run_keys.record`), so a train runs it again; one that never passes the bound
+is one process's, as before. Coverage's runs are one process each, its data file whole, and the census's,
+whose files' selections a recycle would read as their own."""
+
+
 def ran_in_processes(base: list[str], resumes: bool,
                      environment_of: Callable[[Path | None], dict[str, str]], recycle_at: int | None,
                      root: Path, ends: float, grace: float, files: tuple[Path, Path, Path],
@@ -1482,7 +1496,8 @@ def ran_in_processes(base: list[str], resumes: bool,
 
 
 def graded_across(name: str, red: list[str], failed: list, own: list[ET.Element],
-                  processes: Processes) -> tuple[list[str], list, list[ET.Element]]:
+                  processes: Processes, done_before: Mapping[str, float] = MappingProxyType({})
+                  ) -> tuple[list[str], list, list[ET.Element]]:
     """Row `name`'s grade (`red`, `failed`) by its last process's own cases (`own`), joined by its earlier
     processes' (`ran_in_processes`, run past a recycle): red unless every test its first process selected
     (recycle.py's `SELECTED`) was reported by one of them, whatever a later collection found (a test a later
@@ -1491,7 +1506,8 @@ def graded_across(name: str, red: list[str], failed: list, own: list[ET.Element]
     file = grading.owning(name)
     before = [case for case in processes.earlier if grading.of(case, name)]
     chosen = {node for node in processes.first_selected if grading.owning(node) == file}
-    never_ran = sorted(chosen - {grading.node_of(case) for case in [*before, *own]})
+    # A test a recalled attempt passed, which this attempt set aside (`progress.resumed`), ran.
+    never_ran = sorted(chosen - {grading.node_of(case) for case in [*before, *own]} - set(done_before))
     if not chosen or never_ran:
         red = [*red, "its processes, run past a recycle, reported not every test its first selected: "
                + (", ".join(never_ran[:6]) if chosen else "its first process's selection unread")]
@@ -1575,7 +1591,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                             reported, returncode, deadline if expired else None,
                                             running, pid.is_file(), running)
         if processes.segments > 1:
-            red, failed, own = graded_across(name, red, failed, own, processes)
+            red, failed, own = graded_across(name, red, failed, own, processes, done_before)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares

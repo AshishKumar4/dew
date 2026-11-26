@@ -59,9 +59,11 @@ def test_a_resumed_task_runs_whole_a_file_whose_process_ended_red_after_its_test
     assert rows == {"3.12:tests/test_crashing.py": 0, "3.12:tests/test_other.py": 0}
 
 
-def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", **kwargs) -> dict:
+def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", recycle_at: int = 1,
+                 **kwargs) -> dict:
     """The row a dry prepare's task gives tests/test_recycled.py of `source` (a conftest `hook` in its
-    continuations, where DEW_CONTINUES_ROW is set), under a recycle bound every process passes."""
+    continuations, where DEW_CONTINUES_ROW is set), under a recycle bound every process passes (or
+    `recycle_at`)."""
     written(tmp_path, {"test_recycled.py": source})
     if hook:
         conftest = tmp_path / "tests" / "conftest.py"
@@ -72,8 +74,9 @@ def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", **kwarg
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
-    ci.tested("3.12", ["tests/test_recycled.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=1,
-              **{"recorded": False, **kwargs})
+    split = kwargs.pop("split", "")
+    ci.tested("3.12", ["tests/test_recycled.py"], split, out, 600.0, "off", 5.0, "", {},
+              recycle_at=recycle_at, **{"recorded": False, **kwargs})
     [row] = json.loads(out.read_text())["rows"]
     return row
 
@@ -102,6 +105,89 @@ def test_a_dry_prepares_tests_past_its_recycle_bound_run_on_in_fresh_processes_a
     assert len(set((tmp_path / "pids").read_text().split())) == 3
     assert sorted(row["tests"]) == [f"tests/test_recycled.py::test_{name}" for name in "abc"]
     assert row["exitCode"] == (1 if failing else 0)
+
+
+def test_a_test_marked_fresh_process_runs_in_a_process_of_its_own_under_a_bound_none_passes(
+        ci, tmp_path, monkeypatch):
+    """A test marked `fresh_process` (recycle.py's `FRESH`) runs in a process of its own: its pytest ends
+    after the test before it and after it, the tests left running on in fresh processes, under a resident
+    bound no process passes; every test once, in one green row."""
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    row = recycled_row(ci, tmp_path, monkeypatch,
+                       "import os\nimport pytest\ndef ran(name):\n    with open('pids', 'a') as pids:\n"
+                       "        pids.write(f'{name}:{os.getpid()} ')\n"
+                       "def test_a():\n    ran('a')\ndef test_b():\n    ran('b')\n"
+                       "@pytest.mark.fresh_process\ndef test_c():\n    ran('c')\n"
+                       "def test_d():\n    ran('d')\ndef test_e():\n    ran('e')\n",
+                       recycle_at=1 << 50)
+    pids = dict(entry.split(":") for entry in (tmp_path / "pids").read_text().split())
+    assert pids["a"] == pids["b"] and pids["d"] == pids["e"]
+    assert len({pids["b"], pids["c"], pids["d"]}) == 3
+    assert row["exitCode"] == 0 and len(row["tests"]) == 5
+
+
+def test_a_plain_task_runs_its_tests_past_its_recycle_bound_in_fresh_processes(ci, tmp_path, monkeypatch):
+    """A plain task (`task`, no dry prepare's) runs its pytest under `PLAIN_RECYCLE_AT`, so a process holding
+    more than it after a test ends and the tests left run in a fresh one, its row one and green (row 13063:
+    a group's compiles held 10 GiB of a 10 GiB container in one process, each green alone)."""
+    monkeypatch.setattr(ci, "PLAIN_RECYCLE_AT", 1)
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    # Outside the checkout, which each later process finds as the commit holds it (`restored`).
+    pids = tmp_path.parent / f"{tmp_path.name}-pids"
+    written(tmp_path, {"test_plain.py": f"import os\ndef ran():\n    with open({str(pids)!r}, 'a') as pids:\n"
+                                        "        pids.write(f'{os.getpid()} ')\n"
+                                        "def test_a():\n    ran()\ndef test_b():\n    ran()\n"})
+    commit(tmp_path, "the commit")
+    interpreter(tmp_path, "3.12")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    ci.task("3.12", ["tests/test_plain.py"], "", out, 600.0, "off")
+    [row] = json.loads(out.read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"]
+    assert len(set(pids.read_text().split())) == 2
+
+
+def test_a_resumed_groups_test_its_recalled_attempt_passed_is_no_test_its_recycled_processes_missed(
+        ci, tmp_path, monkeypatch):
+    """A split group's attempt resumed after a recall (its ARMADA_RESUME holding a test it passed, set aside
+    by `progress.resumed`) and run past a recycle is green: the test set aside ran, in the recalled attempt,
+    and is none its processes failed to report (`graded_across`)."""
+    resume = tmp_path.parent / f"{tmp_path.name}-resume"
+    resume.mkdir()
+    (resume / "progress.jsonl").write_text(
+        json.dumps({"node": "tests/test_recycled.py::test_a", "seconds": 0.01, "pid": 1}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    row = recycled_row(ci, tmp_path, monkeypatch,
+                       "def test_a():\n    raise AssertionError('set aside, never run')\n"
+                       "def test_b():\n    pass\ndef test_c():\n    pass\n",
+                       recorded=True, split="1/1")
+    assert row["exitCode"] == 0, row["output"]
+
+
+def test_a_fresh_process_test_runs_alone_after_its_predecessor_was_set_aside_by_a_resume(
+        ci, tmp_path, monkeypatch):
+    """A split group resumed after a recall whose attempt passed the test before a `fresh_process` one (set
+    aside, `progress.resumed`) still runs the marked test in a process of its own, apart from the test before
+    it as the group now stands, under a bound no process passes."""
+    resume = tmp_path.parent / f"{tmp_path.name}-resume"
+    resume.mkdir()
+    (resume / "progress.jsonl").write_text(
+        json.dumps({"node": "tests/test_recycled.py::test_b", "seconds": 0.01, "pid": 1}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    pids = tmp_path.parent / f"{tmp_path.name}-pids"
+    row = recycled_row(ci, tmp_path, monkeypatch,
+                       "import os\nimport pytest\n"
+                       f"def ran(name):\n    with open({str(pids)!r}, 'a') as out:\n"
+                       "        out.write(f'{name}:{os.getpid()} ')\n"
+                       "def test_a():\n    ran('a')\ndef test_b():\n    ran('b')\n"
+                       "@pytest.mark.fresh_process\ndef test_c():\n    ran('c')\n",
+                       recorded=True, split="1/1", recycle_at=1 << 50)
+    ran = dict(entry.split(":") for entry in pids.read_text().split())
+    assert row["exitCode"] == 0, row["output"]
+    assert "b" not in ran and ran["a"] != ran["c"]
 
 
 def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path, monkeypatch):
