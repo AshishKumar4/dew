@@ -438,22 +438,25 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
     def branch(path) -> bool:
         return "msa_indexer" in jax.tree_util.keystr(path)
 
-    def norms(objective) -> tuple[float, float, float]:
+    def gradients(objective) -> tuple[list, list, float]:
+        """The index branch's gradient leaves, every other leaf's, and the cross entropy."""
         (_, aux), grads = jax.value_and_grad(lambda p: objective.scalar_loss(p, batch, step_at()),
                                              has_aux=True)(params)
         leaves = jax.tree_util.tree_leaves_with_path(grads["params"])
-        return (float(optax.tree.norm([leaf for path, leaf in leaves if branch(path)])),
-                float(optax.tree.norm([leaf for path, leaf in leaves if not branch(path)])),
-                float(aux.metrics["ce"]))
+        return ([np.asarray(leaf) for path, leaf in leaves if branch(path)],
+                [np.asarray(leaf) for path, leaf in leaves if not branch(path)], float(aux.metrics["ce"]))
 
-    untrained, main, ce = norms(plain)
-    assert untrained == 0
+    untrained, main, ce = gradients(plain)
+    assert untrained and all(not leaf.any() for leaf in untrained)
     seen = {}
     for weight in (0.5, 2.0):
-        seen[weight], weighted_main, weighted_ce = norms(
+        seen[weight], weighted_main, weighted_ce = gradients(
             LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=weight)))
-        assert seen[weight] > 0 and weighted_main == main and weighted_ce == ce
-    assert seen[2.0] == 4 * seen[0.5]
+        assert weighted_ce == ce and any(leaf.any() for leaf in seen[weight])
+        for got, plain_leaf in zip(weighted_main, main, strict=True):
+            np.testing.assert_array_equal(got, plain_leaf)
+    for heavy, light in zip(seen[2.0], seen[0.5], strict=True):
+        np.testing.assert_array_equal(heavy, 4 * light)
     with pytest.raises(ValueError):
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup"))
 
