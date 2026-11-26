@@ -65,6 +65,21 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                         seeds=form.cases.seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("kind", ["placed", "duplicate"])
+def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
+    example = jax.ShapeDtypeStruct((8,), jnp.float32)
+    if kind == "placed":
+        mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        operands = ((jax.ShapeDtypeStruct((8,), jnp.float32, sharding=sharding),),)
+    else:
+        operands = ((example,), (example,))
+    cases = generate.Cases(operands, lambda seed, shapes: (np.ones((8,), np.float32),), seeds=1)
+    form = generate.ComponentForm(jnp.abs, jnp.abs, cases)
+    with pytest.raises(ValueError):
+        generate._chosen("bad.components", form)
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

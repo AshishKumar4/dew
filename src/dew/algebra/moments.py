@@ -17,6 +17,7 @@ from jax.custom_derivatives import SymbolicZero
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.programs import holes
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
@@ -184,15 +185,13 @@ _VAR_FORM = _covariance_form(0, 1)
 def _ratio_jvp_only(primals: Sequence[jax.Array], tangents: Sequence,
                     form: ratios.Ratio, moving: tuple[int, ...]) -> jax.Array:
     """Take a ratio's derivative only in the moving operands, keeping its transpose linear."""
-    active_set = frozenset(moving)
+    live = frozenset(moving)
+    operands, fill = holes(list(primals), [index in live for index in range(len(primals))])
 
-    def evaluate(*active: jax.Array) -> jax.Array:
-        iterator = iter(active)
-        full = [next(iterator) if index in active_set else primal for index, primal in enumerate(primals)]
-        return ratios.ratio(full, form)
+    def evaluate(*active):
+        return ratios.ratio(fill(active), form)
 
-    _, tangent = jax.jvp(evaluate, tuple(primals[index] for index in moving),
-                         tuple(tangents[index] for index in moving))
+    _, tangent = jax.jvp(evaluate, tuple(operands), tuple(tangents[index] for index in moving))
     return tangent
 
 

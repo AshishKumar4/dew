@@ -334,7 +334,8 @@ def _decode_gated(index: Index, joined: int, rows: int) -> Region | None:
     down, = index.readers[hidden]
     if any(not _decode_product(equations[place]) for place in (first, second, down)):
         return None
-    if equations[first].invars[0] is not equations[second].invars[0] or equations[down].invars[0] is not hidden:
+    if (equations[first].invars[0] is not equations[second].invars[0]
+            or equations[down].invars[0] is not hidden):
         return None
     places = (*sorted((first, second)), joined, down)
     ctx = equations[down].ctx

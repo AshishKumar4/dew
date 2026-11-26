@@ -29,18 +29,16 @@ they are declared: neither is generated yet.
 
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
-| Dev time | `python -m dew.algebra.generate` | registered `StableForm` declarations and cases | dev-time rules, with sampled error (§1.5) | checked-in Python modules with a shared accuracy and regeneration suite |
+| Dev time | `python -m dew.algebra.generate` | stable forms and flat component pilots | search and sample stable forms; check components as written (§1.5) | checked-in modules with a shared accuracy and regeneration suite |
 | Dev time (planned) | the same generator, as a declaration changes | template reduction and scan declarations, and the two bodies of a declared surrogate | dev-time rules with the family's independent accuracy and performance gates | checked-in Python and its Check 1, Check 2 and regeneration coverage (§6.11) |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
-- **Dev time** generates stable forms registered with `declare`. The generator writes `*_derived.py`
-  beside the declaring module, with a header naming the declarations, rule sets and egglog version.
-  `tests/test_algebra_generate.py` checks each generated function against the declaration in float64 and
-  runs `generate(check=True)` on the recorded platform. Changes to a rule or declaration show up as a
-  reviewed diff. Template algebra and surrogate gradients remain part of the dev-time design: a
-  template's forward and backward tiles, online step and combine, and a surrogate's two bodies will
-  be generated when those families are adopted (rows 3272, 6109). Today they trace where they are used.
+- **Dev time** generates stable forms and checked component pilots registered with `declare`. The
+  generator writes `*_derived.py` beside the declaring module. `tests/test_algebra_generate.py` checks
+  each function against independent truth and regenerates on the recorded platform. The recurrence score
+  tile and rounded-operand bodies do not replace production forms. Forward and backward template tiles,
+  online step and combine, and surrogate cutover remain measured work (rows 3272, 6109).
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,

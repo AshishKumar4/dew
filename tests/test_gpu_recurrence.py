@@ -466,22 +466,25 @@ def test_the_recurrence_matrix_holds_on_this_gpu():
 @pytest.mark.gpu(reason="the generated score tile has to hold on the native compiler, not only the CPU")
 @pytest.mark.generations("sm90")
 def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
     from dew.algebra import component_cases, component_cases_derived
 
     form = component_cases.SCORES
 
     def call(component):
-        def scores(q, k, decays, scales):
-            return component(q @ k.T, decays, scales)
-        return jax.jit(scores)
+        def scores(products, decays, scales, out):
+            out[...] = component(products[...], decays[...], scales[...])
+
+        dtype = jax.ShapeDtypeStruct((32, 32), jnp.float32)
+        return jax.jit(plgpu.kernel(scores, out_type=dtype, num_threads=1, thread_name="wg"))
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        return tuple(rng.uniform(-0.5, 0.5, shape).astype(np.float32)
-                     for shape in ((32, 32), (32, 32), (32, 32), (32,)))
+        return tuple(rng.uniform(-0.5, 0.5, shape).astype(np.float32) for shape in ((32, 32), (32, 32), (32,)))
 
     assert_as_exact(call(component_cases_derived.scores), call(form.function), draw,
-                    "native recurrence scores, generated or traced", seeds=8, truth_fn=call(form.truth))
+                    "Mosaic recurrence scores, generated or traced", seeds=8, truth_fn=jax.jit(form.truth))
 
 
 def test_the_short_conv_matrix_holds_on_this_gpu():

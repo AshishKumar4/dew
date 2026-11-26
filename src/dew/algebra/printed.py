@@ -63,6 +63,7 @@ class _Printer:
     platforms: dict[jcore.Var, tuple] = dataclasses.field(default_factory=dict)
     pairs: dict[jcore.Var, str] = dataclasses.field(default_factory=dict)
     read: set[jcore.Var] = dataclasses.field(default_factory=set)
+    dimensions: dict[int, str] = dataclasses.field(default_factory=dict)
     count: int = 0
     used: bool = False
 
@@ -91,13 +92,19 @@ class _Printer:
         return f"({'-' if negated else ''}{value}, jnp.zeros_like({value}))"
 
 
-def source(closed: core.Jaxpr, name: str, *, compensated: bool = False) -> tuple[str, bool]:
+def source(closed: core.Jaxpr, name: str, *, compensated: bool = False,
+           borrow_shapes: bool = False) -> tuple[str, bool]:
     """`closed` printed as a function `name` over its inputs returning its outputs as a tuple, and whether a
     sum was compensated (`compensated`: always False where it is not asked). Raises `Unprintable` for an
     equation no plain call writes."""
     printer = _Printer(compensated)
     inputs = [printer.fresh("x") for _ in closed.jaxpr.invars]
     printer.names.update(zip(closed.jaxpr.invars, inputs, strict=True))
+    if borrow_shapes:
+        for var, arg in zip(closed.jaxpr.invars, inputs, strict=True):
+            for axis, extent in enumerate(_shaped(var).shape):
+                if isinstance(extent, int) and extent > 1:
+                    printer.dimensions.setdefault(extent, f"{arg}.shape[{axis}]")
     for var, value in zip(closed.jaxpr.constvars, closed.consts, strict=True):
         printer.names[var] = printer.fresh("c")
         printer.lines.extend(_constant(printer.names[var], np.asarray(value)))
@@ -164,11 +171,20 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
         for var, named in zip(equation.outvars, outputs, strict=True):
             printer.names[var] = named
         arguments = [printer.atom(atom) for atom in equation.invars]
-        arguments += [f"{key}={_param(value)}" for key, value in equation.params.items()]
+        arguments += [f"{key}={_layout(printer, value) if key == 'shape' else _param(value)}"
+                      for key, value in equation.params.items()]
         # A primitive of several results binds a sequence, unpacked even where it holds one.
         target = (", ".join(outputs) + ("," if len(outputs) == 1 else "") if primitive.multiple_results
                   else outputs[0])
         printer.emit(target, f"lax.{primitive.name}_p.bind", arguments)
+
+
+def _layout(printer: _Printer, value) -> str:
+    """Identical emitted bodies may share extents read from their declared input shapes."""
+    if not printer.dimensions or not isinstance(value, tuple) or not all(isinstance(n, int) for n in value):
+        return _param(value)
+    sizes = [printer.dimensions.get(n, repr(n)) for n in value]
+    return f"({', '.join(sizes)}{',' if len(sizes) == 1 else ''})"
 
 
 def _inlined(printer: _Printer, equation: jcore.JaxprEqn) -> tuple:
