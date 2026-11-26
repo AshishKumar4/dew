@@ -1694,7 +1694,9 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     assert pcie.derived_for(held) == pcie.target
     with pytest.raises(ValueError):
         pcie.derived_for(gpu_target("sm90"))
-    assert len(list(records.rglob("*.json"))) == 2
+    # A record each: the inspected build's, whose plan fits its sampled step beside its step, the same
+    # build's uninspected, and the canonical GPU's (the rung key states the run's inspection).
+    assert len(list(records.rglob("*.json"))) == 3
 
 
 def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and_loads_where_that_is_held():
