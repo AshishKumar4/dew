@@ -496,17 +496,23 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         tpu_ops(unnamed, {0}, "jit_run")
 
 
-def test_a_tpu_calls_program_is_named_by_its_module_and_a_call_of_no_one_program_refused():
-    """The module a TPU call's ops are read by (`benchmark._module_of`) is its one program's: a jitted
-    function's as it lowers and its compiled program's alike; a plain function's call, which may run any
-    number of programs, is refused (`AmbiguousCapture`)."""
-    from dew.telemetry.benchmark import AmbiguousCapture, _module_of
+def test_a_tpu_call_is_timed_as_the_one_program_its_module_names_and_a_call_of_no_one_program_refused():
+    """A TPU call is timed as one compiled program (`benchmark._program_of`), whose module names its runs: a
+    compiled program itself, a jitted function compiled for its arguments, which runs even where JIT is
+    disabled (a jitted call would run its body as Python, no program); a plain function's call, which may
+    run any number of programs, is refused (`AmbiguousCapture`)."""
+    from dew.telemetry.benchmark import AmbiguousCapture, _module_of, _program_of
 
     def scaled(x):
         return x * 2.0
 
     x = jnp.ones((8,), jnp.float32)
     jitted = jax.jit(scaled)
-    assert _module_of(jitted, (x,)) == _module_of(jitted.lower(x).compile(), (x,)) == "jit_scaled"
+    compiled = jitted.lower(x).compile()
+    assert _program_of(compiled, (x,)) is compiled
+    with jax.disable_jit():
+        program = _program_of(jitted, (x,))
+    assert isinstance(program, jax.stages.Compiled)
+    assert _module_of(program) == _module_of(compiled) == "jit_scaled"
     with pytest.raises(AmbiguousCapture):
-        _module_of(scaled, (x,))
+        _program_of(scaled, (x,))

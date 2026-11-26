@@ -443,9 +443,9 @@ class TpuTime:
     ops its program ran on its devices in its one run, as one profiler capture of the call holds them
     (`tpu_ops`, through Dew's one reading of a capture), each its duration on the device, which no host
     dispatch enters. The call runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and
-    stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is one program,
-    compiled (`jax.stages.Compiled`) or jitted, which its module names; a call of another kind, or whose
-    devices its arrays do not name, is refused (`AmbiguousCapture`)."""
+    stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is timed as its one
+    compiled program (`_program_of`), whose module names its runs; a call of another kind, or whose devices
+    its arrays do not name, is refused (`AmbiguousCapture`)."""
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
@@ -471,8 +471,9 @@ class TpuTime:
 
         from dew.telemetry.profile import CaptureOptions, Profiler
 
-        module = _module_of(fn, args)
-        warm = jax.block_until_ready(fn(*args))
+        program = _program_of(fn, args)
+        module = _module_of(program)
+        warm = jax.block_until_ready(program(*args))
         devices = (_devices_of(warm) or _devices_of(args))
         if not devices:
             raise AmbiguousCapture(f"{fn}'s call names no device its arrays are on, so its ops are not told "
@@ -484,7 +485,7 @@ class TpuTime:
             except RuntimeError as error:
                 raise CaptureHeld(str(error)) from error
             try:
-                jax.block_until_ready(fn(*args))
+                jax.block_until_ready(program(*args))
             finally:
                 profiler.stop()
             (capture,) = profiler.captures
@@ -497,19 +498,23 @@ def _devices_of(tree) -> set[int]:
             for device in leaf.devices()}
 
 
-def _module_of(fn: Callable, args: tuple) -> str:
-    """The module name of the one program a call of `fn(*args)` runs: a compiled program's own, a jitted
-    function's as it lowers for `args`; a call of anything else (several programs, or none) is refused
-    (`AmbiguousCapture`)."""
+def _program_of(fn: Callable, args: tuple) -> jax.stages.Compiled:
+    """The one executable a TPU call of `fn(*args)` is timed as: a compiled program itself, a jitted
+    function's compiled for `args` (its `.lower`), which the read calls in its place, so the program it names
+    is the one that runs (a jitted call under `jax.disable_jit` runs no program at all); a call of anything
+    else (several programs, or none) is refused (`AmbiguousCapture`)."""
     if isinstance(fn, jax.stages.Compiled):
-        text = fn.as_text()
-    elif callable(getattr(fn, "lower", None)):
-        text = fn.lower(*args).as_text()
-    else:
-        raise AmbiguousCapture(f"{fn} is neither a compiled nor a jitted program, so no module names its ops")
-    found = re.match(r"\s*(?:HloModule|module @)\s*([\w.]+)", text)
+        return fn
+    if callable(getattr(fn, "lower", None)):
+        return fn.lower(*args).compile()
+    raise AmbiguousCapture(f"{fn} is neither a compiled nor a jitted program: no one program names its ops")
+
+
+def _module_of(program: jax.stages.Compiled) -> str:
+    """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its HLO's own."""
+    found = re.match(r"\s*HloModule\s+([\w.]+)", program.as_text())
     if found is None:
-        raise AmbiguousCapture(f"{fn}'s program states no module name")
+        raise AmbiguousCapture(f"{program} states no module name")
     return found.group(1)
 
 
