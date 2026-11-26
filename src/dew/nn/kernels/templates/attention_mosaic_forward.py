@@ -2356,8 +2356,10 @@ def _program_views(program: _Program, refs, read: _Read, *, peaks: bool, kv_head
         views = _parted_views(family, views, named, row, lax.div(head, group), batch=batch, parts=parts,
                               kv_heads=kv_heads)
     if riding(family, kinds, "keys"):
-        tile = program.query_tile(queries // (tiles.consumers * tiles.block_q), fresh=fresh)
-        views = {**views, **score_views(family, read.hooked.score, kinds, "keys", row, head, tile)}
+        held = tiles.consumers * tiles.block_q
+        tile = program.query_tile(queries // held, fresh=fresh)
+        views = {**views, **score_views(family, read.hooked.score, kinds, "keys", row, head, tile,
+                                        band=(held, tiles.block_k))}
     return row, head, column, views
 
 

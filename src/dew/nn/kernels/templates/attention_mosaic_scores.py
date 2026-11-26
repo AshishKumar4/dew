@@ -394,7 +394,8 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads),
                       heads=kv_heads)
     if riding(family, kinds, "keys"):
-        views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
+        views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair),
+                             band=(pair, program.tiles.block_k))
     if spans is not None and spans.walk_count is not None:
         # Each step's key tiles, read through its pair's ranges where its walk is indexed
         # (`_Program.tile_of`).
