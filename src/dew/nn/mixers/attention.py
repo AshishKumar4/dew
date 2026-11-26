@@ -1204,7 +1204,7 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError(f"{self.name}: a relative bias scores a call's own keys, and this call's "
                                  f"{masking.key.shape[-3]} keys are not its {S} tokens")
             relative = self._relative_bias(x, places, query_slots, key_slots, banded=indexed and bias is None)
-            bias = relative if bias is None else bias + relative
+            bias = relative if bias is None else bias + dense_bias(relative, key.shape[-3])
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
 
