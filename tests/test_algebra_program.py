@@ -2060,9 +2060,9 @@ def test_in_process_digest_distinguishes_which_link_each_equation_reads():
         return jax.lax.sub(both, y)
 
     first, clone, different = (jax.make_jaxpr(fn)(shape, shape) for fn in (step, jax.jit(step), other))
-    key = functools.partial(terms.jaxpr_digest, in_process=True)
-    assert key(first) == key(clone.eqns[0].params["jaxpr"])
-    assert key(first) != key(different)
+    key = terms.jaxpr_digest(first, in_process=True)
+    assert key == terms.jaxpr_digest(clone.eqns[0].params["jaxpr"], in_process=True)
+    assert key != terms.jaxpr_digest(different, in_process=True)
 
 
 def _bf16_rms(x, w):
