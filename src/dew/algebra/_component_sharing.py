@@ -11,6 +11,8 @@ from dew.algebra import printed
 
 _MIN_SHARED = 6
 """Smaller fragments would add a call and arguments for little source reduction."""
+_MAX_SHARED = 64
+"""Long repeats can share several readable helpers rather than one oversized body."""
 
 
 class _Fragment(ast.NodeTransformer):
@@ -82,9 +84,12 @@ def _assigns(node: ast.stmt, fragments: set[str]) -> bool:
     if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
         return False
     call = node.value.func
-    return (isinstance(call, ast.Name) and call.id in fragments
-            or isinstance(call, ast.Attribute) and (call.attr == "bind"
-                or (call.attr == "array" and isinstance(call.value, ast.Name) and call.value.id == "np")))
+    if isinstance(call, ast.Name):
+        return call.id in fragments
+    if not isinstance(call, ast.Attribute):
+        return False
+    return call.attr == "bind" or (call.attr == "array" and isinstance(call.value, ast.Name)
+                                   and call.value.id == "np")
 
 
 @dataclasses.dataclass
@@ -147,7 +152,7 @@ def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]
                                   for first in indices[:len(indices) - _MIN_SHARED + 1])
     best: tuple[_Copy, ...] = ()
     saved = 0
-    for width in itertools.count(_MIN_SHARED):
+    for width in range(_MIN_SHARED, _MAX_SHARED + 1):
         by_body: dict[tuple[_Assignment, ...], list[_Span]] = defaultdict(list)
         for span in candidates:
             if span.available >= width:

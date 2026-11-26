@@ -533,6 +533,7 @@ KEY_MEMORY_DECAY = declare(__name__, "key_memory_decay", ComponentForm(
 def _softcap_tile(logits, seen):
     capped, slopes = attention_gradient.tile_logits(attention.Capped(50.0), logits, seen, None, None, (),
                                                      scale=0.125, slopes=True)
+    assert slopes is not None
     # Split out the negative-infinity sentinel for the finite error gate without losing any output.
     unseen = capped == -jnp.inf
     return jnp.where(unseen, 0.0, capped), slopes[0], unseen
@@ -571,7 +572,7 @@ def _sliding_visibility(key, start, stop, queries, documents):
 
 def _sliding_visibility_truth(key, start, stop, queries, documents):
     def visible(lo, hi, document):
-        return jnp.where(documents == document, (key - lo >= 0) & (hi - key > 0), False)
+        return (documents == document) & (key - lo >= 0) & (hi - key > 0)
 
     return jax.vmap(visible)(start, stop, queries)
 
@@ -696,7 +697,9 @@ def _fp8_epilogue_truth(acc):
     stored = acc.astype(jnp.bfloat16).astype(jnp.float64)
     blocks = stored.reshape(acc.shape[0], -1, 128)
     maximum = jnp.maximum(jnp.max(jnp.abs(blocks), axis=-1, keepdims=True), 1e-4)
-    power = jnp.exp2(jnp.ceil(jnp.log2(maximum / 448)))
+    fraction, exponent = jnp.frexp(maximum)
+    # The FP8 ceiling 448 is (7/8) × 2^9. Compare the exact fractions at a scale boundary.
+    power = jnp.ldexp(jnp.ones_like(maximum), exponent - 9 + (fraction > 0.875))
     encoded = jnp.clip(blocks / power, -448, 448).astype(jnp.float8_e4m3fn).astype(jnp.float64)
     return stored, encoded.reshape(acc.shape), jnp.broadcast_to(power, blocks.shape).reshape(acc.shape)
 
