@@ -1286,7 +1286,9 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     uncopied, bounded = [], []
     with report.refusals():
         for form in ("forward", "input gradient", "kernel gradient"):
-            for each in _gate_cases("sm80", form):
+            cases = _gate_cases("sm80", form)
+            assert any(each.case.required for each in cases), form
+            for each in cases:
                 fn, specs = each.case.call()
                 copies = 0
                 for call in kernel_calls(lowered_for(fn, specs, "sm80"), unrun=True):
