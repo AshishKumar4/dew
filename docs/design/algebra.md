@@ -1416,12 +1416,12 @@ converted exactly in the accurate form (a fold's rounded as its kernels round it
 whose scaled value lies within it taken at half each and doubled after, the same bits), split into its nearest
 integer, the value's power of two, and its remainder in [-1/2, 1/2], whose exponential is the significand, so a
 factor is held exactly to `2^-65536` and is zero below it (`means.FLOOR`). The law is one **ratio of sums of
-products** of its float operands, an operation of its own (`means.ratio_p`, its form `means.Ratio`):
-`sum_k o_k l_k f_k / sum_k l_k f_k`. Each term is formed exactly as a double float at a power of two (each
-factor's significand times the running product by an exact product, `two_product`, its residual carried), the
-terms are formed once (materialized before any sum reads them: a compiler fusing the exact products into each
-reduction formed them four times, and XLA:CPU's loop vectorizer held such a program past 240 s, row 7925),
-placed at the power of two that puts the sum of their magnitudes a binade beneath their format's largest power
+products** of its float operands (`ratios.ratio_p`, its form `ratios.Ratio`):
+`sum_k o_k l_k f_k / sum_k l_k f_k`. A term is a double float at a power of two: each factor's
+significand times the running product by an exact product (`two_product`), its residual carried.
+The sum streams a bounded chunk of terms at a time, sharing the factors it reads within the chunk.
+Terms of a window are placed at the power of two that puts the sum of their magnitudes a binade beneath
+their format's largest power
 (so no partial sum passes the format, and a term `2^-252` of that sum keeps its value: V4's tiny output beside
 its cancelling neighbours at its own power; float64's, a truth's, at float64's), summed compensated
 (`compensated`, Ogita, Rump and Oishi's Sum2), the numerator's sum divided by the denominator's with the
@@ -1449,9 +1449,9 @@ rule, no quotient in it:
 
 each term's derivative its product rule's (an exponential's `s f` times its anchor's tangent, the units' scale a
 factor of its own so its powers multiply exactly), each sum formed once and unlanded (`_products_summed`: a
-double float at its power of two, the products multiplied and joined so, `_times`), so its work is each sum's
-states, no grid of them, and no quotient, nor a tangent of one, is a float landed apart from the terms it
-cancels against (a quotient of `2^-156`, landed, lost a derivative of `-2^-66`; the merge P0's base reviews 4
+double float at its power of two, the products multiplied and joined so, `_times`). The work of an ordinary
+product of sums is linear in their states. No quotient, nor a tangent of one, is landed apart from the
+terms it cancels against (a quotient of `2^-156`, landed, lost a derivative of `-2^-66`; the merge P0's base reviews 4
 and 9). Every term of it holds one tangent, so it is linear in them and its transpose is a ratio again
 (`_ratio_jvp`, `_ratio_transpose`), its tangent's sum taken a state at a time, summed over the axes its operand
 is broadcast along and landed once: within that sum where the form sums its terms each over its own extent
@@ -1463,6 +1463,15 @@ that cancel are its value (masses along a common scaling of themselves under out
 2^199 apart, the derivative 0; a zero total's derivative along its total through a second merge, -1/4), the
 anchor `M` reading no tangent (the mean is the same at any anchor). The ratio lowers through XLA as its value,
 batches along its axis, keeps its operands' weak type and sharding, and runs eagerly as one dispatch.
+
+**Independent moment directions.** Products in a mixed covariance derivative can hold independent
+directional sums. A single active sum combines each direction with all its signed coefficients before
+reducing states. When a product holds independent active sums, or a pullback subtracts an active sum from
+an entrywise value, the sums hold their dyadic bins separately (`dew.algebra.bands`). Each bin accumulates
+signed integer digits and becomes a significand with its power of two; a large total that needs two floating
+words is normalized before joining a product. The evaluator visits the occupied bin combinations in bounded
+chunks and reduces the signed products before dividing and landing. This preserves lower terms when a
+stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded
