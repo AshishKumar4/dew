@@ -1005,40 +1005,40 @@ def _register_reduction_slots(graph: EGraph, region: terms.Region, reductions: t
 
 
 def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
-    """Register how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
-    for index, (primitive, params) in enumerate(list(region.params)):
+    """Batch how each parameter in `region.params` moves, inserts, reduces, or contracts axes."""
+    facts = []
+    for index, (primitive, params) in enumerate(region.params):
+        parameter = i64(index)
         declared = terms.OPERATIONS.get(primitive)
         kind = None if declared is None else declared.kind
         if kind in ("binary", "unary", "comparison", "cast"):
-            graph.register(keeps(i64(index)))
+            facts.append(keeps(parameter))
             if primitive is jax.lax.integer_pow_p and params.get("y") == 2:
-                graph.register(is_square(i64(index)))
+                facts.append(is_square(parameter))
         elif primitive is jax.lax.broadcast_in_dim_p:
             dims = tuple(int(d) for d in params["broadcast_dimensions"])
             after = tuple(int(s) for s in params["shape"])
-            for axis, to in enumerate(dims):
-                graph.register(lays(i64(index), i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to)) for axis, to in enumerate(dims))
             if dims == tuple(range(len(after))):
-                graph.register(identity_broadcast(i64(index)))
+                facts.append(identity_broadcast(parameter))
             elif len(dims) == len(after) - 1:
                 missing = [axis for axis in range(len(after)) if axis not in dims]
                 if len(missing) == 1 and dims == tuple(p for p in range(len(after)) if p != missing[0]):
-                    graph.register(inserts_axis(i64(index), i64(missing[0])))
+                    facts.append(inserts_axis(parameter, i64(missing[0])))
         elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
-            for axis in range(len(permutation)):
-                graph.register(lays(i64(index), i64(axis), i64(permutation.index(axis))))
+            facts.extend(lays(parameter, i64(axis), i64(permutation.index(axis)))
+                         for axis in range(len(permutation)))
         elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
-            for axis, to in _moved(primitive, params, region, index):
-                graph.register(lays(i64(index), i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to))
+                         for axis, to in _moved(primitive, params, region, index))
             if primitive is jax.lax.reshape_p and params.get("dimensions") is None:
-                for axis in _inserted_reshape_axes(region, index):
-                    graph.register(inserts_axis(i64(index), i64(axis)))
+                facts.extend(inserts_axis(parameter, i64(axis))
+                             for axis in _inserted_reshape_axes(region, index))
         elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
-            for axis in range(_rank_before(region, index, reduced)):
-                if axis not in reduced:
-                    graph.register(reduces(i64(index), i64(axis), i64(axis - sum(r < axis for r in reduced))))
+            facts.extend(reduces(parameter, i64(axis), i64(axis - sum(r < axis for r in reduced)))
+                         for axis in range(_rank_before(region, index, reduced)) if axis not in reduced)
         elif kind == "product":
             (left_contracted, right_contracted), (left_batch, right_batch) = params["dimension_numbers"]
             left_rank, right_rank = _dot_ranks(region, index)
@@ -1047,17 +1047,18 @@ def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
             right_free = [axis for axis in range(right_rank) if axis not in right_contracted and
                           axis not in right_batch]
             for position, (left, right) in enumerate(zip(left_batch, right_batch, strict=True)):
-                graph.register(left_of(i64(index), i64(int(left)), i64(position)),
-                               right_of(i64(index), i64(int(right)), i64(position)))
-            for position, axis in enumerate(left_free):
-                graph.register(left_of(i64(index), i64(axis), i64(len(left_batch) + position)))
-            for position, axis in enumerate(right_free):
-                place = len(left_batch) + len(left_free) + position
-                graph.register(right_of(i64(index), i64(axis), i64(place)))
-            for axis in left_contracted:
-                graph.register(contracts_left(i64(index), i64(int(axis))))
-            for axis in right_contracted:
-                graph.register(contracts_right(i64(index), i64(int(axis))))
+                facts.append(left_of(parameter, i64(int(left)), i64(position)))
+                facts.append(right_of(parameter, i64(int(right)), i64(position)))
+            left_at = len(left_batch)
+            right_at = left_at + len(left_free)
+            facts.extend(left_of(parameter, i64(axis), i64(left_at + position))
+                         for position, axis in enumerate(left_free))
+            facts.extend(right_of(parameter, i64(axis), i64(right_at + position))
+                         for position, axis in enumerate(right_free))
+            facts.extend(contracts_left(parameter, i64(int(axis))) for axis in left_contracted)
+            facts.extend(contracts_right(parameter, i64(int(axis))) for axis in right_contracted)
+    if facts:
+        graph.register(*facts)
 
 
 def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -> None:
