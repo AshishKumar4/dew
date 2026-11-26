@@ -60,7 +60,7 @@ def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, in
     exactly into bfloat16 before its products read them (`converted.MosaicConvertedGmm`), on par with XLA's
     widened product (check 1) from float64; the routes it records name the template."""
     def truth(lhs, rhs):
-        return np.asarray(lhs, np.float64) @ np.asarray(rhs, np.float64).T
+        return jnp.asarray(lhs, jnp.float64) @ jnp.asarray(rhs, jnp.float64).T
 
     with generation.routes() as routes:
         assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu)),

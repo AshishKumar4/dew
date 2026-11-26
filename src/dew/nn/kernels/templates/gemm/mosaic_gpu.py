@@ -327,8 +327,6 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     (`[width, depth / 8]` words, `scales` `[width, depth / 16]`), the products' rows, and `rhs` the call's
     rows (`[1, rows, depth]`, read transposed): a decode-sized product swapped (row 5387), each step's rows
     decoded in registers into the products' left operand (`packed.rows_decoded`, `packed.rows_taken`). With
-    `rhs` 8-bit codes beside 16-bit rows (FP8 on a family of no FP8 products, row 8548), each stage of it is
-    converted exactly into the rows' dtype before its products read it (`packed.Decoding`). With
     `step_scales` (`row_scales` `[depth / 128, rows]`, `column_scales` `[groups, depth / 128, width / c]`,
     fp32), each 128-deep step's exactly summed partial is multiplied by its rows' scales and its group's
     scales of its columns, `c` columns a scale, before it is added (`xla_products.step_scaled`: DeepSeek-V3's
@@ -524,6 +522,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     their steps over the programs, the program walking a tile's first step adding its partials and storing
     it (`tail.Tail`, `mosaic.Family.fixed_up`), once a configuration; `chained` on: `guarded_walk`'s."""
     family = family_of(tiles, _products_dtype(lhs, {'matrix': rhs}, packed_rows))
+    decode = packed_format or (packing.CODES if jnp.dtype(rhs.dtype).itemsize == 1 else None)
     (prologue, prologue_axes, epilogue, epilogue_axes), (prologue_operands, epilogue_operands) = hooks, sides
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, part = tiles.warpgroups, tiles.cluster, (tiles.share, block_n)
@@ -574,7 +573,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 step, prefetch = stepped_at(
                     wg, tile, fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
                     read_tiles=_reads(prologue_gmems, prologue_axes, read, group, g),
-                    decoded=packing.decoding(decoded, tiles, wg, bool(interpret), weight_fmt=packed_format))
+                    decoded=packing.decoding(decoded, tiles, wg, bool(interpret), weight_fmt=decode))
                 return _walked_products(family, walk, step, part, accumulators, exact_sums, prefetch)
             def finish(wg, tile, accs, store, *, active):
                 if (tail is not None or when is not None) and not active:

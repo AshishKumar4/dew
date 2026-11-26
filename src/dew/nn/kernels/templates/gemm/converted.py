@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.precision import EXACT_FLOAT32
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
@@ -36,7 +37,7 @@ class Codes:
     `[groups, width, depth]`, its shape and dtype the bfloat16 matrix they widen to exactly, `[groups,
     depth, width]`, as a packed matrix states its decoded one (`grouped_matmul._PackedMatrix`)."""
 
-    codes: jax.Array
+    codes: jax.Array | jax.ShapeDtypeStruct
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -62,7 +63,7 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
         # Its codes' layout is the caller's, whole steps and tiles (`STEP`): the call is not padded.
         return True
 
-    def _streamed_matrix(self, kernel: Codes, trans_rhs: bool) -> tuple:
+    def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
         return kernel.codes, True, {}
 
@@ -171,7 +172,7 @@ def _rules(launch: MosaicConvertedGmm, interpret: bool) -> tuple:
     def backward(saved, operands, cotangent, live):
         del saved
         rows, codes, sizes = operands
-        d_rows = jnp.dot(cotangent, codes[0].astype(jnp.float32), precision=jax.lax.Precision.HIGHEST,
+        d_rows = jnp.dot(cotangent, codes[0].astype(jnp.float32), precision=EXACT_FLOAT32,
                          preferred_element_type=jnp.float32)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(codes), zero_from_primal(sizes))
         return tuple(leaves[index] for index in live)
