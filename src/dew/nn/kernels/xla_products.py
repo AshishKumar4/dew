@@ -282,7 +282,9 @@ def exponent_scaled(lhs_codes: jax.Array, lhs_exponents: jax.Array, kernel_codes
     from ..precision import power2
 
     def start(zeros):
-        return zeros, jnp.full(zeros.shape, _NO_EXPONENT, jnp.int32), jnp.zeros(zeros.shape, bool)
+        # Placed as the sum is (`_block_walk`'s zeros), each part of the carry alike.
+        return (zeros, jnp.full_like(zeros, _NO_EXPONENT, dtype=jnp.int32),
+                jnp.zeros_like(zeros, dtype=bool))
 
     def added(index, partial, owner, carry):
         total, exponent, poisoned = carry
