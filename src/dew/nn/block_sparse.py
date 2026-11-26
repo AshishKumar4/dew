@@ -309,20 +309,27 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         total = compensated_sum(summed, (summed.ndim - 1,))[..., None]
         target = jnp.where(total > 0, summed / jnp.where(total > 0, total, 1), 0)
         taken = target > 0
-        # KL = sum t log t + (m - sum t s) + log sum exp(s - m) over the selected keys alone, m their peak:
-        # no gap between two scores is rounded unweighted ([fp32's max, its least] at a uniform teacher is
-        # fp32's max - log 2, finite), and a key it does not select adds nothing, its score however low.
+        # KL = sum t log t + sum t (m - s) + log sum exp(s - m) over the selected keys alone, m their peak:
+        # each gap m - s taken before its weight, none rounded away by a weighted mean, and one past fp32's
+        # range weighted first (t m - t s: [fp32's max, its least] at a uniform teacher is fp32's max -
+        # log 2, finite); a key it does not select adds nothing, its score however low.
         scores = jnp.where(keep, index_scores[:, group].astype(wide), -jnp.inf)
-        peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1))
+        peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1, keepdims=True))
         peak = jnp.where(jnp.isfinite(peak), peak, 0)
-        spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak[..., None]), 0), axis=-1))
-        weighted = compensated_sum(jnp.where(taken, target * jnp.where(taken, scores, 0), 0),
-                                   (scores.ndim - 1,))
-        entropy = compensated_sum(jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)), 0),
-                                  (target.ndim - 1,))
-        return jnp.where(jnp.any(keep, axis=-1), (peak - weighted) + spread + entropy, 0)
+        spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak), 0), axis=-1))
+        held = jnp.where(taken, scores, 0)
+        gap = peak - held
+        gaps = jnp.where(taken, jnp.where(jnp.isfinite(gap), target * gap, target * peak - target * held), 0)
+        entropy = jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)), 0)
+        divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread + compensated_sum(
+            entropy, (entropy.ndim - 1,))
+        return jnp.where(jnp.any(keep, axis=-1), divergence, 0)
 
-    return jnp.mean(jnp.stack([kl(group) for group in range(groups)]), axis=0)
+    # The groups' mean at their largest's scale, each group's KL within fp32 however near its largest.
+    kls = jnp.stack([kl(group) for group in range(groups)])
+    largest = jax.lax.stop_gradient(jnp.max(jnp.abs(kls), axis=0))
+    unit = jnp.where((largest > 0) & jnp.isfinite(largest), largest, 1)
+    return unit * jnp.mean(kls / unit, axis=0)
 
 
 INFLLM_STRIDE = 16

@@ -354,9 +354,10 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     where its index branch scores one 100 below the other, its KL is 50 - log 2 (the float64 run, as a
     float64 oracle writes it) and its gradient on the scores exactly (1/2, -1/2) in fp32, where an epsilon
     inside the logarithm (MaxText's, `mla.indexer_kl`'s) capped the loss near 8.5 and stilled the low
-    score's gradient; scored fp32's largest and least, its KL fp32's largest (its exact value rounds
-    there), not an infinity; and over one selected token beside a key it does not select, nothing, the
-    selected token's score fp32's least."""
+    score's gradient; scored 64 apart at 2^30, its exact KL rounded to fp32; scored fp32's largest and
+    least, its KL fp32's largest (its exact value rounds there), not an infinity, over one group and as
+    the mean of two; and over one selected token beside a key it does not select, nothing, the selected
+    token's score fp32's least."""
     query = jnp.zeros((1, 2, 1, 4), jnp.float32)
     key = jnp.zeros((1, 2, 1, 4), jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
@@ -374,8 +375,20 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     gradient = np.asarray(jax.grad(lambda s: loss(s)[0, 1])(jnp.asarray(low, jnp.float32)))[0, 0, 1]
     np.testing.assert_array_equal(gradient, np.asarray([0.5, -0.5], np.float32))
 
-    extremes = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]]], jnp.float32)
-    np.testing.assert_array_equal(np.asarray(loss(extremes))[0], np.asarray([0.0, largest], np.float32))
+    # A gap of 64 at 2^30, which a weighted mean of the scores rounds away (2^30 - 32 a tie, to 2^30): the
+    # exact KL, 32 - log 2 + log(1 + e^-64), rounded to fp32 (a quarter of its unit from it).
+    near = jnp.asarray([[[[0.0, -np.inf], [2.0**30, 2.0**30 - 64]]]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(loss(near))[0, 1], np.float32(32 - np.log(2.0)))
+    # At fp32's largest and least, over one group and over two, each group's KL fp32's largest.
+    for groups in (1, 2):
+        def grouped(scores, groups=groups):
+            return block_sparse.msa_query_kls(
+                scores, jnp.zeros((1, 2, groups, 4), jnp.float32), jnp.zeros((1, 2, groups, 4), jnp.float32),
+                jnp.zeros((1, groups, 2, 1), jnp.int32), block=2, scale=0.5)
+
+        extremes = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]] * groups], jnp.float32)
+        np.testing.assert_array_equal(np.asarray(grouped(extremes))[0],
+                                      np.asarray([0.0, largest], np.float32))
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0
