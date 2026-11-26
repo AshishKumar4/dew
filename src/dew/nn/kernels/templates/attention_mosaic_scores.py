@@ -247,6 +247,11 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                 exps, w = exps * multiplier, w * multiplier
             return exps, w, gradient.pulled(cot, sl, sn, ())[0]
         if masked is None:
+            # The rows read ahead of the branches: a ring's slot a row reads is held by the step's slots
+            # (`rings.Slots`, its first read's), so one read within a branch leaves the next read the branch's
+            # value, a tracer of a trace that has ended (row 13106: a G4's non-causal training step, its
+            # streamed statistics read in the first branch, failed to lower).
+            rows = tuple(_read(row) for row in rows)
             exponentials, weights, cotangents = lax.cond(whole, functools.partial(scores, is_masked=False),
                                                          functools.partial(scores, is_masked=True))
         else:
