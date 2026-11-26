@@ -6,7 +6,7 @@ query head's), from a scoring pass the model runs in XLA, selecting through
 `dew.nn.sparse_selection.top_k_selection`: MoBA's gate over chunk-mean keys (`moba_selection`), NSA's
 compressed branch's weights (`nsa_selection`), MiniMax's learned indexer max-pooled to blocks
 (`pooled_selection`; MSA's index branch `MsaIndexer`, its selection `msa_selection`, MiniMax M3's at its
-forced first and local blocks, and its loss `msa_indexer_kl`), InfLLM-V2's two-window pooling
+forced first and local blocks, and its loss `msa_query_kls`), InfLLM-V2's two-window pooling
 (`infllm_selection`; its attention, dense below 8192 keys, `infllm_attention`) or a caller's block mask
 (`masked_selection`). `dew.nn.sparse_selection.selected_attention` runs it, each selected block one of the
 key runs `scaled_dot_product_attention` takes (`key_runs`), which the template's mainloops walk as the
@@ -28,12 +28,12 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.dense import Dense
 from dew.nn.documents import CrossDocuments, DocumentWindows, document_windows
-from dew.nn.inspection import QK
+from dew.nn.inspection import INDEXER_COLLECTION, QK
 from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
-from dew.nn.mla import SELECTIONS
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.mla import SELECTIONS, indexer_kl
+from dew.nn.precision import float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import SELECTING, block_maxima, block_runs, selected_attention, top_k_selection
 
@@ -210,7 +210,7 @@ def pooled_selection(index_scores: jax.Array, *, block: int, top_k: int, local: 
 class MsaIndexer(nn.Module):
     """MiniMax Sparse Attention's index branch (arXiv 2606.13392 §3, eqs. 5, 6, 11): an index query head a GQA
     group (`wq`, `groups` heads of `width`) and one index key head every group shares (`wk`), both of the
-    detached hidden states, so the main loss trains neither (its own, `msa_indexer_kl`, trains these alone).
+    detached hidden states, so the main loss trains neither (its own, `msa_query_kls`, trains these alone).
     Its scores `[B, G, N, N]` (fp32) are each query's scaled products with every key, -inf past it (eq. 6's
     `j <= i`); `msa_selection` max-pools them onto blocks and takes each group's top blocks."""
 
@@ -266,28 +266,28 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     return jnp.pad(chosen, ((0, 0),) * 3 + ((0, top_k - chosen.shape[-1]),), constant_values=-1)
 
 
-def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Array, *,
-                   block: int) -> jax.Array:
-    """MSA's indexer loss (arXiv 2606.13392 eqs. 9, 10): over each query's visible tokens of its group's
-    selected blocks, the KL divergence of the index branch's softmax (`index_scores` `[B, G, Q, K]`) from the
-    detached mean of its group's heads' attention softmaxes (`logits` `[B, H, Q, K]`, the main branch's, `H`
-    a multiple of `G`), averaged over the queries and groups. `selected` `[B, G, Q, S]` (`msa_selection`'s,
-    -1 a slot of none)."""
-    rows, groups, queries, keys = index_scores.shape
-    per = logits.shape[1] // groups
+def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
+    """`[B, G, Q, K]`: whether a query's selection (`selected` `[B, G, Q, S]`, blocks of `block`, -1 none)
+    names a key's block and the key is no later than the query."""
     place = jnp.arange(keys)
     chosen = jnp.any(selected[..., None] == (place // block), axis=-2)
-    tokens = chosen & (place[None, :] <= jnp.arange(queries)[:, None])
-    # At least fp32 (float64 a truth's run).
-    wide = at_least_fp32(jnp.result_type(index_scores, logits))
-    teacher = jax.nn.softmax(jnp.where(tokens[:, :, None], logits.reshape(rows, groups, per, queries, keys
-                                                                          ).astype(wide), -jnp.inf),
-                             axis=-1)
-    teacher = jax.lax.stop_gradient(jnp.where(tokens, teacher.mean(axis=2), 0.0))
-    student = jax.nn.log_softmax(jnp.where(tokens, index_scores.astype(wide), -jnp.inf), axis=-1)
-    divergence = jnp.where(tokens & (teacher > 0), teacher * (jnp.log(jnp.where(teacher > 0, teacher, 1.0))
-                                                               - student), 0.0)
-    return divergence.sum() / (rows * queries * groups)
+    return chosen & (place[None, :] <= jnp.arange(selected.shape[2])[:, None])
+
+
+def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, selected: jax.Array, *,
+                  block: int, scale: float) -> jax.Array:
+    """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
+    objective takes it (`mla.indexer_kl`, the objective's `IndexerTraining`): each group's KL of the index
+    branch's softmax over the query's selected tokens from its heads' detached attention there (their
+    softmaxes summed and normalized, each head's at `scale`), averaged over the groups. `query`
+    `[B, Q, G * h, D]`, `key` `[B, K, G, D]`, `index_scores` `[B, G, Q, K]`."""
+    groups, keys = index_scores.shape[1], index_scores.shape[3]
+    per = query.shape[2] // groups
+    tokens = _selected_tokens(selected, keys, block)
+    kls = [indexer_kl(index_scores[:, group], query[:, :, group * per:(group + 1) * per],
+                      jnp.repeat(key[:, :, group:group + 1], per, axis=2), tokens[:, group], scale)
+           for group in range(groups)]
+    return sum(kls) / groups
 
 
 INFLLM_STRIDE = 16
@@ -469,8 +469,9 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         """MSA's attention (arXiv 2606.13392 §3): its index branch over the layer's input (`MsaIndexer`, an
         index query head a key head's group beside one shared index key head, the input detached), each
         group's `top_k` blocks of `block` its own forced (`msa_selection`), through the template's indexed
-        form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`) for its
-        indexer loss (`msa_indexer_kl`), which trains the index branch alone. Over the call's own tokens,
+        form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`), and where an
+        objective trains an indexer its loss per query (`msa_query_kls`, `INDEXER_COLLECTION`), which trains
+        the index branch alone. Over the call's own tokens,
         a row one document: a right-padded row's trailing padding it reads as keys past the real ones, which
         causality keeps every real query from (no dense cut to move)."""
         if append is not None or masking.documents is not None or masking.valid is not None:
@@ -481,6 +482,11 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         selected = msa_selection(scores, block=self.block, top_k=self.top_k)
         if not self.is_initializing():
             self.sow(SELECTIONS, "msa", {"index_scores": scores, "selected": selected})
+            if self.is_mutable_collection(INDEXER_COLLECTION):
+                # Its indexer's loss per query, as an objective training an indexer reads it
+                # (`IndexerTraining`, `mla.indexer_kl`'s collection).
+                self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
+                    scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5))
         return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
                                   dtype=self.ctx.dtype, precision=self.ctx.precision,
                                   force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
@@ -511,6 +517,20 @@ class BlockSparseAttentionMixer(AttentionMixer):
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
         return ("block-selected attention reads each query's blocks as key runs, which a mixed serving step "
                 "lays none of")
+
+    @property
+    def indexed_mixers(self) -> tuple["BlockSparseAttentionMixer", ...]:
+        # MSA's index branch, which an objective trains (`IndexerTraining`), selecting the keys its queries
+        # attend (`sparse`).
+        return (self,) if self.selection == "msa" else ()
+
+    @property
+    def indexed(self) -> bool:
+        return self.selection == "msa"
+
+    @property
+    def sparse(self) -> bool:
+        return self.selection == "msa"
 
     def generation_refusal(self) -> str | None:
         # InfLLM-V2's and MSA's selections read a row of one document's own tokens, uncached (`_infllm`,

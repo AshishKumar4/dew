@@ -22,7 +22,8 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.mla import SELECTIONS
+from dew.nn.inspection import INDEXER_COLLECTION
+from dew.nn.mla import INDEXER_EPS, SELECTIONS
 from dew.registry import mixers
 
 SEEDS = 8
@@ -315,28 +316,34 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
             assert set(slots) == _top(maxima, top_k + 2 - len(forced), forced), (forcing, row, group, at)
     selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k))
 
-    logits = jnp.asarray(rng.standard_normal((rows, heads * groups, length, length)), jnp.float32)
+    main = 16
+    query = jnp.asarray(rng.standard_normal((rows, length, heads * groups, main)), jnp.float32)
+    key = jnp.asarray(rng.standard_normal((rows, length, groups, main)), jnp.float32)
+    scale = main ** -0.5
     with jax.enable_x64(new_val=True):
-        loss = np.asarray(block_sparse.msa_indexer_kl(jnp.asarray(scores, jnp.float64),
-                                                      jnp.asarray(logits, jnp.float64), jnp.asarray(selected),
-                                                      block=block))
-    total = 0.0
+        kls = np.asarray(block_sparse.msa_query_kls(
+            jnp.asarray(scores, jnp.float64), jnp.asarray(query, jnp.float64), jnp.asarray(key, jnp.float64),
+            jnp.asarray(selected), block=block, scale=scale))
+    expected = np.zeros((rows, length))
+    eps = INDEXER_EPS
     for row, group, at in np.ndindex(rows, groups, length):
         blocks = {int(b) for b in selected[row, group, at] if b >= 0}
         tokens = [j for j in range(at + 1) if j // block in blocks]
-        heads_of = np.asarray(logits, np.float64)[row, group * heads:(group + 1) * heads, at][:, tokens]
-        teacher = (np.exp(heads_of - heads_of.max(-1, keepdims=True))
-                   / np.exp(heads_of - heads_of.max(-1, keepdims=True)).sum(-1, keepdims=True)).mean(0)
+        heads_of = np.asarray(query, np.float64)[row, at, group * heads:(group + 1) * heads] @ np.asarray(
+            key, np.float64)[row, tokens, group].T * scale
+        summed = (np.exp(heads_of - heads_of.max(-1, keepdims=True))
+                  / np.exp(heads_of - heads_of.max(-1, keepdims=True)).sum(-1, keepdims=True)).sum(0)
+        teacher = summed / (summed.sum() + eps)
         student = scores[row, group, at, tokens].astype(np.float64)
-        student = student - student.max() - np.log(np.exp(student - student.max()).sum())
-        total += float(np.sum(teacher * (np.log(teacher) - student)))
-    # The loss run in float64 is the oracle's, to float64 rounding over a row's softmaxes and the sum.
-    assert_computes_the_oracle(loss, np.asarray(total / (rows * groups * length)), "MSA's indexer loss",
-                               roundings=rows * groups * length * length)
+        student = np.exp(student - student.max()) / np.exp(student - student.max()).sum()
+        expected[row, at] += float(np.sum(teacher * (np.log(teacher + eps) - np.log(student + eps)))) / groups
+    # The loss run in float64 is the oracle's, to float64 rounding over a query's softmaxes and its sum.
+    assert_computes_the_oracle(kls, expected, "MSA's indexer loss per query",
+                               roundings=heads * length * main)
 
     def trained(params, hidden):
-        return block_sparse.msa_indexer_kl(indexer.apply(params, hidden), logits, jnp.asarray(selected),
-                                           block=block)
+        return block_sparse.msa_query_kls(indexer.apply(params, hidden), query, key, jnp.asarray(selected),
+                                          block=block, scale=scale).sum()
 
     by_params, by_hidden = jax.grad(trained, argnums=(0, 1))(params, hidden)
     assert np.any(np.asarray(by_params["params"]["wq"]["kernel"]) != 0)
@@ -479,7 +486,8 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():
     """A decoder of block-selected attention by MSA's selection (`block_sparse_attention`,
     `selection="msa"`): its index branch's parameters are the model's (`msa_indexer`), it sows its index
-    scores and its selection (`SELECTIONS`, for the indexer's loss, `msa_indexer_kl`), and the main loss's
+    scores and its selection (`SELECTIONS`) and, where an objective trains an indexer, its loss per query
+    (`msa_query_kls`, `INDEXER_COLLECTION`; an indexed mixer), and the main loss's
     gradient leaves the index branch untouched: its input is read detached, the selection taking none."""
     model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2,
                                     index_width=8), dtype="float32")
@@ -491,8 +499,11 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
                 if part in "/".join(str(key) for key in path)]
 
     assert named(params, "msa_indexer")
-    _, sown = model.apply(params, tokens, mutable=[SELECTIONS])
+    _, sown = model.apply(params, tokens, mutable=[SELECTIONS, INDEXER_COLLECTION])
     assert named(sown, "index_scores") and named(sown, "selected")
+    # Its indexer's loss per query, where an objective training an indexer opens its collection.
+    (kl,) = named(sown, "kl")
+    assert kl.shape == (1, 16) and model.indexed_mixers
     grads = jax.grad(lambda p: jnp.sum(model.apply(p, tokens)))(params)
     for leaf in named(grads, "msa_indexer"):
         np.testing.assert_array_equal(np.asarray(leaf), 0.0)
