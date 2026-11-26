@@ -365,8 +365,11 @@ class RemoteCache:
                 # One that loaded none of it and compiled as many as it held found it stale (its file's code
                 # changed): it prunes.
                 # A later process of a dry prepare's task (`RECYCLE.CONTINUES`) keeps it whole too: an earlier
-                # process of its row compiled and wrote what it holds, and its own tests used none of it.
-                keeps = file in self.blind or bool(os.environ.get(RECYCLE.CONTINUES)) or (
+                # process of its row compiled and wrote what it holds, and its own tests used none of it. So
+                # does one that recycle.py stopped (its `RECYCLED` marker written): its row's later processes
+                # load the rest.
+                stopped = (marker := os.environ.get(RECYCLE.RECYCLED)) is not None and Path(marker).is_file()
+                keeps = file in self.blind or bool(os.environ.get(RECYCLE.CONTINUES)) or stopped or (
                     2 * len(loaded) < len(every) and (bool(loaded) or len(written) < len(every)))
                 fetched = every if keeps else loaded
                 self.sealed.add(file)
