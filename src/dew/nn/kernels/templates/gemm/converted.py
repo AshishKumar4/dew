@@ -77,6 +77,10 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
             config, family, dtype=rows, rhs_dtype=matrix, transpose_rhs=True, prologue_axes=(),
             prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(), dtypes=(ba.arguments['out_dtype'],))
 
+    def _priced_operands(self, ba):
+        # A swapped call's binding, its rows the codes (`_swapped`), is priced as its dtype's.
+        return None if isinstance(ba.arguments['tokens'], Codes) else super()._priced_operands(ba)
+
     def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
         return grouped_matmul.MosaicGmm._swaps_on(self, family, dtype)
 

@@ -1482,6 +1482,10 @@ class MosaicPackedGmm(MosaicGmm):
                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
                             return_residuals=return_residuals)
 
+    def _priced_operands(self, ba) -> Callable | None:
+        # A swapped call's binding (`packed_rows`) states no packed matrix of its own (`_operand_bytes`).
+        return None if ba.arguments['packed_rows'] else super()._priced_operands(ba)
+
     def _streamed_matrix(self, kernel: _PackedMatrix, trans_rhs: bool) -> tuple:
         # Its words, K-major whatever orientation its decoded shape states, and its block scales, which each
         # stage decodes (`mosaic_gpu.gmm`'s `scales`).

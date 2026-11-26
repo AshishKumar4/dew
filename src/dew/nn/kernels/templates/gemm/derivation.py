@@ -48,7 +48,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`;
     `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
     `hooked`, whether a column-local epilogue's hook computes them, its tile read out a chunk at a time
-    (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring).
+    (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring); `operands(tile)`, the
+    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s.
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -73,11 +74,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       stages the balanced tile busy (`tiled`'s balanced pass); where no count does, the most whose share
       holds a tile, one at least; a wave is all of them. Fewer programs before a smaller tile: programs
       share the multiprocessor's tensor rate (`pricing.SplitWalk.walk`), so a second one adds overlap, never a
-      product's rate, where a halved share halves the tile and doubles its reads a FLOP: an RTX PRO
-      6000's two programs a multiprocessor held 64 x 64 tiles at two stages in their 49 KB shares, its
-      dense products 1.99x (forward), 3.00x (input gradient) and 1.72x (kernel gradient) cuBLASLt's time,
-      geomean of 13 projections at 8192 tokens (M-FS-9, receipts dew-g4-measure2), where the balanced
-      128 x 64 tile stages busy in that share at 32-deep steps (`MmaIssuer.depths`).
+      product's rate, where a halved share halves the tile and doubles its reads a FLOP (M-FS-9: an RTX
+      PRO 6000's 64 x 64 tiles at two programs ran 1.72-3.00x cuBLASLt's time, where 128 x 64 stages busy).
     - Rows: no more than the call's rows rounded up to a role's or, where grouped, half a group's in
       whole roles, at least one role (each group takes a partial tile more, so at half its rows that tile
       adds at most a third of its work).
