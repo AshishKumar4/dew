@@ -209,6 +209,45 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
                                           err_msg=f'{type(given).__name__} {name}')
 
 
+def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
+    """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
+    (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
+    answers 404 is refused."""
+    import functools
+    import http.server
+    import threading
+
+    from PIL import Image
+
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    rgba = np.zeros((16, 24, 4), np.uint8)
+    rgba[4:12, 8:16] = (200, 30, 90, 255)
+    served = tmp_path / 'served'
+    served.mkdir()
+    Image.fromarray(rgba).save(served / 'transparent.png')
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f'http://127.0.0.1:{server.server_address[1]}'
+
+        def read(given):
+            return {name: np.asarray(value) for name, value in
+                    loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
+
+        fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
+        for field, value in fetched.items():
+            np.testing.assert_array_equal(value, stored[field], err_msg=field)
+        with pytest.raises(ValueError):
+            read(f'{url}/missing.png')
+    finally:
+        server.shutdown()
+        thread.join()
+
+
 def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path):
     """An RGBA PNG's transparent pixels take the checkerboard's shades (Inkling 2's alpha rule), and a JPEG
     turned by its EXIF orientation reads upright, whether the image is given through the public processor
