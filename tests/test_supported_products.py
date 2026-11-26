@@ -12,23 +12,28 @@ from kernel_compile import lowered_for
 from test_recurrence_mosaic import resource_operands
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
+from dew.nn.kernels.templates import bundles, product
+from dew.nn.kernels.templates.recurrence import mainloop, template
 
 SIZE = 64
 
 
+def _summed(left, right, held=None):
+    """`left @ right` in float32, each output's terms summed in one order, those `held` (`[M, N, K]`) does not
+    hold dropped where given."""
+    terms = np.asarray(left, np.float32)[:, None, :] * np.asarray(right, np.float32).T[None, :, :]
+    return (terms if held is None else np.where(held, terms, np.float32(0))).sum(axis=2, dtype=np.float32)
+
+
 def _whole(name, left, right):
     del name
-    return np.asarray(left, np.float32) @ np.asarray(right, np.float32)
+    return _summed(left, right)
 
 
 def _of_support(name, left, right, support: product.Support):
-    """The product of `support`'s terms alone, in float32, each term summed as the whole product sums it."""
+    """The product of `support`'s terms alone, every output it does not keep NaN."""
     del name
-    left, right = np.asarray(left, np.float32), np.asarray(right, np.float32)
-    terms = left[:, None, :] * right.T[None, :, :] * (support.left[:, None, :] & support.right.T[None, :, :])
-    out = terms.sum(axis=2, dtype=np.float32)
+    out = _summed(left, right, support.left[:, None, :] & support.right.T[None, :, :])
     return np.where(support.kept, out, np.float32(np.nan))
 
 
@@ -38,16 +43,18 @@ def _system(seed: int, scale: float) -> np.ndarray:
     return np.where(rows > cols, scale * normal((SIZE, SIZE)), 0.0).astype(np.float32)
 
 
-@pytest.mark.parametrize("scale", [0.05, 1.0, 30.0])
+@pytest.mark.parametrize("scale", [0.05, 1.0, 4.0])
 def test_the_doublings_merges_supports_hold_every_term_they_sum(scale):
     """`doubled` issued of its merges' supports alone (`_merges_support`), each product summing only the
     terms its support states and leaving every output it does not keep NaN, is `doubled` of the whole
-    products bit for bit, over systems whose inverses stay small and grow past fp32's least: every term the
-    whole merges sum lies in its support and every output read is one it keeps."""
+    products bit for bit, each output's terms summed in one order, over systems whose inverses stay small
+    and grow to thousands, finite (the contract's: a skipped zero times an infinity is the whole's NaN):
+    every term the whole merges sum lies in its support and every output read is one it keeps."""
     for seed in range(4):
         a = _system(seed, scale)
-        np.testing.assert_array_equal(algebra.doubled(a, _whole, supported=_of_support),
-                                      algebra.doubled(a, _whole))
+        whole = algebra.doubled(a, _whole)
+        assert np.isfinite(whole).all()
+        np.testing.assert_array_equal(algebra.doubled(a, _whole, supported=_of_support), whole)
 
 
 def test_a_support_missing_a_term_changes_the_doubling():
@@ -63,21 +70,19 @@ def test_a_support_missing_a_term_changes_the_doubling():
 
 
 def _solve_call(target: str):
-    """Qwen3.5-27B's gated delta net forward on `target` at its derived tiles: the call, and a function of its
-    operands and their shapes."""
+    """Qwen3.5-27B's gated delta net forward on `target` at its derived tiles: the tiles, and a function of
+    its operands and their shapes."""
     facts = generation.gpu_target(target)
     q, k, v, g, beta, _ = resource_operands("qwen3.5-27b-gdn", jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(q, k, v, g, beta, None, None, bound=1.0)
     with generation.assumed(facts):
         tiles = template.MOSAIC.derived(bound, facts)
-        forward = tiles.forward or tiles
-        with chunk_forward.observed() as calls:
-            jax.eval_shape(lambda *x: template.mosaic_rule(*x, tiles=forward, bound=1.0)[0], q, k, v, g, beta)
+    forward = tiles.forward or tiles
 
     def run(*operands):
         return template.mosaic_rule(*operands, tiles=forward, bound=1.0)[0]
 
-    return calls[0], run, (q, k, v, g, beta)
+    return forward, run, (q, k, v, g, beta)
 
 
 def _tf32_products(target: str) -> int:
@@ -112,18 +117,24 @@ def test_the_doublings_merges_issue_their_supports_instructions_alone(target):
     instructions as its merges' supports hold tiles of the issuer's (`Support.tiles` on `term_tile` and
     TF32's depth, a part pair each), a small share of its whole products' (each level's two merges the
     whole `[C, C]` tile: 544 an RTX PRO 6000's thread at main 01656004b)."""
-    call, _, _ = _solve_call(target)
-    rows, columns = call.family.term_tile
-    pairs = len(product.terms(*(mainloop._merged(call).parts,) * 2))
+    tiles, _, _ = _solve_call(target)
+    family = bundles.of(target, jnp.bfloat16)
+    rows, columns = family.term_tile
+    parts = mainloop.merge_parts(family, jnp.bfloat16, held=1, ranged=False)
+    pairs = len(product.terms(parts, parts))
     supports = [support for width in (2, 4, 8, 16, 32)
-                for support in algebra._merges_support(call.chunk, width)]
+                for support in algebra._merges_support(tiles.chunk, width)]
     expected = pairs * sum(int(support.tiles(rows, columns, 8).sum()) for support in supports)
-    whole = pairs * len(supports) * (call.chunk // rows) * (call.chunk // columns) * (call.chunk // 8)
+    whole = pairs * len(supports) * (tiles.chunk // rows) * (tiles.chunk // columns) * (tiles.chunk // 8)
     assert _tf32_products(target) == expected < whole // 4, (expected, whole)
 
 
-@pytest.mark.skipif(generation.family(jax.devices()[0]) != "mma.sync" if jax.default_backend() == "gpu"
-                    else True, reason="a product of a support issues on mma.sync alone")
+def _on_mma_sync() -> bool:
+    return (jax.default_backend() == "gpu"
+            and generation.family(generation.gpu_target().generation) == "mma.sync")
+
+
+@pytest.mark.skipif(not _on_mma_sync(), reason="a product of a support issues on mma.sync's GPUs alone")
 def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(monkeypatch):
     """On this GPU (an mma.sync part's), Qwen3.5-27B's gated delta net forward with its solve's merges
     issued of their supports alone is the same forward with every merge whole, bit for bit, over finite
@@ -131,8 +142,7 @@ def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(mo
     from dew import _cache
     from dew.nn.kernels.templates import operands
 
-    target = generation.family(jax.devices()[0]) and str(generation.gpu_target())
-    _, run, shapes = _solve_call(target)
+    _, run, shapes = _solve_call(generation.gpu_target().generation)
     draw = np.random.default_rng(0).standard_normal
     given = [jnp.asarray(draw(x.shape), x.dtype) for x in shapes]
     given[3] = -jnp.abs(given[3]) * 0.1
