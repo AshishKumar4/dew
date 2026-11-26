@@ -208,6 +208,63 @@ def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_option
     assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
 
 
+def test_a_written_twin_of_a_cublas_reference_keeps_its_compiler_options():
+    """A library reference compiled with its caller's `compiler_options`
+    (`generation_support.cublas_compiled`'s `CUBLAS`, Triton GEMMs off) keeps them on its twin as written,
+    live (`arm_forms._written_twin`) and as a compile-only GPU's prepare compiles a held arm
+    (`arm_store._arm_compile`): an sm90 FP8 dot stays cuBLASLt's `__cublas$lt$matmul$f8`, where dropping them
+    let XLA's Triton GEMM take it as a split-K fusion (rows 12983, 12984). An arm of no options of its own
+    compiles as written alone."""
+    import generation_support
+    from arm_arithmetic import Unrewritten, Written, as_written
+    from arm_forms import _Paired, _written_twin, own_options
+    from arm_store import _arm_compile, _arm_program
+    from jax.sharding import NamedSharding, PartitionSpec
+    from kernel_compile import _device
+
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    def fp8_dot(lhs, rhs):
+        return jnp.dot(lhs, rhs, precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.float32)
+
+    shapes = (jax.ShapeDtypeStruct((256, 128), jnp.float8_e4m3fn),
+              jax.ShapeDtypeStruct((128, 256), jnp.float8_e4m3fn))
+    drawn = tuple(np.zeros(each.shape, each.dtype) for each in shapes)
+    reference = without_ynn(fp8_dot, compiler_options=generation_support.CUBLAS)
+    def written(twin) -> Written:
+        held = twin.without if isinstance(twin, _Paired) else twin
+        assert isinstance(held, Unrewritten) and isinstance(held.wrapped, Written), held
+        return held.wrapped
+
+    live = written(_written_twin(jax.jit(fp8_dot), reference))
+    plain_live = written(_written_twin(jax.jit(fp8_dot), jax.jit(fp8_dot)))
+    assert own_options(jax.jit(fp8_dot)) is None
+
+    mesh = _device("sm90")
+    placed = tuple(jax.ShapeDtypeStruct(each.shape, each.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
+                   for each in shapes)
+
+    def targets(compiled) -> set[str]:
+        with generation.assumed("sm90"), jax.set_mesh(mesh):
+            executable = compiled.trace(*placed).lower().compile()
+        return {each.target for each in hlo_instructions(executable).values()} - {""}
+
+    def held(arm):
+        # The arm as a prepare holds its twin as written (`arm_store._arm_program`) and compiles it.
+        programs, holding = {}, {}
+        _arm_program(programs, holding, "reference", arm, drawn, reference=True, written=True)
+        [(program, _)] = programs.values()
+        return _arm_compile(jax.jit, as_written("gpu"))(program, out_shardings=None)
+
+    with generation.assumed("sm90"), jax.set_mesh(mesh):
+        live_program, plain_program = live.program("gpu"), plain_live.program("gpu")
+    # The live twin's program and a prepare's held arm compile the reference's cuBLASLt FP8 product; the
+    # same arm of no options of its own takes XLA's own GEMM as written.
+    cublas = {"__cublas$lt$matmul$f8"}
+    assert targets(live_program) == targets(held(reference)) == cublas
+    assert targets(plain_program) == targets(held(jax.jit(fp8_dot))) != cublas
+
+
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
     """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
     CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's

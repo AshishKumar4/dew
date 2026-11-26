@@ -55,6 +55,7 @@ import numpy as np
 import pytest
 import syrk_matrix
 import test_contracts_gemm as contracts_gemm
+import test_declared_cells_memory as declared_cells_memory
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
@@ -193,6 +194,32 @@ def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
+    """A dense bf16 product the template leaves to XLA, no derivative taken, stores bf16 directly
+    (`gemm_xla.direct_dtype`, row 12898): check 1 against XLA's own dense dot (Dense's, the reference's bf16
+    product) from float64 truth, over draws whose rows cancel to below a bf16 ulp of their terms."""
+    from dew.nn.kernels import gemm
+
+    def draw(seed):
+        rng = np.random.default_rng(12898 + seed)
+        x = rng.normal(size=(512, 1024))
+        w = rng.normal(size=(1024, 768)) / np.sqrt(1024)
+        x[:, 512:] = -x[:, :512] * (1 + 2.0 ** -9)  # each row's second half nearly cancels its first
+        w[512:] = w[:512]
+        return x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)
+
+    def dew_fn(x, w):
+        with generation.chosen(grouped_matmul="xla"):
+            return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def plain(x, w, *, wide=None, out=jnp.bfloat16):
+        return jax.lax.dot(x.astype(wide or x.dtype), w.astype(wide or w.dtype),
+                           preferred_element_type=wide).astype(out)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "xla fallback dense bf16 512x1024x768", seeds=8,
+                    truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -200,6 +227,14 @@ def _syrk_and_tail_cells():
                   native=lambda case: {"launch": "syrk", "form": case[1]},
                   fault=lambda case: ("native SYRK upper-triangle mirror store (row 11941)"
                                       if case[1] == "gram" else None)),
+        Cell("an XLA fallback's dense bf16 product holds check 1 against XLA's own dot",
+             an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot, "sm90",
+             fault=CUBLAS_BF16, native={"launch": "xla fallback", "pass": "forward"}),
+        *(Cell(f"an XLA fallback's {product} tangent sums its terms before rounding",
+               functools.partial(TANGENT_SUMS, product),
+               "sm90", fault=CUBLAS_BF16,
+               native={"launch": "xla fallback", "pass": f"{product} tangent"})
+          for product in ("gemm", "gemm_t")),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
@@ -220,6 +255,12 @@ SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as
 
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+TANGENT_SUMS = declared_cells_memory.a_dense_bf16_products_tangent_sums_its_terms_before_rounding
+"""The tangent's cancellation check (tests/test_declared_cells_memory.py), run on CUDA's fallback."""
+
+CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
+"""Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
@@ -531,5 +572,7 @@ def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide(
         label = f"an adapted product's rows gradient into {np.dtype(out_dtype)}"
         gradients.append((scale, out_dtype, ahead_arm(jax.jit(rows_gradient), label)(x, kernel, a, b, dy)))
     for scale, out_dtype, d_x in gradients:
-        assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
-        assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])
+        # Every feature of the cotangent's row 64 (or 256 through the scale), every other row zero: exact.
+        want = np.zeros((8, 16), np.float32)
+        want[0] = 64.0 * (4.0 if scale > 1 else 1.0)
+        np.testing.assert_array_equal(np.asarray(d_x, np.float32), want, err_msg=str(out_dtype))

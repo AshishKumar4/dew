@@ -25,6 +25,8 @@ from arm_forms import (
     _Windowed,
     _written_references,
     _written_role,
+    own_options,
+    with_own_options,
 )
 from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, static, traced
@@ -60,8 +62,10 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
         # may hold it.
         if isinstance(function, Whole):
             return function
+        own = own_options(function) if written is not None else None
+        options = written if own is None else {**written, **own}
         return compile(function if written is None else products_held(function), out_shardings=out_shardings,
-                       compiler_options=written)
+                       compiler_options=options)
 
     return compiled
 
@@ -195,6 +199,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     if isinstance(fn, _Windowed):
         return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
                             reference=reference, written=written)
+    own = own_options(fn) if written else None
     fn = _own_function(fn) if written else fn
     name = named(role, inputs)
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
@@ -238,6 +243,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     # (`again`).
     held_now = {"routes": list(reported), "launches": launched.held()}
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    with_own_options(programs[name][0], own)
     held[name].update(held_now)
     return shapes
 
