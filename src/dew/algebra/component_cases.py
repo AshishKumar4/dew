@@ -284,6 +284,7 @@ def _chunk_level_draw(seed, operands):
     inverse = np.linalg.solve(diagonal + identity, identity).astype(system.dtype)
     return system, inverse, np.asarray(level, np.int32)
 
+
 def _inverse_pullback(lower, cotangent):
     def issue(_, left, right):
         return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION,
@@ -308,7 +309,6 @@ def _inverse_pullback_draw(seed, operands):
         cotangent[:2], cotangent[2:, :2] = 0, 0
         cotangent[1, 0] = 2.0 ** 127
     return lower, cotangent
-
 
 
 def _chunk_weighted(lower, values, strengths):
