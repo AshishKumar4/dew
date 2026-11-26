@@ -355,8 +355,11 @@ def test_generate_runs_an_exchange_wherever_the_decoder_routes_it(rng, site):
     with boxed(decoder_axes(model("global"))):
         placed = place(params, spec, Layout(min_shard=1, tolerance=1.0))
     assert model("exchange").generation_refusal() is None
-    with jax.set_mesh(spec.build()):
-        exchanged = generate(model("exchange"), placed, prompt, 3, key=jax.random.key(1), sampling=greedy)
+    mesh = spec.build()
+    # The key replicated over the mesh the exchange runs on, as the request's other operands are.
+    key = jax.device_put(jax.random.key(1), jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))
+    with jax.set_mesh(mesh):
+        exchanged = generate(model("exchange"), placed, prompt, 3, key=key, sampling=greedy)
         np.testing.assert_array_equal(np.asarray(exchanged.tokens), np.asarray(alone.tokens))
 
         def undefined_after_the_first(state: decoding.StepState, scores):
@@ -364,7 +367,7 @@ def test_generate_runs_an_exchange_wherever_the_decoder_routes_it(rng, site):
 
         refusing = Sampling(temperature=0, logits=(jax.tree_util.Partial(undefined_after_the_first),))
         with pytest.raises(checkify.JaxRuntimeError):
-            generate(model("exchange"), placed, prompt, 3, key=jax.random.key(1), sampling=refusing)
+            generate(model("exchange"), placed, prompt, 3, key=key, sampling=refusing)
 
 
 def copy_batch(rng, size):

@@ -1215,12 +1215,10 @@ class PretrainedPipeline(Pretrained):
 class PretrainedFallback(Pretrained):
     """A causal LM run as transformers' PyTorch forward, lowered to JAX by torchax (tier 3).
 
-    Fine-tune it on next-token prediction like any source, `LMObjective(fallback, seq_len)`: the
-    loader places its weights by the model's tensor-parallel plan (`TorchLayout`), the parts Dew
-    recognizes run through Dew's kernels (`torchax_kernels.kernel_parts`) and the rest of the forward
-    through torchax. One whose attention runs on Dew's generates through
-    Dew's decode cache (`text_generation`, as a native decoder's, which `dew.pipeline` and the
-    server run); one on transformers' own refuses a cache (`TorchCausalLM`).
+    Fine-tune it like any source, `LMObjective(fallback, seq_len)`: weights placed by the model's
+    tensor-parallel plan (`TorchLayout`), the parts Dew knows on Dew's kernels (`kernel_parts`), the rest
+    on torchax. One on Dew's attention generates through Dew's decode cache (`text_generation`, as a
+    native decoder's); one on transformers' own refuses a cache (`TorchCausalLM`).
     """
 
     def pipeline(self):

@@ -209,6 +209,21 @@ def test_raw_images_are_processed_as_transformers_inkling2_processor_processes_t
                                           err_msg=f'{type(given).__name__} {name}')
 
 
+def _media_reader(tmp_path):
+    """The public processor of a bundle with a tokenizer and Inkling 2's processor, and its read of one
+    image (each conditioning field as an array), with a transparent RGBA image `[16, 24]` it reads."""
+    directory = _bundle_with_tokenizer(tmp_path)
+    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
+    loaded = Pretrained.load(directory, dtype='float32')
+    rgba = np.zeros((16, 24, 4), np.uint8)
+    rgba[4:12, 8:16] = (200, 30, 90, 255)
+
+    def read(given):
+        return {name: np.asarray(value) for name, value in
+                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
+    return loaded, rgba, read
+
+
 def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
     """A transparent PNG served over HTTP reads, through the public processor, as its file's path does
     (Inkling 2's alpha rule on the image as served, `bounded_read` its fetch, row 13348); a URL its server
@@ -219,11 +234,7 @@ def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
 
     from PIL import Image
 
-    directory = _bundle_with_tokenizer(tmp_path)
-    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
-    loaded = Pretrained.load(directory, dtype='float32')
-    rgba = np.zeros((16, 24, 4), np.uint8)
-    rgba[4:12, 8:16] = (200, 30, 90, 255)
+    _, rgba, read = _media_reader(tmp_path)
     served = tmp_path / 'served'
     served.mkdir()
     Image.fromarray(rgba).save(served / 'transparent.png')
@@ -233,11 +244,6 @@ def test_an_image_a_url_names_reads_as_its_file_does(tmp_path):
     thread.start()
     try:
         url = f'http://127.0.0.1:{server.server_address[1]}'
-
-        def read(given):
-            return {name: np.asarray(value) for name, value in
-                    loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
-
         fetched, stored = read(f'{url}/transparent.png'), read(served / 'transparent.png')
         for field, value in fetched.items():
             np.testing.assert_array_equal(value, stored[field], err_msg=field)
@@ -261,11 +267,7 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
 
     from dew.interop.inkling_media import InklingProcessor
 
-    directory = _bundle_with_tokenizer(tmp_path)
-    (directory / 'processor_config.json').write_text('{"processor_class": "Inkling2Processor"}')
-    loaded = Pretrained.load(directory, dtype='float32')
-    rgba = np.zeros((16, 24, 4), np.uint8)
-    rgba[4:12, 8:16] = (200, 30, 90, 255)
+    loaded, rgba, read = _media_reader(tmp_path)
     transparent = tmp_path / 'transparent.png'
     Image.fromarray(rgba).save(transparent)
     turned = tmp_path / 'turned.jpg'
@@ -273,10 +275,6 @@ def test_a_transparent_or_turned_image_reads_alike_however_it_is_given(tmp_path)
     exif[0x0112] = 6  # Orientation: the stored image turned a quarter, read upright.
     drawn = np.random.default_rng(13341).integers(0, 256, (16, 40, 3), np.uint8)
     Image.fromarray(drawn).save(turned, exif=exif)
-
-    def read(given):
-        return {name: np.asarray(value) for name, value in
-                loaded.processor('w1 <|image|> w2', images=[given]).conditioning.items()}
 
     for stored, kind in ((transparent, 'png'), (turned, 'jpeg')):
         encoded = stored.read_bytes()
