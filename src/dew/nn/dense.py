@@ -551,13 +551,14 @@ class Dense(_LinearEnvelope, nn.Dense):
 def _windowed(layer: nn.Dense) -> bool:
     """Whether `layer`'s product over a bfloat16 window is the window's (`gemm.window_product`: bfloat16
     operands' exact products summed in fp32, as every precision level and a whole-product algorithm states
-    them, `precision.exact_products`; an algorithm narrowing them, F16_F16_F32's, is the layer's own): its
-    dtype bfloat16
-    under flax's own promotion (`promote_dtype`), which rounds inputs, kernel and bias there, and its
-    product Dense's own, no `dot_general` or `dot_general_cls` of its own."""
+    them, `precision.exact_products`, the layer's and the run's, which the window's dot reads; an algorithm
+    narrowing them, F16_F16_F32's, is the layer's own): its dtype bfloat16 under flax's own promotion
+    (`promote_dtype`), which rounds inputs, kernel and bias there, and its product Dense's own, no
+    `dot_general` or `dot_general_cls` of its own."""
     return (layer.dtype is not None and jnp.dtype(layer.dtype) == jnp.bfloat16
             and layer.promote_dtype is promote_dtype and layer.dot_general is None
-            and layer.dot_general_cls is None and exact_products(layer.precision, jnp.bfloat16))
+            and layer.dot_general_cls is None
+            and all(exact_products(stated, jnp.bfloat16) for stated in (layer.precision, None)))
 
 
 def _members(init, batched: int, flat_shape):

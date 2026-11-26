@@ -296,3 +296,11 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
     plain = jax.jit(layer.apply)(variables, x)
     served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
+    # The run's algorithm narrowing them beneath a layer stating F32_F32_F32: the window's dot would read the
+    # run's, so the layer's own product runs.
+    whole = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
+                  precision=jax.lax.DotAlgorithmPreset.F32_F32_F32)
+    with jax.default_matmul_precision("F16_F16_F32"):
+        plain = jax.jit(whole.apply)(variables, x)
+        served = jax.jit(whole.apply)(quantization.bf16_windows(variables, sites=[""]), x)
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
