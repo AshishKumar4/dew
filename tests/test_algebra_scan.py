@@ -1844,6 +1844,31 @@ def test_a_portable_per_key_transpose_sums_opposite_cotangents_before_they_land(
     np.testing.assert_array_equal(pull(row, keys, decay, cotangent), np.zeros_like(row))
 
 
+@pytest.mark.parametrize("side", ["reader", "state"])
+def test_a_subnormal_read_scale_keeps_the_primal_and_pullback_in_range(side):
+    scale = np.float32(2.0 ** -128)
+    giant = np.float32(2.0 ** 127)
+    reader = np.asarray([giant if side == "reader" else 1], np.float32)
+    state = np.asarray([[giant if side == "state" else 1]], np.float32)
+    cotangent = np.asarray([giant], np.float32)
+
+    def read(q, h):
+        return scan._read(h, q, False, scale)
+
+    def orders(q, h, ct):
+        out, pull = jax.vjp(read, q, h)
+        moved = jax.jvp(lambda q: read(q, h), (q,), (ct,))[1]
+        mixed = jax.jvp(lambda h: jax.grad(lambda x: (read(x, h) * ct).sum())(q), (h,), (ct[:, None],))[1]
+        return out, pull(ct), moved, mixed
+
+    out, (dq, dh), moved, mixed = jax.jit(orders)(reader, state, cotangent)
+    np.testing.assert_array_equal(out, [0.5])
+    np.testing.assert_array_equal(dq, state[:, 0] * 0.5)
+    np.testing.assert_array_equal(dh, reader[:, None] * 0.5)
+    np.testing.assert_array_equal(moved, state[:, 0] * 0.5)
+    np.testing.assert_array_equal(mixed, [2.0 ** 126])
+
+
 DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}
 """The isolated write's size and its three gates (`isolated_draw`): about 2^100 through gates of -39 to -41
 (`e^-120`, past fp32's least normal, row 9660), or about 2^127 through three of -58.375 (`e^-175.125`, past

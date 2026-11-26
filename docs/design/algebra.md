@@ -1283,6 +1283,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
+    A subnormal static readout scale participates in the unlanded product of all factors, including in
+    transpose: multiplying it into one operand first can erase an otherwise normal read.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
