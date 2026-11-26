@@ -37,12 +37,19 @@ def clipped(x: jax.Array, threshold: float, eps: float, scale: jax.Array | None 
     `threshold` (`QKClip`), in at least fp32 and returned in `x`'s dtype."""
     wide = at_least_fp32(x.dtype)
     x_wide = x.astype(wide) if scale is None else x.astype(wide) * scale.astype(wide)
-    squared = jnp.sum(jnp.square(x_wide), axis=-1, keepdims=True)
+    # The head over its largest magnitude `m`, whose squares sum in range where a finite head's own
+    # overflow (1e20's square is fp32's infinity, row 13137): the clip is `unit * min(threshold / (|unit| +
+    # eps / m), m)`, `x * min(threshold / (|x| + eps), 1)` for any `m` > 0, so `m` is held constant
+    # (`stop_gradient`) and the derivative is the clip's own; a zero head divides by 1.
+    largest = jax.lax.stop_gradient(jnp.max(jnp.abs(x_wide), axis=-1, keepdims=True))
+    divisor = jnp.where(largest > 0, largest, 1)
+    unit = x_wide / divisor
+    squared = jnp.sum(jnp.square(unit), axis=-1, keepdims=True)
     # A zero head's length is zero, its derivative there taken as the clip's (none: it lies in the clip's
     # constant region), where the square root's would be infinite times zero.
     held = squared > 0
     length = jnp.where(held, jnp.sqrt(jnp.where(held, squared, 1)), 0)
-    return (x_wide * jnp.minimum(threshold / (length + eps), 1)).astype(x.dtype)
+    return (unit * jnp.minimum(threshold / (length + eps / divisor), divisor)).astype(x.dtype)
 
 
 def log_ratio_scale(positions, floor: float, scale: float, *, dtype: DTypeLike) -> jax.Array:

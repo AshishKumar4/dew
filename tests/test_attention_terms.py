@@ -123,6 +123,21 @@ def test_a_zero_head_passes_its_gradient_through_the_clip():
     assert bool(jnp.all(jnp.isfinite(gradient)))
 
 
+def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold():
+    """Heads of one fp32 component 1e20 or -3e38, whose squares overflow fp32, clip to length 8 along it,
+    `[8, 0, ...]` and `[-8, 0, ...]` bit for bit, with a finite gradient, where their summed squares'
+    infinity clipped them to zero (row 13137)."""
+    from dew.nn.attention_terms import clipped
+
+    x = jnp.zeros((2, 8), jnp.float32).at[0, 0].set(1e20).at[1, 3].set(-3e38)
+    out, pull = jax.vjp(lambda x: clipped(x, 8.0, 1e-6), x)
+    expected = np.zeros((2, 8), np.float32)
+    expected[0, 0], expected[1, 3] = 8, -8
+    np.testing.assert_array_equal(np.asarray(out), expected)
+    (gradient,) = pull(jnp.arange(16, dtype=jnp.float32).reshape(2, 8))
+    assert bool(jnp.all(jnp.isfinite(gradient)))
+
+
 @attending("reference")
 def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_counts():
     """A layer scored over a causal pairwise mask, its keys' visibility places stated from 100 on
