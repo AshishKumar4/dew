@@ -1147,37 +1147,62 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
     assert (cell in attention_kernels.DECLARED) == declared
 
 
-def test_an_a100s_16_bit_call_infers_on_flashattention_and_trains_on_the_template():
-    """A bf16 causal call on an A100 in its declared cell ('flash_inference', M-NA-44's receipt: the forward
-    of FlashAttention-2 holds check 1 and its backward does not): a call no derivative is taken of launches
-    FlashAttention's forward and no template kernel, a differentiated one the template's kernels, its
-    forward and derivatives, and no FlashAttention launch (row 13288)."""
+def _launches(fn, *operands) -> set[str]:
+    """The kernels `fn`'s program launches, by the launches themselves: FlashAttention's FFI targets
+    ('flash'), the template's Pallas launches ('template', `report.named`'s `attention_` kernels), and any
+    other native launch by its name."""
     from reference_error import equations
 
-    from dew.nn import attention_kernels, programs
-    from dew.nn.attention import attention_case
+    from dew.nn import programs
+
+    found = set()
+    for equation in equations(jax.make_jaxpr(fn)(*operands).jaxpr, prune=programs.opaque):
+        if equation.primitive.name == "ffi_call" and "flash" in str(equation.params.get("target_name")):
+            found.add("flash")
+        elif programs.opaque(equation):
+            name = str(equation.params.get("name") or equation.params.get("name_and_src_info"))
+            found.add("template" if name.startswith("attention_") else name)
+    return found
+
+
+def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
+    """A bf16 causal call named onto 'flash_inference' on an A100: undifferentiated, it launches
+    FlashAttention's forward alone where this host lowers it for the target
+    (`attention_kernels.flash_lowered`) and is refused, named (`selection.Unlowerable`, its kernel 'flash'), where it does not, never another
+    kernel nor an import error (head review); differentiated, the template's kernels alone, forward and
+    derivatives, which lower for the target on any host (row 13288)."""
+    from dew.nn import attention_kernels
+    from dew.nn.kernels import selection
 
     query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
 
     def call(query, key, value):
-        return scaled_dot_product_attention(query, key, value, causal=True)
-
-    def launched(fn) -> set[str]:
-        # FlashAttention's FFI targets and the template's Pallas launches, by the program's equations.
-        found = set()
-        for equation in equations(jax.make_jaxpr(fn)(query, key, key).jaxpr, prune=programs.opaque):
-            if equation.primitive.name == "ffi_call" and "flash" in str(equation.params.get("target_name")):
-                found.add("flash")
-            elif programs.opaque(equation):
-                found.add("template")
-        return found
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="flash_inference")
 
     with generation.assumed("sm80"):
-        assert attention_case(query, key, causal=True).cell in attention_kernels.DECLARED
-        inferred = launched(call)
-        trained = launched(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)))
-    assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
+        if attention_kernels.flash_lowered():
+            assert _launches(call, query, key, key) == {"flash"}
+        else:
+            with pytest.raises(selection.Unlowerable) as refused:
+                jax.eval_shape(call, query, key, key)
+            assert refused.value.kernel == "flash"
+        trained = _launches(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
+                            query, key, key)
+    assert trained == {"template"}, trained
+
+
+def test_an_a100s_declared_16_bit_cell_is_flash_inference():
+    """The A100's 16-bit cell declares 'flash_inference' (`attention_kernels.DECLARED`: FlashAttention-2's
+    backward fails check 1 at its receipt's shape, M-NA-44), its receipt's call in that cell."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        cell = attention_case(query, key, causal=True).cell
+    assert attention_kernels.DECLARED[cell][0] is attention_kernels.FLASH_INFERENCE
 
 
 @pytest.mark.parametrize(("rows", "heads", "kv_heads", "dtype", "causal", "declared"), [

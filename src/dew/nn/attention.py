@@ -40,6 +40,7 @@ from .attention_kernels import (
     flash_target,
     primal_alone,
     reverse_only,
+    unlowered,
 )
 from .attention_masks import (
     combined_attention_mask,
@@ -77,7 +78,7 @@ from .documents import (
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
-from .kernels.selection import forced, select, selected
+from .kernels.selection import Unlowerable, forced, select, selected
 from .kernels.templates import attention as template
 from .precision import (
     EXACT_FLOAT32,
@@ -1280,6 +1281,11 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             # and derivatives its second's (`attention_kernels.primal_alone`).
             def on(implementation):
                 def run(query, key, value, bias, sinks, *extra):
+                    # Each arm lowered as its own kernel is where it runs: one this host lowers for no
+                    # GPU of the target refuses its program, named (`attention_kernels.unlowered`), as the
+                    # kernel named alone does, the other arm's program compiled ahead whatever it.
+                    if (why := unlowered(implementation)) is not None:
+                        raise Unlowerable(generation.Choice.ATTENTION, implementation, why)
                     return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation,
                                 **operands_of(extra))
                 return run
