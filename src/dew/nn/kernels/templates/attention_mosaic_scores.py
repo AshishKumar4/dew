@@ -212,11 +212,11 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
         if walk.scaled:
             # Retire prescaled Q registers before scoping dP and free S before allocating dP so peak
             # registers hold even at the deepest ring (0 spills at 231.6 KB SMEM), while overlapping dV
-            # with dP and `_score_cotangents` via `product_with(..., pending=1)` (rows 5272, 11998).
+            # with dP and `_score_cotangents` via `product_with`, dV's group in flight (rows 5272, 11998).
             s = family.registers_product(by_power(family.left_of(q_slot), walk.spec.prescale), held)
             weights, slopes, seen = prepare_weights(s)
             if after_weights is not None and not whole_operands:
-                _, dp = family.product_with(do_slot, values_t, shape, after_weights, pending=1)
+                _, dp = family.product_with(do_slot, values_t, shape, after_weights)
             else:
                 dp = family.product(do_slot, values_t, shape)
         elif stages_weights:

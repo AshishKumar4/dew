@@ -85,13 +85,16 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
-            value = between()
+            with mosaic.committed_here() as committed:
+                value = between()
+            # The groups `between` committed run on past the product's read (`committed_here`).
+            pending = committed()
             return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))

@@ -1315,6 +1315,67 @@ def _negated(a, b, *, path: str, interpret: bool):
                          interpret=interpret, name="negated")(a, b)
 
 
+def _read_past(a, b, *, between: str):
+    """`a @ b` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup) read through `product_with` while
+    `between` issues products into two accumulators the program scoped before it: "two" issues both in the
+    product's own trace, "branch" one under a branch on the program's index, "scope" one within a scope of
+    its own."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.FED
+    shape = (LANDED, LANDED)
+
+    def body(a_gmem, b_gmem, out_gmem):
+        def scoped(a_smem, b_smem, out_smem, first, second):
+            swizzling.copied(a_gmem, a_smem)
+            swizzling.copied(b_gmem, b_smem)
+            plgpu.commit_smem()
+            mosaic.synced(interpret=False)
+
+            def issued():
+                if between == "two":
+                    family.products(first, a_smem, b_smem)
+                    family.products(second, a_smem, b_smem)
+                elif between == "branch":
+                    @pl.when(jax.lax.axis_index("programs") == 0)
+                    def _():
+                        family.products(first, a_smem, b_smem)
+                else:
+                    pl.run_scoped(lambda third: family.products(third, a_smem, b_smem),
+                                  plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
+            _, value = family.product_with(a_smem, b_smem, shape, issued)
+            plgpu.store(out_smem, value, optimized=False)
+            plgpu.commit_smem()
+            mosaic.synced(interpret=False)
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
+                              copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
+        accumulators = (plgpu.WGMMAAccumulatorRef(shape, jnp.float32),) * 2
+        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                      swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=False, name="read_past")(a, b)
+
+
+@pytest.mark.parametrize(("between", "in_flight"), [("two", 2), ("branch", 0), ("scope", 0)])
+def test_a_products_read_leaves_in_flight_the_groups_every_run_commits_past_it(between, in_flight):
+    """Traced for an H100: a product read through `product_with` (`Issuer.product_with`) leaves in flight the
+    groups its overlapped work committed in its own trace, two issued there, and none of one a branch
+    commits, which a run may skip, nor of one a scope of its own commits: its read's wait counts them
+    (`mosaic.committed_here`), where callers declared a count, which a branch that committed fewer read the
+    product unfinished by (row 10851)."""
+    a = b = np.zeros((LANDED, LANDED), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(functools.partial(_read_past, between=between))(a, b)
+    waits = [equation.params["wait_n"] for equation in equations(traced.jaxpr)
+             if equation.primitive.name == "wgmma_accumulator_deref"]
+    assert max(waits, default=0) == in_flight, waits
+
+
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
     """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
     on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0

@@ -169,10 +169,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
-        if pending:
-            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
         return between(), _product(lhs, rhs)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
