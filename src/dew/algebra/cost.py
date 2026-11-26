@@ -40,6 +40,16 @@ def target(named: str | None = None) -> generation.GpuTarget:
     return generation.gpu_target(named)
 
 
+@functools.lru_cache
+def pricing_key(facts: generation.GpuTarget) -> generation.GpuTarget:
+    """A target's Algebra prices, not the allocation capacity used to fit a launch.
+
+    Keep the rates, architecture and every other target field; only the memory budget is
+    irrelevant to work, scheduling, and extraction. Do not change the assumed launch target.
+    """
+    return facts if facts.memory is None else dataclasses.replace(facts, memory=None)
+
+
 def shape_of(graph: EGraph, term, held: dict | None = None) -> tuple[int, ...] | None:
     """The shape of the value `term`, an e-class the extractor supplied, stands for (`rules.shape`), kept in
     `held` (by `terms.key`) where given: an extraction asks each e-class's shape of every node reading it,

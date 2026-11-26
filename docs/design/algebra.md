@@ -799,6 +799,10 @@ def cheapest(graph, root, model, *, exact=False, checked=False): ...  # extract.
 def extracted(graph, root, model): ...          # the exact extractor (a MILP), the oracle under `checked`
 ```
 
+Cached forms share a target's pricing facts (`cost.pricing_key`), excluding only the allocator's memory
+capacity. Bandwidth, on-chip limits, and every other hardware fact remain part of the price key. The
+actual capacity still governs which compiler and training plans fit; it is not changed while tracing.
+
 - A cost model gives a node's work alone. Extraction composes it over the chosen DAG: bytes and FLOPs add up
   with each shared e-class counted once, and a span is the largest any chosen node states (`extract.Level`'s
   peak), extraction's composition being additive; a derivation that prices a path's length composes it itself

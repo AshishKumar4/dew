@@ -702,10 +702,10 @@ def _form(extents: linear_scan.Extents, corrected: bool,
     """The chunk's form at its extents, derived by the identities of affine scans within `saturation`'s limits
     and extracted by the
     work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for, which
-    prices the forms (`cost.target`, `cost.product_work`): a derivation under one target is no other's. Its
+    prices the forms (`cost.pricing_key`, `cost.product_work`): different prices require a new derivation. Its
     products are priced at the precision they run at (`_portable`'s, IEEE float32 whatever the configured
     one), so the configured precision is no fact of the form."""
-    return _derived_form(extents, corrected, cost.target(), ALGEBRA.value.checked, saturation)
+    return _derived_form(extents, corrected, cost.pricing_key(cost.target()), ALGEBRA.value.checked, saturation)
 
 
 @functools.cache
