@@ -34,7 +34,8 @@ from dew.nn.kernels import (
     grouped_triton,
     tuning,
 )
-from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tail as tail_of, tiling
+from dew.nn.kernels.templates import tail as tail_of
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.moe import expert_projection
