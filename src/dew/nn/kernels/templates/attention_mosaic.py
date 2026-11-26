@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import tokamax
 
 from dew._devices import deterministic_ops_requested
-from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
@@ -767,7 +766,13 @@ class MosaicForward(_Mainloop[Tiles]):
         which traces none) prices, and chooses, as its live call does. A heuristic proxy of the live call's
         price, not that price less a common cost: a score hook's work scales with each candidate's entries
         alike, but its absence can change the surrogate's own schedule (an output hook's rewalk in place, a
-        transcendental hook's approximate math)."""
+        transcendental hook's approximate math). None with `issued` where `target` states no issue
+        interval: its walk's latency unpriced, its price its bytes' alone, level over every slice count (a
+        G4's decode planned 2 slices, 16 of its 188 multiprocessors, 281 of a step's 288 us,
+        M-NA-35-decodec-g4)."""
+        multiprocessor = target.architecture.multiprocessor
+        if issued and (multiprocessor is None or multiprocessor.issue_interval is None):
+            return None
         hooks = ("score_params", "output_params", "query_params")
         names = ("query", "key", "value", "start", "end", "query_ids", "key_ids", "score_params",
                  "output_params", "initial", "drop", "table", "sources", "scales", "query_params")
@@ -786,19 +791,14 @@ class MosaicForward(_Mainloop[Tiles]):
             f"priced_{type(self).__name__}_l{report._digest(identity)}_c{report._digest(repr(config))}")
         with generation.assumed(target), report.launching(self, ba, config):
             traced = jax.make_jaxpr(priced)(*operands)
-        kernels = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive in programs.NATIVE_KERNELS]
-        if not kernels:
+        # Its launches as their emission counted them (`emission.launched_kernels`, the one discovery): None
+        # where one is uncounted or under control flow, its price unknown.
+        if not (found := emission.launched_kernels(traced.jaxpr)):
             return None
-        total = 0.0
         resident = self.resident(ba, config, target)
-        for kernel in kernels:
-            work = emission.work_of(kernel)
-            if work is None:
-                return None
-            warps = (emission.warps_of(kernel) or 0.0) if issued else 0.0
-            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident,
-                                         warps=warps)
-        return total
+        return sum(cost.launch_seconds(launched.work, emission.launch_programs(kernel), target,
+                                       resident=resident, warps=launched.warps if issued else 0.0)
+                   for kernel, launched in found)
 
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,
                           target: generation.GpuTarget, launch: Callable[[Tiles], Tiles | None] | None = None
@@ -1960,16 +1960,16 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def price_config(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
                      ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
-        over `emission.work_of`, each kernel at its own launch's residency, `_launch_models`), traced under
-        `report.launching`: whether any of their work lies at a rate the target states none of, a
+        over `emission.launched_kernels`, each kernel at its own launch's residency, `_launch_models`), traced
+        under `report.launching`: whether any of their work lies at a rate the target states none of, a
         multiprocessor's or the whole device's (`cost.units`' unpriced; its memory's bandwidth, which the
         first prices infinite), or a step of no latency (`cost.spanned`'s), or a launch's registers' model
-        passes its cap (spills no rate prices), and the seconds; None where its launches' work is uncounted.
-        Every fact read is `target`'s, whatever GPU is in effect where it is asked. As its hookless call (its
-        hook fields none): a hook a choice prices takes no parameters, its work the same a score in either
-        form, and a launch keyed by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as
-        its live call does; one whose hook takes parameters (which holds no fused launch, so no choice)
-        None."""
+        passes its cap (spills no rate prices), and the seconds; None where a launch's work is uncounted, a
+        launch lies under a loop or a branch, or it traces none. Every fact read is `target`'s, whatever GPU
+        is in effect where it is asked. As its hookless call (its hook fields none): a hook a choice prices
+        takes no parameters, its work the same a score in either form, and a launch keyed by its hooks'
+        fingerprints (`KernelOp.keyed`, which traces none) prices as its live call does; one whose hook takes
+        parameters (which holds no fused launch, so no choice) None."""
         if ba.arguments["score_params"]:
             return None
         names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
@@ -1987,9 +1987,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         with generation.assumed(target):
             with report.launching(self, ba, config):
                 traced = jax.make_jaxpr(priced)(*operands)
-            kernels = [eq for eq in programs.equations(traced.jaxpr)
-                       if eq.primitive in programs.NATIVE_KERNELS]
-            if not kernels:
+            # Its launches as their emission counted them (`emission.launched_kernels`): None where one is
+            # uncounted or under control flow.
+            if not (found := emission.launched_kernels(traced.jaxpr)):
                 return None
             budgeted = bundle_of(config, ba.arguments["query"].dtype, target=target).budgets_registers
             launches = self._launch_models(ba, config, target) if budgeted else ()
@@ -2001,10 +2001,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             rates = [cost.rates(target, device=device) for device in (False, True)]
             latency = cost.step_latency(target, device=False)
             total = 0.0
-            for kernel in kernels:
-                work = emission.work_of(kernel)
-                if work is None:
-                    return None
+            for kernel, launched in found:
+                work = launched.work
                 dq = assembled.kernel_of(kernel.params.get("name") or "")[0].startswith(DQ_KERNEL)
                 total += cost.launch_seconds(work, emission.launch_programs(kernel), target,
                                              resident=residency[dq])

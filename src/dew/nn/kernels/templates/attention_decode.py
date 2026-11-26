@@ -251,7 +251,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     priced = None if chosen_by_caller else _priced_slices(
         query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
-        initial=hooks is not None and hooks.initial is not None)
+        initial=hooks is not None and hooks.initial is not None,
+        single_launch=(single_hooks, jnp.float32 if defer_output else None))
     if priced is not None:
         slices, tile = priced
         if slices == 1:
@@ -287,9 +288,10 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
                    counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
-                   scales, chosen: Walk, in_key: bool, initial: bool
+                   scales, chosen: Walk, in_key: bool, initial: bool, single_launch: tuple
                    ) -> tuple[int, attention_mosaic.Tiles] | None:
-    """The slice count of `counts` (one beside them, at the derived `single` tile) and key tile whose step
+    """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
+    and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
     hiding each other's issue intervals) and, past one slice, the merge of its slices (`merged.launch_work`,
     its passes' waited loads: the state form's merge, a proxy of a finished step's, its cast, its heads'
@@ -301,8 +303,11 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     (FS-5274-LAT1)."""
     bound = functools.partial(_bound, query, key, value, spans, hooks, scale=scale, table=table,
                               sources=sources, scales=scales, chosen=chosen, in_key=in_key)
-    # The single tile priced only where it launches at these spans too.
-    op, ba = bound(splits=1)
+    # The single tile priced as its one-slice launch runs (`single_launch`: its hooks, its initial state
+    # among them, and the dtype it writes, `plan`'s), only where it launches at these spans too.
+    single_hooks, single_out = single_launch
+    op, ba = _stream_op(query, key, value, spans, single_hooks, scale=scale, table=table, sources=sources,
+                        out_dtype=single_out, scales=scales, chosen=chosen, in_key=in_key)
     alone = None if op._launchable(ba, single, target) is None else op.price_config(ba, single, target,
                                                                                      issued=True)
     if alone is None:
