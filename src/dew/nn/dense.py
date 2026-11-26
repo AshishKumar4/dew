@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.linen.dtypes import promote_dtype
 from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
@@ -536,17 +537,24 @@ class Dense(_LinearEnvelope, nn.Dense):
             summed = ternary_weight_product(rows, frozen, out_dtype=jnp.float32)
         else:
             summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
+        if bias is not None and isinstance(matrix, Bf16Window) and jnp.dtype(bias.dtype) != jnp.float32:
+            # A window's product as the layer's own (`_windowed`): a bias stored narrow is added to the
+            # product rounded to the layer's dtype (`_biased`), one stored fp32 rounded once with it
+            # (`_rounds_once`), as below.
+            out = biased(summed.astype(dtype), jnp.asarray(bias, dtype))
+            return jnp.reshape(out, (*jnp.shape(inputs)[:-1], self.features))
         if bias is not None:
             summed = summed + jnp.asarray(bias, jnp.float32)
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
 
 
 def _windowed(layer: nn.Dense) -> bool:
-    """Whether `layer`'s product over a bfloat16 window is the window's (`gemm.window_product`: its inputs,
-    kernel and bias promoted to bfloat16, the sums fp32 and the bias added before the one rounding): its
-    dtype bfloat16, so flax's promotion rounds all three there, and its product Dense's own, no
-    `dot_general` or `dot_general_cls` of its own."""
-    return (layer.dtype is not None and jnp.dtype(layer.dtype) == jnp.bfloat16 and layer.dot_general is None
+    """Whether `layer`'s product over a bfloat16 window is the window's (`gemm.window_product`: bfloat16
+    operands' exact products summed in fp32, at any precision a 16-bit product states): its dtype bfloat16
+    under flax's own promotion (`promote_dtype`), which rounds inputs, kernel and bias there, and its
+    product Dense's own, no `dot_general` or `dot_general_cls` of its own."""
+    return (layer.dtype is not None and jnp.dtype(layer.dtype) == jnp.bfloat16
+            and layer.promote_dtype is promote_dtype and layer.dot_general is None
             and layer.dot_general_cls is None)
 
 

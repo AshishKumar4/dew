@@ -1,7 +1,7 @@
 """A frozen bfloat16 matrix's lossless 13-bit window's product (`window_product`, row 5387): its words and
 meta halves (`formats.Bf16Window`) streamed into the Mosaic GEMM mainloop and each stage decoded in place
 into the bfloat16 weights it stores, bit for bit (`MosaicWindowPackedGmm`, `packed.weight_format('window')`),
-where a receipt finds that faster than the decoded matrix's GEMM; else the decoded matrix's product."""
+where a receipt finds that faster than the decoded matrix's GEMM; else the decoded matrix's XLA dot."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     dense, or `[groups, depth, width]` grouped by `group_sizes`): `lhs` rounded to bfloat16, each product of
     a decoded weight (its stored bits again) exact, summed in fp32 and rounded once to `out_dtype` (`lhs`'s
     where None); decoded a stage at a time in the GEMM mainloop where the selector takes it (`WINDOW`), else
-    the decoded matrix's GEMM. Frozen: its gradient is the rows' alone."""
+    the decoded matrix's XLA dot (`gemm.decoded_dot`). Frozen: its gradient is the rows' alone."""
     if not isinstance(window.form, Tracer):
         window.checked()
     dense = group_sizes is None
@@ -67,7 +67,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
         operands = (words, sizes, meta)
     else:
-        product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
+        product = gemm.decoded_dot
         operands = (window.decoded(), group_sizes)
     summed = gemm._interpreted(product, interpret_on_cpu, rows, *operands)
     return summed.astype(lhs.dtype if out_dtype is None else out_dtype)

@@ -2,6 +2,7 @@
 again decoded, a group past its escapes refused by its site's name, and a Dense served its window as its
 kernel (`quantization.bf16_windows`), its variables' kernels back bitwise (`decoded_bf16_windows`)."""
 
+import contextlib
 import functools
 
 import jax
@@ -251,17 +252,32 @@ def test_a_dense_of_its_own_promotion_served_its_window_computes_as_its_kernel()
 
 def test_a_window_products_rows_cotangent_keeps_a_cancellation():
     """A window of `+1` and `-1` columns, its product's cotangent `[1 + 2**-12, 1]` pulled back on the
-    template's route and XLA's at the highest precision: the rows' cotangent is `2**-12` at each depth, the
+    template's route, XLA's and the one the selector takes at the highest precision: the rows' cotangent is
+    `2**-12` at each depth, the
     cotangent's difference read whole (a product rounding it to TF32's 10 bits cancels it to zero)."""
     weights = np.zeros((256, 64), jnp.bfloat16)
     weights[:, 0], weights[:, 1] = 1.0, -1.0
     window = Bf16Window.of(weights)
     rows = jnp.ones((2, 256), jnp.bfloat16)
     cotangent = jnp.zeros((2, 64), jnp.float32).at[:, 0].set(1 + 2.0 ** -12).at[:, 1].set(1.0)
-    for kernel in ("mosaic", "xla"):
-        with (jax.default_matmul_precision("highest"), generation.assumed("sm90"),
-              generation.chosen(grouped_matmul=kernel)):
+    for kernel in ("mosaic", "xla", None):
+        chosen = contextlib.nullcontext() if kernel is None else generation.chosen(grouped_matmul=kernel)
+        with jax.default_matmul_precision("highest"), generation.assumed("sm90"), chosen:
             [got] = jax.vjp(lambda rows: gemm.window_product(rows, window, out_dtype=jnp.float32,
                                                              interpret_on_cpu=True), rows)[1](cotangent)
         np.testing.assert_array_equal(np.asarray(got, np.float32), np.full((2, 256), 2.0 ** -12, np.float32),
                                       err_msg=kernel)
+
+
+def test_a_bf16_dense_with_a_narrow_bias_served_its_window_rounds_as_its_kernel():
+    """A bfloat16 Dense whose bias is stored bfloat16 (`2**-8`) over a kernel column `[1, 2**-8, 0, ...]`
+    and inputs of ones: its product rounds to bfloat16 before the bias adds, as over its kernel (two ties to
+    even, `1`), not once with it (`1 + 2**-7`), served its window too, bit for bit."""
+    kernel = np.zeros((128, 64), jnp.bfloat16)
+    kernel[0, 0], kernel[1, 0] = 1.0, 2.0 ** -8
+    layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+    variables = {"params": {"kernel": jnp.asarray(kernel), "bias": jnp.full((64,), 2.0 ** -8, jnp.bfloat16)}}
+    x = jnp.ones((2, 128), jnp.bfloat16)
+    plain = jax.jit(layer.apply)(variables, x)
+    served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))

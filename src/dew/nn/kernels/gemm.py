@@ -843,9 +843,7 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
                       trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
 
     def portable(r: jax.Array, w: jax.Array, s: jax.Array, *rest) -> jax.Array:
-        matrices = decoded(w, *rest)
-        return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
-                else xla_products.placed_ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
+        return decoded_dot(r, decoded(w, *rest), None if dense else s)
 
     def forward(r: jax.Array, w: jax.Array, s: jax.Array, *rest):
         with xla_products.interpreted_context(interpret):
@@ -854,9 +852,9 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
     def backward(saved, operands, cotangent, live):
         del saved
         r, w, s, *rest = operands
-        matrices = decoded(w, *rest)
         with xla_products.interpreted_context(interpret):
             if finite:
+                matrices = decoded(w, *rest)
                 parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
                 d_rows = functools.reduce(jnp.add, [
                     gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
@@ -873,6 +871,15 @@ def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
     decoded = (matrix.unscaled(jnp.bfloat16) if isinstance(matrix, TernaryWeights)
                else matrix.decoded())
     return decoded, group_sizes
+
+
+def decoded_dot(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None) -> jax.Array:
+    """A packed matrix's decoded product as XLA's own dot: bf16 `rows` times its decoded `matrix` (dense, or
+    grouped by `group_sizes`: XLA's ragged dot), summed in fp32, differentiated by XLA's transpose at the
+    configured precision (no nested `gemm`, whose native transpose of an fp32 cotangent may round it)."""
+    return (jax.lax.dot(rows, matrix, preferred_element_type=jnp.float32) if group_sizes is None
+            else xla_products.placed_ragged_dot(rows, matrix, group_sizes,
+                                                preferred_element_type=jnp.float32))
 
 
 def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
