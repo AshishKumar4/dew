@@ -1104,6 +1104,25 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
     finally:
         _CTX_HOOK_MODE.reset(token)
     assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
+    # A merge's plan is held by its hook as the epilogue calls it: its 16-bit gate widened to fp32 (a bf16 key
+    # held the gated hook's plan for the subtracting one, its exponentials unpriced; a hook holding its gate
+    # to fp32 raised as it was priced).
+
+    def strict(o, g):
+        assert g.dtype == jnp.float32, g.dtype
+        return o * g
+
+    def gating(o, g):
+        return o * jax.nn.sigmoid(g) if g.dtype == jnp.float32 else o + g
+
+    def subtracting(o, g):
+        return o - g if g.dtype == jnp.float32 else o + g
+
+    worked = {hook: merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+                                       output_mod=hook, output_kinds=(template.Kind.OUTPUT,),
+                                       output_specs=(g_s,))
+              for hook in (strict, gating, subtracting)}
+    assert worked[gating].exponentials > worked[subtracting].exponentials, worked
     # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
     # array is planned once for its program, as one that holds none is.
     captured = jnp.ones((), jnp.float32)

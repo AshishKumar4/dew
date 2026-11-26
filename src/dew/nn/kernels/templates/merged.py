@@ -48,15 +48,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     report,
 )
-from dew.nn.kernels.templates.attention import (
-    Initial,
-    Kind,
-    Param,
-    hook_program,
-    kept_dtype,
-    output_hooked,
-    ungrouped_rows,
-)
+from dew.nn.kernels.templates.attention import Initial, Kind, Param, kept_dtype, output_hooked, ungrouped_rows
 
 _OUTPUT_KINDS = (Kind.HEAD, Kind.QUERY, Kind.OUTPUT)
 
@@ -419,17 +411,43 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                    output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[int, cost.Work]:
     """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
     held through `_cache.holding` (the one owner of what a process derives once and the facts it read, row
-    12420) by the call's shapes, the target, the output hook as what it computes (`hook_program`) and the
-    context a kernel of Dew's is chosen in (`fusion.choice_context`), the latest `PLANNED_HELD`."""
+    12420) by the call's shapes, the target, the output hook as its epilogue computes it at each candidate
+    block (`_epilogue_programs`) and the context a kernel of Dew's is chosen in (`fusion.choice_context`), the
+    latest `PLANNED_HELD`."""
     from dew.algebra import fusion
 
-    hooked = hook_program("output_mod", output_mod, output_kinds,
-                          tuple(str(spec.dtype) for spec in output_specs), width=width)
+    total_slices = padded.shape[1] + int(has_initial)
+    blocks = _candidate_blocks(width, total_slices)
+    hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks,
+                                mosaic=_uses_mosaic(target, output_mod))
     key = (units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
            output_kinds, output_specs, hooked, fusion.choice_context())
     return _cache.holding(_PLANNED, key, lambda: _compute_planned_block(
         units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
         output_mod, output_kinds, output_specs), PLANNED_HELD)
+
+
+def _epilogue_programs(output_mod: Callable | None, output_kinds: tuple[Kind, ...],
+                       output_specs: tuple[jax.ShapeDtypeStruct, ...], blocks: tuple[int, ...], *,
+                       mosaic: bool) -> tuple[str, ...] | None:
+    """What an output hook computes in a merge's epilogue at each of its candidate `blocks` of channels
+    (`tuning.program`), as the launch calls it: Mosaic GPU's `[2, max(block, 64)]` fragment
+    (`merged_mosaic._mgpu_load_output_param`), Pallas Triton's `[1, block]` row (`_launch`), the
+    parameters' 16-bit floats widened to fp32 in both. None where the merge has no hook."""
+    if output_mod is None:
+        return None
+    rows = 2 if mosaic else 1
+
+    def operand(kind: Kind, spec: jax.ShapeDtypeStruct, tile: int) -> jax.ShapeDtypeStruct:
+        dtype = jnp.float32 if jnp.issubdtype(spec.dtype, jnp.floating) else spec.dtype
+        return jax.ShapeDtypeStruct({Kind.HEAD: (), Kind.QUERY: (rows, 1), Kind.OUTPUT: (rows, tile)}[kind],
+                                    dtype)
+
+    tiles = sorted({max(block, 64) if mosaic else block for block in blocks})
+    return tuple(tuning.program(output_mod, jax.ShapeDtypeStruct((rows, tile), jnp.float32),
+                                *(operand(kind, spec, tile)
+                                  for kind, spec in zip(output_kinds, output_specs, strict=True)))
+                 for tile in tiles)
 
 
 _PLANNED: collections.OrderedDict = collections.OrderedDict()

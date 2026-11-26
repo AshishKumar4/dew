@@ -530,8 +530,8 @@ def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, m
 def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others_ahead(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (its node an H100), a site whose Dew arm calls cuDNN's attention, which a
     prepare's compile for any GPU of the generation refuses (`selection.Unlowerable`: a cuDNN plan holds to
-    its GPU's model), writes that arm to compile at its run, its refusal its reason, and compiles the site's
-    XLA reference ahead: the refusal aborted the site's every arm, and an A100 tier named its cuDNN cells'
+    its GPU's model), writes that arm alone to compile at its run and compiles the site's XLA reference
+    ahead: the refusal aborted the site's every arm, and an A100 tier named its cuDNN cells'
     dew, reference and written arms unprepared, "compiled none of its arms" (MAINGPU-2b1b88c39)."""
     import jax
     import jax.numpy as jnp
@@ -556,9 +556,10 @@ def test_a_parts_prepare_writes_a_cudnn_arm_at_run_and_compiles_its_sites_others
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
         assert_as_exact(cudnn, xla, draw, label, seeds=8)
     store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
-    why = store.at_run(_unlowered_arm(armed(label), arm_role("dew", cudnn, label)))
-    assert why is not None and "kernel 'cudnn' does not lower on this host" in why, why
-    assert store.holds(armed(label)) and store.at_run(armed(label)) is None
+    arms = armed(label)
+    assert store.at_run(_unlowered_arm(arms, arm_role("dew", cudnn, label))) is not None
+    assert store.at_run(_unlowered_arm(arms, arm_role("reference", xla, label))) is None
+    assert store.holds(arms) and store.at_run(arms) is None
 
 
 def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, monkeypatch):

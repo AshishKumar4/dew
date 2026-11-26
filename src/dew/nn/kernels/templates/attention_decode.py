@@ -325,10 +325,16 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
                 return None
             prices[count, tile] = walk + _merge_seconds(query, value, spans, tile, count, target=target,
                                                         initial=initial)
-    # The least price, then the fewer slices, then the larger key tile: a walk at the device's bytes prices
-    # every key tile alike, and at one count the larger walked faster (a GH200's B8 over 4096 keys at width
-    # 64 on 4 slices, K128 30.9 against K64 37.2 us, M-NA-27c-gh200: half the steps' waits and issue).
-    return min(prices, key=lambda chosen_plan: (prices[chosen_plan], chosen_plan[0], -chosen_plan[1].block_k))
+    return least_plan(prices)
+
+
+def least_plan(prices: Mapping[tuple[int, attention_mosaic.Tiles], float]
+               ) -> tuple[int, attention_mosaic.Tiles]:
+    """The plan, a slice count and key tile, of the least of `prices`, then of the fewer slices, then of the
+    larger key tile: a walk at the device's bytes prices every key tile alike, and at one count the larger
+    walked faster (a GH200's B8 over 4096 keys at width 64 on 4 slices, K128 30.9 against K64 37.2 us,
+    M-NA-27c-gh200: half the steps' waits and issue)."""
+    return min(prices, key=lambda plan: (prices[plan], plan[0], -plan[1].block_k))
 
 
 def _bound(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None, table, sources,
