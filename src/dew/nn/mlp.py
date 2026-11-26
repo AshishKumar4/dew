@@ -44,6 +44,10 @@ from .precision import at_least_fp32, compensated_sum, float32_dot_general, scal
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
+GATED_HIDDEN = "gated_mlp_hidden"
+"""The checkpoint name of a gated MLP's hidden product (`GatedMLP._gated_down`), which no remat policy
+saves: its reverse mode forms it again from the gate and up projections' outputs it holds already."""
+
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
 
@@ -276,7 +280,7 @@ class GatedMLP(nn.Module):
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
                 gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
-                return self._down(packed_gated_product(activation, axes=axes)(gate_up), train)
+                return self._gated_down(packed_gated_product(activation, axes=axes), (gate_up,), train)
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -290,7 +294,7 @@ class GatedMLP(nn.Module):
         gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        return self._down(gated_product(activation, axes=axes)(gate, up), train)
+        return self._gated_down(gated_product(activation, axes=axes), (gate, up), train)
 
     def _fusable(self) -> bool:
         """Whether the gated product and its three projections may run fused (`dew.nn.gated_mlp`), where the
@@ -368,6 +372,18 @@ class GatedMLP(nn.Module):
         if out is None:
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
+
+    def _gated_down(self, product: Callable, halves: tuple, train: bool):
+        """The down projection of the gated product of `halves` (the gate's and the up projection's
+        outputs, or both packed), the product formed again from them in reverse mode, never held beside
+        them: a `[tokens, hidden]` residual a layer less, a third of an MLP's (Qwen3.5-4B's 18 GiB at 8 x
+        4096 tokens unrematerialized). Its value and every gradient are the product's and the projection's
+        as they are, bitwise: the same functions, the product's recomputation its forward's."""
+        def run(module, *held):
+            return module._down(checkpoint_name(product(*held), GATED_HIDDEN), train)
+
+        policy = jax.checkpoint_policies.save_anything_except_these_names(GATED_HIDDEN)
+        return nn.remat(run, policy=policy)(self, *halves)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:

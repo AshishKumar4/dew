@@ -3,6 +3,7 @@ interpreted as a GPU on a CPU (its training step compiled within resources and u
 tests/test_gemm_formed.py), and its selector's call site in `GatedMLP`."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -15,6 +16,7 @@ from test_gemm_formed import FEATURES, HIDDEN, _draw
 from dew.nn import activations
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import generation
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import LowPrecision, Numerics, projection_role
 
 SEEDS = 8
@@ -605,3 +607,43 @@ def test_wide_gated_mlp_selector_handoffs_and_remat_recompute(generation_name):
     with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
         assert_as_exact(with_gradients(wide_recomputed), jax.jit(apart), _draw,
                         f"wide swiglu recomputed on {generation_name}", seeds=SEEDS, truth_fn=truth)
+
+
+class _HoldingItsHidden(GatedMLP):
+    """A gated MLP whose down projection reads its gated product as a value it holds for reverse mode (the
+    path before `_gated_down`): the reference its value and gradients are bitwise."""
+
+    def _gated_down(self, product, halves, train):
+        return self._down(product(*halves), train)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["apart", "packed"])
+def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed):
+    """A gated MLP of bf16 projections, its gate and up apart or packed (`[..., 2, H]`), unrematerialized:
+    its value and every gradient bitwise the path that held its hidden product, and its reverse mode holds
+    no `[tokens, hidden]` value but the gate's and the up projection's (`GatedMLP._gated_down`: 18 GiB at
+    Qwen3.5-4B's 8 x 4096 tokens), the product formed again from them."""
+    tokens, hidden, features = 24, 48, 16
+    x = jnp.asarray(np.random.default_rng(13460).normal(size=(tokens, features)), jnp.bfloat16)
+    layer, before = (cls(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, packed=packed)
+                     for cls in (GatedMLP, _HoldingItsHidden))
+    params = layer.init(jax.random.key(0), x)
+
+    def run(module):
+        def loss(variables, rows):
+            return jnp.sum(module.apply(variables, rows).astype(jnp.float32) ** 2)
+        return jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(params, x)
+
+    (got, (d_params, d_x)), (want, (want_params, want_x)) = run(layer), run(before)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(d_x), np.asarray(want_x))
+    for leaf, wanted in zip(jax.tree.leaves(d_params), jax.tree.leaves(want_params), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(wanted))
+
+    def held(module):
+        residuals = jax.ad_checkpoint.saved_residuals(lambda v, r: module.apply(v, r), params, x)
+        return [aval for aval, _ in residuals if math.prod(aval.shape) == tokens * hidden]
+
+    # Apart, the gate's and the up projection's outputs; packed, their one `[tokens, 2, hidden]` output.
+    assert len(held(layer)) == (0 if packed else 2), held(layer)
+    assert len(held(before)) == len(held(layer)) + 1, held(before)
