@@ -127,7 +127,8 @@ def _lightnet(q, k, v, state):
 
 
 def _slot_attention(q, k, v, s, keys_memory, values_memory, g=None):
-    return slots.slot_attention(q, k, v, s, g, state=(keys_memory, values_memory))
+    out, finals = slots.slot_attention(q, k, v, s, g, state=(keys_memory, values_memory))
+    return out, finals[:2]
 
 
 @pytest.mark.parametrize('dtype', [np.float32, jnp.bfloat16], ids=['fp32', 'bf16'])
@@ -155,68 +156,153 @@ def test_slot_attention_is_as_exact_as_its_recurrences_token_by_token(dtype, for
                     truth_fn=jax.jit(differentiated(slots_by_token, count)))
 
 
+def _equal(found, expected) -> bool:
+    """Whether two trees' leaves are equal bit for bit (a normalizer's pair among them)."""
+    pairs = zip(jax.tree.leaves(found), jax.tree.leaves(expected), strict=True)
+    return all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in pairs)
+
+
+NONE = (-jnp.inf, 0.0)
+"""A normalizer of no writes (`additive_gate`'s pair)."""
+
+
 def test_the_additive_gate_starts_each_row_at_its_own_write():
     """`slots.additive_gate` with no normalizer entering: a row's first token is its own normalizer, so its
     weight is exactly one and its log decay exactly zero (fla's convention: no decay before a first write),
-    and a normalizer entering at `-inf` is none."""
+    and a normalizer entering as none is none."""
     x = jnp.asarray(np.random.default_rng(6127).standard_normal((2, 40, 3)), jnp.float32)
-    weights, log_decay, last = slots.additive_gate(x)
+    found = slots.additive_gate(x)
+    weights, log_decay, _ = found
     assert np.all(np.asarray(weights[:, 0]) == 1.0) and np.all(np.asarray(log_decay[:, 0]) == 0.0)
-    entered = slots.additive_gate(x, jnp.full((2, 3), -jnp.inf))
-    assert all(np.array_equal(np.asarray(a), np.asarray(b))
-               for a, b in zip(entered, (weights, log_decay, last), strict=True))
+    assert _equal(slots.additive_gate(x, tuple(jnp.full((2, 3), part) for part in NONE)), found)
 
 
 def test_the_additive_gate_takes_absent_writes_with_zero_gradients():
     """`slots.additive_gate` of absent writes (`-inf` logits) from a normalizer entering at zero: their
-    weights and log decays zero, the normalizer the one entering, and its gradient one to the normalizer
-    entering and zero to every absent write (a NaN where its scan combined two absent writes before the
-    seed)."""
+    weights and log decays zero, the normalizer the one entering, and its log's gradient one to the
+    normalizer's largest write entering and zero to every absent write (a NaN where its scan combined two
+    absent writes before the seed)."""
     x = jnp.full((1, 2, 1), -jnp.inf, jnp.float32)
-    entering = jnp.zeros((1, 1), jnp.float32)
+    entering = (jnp.zeros((1, 1), jnp.float32), jnp.zeros((1, 1), jnp.float32))
     weights, log_decay, last = slots.additive_gate(x, entering)
     assert np.all(np.asarray(weights) == 0.0) and np.all(np.asarray(log_decay) == 0.0)
-    assert np.all(np.asarray(last) == 0.0)
-    normalizer = jax.grad(lambda x, z: slots.additive_gate(x, z)[2].sum(), argnums=(0, 1))
-    d_x, d_entering = normalizer(x, entering)
+    assert _equal(last, entering)
+
+    def logged(x, largest):
+        return slots.log_normalizer(slots.additive_gate(x, (largest, entering[1]))[2]).sum()
+
+    d_x, d_entering = jax.grad(logged, argnums=(0, 1))(x, entering[0])
     assert np.all(np.asarray(d_x) == 0.0) and np.all(np.asarray(d_entering) == 1.0)
 
 
 def test_a_call_of_no_tokens_returns_its_entering_states():
     """The gate and both compositions over no tokens: empty outputs, the normalizer and memories entering."""
-    entering = jnp.full((ROWS, HEADS, KEYS), 0.5, jnp.float32)
+    entering = (jnp.full((ROWS, HEADS, KEYS), 0.5, jnp.float32), jnp.full((ROWS, HEADS, KEYS), 0.125))
     weights, log_decay, last = slots.additive_gate(jnp.zeros((ROWS, 0, HEADS, KEYS)), entering)
-    assert weights.shape == log_decay.shape == (ROWS, 0, HEADS, KEYS) and np.all(np.asarray(last) == 0.5)
+    assert weights.shape == log_decay.shape == (ROWS, 0, HEADS, KEYS) and _equal(last, entering)
     empty = {width: jnp.zeros((ROWS, 0, HEADS, width), jnp.float32) for width in (KEYS, SLOTS, VALUES)}
     memory = jnp.ones((ROWS, HEADS, KEYS, VALUES), jnp.float32)
-    out, (final, normalizer) = slots.lightnet(empty[KEYS], empty[KEYS], empty[VALUES], state=memory,
-                                              normalizer=entering)
-    assert out.shape == (ROWS, 0, HEADS, VALUES) and np.array_equal(np.asarray(final), np.asarray(memory))
-    assert np.array_equal(np.asarray(normalizer), np.asarray(entering))
-    memories = (jnp.ones((ROWS, HEADS, KEYS, SLOTS)), jnp.ones((ROWS, HEADS, SLOTS, VALUES)))
+    out, finals = slots.lightnet(empty[KEYS], empty[KEYS], empty[VALUES], state=memory, normalizer=entering)
+    assert out.shape == (ROWS, 0, HEADS, VALUES) and _equal(finals, (memory, entering))
+    memories = (jnp.ones((ROWS, HEADS, KEYS, SLOTS)), jnp.ones((ROWS, HEADS, SLOTS, VALUES)),
+                (jnp.full((ROWS, HEADS, SLOTS), 0.25), jnp.full((ROWS, HEADS, SLOTS), 0.5)))
     out, finals = slots.slot_attention(empty[KEYS], empty[KEYS], empty[VALUES], empty[SLOTS], state=memories)
-    assert out.shape == (ROWS, 0, HEADS, VALUES)
-    assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(finals, memories, strict=True))
+    assert out.shape == (ROWS, 0, HEADS, VALUES) and _equal(finals, memories)
 
 
 def test_the_additive_gate_takes_an_unseeded_absent_write_with_no_gradient():
-    """An absent write (`-inf`) with no normalizer entering: the normalizer stays absent (`-inf`), the write
-    weighs zero, and the normalizer's gradient into it is zero (a both-absent combine a constant, not the
-    larger of its two)."""
+    """An absent write (`-inf`) with no normalizer entering: the normalizer stays none, the write weighs
+    zero, and each of the normalizer's leaves' gradient into it is zero (a both-absent combine a constant
+    in both leaves: `maximum`'s derivative sent half to each absent write, a review's P0 of b29675646)."""
     x = jnp.full((1, 2, 1), -jnp.inf, jnp.float32)
     weights, log_decay, last = slots.additive_gate(x)
     assert np.all(np.asarray(weights) == 0.0) and np.all(np.asarray(log_decay) == 0.0)
-    assert np.all(np.asarray(last) == -np.inf)
-    d_x = jax.grad(lambda x: slots.additive_gate(x)[2].sum())(x)
-    assert np.all(np.asarray(d_x) == 0.0)
+    assert _equal(last, tuple(jnp.full((1, 1), part) for part in NONE))
+    for leaf in range(2):
+        d_x = jax.grad(lambda x, leaf=leaf: slots.additive_gate(x)[2][leaf].sum())(x)
+        assert np.all(np.asarray(d_x) == 0.0), leaf
+
+
+def test_the_additive_gate_carries_a_nan_write_on():
+    """Unseeded writes `[NaN, 0]`: the NaN is no absent write (only `-inf` is), so the second token's weight
+    and the normalizer returned are NaN, not a fresh start's one and a finite carry (a review's P0 of
+    12a1ac57c, its combine taking a NaN largest for an empty prefix)."""
+    x = jnp.asarray([[[np.nan], [0.0]]], jnp.float32)
+    weights, _, (largest, mass) = slots.additive_gate(x)
+    assert np.isnan(np.asarray(weights)[0, 1, 0])
+    assert np.isnan(np.asarray(largest)[0, 0]) or np.isnan(np.asarray(mass)[0, 0])
 
 
 def test_the_additive_gate_keeps_a_faint_increment():
-    """Unseeded writes `[0, -20]`: the normalizer `log(1 + e^-20)`, about `2.061e-9`, and the second token's
-    log decay its negation, each exactly as `jnp.logaddexp` (its `log1p`) forms them, where `log` of the
-    rounded sum `1 + e^-20` reads zero."""
+    """Unseeded writes `[0, -20]`: the normalizer's relative mass `log(1 + e^-20)`, about `2.061e-9`, and the
+    second token's log decay its negation, each exactly as `jnp.logaddexp` (its `log1p`) forms them, where
+    `log` of the rounded sum `1 + e^-20` reads zero."""
     x = jnp.asarray([[[0.0], [-20.0]]], jnp.float32)
-    _, log_decay, last = slots.additive_gate(x)
+    _, log_decay, (largest, mass) = slots.additive_gate(x)
     expected = np.asarray(jnp.logaddexp(jnp.float32(0.0), jnp.float32(-20.0)))
-    assert expected > 0.0
-    assert np.asarray(last)[0, 0] == expected and np.asarray(log_decay)[0, 1, 0] == -expected
+    assert expected > 0.0 and np.asarray(largest)[0, 0] == 0.0
+    assert np.asarray(mass)[0, 0] == expected and np.asarray(log_decay)[0, 1, 0] == -expected
+
+
+def test_an_abc_call_split_in_two_is_the_call_whole():
+    """ABC's call of two tokens split into calls of one, each entering the state the first returns (its
+    memories and its slots' normalizer), is the call whole bit for bit: two slots of zero logits (a softmax
+    over them a half each), values 2 and 4 in both channels, so the second token weighs a half and the
+    first decays by a half, both reading 3. Its normalizer dropped, the second call's gate started afresh
+    and read 6 (a review's P0 of 1a60ffc17)."""
+    q = jnp.ones((1, 2, 1, 2), jnp.float32)
+    s = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    v = jnp.asarray([[2.0, 2.0], [4.0, 4.0]], jnp.float32).reshape(1, 2, 1, 2)
+    whole, _ = slots.slot_attention(q, q, v, s)
+    first, state = slots.slot_attention(q[:, :1], q[:, :1], v[:, :1], s[:, :1])
+    second, _ = slots.slot_attention(q[:, 1:], q[:, 1:], v[:, 1:], s[:, 1:], state=state)
+    assert np.array_equal(np.asarray(whole), np.asarray(jnp.concatenate([first, second], axis=1)))
+    assert np.all(np.asarray(whole)[0, 1] == 3.0)
+
+
+def _split(rule, operands: tuple, at: int):
+    """`rule`'s reads of `operands` (time on axis 1) in two calls, split at token `at`, the second entering
+    the state the first returns."""
+    first, state = rule(*(x[:, :at] for x in operands))
+    second, _ = rule(*(x[:, at:] for x in operands), state=state)
+    return jnp.concatenate([first, second], axis=1)
+
+
+def test_the_slot_forms_are_their_writes_shifted_by_a_common_large_offset_split_or_whole():
+    """Integer writes and their copies shifted by 2^24's neighbourhood (2^20 for drawn integers, each shift
+    exact in fp32; three equal writes at 2^24 itself), through the gate, LightNet and ABC, whole and split
+    into a call of two tokens and one: the shifted reads are the unshifted's bit for bit, split or whole.
+    The gate's relative masses keep the increments a normalizer in absolute scale rounds off: two equal
+    writes at 2^24 weighed one where they weigh a half (a review's P0 of 1a60ffc17), and returned as one
+    number between calls, `2^24 + log 2` rounded to `2^24`, a third token weighed a half where it weighs a
+    third, ABC reading about 4.5 where it reads 4 (one of 969895771)."""
+    drawn = np.random.default_rng(13500).integers(-4, 4, (ROWS, LENGTH, HEADS, KEYS))
+    small = jnp.asarray(drawn, jnp.float32)
+    shifted = small + 2.0 ** 20
+    assert _equal(slots.additive_gate(small)[:2], slots.additive_gate(shifted)[:2])
+    weights, _, _ = slots.additive_gate(jnp.full((1, 2, 1), 2.0 ** 24, jnp.float32))
+    assert np.asarray(weights)[0, 1, 0] == 0.5
+    q, v = (jnp.asarray(np.random.default_rng(seed).standard_normal((ROWS, LENGTH, HEADS, width)),
+                        jnp.float32) for seed, width in ((1, KEYS), (2, VALUES)))
+
+    def lightnet(q, k, v, state=None):
+        memory, normalizer = (None, None) if state is None else state
+        return slots.lightnet(q, k, v, state=memory, normalizer=normalizer)
+
+    for read in (lambda k: lightnet(q, k, v)[0], lambda k: _split(lightnet, (q, k, v), LENGTH // 2)):
+        assert _equal(read(small), read(shifted))
+    ones = jnp.ones((1, 3, 1, 2), jnp.float32)
+    values = jnp.asarray([[2.0, 2.0], [4.0, 4.0], [6.0, 6.0]], jnp.float32).reshape(1, 3, 1, 2)
+
+    def abc(q, k, v, s, state=None):
+        return slots.slot_attention(q, k, v, s, state=state)
+
+    for logit in (0.0, 2.0 ** 24):
+        logits = jnp.full((1, 3, 1, 2), logit, jnp.float32)
+        found = [abc(ones, ones, values, logits)[0], _split(abc, (ones, ones, values, logits), 2)]
+        if logit == 0.0:
+            unshifted = found
+        else:
+            assert all(_equal(a, b) for a, b in zip(found, unshifted, strict=True))
+
+
