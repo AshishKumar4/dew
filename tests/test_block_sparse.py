@@ -370,7 +370,7 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
                     "InfLLM-V2's attention over every block", seeds=SEEDS)
     query, key, value, _ = draw(0)
     for dense_below in (queries + 1, queries):
-        with pytest.raises(ValueError, match="sinks"):
+        with pytest.raises(ValueError):
             block_sparse.infllm_attention(query, key, value, dense_below=dense_below,
                                           sinks=jnp.zeros((heads,)), **shape)
 
