@@ -1194,35 +1194,42 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
         Summary('summary/board', {'val/value': 1.0}, better='lower')
 
 
-def test_a_resume_under_other_numerics_is_refused_and_under_its_own_resumes(tmp_path):
-    """A trainer built directly over a directory whose run traced its programs under other numerics
-    (`TrainerAdvanced.numerics`: its unpinned products at "highest", the resume's at "default"), which
-    change no tree and no loss scale, refuses to resume, as a configured run's precision refuses it; the
-    numerics that trained it resume (row 13537)."""
-    from dew.data import Memory
-    from dew.data.pipeline import Pipeline
-    from dew.nn.backbones.causal_transformer import CausalTransformer
+def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records_for_inference(tmp_path):
+    """A trainer built directly over a directory whose run traced its programs under other numerics than
+    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its outputs
+    in bfloat16, or none given, JAX's own), which change no tree and no loss scale, refuses to resume, an
+    objective that records nothing for inference (no task) among them, as the run's training record holds
+    them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537)."""
+    import dataclasses
+
+    from affine_run import Regression, dataset
+    from flax import linen as nn
+
     from dew.nn.precision import DTYPE_PRESETS, Numerics
-    from dew.objectives.lm import LMObjective
     from dew.training import TrainerAdvanced
 
-    rows = (np.arange(16 * 7, dtype=np.int32) % 13).reshape(-1, 7)
+    class Stated(Regression):
+        """The affine regression, its layer stating the float32 it computes in."""
 
-    def lm_data():
-        return Pipeline(Memory({"text": rows})).repeat().batch(8)
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Dense(2, dtype=jnp.float32, param_dtype=jnp.float32)
 
-    def lm(matmul: str) -> Trainer:
-        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=12, dtype="float32")
-        numerics = Numerics(DTYPE_PRESETS["32-true"], matmul=matmul)
-        return Trainer(LMObjective(model, seq_len=6), optax.sgd(0.1), key=jax.random.key(0),
+    full = DTYPE_PRESETS["32-true"]
+
+    def trainer(numerics: Numerics | None) -> Trainer:
+        return Trainer(Stated(), optax.sgd(0.1), key=jax.random.key(0),
                        checkpoints=Checkpoints(str(tmp_path / "run")),
                        advanced=TrainerAdvanced(numerics=numerics))
 
-    lm("highest").fit(lm_data(), steps=1)
-    with pytest.raises(ValueError):
-        lm("default").fit(lm_data(), steps=2)
-    assert int(lm("highest").fit(lm_data(), steps=2).step) == 2
+    assert Stated().inference_record() is None
+    trained = Numerics(full, matmul="highest")
+    trainer(trained).fit(dataset(), steps=1)
+    for other in (Numerics(full, matmul="default"),
+                  Numerics(dataclasses.replace(full, output="bfloat16"), matmul="highest"), None):
+        with pytest.raises(ValueError):
+            trainer(other).fit(dataset(), steps=2)
+    assert int(trainer(trained).fit(dataset(), steps=2).step) == 2
 
 
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):

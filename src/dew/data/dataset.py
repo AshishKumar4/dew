@@ -530,10 +530,13 @@ class Loading:
         start), so the read is sized for the step it can least wait on."""
         if self.workers != "auto":
             return self
+        host = Host.current() if self.host is None else self.host
+        cpus = self._worker_cpus(host)
         reading, sampled, seconds = iter(records), [], []
-        # One batch where no measure would size a worker (`selects_none`): its bytes size the read-ahead
-        # alone, the rest's time sizing nothing (row 13540: nine decoded at startup and made again).
-        for _ in range(1 if self.selects_none(batches) else SAMPLED_BATCHES):
+        # One batch where no measure would size a worker (a run of no stated length, no CPU a worker may
+        # take): its bytes size the read-ahead alone, the rest's times sizing nothing (row 13540: nine
+        # decoded at startup and made again).
+        for _ in range(1 if batches is None or not cpus else SAMPLED_BATCHES):
             began = time.perf_counter()
             batch = next(reading, None)
             if batch is None:
@@ -545,11 +548,9 @@ class Loading:
         # Their mean, which a step making several batches at once is paid in, as the run pays it.
         python = statistics.fmean(seconds[1:] or seconds)
         slowest = max(seconds[1:] or seconds)
-        host = self._host()
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
-        cpus = self._worker_cpus(host)
         read_buffer = min(self.read_buffer, budget // read)
         ahead = WORKER_BUFFER if self.worker_buffer is None else self.worker_buffer
         held = WORKER_PROCESS_BYTES + ahead * batch + read_buffer * read
@@ -573,16 +574,6 @@ class Loading:
                       budget=budget, batches=batches)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer, worker_buffer=ahead,
                                    sized=sized)
-
-    def selects_none(self, batches: int | None) -> bool:
-        """Whether automatic loading would read in the process whatever its sample of batches measured
-        (`resolved`): over a run whose length nothing states (`batches` None), or on a host with no CPU a
-        worker may take (one CPU, or `max_workers` 0). Its read then samples one batch, whose bytes size
-        its read-ahead, not the `SAMPLED_BATCHES` whose times size workers, each made again by the run."""
-        return batches is None or self._worker_cpus(self._host()) == 0
-
-    def _host(self) -> Host:
-        return Host.current() if self.host is None else self.host
 
     def _worker_cpus(self, host: Host) -> int:
         """The CPUs workers may take of `host`: none of one CPU, where a worker adds a process and no

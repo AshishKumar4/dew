@@ -342,7 +342,7 @@ class _Spread:
 def test_automatic_loading_samples_one_batch_where_it_could_choose_no_worker():
     """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`), which its
     read's explanation states it was sized from; where it would read in the process whatever the sample
-    measured (`Loading.selects_none`: a run whose length nothing states, one CPU, `max_workers` 0) it
+    measured (a run whose length nothing states, one CPU, `max_workers` 0) it
     samples the one batch whose bytes size its read-ahead (row 13540: nine decoded at startup and made
     again), where a run of a stated length on a host of CPUs samples `SAMPLED_BATCHES`."""
     from dew.data.dataset import SAMPLED_BATCHES
