@@ -9,6 +9,7 @@ covering each row's keys.
 
 import dataclasses
 import itertools
+import math
 
 import jax
 import jax.numpy as jnp
