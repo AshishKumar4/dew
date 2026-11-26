@@ -53,7 +53,7 @@ def rung_records() -> Path | None:
     return _cache.kept_beside('dew-rungs', variable='DEW_RUNG_RECORDS', configured=True)
 
 
-RECORD_VERSION = 3
+RECORD_VERSION = 4
 """The identity a record names (`rung_key`); a record of another version is another run's."""
 
 
@@ -78,7 +78,8 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     try:
         traced = stated([list(modules), step, structure,
                          [[jax.typeof(leaf), leaf.sharding if isinstance(leaf, jax.Array) else None]
-                          for leaf in leaves], trace_context()], "the step a rung record names")
+                          for leaf in leaves], trace_context(), _configured(settings)],
+                        "the step a rung record names")
     except Unestablished as unstated:
         _log.info("the step keeps no rung record, its rung decided as it compiles: %s", unstated)
         return None
@@ -100,6 +101,36 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
                           jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(flags)}
+
+
+def _configured(settings: StepSettings) -> dict[str, object]:
+    """What a run's `settings` state of its step by value, beside the code `_code` states: each setting that
+    is no function, mesh or module (its loss scale, whether it skips a step not finite, its layout, its
+    microbatches, its Newton-Schulz group...), its objective's own configuration (`objective_configured`:
+    its head's chunks and tile, a sequence length) and the optimizer config it was built from. Two runs of
+    one shape and code whose steps compute otherwise by a setting name two records (row 13168's audit: a
+    run skipping a step not finite, or scoring its head in other chunks, took another's rung)."""
+    from dew.optim import OptimConfig
+
+    apart = ("objective", "built_optimizer", "device_mesh", "state_mesh", "step", "inspection",
+             "optimizer_source")
+    held = {field.name: getattr(settings, field.name) for field in dataclasses.fields(settings)
+            if field.name not in apart}
+    source = settings.optimizer_source
+    return {**held, "objective": objective_configured(settings.objective),
+            "optimizer": source if isinstance(source, OptimConfig) else None}
+
+
+def objective_configured(objective: object) -> dict[str, object]:
+    """An objective's own configuration, the plain values it holds by name (numbers, strings, flags and
+    tuples of them; none private), which its modules (`Objective.program_key`) do not state."""
+    def plain(value: object) -> bool:
+        if isinstance(value, (tuple, list)):
+            return all(plain(each) for each in value)
+        return value is None or isinstance(value, (bool, int, float, str))
+
+    return {name: value for name, value in sorted(vars(objective).items())
+            if not name.startswith("_") and plain(value)}
 
 
 def _code(settings: StepSettings, modules: Sequence[object], step: Callable[..., StepFn] | None) -> list[str]:

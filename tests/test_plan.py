@@ -2036,6 +2036,28 @@ def test_a_rung_key_states_its_modules_configuration_not_their_display():
     assert first is not None and first == key(Displayed(4, held=jax.random.key(0))) != second
 
 
+def test_a_rung_key_states_the_settings_a_step_computes_by():
+    """A rung record's key states what a run's settings and objective hold by value: a run skipping a step
+    not finite, or scoring its head in other chunks, names another record than its twin of one shape and code,
+    and the same settings the same record (the 2026-11-26 audit of `rungs.py`: they named one, so one took the
+    other's rung)."""
+    from dew.training.rungs import rung_key
+
+    def key(trainer):
+        state, _, _ = trainer.place()
+        return rung_key(trainer.objective.program_key(), (state, BATCH), [1, 2], trainer.device_mesh,
+                        settings=trainer._settings())
+
+    plain = lm()
+    skipping = lm()
+    skipping.skip_nonfinite = True
+    chunked = lm()
+    chunked.objective.head_chunks = 8
+    first = key(plain)
+    assert first is not None and first == key(lm())
+    assert key(skipping) != first and key(chunked) != first
+
+
 def test_a_rung_key_holds_a_flag_given_twice_by_its_order(monkeypatch):
     """A flag given twice is read by its last value, so a rung record's key states the flags in their order:
     two orders of one flag's two values compute apart and key apart (row 10797: sorted, they were one key),
