@@ -2211,10 +2211,9 @@ class _Build:
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0, threads=0,
                                                                      read_buffer=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-        if loading.workers == "auto" and (not (self.global_order or self.in_order)
-                                          or loading.selects_none(batches)):
+        if loading.workers == "auto" and not (self.global_order or self.in_order):
             # A read whose rows are its workers' count's (`in_order`) reads in the process, so its rows and
-            # its position are one host's and another's alike; so does one no sample would size workers for.
+            # its position are one host's and another's alike.
             loading = dataclasses.replace(loading, workers=0)
         if loading.workers == "auto":
             # A global order is read by the batch, as an elastic read is, a batch's count of its inputs a

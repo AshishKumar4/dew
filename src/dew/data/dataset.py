@@ -531,7 +531,9 @@ class Loading:
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []
-        for _ in range(SAMPLED_BATCHES):
+        # One batch where no measure would size a worker (`selects_none`): its bytes size the read-ahead
+        # alone, the rest's time sizing nothing (row 13540: nine decoded at startup and made again).
+        for _ in range(1 if self.selects_none(batches) else SAMPLED_BATCHES):
             began = time.perf_counter()
             batch = next(reading, None)
             if batch is None:
@@ -575,8 +577,8 @@ class Loading:
     def selects_none(self, batches: int | None) -> bool:
         """Whether automatic loading would read in the process whatever its sample of batches measured
         (`resolved`): over a run whose length nothing states (`batches` None), or on a host with no CPU a
-        worker may take (one CPU, or `max_workers` 0). Its read then opens no sample, whose batches (up to
-        `SAMPLED_BATCHES`, decoded and held together) the run's own read makes again."""
+        worker may take (one CPU, or `max_workers` 0). Its read then samples one batch, whose bytes size
+        its read-ahead, not the `SAMPLED_BATCHES` whose times size workers, each made again by the run."""
         return batches is None or self._worker_cpus(self._host()) == 0
 
     def _host(self) -> Host:

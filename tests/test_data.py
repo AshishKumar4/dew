@@ -343,15 +343,17 @@ def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
     """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`), which its
     read's explanation states it was sized from; where it would read in the process whatever the sample
     measured (`Loading.selects_none`: a run whose length nothing states, one CPU, `max_workers` 0) it
-    samples none (row 13540: up to nine batches decoded at startup and made again), where a run of a stated
-    length on a host of CPUs samples its batches."""
+    samples the one batch whose bytes size its read-ahead (row 13540: nine decoded at startup and made
+    again), where a run of a stated length on a host of CPUs samples `SAMPLED_BATCHES`."""
+    from dew.data.dataset import SAMPLED_BATCHES
+
     chain = Pipeline(Memory(_Indexed(30))).repeat().batch(4)
     one_cpu = Host(1, 2**34, worker_start=1.0)
-    for host, steps, most, sampled in ((TWO_CPUS, None, None, False), (one_cpu, 10**6, None, False),
-                                       (TWO_CPUS, 10**6, 0, False), (TWO_CPUS, 10**6, None, True)):
+    for host, steps, most, sampled in ((TWO_CPUS, None, None, 1), (one_cpu, 10**6, None, 1),
+                                       (TWO_CPUS, 10**6, 0, 1), (TWO_CPUS, 10**6, None, SAMPLED_BATCHES)):
         loading = Loading(workers="auto", host=host, max_workers=most)
         explained = compile(chain, seed=5, steps=steps, loading=loading).explain()
-        assert ("sampled:" in explained) == sampled, (host, steps, most, explained)
+        assert f"from {sampled} sampled:" in explained, (host, steps, most, explained)
 
 
 def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
@@ -1537,19 +1539,15 @@ def test_a_validation_split_needs_no_training_records():
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     """Token ids of varying length are the usual cause, and grain's own
     message names the batch structure rather than what to change. Automatic
-    loading sizing workers samples batches to size them by, so compiling a
-    run of a stated length on a host of CPUs refuses them; where it sizes none
-    (a run of no stated length, `Loading.selects_none`) and with loading set by
-    hand, the first batch does."""
+    loading samples a batch to size its buffers, so compiling refuses them;
+    with loading set by hand, the first batch does."""
     rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
     with pytest.raises(ValueError):
-        compile(Pipeline(Memory(rows)).map(Formatting()).repeat().batch(2), seed=0, steps=10**6,
-                loading=Loading(workers="auto", host=TWO_CPUS))
-    for loading in (Loading(workers="auto"), None):
-        stream = _records(rows, 2, loading=loading).train(DataPartition())
-        with pytest.raises(ValueError):
-            next(stream)
-        stream.close()
+        _records(rows, 2, loading=Loading(workers="auto"))
+    stream = _records(rows, 2).train(DataPartition())
+    with pytest.raises(ValueError):
+        next(stream)
+    stream.close()
 
 
 def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():

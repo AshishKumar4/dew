@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
 
-from dew._records import JSON, record
+from dew._records import JSON
 from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.handed import Handed
@@ -193,10 +193,10 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     artifact = checkpoints.artifact(step)
     precision: list[str] = []
     held = artifact.get("precision") if isinstance(artifact, dict) else None
-    if trainer.numerics is not None and isinstance(held, dict):
-        running = record(to_record(trainer.numerics, Numerics), "precision")
-        before, after = ({name: value for name, value in stated.items() if name not in _SHOWN_BY_STATE}
-                         for stated in (held, running))
+    running = None if trainer.numerics is None else to_record(trainer.numerics, Numerics)
+    if isinstance(held, dict) and isinstance(running, dict):
+        before: JSON = {name: value for name, value in held.items() if name not in _SHOWN_BY_STATE}
+        after: JSON = {name: value for name, value in running.items() if name not in _SHOWN_BY_STATE}
         precision = _differing(before, after, "precision")
     return differing_records(artifact, trainer._artifact(), saved, now) + dropped + precision
 
