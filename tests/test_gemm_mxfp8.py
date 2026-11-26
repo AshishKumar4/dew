@@ -255,3 +255,52 @@ def test_a_nan_block_takes_the_nan_scale_and_poisons_only_the_sums_it_reaches():
     assert nan[3].all() and nan[:128, 7].all() and nan.sum() == 128 + 128 - 1
     np.testing.assert_array_equal(out[128:], np.zeros((128, 128), np.float32))
     assert (out[:128][~nan[:128]] == 64.0).all()
+
+
+def _blocks_product(signs: tuple[int, ...], row_exponents: tuple[int, ...],
+                    column_exponents: tuple[int, ...]) -> np.ndarray:
+    """An MXFP8 product of one 128-row group over `len(signs)` 32-deep blocks, every code one (its row's sign
+    `signs[b]` in block `b`), the rows' and the matrix's E8M0 exponents per block, by XLA (each block's
+    partial 32 times 2 to its two exponents)."""
+    def scales(exponents, shape):
+        held = jnp.broadcast_to(jnp.asarray([e + 127 for e in exponents], jnp.uint8), shape)
+        return jax.lax.bitcast_convert_type(held, jnp.float8_e8m0fnu)
+
+    blocks = len(signs)
+    codes = jnp.repeat(jnp.asarray(signs, jnp.float32), 32)[None].repeat(128, 0).astype(jnp.float8_e4m3fn)
+    rows = formats.MxFp8(codes, scales(row_exponents, (128, blocks)))
+    matrices = formats.MxFp8(jnp.ones((1, 128, 32 * blocks), jnp.float8_e4m3fn),
+                             scales(column_exponents, (1, 128, blocks)))
+    with generation.chosen(mxfp8="xla"):
+        return np.asarray(jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.asarray([1], jnp.int32),
+                                                                  out_dtype=jnp.float32))(rows, matrices))
+
+
+def test_an_mxfp8_sum_that_cancels_keeps_its_small_remainder():
+    """Three blocks' partials 32 x 2^120, -32 x 2^120 and 32 x 2^-32: the first two cancel exactly and the
+    sum is the third's, 2^-27, kept where the running sum's exponent had been 2^125's (row 13164's
+    review: an exponent left at the cancelled blocks' brought the last to 2^-153 and lost it)."""
+    out = _blocks_product((1, -1, 1), (60, 60, -16), (60, 60, -16))
+    np.testing.assert_array_equal(out, np.full((128, 128), 2.0 ** -27, np.float32))
+
+
+def test_an_mxfp8_sum_keeps_what_each_addition_rounds_away():
+    """Three blocks' partials 2^24, 1 and -2^24: fp32 adds the one to 2^24 and rounds it away, the sum
+    compensated keeps it, so the product is 1 as its depth contracted whole is (testing.md's split
+    products; row 13164's review)."""
+    out = _blocks_product((1, 1, -1), (10, -3, 10), (9, -2, 9))
+    np.testing.assert_array_equal(out, np.ones((128, 128), np.float32))
+
+
+def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
+    """A NaN in a GEMM's rows reaches every column of its row's product, whose blocks the quantizing epilogue
+    (`gemm.gemm_quantized(..., MxFp8)`) scales NaN (`0xFF`), every other row's block its own scale, as the
+    quantizer scales the product (row 13164)."""
+    x = jnp.ones((16, 64), jnp.bfloat16).at[2, 7].set(jnp.nan)
+    w = jnp.eye(64, dtype=jnp.bfloat16)
+    fused = gemm.gemm_quantized(x, w, minifloat=formats.MxFp8)
+    assert isinstance(fused, formats.MxFp8)
+    held = np.asarray(jax.lax.bitcast_convert_type(fused.scales, jnp.uint8))
+    assert (held[2] == 0xFF).all() and (np.delete(held, 2, axis=0) != 0xFF).all()
+    expected = formats.MxFp8.quantized(jnp.dot(x, w, preferred_element_type=jnp.float32)).scales
+    np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))

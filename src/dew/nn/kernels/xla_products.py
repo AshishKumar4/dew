@@ -269,35 +269,43 @@ def exponent_scaled(lhs_codes: jax.Array, lhs_exponents: jax.Array, kernel_codes
                     kernel_exponents: jax.Array, group_sizes: jax.Array, *, depth: int,
                     unscaled: jax.Array, kernel_unscaled: jax.Array) -> jax.Array:
     """Each group's rows of `lhs_codes` `[rows, k]` times its matrix of `kernel_codes` `[groups, k, width]`,
-    every `depth`-deep block's codes multiplied whole (each product exact, its partial exact in fp32) and
-    scaled by the power two of its row's and column's exponents summed (`lhs_exponents` `[rows, k /
-    depth]`, `kernel_exponents` `[groups, k / depth, width]`), added in the blocks' order (`_block_walk`):
-    a block-scaled product whose values no operand holds apart (MXFP8's, `gemm.mxfp8_product`'s portable
-    branch, OCP MX's dot). Its fp32 sum is held as a significand and an exponent apart, each partial
-    brought to the larger exponent by an exact power of two (`precision.power2`) before it is added, and
-    raised to its exponent once at the end: every addition rounds as fp32's sum does, and no partial or
-    running sum is a subnormal a backend flushes, so 2^-127 meets 2^127 in the exponents, and partials of
-    2^-127 sum to a normal 2^-126 (row 13164). A block either of whose scales is NaN (`unscaled`,
-    `kernel_unscaled`, its exponents' shape) makes its sums NaN. The rows past the groups are zero."""
-    from ..precision import power2
+    every `depth`-deep block's codes multiplied whole (each product exact; the block's fp32 partial their
+    sum, rounded as XLA's dot rounds it) and scaled by the power two of its row's and column's exponents
+    summed (`lhs_exponents` `[rows, k / depth]`, `kernel_exponents` `[groups, k / depth, width]`), added
+    in the blocks' order (`_block_walk`): a block-scaled product whose values no operand holds apart
+    (MXFP8's, `gemm.mxfp8_product`'s portable branch, OCP MX's dot). The blocks' sum is a compensated pair
+    (`precision.compensated_add`: what each addition rounds away kept, as testing.md asks of a product split
+    where its reference takes the depth whole) held at an exponent of its own: each partial brought to the
+    larger of its own and the sum's exponent by an exact power of two (`precision.power2`) before it is
+    added, the pair renormalized to its leading half's exponent after (an exact cancellation's zero back to
+    no exponent), the sum raised to its exponent once at the end. So no partial or running sum is a
+    subnormal a backend flushes: 2^-127 meets 2^127 in the exponents, partials of 2^-127 sum to a normal
+    2^-126, and a sum that cancels to a small remainder keeps it (row 13164). A block either of whose scales
+    is NaN (`unscaled`, `kernel_unscaled`, its exponents' shape) makes its sums NaN. The rows past the
+    groups are zero."""
+    from ..precision import compensated_add, power2
 
     def start(zeros):
         # Placed as the sum is (`_block_walk`'s zeros), each part of the carry alike.
-        return (zeros, jnp.full_like(zeros, _NO_EXPONENT, dtype=jnp.int32),
+        return (zeros, zeros, jnp.full_like(zeros, _NO_EXPONENT, dtype=jnp.int32),
                 jnp.zeros_like(zeros, dtype=bool))
 
     def added(index, partial, owner, carry):
-        total, exponent, poisoned = carry
+        high, low, exponent, poisoned = carry
         scale = lhs_exponents[:, index][:, None] + kernel_exponents[:, index][owner]
         own = jnp.where(partial != 0, scale + jnp.frexp(partial)[1], _NO_EXPONENT)
         top = jnp.maximum(exponent, own)
-        total = power2(total, exponent - top) + power2(partial, scale - top)
+        high, low = compensated_add((power2(high, exponent - top), power2(low, exponent - top)),
+                                    (power2(partial, scale - top), jnp.zeros_like(partial)))
+        # The pair at its leading half's exponent: none where it cancelled to zero.
+        lead = jnp.where(high != 0, jnp.frexp(high)[1], 0)
+        exponent = jnp.where(high != 0, top + lead, _NO_EXPONENT)
         nan = unscaled[:, index][:, None] | kernel_unscaled[:, index][owner]
-        return total, top, poisoned | nan
+        return power2(high, -lead), power2(low, -lead), exponent, poisoned | nan
 
     def finished(carry):
-        total, exponent, poisoned = carry
-        return jnp.where(poisoned, jnp.float32(jnp.nan), power2(total, exponent))
+        high, _, exponent, poisoned = carry
+        return jnp.where(poisoned, jnp.float32(jnp.nan), power2(high, exponent))
 
     return _block_walk(lhs_codes, kernel_codes, group_sizes, depth, start, added, finished,
                        precision=jax.lax.Precision.DEFAULT)
