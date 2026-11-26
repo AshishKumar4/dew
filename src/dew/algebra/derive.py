@@ -870,9 +870,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     _register(graph, region, closed, names, walked_axes)
     walking = WALKING if declaration.rescale is None else WALKING_SCALED
     graph.run(walking.saturate())
-    for term in _opaque_locals(graph, region, walking):
-        graph.register(local(term))
-    graph.run(walking.saturate())
+    _register_local_opaques(graph, region, walking)
     graph.run(PLAIN.saturate())
     found = [term for term, _ in region.shapes if _holds(graph, summed(term)) or _holds(graph, peaked(term))]
     reductions = tuple({terms.key(term): term for term in found}.values())
@@ -1111,6 +1109,7 @@ def _least(graph: EGraph, region: terms.Region) -> None:
     may anchor (its own, or one made from it: a broadcast, a difference), one literal a dtype: maxima of two
     dtypes are each corrected by their own, where one value for the whole program refused them."""
     floors: dict[np.dtype, int] = {}
+    facts = []
     for term, _ in region.shapes:
         dtype = region.dtypes.get(terms.key(term))
         if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
@@ -1120,8 +1119,10 @@ def _least(graph: EGraph, region: terms.Region) -> None:
             floors[dtype] = len(region.literals) - 1
             literal = Term.literal(i64(floors[dtype]))
             region.shaped(literal, ())
-            graph.register(set_(rules.shape(literal)).to(Vec[i64]()))
-        graph.register(set_(least(term)).to(i64(floors[dtype])))
+            facts.append(set_(rules.shape(literal)).to(Vec[i64]()))
+        facts.append(set_(least(term)).to(i64(floors[dtype])))
+    if facts:
+        graph.register(*facts)
 
 
 def _inserted_reshape_axes(region: terms.Region, index: int) -> list[int]:
@@ -1175,13 +1176,12 @@ def _dot_ranks(region: terms.Region, index: int) -> tuple[int, int]:
     return 0, 0
 
 
-def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> list[Term]:
+def _register_local_opaques(graph: EGraph, region: terms.Region, walking: Ruleset) -> None:
     """The outputs of equations outside the language (`terms.Opaque`), each over local, unwalked inputs alone:
     local themselves, in program order, so an equation over an earlier one's outputs reads them as local. An
     equation outside the language over a value the walk reads is refused: over a walked value its axis is
     unknown, and over one a walked reduction gave (a total's `log2`) no form computes it from the walk's
     state, where evaluating it from the operands would read them whole."""
-    found = []
     for opaque in region.opaque:
         inputs = [term for term in opaque.inputs if term is not None]
         name = opaque.equation.primitive.name
@@ -1189,11 +1189,10 @@ def _opaque_locals(graph: EGraph, region: terms.Region, walking: Ruleset) -> lis
             raise Refused(f"{name}: an equation outside the language over a walked value")
         if not all(_holds(graph, local(term)) and _holds(graph, unwalked(term)) for term in inputs):
             raise Refused(f"{name}: an equation outside the language over a value a walked reduction gave")
-        for leaf in opaque.outputs:
-            found.append(Term.leaf(i64(leaf)))
-            graph.register(local(Term.leaf(i64(leaf))), unwalked(Term.leaf(i64(leaf))))
-        graph.run(walking.saturate())
-    return found
+        facts = [fact(Term.leaf(i64(leaf))) for leaf in opaque.outputs for fact in (local, unwalked)]
+        if facts:
+            graph.register(*facts)
+            graph.run(walking.saturate())
 
 
 def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
@@ -1203,6 +1202,7 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
     correction is no broadcast of these, and the declaration is refused."""
     anchors = {extent for term, extent in region.shapes if _holds(graph, anchor(term))}
     lifted = set()
+    facts = []
     for reduction in reductions:
         to = region.extents.get(terms.key(reduction))
         if to is None:
@@ -1218,9 +1218,11 @@ def _lift(graph: EGraph, region: terms.Region, reductions) -> None:
                 dimensions = () if at < 0 else (at,)
                 params = {"shape": tuple(to), "broadcast_dimensions": dimensions, "sharding": None}
                 region.params.append((jax.lax.broadcast_in_dim_p, params))
-                graph.register(set_(lifts(Vec[i64](*(i64(size) for size in given)),
-                                          Vec[i64](*(i64(size) for size in to)), i64(at))).to(
+                facts.append(set_(lifts(Vec[i64](*(i64(size) for size in given)),
+                                        Vec[i64](*(i64(size) for size in to)), i64(at))).to(
                     i64(len(region.params) - 1)))
+    if facts:
+        graph.register(*facts)
 
 
 def _walked(graph: EGraph, term: Term) -> bool:

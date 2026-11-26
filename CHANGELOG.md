@@ -8,7 +8,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 ## Unreleased
 
 - Algebra encodes each binder and repeated source site once per digest and reuses the settled fact closure
-  when an e-graph rule set changes nothing. Persistent fingerprints and provenance are preserved.
+  when nothing changes. Derivations batch floors and broadcasts, and no longer register twice that an
+  opaque output is local. Persistent fingerprints and provenance are preserved.
 
 - Algebra derivation registers axis movement facts in one batch and avoids rebuilding plain structural
   key tuples; literal bytes, opaque identities and rewrite cache admission are unchanged.
