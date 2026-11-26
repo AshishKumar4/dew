@@ -30,6 +30,7 @@ they are declared: neither is generated yet.
 | Mode | When | Input | Rule sets | Output |
 |---|---|---|---|---|
 | Dev time | `python -m dew.algebra.generate` | registered `StableForm` declarations and cases | dev-time rules, with sampled error (§1.5) | checked-in Python modules with a shared accuracy and regeneration suite |
+| Dev time (planned) | the same generator, as a declaration changes | template reduction and scan declarations, and the two bodies of a declared surrogate | dev-time rules with the family's independent accuracy and performance gates | checked-in Python and its Check 1, Check 2 and regeneration coverage (§6.11) |
 | Compile time | the program pass, once per program Dew compiles at its seam (§2) | the traced jaxpr of a training step, an evaluation, a rollout or a serving program, a step's backward included | `identities`, `contracted`, `linear`, `joined`: small and fast, admitted by rounding class (§1.4) | the rewritten jaxpr, compiled under the program's own options |
 | Runtime | never | — | — | — |
 
@@ -37,7 +38,9 @@ they are declared: neither is generated yet.
   beside the declaring module, with a header naming the declarations, rule sets and egglog version.
   `tests/test_algebra_generate.py` checks each generated function against the declaration in float64 and
   runs `generate(check=True)` on the recorded platform. Changes to a rule or declaration show up as a
-  reviewed diff. The generator does not yet write template algebra or surrogate gradients (rows 3272, 6109).
+  reviewed diff. Template algebra and surrogate gradients remain part of the dev-time design: a
+  template's forward and backward tiles, online step and combine, and a surrogate's two bodies will
+  be generated when those families are adopted (rows 3272, 6109). Today they trace where they are used.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
@@ -1371,6 +1374,15 @@ DECLARATIONS: dict[str, StableForm]  # each key is the declaring module and func
 def declare(module: str, name: str, form: StableForm) -> StableForm: ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
+
+**Planned families (row 3272).** The same registry will accept a template's `Declaration` (a
+`Reduction` or `Scan`) and `SurrogateBodies` (row 3271). A surrogate declaration records its
+`forward` and `derivative` callables and their `Cases`; generation optimizes each body independently,
+never replaces the declared derivative with autodiff of the forward. Template generation emits the
+forward/backward tiled forms and their step, merge and finish as ordinary Python. Both families will
+emit checked-in modules with a gate site for every served case and deterministic `--check` regeneration;
+replacing an existing form requires the accuracy and efficiency bars in §4. Neither family is registered
+in the built `dict[str, StableForm]` yet.
 
 - `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
   saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
