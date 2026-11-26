@@ -64,8 +64,8 @@ from .activations import (
 )
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
+from .gated_mlp import fuses_grouped
 from .kernels import formats, gemm, generation, projections
-from .kernels.templates.gemm.hooks import hook_lowers
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -829,33 +829,47 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     product its epilogue (`activations.gated_hook`: the product's arithmetic on the tile, no launch of its
     own), the gate's and up's kept under the names a remat policy reads (`Residual.GATE_PROJ`,
     `Residual.UP_PROJ`); the down projection's prologue that gated product of the kept roundings, the
-    epilogue's output its formed value (`gemm.gemm`'s `applied`). So neither backward recomputes the pair: the
-    paired product's reads its kept roundings, the down projection's its prologue's operands, which a policy
-    saving the two names keeps. The gated product's gradient is `gated_hook`'s portable one (its activation
-    rounded to the compute dtype, as `GatedMLP`'s fused products take it), check 1 against float64 and bitwise
-    the unfused hook's; a dense layer's standalone `norm_swiglu` launch multiplies by the unrounded fp32
-    activation, a bf16 ulp apart where they differ. Where the pair runs apart (`paired_projections`) or the
-    down projection takes
-    no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`)
-    or the gated product's hook lowers on no launch's epilogue (a `Situ`, an exact GELU's erfc), each
-    projection runs on its own and the gated
-    product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
-    `expert_projection`'s. `scales`, the gate's, up's and down's delayed-scaling NVFP4 tensor scales
-    (`ExpertLinear.history`, row 12721) where a run's delayed recipe takes the experts, which runs them apart,
-    and `noted`, what takes the down projection's rows (their gated product) as its recipe reads them."""
+    epilogue's output its formed value (`gemm.gemm`'s `applied`). So neither backward recomputes the pair:
+    the paired product's reads its kept roundings, the down projection's its prologue's operands, which a
+    policy saving the two names keeps. The gated product's gradient is `gated_hook`'s portable one (its
+    activation rounded to the compute dtype, as `GatedMLP`'s fused products take it), check 1 against
+    float64 and bitwise the unfused hook's; a dense layer's standalone `norm_swiglu` launch multiplies by
+    the unrounded fp32 activation, a bf16 ulp apart where they differ. It runs so where the gated MLP's
+    selector chooses its fused kernel for the grouped call (`gated_mlp.fuses_grouped`, `GATED_MLP`'s
+    `(dtype, 'grouped')` cell, row 12847): where a receipt declares it faster or the block names it
+    (`generation.chosen(gated_mlp='fused')`) and its requirements hold. Where the selector takes it apart,
+    or a requirement hands it off (the pair runs apart, `paired_projections`; the down projection takes no
+    prologue, a packed bank's NVFP4 product or a run's recipe that takes the experts, `expert_projection`;
+    the gated product's hook lowers on no launch's epilogue, a `Situ`, an exact GELU's erfc), each
+    projection runs on its own and the gated product between them (`gated_product`). Every arm's output the
+    compute dtype's. `scatter`, `expert_projection`'s. `scales`, the gate's, up's and down's
+    delayed-scaling NVFP4 tensor scales (`ExpertLinear.history`, row 12721) where a run's delayed recipe
+    takes the experts, which runs them apart, and `noted`, what takes the down projection's rows (their
+    gated product) as its recipe reads them."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
-    fusable = (paired is not None and down_layer is paired[-1] and not isinstance(down_stack, formats.NvFp4)
-               and not _recipe_takes_experts(down_stack))
-    # The gated product's hook where a launch's epilogue and prologue take its operations (`hook_lowers`, as
-    # `dew.nn.gated_mlp` asks: an exact GELU's erfc lowers on no Mosaic launch), else None; asked of a
-    # compute dtype a launch takes (float32 or narrower), a wider one's products XLA's, whose hook is its own.
-    hook = None if isinstance(activation, Situ) or not fusable else gated_hook(activation, limit)
-    if (hook is not None and jnp.dtype(compute).itemsize <= 4
-            and not hook_lowers(hook, (jax.ShapeDtypeStruct((128, 128), compute),) * 2,
-                                generation.gpu_target())):
-        hook = None
-    if paired is None or hook is None:
+    hook = None if isinstance(activation, Situ) else gated_hook(activation, limit)
+    gate_stack = gate.stack if isinstance(gate, Layered) else gate
+    # Fused where the gated MLP's selector chooses it (`gated_mlp.GATED_MLP`, its grouped cell, row 12847):
+    # the pair one product of a layer the down projection's, which takes the gated product as its prologue
+    # (no NVFP4 bank's, no recipe's that takes the experts), the hook lowering on the template's launches.
+    packed = isinstance(gate_stack, formats.NvFp4) or isinstance(down_stack, formats.NvFp4)
+    with _named(implementation):
+        # Asked of every call, one whose pair runs apart among them, so the selector reports each grouped
+        # MLP's route. A packed bank's matrices are its codes, of no product's shape a launch reads (`None`).
+        # Asked of the calls the chain makes: its tokens and the gathered rows' indices, its group sizes, the
+        # down projection's scatter and the layer of a stack of layers (`_paired_call`'s).
+        tokens = x.tokens if isinstance(x, Gathered) else x
+        fused = fuses_grouped(
+            jax.ShapeDtypeStruct(tokens.shape, compute),
+            None if packed else (jax.ShapeDtypeStruct(gate_stack.shape, compute),
+                                 jax.ShapeDtypeStruct(down_stack.shape, compute)),
+            precision, hook, paired=paired is not None and down_layer is paired[-1],
+            down_prologue=not isinstance(down_stack, formats.NvFp4) and not _recipe_takes_experts(down_stack),
+            group_sizes=group_sizes, gather=x.rows if isinstance(x, Gathered) else None, scatter=scatter,
+            layer=down_layer)
+    # The selector fuses a pair alone, of a gated product with a hook (its `paired` and `hook` requirements).
+    if paired is None or hook is None or not fused:
         gate_scale, up_scale, down_scale = scales or (None, None, None)
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
                                      (gate_scale, up_scale))

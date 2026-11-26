@@ -1070,7 +1070,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
-        held: collections.OrderedDict[Hashable, Held[_Held]] = collections.OrderedDict()
+        held: collections.OrderedDict[Hashable, Held[_Held | None]] = collections.OrderedDict()
 
         def calling(arguments: Mapping[str, object]):
             # `launch` called with `arguments` by name, as `signature.bind` gave them.
@@ -1101,7 +1101,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                 key = (tuple(statics.items()), operands, tuple(map(jax.typeof, leaves)), state, metadata)
                 made = []
 
-                def making() -> _Held:
+                def making() -> _Held | None:
                     def traced(*values):
                         return calling({**statics, **jax.tree.unflatten(operands, values)})
 
@@ -1113,10 +1113,17 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                         raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
                                          f"say it builds ({sorted(builds or ())}): it was given none of "
                                          "their config")
+                    if len(program.jaxpr.in_avals) != len(leaves):
+                        # It read a value of the trace around it that is none of its operands, which its
+                        # program takes ahead of them: no function of its key, so none is held and each call
+                        # runs the launch itself, as a static that may reach an array does.
+                        return None
                     made.append(_Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named)))
                     return made[-1]
 
                 found = _cache.holding(held, key, making, LAUNCHES_HELD)
+                if found is None:
+                    return calling(given)
                 if not made:
                     # A held trace taken: its kernels named for this launch again.
                     report.renamed(found.named)

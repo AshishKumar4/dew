@@ -431,11 +431,18 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
 
     def _refused(self, ba, config: tiling.Tiles, target) -> bool:
         # Refused on `target` past its producer's ladder: spilling at the rung it settles on
-        # (`producers.settled`, settled under `target` until it takes one, rows 11885, 11889).
+        # (`producers.settled`, settled under `target` until it takes one, rows 11885, 11889), or settled past
+        # its start onto a rung the launch does not take (`legal`), which no offer of it can hold: a refused
+        # paired tile's rungs each modelled past their consumers' budget left it offered, its offer refused,
+        # and the call Exhausted (row 12972).
         from .templates import report
         from .templates.gemm import producers
         with generation.as_target(target):
-            return report.refused(self, ba, producers.settled(self, ba, config, target), target)
+            settled = producers.settled(self, ba, config, target)
+            if report.refused(self, ba, settled, target):
+                return True
+            return (settled != producers.started(self, ba, config, target)
+                    and not self.legal(ba, settled, target))
 
     def _derived(self, ba, target, admits=None, *, programs: int | None = None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
@@ -444,7 +451,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         run partial (`_partial_axes`)."""
         from .templates.gemm import derivation, hooks, quantized
 
-        ba = self._aligned(ba, target, whole_tiles=True)
+        # A compile's refusals are the call's own (`report.refuse_launch` of its bound arguments), read so
+        # beside the padded call's sizing and legality (row 12972: a gathered depth of 511, padded to 512).
+        call, ba = ba, self._aligned(ba, target, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
         # A call storing an output a form reduces stages each output a block of the form's at a time
         # (`quantized.formed`), each tile planned and taken so.
@@ -456,8 +465,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
             tile = derivation.derived(tried, rows=rows, depth=depth, width=width,
                                       dtype=ba.arguments['tokens'].dtype,
                                       multiprocessors=_multiprocessors(target), target=target,
-                                      candidate=lambda tile: (self.candidate(ba, formed(tile), target)
-                                                              and (admits is None or admits(tile))),
+                                      candidate=lambda tile: (
+                                          self.candidate(ba, formed(tile), target)
+                                          and not self._refused(call, formed(tile), target)
+                                          and (admits is None or admits(tile))),
                                       launch_of=lambda tile: self.launch_of(ba, formed(tile), target),
                                       grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
@@ -1093,7 +1104,8 @@ class MosaicGmm(_Mosaic):
             # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
             held=-(-rows // row_tiles.TMA_ROWS) * row_tiles.TMA_ROWS,
             operands=self._operand_bytes(ba, tile), stored=_stored_bytes(ba, rows, width),
-            multiprocessors=_multiprocessors(target), partial_bytes=self._slice_bytes(ba, tile, target))
+            multiprocessors=_multiprocessors(target), issued=ba.arguments['tokens'].dtype,
+            partial_bytes=self._slice_bytes(ba, tile, target))
 
     def _slice_bytes(self, ba, config: tiling.Tiles, target) -> int:
         """One depth slice's fp32 partials as a split launch at `config` declares them
@@ -1729,7 +1741,7 @@ class MosaicTgmm(_Mosaic):
                 'width': width, 'itemsizes': itemsizes,
                 'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
                 'multiprocessors': _multiprocessors(target),
-                'step_seconds': pricing.step_seconds(tile, target, itemsizes),
+                'step_seconds': pricing.step_seconds(tile, target, itemsizes, issued=tokens.dtype),
                 'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target,
                 'partial_bytes': self._slice_bytes(ba, tile, target)}
 

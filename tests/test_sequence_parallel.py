@@ -93,6 +93,8 @@ CALLS = {
     "full": {},
     # One learned logit per query head, split with the heads by the exchange.
     "sinks": {"causal": True, "sinks": jax.random.normal(jax.random.key(4), (4,))},
+    # Each query's own logit per head (projected sinks), split with its row, place and head.
+    "query_sinks": {"causal": True, "sinks": jax.random.normal(jax.random.key(5), (BATCH, SEQ_LEN, 4))},
     # Each row's keys end at its own length; the rows split with the batch.
     "key_lengths": {"key_value_seq_lengths": jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)},
     "causal_key_lengths": {"causal": True, "key_value_seq_lengths": jnp.asarray(

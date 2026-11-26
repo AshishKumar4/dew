@@ -283,6 +283,8 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert grouped_cutlass.cutlass_built_for("sm80") is None
     ampere = installed((8, 0), "sm80")
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
+    blackwell = installed((10, 0), "sm100")
+    assert blackwell["sm100"] == "sm100" and blackwell["sm90"] is None
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False, prologued=False):
@@ -1490,7 +1492,7 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
     with generation.assumed(small_sm80):
         from dew.nn.kernels.templates import tail as tail_mod
 
-        step_s = pricing.step_seconds(tile_mw, small_sm80, (2, 2))
+        step_s = pricing.step_seconds(tile_mw, small_sm80, (2, 2), issued=jnp.bfloat16)
         assert step_s is not None
         traffic = tail_mod.Traffic((5, 2), 2, 64 * 32 * 2, 64 * 32 * 2, step_s, 4, 120e9, 64 * 1024)
         # Unscoped, tail.balanced accepts the 2-tile tail; scoped (mma.sync's walk launched persistent), the
@@ -2205,7 +2207,8 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
         unsplit = dataclasses.replace(tile, splits=1)
         work = pricing.decode_contraction(
             unsplit, target, rows=8192, groups=1, depth=depth_k, width=width_n, columns=None, held=8192,
-            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors)
+            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors,
+            issued=jnp.bfloat16)
         return pricing.split_walk(unsplit, **work)
 
     with generation.assumed("sm80"):

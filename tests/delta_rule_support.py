@@ -275,9 +275,15 @@ def fla_run(script: str, given: dict, *arguments: str) -> dict:
                     "which a run selecting fla's gate gives it")
     with tempfile.TemporaryDirectory() as root:
         np.savez(Path(root) / "in.npz", **given)
-        subprocess.run([python, "-c", script, Path(root) / "in.npz", Path(root) / "out.npz", *arguments],
-                       check=True)
-        with np.load(Path(root) / "out.npz") as found:
+        written = Path(root) / "out.npz"
+        ran = subprocess.run([python, "-c", script, Path(root) / "in.npz", written, *arguments],
+                             capture_output=True, text=True)
+        # Its failure names its stage and its own words: an A100's lightning cell's script died of an abort
+        # its log kept one line of, whether before its outputs or after them unknown (row 12914).
+        if ran.returncode:
+            stage = "after writing its outputs" if written.exists() else "before its outputs"
+            raise RuntimeError(f"fla's script exited {ran.returncode} {stage}: {ran.stderr[-4000:]}")
+        with np.load(written) as found:
             return dict(found)
 
 

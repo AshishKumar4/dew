@@ -410,7 +410,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, target, tiles.chunk, ranged=ranged, apart=apart, values_gated=values_gated,
                 unit_pairs=unit_pairs, decay_bound=decay_bound, producers=tiles.producers,
-                residents=tiles.residents, alone=not keeps)
+                residents=tiles.residents, keys=tiles.keys, alone=not keeps)
     _record_observed(call)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.

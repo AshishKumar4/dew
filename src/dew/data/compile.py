@@ -104,6 +104,7 @@ from dew.data.lowering import (
     _split_spans,
     _workers,
     cache_prefix,
+    worker_stage,
 )
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions, _weights, mixed_indexed, warn_rejections
@@ -1244,8 +1245,11 @@ def _compiled(
         widths=_bound_widths(original),
         tail=tail(train, build),
         order_records=ordered,
-        reading=TrainingRead(read, chooser, build.loading, _workers(train, build.loading), build.pools(train),
-                        faster=_faster((train,) if validation is None else (train, validation), build)),
+        # As a reader of each share is built (`_Build.pool_stages`): a whole-file corpus's pool bounded by its
+        # shards over the run's shares, which are read here, once (`_Build.whole_files_of`).
+        reading=TrainingRead(read, chooser, build.loading, worker_stage(train, build.loading),
+                             functools.partial(build.pool_stages, train, files=build.whole_files_of(train)),
+                             faster=_faster((train,) if validation is None else (train, validation), build)),
     )
 
 
@@ -1701,10 +1705,20 @@ def _compile_phases(
         return statistics_of(tuple(reading.values()))
 
     return dataclasses.replace(built[0][0], train=training, statistics=statistics, tail=built[-1][0].tail,
-                               order_records=None,
+                               order_records=None, reading=_phases_read([loaded for loaded, _ in built]),
                                token_ends=source.ends if tokens else None, batches=batches, stages=stages,
                                token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))
+
+
+def _phases_read(loaders: Sequence[Loader]) -> TrainingRead | None:
+    """The training read of phases each `loaders` reads, its first's: one read serves every phase, so a faster
+    one is named only where every phase would take it."""
+    first = loaders[0].reading
+    if first is None:
+        return None
+    agreed = all(loaded.reading is not None and loaded.reading.faster == first.faster for loaded in loaders)
+    return dataclasses.replace(first, faster=first.faster if agreed else None)
 
 
 def _in_one_order(source: Phases, first: _Staged, staged_at: Callable[[int, Mapping[str, _Trained]], _Staged]
@@ -1878,7 +1892,8 @@ def _training_reader(
                 ],
                 # Where a read that drops records reads in workers of each corpus's own (`pooled`),
                 # each worker's position is that corpus's, saved in that many.
-                **({} if build.pool is None or build.in_order else {"pools": build.pools(pipeline)}),
+                **({} if build.pool is None or build.in_order
+                   else {"pools": build.pools(pipeline, partition)}),
             })
         opened = _PerShare(
             functools.partial(build.batches, pipeline, partition),

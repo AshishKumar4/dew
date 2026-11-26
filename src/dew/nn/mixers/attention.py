@@ -39,6 +39,7 @@ from dew.nn.attention_masks import (
     repeat_kv_heads,
     visibility_mask,
 )
+from dew.nn.attention_terms import QKClip, RelativeBias, clipped, log_ratio_scale, relative_logits
 from dew.nn.blocks import normal_kernel
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
@@ -66,6 +67,7 @@ from dew.nn.kv_cache import (
     DOCUMENTS,
     TABLE,
     Append,
+    CacheSpec,
     KVCache,
     KVSpec,
     KVStore,
@@ -93,6 +95,7 @@ from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.residuals import QKV_RESIDUALS, Residual
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
+from dew.nn.short_conv_site import ShortConvs, ShortConvSite
 from dew.nn.value_experts import RoutedValues
 from dew.nn.visibility import windowed
 
@@ -405,8 +408,28 @@ class CausalSelfAttention(nn.Module):
     them for its kind (`MixerContext`)."""
     qk_norm_weight: bool = True  # False: Llama 4's weightless L2 norm (Llama4TextL2Norm)
     temperature_tuning: tuple[float, float] | None = None
-    """A (floor_scale, attn_scale) that scales each query by its position
-    (`temperature_scale`), rotated or not: Llama 4's unrotated layers'."""
+    """A (floor_scale, attn_scale) that scales each query by its position, rotated or not, in the form
+    `temperature_form` names: Llama 4's unrotated layers'."""
+    temperature_form: Literal['floored', 'log_ratio'] = 'floored'
+    """How `temperature_tuning` grows with the position: Llama 4's floored ratio plus one
+    (`temperature_scale`), or the log of the ratio past the floor (`log_ratio_scale`, Inkling 2's global
+    layers)."""
+    qk_clip: QKClip | None = None
+    """Each query and key head's length clipped (`QKClip`), where a head norm (`MixerContext.qk_norm`)
+    would sit: after the projections, before any rotation and the temperature; a layer takes one or the
+    other."""
+    short_convs: ShortConvs | None = None
+    """Its causal short convolutions (`ShortConvs`): its projected keys' and values' before their head
+    clip and norm, each its own decode history (its output's, on the residual's width, is its block's:
+    `LayerKind.mixer_conv`)."""
+    projected_sinks: bool = False
+    """Each query's own value-free sink logit a head, a bias-free projection of its input (`sink_proj`,
+    `[B, Q, H]` in fp32; Inkling 2's), in place of a head's static ones (`MixerContext.attention_sinks`):
+    the template's initial state or the portable softmax's column, the kernels taking a head's sinks alone
+    declining it (`scaled_dot_product_attention`); a cached step attends it on the masked route."""
+    relative_bias: RelativeBias | None = None
+    """An input-conditioned relative-position bias (`RelativeBias`): an fp32 `[B, H, Q, K]` dense bias,
+    O(Q K) memory at a prefill, added to the call's own before the softmax."""
     gate_projection: Literal['query', 'own', 'head'] = 'query'
     """Where the output gate comes from: the doubled query projection
     (Qwen3.5), a `gate_proj` of its own over the layer's input (Muse
@@ -540,6 +563,7 @@ class CausalSelfAttention(nn.Module):
             self.q_norm = norm(name='q_norm')
             if not self.ctx.kv_shared:
                 self.k_norm = norm(name='k_norm')
+        self._input_terms(dense)
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
         if self.ctx.dex is not None:
@@ -555,6 +579,50 @@ class CausalSelfAttention(nn.Module):
             # parameters either way.
             self.values_norm = RMSNorm(epsilon=self.ctx.norm_eps, with_scale=False,
                                        dtype=self.ctx.dtype, name='v_norm')
+
+    def _input_terms(self, dense: Callable[..., nn.Module]):
+        """The parameters of the terms the layer computes from its input beside its projections (`setup`'s
+        `dense` its projections): its head clip's query scale, its projected sinks and its relative bias
+        (`dew.nn.attention_terms`)."""
+        if self.qk_clip is not None:
+            if self.ctx.qk_norm:
+                raise ValueError("qk_clip and qk_norm each bound a head's queries and keys: take one")
+            if self.qk_clip.query_scale:
+                self.q_clip_scale = self.param('q_clip_scale', nn.initializers.ones,
+                                               (self.ctx.num_heads, self.ctx.head_dim), jnp.float32)
+        if self.projected_sinks:
+            if self.ctx.attention_sinks:
+                raise ValueError("a layer's sinks are a head's or each query's own: take one")
+            self.sink_proj = dense(self.ctx.num_heads, name='sink_proj', use_bias=False,
+                                   kernel_axes=ATTENTION_AXES['gate_proj'])
+        if self.short_convs is not None:
+            self._short_convs(self.short_convs)
+        if self.relative_bias is not None and not self.ctx.causal:
+            # Its distances are backward ones over the stream's slots, which a bidirectional canvas (and its
+            # frozen prefix, whose keys follow the cache's allocation) places otherwise.
+            raise ValueError("a relative bias reads each query's backward distance to its keys: a causal "
+                             "layer's alone")
+        if self.relative_bias is not None:
+            bias = self.relative_bias
+            self.relative = dense(self.ctx.num_heads * bias.rank, name='relative', use_bias=False,
+                                  kernel_axes=ATTENTION_AXES['gate_proj'])
+            self.relative_scale = self.param('relative_scale', nn.initializers.ones,
+                                             (self.ctx.num_heads, bias.rank), jnp.float32)
+            self.relative_bank = self.param('relative_bank', nn.initializers.zeros, (bias.rank, bias.extent),
+                                            jnp.float32)
+
+    def _short_convs(self, convs: ShortConvs):
+        """Its short convolutions' sites (`short_convs`): its keys' and values' where it projects its own
+        (dynamic taps a key head where `convs.dynamic`)."""
+        if self.ctx.k_eq_v or self.ctx.value_experts is not None or self.ctx.ngpt is not None:
+            raise ValueError("short convolutions run over a layer's own projected keys, values and gated "
+                             "output: not keys that are values, routed values or nGPT's normed output")
+        heads = self.ctx.num_kv_heads if convs.dynamic else None
+        if not self.ctx.kv_shared:
+            self.k_conv = ShortConvSite(self.ctx.num_kv_heads * self.ctx.head_dim, convs.kernel, heads,
+                                        dtype=self.ctx.dtype, name='k_conv')
+            self.v_conv = ShortConvSite(self.ctx.num_kv_heads * self.value_dim, convs.kernel, heads,
+                                        dtype=self.ctx.dtype, name='v_conv')
 
     def _ngpt_gains(self, ngpt: NGPT):
         """nGPT's query gain and, under an output gate, the gate's logit gain, one a feature of the
@@ -758,7 +826,7 @@ class CausalSelfAttention(nn.Module):
         return stashed
 
     def _projected_kv(self, x, whole: bool, projected=None,
-                      sites: Mapping[str, jax.Array] | None = None):
+                      sites: Mapping[str, jax.Array] | None = None, call: MixerCall = PLAIN_CALL):
         """Project the keys and values, norm them, and split them into heads.
 
         `whole` norms the key projection before the head split, which is
@@ -767,9 +835,9 @@ class CausalSelfAttention(nn.Module):
         'v' site's, where a looped pass merged its message into each apart.
         """
         batch, length, _ = x.shape
+        keys = x if sites is None else sites['k']
+        values = keys if sites is None else sites.get('v', keys)
         if projected is None:
-            keys = x if sites is None else sites['k']
-            values = keys if sites is None else sites.get('v', keys)
             key = self.k_proj(keys)
             # Gemma 4's global layers use the raw key projection as the
             # values before its norm (modeling_gemma4.py); MoVA's are routed experts'.
@@ -777,6 +845,11 @@ class CausalSelfAttention(nn.Module):
                      else self.v_proj(values))
         else:
             key, value = projected
+        if self.short_convs is not None:
+            # Each convolved over the call's tokens behind its own history, before its norm (`short_convs`).
+            dynamic = self.short_convs.dynamic
+            key = self.k_conv(key, call, keys if dynamic else None)
+            value = self.v_conv(value, call, values if dynamic else None)
         if self.ctx.key_multiplier is not None:
             # Before its norm and rotation, as Falcon-H1's keys (`k_proj(x) * key_multiplier`).
             key = scaled(key, self.ctx.key_multiplier)
@@ -791,6 +864,8 @@ class CausalSelfAttention(nn.Module):
         key = key.reshape(batch, length, self.ctx.num_kv_heads, self.ctx.head_dim)
         if self.ctx.qk_norm and not whole and not self.qk_norm_after_rotary:
             key = self.k_norm(key, axes=KV_HEADS)
+        if self.qk_clip is not None:
+            key = clipped(key, self.qk_clip.threshold, self.qk_clip.eps)
         if self.ctx.v_norm:
             value = self.values_norm(value, axes=KV_HEADS)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
@@ -827,9 +902,31 @@ class CausalSelfAttention(nn.Module):
         no normalization undoes it. A scalar a position, rotated kind or not."""
         if self.temperature_tuning is None:
             return query
-        scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
+        scale = self._temperature(places, at_least_fp32(query.dtype))
         return query * (scale[..., None, None] if scale.ndim == 2
                         else scale[None, :, None, None]).astype(query.dtype)
+
+    def _temperature(self, places, dtype) -> jax.Array:
+        """Each place's query multiplier under `temperature_tuning`, in the form `temperature_form` names."""
+        assert self.temperature_tuning is not None, "a temperature is read where the layer tunes one"
+        form = temperature_scale if self.temperature_form == 'floored' else log_ratio_scale
+        return form(places, *self.temperature_tuning, dtype=dtype)
+
+    def _relative_bias(self, x, places, query_slots, key_slots) -> jax.Array:
+        """`relative_bias`'s `[B, H, Q, K]` bias of the queries' input `x` (its states tuned by the queries'
+        `places` under `temperature`) at `query_slots` against the keys at `key_slots`
+        (`relative_logits`)."""
+        spec = self.relative_bias
+        assert spec is not None, "a relative bias is read where the layer computes one"
+        B, S, _ = x.shape
+        states = self.relative(x).reshape(B, S, self.ctx.num_heads, spec.rank)
+        states = (clipped(states, spec.clip, 1e-6, self.relative_scale) if spec.clip is not None
+                  else (states.astype(jnp.float32) * self.relative_scale).astype(states.dtype))
+        if spec.temperature and self.temperature_tuning is not None:
+            scale = self._temperature(places, at_least_fp32(states.dtype))
+            states = states * (scale[..., None, None] if scale.ndim == 2
+                               else scale[None, :, None, None]).astype(states.dtype)
+        return relative_logits(states, self.relative_bank, query_slots, key_slots)
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
@@ -891,14 +988,21 @@ class CausalSelfAttention(nn.Module):
                 INDEX_PLACES: Opened((rows, capacity, *axes), jnp.int32)}
 
     @nn.nowrap
-    def cache_spec(self, rows: int) -> dict[str, Opened]:
+    def cache_spec(self, rows: int) -> CacheSpec:
         """The layer's decode cache for `rows` rows: a causal layer's own keys and values with their
         cursor (`open_kv_cache`), and QSA's indexer keys beside them; none for a layer sharing another's
-        keys or a bidirectional one, which reads its causal model's."""
+        keys or a bidirectional one, which reads its causal model's. Its short convolutions' histories
+        beside them, each under its site's name (`short_convs`)."""
+        convs = {} if self.short_convs is None else {
+            name: site.cache_spec(rows) for name, site in self._conv_sites().items()}
         if not self.ctx.causal or self.ctx.kv_shared:
-            return {}
+            return convs
         indexed = {} if self.qsa is None else self._indexed(rows)
-        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed}
+        return {**self._kv_spec(rows).leaves(), **cursor(rows), **indexed, **convs}
+
+    def _conv_sites(self) -> dict[str, ShortConvSite]:
+        """Its short convolutions' sites by name (`short_convs`), each holding its own decode history."""
+        return {} if self.ctx.kv_shared else {'k_conv': self.k_conv, 'v_conv': self.v_conv}
 
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups the layer reads (`group_fields`)."""
@@ -1003,7 +1107,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.kv_shared:
             key, value, positions, *held = self._shared_kv(kv_store, decode)
         else:
-            key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs)
+            key, value = self._projected_kv(x, self._whole_norm, projected_kv, call.site_inputs, call)
 
         kv_len = key.shape[-3]
         positions, append, prefix = self._step_positions(key, positions, segment_ids, attention_metadata,
@@ -1035,9 +1139,13 @@ class CausalSelfAttention(nn.Module):
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
         query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
+            if self.relative_bias is not None or self.projected_sinks or self.short_convs is not None:
+                raise ValueError(f"{self.name}: a server's mixed step attends its rows' caches by pages, "
+                                 "which take no dense bias, a head's sinks alone and no convolution's "
+                                 "history: serve this layer by the dense cache")
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value, progress)
-        sinks = self.sinks
+        sinks = self.sink_proj(x).astype(at_least_fp32(x.dtype)) if self.projected_sinks else self.sinks
         if self._runs_local(attention_metadata, decode) and not (self.ctx.attention_dropout_rate and train):
             attention = checkpoint_name(local_attention(
                 query, key, value, window=self.ctx.sliding_window, chunk=self.ctx.attention_chunk,
@@ -1064,6 +1172,21 @@ class CausalSelfAttention(nn.Module):
         if attention_metadata is not None and attention_metadata.position_bias is not None:
             position_bias = attention_metadata.position_bias
             bias = position_bias if bias is None else bias + position_bias
+        if self.relative_bias is not None:
+            # Its distances in the stream's slots, as the reference's (`get_relative_distance`): a cached
+            # step's write slots against the cache's, a scored row's tokens counted within their documents
+            # (`counted`) on both sides, whatever places the caller gives.
+            if decode:
+                query_slots, key_slots = positions, jnp.arange(masking.key.shape[-3])
+            elif masking.key.shape[-3] == S:
+                # A scored call's keys are its own tokens: the same counted slots, whatever places its
+                # visibility counts keys at (`attention_key_positions`).
+                query_slots = key_slots = counted
+            else:
+                raise ValueError(f"{self.name}: a relative bias scores a call's own keys, and this call's "
+                                 f"{masking.key.shape[-3]} keys are not its {S} tokens")
+            relative = self._relative_bias(x, places, query_slots, key_slots)
+            bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
 
@@ -1128,14 +1251,18 @@ class CausalSelfAttention(nn.Module):
             gate = gate.reshape(B, S, self.ctx.num_heads, -1)
         if self.ctx.qk_norm and not self._whole_norm and not self.qk_norm_after_rotary:
             query = self.q_norm(query, axes=HEADS)
+        if self.qk_clip is not None:
+            query = clipped(query, self.qk_clip.threshold, self.qk_clip.eps,
+                            self.q_clip_scale if self.qk_clip.query_scale else None)
         # o_proj's sum returns to the residual placement in the block.
         return constrain(query, HEADS), gate, projected_kv
 
     @property
     def reads_context(self) -> bool:
         """Whether it projects keys and values of its own to read a context with (`context_keys`):
-        a KV-sharing layer does not."""
-        return not self.ctx.kv_shared
+        a KV-sharing layer does not, nor one whose sinks each query projects (`projected_sinks`), which a
+        context's softmax (`attend_context`) takes no query's of."""
+        return not self.ctx.kv_shared and not self.projected_sinks
 
     @nn.nowrap
     def context_heads(self) -> tuple[int, int, int]:
@@ -1161,6 +1288,8 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.kv_shared:
             raise ValueError("a KV-sharing layer projects no keys or values of its own to read a context "
                              "with")
+        if self.short_convs is not None:
+            raise ValueError("a layer convolving its keys and values over its own tokens reads no context's")
         group = self._group()
         projected = None
         if group is not None and self._packed():
@@ -1275,7 +1404,8 @@ class CausalSelfAttention(nn.Module):
         return mask_kernel(chosen_attention(), query, key, as_bias=decode and query.shape[1] > 1,
                            dtype=self.ctx.dtype, precision=self.ctx.precision,
                            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                           softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
+                           softcap=self.ctx.attn_logit_softcap,
+                           sinks=bool(self.ctx.attention_sinks) or self.projected_sinks,
                            wide_logits=self.ctx.wide_logits)
 
     def _prefixed(self, query, key, value, places, prefix, attention_metadata: AttentionMetadata | None):
@@ -1592,7 +1722,8 @@ class CausalSelfAttention(nn.Module):
                 deterministic=False), Residual.CONTEXT)
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
         # as each row's first key (`starts`).
-        plain_step = append is not None and mask is cursor and S == 1 and bias is None and not sowing
+        plain_step = (append is not None and mask is cursor and S == 1 and bias is None and not sowing
+                      and not self.projected_sinks)
         if plain_step:
             step = functools.partial(self._plain_step, append, query, key, value,
                                      jnp.asarray(positions).reshape(B, S)[:, 0], sinks=sinks)
@@ -1887,7 +2018,10 @@ class CausalSelfAttention(nn.Module):
         """
         if (self.ctx.sliding_window is None and self.ctx.attention_chunk is None) or not self.ctx.causal:
             return False
-        if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection(QK)):
+        # A bias over the logits (ALiBi's, a relative bias's) is the general kernel's, which local
+        # attention takes none of.
+        if (self.alibi or self.relative_bias is not None or self.projected_sinks or decode
+                or (not self.is_initializing() and self.is_mutable_collection(QK))):
             return False
         return metadata is None or (not self._unhonoured(metadata, "local") and all(
             getattr(metadata, name) is None for name in self._group_fields()))
@@ -1979,12 +2113,32 @@ class AttentionMixer(MixerBase):
     temperature_tuning: tuple[float, float] | None = None
     """A (floor_scale, attn_scale) that scales each query by its position (`temperature_scale`,
     arXiv 2501.19399), as Llama 4's unrotated layers do; None scales none."""
+    temperature_form: Literal['floored', 'log_ratio'] = 'floored'
+    """How `temperature_tuning` grows (`CausalSelfAttention.temperature_form`)."""
+    qk_clip: QKClip | None = None
+    """Each head's length clipped in place of a head norm (`CausalSelfAttention.qk_clip`)."""
+    relative_bias: RelativeBias | None = None
+    """An input-conditioned relative-position bias (`CausalSelfAttention.relative_bias`)."""
+    projected_sinks: bool = False
+    """Each query's own projected sink (`CausalSelfAttention.projected_sinks`)."""
+    short_convs: ShortConvs | None = None
+    """Causal short convolutions at its keys and values (`CausalSelfAttention.short_convs`)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout, and its cached keys by their documents.
     mixed_step = True
     packed_cache = True
 
+    def fork_refusal(self) -> str | None:
+        """Its short convolutions read each document's own inputs (`ShortConvSite`), where a fork's first
+        tokens would read its parent's tail."""
+        if self.short_convs is not None:
+            return "its short convolutions read each document's own inputs, none of a fork's parent's"
+        return super().fork_refusal()
+
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
+        if self.relative_bias is not None or self.projected_sinks or self.short_convs is not None:
+            return ("a mixed step attends its rows' caches by pages, which take no dense bias, a head's "
+                    "sinks alone and no convolution's history")
         return mixed_attention_refusal(ctx, alibi=self.alibi)
 
     def __post_init__(self):

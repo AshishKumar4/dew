@@ -25,6 +25,8 @@ from arm_forms import (
     _Windowed,
     _written_references,
     _written_role,
+    own_options,
+    with_own_options,
 )
 from check1_wire import QUALIFY
 from float64_terms import POWER, evaluated, evaluated_on, static, traced
@@ -43,6 +45,12 @@ def armed(label: str, written: bool = False) -> str:
     return f"{label}, its arms as written" if written else f"{label}, its arms"
 
 
+def _unlowered_arm(arms: str, role: str) -> str:
+    """The label one arm `role` of a site's `arms` (`armed`) is written at run under where this host lowers
+    none of it (`selection.Unlowerable`), apart from the site's arms compiled ahead."""
+    return f"{arms}, {role} at run"
+
+
 def _arm_compile(compile: Callable, written: dict | None) -> Callable:
     """How the gate compiles a site's arms (`arm_forms._arms`), its results placed
     (`dew.training.ahead.compile_programs`' `compiled`): by `compile` (`arm_forms._compile_for`'s: as Dew's
@@ -54,8 +62,10 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
         # may hold it.
         if isinstance(function, Whole):
             return function
+        own = own_options(function) if written is not None else None
+        options = written if own is None else {**written, **own}
         return compile(function if written is None else products_held(function), out_shardings=out_shardings,
-                       compiler_options=written)
+                       compiler_options=options)
 
     return compiled
 
@@ -111,7 +121,9 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     (`_ahead_arm`), tracing, lowering and compiling none, its sizing too. An arm the gate runs as given, or
     one running Dew's own programs (`dew_programs`, a host loop), holds no program. A site its target's
     compile refuses (`report.CompiledOnDevice`: a convolution's algorithm, which its GPU picks) is written at
-    run (`compile_site`'s `at_run`): its run compiles every arm on its GPU, as given (`_stored_arm`)."""
+    run (`compile_site`'s `at_run`): its run compiles every arm on its GPU, as given (`_stored_arm`). An arm
+    whose trace this host refuses (`selection.Unlowerable`) is written at run alone, its refusal its reason
+    (`_unlowered_arm`), the site's other arms compiled ahead."""
     # Each arm named as each process first finds it, before any call of it here (`arm_role`); one no
     # statement holds runs unprepared in its run.
     named_arms = {role: (named_role, fn, reference) for role, (fn, reference) in arms.items()
@@ -128,18 +140,35 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
     for drawn in _first_draws(draw, staged, armed(label, written)):
         for ordered in (drawn,) if orders is None else orders(drawn):
             inputs.setdefault(named("arms", ordered), ordered)
+    from dew.nn.kernels.selection import Unlowerable
+
     programs: dict = {}
     held: dict = {}
+    unlowered: dict[str, str] = {}
     # The arithmetic arms run in on the store's devices (`summed_as_run`, read where the store places its
     # calls: a GPU's own on a target's compile-only GPU, whatever the host the prepare runs on).
     with store.tracing(), summed_as_run():
         for role, fn, reference in named_arms.values():
-            for drawn in inputs.values():
-                _arm_program(programs, held, role, fn, drawn, reference=reference, written=written)
+            arm_programs, arm_held = {}, {}
+            try:
+                for drawn in inputs.values():
+                    _arm_program(arm_programs, arm_held, role, fn, drawn, reference=reference,
+                                 written=written)
+            except Unlowerable as refused:
+                # A kernel only its GPU lowers (cuDNN's plan under a generation's portable compile): this arm
+                # compiles in its run, the site's others ahead (`_stored_arm`).
+                unlowered[role] = str(refused)
+                continue
+            programs.update(arm_programs)
+            held.update(arm_held)
+    compiled = _arm_compile(compile, as_written(store.device().platform) if written else None)
+    for role, why in unlowered.items():
+        with summed_as_run():
+            store.compile_site(_unlowered_arm(armed(label, written), role), {}, {}, compiled=compiled,
+                               arms=True, at_run=why)
     if programs:
         from dew.nn.kernels.templates import report
 
-        compiled = _arm_compile(compile, as_written(store.device().platform) if written else None)
         with summed_as_run():
             try:
                 store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True)
@@ -170,6 +199,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     if isinstance(fn, _Windowed):
         return _arm_program(programs, held, role, fn.fn, jax.tree.map(lambda leaf: leaf[0], inputs),
                             reference=reference, written=written)
+    own = own_options(fn) if written else None
     fn = _own_function(fn) if written else fn
     name = named(role, inputs)
     traced_fn = unrewritten(fn) if reference and not _declared(fn) else fn
@@ -213,6 +243,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     # (`again`).
     held_now = {"routes": list(reported), "launches": launched.held()}
     _hold(programs, held, name, closed, jax.tree.structure(shapes), inputs, again)
+    with_own_options(programs[name][0], own)
     held[name].update(held_now)
     return shapes
 
@@ -283,7 +314,8 @@ def _stored_arm(store: CompiledTruths, label: str, given_fn, arm, role: str, *, 
     if named_role is None:
         store.unprepared(f"{label}: its {role} arm has no statement of what it computes")
         return arm
-    at_run = store.at_run(armed(label, written))
+    at_run = store.at_run(_unlowered_arm(armed(label, written), named_role)) or store.at_run(
+        armed(label, written))
     if at_run is not None:
         # Compiled on its GPU in the run, as its prepare stated (`_compile_arms`).
         store.unprepared(f"{label}: its {role} arm: {at_run}", AT_RUN)

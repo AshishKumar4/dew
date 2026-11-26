@@ -1757,8 +1757,8 @@ def test_a_saved_wrapped_decoders_attention_pin_is_its_steps(wrapper):
 def test_a_run_naming_its_attention_kernel_by_any_selector_name_traces_under_it():
     """A run naming its attention kernel `inference` (the attention selector's, `attention_kernels.INFERENCE`:
     the template for a call no derivative is taken of, xla's attention for one differentiated) traces every
-    attention layer under it, each call routed to that kernel and the forward finite, where the run's name
-    was narrowed to a call's names and refused before any selection (the API02 review)."""
+    attention layer under it, each call routed to that kernel, where the run's name was narrowed to a call's
+    names and refused before any selection (the API02 review). What the kernel computes is its own tests'."""
     from tiny_models import build_model
 
     from dew import kernels
@@ -1770,10 +1770,9 @@ def test_a_run_naming_its_attention_kernel_by_any_selector_name_traces_under_it(
     variables = model.init(jax.random.key(0), tokens)
     with kernels.use(attention="inference"), generation.routes() as found:
         assert chosen_attention() == "inference"
-        inferred = jax.jit(model.apply)(variables, tokens)
+        jax.jit(model.apply).trace(variables, tokens)
     taken = {route.kernel for route in found if route.choice == "attention"}
     assert taken == {"inference"}, taken
-    assert bool(jnp.all(jnp.isfinite(inferred)))
 
 
 

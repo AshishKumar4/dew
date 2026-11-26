@@ -101,23 +101,30 @@ def test_the_loss_is_the_papers_equation(runs):
     # The step reads these scales, times and noise (`Step.tape`); its conditions' key is its own.
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None,
                 tape={"guidance scale": scale, "times": t, "noise": noise})
-    loss, _ = task.loss(params, batch, step)
-    alpha, sigma = broadcast_rates(schedule, t, samples)
-    x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
-    time = schedule.model_time(t)
     teacher = task.teacher
-    given, blank = teacher._conditions(params[TEACHER], batch, drop_key)
-    variables = teacher.model_variables(params[TEACHER])
-    null = jax.tree.map(lambda value, empty: jnp.broadcast_to(empty, value.shape), given,
-                        aligned_conditions(given, blank))
-    conditional = teacher.model.apply(variables, x, time, **given)
-    unconditional = teacher.model.apply(variables, x, time, **null)
-    target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
-    student_given, _ = task._conditions(params, batch, drop_key)
-    output = task.model.apply(task.model_variables(params), x, time, **with_guidance(student_given, scale))
-    # Weighted per row as the process weighs its times: one for flow matching, EDM's lambda(sigma).
-    expected = jnp.mean(0.5 * jnp.square(output - target) * task.process.weight(t).reshape(-1, 1, 1, 1))
-    assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)
+
+    # The loss and the paper's equation each one compiled program: applied op by op, each of the U-Nets'
+    # operations compiles on its own (row 7429).
+    @jax.jit
+    def equation(params, batch):
+        alpha, sigma = broadcast_rates(schedule, t, samples)
+        x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
+        time = schedule.model_time(t)
+        given, blank = teacher._conditions(params[TEACHER], batch, drop_key)
+        variables = teacher.model_variables(params[TEACHER])
+        null = jax.tree.map(lambda value, empty: jnp.broadcast_to(empty, value.shape), given,
+                            aligned_conditions(given, blank))
+        conditional = teacher.model.apply(variables, x, time, **given)
+        unconditional = teacher.model.apply(variables, x, time, **null)
+        target = unconditional + scale.reshape(-1, 1, 1, 1) * (conditional - unconditional)
+        student_given, _ = task._conditions(params, batch, drop_key)
+        output = task.model.apply(task.model_variables(params), x, time,
+                                  **with_guidance(student_given, scale))
+        # Weighted per row as the process weighs its times: one for flow matching, EDM's lambda(sigma).
+        return jnp.mean(0.5 * jnp.square(output - target) * task.process.weight(t).reshape(-1, 1, 1, 1))
+
+    loss, _ = jax.jit(task.loss)(params, batch, step)
+    assert float(loss.total / loss.mass) == pytest.approx(float(equation(params, batch)), rel=1e-5)
     modules = [program.module.clone() for program in task.program_key()]
     task.substitute(modules)
     assert all(program.module is module for program, module in zip(task.program_key(), modules, strict=True))

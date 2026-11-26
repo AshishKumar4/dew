@@ -1067,6 +1067,26 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
+def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
+    """A one-row decode walk over 32768 keys, 32 heads over 8 key heads 64 wide in bf16, on an RTX PRO 6000,
+    whose multiprocessor states no issue interval: its issued price (`MosaicForward.price_config`'s
+    `issued`, the decode planner's) is unknown, where priced at its bytes alone it was level over every slice
+    count and the planner took two of them, 16 programs on 188 multiprocessors (M-NA-35-decodec-g4: 281 of
+    a step's 288 us); its unissued price still its own."""
+    target = generation.gpu_target("NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    query = jax.ShapeDtypeStruct((1, 1, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 32768, 8, 64), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, 32768, 1)
+    op, ba = attention_decode._bound(query, key, key, spans, None, scale=None, table=None, sources=None,
+                                     scales=None, splits=4, chosen=attention_decode.WALKS["plain"],
+                                     in_key=False)
+    with generation.assumed(target):
+        tiles = op.derived(ba, target)
+        assert tiles is not None
+        assert op.price_config(ba, tiles, target, issued=True) is None
+        assert op.price_config(ba, tiles, target) is not None
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
@@ -1184,6 +1204,17 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
             jnp.zeros(q8.shape, q8.dtype), k8, k8, template.spans(1, 4096, 8, causal=False),
             template.Hooks())
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
+
+
+def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
+    """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
+    (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at
+    width 64 on 4 slices walked 30.9 us at K128 and 37.2 at K64 (M-NA-27c-gh200), which its walk prices
+    alike."""
+    small, large = (attention_mosaic.Tiles(16, block_k, 3, 1, family="mma.sync.fed") for block_k in (64, 128))
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0, (8, large): 1.0}) == (4, large)
+    assert attention_decode.least_plan({(4, small): 1.0, (4, large): 1.0 + 2.0**-20}) == (4, small)
+    assert attention_decode.least_plan({(2, small): 1.0, (4, large): 1.0}) == (2, small)
 
 
 def _query_gated(o, q_p):

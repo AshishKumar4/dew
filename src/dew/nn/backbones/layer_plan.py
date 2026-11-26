@@ -83,6 +83,17 @@ class LayerKind:
     (`use_qk_norm`, Llama4TextAttention)."""
     mixer: MixerBase | None = None
     """This kind's mixer value, or its record. None uses the model's mixer."""
+    mixer_conv: int | None = None
+    """The taps of a causal short convolution over this kind's mixer output, on the residual's width after
+    its output projection, before it joins the residual (`ShortConvSite`, its own decode history; Inkling
+    2's `attn_sconv`), None for none."""
+    feedforward_conv: int | None = None
+    """The taps of a causal short convolution over this kind's feed-forward output before it joins the
+    residual (`ShortConvSite`, its own decode history; Inkling 2's `mlp_sconv`), None for none."""
+    depth_sites: bool = False
+    """Under attention residuals, whether each input site of this kind's mixer (`InputSites`: its query's,
+    keys' and values') reads the depth sources with its own query and norms its input with its own norm
+    (Inkling 2's full layers), or every site reads them once, through the one input norm."""
 
     def __post_init__(self):
         # A kind's mixer and ramp arrive as values from code and as records
@@ -124,6 +135,9 @@ class ResolvedKind:
     sinks: bool
     qk_norm: bool
     mixer: MixerBase | None
+    mixer_conv: int | None
+    feedforward_conv: int | None
+    depth_sites: bool
 
 
 @dataclasses.dataclass(frozen=True)

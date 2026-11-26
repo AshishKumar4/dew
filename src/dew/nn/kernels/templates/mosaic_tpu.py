@@ -29,6 +29,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     outputs as stated_outputs,
     persistent,
+    product,
     rings,
 )
 from dew.nn.kernels.templates.cost import Stated
@@ -100,6 +101,11 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def lane_columns(self) -> int:
         raise NotImplementedError(self._VALUES)
 
+    def formed(self, value: jax.Array, count: int, interpret: bool) -> tuple[jax.Array, ...]:
+        """`product.formed`'s parts as Mosaic TPU lowers them: no register layout an inline form reads."""
+        del interpret
+        return product.formed(value, count)
+
     def held_area(self, consumers: int) -> int:
         # Its accumulator and each step's product beside it, both fp32 values Mosaic TPU holds in VMEM: the
         # scoped VMEM's of them (`value_scratch`), the derivation's planner then fitting its rings beside.
@@ -169,10 +175,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
-                        pending: int = 0) -> tuple[T, jax.Array]:
-        if pending:
-            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T]
+                        ) -> tuple[T, jax.Array]:
         return between(), _product(lhs, rhs)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:

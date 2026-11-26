@@ -189,7 +189,7 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
     where `target` states no tensor rate. Leaving out the call's constant `rows` factor lets even `rows == 0`
     rank its tiles alike."""
     itemsize = jnp.dtype(dtype).itemsize
-    seconds = pricing.step_seconds(tile, target, (itemsize, itemsize))
+    seconds = pricing.step_seconds(tile, target, (itemsize, itemsize), issued=dtype)
     if seconds is None:
         return None
     row_tile, columns = pricing.tile_rows(tile, family), pricing.tile_columns(tile, family)

@@ -346,7 +346,9 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
-    documents = [slice(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
+    # Each document's rows as bounds, which a statement of the arms holds (a slice has none, so the arms ran
+    # unprepared: MAINGPU-2b1b88c39 on an A100).
+    documents = [(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
     ids = np.repeat(np.arange(1, len(lengths) + 1), lengths)[None]
 
@@ -366,13 +368,13 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
 
     def dense(q, k, v, *s):
         # Each document alone, its rows put back where the packed call holds them.
-        return jnp.concatenate([flash.flash_mha(q[None, at], k[None, at], v[None, at], **options(s))[0]
-                                for at in documents])
+        return jnp.concatenate([flash.flash_mha(q[None, b:e], k[None, b:e], v[None, b:e], **options(s))[0]
+                                for b, e in documents])
 
     def by_document(leaves):
         # Each document's rows a leaf of their own, so a document's error answers to its own budget (a
         # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
-        return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
+        return (*(leaf[b:e] for leaf in leaves[:4] for b, e in documents), *leaves[4:])
 
     # A label a cell's own: a part's store of compiled truths holds one site a label.
     label = f"packed documents {head_dim} {'causal' if causal else 'full'}{' sunk' if sunk else ''}"
@@ -848,7 +850,9 @@ def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
                                                             causal=causal, **mask)
 
-    attention_on_par(attend('cudnn'), attend('xla'), draw, f"cudnn key lengths {q_len}x{kv_len}", keep=keep)
+    # A label a cell's own: a part's store of compiled truths holds one site a label.
+    label = f"cudnn key {'mask' if as_mask else 'lengths'} {q_len}x{kv_len}"
+    attention_on_par(attend('cudnn'), attend('xla'), draw, label, keep=keep)
 
 
 def single_query_cudnn_decode_matches_float64_attention_and_gradients():

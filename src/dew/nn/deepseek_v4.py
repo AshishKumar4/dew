@@ -650,8 +650,10 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.candidates is not None:
             if self.candidates not in CANDIDATES:
                 raise ValueError(f"candidates is one of {CANDIDATES} or None, got {self.candidates!r}")
-            if self.candidate_blocks is None or self.candidate_block_size is None:
-                raise ValueError("a candidate pool is candidate_blocks blocks of candidate_block_size")
+            if (self.candidate_blocks is None or self.candidate_block_size is None
+                    or self.candidate_blocks < 1 or self.candidate_block_size < 1):
+                raise ValueError("a candidate pool is candidate_blocks blocks of candidate_block_size, "
+                                 "each at least one: a pool of none holds no candidate")
             # A Reuse layer rides its Full layer's kind and computes no selection.
             if not self.kv_shared and (self.candidates == 'source') == self.reindex:
                 raise ValueError("a Full layer builds the candidate pool and a Reindex layer "
@@ -792,8 +794,9 @@ class DeepseekV4Attention(FakeQuantizing):
             agreements = self.indexer.agreements(q_resid, keys, cos, sin)
             scores = self.indexer.weighed(agreements, x)
             blocks, block_size = self.candidate_blocks, self.candidate_block_size
-            pooled = self.candidates == 'source' and kv_store is not None
-            if pooled and blocks and block_size:
+            if self.candidates == 'source' and kv_store is not None:
+                # Setup holds a source's pool to at least one block of one entry.
+                assert blocks is not None and block_size is not None
                 sow_selection(self, scores, agreements, seen, top_k, blocks=blocks, block_size=block_size)
                 kv_store[_CSA2_CANDIDATES] = candidate_pool(scores, seen, blocks, block_size)
             else:
@@ -1122,11 +1125,20 @@ class DeepseekV4Mixer(MixerBase):
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         return self._built(DeepseekV4Attention, ctx)
 
-    def publishes(self, kv_shared: bool) -> bool:
-        """Whether a layer of this kind leaves what later layers read in the
-        kv_store: a CSA2 Full layer its entries, index keys and selection, a
-        Reindex layer its selection."""
-        return self.compressor == 'csa2' and (self.reindex or not kv_shared)
+    def publications(self, kv_shared: bool) -> tuple[frozenset[str], frozenset[str]]:
+        """`MixerBase.publications`, of the roles a CSA2 layer runs (`DeepseekV4Attention.setup`): a Reuse
+        layer (sharing) reads the entries and selection; a Reindex layer reads the entries and index keys,
+        and the candidates where it restricts to them, and writes its selection; a Full layer writes its
+        entries, index keys and selection, and the candidate pool where it is its source."""
+        if self.compressor != 'csa2':
+            return frozenset(), frozenset()
+        if kv_shared:
+            return frozenset({_CSA2_ENTRIES, _CSA2_SELECTED}), frozenset()
+        if self.reindex:
+            restricted = {_CSA2_CANDIDATES} if self.candidates == 'restrict' else set()
+            return frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, *restricted}), frozenset({_CSA2_SELECTED})
+        pooled = {_CSA2_CANDIDATES} if self.candidates == 'source' else set()
+        return frozenset(), frozenset({_CSA2_ENTRIES, _CSA2_INDEX_KEYS, _CSA2_SELECTED, *pooled})
 
     def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """This kind's attention as a DSpark stage's (`DSparkAttention`)."""

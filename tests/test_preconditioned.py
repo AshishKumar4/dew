@@ -27,7 +27,6 @@ from dew.nn.kernels.preconditioned import (
 )
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.mainloop import Tiles
 from dew.nn.precision import l2norm
@@ -365,13 +364,12 @@ def test_a_read_erase_along_its_keys_under_distinct_key_decays_is_kimis_delta_at
 
 @INTERPRETS
 @pytest.mark.parametrize('target', ['sm90', 'sm86'])
-def test_a_key_decays_read_erase_trains_on_the_template_where_its_launches_hold(target):
-    """PKDA's 16-bit training call naming the template, traced through the public gradient: on an H100 the
-    template's (the kernels its traced routes name, beside the portable tangent's); on an sm86 (99 KB a
-    block), where its key memory launch is past the part's registers with its reads (row 12890), refused as
-    the selector refuses a kernel that does not take a call (`selection.KernelRefused`), the selector and the
-    rule's gradient one predicate (`template.reads_trained`): the selector's alone took it, its pullback then
-    raising past the selection (head review of 2b18b2979)."""
+def test_a_key_decays_read_erase_trains_on_the_template(target):
+    """PKDA's 16-bit training call naming the template, traced through the public gradient, the template's
+    on an H100 and on an sm86 (99 KB a block) alike: the kernels its traced routes name, beside the portable
+    tangent's. Its key memory launch landing its inverse's gradient through its key block's landing, its
+    reads hold whole value rows on a 99 KB part (row 12890: a `[C, C]` landing of its own walked them, its
+    memory sums carried, and spilled; the part refused)."""
     drawn = operands(per_key=True, shape=TEMPLATED)(0)[:-1]
     drawn = (*(x.astype(jnp.bfloat16) for x in drawn[:3]), *drawn[3:])
 
@@ -379,10 +377,6 @@ def test_a_key_decays_read_erase_trains_on_the_template_where_its_launches_hold(
         return templated(*given, target=target)[0].astype(jnp.float32).sum()
 
     gradient = functools.partial(jax.eval_shape, jax.grad(loss, argnums=(0, 1, 2)), *drawn)
-    if target == 'sm86':
-        with pytest.raises(KernelRefused):
-            gradient()
-        return
     with generation.routes() as found:
         gradient()
     assert {route.kernel for route in found if route.choice == generation.Choice.GATED_DELTA_RULE} == {
@@ -542,8 +536,6 @@ def test_a_key_decays_read_erase_on_the_template_is_as_exact_as_its_reference(ca
     (`test_recurrence_mosaic_gradient`): a read's decay taken from another key's, or a term lost between the
     reads' gradient and the keys', moves it far past. fla's recorded PKDA sites hold it once M-JS-266b's
     fixture lands (rows 1459, 12696)."""
-    if not template.reads_trained(template.Mosaic.launched(), reads=True, per_key=True):
-        pytest.skip("a key decay's read erase trains on the portable math on this part (row 12890)")
     dew, reference, truth, draw = KEY_DECAY_CASES[case]
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
                     f"a key decay's read erase on the template: {case}", seeds=SEEDS, truth_fn=jax.jit(truth))
