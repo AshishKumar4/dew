@@ -1224,6 +1224,19 @@ class PretrainedFallback(Pretrained):
     def pipeline(self):
         return self.text_generation()
 
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model` in its model's place where `model` runs this source's own torch forward
+        (its `graph`: a loop or recompute of its layers, `TorchCausalLM.with_loop`), its parameters this
+        source's, none drawn; any other model as `Pretrained.with_model` places it."""
+        from dew.interop.torchax_fallback import TorchCausalLM
+
+        if isinstance(model, TorchCausalLM) and isinstance(self.model, TorchCausalLM):
+            if model.graph is not self.model.graph:
+                raise ValueError("a tier-3 source's model in its place runs the source's own torch forward "
+                                 "(`graph`), whose parameters it holds")
+            return replace(self, model=model)
+        return super().with_model(model, key=key)
+
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
         (`PretrainedDecoder.text_generation`)."""
