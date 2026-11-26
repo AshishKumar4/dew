@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.continuum import HeadTerms, HeadTransform, _head_growth, _squared_norm, continuum_modules
-from dew.nn.dense import Dense, watched_or_owned
+from dew.nn.dense import Dense, packed_ternary, watched_or_owned
 
 from ..activations import _SLOPES, UNGATED, ungated_activation
 from ..blocks import normal_kernel
@@ -150,11 +150,13 @@ def output_table(decoder: CausalTransformer) -> OutputTable | None:
     """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
     (`head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
     level, or where `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s
-    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's."""
+    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's; or where it serves a
+    packed ternary kernel (`dense.packed_ternary`)."""
     layers = [*([] if decoder.tie_embeddings else [decoder.lm_head]),
               *([] if decoder.embedding_features is None else [decoder.project_out])]
     if (decoder.head_transform is not None or decoder.continuum is not None
-            or any(set(layer.variables.get("params", {})) != {"kernel"} for layer in layers)):
+            or any(set(layer.variables.get("params", {})) != {"kernel"} or packed_ternary(layer)
+                   for layer in layers)):
         return None
     return head_table(decoder)
 

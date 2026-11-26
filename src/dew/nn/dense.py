@@ -19,9 +19,11 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
+import dataclasses
 import functools
 import importlib.util
 import inspect
+import math
 import sys
 import types
 from collections.abc import Callable, Iterable, Mapping
@@ -37,7 +39,7 @@ from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed
 from .kernels import projections
-from .kernels.formats import NvFp4
+from .kernels.formats import NvFp4, TernaryWeights
 from .precision import accumulated, biased, float32_dot_general, refuse_recipe
 from .sharding import contracted_alike, declared
 
@@ -52,13 +54,22 @@ stack, a packed group, a pipeline) carries it with the weights it scales."""
 
 
 def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
-    """`module`'s matrix `name`: the packed NVFP4 matrix its `QUANTIZATION` collection holds under the name
-    (`dew.nn.kernels.formats.NvFp4`, a checkpoint's 4-bit weight served as its codes: an expert bank's
-    `[experts, in, out]`, row 4516, a Linear's kernel `[in, out]`, row 8550), else its parameter, `make()`.
+    """`module`'s matrix `name`: the packed matrix its `QUANTIZATION` collection holds under the name (a
+    checkpoint's weight served as its codes: `dew.nn.kernels.formats.NvFp4`'s 4-bit, an expert bank's
+    `[experts, in, out]`, row 4516, a Linear's kernel `[in, out]`, row 8550; a Linear's BitNet b1.58
+    `TernaryWeights`, row 1464), else its parameter, `make()`.
     The one reader of a packed matrix every layer that multiplies one takes (row 11641)."""
     if module.has_variable(QUANTIZATION, name):
         return module.get_variable(QUANTIZATION, name)
     return make()
+
+
+def packed_ternary(module: nn.Module, name: str = "kernel") -> bool:
+    """Whether `module`'s matrix `name` is a packed BitNet b1.58 matrix (`packed_matrix`'s, row 1464): its
+    layer quantizes its input a token at a time, so no matrix alone is its product, whatever its `params`
+    hold (`quantization.LinearProducts.nonlinear_input`, `decoder_head.output_table`)."""
+    return module.has_variable(QUANTIZATION, name) and isinstance(module.get_variable(QUANTIZATION, name),
+                                                                   TernaryWeights)
 
 
 def watched_or_owned(module: nn.Module) -> bool:
@@ -469,7 +480,7 @@ class Dense(_LinearEnvelope, nn.Dense):
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
-        if isinstance(kernel, NvFp4):
+        if isinstance(kernel, (NvFp4, TernaryWeights)):
             return self._packed(inputs, kernel)
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
@@ -484,18 +495,20 @@ class Dense(_LinearEnvelope, nn.Dense):
 
 
     @nn.nowrap
-    def _packed(self, inputs: Array, matrix) -> jax.Array:
-        """The layer over its packed kernel (`packed_matrix`, a checkpoint's 4-bit weight
-        served as its codes, row 8550): its NVFP4 product (`gemm.nvfp4_product`: the inputs rounded to
-        bfloat16, each code times its block's scale exact, the sums in fp32 and the matrix's tensor scale
-        after), its fp32 sum plus its bias rounded once to the layer's dtype. Frozen, as the codes are a
+    def _packed(self, inputs: Array, matrix: NvFp4 | TernaryWeights) -> jax.Array:
+        """The layer over its packed kernel (`packed_matrix`, a checkpoint's weight served as its codes):
+        an NVFP4 matrix's product (`gemm.nvfp4_product`, row 8550: the inputs rounded to bfloat16, each code
+        times its block's scale exact, the sums in fp32 and the matrix's tensor scale after) or a BitNet
+        b1.58 ternary matrix's (`gemm.ternary_weight_product`, row 1464: the inputs quantized a token at a
+        time to int8, each {-1, 0, 1} code's product exact, the scales after), its fp32 sum plus its bias
+        rounded once to the layer's dtype. Frozen, as the codes are a
         checkpoint's; a quantization rule over the site (Qwix's) quantizes a kernel, which a packed one is
         not, and is refused. An input quantization of other sites (a source's stored input scales) leaves
         it as it is: a packed weight's source stores none for it (`codecs.SourceQuantization.as_nvfp4`)."""
-        from dew.nn.kernels.gemm import nvfp4_product
+        from dew.nn.kernels.gemm import nvfp4_product, ternary_weight_product
 
         if _ruled():
-            raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's NVFP4 codes, served as they "
+            raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's codes, served as they "
                              "are), and a quantization rule owns its product: load it without packed_weights")
         width = jnp.shape(inputs)[-1]
         if tuple(matrix.shape) != (width, self.features):
@@ -505,8 +518,14 @@ class Dense(_LinearEnvelope, nn.Dense):
                                             else self.kernel_axes[-1:]), (self.features,), self.param_dtype)
                 if self.use_bias else None)
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
-        rows = jnp.reshape(inputs, (-1, width))
-        summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
+        # The rows counted, not inferred: a packed matrix of no depth takes inputs of no width.
+        rows = jnp.reshape(inputs, (math.prod(jnp.shape(inputs)[:-1]), width))
+        if isinstance(matrix, TernaryWeights):
+            # Frozen, its scale too: the product differentiates in its scale (`ternary_weight_product`).
+            frozen = dataclasses.replace(matrix, scale=jax.lax.stop_gradient(matrix.scale))
+            summed = ternary_weight_product(rows, frozen, out_dtype=jnp.float32)
+        else:
+            summed = nvfp4_product(rows, matrix, out_dtype=jnp.float32)
         if bias is not None:
             summed = summed + jnp.asarray(bias, jnp.float32)
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))

@@ -276,6 +276,9 @@ def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> ja
     apart rounds its own); `joins` says when the result is theirs."""
     if axis not in (-2, -1):
         raise ValueError(f"the projections stack on output axis -2 or -1, not {axis}")
+    if x.size == 0:
+        # An empty product joins nothing: each projection's own call, its plain dot and bias (row 13328).
+        return jnp.stack([projection(x) for projection in projections], axis=axis)
     leaves = _leaves(projections, x.shape[-1])
     if leaves is None:
         raise ValueError("the joined projections hold no kernel or bias of the shapes their calls declare: "

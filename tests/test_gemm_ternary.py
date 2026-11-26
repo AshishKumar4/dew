@@ -583,6 +583,59 @@ def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
         np.testing.assert_array_equal(np.asarray(mapped(rows, scales, dy)), want)
 
 
+@pytest.mark.parametrize("use_bias", [False, True], ids=["no bias", "bias"])
+def test_a_dense_layer_serves_a_packed_ternary_kernel_as_its_ternary_product(use_bias):
+    """A Dense layer whose `quantization` collection holds a packed BitNet b1.58 kernel
+    (`formats.TernaryWeights`, a checkpoint's weight served as its codes, row 1464) holds no kernel parameter
+    and computes BitNet's product of it plus its bias, rounded once to its dtype, bitwise: its inputs
+    quantized a token at a time to int8, times the unpacked {-1, 0, 1} codes, summed exactly, then the
+    scales; its scale frozen (no cotangent), its inputs' straight through."""
+    from dew.nn.dense import QUANTIZATION, Dense
+
+    rng = np.random.default_rng(1464)
+    codes = rng.integers(-127, 128, size=(16, 256)).astype(np.float32)
+    codes[:, 0] = 127
+    values = codes * 2.0 ** -7
+    # One entry off the int8 grid (2^-9 beside a peak of 127 * 2^-7): its code is zero, which an
+    # unquantized product would not read.
+    values[0, 1] = 2.0 ** -9
+    codes[0, 1] = 0
+    x = jnp.asarray(values.reshape(2, 8, 256), jnp.bfloat16)
+    weights = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32), scale=0.5)
+    bias = jnp.asarray(rng.standard_normal((64,)) * 4, jnp.float32).astype(jnp.bfloat16).astype(jnp.float32)
+    layer = Dense(64, dtype=jnp.bfloat16, use_bias=use_bias)
+
+    def run(x, weights):
+        variables = {QUANTIZATION: {"kernel": weights}, **({"params": {"bias": bias}} if use_bias else {})}
+        return layer.apply(variables, x)
+
+    out = jax.jit(run)(x, weights)
+    # BitNet's arithmetic written out (as `test_a_ternary_weight_product_quantizes_its_activations_as_...`):
+    # each row's largest is 127 * 2^-7, so its int8 codes are `codes`; their exact products with the
+    # unpacked codes, then the row's largest over 127 and the matrix's scale.
+    exact = jax.lax.dot(jnp.asarray(codes, jnp.bfloat16), weights.unscaled(jnp.bfloat16),
+                        preferred_element_type=jnp.float32)
+    summed = precision.twice_scaled(precision.divided(exact, jnp.float32(127.0)),
+                                    jnp.full((16, 1), 127 * 2.0 ** -7, jnp.float32), jnp.float32(0.5))
+    expected = (summed + (bias if use_bias else 0)).astype(jnp.bfloat16).reshape(2, 8, 64)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
+    _, pull = jax.vjp(run, x, weights)
+    d_x, d_weights = pull(jnp.ones((2, 8, 64), jnp.bfloat16))
+    assert not np.any(np.asarray(d_weights.scale)) and np.any(np.asarray(d_x, np.float32))
+
+
+def test_a_dense_layer_of_no_depth_serves_its_packed_ternary_kernel():
+    """A Dense layer over inputs of no width and a packed ternary kernel of no depth (`[0, 64]`) is its
+    bias: the empty contraction's zeros (row 1464's review: its rows inferred from no width failed)."""
+    from dew.nn.dense import QUANTIZATION, Dense
+
+    weights = formats.TernaryWeights.of(jnp.zeros((0, 64), jnp.float32))
+    bias = jnp.arange(64, dtype=jnp.float32)
+    out = Dense(64, dtype=jnp.float32).apply({QUANTIZATION: {"kernel": weights}, "params": {"bias": bias}},
+                                             jnp.zeros((2, 3, 0), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(out), np.broadcast_to(np.asarray(bias), (2, 3, 64)))
+
+
 def test_a_ternary_matrix_at_a_scale_neither_zero_nor_finite_normal_is_refused_where_packed_and_restored():
     """A BitNet b1.58 matrix's fp32 scale is zero or a finite normal (row 13340): a subnormal one given to
     `TernaryWeights.of` is refused, as are an infinity and a NaN; so is a negative subnormal among a

@@ -164,3 +164,20 @@ def test_a_narrow_heads_call_keeps_its_adapters_its_watchers_and_its_promotion()
         np.testing.assert_array_equal(
             np.asarray(narrow.apply(variables, hidden, method="logits_from_hidden")),
             np.asarray(full.apply(variables, hidden, method="logits_from_hidden"))[..., :SCORED])
+
+
+def test_a_head_serving_a_packed_ternary_kernel_has_no_affine_table():
+    """An untied head whose `lm_head` serves a packed BitNet b1.58 kernel (its `quantization` collection,
+    `dense.Dense._packed`, row 1464) beside its own parameter has no output table: its product quantizes its
+    input a token at a time, so no matrix alone is it (row 1464's review)."""
+    from dew.nn.dense import QUANTIZATION
+    from dew.nn.kernels.formats import TernaryWeights
+
+    model = _decoder(tied=False)
+    ids = jnp.asarray(np.random.default_rng(0).integers(1, ROWS, (1, 4)), jnp.int32)
+    variables = nn.unbox(model.init(jax.random.key(0), ids))
+    assert model.bind(variables).output_table() is not None
+    # The table reads which kernel the head serves, not its values: a stage-whole ternary kernel stands in.
+    packed = TernaryWeights.of(jnp.zeros((256, ROWS), jnp.float32))
+    held = {**variables, QUANTIZATION: {"lm_head": {"kernel": packed}}}
+    assert model.bind(held).output_table() is None
