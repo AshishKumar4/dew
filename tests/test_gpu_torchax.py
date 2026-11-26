@@ -5,6 +5,8 @@ no process with the torch-using ones (`gpu_flow`):
 - A float32 torchax model's logits and its output tables are as exact as torch's under the GPU's TF32
   default (test_torchax_fallback).
 - A tier-3 source loads and runs in a process of the GPU alone, with no CPU backend (test_torchax_fallback).
+- A bf16 tier-3 Qwen3-Next steps through Dew's native norm, SiLU-product and delta-rule kernels, its loss and
+  gradients as exact as transformers' (test_torchax_fallback, row 13280).
 """
 
 import pytest
@@ -23,4 +25,7 @@ def test_the_torchax_fallback_runs_on_the_gpu(tmp_path):
                  tmp_path / "exact")),
         Cell("a tier-3 source runs in a process with no CPU backend",
              lambda: fallback.a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path / "alone")),
+        Cell("a bf16 tier-3 Qwen3-Next steps through Dew's native kernels as exactly as transformers",
+             lambda: fallback.a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(
+                 tmp_path / "kernels")),
     ])

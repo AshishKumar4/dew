@@ -1711,6 +1711,52 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
                     truth_fn=torch_arm(wide, float64))
 
 
+QWEN3_NEXT_GPU = {**QWEN3_NEXT, "hidden_size": 256, "head_dim": 64, "intermediate_size": 512,
+                  "linear_key_head_dim": 128, "linear_value_head_dim": 128}
+"""`QWEN3_NEXT` at widths the GPU's kernels take (the delta net's heads of 128, its port's), bf16."""
+
+
+def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
+    """On a GPU, a bf16 Qwen3-Next taken to tier 3 (`kernel_parts`, row 13044) steps through Dew's native
+    kernels where a native model's would: its RMSNorms' fused norm (`rms_norm_forward`, its backward), its
+    gated MLPs' fused SiLU product (`swiglu_forward`, its backward) and its delta net's chunked rule's
+    kernels (fla's port, `fla_*`), each launched in its step's program; and its LM loss and every
+    parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1, row
+    13280), where the CPU's float32 witness reaches XLA's arithmetic alone."""
+    from dew.nn.programs import equations
+
+    torch.manual_seed(0)
+    model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT_GPU)).eval()
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="bfloat16", fallback="torchax")
+    params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
+    tokens = np.random.default_rng(0x13280).integers(0, QWEN3_NEXT["vocab_size"], (ROWS, SEQ + 1)).astype(
+        np.int32)
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    program = jax.make_jaxpr(jax.grad(lambda params: objective_loss(
+        objective, {**loaded.variables, "params": params}, tokens, scalar=True)))(params)
+    names = {str(eqn.params["name"]) for eqn in equations(program.jaxpr)
+             if eqn.primitive.name == "pallas_call"}
+    for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
+        assert kernel in names, (kernel, sorted(names))
+    assert any(name.startswith("fla_") for name in names), sorted(names)
+    reference = copy.deepcopy(model).to(torch.bfloat16)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    @as_given
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.bfloat16)
+
+    assert_as_exact(loss_and_gradients(loaded, reference, params),
+                    as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent, torch.bfloat16)),
+                    token_draws(tokens), "tier 3 bf16 Qwen3-Next LM step", seeds=UNREGISTERED_SEEDS,
+                    truth_fn=truth_fn)
+
+
 def a_tier_three_source_runs_in_a_process_with_no_cpu_backend(tmp_path):
     """A tiny Longcat Flash, admitted to tier 3, loads and runs in a process of this GPU alone
     (`JAX_PLATFORMS=cuda`, no CPU backend): its admission decides its causality from its programs

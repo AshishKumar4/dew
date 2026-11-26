@@ -174,22 +174,31 @@ def _is_chunk_rule(bound) -> bool:
 
 def _dew_chunk_rule(original: Callable) -> Callable:
     """transformers' chunked delta rule's signature over Dew's (`chunk_gated_delta_rule`): queries and keys
-    l2-normalized in float32 where asked (FLA's `l2norm` at 1e-6), the rule over float32 operands, its output
-    in the queries' dtype; `original` where it runs outside a trace or packs documents (`cu_seqlens`)."""
+    l2-normalized in float32 where asked (FLA's `l2norm` at 1e-6), the rule over its kernel's operands (the
+    source's dtype where its kernel takes them, else float32), its output in the queries' dtype; `original`
+    where it runs outside a trace or packs documents (`cu_seqlens`)."""
     def rule(query, key, value, g, beta, chunk_size=64, initial_state=None, output_final_state=False,
              use_qk_l2norm_in_kernel=False, **kwargs):
         from torchax.interop import jax_view, torch_view
 
-        from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule
+        from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, kernel_routed
         from dew.nn.precision import l2norm
 
         if kwargs.get('cu_seqlens') is not None or not _traced(query):
             return original(query, key, value, g=g, beta=beta, chunk_size=chunk_size,
                             initial_state=initial_state, output_final_state=output_final_state,
                             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs)
-        q, k, v, decay, write = (x.astype(jnp.float32) for x in jax_view((query, key, value, g, beta)))
+        given = jax_view((query, key, value))
+        q, k, v, decay, write = (x.astype(jnp.float32) for x in (*given, *jax_view((g, beta))))
         if use_qk_l2norm_in_kernel:
             q, k = l2norm(q, 1e-6), l2norm(k, 1e-6)
+        # The rule's operands rounded once to the dtype it takes, as a native layer's (`linear.py`'s gated
+        # delta net): the projections' where the kernel takes them (`kernel_routed`, a bf16 source on a
+        # GPU), float32 for the portable arithmetic (row 13280).
+        narrow = given[0].dtype
+        if narrow != jnp.float32 and q.shape[1] > 1 and kernel_routed(
+                *(x.astype(narrow) for x in (q, k, v)), decay, write, unit_queries=use_qk_l2norm_in_kernel):
+            q, k, v = (x.astype(narrow) for x in (q, k, v))
         state = None if initial_state is None else jax_view(initial_state).astype(jnp.float32)
         # Attested causal over the queries' positions (`sequence_causality.CAUSAL_ATTENTION`): each token's
         # output reads its own and earlier tokens' queries, keys, values, decays and writes and the whole
