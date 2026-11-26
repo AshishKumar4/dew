@@ -445,25 +445,28 @@ class TpuTime:
         return sum(op.milliseconds for op in self.kernels(fn, *args, evicted=evicted)) / 1e3
 
     def _read(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
-        """One capture of `fn(*args)` after an untimed call, read on the devices its arrays are on (the
+        """One capture of `fn(*args)` after an untimed call, by Dew's profiler (`dew.telemetry.profile
+        .Profiler`: no reports and no HLO, its trace alone read), on the devices its arrays are on (the
         default one where it takes none)."""
         import tempfile
 
-        from jax import profiler
+        from dew.telemetry.profile import CaptureOptions, Profiler
 
         devices = {device.id for leaf in jax.tree.leaves(args) if isinstance(leaf, jax.Array)
                    for device in leaf.devices()} or {jax.devices()[0].id}
         jax.block_until_ready(fn(*args))
         with tempfile.TemporaryDirectory() as directory:
+            profiler = Profiler(directory, options=CaptureOptions(hlo=False).profile_options(), reports=False)
             try:
-                profiler.start_trace(directory)
+                profiler.start()
             except RuntimeError as error:
                 raise CaptureHeld(str(error)) from error
             try:
                 jax.block_until_ready(fn(*args))
             finally:
-                profiler.stop_trace()
-            return tpu_ops(directory, devices)
+                profiler.stop()
+            (capture,) = profiler.captures
+            return tpu_ops(capture, devices)
 
 
 @contextlib.contextmanager
