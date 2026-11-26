@@ -1144,3 +1144,24 @@ def test_twice_scaled_keeps_the_plain_products_overflow_and_non_finite_values():
         assert got == want or (np.isnan(got) and np.isnan(want)), (product, first, second, got, want)
     grads = jax.grad(lambda *ops: twice_scaled(*ops), argnums=(0, 1, 2))(f32(3.0), f32(0.5), f32(4.0))
     assert tuple(float(g) for g in grads) == (2.0, 12.0, 1.5)
+
+
+def test_a_steps_scales_are_ordered_so_no_intermediate_overflows_or_underflows():
+    """`precision.ranged_scaled` (an FP8 step's partial, 2^-18 to 2^25, times its row and column scales, the
+    native blockwise step's order): two scales near 2^64 give 2^122 of a 2^-6 partial, not infinity; two
+    near 2^-70 give 2^-120 of a 2^20 partial, not their product's underflow; far-apart normal scales
+    (2^100 and 2^-120) their product's; a true overflow overflows; zeros and NaN as the plain product
+    (rows 13257, 13274)."""
+    from dew.nn.precision import ranged_scaled
+
+    f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
+
+    def scaled(value, first, second):
+        return float(ranged_scaled(f32(value), f32(first), f32(second), binades=(-18, 25)))
+
+    assert scaled(2.0 ** -6, 2.0 ** 64, 2.0 ** 64) == 2.0 ** 122
+    assert scaled(2.0 ** 20, 2.0 ** -70, 2.0 ** -70) == 2.0 ** -120
+    assert scaled(3.0, 2.0 ** 100, 2.0 ** -120) == 3.0 * 2.0 ** -20
+    assert scaled(2.0 ** 25, 2.0 ** 64, 2.0 ** 64) == np.inf
+    assert scaled(0.0, 2.0 ** 100, 2.0 ** 100) == 0.0
+    assert np.isnan(scaled(1.0, np.nan, 2.0))
