@@ -1853,7 +1853,7 @@ def test_a_subnormal_read_scale_keeps_the_primal_and_pullback_in_range(side):
     cotangent = np.asarray([giant], np.float32)
 
     def read(q, h):
-        return scan._read(h, q, False, scale)
+        return scan._read(h, q, values_read=False, scale=scale)
 
     def orders(q, h, ct):
         out, pull = jax.vjp(read, q, h)
@@ -1867,6 +1867,41 @@ def test_a_subnormal_read_scale_keeps_the_primal_and_pullback_in_range(side):
     np.testing.assert_array_equal(dh, reader[:, None] * 0.5)
     np.testing.assert_array_equal(moved, state[:, 0] * 0.5)
     np.testing.assert_array_equal(mixed, [2.0 ** 126])
+
+
+def test_a_mixed_width_subnormal_read_uses_the_first_multiply_dtype_for_admission():
+    scale = np.float32(2.0 ** -149)
+
+    def read(q, h):
+        return scan._read(h, q, values_read=False, scale=scale)
+
+    def orders(q, h, cotangent):
+        value, pull = jax.vjp(read, q, h)
+        return value, pull(cotangent)
+
+    with jax.enable_x64():
+        value, (dq, dh) = jax.jit(orders)(np.asarray([0.25], np.float32), np.asarray([[2.0 ** 127]], np.float64),
+                                          np.asarray([2.0 ** 100], np.float64))
+    assert value.dtype == jnp.float64
+    np.testing.assert_array_equal(value, [2.0 ** -24])
+    np.testing.assert_array_equal(dq, [2.0 ** 78])
+    np.testing.assert_array_equal(dh, [[2.0 ** -51]])
+
+
+def test_a_rank_one_subnormal_read_keeps_the_explicit_value_axis():
+    from jax.sharding import AbstractMesh, AxisType, NamedSharding, PartitionSpec, use_abstract_mesh
+
+    mesh = AbstractMesh((2,), ("value",), axis_types=(AxisType.Explicit,))
+    whole = jax.ShapeDtypeStruct((3,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec()))
+    values = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec("value")))
+
+    def read(q, left, right):
+        return scan._read((left, right), q, values_read=False, scale=np.float32(2.0 ** -128))
+
+    with use_abstract_mesh(mesh):
+        out = jax.eval_shape(read, whole, whole, values)
+    assert out.shape == (4,)
+    assert out.sharding == values.sharding
 
 
 DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}

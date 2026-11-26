@@ -1106,9 +1106,9 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
 
     def value(*operands):
         factor = scale if scale_dtype is None else jnp.asarray(scale, dtype=scale_dtype)
-        dtype = jnp.result_type(factor, *operands)
-        if jnp.issubdtype(dtype, jnp.floating) and 0 < abs(float(scale)) < jnp.finfo(dtype).tiny:
-            return _subnormal_contract(axes, output, operands, scale, dtype)
+        first = jnp.result_type(factor, operands[0])
+        if jnp.issubdtype(first, jnp.floating) and 0 < abs(float(scale)) < jnp.finfo(first).tiny:
+            return _subnormal_contract(axes, output, operands, scale, jnp.result_type(factor, *operands))
         return _portable_einsum(subscripts, factor * operands[0], *operands[1:])
 
     def tangent(primals, tangents):

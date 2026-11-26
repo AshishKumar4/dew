@@ -14,6 +14,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src.lax import lax as lax_internal
 from jax.interpreters import ad, batching
 from jax.sharding import PartitionSpec
 
@@ -422,14 +423,16 @@ def _ratio_value(*operands, form: Ratio):
 
 
 def _ratio_abstract(*operands, form: Ratio):
-    """A ratio's result type: its operands' broadcast (each laid along the trailing axes, `_laid_to`), its
-    sharding the full operand's, without the reduced axis (`_without_axis`), varying along every manual axis
-    an operand varies along (`scaled.varying`), weak where every operand is."""
+    """A ratio's broadcast type over the operands laid along trailing axes, without the reduced axis;
+    varying along every manual axis an input varies along and weak where every operand is."""
     rank = max(operand.ndim for operand in operands)
     shape = np.broadcast_shapes(*(operand.shape + (1,) * (rank - operand.ndim) for operand in operands))
     full = next((operand for operand in operands if operand.shape == shape), None)
-    typed = scaled.varying((full if full is not None else operands[0].update(shape=shape)).update(
-        weak_type=all(operand.weak_type for operand in operands)), *operands)
+    base = full if full is not None else operands[0].update(shape=shape)
+    if full is None and any(operand.sharding.mesh.explicit_axes for operand in operands):
+        laid = [operand.update(shape=operand.shape + (1,) * (rank - operand.ndim)) for operand in operands]
+        base = base.update(sharding=lax_internal.broadcasting_sharding_rule("algebra_ratio", *laid))
+    typed = scaled.varying(base.update(weak_type=all(operand.weak_type for operand in operands)), *operands)
     summed = (*form.over, *form.across)
     if summed:
         spec = (*typed.sharding.spec, *(None,) * (typed.ndim - len(typed.sharding.spec)))
