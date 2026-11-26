@@ -511,9 +511,11 @@ def laid(condition, like: jax.Array) -> jax.Array:
 
 
 def _warpgroup_barrier(ctx) -> None:
-    """A warpgroup's barrier (`synced`), inlined: synchronization alone, no work a count prices."""
+    """A warpgroup's barrier (`synced`), inlined, collective: every thread of the warpgroup reaches it from
+    one program point, so the fork drops a repeat of it (`core._drop_repeated_barriers`); synchronization
+    alone, no work a count prices."""
     del ctx
-    mgpu_utils.warpgroup_barrier()
+    mgpu_utils.warpgroup_barrier(collective=True)
 
 
 def synced(interpret: bool) -> None:

@@ -1067,6 +1067,23 @@ def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
         query=(64, 64, jnp.bfloat16))
 
 
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("backend, target", [("mosaic", "sm90"), ("triton", "sm80")],
+                         ids=["mosaic sm90", "triton sm80"])
+def test_an_output_hook_taking_erf_lowers(backend, target):
+    """An output hook taking erf (a GELU gate, `o * Φ(o)`) lowers in the Mosaic forward for an H100, whose
+    warpgroup layout inference had no rule for math.erf ('No layout inference rule defined for math.erf
+    vector<64x64xf32>'), and in the Triton forward for an A100, Pallas Triton lowering it by libdevice's erf
+    where it had no rule for lax.erf (row 12426; Dew's fork from post134)."""
+    from dew.nn.kernels.templates import attention_triton
+
+    forward = attention_mosaic.forward if backend == "mosaic" else attention_triton.forward
+    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    hooks = template.Hooks(output=Hook(lambda o: o * 0.5 * (1.0 + jax.lax.erf(o * 0.7071067811865476))))
+    spans = template.spans(256, 256, 1, causal=True)
+    lowered_for(lambda q, k, v: forward(q, k, v, spans, hooks), (shape,) * 3, target)
+
+
 def _fullest(op, ba, target):
     """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))

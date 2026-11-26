@@ -884,10 +884,10 @@ class _Counting:
         return next((index for axis, index in found.items() if name in (axis, (axis,))), None)
 
     def scoped(self, equation, values: list, given: list[bool]) -> list:
-        """A scope (`run_scoped`): its operands its body's constants, its body's inputs the refs it
-        allocates."""
+        """A scope (`run_scoped`): its body's leading inputs its operands, the rest the refs it allocates."""
         body = equation.params["jaxpr"]
-        return self.run(body, [_barrier(var) for var in body.invars], values, constant_static=given)
+        allocated = body.invars[len(values):]
+        return self.run(body, [*values, *map(_barrier, allocated)], static=given)
 
     def loop(self, equation, values: list, given: list[bool]) -> None:
         """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
@@ -1170,10 +1170,9 @@ def layouts(jaxpr) -> dict:
 
 
 
-def _laid_out(jaxpr, given: Sequence, found: dict, consts: Sequence = ()) -> list:
-    """The layouts of `jaxpr`'s outputs, its inputs' `given` and its constants' `consts` (a scope's operands,
-    none other's), each value's noted in `found` (a value two visits lay out apart, a body's two calls',
-    none)."""
+def _laid_out(jaxpr, given: Sequence, found: dict) -> list:
+    """The layouts of `jaxpr`'s outputs, its inputs' `given` (its constants' none), each value's noted in
+    `found` (a value two visits lay out apart, a body's two calls', none)."""
     known: dict = {}
 
     def note(var, layout) -> None:
@@ -1187,8 +1186,7 @@ def _laid_out(jaxpr, given: Sequence, found: dict, consts: Sequence = ()) -> lis
     def of(atom):
         return known.get(atom) if isinstance(atom, jax_core.Var) else None
 
-    for var, layout in [*zip(jaxpr.invars, given, strict=True),
-                        *zip(jaxpr.constvars, consts or [None] * len(jaxpr.constvars), strict=True)]:
+    for var, layout in [*zip(jaxpr.invars, given, strict=True), *((var, None) for var in jaxpr.constvars)]:
         note(var, layout)
     for equation in jaxpr.eqns:
         laid = _equation_layouts(equation, [of(atom) for atom in equation.invars], found)
@@ -1229,9 +1227,9 @@ def _equation_layouts(equation, given: list, found: dict) -> list:
                 if layout is not None and tuple(getattr(atom.aval, "shape", ())) == shape}
         return [next(iter(held))] if len(held) == 1 else unknown
     if primitive is pallas.run_scoped_p:
-        # Its operands its body's constants (`pallas.run_scoped`), its inputs the refs it allocates.
+        # Its body's leading inputs its operands (`pallas.run_scoped`), the rest the refs it allocates.
         body = params["jaxpr"]
-        return _laid_out(body, [None] * len(body.invars), found, consts=given)
+        return _laid_out(body, [*given, *[None] * (len(body.invars) - len(given))], found)
     if primitive is mpmd.mpmd_map_p:
         # A warp mesh's or a kernel's regions, each its own body over its refs.
         for region in params["jaxprs"]:
