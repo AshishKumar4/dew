@@ -184,7 +184,7 @@ class PhasePasses[L, E]:
         # The precision an unpinned product multiplies at as it is read, resolved (`effective_precision`) and
         # named canonically (`precision_names`: 'highest' and 'float32' one), none where JAX's is unset:
         # numerics at "default" leave JAX's own setting, which another context may set otherwise.
-        products: list[JSON] = sorted(precision_names(effective_precision(None)))
+        products: list[JSON] = [*sorted(precision_names(effective_precision(None)))]
         return {**objective.training_record(), **sampled, "numerics": numerics, "products": products}
 
     def drawn_cap(self) -> int | None:
