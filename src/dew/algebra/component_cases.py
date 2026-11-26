@@ -693,11 +693,11 @@ def _gemm_scale_draw(seed, operands):
 
 def _fp8_epilogue_truth(acc):
     # The recipe first stores its rounded activation, then scales each 128 columns independently.
-    stored = acc.astype(jnp.bfloat16)
-    blocks = stored.astype(jnp.float64).reshape(acc.shape[0], -1, 128)
+    stored = acc.astype(jnp.bfloat16).astype(jnp.float64)
+    blocks = stored.reshape(acc.shape[0], -1, 128)
     maximum = jnp.maximum(jnp.max(jnp.abs(blocks), axis=-1, keepdims=True), 1e-4)
     power = jnp.exp2(jnp.ceil(jnp.log2(maximum / 448)))
-    encoded = jnp.clip(blocks / power, -448, 448).astype(jnp.float8_e4m3fn)
+    encoded = jnp.clip(blocks / power, -448, 448).astype(jnp.float8_e4m3fn).astype(jnp.float64)
     return stored, encoded.reshape(acc.shape), jnp.broadcast_to(power, blocks.shape).reshape(acc.shape)
 
 
