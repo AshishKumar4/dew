@@ -1296,7 +1296,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
     take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
     independently rounded inverse, decay and readout paths (row 1966);
     A subnormal static readout scale stays in the unlanded contraction, including in transpose:
-    the prepared chunk uses the token loop for that case instead of scaling its reader before a dot.
+    the prepared chunk uses the token loop with each step's split decay applied to the live state,
+    rather than landing either its decay or its reader's scale early.
   - no `error_free` set: the e-graph's equality is the reals', in which a transform's error term is zero, so
     extraction would cancel what a rule wrote. A derivation's compensated form is the declaration's own
     numerics (`Reduction.exponential`, `rescale`: the natural exponent through `two_product` and `2**k`) or
