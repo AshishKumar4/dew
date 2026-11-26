@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, assert_computes_the_oracle, equations
-from test_algebra import cheaper_spliced, rows, traces_cheaper, two_sums
+from test_algebra import cheaper_spliced, count_above, rows, traces_cheaper, two_sums
 
 from dew import algebra
 from dew.algebra import cost, program, terms
@@ -1131,8 +1131,6 @@ def test_an_algebra_span_joins_the_windows_around_it():
     opens into the region around it, so a sum inside it and a sum outside it take one cheaper form, no
     marked call left, and the program computes what it computes (check 1)."""
     from dew.nn.derivatives import Algebra, marked
-
-    from test_algebra import count_above
 
     def spanning(x, y, a):
         return marked(Algebra(), count_above)(x, a) + count_above(y, a)

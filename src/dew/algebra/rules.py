@@ -702,7 +702,7 @@ def _linear() -> tuple[RuleFamily, ...]:
     reaches (`dominated`, §6.3), each stating its own (`made`)."""
     x, y, a, t = vars_("x y a t", Term)
     axes, extent = vars_("axes extent", Vec[i64])
-    params, laid, axis, added, multiplied, summed = vars_("params laid axis added multiplied summed", i64)
+    laid, axis, added, multiplied, summed = vars_("laid axis added multiplied summed", i64)
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
     # The factored product too: `a (x + y)` rounds `x + y` before the product, so it may pass the float's

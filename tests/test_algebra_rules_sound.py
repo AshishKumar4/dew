@@ -479,7 +479,7 @@ def _named(conditions, fact: str) -> set[str]:
         named = getattr(inner.callable, "ident", None) if isinstance(inner, decl.CallDecl) else None
         if named is not None and named.name == fact:
             argument = _inner(inner.args[0])
-            if fact == "counting_sum":
+            if fact == "counting_sum" and isinstance(argument, decl.CallDecl):
                 argument = _inner(argument.args[0])
             found.add(argument.name)
     return found
