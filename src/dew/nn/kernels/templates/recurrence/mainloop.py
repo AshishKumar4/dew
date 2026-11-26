@@ -881,9 +881,10 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     staging tiles (its landing's last) and landing tiles: the one account a launch's legality and its plan
     both read; a launch issuing no products (not `issues`) scopes none of theirs, and one whose arithmetic
     reduces across warps implicitly its `reducing` warpgroups' share of the scratch (`resources.Scope`).
-    Its staging tiles read only past its walks (`after_walks`, `launch_kernel`'s) are counted in a scope of
-    their own after the walks where its family scopes its walks apart (`Family.walks_scoped`), beside its
-    staging otherwise, as `Family.scoped` allocates them; neither in the staging returned."""
+    Its staging tiles read only past its walks (`after_walks`, `launch_kernel`'s) are counted as one scope
+    of their own past the walks, the larger of it and each walk's, where its family scopes its walks apart
+    (`Family.walks_scoped`), beside its staging otherwise, as `Family.scoped` allocates them; neither in the
+    staging returned."""
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
@@ -891,8 +892,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     # scratch `launch_kernel` scopes beside the staging), as wide as any staged tile, past the walks or not.
     scoped = _products_scoped(call, blocks, (*staging, *after_walks), consumers, issues, together, sums)
     products, addresses = family.product_held(scoped), family.product_addresses(scoped)
-    apart = tuple((tile.shape, tile.dtype) for tile in jax.tree.leaves(after_walks)) if family.walks_scoped \
-        else ()
+    # Past the walks, one scope of their own (`after_walk.scoped`), on a family scoping its walks apart a
+    # walk's scope beside them (the larger counted), else the program's beside its staging.
+    apart = (tuple(jax.tree.leaves(after_walks)),) if family.walks_scoped and after_walks else ()
     beside = () if family.walks_scoped else after_walks
 
     def allocations(depth: int) -> dict:
@@ -902,10 +904,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return dataclasses.replace(allocation_scope(family, allocations(depth), (*staged, *products, *beside),
-                                                    reduces=reduces, after=(*after, *apart),
-                                                    addresses=addresses),
-                                   reducing_warpgroups=reducing)
+        found = allocation_scope(family, allocations(depth), (*staged, *products, *beside), reduces=reduces,
+                                 after=after, addresses=addresses)
+        return dataclasses.replace(found, walks=(*found.walks, *apart), reducing_warpgroups=reducing)
 
     return allocations, scope, staged, landed
 

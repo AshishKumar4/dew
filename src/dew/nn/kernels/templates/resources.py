@@ -580,10 +580,10 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for besides its barriers (`_named_barrier`'s none) and
     semaphores (`_semaphore`), as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every
     array rounded up to `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member
-    (`after_walk`, row 8800), the walks the largest of them, the tiles scoped after the walks, together in
-    one scope, the larger of them and the walks on a family that scopes its walks apart
-    (`Family.walks_scoped`), and beside the program's otherwise, and the family's reduction scratch where
-    the program reduces (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
+    (`after_walk`, row 8800), the walks the largest of them, the tiles scoped after the walks the larger of
+    them and the walks on a family that scopes its walks apart (`Family.walks_scoped`), and beside the
+    program's otherwise, and the family's reduction scratch where the program reduces
+    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
     (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         sizes = []
@@ -598,7 +598,7 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
     after = [stored_bytes(shape, dtype) for shape, dtype in scope.after]
     if family.walks_scoped:
-        walks += [allocated(*after)] if after else []
+        walks += [allocated(size) for size in after]
     else:
         sizes += after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
