@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from jax._src import source_info_util
 from reference_error import assert_as_exact
-from test_algebra_program import _bf16_rms
+from test_algebra_cache import _bf16_rms
 
 from dew import algebra
 from dew.algebra import program, terms
