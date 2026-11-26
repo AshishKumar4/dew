@@ -287,6 +287,54 @@ def test_a_merge_of_anchors_whose_difference_passes_the_format_weighs_its_scaled
     assert merges[0] == merges[1]
 
 
+@pytest.mark.parametrize(("dtype", "power", "shift"), [
+    (np.float32, 127, 128), (np.float32, 127, 129), (jnp.bfloat16, 127, 128), (np.float16, 15, 16),
+])
+def test_a_merge_keeps_tiny_units_at_opposite_binade_edges(dtype, power, shift):
+    from reference_error import assert_as_exact
+
+    units = windows.Units(scale=2.0 ** -shift)
+
+    def found(y, t, a, dt):
+        def mean(weight):
+            return means.merged_output(y, weight, a, units, 0)[0]
+
+        value, tangent = jax.jvp(mean, (t,), (dt,))
+        return value, tangent, jax.grad(mean)(t)
+
+    def reference(y, t, a, dt):
+        # Independent factors: both powers are normal in f32, so no subnormal constant is multiplied.
+        first = shift // 2
+        x = a.astype(jnp.result_type(a.dtype, jnp.float32))
+        x = (x * (2.0 ** -first)) * (2.0 ** (first - shift))
+        factors = jnp.exp(x - jnp.max(x))
+
+        def mean(weight):
+            mass = factors * weight
+            return (jnp.sum(mass * y[:, 0]) / jnp.sum(mass)).astype(y.dtype)
+
+        value, tangent = jax.jvp(mean, (t,), (dt,))
+        return value, tangent, jax.grad(mean)(t)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (np.asarray([[0.], [2.]], dtype), np.asarray(rng.uniform(0.75, 1.25, 2), dtype),
+                np.asarray([-2.0 ** power, 2.0 ** power], dtype), np.asarray([1, 0], dtype))
+
+    assert_as_exact(found, reference, draw, "tiny merge units and mass derivatives", seeds=8, truth_fn=reference)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_a_narrow_finished_state_lands_mean_and_mass_in_its_own_format(dtype):
+    def run(y, t, a):
+        return means.merged_state(y, t, a, windows.Units(), 0)
+
+    inputs = (np.asarray([[0], [2]], dtype), np.asarray([1, 3], dtype), np.asarray([1, 1], dtype))
+    for result, expected in zip(jax.jit(run)(*inputs), ([1.5], 4, 1), strict=True):
+        assert result.dtype == dtype
+        np.testing.assert_array_equal(result, np.asarray(expected, dtype))
+
+
 @pytest.mark.parametrize(("outputs", "totals", "anchors"), [((2, 2, 1), (1, 2), (2, 2)),
                                                             ((1, 2, 1), (2, 2), (2, 2))],
                          ids=["totals shared by a batch", "outputs shared by a batch"])

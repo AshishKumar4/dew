@@ -33,6 +33,7 @@ from dew.algebra.windows import (
     chunk_width,
 )
 from dew.nn.float_bits import raw_fields
+from dew.nn.precision import at_least_fp32
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,7 +335,7 @@ def _products_summed(operands, form: Ratio):
     if not form.reduced:
         values = {each: tuple(jnp.expand_dims(part, form.axis) for part in value) if each.reduced else value
                   for each, value in values.items()}
-    dtype = laid[0].dtype
+    dtype = at_least_fp32(laid[0].dtype)
     if expanded:
         values_by_band = _banded_sums(expanded, arrays, count, rank, form, dtype)
         if not form.reduced:

@@ -1489,6 +1489,9 @@ rounded one lost masses the ratio keeps and landed it past the format), a walk's
 resumed state's `acc = o l` ratios of one state each.
 An empty walk has a nonfinite anchor; its stored total, output and all derivative directions are ignored.
 A finite anchor with zero weight still has its own derivative along that weight.
+The window's working words are at least float32, even when the outputs and anchor land in a narrower
+format. A subnormal static unit scale applies its power of two to the anchors before the normalized
+significand participates in the difference or anchor relocation.
 
 **The law's domain.** A merge's mass at its joined anchor lies within the format at that anchor's resolution:
 where the masses' sum passes the format's largest, the anchor moves to land it (`_landing`), and an anchor's

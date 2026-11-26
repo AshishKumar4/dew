@@ -1807,6 +1807,29 @@ def test_a_two_sided_decays_pairs_across_a_sub_chunk_are_decayed_before_they_are
     assert float(outputs[reader, 0]) == 2.0 ** 126
 
 
+@pytest.mark.parametrize("crossed", [False, True], ids=["cancelling", "crossed-key"])
+def test_a_portable_per_key_pair_keeps_the_finite_sum_and_left_adjoint(crossed):
+    from dew.nn.precision import FP32_SUMS
+
+    left = np.asarray([[np.inf if crossed else 2.0 ** 127, 1 if crossed else 2.0 ** 127]], np.float32)
+    right = np.asarray([[1, 1] if crossed else [2, -2]], np.float32)
+    decays = np.asarray([[[-0.0 if crossed else 1.0, 1.0]]], np.float32)
+    direction = np.asarray([[0, 1]] if crossed else [[1, 0]], np.float32)
+
+    def orders(a, b, d, da):
+        def pair(x):
+            return scan._paired(x, b, d).sum()
+
+        result, tangent = jax.jvp(pair, (a,), (da,))
+        return result, tangent, jax.grad(pair)(a)
+
+    with jax.default_matmul_precision(FP32_SUMS):
+        result, tangent, adjoint = jax.jit(orders)(left, right, decays, direction)
+    assert float(result) == (1 if crossed else 0)
+    assert float(tangent) == (1 if crossed else 2)
+    np.testing.assert_array_equal(adjoint, [[0, 1]] if crossed else [[2, -2]])
+
+
 DEPTHS = {"past the least normal": (2.0 ** 100, None), "past two normal factors": (2.0 ** 127, -58.375)}
 """The isolated write's size and its three gates (`isolated_draw`): about 2^100 through gates of -39 to -41
 (`e^-120`, past fp32's least normal, row 9660), or about 2^127 through three of -58.375 (`e^-175.125`, past
