@@ -195,9 +195,9 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     held = artifact.get("precision") if isinstance(artifact, dict) else None
     if trainer.numerics is not None and isinstance(held, dict):
         running = record(to_record(trainer.numerics, Numerics), "precision")
-        unshown = [{name: value for name, value in stated.items() if name not in _SHOWN_BY_STATE}
-                   for stated in (held, running)]
-        precision = _differing(*unshown, "precision")
+        before, after = ({name: value for name, value in stated.items() if name not in _SHOWN_BY_STATE}
+                         for stated in (held, running))
+        precision = _differing(before, after, "precision")
     return differing_records(artifact, trainer._artifact(), saved, now) + dropped + precision
 
 
