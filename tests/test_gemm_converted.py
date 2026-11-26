@@ -95,14 +95,17 @@ def test_an_fp8_codes_product_unnamed_is_xlas_widened_product_until_a_receipt():
 def test_an_fp8_codes_product_differentiates_its_rows_alone(kernel):
     """On an A100, through the converting launch named or XLA's arm, the FP8 codes product of rows and a
     matrix cast to E4M3 (an unaligned depth and width, padded and sliced back) takes the rows' tangent times
-    the matrix's exact values, its pullback that product's transpose rounded through the rows' cast, and the
-    matrix no cotangent: a frozen site's (row 8548's review)."""
+    the matrix's values, its pullback that product's transpose, and the matrix no cotangent: a frozen
+    site's (row 8548's review). Every value dyadic, each sum exact in fp32 and each cotangent a matrix row
+    E4M3 holds, so each is compared exactly."""
     rng = np.random.default_rng(8548)
-    x, w, dx = (rng.normal(size=shape).astype(np.float32) for shape in ((ROWS, DEPTH), (WIDTH, DEPTH),
-                                                                         (ROWS, DEPTH)))
-    cotangent = rng.normal(size=(ROWS, WIDTH)).astype(np.float32)
+    x = rng.choice([-2.0, -1.0, 0.0, 0.5, 1.0], size=(ROWS, DEPTH)).astype(np.float32)
+    w = rng.choice([-1.0, -0.5, 0.5, 1.0], size=(WIDTH, DEPTH)).astype(np.float32)
+    dx = rng.choice([-1.0, 0.0, 0.5], size=(ROWS, DEPTH)).astype(np.float32)
+    # One column a row, of sign either way: each row's cotangent one of the matrix's rows, exact in E4M3.
+    cotangent = np.zeros((ROWS, WIDTH), np.float32)
+    cotangent[np.arange(ROWS), rng.integers(0, WIDTH, ROWS)] = rng.choice([-1.0, 1.0], size=ROWS)
     e4m3 = jnp.float8_e4m3fn
-    matrix = np.asarray(jnp.asarray(w).astype(e4m3).astype(jnp.float32), np.float64)
 
     def product(rows, weights):
         return _product(kernel, True, rows.astype(e4m3), weights.astype(e4m3))
@@ -112,11 +115,8 @@ def test_an_fp8_codes_product_differentiates_its_rows_alone(kernel):
                              (jnp.asarray(dx),))
         _, pull = jax.vjp(product, jnp.asarray(x), jnp.asarray(w))
         d_rows, d_weights = pull(jnp.asarray(cotangent))
-    moved = np.asarray(jnp.asarray(dx).astype(e4m3).astype(jnp.float32), np.float64)
-    np.testing.assert_allclose(np.asarray(tangent, np.float64), moved @ matrix.T, rtol=1e-6, atol=1e-6)
-    # Rounded to E4M3 by the rows' cast: within its step (2^-3 relative, 2^-9 at its least subnormal).
-    np.testing.assert_allclose(np.asarray(d_rows), cotangent.astype(np.float64) @ matrix, rtol=2.0 ** -3,
-                               atol=2.0 ** -9)
+    np.testing.assert_array_equal(np.asarray(tangent), (dx.astype(np.float64) @ w.T.astype(np.float64)))
+    np.testing.assert_array_equal(np.asarray(d_rows), cotangent.astype(np.float64) @ w.astype(np.float64))
     assert np.count_nonzero(np.asarray(d_rows)) > d_rows.size // 2
     np.testing.assert_array_equal(np.asarray(d_weights), np.zeros_like(w))
 
