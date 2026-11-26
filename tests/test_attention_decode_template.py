@@ -210,6 +210,86 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 
 
 @INTERPRETS
+def test_an_absorbed_mla_window_over_a_paged_latent_cache_returns_its_partial_for_the_merge_interpreted():
+    """MLA over a sliding window of a paged latent cache returning its partial accumulators
+    (kernel-templates.md §A row 63, tokamax's `mla_swa`): an absorbed step (`in_key`, the values its
+    latents' leading 512 columns) over each row's last 64 keys read from 4-key pages through a shuffled
+    table, `finished=False` (its state, an `Initial`), merged by the step over the rest of its keys (the
+    sparse part's, here its earlier keys whole, a dense cache) as its initial state: on par with the
+    reference path over every key (check 1), as an H100 runs it under the interpreter."""
+    page, window, latent, heads = 4, 64, 576, 16
+    lengths = jnp.asarray([KEYS - 56, KEYS // 3 * 2], jnp.int32)
+    starts = lengths - window
+    windowed = template.spans(1, KEYS, 2, lengths=lengths, starts=starts)
+    rest = template.spans(1, KEYS, 2, lengths=starts)
+    whole = template.spans(1, KEYS, 2, lengths=lengths)
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
+                        jnp.int32)
+
+    def pooled(cache):
+        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
+        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
+        return pages[:, jnp.argsort(table.reshape(-1))]
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        return (jax.random.normal(streams[0], (2, 1, heads, latent), jnp.bfloat16),
+                jax.random.normal(streams[1], (2, KEYS, 1, latent), jnp.bfloat16))
+
+    def ours(query, key):
+        with generation.assumed("sm90"):
+            pool = pooled(key)
+            state = attention_decode.attend(query, pool, pool[..., :512], windowed, interpret=True,
+                                            table=table, in_key=True, finished=False)
+            return attention_decode.attend(query, key, key[..., :512], rest, template.Hooks(initial=state),
+                                           interpret=True, in_key=True)
+
+    def reference(query, key):
+        return template.reference(query, key, key[..., :512], whole)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    "template decode absorbed MLA paged window merged", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
+    """MiniMax M3's sparse decode (kernel-templates.md §A row 37a): a decode step over a paged cache of
+    128-token pages reading only the pages its selection names (the first, its own, and one between, as
+    `msa_selection`'s M3 forcing and top take them), as the indexed form's key runs (`runs`), each row's
+    pages at shuffled places of the pool through its table, as an H100 runs it under the interpreter: on par
+    with the reference path over the same runs of the dense keys (check 1)."""
+    page, keys, heads, kv_heads = 128, 512, 8, 2
+    lengths = jnp.asarray([keys - 40, keys - 200], jnp.int32)
+    # Each row's one query: its first page, one between and its own up to its last key.
+    runs = np.zeros((2, 1, 3, 2), np.int32)
+    for row, (end, between) in enumerate(zip(np.asarray(lengths), (2, 1), strict=True)):
+        own = (end - 1) // page
+        runs[row, 0] = [(0, page), (between * page, (between + 1) * page), (own * page, end)]
+    spans = template.spans(1, keys, 2, lengths=lengths, runs=jnp.asarray(runs))
+    per_row = keys // page
+    table = jnp.asarray(np.random.default_rng(37).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def pooled(rows):
+        # `[B, K, KV, D]` as a pool `[KV, P, page, D]` holding row `b`'s page `j` at `table[b, j]`.
+        held = jnp.moveaxis(rows.reshape(2, per_row, page, *rows.shape[2:]), 3, 0)
+        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
+        return pool.at[:, table].set(held)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (2, 1, heads, 64), jnp.bfloat16),
+                *(jax.random.normal(stream, (2, keys, kv_heads, 64), jnp.bfloat16) for stream in streams[1:]))
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                           table=table)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    "template decode page-selected paged", seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_split_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_is_on_par_interpreted():
     """An absorbed MLA decode step over 512 keys whose plan cuts its row into slices (`plan`: a split launch
     keeps its rows, `Kept.OUTPUT`), its values its keys' leading 512 columns read from the key's slot

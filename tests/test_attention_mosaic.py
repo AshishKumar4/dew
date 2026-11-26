@@ -1759,6 +1759,40 @@ def test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpre
 
 
 @INTERPRETS
+def test_a_block_mask_prefill_over_fp8_keys_and_values_is_on_par_interpreted():
+    """A block-mask sparse prefill whose keys and values are FP8 codes with a token's fp32 scale
+    (kernel-templates.md §A row 64, FlagAttention's Hy3): a caller's block mask (`block_selected`'s, each
+    query block its own block and two earlier ones) as the indexed block lists (`runs`), the codes
+    dequantized in the walk (`scales`, rows 45 and 46), causal over 512 tokens as an H100 runs it under the
+    interpreter: on par with the reference path over the keys and values the codes dequantize to under the
+    same mask (check 1)."""
+    from dew.nn.kv_cache import dequantize, quantize
+
+    tokens, heads, kv_heads, width = 512, 4, 2, 64
+    spans = template.spans(tokens, tokens, 1, causal=True, runs=jnp.asarray(block_selected(tokens, 64)))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (1, tokens, heads, width), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (1, tokens, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[1:])
+        return query, *quantize(key, jnp.float8_e4m3fn), *quantize(value, jnp.float8_e4m3fn)
+
+    def ours(query, k_codes, k_scale, v_codes, v_scale):
+        scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
+        with generation.assumed("sm90"):
+            return attention_mosaic.forward(query, k_codes, v_codes, spans, None, scales=scales,
+                                            interpret=True)
+
+    def reference(query, k_codes, k_scale, v_codes, v_scale):
+        return template.reference(query, dequantize(k_codes, k_scale, query.dtype),
+                                  dequantize(v_codes, v_scale, query.dtype), spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic block-mask prefill fp8 keys and values",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
 @on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str,
                     mechanisms_elsewhere="case")
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
