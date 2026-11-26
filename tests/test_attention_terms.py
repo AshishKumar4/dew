@@ -141,7 +141,8 @@ def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_c
 
     def run(key_positions):
         call = MixerCall(AttentionMetadata(pairwise_mask=causal, key_positions=key_positions))
-        return np.asarray(attending("reference")(jax.jit(layer.apply))(params, x, call))
+        return np.asarray(attending("reference")(jax.jit(lambda params, x: layer.apply(params, x, call)))(
+            params, x))
     np.testing.assert_array_equal(run(places), run(None))
 
 
