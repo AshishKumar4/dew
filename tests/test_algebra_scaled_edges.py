@@ -484,6 +484,8 @@ def test_nonfinite_anchors_remove_stale_mass_and_its_derivatives():
 
 
 def test_a_streamed_empty_walk_does_not_put_stale_readouts_in_its_hull():
+    from dew.nn.kernels.templates import attention_algebra
+
     units = windows.Units()
     outputs = np.asarray([[[2.], [17.]], [[13.], [19.]]], np.float32)
     totals = np.asarray([[0., 2.], [1., 1.]], np.float32)
@@ -492,9 +494,9 @@ def test_a_streamed_empty_walk_does_not_put_stale_readouts_in_its_hull():
 
     @jax.jit
     def merged(y, t, a, v):
-        return means.merged_state_chunked(lambda i: (y[i], t[i], a[i], v[i]), 2, units, 0)
+        return attention_algebra.finished_merged_chunked(units, lambda i: (y[i], a[i], t[i], v[i]), 2)
 
-    mean, mass, peak = merged(outputs, totals, anchors, valid)
+    mean, peak, mass, *_ = merged(outputs, totals, anchors, valid)
     np.testing.assert_array_equal(mean, [0.])
     assert float(mass) == 0.0 and float(peak) == 0.0
 
