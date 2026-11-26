@@ -15,6 +15,10 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import fed, mosaic, resources, ring_family
 
+WAIT_MOST = 7
+"""The most product groups a warpgroup's wait leaves in flight: `wgmma.wait_group`'s immediate, 0 to 7 (PTX
+ISA, wgmma.wait_group; CUTLASS's `warpgroup_wait` asserts the same range)."""
+
 
 class WgmmaLayout:
     """A home whose 64-row tiles sit in registers in the WGMMA layout (`plgpu.Layout.WGMMA`), a thread two
@@ -93,8 +97,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             mosaic.committed()
             with mosaic.committed_here() as committed:
                 value = between()
-            # The groups `between` committed run on past the product's read (`committed_here`).
-            pending = committed()
+            # The groups `between` committed run on past the product's read (`committed_here`), no more than
+            # a wait's immediate holds (`WAIT_MOST`): one leaving fewer in flight waits on the product still.
+            pending = min(committed(), WAIT_MOST)
             return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))

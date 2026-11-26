@@ -1316,10 +1316,10 @@ def _negated(a, b, *, path: str, interpret: bool):
 
 
 def _read_past(a, b, *, between: str):
-    """`a @ b` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup) read through `product_with` while
-    `between` issues products into two accumulators the program scoped before it: "two" issues both in the
-    product's own trace, "branch" one under a branch on the program's index, "scope" one within a scope of
-    its own."""
+    """`a @ b` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup a program, two programs) read through
+    `product_with` while `between` issues products into two accumulators the program scoped before it:
+    "two" issues both in the product's own trace, "branch" one under a branch on the program's index, which
+    one program takes and the other does not, "scope" one within a scope of its own."""
     from dew.nn.kernels.templates import mosaic_sm90
 
     family = mosaic_sm90.FED
@@ -1357,7 +1357,7 @@ def _read_past(a, b, *, between: str):
                       swizzling.plain(shape, jnp.float32), *accumulators, collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
-    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+    return family.kernel(body, out_type=out, grid=(2,), grid_names=("programs",), consumers=1,
                          interpret=False, name="read_past")(a, b)
 
 
@@ -1371,9 +1371,10 @@ def test_a_products_read_leaves_in_flight_the_groups_every_run_commits_past_it(b
     a = b = np.zeros((LANDED, LANDED), jnp.bfloat16)
     with generation.assumed("sm90"):
         traced = jax.make_jaxpr(functools.partial(_read_past, between=between))(a, b)
+    # The product's read is the kernel's one accumulator read: its wait the groups it leaves in flight.
     waits = [equation.params["wait_n"] for equation in equations(traced.jaxpr)
              if equation.primitive.name == "wgmma_accumulator_deref"]
-    assert max(waits, default=0) == in_flight, waits
+    assert waits == [in_flight], waits
 
 
 def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
