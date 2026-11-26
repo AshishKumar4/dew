@@ -1651,6 +1651,14 @@ def noted(found: Seen) -> None:
         collected.found.taken.extend(found.taken)
 
 
+def _on_its_tpu() -> bool:
+    """Whether a trace here targets the TPU this process runs on: its platform a TPU's (`generation.backend`)
+    and its generation the default device's own (`generation.device_target`), so a measurement times the
+    launches it traced on the device they target."""
+    return (generation.backend() == jax.default_backend() == "tpu"
+            and generation.device_target(jax.devices()[0]).generation == generation.gpu_target().generation)
+
+
 def tune(lower: Callable[[], jax.stages.Lowered], *,
          measure: bool = False) -> jax.stages.Lowered:
     """An opt-in tuning run's program (bible §6: off by default): what `lower()`
@@ -1662,9 +1670,10 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     lowering traced, it lowers again. A launch without a pick takes its heuristic. A measuring run of a step
     with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
     refused (`Untunable`). A GPU that runs Dew's Pallas kernels (`generation.triton_runs`) and a TPU core are
-    tuned alike, each timed as its device reads it (`dew.telemetry.benchmark.device_time`); anywhere else the
-    program is lowered as it is."""
-    if not (generation.triton_runs() or generation.backend() == "tpu"):
+    tuned alike, each timed as its device reads it (`dew.telemetry.benchmark.device_time`), a TPU's where the
+    trace targets the TPU the process runs on (`_on_its_tpu`); anywhere else (a compile-only TPU's trace on
+    another host) the program is lowered as it is."""
+    if not (generation.triton_runs() or _on_its_tpu()):
         return lower()
     with reading():
         tuned = _cache.KERNEL_TUNES.get_global()

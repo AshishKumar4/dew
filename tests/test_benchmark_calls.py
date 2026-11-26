@@ -432,3 +432,47 @@ def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkey
         again = forward(x, kernel, jnp.asarray([6, 10], jnp.int32))
         assert np.asarray(out).shape == np.asarray(again).shape == (16, 4)
         assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}
+
+
+def _tpu_capture(directory, ops):
+    """A capture under `directory` as JAX writes a TPU's (plugins/profile/<run>/<host>.xplane.pb): `ops`, each
+    (device, name, start ms, end ms, program id or None for a host transfer), on each TPU's `XLA Ops` line,
+    its events carrying XLA's program_id stat."""
+    from jax.profiler import ProfileData
+
+    names = sorted({name for _, name, *_ in ops})
+    planes = []
+    for plane, device in enumerate(sorted({device for device, *_ in ops}), 1):
+        events = "".join(
+            f"events {{ metadata_id: {names.index(name) + 1} offset_ps: {round(start * 1e9)} "
+            f"duration_ps: {round((end - start) * 1e9)}"
+            + ("" if program is None else f" stats {{ metadata_id: 1 int64_value: {program} }}") + " } "
+            for each, name, start, end, program in ops if each == device)
+        metadata = "".join(f'event_metadata {{ key: {index} value {{ id: {index} name: "{name}" }} }} '
+                           for index, name in enumerate(names, 1))
+        planes.append(f'planes {{ id: {plane} name: "/device:TPU:{device}" '
+                      f'lines {{ id: 1 name: "XLA Ops" timestamp_ns: 0 {events}}} {metadata}'
+                      'stat_metadata { key: 1 value { id: 1 name: "program_id" } } }')
+    run = directory / "plugins" / "profile" / "run"
+    run.mkdir(parents=True)
+    (run / "host.xplane.pb").write_bytes(ProfileData.text_proto_to_serialized_xspace(" ".join(planes)))
+
+
+def test_a_tpu_call_is_timed_by_its_own_programs_ops_on_its_own_devices(tmp_path):
+    """A TPU call's device time (`benchmark.tpu_ops`, the kernel tuner's on a TPU core) is the ops of the one
+    program it ran on its devices, each its device milliseconds: a host transfer and another device's
+    program left out; a capture of no program's op on its devices refused, as a GPU call of no kernel is
+    (`NoKernels`), and one of two programs' there refused as ambiguous, its own not told apart."""
+    from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
+
+    one = tmp_path / "one"
+    _tpu_capture(one, [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7),
+                       (0, "transfer", 1.0, 1.5, None), (1, "fusion.9", 0.0, 4.0, 8)])
+    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0})] == [("fusion.1", 0.25),
+                                                                        ("custom-call.2", 0.75)]
+    with pytest.raises(NoKernels):
+        tpu_ops(one, {2})
+    two = tmp_path / "two"
+    _tpu_capture(two, [(0, "fusion.1", 0.0, 0.25, 7), (0, "fusion.3", 0.5, 0.75, 9)])
+    with pytest.raises(AmbiguousCapture):
+        tpu_ops(two, {0})

@@ -396,40 +396,74 @@ class CaptureHeld(CuptiHeld):
     nowhere (`TpuTime`): a TPU's `CuptiHeld`, which the kernel tuner and a benchmark take alike."""
 
 
+class AmbiguousCapture(NoKernels):
+    """A TPU capture whose devices ran ops of more than one program while a call ran (`tpu_ops`): which are
+    the call's own it does not say, so it times nothing, as a call of no kernel does (`NoKernels`)."""
+
+
+def tpu_ops(directory: str | Path, devices: Iterable[int]) -> tuple[KernelTime, ...]:
+    """The ops one call ran on the TPU `devices` (their ids), as the newest capture under `directory` holds
+    them (`dew.telemetry.trace.device_events`: each device's `XLA Ops` line): the ops of the one program it
+    ran there, each its device milliseconds, a host transfer (no program's) and another device's left out.
+    Ops of no program are refused (`NoKernels`), of more than one (`AmbiguousCapture`)."""
+    from dew.telemetry import trace
+
+    planes, _ = trace.device_events(directory)
+    named = {f"/device:TPU:{device}" for device in devices}
+    ops = [op for plane, events in planes.items() if plane in named for op in events
+           if trace.program_of(op) is not None]
+    programs = {trace.program_of(op) for op in ops}
+    if not programs:
+        raise NoKernels(f"the capture under {directory} holds no program's op on TPU {sorted(devices)}")
+    if len(programs) > 1:
+        raise AmbiguousCapture(f"the capture under {directory} holds ops of programs {sorted(programs)} on "
+                               f"TPU {sorted(devices)}, which no call's own are told apart from")
+    return tuple(KernelTime(op.name, op.duration_ns / 1e6) for op in ops)
+
+
 class TpuTime:
-    """The device time of each TPU call `device_time`'s session reads: the ops its programs ran on the
-    TPU's `XLA Ops` line, as one profiler capture of the call holds them (`dew.telemetry.trace.device_events`,
+    """The device time of each TPU call `device_time`'s session reads, as `DeviceTime` reads a GPU's: the
+    ops its program ran on its devices, as one profiler capture of the call holds them (`tpu_ops`, through
     Dew's one reading of a capture), each its duration on the device, which no host dispatch enters. The call
-    runs once untimed before it, warm as CUPTI reads a GPU's (`DeviceTime`); a capture starts and stops a
-    call, a second or so a read."""
+    runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and stops a call, a second or
+    so a read. A TPU's call runs unevicted (`eviction`)."""
+
+    def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
+        """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
+        L2 a TPU has none of."""
+        del evicted
+        return self._read(fn, *args)
 
     def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
         """The ops of one call of `program`, compiled by its caller to run behind `evicting` (`behind`, which
-        a TPU's empty eviction leaves out). A call whose capture holds no program's op is refused
-        (`NoKernels`)."""
+        a TPU's empty eviction leaves out), called as `DeviceTime.behind` calls it, its arguments one
+        tuple."""
+        return self._read(program, evicting, args)
+
+    def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
+        """One call's device seconds, its ops' summed (`kernels`)."""
+        return sum(op.milliseconds for op in self.kernels(fn, *args, evicted=evicted)) / 1e3
+
+    def _read(self, fn: Callable, *args) -> tuple[KernelTime, ...]:
+        """One capture of `fn(*args)` after an untimed call, read on the devices its arrays are on (the
+        default one where it takes none)."""
         import tempfile
 
         from jax import profiler
 
-        from dew.telemetry import trace
-
-        # Called as `DeviceTime.behind` calls it, its arguments one tuple (`behind`'s program's).
-        jax.block_until_ready(program(evicting, args))
+        devices = {device.id for leaf in jax.tree.leaves(args) if isinstance(leaf, jax.Array)
+                   for device in leaf.devices()} or {jax.devices()[0].id}
+        jax.block_until_ready(fn(*args))
         with tempfile.TemporaryDirectory() as directory:
             try:
                 profiler.start_trace(directory)
             except RuntimeError as error:
                 raise CaptureHeld(str(error)) from error
             try:
-                jax.block_until_ready(program(evicting, args))
+                jax.block_until_ready(fn(*args))
             finally:
                 profiler.stop_trace()
-            planes, _ = trace.device_events(directory)
-        timed = tuple(KernelTime(op.name, op.duration_ns / 1e6) for name, ops in planes.items()
-                      if name.startswith("/device:TPU:") for op in ops if trace.program_of(op) is not None)
-        if not timed:
-            raise NoKernels(f"{program} ran no op a TPU capture timed")
-        return timed
+            return tpu_ops(directory, devices)
 
 
 @contextlib.contextmanager
