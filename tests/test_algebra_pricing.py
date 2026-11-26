@@ -300,8 +300,9 @@ def _priced(fn, *shapes, schedule=None):
 def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(name):
     """A term's arithmetic (`cost.work`) is what the kernels' counter prices its equation at in a kernel's
     body (`emission.operation_work`, the one rule): a power an exponential an element, a clamp a maximum and
-    a minimum, an exponential, a comparison and a selection, a conversion and a reduction theirs, where the
-    algebra's own table priced a power as an operation and the counter a clamp as one (row 5901)."""
+    a minimum, an exponential, a comparison and a selection, a conversion and a reduction theirs, both on the
+    H100 the price names, where the algebra's own table priced a power as an operation and the counter a
+    clamp as one (row 5901; on the host's own target, an exponential's forms differed, row 13154)."""
     from dew.nn.kernels.templates import emission
 
     fn = {"power": jax.lax.pow,
@@ -311,7 +312,10 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
           "conversion": lambda x, y: jax.lax.convert_element_type(x, jnp.bfloat16) * y.astype(jnp.bfloat16),
           "reduction": lambda x, y: jnp.sum(x * y, axis=-1)}[name]
     price, traced = _priced(fn, (64, 128), (64, 128))
-    counted = emission.emitted(traced.jaxpr, 1, None).fixed
+    # Counted on the H100 its price names, whatever GPU the process holds or none: an fp32 exponential's
+    # forms are its multiprocessor's (`emission.ACCURATE_FORMS`), a CPU host's one MUFU apart from them.
+    with generation.assumed("sm90"):
+        counted = emission.emitted(traced.jaxpr, 1, None).fixed
     fields = ("operations", "exponentials", "conversions")
     assert [getattr(price.work, field) for field in fields] == [getattr(counted, field) for field in fields]
 

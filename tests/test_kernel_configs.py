@@ -7,7 +7,6 @@ import dataclasses
 import functools
 import itertools
 import os
-import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -1274,21 +1273,48 @@ def _gpt_oss_projected():
 @lowers("sm80")
 def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     """An A100's GEMM, its forward and its gradients at the gate's tiles, issues each cp.async copy without a
-    source size (`cp.async`'s `src-size`, a bounds check a transfer): its launch extends every operand its
-    blocks read past, so its specs promise their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a
-    pipeline that checks a block sliced from a dynamically started view (the fork's zero-fill) would bound
-    every transfer of the sm80 cells, unchanged at their pin otherwise."""
-    from kernel_compile import PTX, compile_mosaic_kernels
+    source size (`cp.async`'s `src-size`, a bounds check a transfer: its `nvvm.cp.async.shared.global`'s
+    optional size operand): its launch extends every operand its blocks read past, so its specs promise
+    their copies in bounds (`mosaic_sm80`'s `oob_fill_mode`), where a pipeline that checks a block sliced
+    from a dynamically started view (the fork's zero-fill) would bound every transfer of the sm80 cells,
+    unchanged at their pin otherwise. Read from each kernel's own lowered module, as its call lowers it,
+    whatever compiled before it in the process."""
+    import jax.experimental.mosaic.gpu as mgpu
+    from kernel_compile import lowered_for
 
+    from dew.nn.kernels.lowered import kernel_calls
+
+    uncopied, bounded = [], []
     with report.refusals():
-        cases = [each.case for form in ("forward", "input gradient", "kernel gradient")
-                 for each in _gate_cases("sm80", form)]
-        found = compile_mosaic_kernels(cases, "sm80")
-    modules = [kernel["module"] for record in found for kernel in record.get("kernels", ())]
-    copies = [line for module in modules for line in PTX.get(module, "").splitlines() if "cp.async.c" in line]
-    assert copies, modules
-    bounded = [line.strip() for line in copies if re.search(r"\],\s*\d+,\s*%r", line)]
+        for form in ("forward", "input gradient", "kernel gradient"):
+            cases = _gate_cases("sm80", form)
+            assert any(each.case.required for each in cases), form
+            for each in cases:
+                fn, specs = each.case.call()
+                copies = 0
+                for call in kernel_calls(lowered_for(fn, specs, "sm80"), unrun=True):
+                    if call.kind != "mosaic_gpu":
+                        continue
+                    module = mgpu.deserialized(call.ir)
+                    with module.context:
+                        for operation in _operations(module.operation):
+                            if operation.name == "nvvm.cp.async.shared.global":
+                                copies += 1
+                                if len(operation.operands) > 2:
+                                    bounded.append((each.case.name, call.name))
+                if each.case.required and not copies:
+                    uncopied.append(each.case.name)
+    assert not uncopied, uncopied[:4]
     assert not bounded, bounded[:4]
+
+
+def _operations(operation):
+    """Every operation nested in `operation`, in program order."""
+    for region in operation.regions:
+        for block in region.blocks:
+            for inner in block.operations:
+                yield inner.operation
+                yield from _operations(inner.operation)
 
 
 @COMPILES_ON_CPU
