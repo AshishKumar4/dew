@@ -209,8 +209,8 @@ class OutputTable:
     included. Where no matrix does, `output_table` returns None, and the
     logits come from `logits_from_hidden` or `logits` instead. A head scoring
     the first `scored` of the matrix's rows alone (`CausalTransformer.output_vocab`)
-    keeps the matrix whole, the stored parameter itself, and reads those rows
-    of its product; its `scale` and `bias` are theirs.
+    keeps the matrix whole, the stored parameter itself, and contracts those rows
+    alone (`scored_matrix`); its `scale` and `bias` are theirs.
     """
 
     matrix: jax.Array
@@ -237,8 +237,7 @@ class OutputTable:
         bias (`scaled_logits`), the softcap, then `temperature`, which a
         sampler applies to the head's logits."""
         logits = head_product('...d,vd->...v' if self.vocab_major else '...d,dv->...v',
-                              self.states(hidden), self.matrix, self.precision, compute=self.compute)
-        logits = logits if self.scored is None else logits[..., :self.scored]
+                              self.states(hidden), self.scored_matrix(), self.precision, compute=self.compute)
         return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
 
     def columns(self, hidden: jax.Array, ids: Sequence[int] | jax.Array, *, temperature: float = 1.0,
@@ -259,7 +258,7 @@ class OutputTable:
             vocab = self.vocab
             if index.size and (index.min() < 0 or index.max() >= vocab):
                 raise IndexError(f"columns {index.tolist()} reach past a vocabulary of {vocab}")
-        matrix = jnp.take(self.matrix, index, axis=0 if self.vocab_major else 1)
+        matrix = jnp.take(self.scored_matrix(), index, axis=0 if self.vocab_major else 1)
         states = self.states(hidden)
         subscripts = '...d,vd->...v' if self.vocab_major else '...d,dv->...v'
         if exact:
@@ -279,8 +278,16 @@ class OutputTable:
         it (`states`) is the token's logit before its bias and softcap, in the
         wider of the two dtypes. A reader
         of tokens' vectors (a decision head's lexical prior) takes these."""
-        rows = (self.matrix if self.vocab_major else self.matrix.T)[:self.vocab]
+        rows = self.scored_matrix() if self.vocab_major else self.scored_matrix().T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+    def scored_matrix(self) -> jax.Array:
+        """The matrix over the tokens it scores (`vocab`), in its stored layout: the stored matrix itself
+        where it scores every row, its first rows (columns, `vocab_major` False) otherwise, which every
+        product takes, so no unscored row enters a product or its pullback."""
+        if self.scored is None:
+            return self.matrix
+        return self.matrix[:self.scored] if self.vocab_major else self.matrix[:, :self.scored]
 
     @property
     def vocab(self) -> int:

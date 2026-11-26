@@ -206,14 +206,6 @@ def _without(logits, first, excluded, *, value: float = -jnp.inf):
     return jnp.where(columns == excluded, value, logits)
 
 
-def _scored(head: OutputTable) -> jax.Array:
-    """The head's matrix over the tokens it scores (`OutputTable.vocab`), in its stored layout: whole where
-    it scores every row."""
-    if head.scored is None:
-        return head.matrix
-    return head.matrix[:head.scored] if head.vocab_major else head.matrix[:, :head.scored]
-
-
 class _Columns(NamedTuple):
     """A head's per-column terms past its product (`OutputTable.scale` and `bias`), each `[vocab]`
     at the loss's work dtype or None, which a tile slices, a mesh gathers and a backward
@@ -883,7 +875,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # A traced cap keeps `final_logit_softcap` differentiable; the head is
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
-    held = _scored(head)
+    held = head.scored_matrix()
     table = held if vocab_major else held.T
     product = _head_product(head, hidden)
 
@@ -1075,7 +1067,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
     precision = _head_product(head, states)
-    held = _scored(head)
+    held = head.scored_matrix()
     table = held if head.vocab_major else held.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)
@@ -1155,7 +1147,8 @@ def head_divergence(hidden, head: OutputTable, reference, reference_head: Output
     hidden, reference = head.states(hidden), jax.lax.stop_gradient(reference_head.states(reference))
     if hidden.shape[:-1] != kept.shape or reference.shape[:-1] != kept.shape:
         raise ValueError(f"{hidden.shape[:-1]} and {reference.shape[:-1]} states for {kept.shape} positions")
-    table, other = (_scored(side) if side.vocab_major else _scored(side).T for side in (head, reference_head))
+    table, other = (side.scored_matrix() if side.vocab_major else side.scored_matrix().T
+                    for side in (head, reference_head))
     if table.shape[0] != other.shape[0]:
         raise ValueError(f"the KL compares two distributions column by column, and the head scores "
                          f"{table.shape[0]} ids where the reference's scores {other.shape[0]}")
@@ -1404,7 +1397,8 @@ def support_log_probs(hidden, head: OutputTable, targets, support_ids, support_c
     scores 0.0 here.
     """
     hidden = head.states(hidden)
-    table = jnp.asarray(_scored(head)) if head.vocab_major else jnp.asarray(_scored(head)).T
+    held = jnp.asarray(head.scored_matrix())
+    table = held if head.vocab_major else held.T
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
     blocks = -(-kept // block)

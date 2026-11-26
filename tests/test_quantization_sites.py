@@ -194,8 +194,9 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
 
     loop = stored.model.loop if isinstance(stored.model, Looped) else None
     if loop is not None and loop.layers is not None:
-        with pytest.raises(LayoutRefused):
+        with pytest.raises(LayoutRefused) as refused:
             view(np.zeros((2, 8), np.int32))
+        assert f"a loop over layers {loop.layers} runs part of the stack" in str(refused.value)
         return
     assert_stored_view(view, stored, "two stages")
 

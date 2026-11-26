@@ -69,3 +69,19 @@ def test_a_chunked_loss_over_a_narrow_head_reads_its_scored_rows_alone(tied):
     gradient = jax.grad(loss)(variables)["params"]
     table = gradient["embed_tokens"]["embedding"] if tied else gradient["lm_head"]["kernel"].T
     assert not np.any(np.asarray(table[SCORED:])) and np.any(np.asarray(table[:SCORED]))
+
+
+def test_an_unscored_row_enters_no_product_of_the_head():
+    """A head scoring 48 of its 64 rows, an unscored row holding fp32's largest values, which round to
+    infinity in its bf16 product: its logits and their pullback to the states are finite, the row entering
+    neither, where a product over every row multiplied the discarded columns' zero cotangents by it."""
+    from dew.nn.protocols import OutputTable
+
+    rng = np.random.default_rng(0x0B2)
+    matrix = jnp.asarray(rng.normal(size=(ROWS, 16)), jnp.float32).at[SCORED + 3].set(3.0e38)
+    table = OutputTable(matrix, vocab_major=True, compute=jnp.bfloat16, scored=SCORED)
+    hidden = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
+    logits, pull = jax.vjp(table.logits, hidden)
+    (gradient,) = pull(jnp.ones_like(logits))
+    assert logits.shape[-1] == SCORED
+    assert bool(jnp.all(jnp.isfinite(logits))) and bool(jnp.all(jnp.isfinite(gradient)))
