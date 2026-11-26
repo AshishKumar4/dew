@@ -140,7 +140,7 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
 
 def test_moe_mesh_example_records_the_global_dispatch_its_layers_run(tmp_path):
     """Asked the global dispatch on the same eight-device mesh, the example records the dispatch its layers
-    ran by their own rule (`moe.resolved_dispatch`), global, whatever all-to-all XLA's partitioner adds to
+    ran by their own rule (`Mixture.dispatch_over`), global, whatever all-to-all XLA's partitioner adds to
     the compiled step, which it prints as a diagnostic alone (ledger 4775: the example read its dispatch off
     that count, a second way to decide what the rule decides)."""
     out = tmp_path / "mesh"

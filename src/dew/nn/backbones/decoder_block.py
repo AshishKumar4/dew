@@ -19,6 +19,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew._records import JSON
+from dew.mesh import EXPERT_AXIS
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 
@@ -56,7 +57,7 @@ from ..inputs import (
 )
 from ..kv_cache import CacheSpec, cache_of
 from ..mlp import GatedMLP
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
@@ -331,17 +332,28 @@ class Mixture:
                     "counts otherwise")
         return None
 
+    def dispatch_over(self, shards: int) -> str:
+        """The dispatch its layers run over `shards` expert shards (`moe.resolved_dispatch`): `'auto'` the
+        exchange where the shards divide the experts, the global dispatch anywhere else, either other as
+        named."""
+        return resolved_dispatch(self.dispatch, self.experts, shards)
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None: block routing, which
-        a cached decode step cannot reproduce. Either dispatch generates: a draw's device checks reach the
-        next step's model call through the exchange's `shard_map` (jax-ml/jax#40907, fixed in the pinned
-        jax)."""
+        a cached decode step cannot reproduce, and the exchange dispatch (named, or what `'auto'` resolves
+        to on the mesh in context), which reads its expert axis off a mesh in context that `generate` does
+        not run under (its rows' keys fold on one device, row 13493). A `dew.inference.serving.Server`
+        serves the exchange; `dispatch='global'` computes the same layer."""
         if self.routing_block is not None:
             return ("block routing chooses each block's experts from every token in it, which a cached "
                     "decode step, holding one token of its block, cannot: the step's routing would differ "
                     "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
                     "or route without blocks")
-        return None
+        if self.dispatch_over(jax.sharding.get_abstract_mesh().shape.get(EXPERT_AXIS, 1)) != 'exchange':
+            return None
+        return ("generate runs no mesh in context, which dispatch='exchange' reads its expert axis off "
+                "(row 13493). Serve the model with dew.inference.serving.Server, or generate with the "
+                "mixture's dispatch='global', the same layer")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm_eps: float, scale_offset: bool = False,
