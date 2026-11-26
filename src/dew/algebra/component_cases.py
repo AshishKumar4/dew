@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -34,6 +36,17 @@ def _apart_truth(rows, rows_lo, columns, columns_lo):
     left = rows + rows_lo
     right = columns + columns_lo
     return left[:, None] - right[None, :]
+
+
+def _apart_draw(seed, operands):
+    rows, rows_lo, columns, columns_lo = _arrays(seed, operands)
+    if seed == 1:
+        # Rounding either compensated prefix before subtraction would lose every difference.
+        rows.fill(2 ** 24)
+        columns.fill(2 ** 24)
+        rows_lo.fill(0.25)
+        columns_lo.fill(0)
+    return rows, rows_lo, columns, columns_lo
 
 
 def _keys_cotangent(weights, products, anchor, delta, seen):
@@ -104,7 +117,8 @@ ROUNDED = declare(__name__, "rounded", ComponentForm(_rounded, _rounded_truth, _
 TANGENT = declare(__name__, "rounded_tangent", ComponentForm(
     _tangent, _tangent_truth, _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))])))
 PREFIX_DIFFERENCE = declare(__name__, "prefix_difference", ComponentForm(
-    apart, _apart_truth, _cases(((32,), (32,), (64,), (64,)))))
+    apart, _apart_truth,
+    dataclasses.replace(_cases(((32,), (32,), (64,), (64,))), draw=_apart_draw)))
 KEYS_COTANGENT = declare(__name__, "keys_cotangent", ComponentForm(
     _keys_cotangent, _keys_truth,
     _backward_cases(((64, 32), (64, 32), (32,), (32,), (64, 32)), mask_count=1)))
