@@ -17,10 +17,23 @@ from jax.custom_derivatives import SymbolicZero
 from dew.algebra import derive, program, ratios, windows
 from dew.algebra.forms import Derived
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import raw_fields
 from dew.nn.programs import holes
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
+
+
+def _observed(w: jax.Array, *values: jax.Array) -> tuple[jax.Array, ...]:
+    """Ignore a missing observation, but not an ordinary finite observation of weight zero."""
+    if jnp.issubdtype(w.dtype, jnp.floating):
+        bits, sign, _, _ = raw_fields(w)
+        zero = bits == sign  # The backend must not treat a positive subnormal as empty.
+    else:
+        zero = w == 0
+    nonfinite = functools.reduce(jnp.logical_or, (~jnp.isfinite(value) for value in values))
+    absent = zero & nonfinite
+    return tuple(jnp.where(absent, jnp.zeros_like(value), value) for value in (*values, w))
 
 
 def _weighted_moments_with_total(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -36,6 +49,7 @@ def _weighted_moments_with_total(x: jax.Array, w: jax.Array) -> tuple[jax.Array,
 def weighted_moments(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Weighted `(mean, variance)` of `x` along its last axis under nonnegative weights `w`, zero where
     total weight is zero."""
+    x, w = _observed(w, x)
     return _weighted_moments_with_total(x, w)[:2]
 
 
@@ -66,6 +80,7 @@ def _weighted_cov_with_total(
 
 def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`."""
+    x, y, w = _observed(w, x, y)
     return _weighted_cov_with_total(x, y, w)[:3]
 
 
@@ -75,12 +90,18 @@ def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
     exposing total weight `n` as the final declared output (reusing the same reduction contract)."""
     axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
     if kind == "weighted":
-        fn = _weighted_moments_with_total if with_total else weighted_moments
+        def weighted(x, w):
+            return _weighted_moments_with_total(x, w)[:2]
+
+        fn = _weighted_moments_with_total if with_total else weighted
         return derive.Reduction(fn, {"x": axes, "w": axes}, walked="walked", ranges={"w": (0.0, math.inf)})
     if kind == "masked":
         return derive.Reduction(masked_moments, {"x": axes, "mask": axes}, walked="walked")
     if kind == "covariance":
-        fn = _weighted_cov_with_total if with_total else weighted_covariance
+        def covariance(x, y, w):
+            return _weighted_cov_with_total(x, y, w)[:3]
+
+        fn = _weighted_cov_with_total if with_total else covariance
         return derive.Reduction(fn, {"x": axes, "y": axes, "w": axes}, walked="walked",
                                 ranges={"w": (0.0, math.inf)})
     raise ValueError(f"unknown central-moment declaration kind: {kind!r}")
@@ -338,6 +359,7 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
         return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)
     work = _working_dtype(out_dtype)
+    x_arr, w_arr = _observed(w_arr, x_arr)
     return _cast_back(_run_chunked_weighted(x_arr.astype(work), w_arr.astype(work), tile, mode)[:2],
                       work, out_dtype)
 
@@ -351,5 +373,6 @@ def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
     x_arr, y_arr, w_arr = jnp.asarray(x), jnp.asarray(y), jnp.asarray(w)
     out_dtype = _floating_dtype(x_arr, y_arr, w_arr)
     work = _working_dtype(out_dtype)
+    x_arr, y_arr, w_arr = _observed(w_arr, x_arr, y_arr)
     return _cast_back(_run_chunked_cov(x_arr.astype(work), y_arr.astype(work), w_arr.astype(work), tile,
                                        mode)[:3], work, out_dtype)
