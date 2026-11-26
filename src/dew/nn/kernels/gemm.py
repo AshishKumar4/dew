@@ -60,7 +60,14 @@ from dew.nn.kernels.formats import PACKED_FORMATS, MxFp8, NvFp4, NvFp4Block, Ter
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, sides as hook_sides, tiling
+from dew.nn.kernels.templates.gemm import (
+    epilogue_vjp,
+    rows_gathered_wide,
+    rows_permuted,
+    scattered,
+    sides as hook_sides,
+    tiling,
+)
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import (
     NO_HOOKS,
@@ -193,7 +200,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights,
         # `applied` is the prologue's operand formed (`gemm`): the derivative forms it from its operands.
         del applied
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
-        lhs = lhs if gather is None else lhs.astype(at_least_fp32(lhs.dtype))[gather].astype(lhs.dtype)
+        lhs = lhs if gather is None else rows_gathered_wide(lhs, gather)
         out = scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                       before, prologue_arrays, prologue_axes, after, epilogue_arrays,
                                       epilogue_axes, dtypes, several, paired=paired, first=first,
