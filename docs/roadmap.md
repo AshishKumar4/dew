@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 12850, 13557, 13562, 13587]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010]
 - The kernel challenge's lessons in the templates. [5271, 3611]
@@ -25,8 +25,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873, 13489]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
-- Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
-- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
+- Low-precision and decode-size GEMMs. [483, 4518, 4519]
+- Model consumers fused through the template's hooks. [1376, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
@@ -34,7 +34,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - A forked chunked call whose readout reads the memory entering its token or weighs its own write (recurrence.Hooks.reads 'before', Hooks.own_weight: RWKV6's)…. [6267]
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
-- FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
