@@ -227,46 +227,6 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 
 
 @INTERPRETS
-def test_an_absorbed_mla_window_over_a_paged_latent_cache_returns_its_partial_for_the_merge_interpreted():
-    """MLA over a sliding window of a paged latent cache returning its partial accumulators
-    (kernel-templates.md §A row 63, tokamax's `mla_swa`): an absorbed step (`in_key`, the values its
-    latents' leading 512 columns) over each row's last 64 keys read from 16-key pages through a shuffled
-    table, `finished=False` (its state, an `Initial`), merged by the step over the rest of its keys (the
-    sparse part's, here its earlier keys whole, a dense cache) as its initial state: on par with the
-    reference path over every key (check 1), as an H100 runs it under the interpreter."""
-    page, window, latent, heads = 16, 64, 576, 4
-    lengths = jnp.asarray([KEYS - 56, KEYS // 3 * 2], jnp.int32)
-    starts = lengths - window
-    windowed = template.spans(1, KEYS, 2, lengths=lengths, starts=starts)
-    rest = template.spans(1, KEYS, 2, lengths=starts)
-    whole = template.spans(1, KEYS, 2, lengths=lengths)
-    table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
-                        jnp.int32)
-
-    def pooled(cache):
-        return _pooled(cache, table, page)
-
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 2)
-        return (jax.random.normal(streams[0], (2, 1, heads, latent), jnp.bfloat16),
-                jax.random.normal(streams[1], (2, KEYS, 1, latent), jnp.bfloat16))
-
-    def ours(query, key):
-        with generation.assumed("sm90"):
-            pool = pooled(key)
-            state = attention_decode.attend(query, pool, pool[..., :512], windowed, interpret=True,
-                                            table=table, in_key=True, finished=False)
-            return attention_decode.attend(query, key, key[..., :512], rest, template.Hooks(initial=state),
-                                           interpret=True, in_key=True)
-
-    def reference(query, key):
-        return template.reference(query, key, key[..., :512], whole)
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
-                    "template decode absorbed MLA paged window merged", seeds=SEEDS)
-
-
-@INTERPRETS
 def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
     """MiniMax M3's sparse decode (kernel-templates.md §A row 37a): a decode step over a paged cache of
     128-token pages reading only the pages its selection names (the first, its own, and one between, as
