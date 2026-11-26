@@ -130,8 +130,9 @@ def test_a_zero_head_passes_its_gradient_through_the_clip():
     ({0: 2.0 ** 63, 1: 2.0 ** 63, 2: 2.0 ** 63, 3: 2.0 ** 63}, 8.0, {0: 4.0, 1: 4.0, 2: 4.0, 3: 4.0}),
     ({4: 2.0 ** 61, 5: 2.0 ** 61, 6: 2.0 ** 61, 7: 2.0 ** 61}, 8.0, {4: 4.0, 5: 4.0, 6: 4.0, 7: 4.0}),
     ({0: 2.0 ** 62, 1: 2.0 ** -100}, 2.0 ** 61, {0: 2.0 ** 61, 1: 2.0 ** -101}),
+    ({0: 2.0 ** 127}, 2.0 ** -100, {0: 2.0 ** -100}),
 ], ids=["one-past-the-square", "one-near-the-largest", "near-the-largest-gain-subnormal", "four-past",
-        "four-at-the-bound", "a-small-component-kept"])
+        "four-at-the-bound", "a-small-component-kept", "a-subnormal-gain-to-a-small-threshold"])
 def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold(head, threshold, clipped_head):
     """fp32 heads of eight whose squares' sum overflows (one component 2^66 or -2^127, whose reciprocal is
     subnormal too, under a threshold whose gain stays normal or does not; four of 2^63), four just inside
@@ -207,6 +208,20 @@ def test_a_giant_heads_normal_gain_scales_its_seeds_whole(width, head, threshold
     np.testing.assert_array_equal(np.asarray(moved), wanted)
     _, pull = jax.vjp(lambda x: clipped(x, threshold, 1e-6), jnp.asarray(x))
     np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seeded))[0]), wanted)
+
+
+def test_a_giant_heads_radial_derivative_keeps_epsilons_share():
+    """`[2^70, 0, ...]` clipped to `2^69` with epsilon 1: along the head, where its length's share of
+    `|x| + eps` rounds to 1, its derivative is epsilon's alone, `g eps / (|x| + eps)` = `2^-71`, both ways,
+    where `1 - r` cancelled it to zero (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed, expected = (np.zeros(8, np.float32) for _ in range(3))
+    x[0], seed[0], expected[0] = 2.0 ** 70, 1.0, 2.0 ** -71
+    _, moved = jax.jvp(lambda x: clipped(x, 2.0 ** 69, 1.0), (jnp.asarray(x),), (jnp.asarray(seed),))
+    np.testing.assert_array_equal(np.asarray(moved), expected)
+    _, pull = jax.vjp(lambda x: clipped(x, 2.0 ** 69, 1.0), jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
 
 
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
