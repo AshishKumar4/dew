@@ -172,7 +172,10 @@ def test_padded_rows_score_as_they_do_alone():
     score -inf."""
     checkpoint = tiny()
     ordered = sorted(rows(checkpoint, parallel=False), key=lambda row: row[0])
-    batch = DecisionInputs.collate([encoded for _, _, encoded in ordered], checkpoint.specials.pad)
+    # Collated on the host before its site, as a GPU tier part's prepare runs it (row 8060).
+    with ahead_on_the_host(wherever=True):
+        batch = jax.tree.map(np.asarray, DecisionInputs.collate([encoded for _, _, encoded in ordered],
+                                                                checkpoint.specials.pad))
     widths = [len(markers(encoded)) for _, _, encoded in ordered]
 
     def in_one_batch(dtype, inputs):
