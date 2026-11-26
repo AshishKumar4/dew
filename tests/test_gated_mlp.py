@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from generation_support import generations
-from reference_error import assert_as_exact, seeds_for, with_gradients
+from reference_error import assert_as_exact, with_gradients
 from test_gemm_formed import FEATURES, HIDDEN, _draw
 
 from dew.nn import activations
@@ -651,8 +651,7 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
 
     label = f"gated mlp hidden {'packed' if packed else 'apart'} dropout {dropout}"
     dew_fn, ref_fn = jax.jit(apply_of(layer)), jax.jit(apply_of(before))
-    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth,
-                    seeds=seeds_for(ref_fn, draw, label, truth_fn=truth, dew_fn=dew_fn))
+    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth, seeds=SEEDS)
 
     def applied(module):
         return lambda variables, rows: module.apply(variables, rows, train=True, rngs=rngs)

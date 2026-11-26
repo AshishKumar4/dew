@@ -1932,7 +1932,9 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     if prologue is None:
         return d_operand.astype(rounded if wide_rows else lhs.dtype), (), None
     # A gathered call's rows taken wide (exactly) into the prologue, run at its own dtype as the forward ran
-    # it: each route's cotangent the prologue's VJP gives, widened, not rounded to the rows' dtype.
+    # it: each route's cotangent the prologue's VJP gives, widened, not rounded to the rows' dtype. A narrow
+    # prologue's VJP takes its operand's cotangent in its own dtype (reverse mode's: a value's cotangent is
+    # its dtype), as the portable program's does; an fp32 one's routes reach the sum unrounded.
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs.astype(wide) if wide_rows else lhs,
                                              prologue_arrays, prologue_axes, group_sizes, d_operand, compute)
     sides = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
