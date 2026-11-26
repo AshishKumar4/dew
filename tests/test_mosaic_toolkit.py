@@ -473,9 +473,9 @@ def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes, a named CTA barrier none (the block's hardware barrier,
-    `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
-    on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
-    each walk apart (mma.sync's emit_pipeline)."""
+    `plgpu.CtaBarrier`, a packed decode's consumers' meet); tiles scoped after its walks beside the program's
+    on a family whose walks share a scope (warpgroup MMA), together the larger of them and the walks on one
+    that scopes each walk apart (mma.sync's emit_pipeline): one scope holds them all past the walks."""
     from dew.nn.kernels.templates import mosaic_sm90
 
     program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
@@ -485,6 +485,9 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
     assert resources.shared_bytes(mosaic_sm90.WGMMA, scope) == 1024 + 2048 + 8192 + 3 * 8
     assert resources.shared_bytes(mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), scope) == 1024 + 8192 + 3 * 8
+    # Two 6 KiB tiles past the walks: 12 KiB together, past the walks' 8 KiB.
+    both = dataclasses.replace(scope, after=(((1536,), jnp.float32),) * 2)
+    assert resources.shared_bytes(mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), both) == 1024 + 12288 + 3 * 8
     # Three warpgroups reducing implicitly each take their share of Mosaic GPU's scratch on warpgroup MMA.
     reducing = dataclasses.replace(scope, reducing_warpgroups=3)
     assert resources.shared_bytes(mosaic_sm90.WGMMA, reducing) == 1024 + 3 * 2048 + 2048 + 8192 + 3 * 8
