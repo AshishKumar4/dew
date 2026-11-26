@@ -266,8 +266,7 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
     and, with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
     None)."""
     initial = None
-    if walked_initial(hooks.initial) is not None:
-        state = hooks.initial
+    if (state := walked_initial(hooks.initial)) is not None:
         widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
         initial = (call.rows(state.m, algebra.LEAST), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), widened))
