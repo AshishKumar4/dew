@@ -99,7 +99,8 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     if not any(anchors):
         return []
     base = fusion.base_context() if _base is None else _base
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context_of(base))
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families),
+           fusion.choice_context_of(base))
 
     def recognizing() -> list:
         return [_positioned(jaxpr, written)

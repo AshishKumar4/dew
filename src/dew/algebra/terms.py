@@ -707,7 +707,8 @@ def _in_process_digest(jaxpr: jcore.Jaxpr) -> _SubKey:
     inner = jaxpr.jaxpr
     # A const-free body already keyed for whole-body reuse has the same structural digest. Only that
     # direction of reuse is safe: the permissive key can hold device buffers or identity-only parameters.
-    if (cached := _BODY_KEYS.get(inner)) is not None or (cached := _IN_PROCESS_DIGESTS.get(inner)) is not None:
+    cached = _BODY_KEYS.get(inner) or _IN_PROCESS_DIGESTS.get(inner)
+    if cached is not None:
         return cached
     sub = _SubKey(*_body_digest(inner, in_process=True, reject_device=False))
     _IN_PROCESS_DIGESTS[inner] = sub

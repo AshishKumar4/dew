@@ -354,7 +354,8 @@ fitted to them, and a rule set ships only with measured receipts.
   candidates is proven equal taken). A body without a local unclaimed anchor is answered before hashing.
   Control-flow bodies are searched separately. Recognition reuses a body digest already proven safe for
   whole-body reuse without adopting that cache's output or source locations (rows 5556, 13020). The region's
-  equations and each candidate's declaration over the same operands are traced as one program and brought to a normal form
+  equations and each candidate's declaration are traced over the same operands as one program and brought to
+  a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
   product, a narrow float's correctly rounded arithmetic its float32 arithmetic rounded once, axes of one
   element erased, equal equations once). Where a candidate's results are then its declaration's very values,
