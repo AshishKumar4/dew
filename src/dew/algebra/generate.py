@@ -244,7 +244,8 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
         single = own[0].single
-        body += ["", "", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
+        policy, target = own[0].policy, own[0].target
+        body += ["", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
                  "    forms: dict[tuple, Callable[..., tuple]] = {"]

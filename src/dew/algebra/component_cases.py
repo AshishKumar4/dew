@@ -73,6 +73,11 @@ def _backward_cases(shapes, *, mask_count, total_at=None, accurate=False):
             if seed % 2 == 0:
                 total[0] = 0
                 values[-2][0] = False
+            elif seed == 1:
+                # The weight rounds to zero, but a large live dP keeps the cotangent normal.
+                values[0][0], values[2][0], total[0] = 0, 87, 2.0 ** 25
+                values[1][0, 1], values[4][0], values[5][0] = 3.8e30, 0, 0
+                values[-2][0, 1], values[-1][0, 1] = True, False
             values[total_at] = total
         return tuple(values)
 
