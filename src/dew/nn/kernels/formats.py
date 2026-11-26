@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import Tracer
 from jax.typing import DTypeLike
 
 from dew.algebra import bits
