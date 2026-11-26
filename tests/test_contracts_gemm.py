@@ -233,6 +233,7 @@ def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
         np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
     np.testing.assert_array_equal(gradient, np.broadcast_to([[0.25], [0.5]], codes.shape))
 
+
 def test_decoded_ternary_preserves_its_linear_scale_rule():
     values = np.tile(np.asarray([[-1, 1], [0, 0], [1, -1], [0, 0]], np.float32), (64, 1))
     weights = formats.TernaryWeights.of(values, scale=np.ones(2, np.float32))
@@ -255,6 +256,16 @@ def test_decoded_ternary_preserves_its_linear_scale_rule():
     np.testing.assert_array_equal(np.asarray(tangent).view(np.uint32), (values * small).view(np.uint32))
     np.testing.assert_array_equal(gradient, [3, -6])
 
+    @jax.jit
+    def exact_output(s):
+        def convert(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.int32)
+
+        return jax.jvp(convert, (s,), (jnp.ones_like(s),))
+
+    integer, no_tangent = exact_output(scale)
+    np.testing.assert_array_equal(integer, values.astype(np.int32))
+    assert no_tangent.dtype == jax.dtypes.float0
 
 
 @pytest.mark.parametrize("edge", EDGES)

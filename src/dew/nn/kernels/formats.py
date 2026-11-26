@@ -551,8 +551,11 @@ class TernaryWeights:
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
         """Decode the packed values in `dtype`, including a representable subnormal stored scale."""
         scale_checked(jnp.shape(self.scale), self.shape)
-        return _decode_ternary(jax.dtypes.canonicalize_dtype(dtype), self.unscaled(jnp.float32),
-                               jnp.asarray(self.scale))
+        dtype = jax.dtypes.canonicalize_dtype(dtype)
+        codes, scale = self.unscaled(jnp.float32), jnp.asarray(self.scale)
+        if scale.dtype == jnp.float32 and dtype in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
+            return _decode_ternary(dtype, codes, scale)
+        return _ternary_arithmetic(dtype, codes, scale)
 
 
 def _ternary_arithmetic(dtype, codes, scale):
@@ -562,8 +565,6 @@ def _ternary_arithmetic(dtype, codes, scale):
 
 def _ternary_decoded(dtype, codes, scale):
     ordinary = _ternary_arithmetic(dtype, codes, scale)
-    if scale.dtype != jnp.float32 or dtype not in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
-        return ordinary
     _, sign, biased, fraction = raw_fields(scale)
     power = jnp.full(fraction.shape, -149, jnp.int32)
     if dtype == jnp.float64:
