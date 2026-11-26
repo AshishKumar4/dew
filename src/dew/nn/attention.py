@@ -1216,14 +1216,6 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
     resolved = resolve_implementation(implementation, query, key, **facts).kernel
-    taking = ('template', 'inference', 'xla', 'reference')
-    if sinks is not None and sinks.ndim != 1 and resolved not in taking:
-        # A query's own sink is the template's initial state (`template.sinks`) or the portable softmax's
-        # column (`sink_column`); a kernel taking a head's sinks alone declines it, by name where named.
-        if implementation != 'auto':
-            raise ValueError(f"the {resolved} kernel takes a head's sinks, not a query's: attend a query's "
-                             "own sinks on the template or the reference")
-        resolved = 'template'
     if resolved != 'template' or FORWARD_MODE.get():
         # The template reads a separable bias as its two terms (`template_attention`); every other route,
         # 'inference''s two among them, adds it written out, as forward mode's reference and kernel do.
@@ -1523,7 +1515,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
                     and not isinstance(bias, SeparableBias)),
         separable_bias=isinstance(bias, SeparableBias),
-        sinks=sinks is not None, softcap=softcap,
+        sinks=sinks is not None, query_sinks=sinks is not None and sinks.ndim != 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),

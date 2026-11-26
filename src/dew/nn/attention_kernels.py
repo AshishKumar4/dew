@@ -222,6 +222,10 @@ class AttentionCase:
     """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's), which the
     template reads as its two terms in O(S) and every other route writes out, `[B, H, S, S]`: not a dense
     bias (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
+    query_sinks: bool = False
+    """Whether the call's sinks are each query's own (`[B, S, H]`, projected from its input), not a head's
+    (`[H]`): the template's initial state (`template.sinks`) and the portable softmax's column read them,
+    and a kernel taking a head's sinks alone refuses the call (`_HEAD_SINKS`)."""
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
@@ -295,6 +299,10 @@ _WHOLE_PRODUCTS = _Need('quantized', lambda case: case.quantized is None,
                         "a quantized model's rule owns the call's products, which this kernel forms whole "
                         "inside its launch, past the rule (`AttentionCase.quantized`)", row=INHERENT)
 _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
+_HEAD_SINKS = _Need('query_sinks', lambda case: not case.query_sinks,
+                    "it takes a head's sinks, not a query's own", row=INHERENT)
+"""A kernel reading one sink a head (splash's, the decode kernel's), which refuses a call whose every query
+weighs its own (`AttentionCase.query_sinks`), however named."""
 _FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
 _FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
                       kind='handoff')
@@ -479,6 +487,7 @@ TPU_SUPPORTS = (
     TPU_BACKEND,
     NATIVE_FLOAT16,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
+    _HEAD_SINKS,
     _Need('spans_only', lambda case: not case.spans_only,
           "splash's descriptor describes no mask of the call's own data, which block groups, key validity "
           "and counted places are; a named tpu call takes them as their mask on its pallas flash kernel "
@@ -963,7 +972,7 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
-    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, *decode_attention.SUPPORTS)),
+    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, _HEAD_SINKS, *decode_attention.SUPPORTS)),
     Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
