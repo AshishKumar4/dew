@@ -1323,34 +1323,35 @@ class RowPlan:
 
         A pool of processes therefore draws the same values as one process does
         for the same rows. On a mesh the rows fold on the mesh itself, each device
-        its own rows from `key` replicated over it, so the fold runs under a mesh
-        in context as every other program of the request does (row 13493).
+        its own rows from its process's key, so the fold runs under a mesh in
+        context as every other program of the request does (row 13493).
         """
         sharding = self.sharding
         start = self.process * self.rows
         indices = np.arange(start, start + self.count, dtype=np.uint32)
         if sharding is None:
             return jax.vmap(lambda row: jax.random.fold_in(key, row))(jax.device_put(indices, key.sharding))
-        # A request key replicated over a multi-process mesh is not addressable: every replica holds the
-        # same key data, so each process lays this process's copy over the mesh replicated, its rows'
-        # indices sharded as the rows are, and the fold reads no host and moves no key between devices.
+        # Each process's rows fold from its own root (processes may hold different seeds, which a request
+        # does not agree on), so each placed row carries its process's root's words beside its global
+        # index, both laid out as the rows are, and each device folds its own rows.
         from dew.nn.kernels.options import program
 
-        replicated = jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec())
-        local = jax.random.key_data(key.addressable_data(0))
-        held = jax.random.wrap_key_data(jax.make_array_from_process_local_data(replicated, local),
-                                        impl=jax.random.key_impl(key))
+        local = np.asarray(jax.random.key_data(key.addressable_data(0)))
+        rows_of_roots = np.broadcast_to(local, (self.count, *local.shape))
+        roots = jax.make_array_from_process_local_data(sharding, rows_of_roots)
         placed = jax.make_array_from_process_local_data(sharding, indices)
-        return program(_row_keys, out_shardings=sharding)(held, placed)
+        return program(_row_keys, static_argnames=("impl",), out_shardings=sharding)(
+            roots, placed, impl=jax.random.key_impl(key))
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
         return host_rows(leaf, self.rows)
 
 
-def _row_keys(key: jax.Array, rows: jax.Array) -> jax.Array:
-    """`key` folded by each of `rows`' indices (`RowPlan.keys`)."""
-    return jax.vmap(jax.random.fold_in, in_axes=(None, 0))(key, rows)
+def _row_keys(roots: jax.Array, rows: jax.Array, impl) -> jax.Array:
+    """Each row's root key (its key data `roots`, of `impl`) folded by its index in `rows`
+    (`RowPlan.keys`)."""
+    return jax.vmap(jax.random.fold_in)(jax.random.wrap_key_data(roots, impl=impl), rows)
 
 
 @dataclass(frozen=True)
