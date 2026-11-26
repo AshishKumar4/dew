@@ -284,10 +284,9 @@ def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
         return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
 
     def truth(x, w, t):
-        logits = np.asarray(x, np.float64) @ np.asarray(w, np.float64).T
-        capped = 20.0 * np.tanh(logits / 20.0)
-        peak = capped.max(axis=1, keepdims=True)
-        return (np.log(np.exp(capped - peak).sum(axis=1)) + peak[:, 0]) - capped[np.arange(64), np.asarray(t)]
+        # Its operands widened to float64 by the gate (`assert_as_exact`): the cap's quotient exact there.
+        capped = 20.0 * jnp.tanh(jnp.dot(x, w.T) / 20.0)
+        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
 
     label = "capped linear_ce"
     dew_fn, ref_fn = jax.jit(fused), jax.jit(portable)

@@ -16,7 +16,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import categorical
-from dew.nn.precision import capped_logits
 from dew.nn.kernels import generation, grouped_launch, selection, tuning, xla_products
 from dew.nn.kernels.templates import (
     bundles,
@@ -48,7 +47,7 @@ from dew.nn.kernels.templates.gemm.pricing import (
     tile_rows,
 )
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
-from dew.nn.precision import exact_products
+from dew.nn.precision import capped_logits, exact_products
 from dew.nn.sharding import automatic_axes
 
 LINEAR_CE = "dew_linear_ce"
