@@ -452,9 +452,9 @@ class Store:
         with self.request("GET", key, limit=limit, until=until) as reply:
             return None if reply.body is None else reply.body.whole()
 
-    def put(self, key: str, body: bytes) -> None:
-        """`body` written at `key`."""
-        with self.request("PUT", key, body=body):
+    def put(self, key: str, body: bytes, until: float | None = None) -> None:
+        """`body` written at `key`, within `until` where one is given (`request`)."""
+        with self.request("PUT", key, body=body, until=until):
             pass
 
     def delete(self, key: str) -> None:

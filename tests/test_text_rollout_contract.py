@@ -12,6 +12,7 @@ logits it reads are the raw likelihoods'. What is one computation, or a token,
 is held exactly.
 """
 
+import dataclasses
 import functools
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -757,3 +758,42 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
         assert typed.keys() == legacy.keys()
         for name in typed:
             np.testing.assert_array_equal(np.asarray(typed[name]), np.asarray(legacy[name]))
+
+
+def test_an_episodes_rollout_owes_its_objective_what_a_sampled_one_does():
+    """A native episodes rollout (`RolloutScheduler.episodes`) trains a GRPO objective as a sampled one
+    does (one policy, `_trained_by`): reading its ratio at `sampling_temperature` 0.7, its packed proximal
+    column is rescored under the step's weights, the policy its loss scores (a ratio of 1 over unchanged
+    weights); and paying a reward-side reference penalty (`reward_kl`), its advantages, over weights moved
+    off the frozen reference, are not those the same draws earn unpenalized, where the episodes factory
+    left both off (the 2026-11-26 audit: a ratio of 0.830 before any update, a penalty silently unpaid)."""
+    from model_support import moved
+
+    from dew.objectives.rl.scheduler import scored_rows
+    from dew.objectives.rl.sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
+
+    model = decoder()
+    sampling = Sampling(temperature=1.2, eos_token_ids=(3, 7), pad_token_id=12)
+
+    def rolled(reward_kl: float):
+        objective = GRPOObjective(model, seq_len=7, sampling_temperature=0.7, reward_kl=reward_kl)
+        params = nn.unbox(objective.init(jax.random.key(0)))
+        state = Trainer(objective, optax.sgd(.01), key=jax.random.key(1)).initial_state()
+        # The policy moved off the frozen reference it starts at, so the penalty it pays is not zero.
+        state = dataclasses.replace(state, variables={
+            **state.variables, "params": moved(state.variables["params"], jax.random.key(2), 0.3)})
+        episodes = RolloutScheduler.episodes(
+            TextGeneration(model, params), answered,
+            lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),
+            objective=objective, max_prompt_tokens=4, max_new_tokens=4, max_turns=1, groups=2,
+            sampling=sampling)
+        batch = {"task_id": np.array([31], np.int32)}
+        packed = episodes(state, batch, jax.random.key(3), objective=objective)
+        return objective, state, packed
+
+    objective, state, penalized = rolled(0.5)
+    np.testing.assert_array_equal(
+        np.asarray(penalized[OLD_LOG_PROBS_KEY]),
+        np.asarray(scored_rows(objective, state.variables, penalized, Progress(state.updates))))
+    _, _, unpenalized = rolled(0.0)
+    assert not np.array_equal(np.asarray(penalized[ADVANTAGES_KEY]), np.asarray(unpenalized[ADVANTAGES_KEY]))

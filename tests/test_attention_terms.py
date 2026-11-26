@@ -249,6 +249,53 @@ def test_an_unclipped_giant_heads_derivative_is_the_identity():
     np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), seed)
 
 
+def test_a_subnormal_gains_tangent_near_one_stays_finite_both_ways():
+    """A head of four channels `2^127` (the rest zero) clipped to 2, its gain subnormal: a tangent or a
+    cotangent `2^127` across it, on the sixth channel, moves its clip by 1 there, bit for bit, both ways,
+    where the product `2^127 * 2` overflowed before the head's length scaled it back (row 13169)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed, expected = (np.zeros(8, np.float32) for _ in range(3))
+    x[:4], seed[5], expected[5] = 2.0 ** 127, 2.0 ** 127, 1.0
+    _, moved = jax.jvp(lambda x: clipped(x, 2.0, 1e-6), (jnp.asarray(x),), (jnp.asarray(seed),))
+    np.testing.assert_array_equal(np.asarray(moved), expected)
+    _, pull = jax.vjp(lambda x: clipped(x, 2.0, 1e-6), jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
+
+
+def test_a_float64_giant_heads_subnormal_gain_tangent_stays_in_float64():
+    """A float64 head `[2^1023, 0, ...]` clipped to 1, its gain subnormal in float64: a tangent or a
+    cotangent `2^1023` across it moves its clip by 1 there, both ways, bit for bit, where the balanced
+    product taken in float32 read the head's scale as zero (row 13169's review)."""
+    from dew.nn.attention_terms import clipped
+
+    with jax.enable_x64(new_val=True):
+        x, seed, expected = (np.zeros(8, np.float64) for _ in range(3))
+        x[0], seed[5], expected[5] = 2.0 ** 1023, 2.0 ** 1023, 1.0
+        _, moved = jax.jvp(lambda x: clipped(x, 1.0, 1e-6), (jnp.asarray(x),), (jnp.asarray(seed),))
+        np.testing.assert_array_equal(np.asarray(moved), expected)
+        _, pull = jax.vjp(lambda x: clipped(x, 1.0, 1e-6), jnp.asarray(x))
+        np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
+
+
+def test_a_tiny_epsilons_radial_share_survives_a_giant_head():
+    """`[2^62, 0, ...]` clipped to `2^61` with epsilon `2^-62`: a radial seed `2^120` moves the clip along
+    the head by `2^-5`, both ways, jitted, where `eps * s` (`2^-129`) flushed before its division by the
+    scaled length and the share was zero (row 13169's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed = np.zeros(8, np.float32), np.zeros(8, np.float32)
+    x[0], seed[0] = 2.0 ** 62, 2.0 ** 120
+
+    def clip(x):
+        return clipped(x, 2.0 ** 61, 2.0 ** -62)
+
+    moved = jax.jit(lambda x, seed: jax.jvp(clip, (x,), (seed,))[1])(jnp.asarray(x), jnp.asarray(seed))
+    pulled = jax.jit(lambda x, seed: jax.vjp(clip, x)[1](seed)[0])(jnp.asarray(x), jnp.asarray(seed))
+    for derivative in (np.asarray(moved), np.asarray(pulled)):
+        assert derivative[0] == 2.0 ** -5, derivative
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped

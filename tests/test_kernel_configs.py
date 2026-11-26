@@ -2175,3 +2175,40 @@ def test_a_walk_stores_each_output_and_reads_each_epilogue_operand_at_its_dtype(
         assert walks[4].stored == walks[1].stored
         assert walks[4].stored * 2 == walks[4].passes
 
+
+def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_on_that_kind_alone():
+    """A build that states the kind of GPU it compiled for (a host's own topology's) takes that part's facts
+    within its generation (`built_target`: a GH200's own, not the canonical H100's),
+    refuses a part of another generation, and keeps the canonical target for a kind the table names no part
+    of; its build target loads on that kind alone, where a canonical build loads on any part of its
+    generation (row 13252)."""
+    from dew.nn.kernels.generation import built_target, gpu_target
+    from dew.training.ahead import BuildTarget
+
+    gh200 = built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    canonical = built_target("sm90")
+    assert gh200 == gpu_target("NVIDIA GH200 480GB") and gh200 != canonical
+    assert built_target("sm90", 114, device_kind="NVIDIA GH200 480GB").multiprocessors == 114
+    assert built_target("sm90", device_kind="NVIDIA H999 unknown") == canonical
+    assert built_target("sm90", device_kind=canonical.device_kind) == canonical
+    with pytest.raises(ValueError):
+        built_target("sm80", device_kind="NVIDIA GH200 480GB")
+    stated = BuildTarget.built(gh200, 1, device_kind="NVIDIA GH200 480GB")
+    anywhere = BuildTarget.built(canonical, 1)
+    h100 = dataclasses.replace(stated, device_kind=gpu_target("sm90").device_kind)
+    assert stated.differences(stated) == [] and stated.differences(h100) != []
+    assert anywhere.differences(h100) == [] and anywhere.differences(stated) == []
+
+
+def test_a_programs_lowering_for_a_stated_kind_derives_its_launches_from_that_part():
+    """Within `lowering_for` of a stated kind (a node's own topology's, as `compile_programs` and a prepare's
+    trace read it) the GPU in effect is that part's target, and the generation's canonical one without it
+    (row 13252: a GH200 prepare's launches priced as the canonical H100's)."""
+    from dew.nn.kernels.generation import built_target, gpu_target
+    from dew.training.ahead import lowering_for
+
+    with lowering_for("sm90", device_kind="NVIDIA GH200 480GB"):
+        assert gpu_target() == built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    with lowering_for("sm90"):
+        assert gpu_target() == built_target("sm90")
+

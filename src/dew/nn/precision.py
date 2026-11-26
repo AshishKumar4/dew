@@ -41,7 +41,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
-from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
@@ -55,17 +54,19 @@ from dew.nn.derivatives import (
     with_gradients_formed_at,
     with_tangents_formed,
 )
-from dew.nn.float_bits import (
-    exact_power2,
-    lowered_rounded,
-    raw_fields,
-    split_bits,
-    two_factor_reach,
-    whole_power2,
-    widened_exactly,
+
+# The division's names, which its callers read here as before it had a module of its own.
+from dew.nn.division import (
+    _correctly_rounded_divide as _correctly_rounded_divide,
+    correctly_rounded_divide as correctly_rounded_divide,
+    correctly_rounded_divide_p as correctly_rounded_divide_p,
+    divided as divided,
+    lowered_divide as lowered_divide,
+    triton_lowerings as triton_lowerings,
 )
+from dew.nn.float_bits import exact_power2, split_bits, two_factor_reach, whole_power2, widened_exactly
 from dew.nn.nested import nested
-from dew.nn.programs import UNROUNDED, equations, own_preset
+from dew.nn.programs import equations, own_preset
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -1704,217 +1705,6 @@ def _two_product(left, right, *, bit_split: bool, subtract: bool,
     tail = rounded(ll * rl)
     residual = rounded(tail - lost if subtract else lost + tail)
     return (product, residual) if scale is None else (product * scale, residual * scale)
-
-
-def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
-                              denominator: jax.typing.ArrayLike) -> jax.Array:
-    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
-    dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
-    by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
-    30 to 50% of quotients (DIVIDE-a100, DIVIDE-h100 receipts), where a quantizer's
-    scales and a diffusion schedule's states must round as the reference's host or
-    CUDA division does (compressed-tensors' NVFP4, the FP8 block cast, PyTorch's
-    schedulers).
-
-    Each operand's significand, its fraction bits under the exponent of one, in
-    [1, 2), divides apart from its exponent field (`_rounded_significand`), so
-    every intermediate stays normal whatever the operands' range; the fields'
-    difference then scales the rounded significand by its exponent bits, exact
-    for a normal result. A quotient below the normal range rounds once to the
-    subnormal grid: the significand scaled onto that grid rounds to its nearest
-    integer, ties to even, the exact residual settling a scaled significand that
-    lands on a half, and the integer is the result's bits, which no flush to zero
-    reaches. Past the largest float the quotient is infinite. A zero, infinite or
-    NaN operand, or a subnormal one, which XLA:CPU reads as zero (an exponent field
-    of 0 or 255), is the division's. Every step is a bit operation or a float32
-    operation on normal values, about 140 operations a quotient where frexp's and
-    nextafter's own special cases took 210 (row 6312). It is the lowering of a
-    primitive of its own (`correctly_rounded_divide`), so no pass sees its
-    error-free steps to reassociate them.
-    """
-    return _divided(numerator, denominator)
-
-
-def lowered_divide(numerator: jax.Array, denominator: jax.Array, lowered: jax.Array) -> jax.Array:
-    """`numerator / denominator * 2^-lowered` (`lowered` int32, at least 0, broadcast), rounded once to fp32
-    however far below its least normal (`_divided`, `correctly_rounded_divide`'s): a quotient a CPU flushes
-    (row 4023), its numerator raised by `lowered` from its bits by its caller (`raised_exactly`), so both
-    operands are normal; a subnormal operand is the division's (row 6302's finish and an initial state's
-    gradient)."""
-    return _divided(numerator, denominator, lowered)
-
-
-def _divided(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
-             lowered: jax.typing.ArrayLike = 0) -> jax.Array:
-    """`correctly_rounded_divide`'s quotient times `2^-lowered`, rounded once
-    (`_correctly_rounded_divide`); a special operand's division lowered in integers (`lowered_rounded`)."""
-    numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
-                                                  jnp.asarray(denominator, jnp.float32))
-    plain = numerator / denominator
-    if not (isinstance(lowered, int) and lowered == 0):
-        plain = lowered_rounded(plain, jnp.broadcast_to(jnp.asarray(lowered, jnp.int32), plain.shape))
-    (_, top_sign, top_field, top_fraction), (_, bottom_sign, bottom_field, bottom_fraction) = (
-        raw_fields(value) for value in (numerator, denominator))
-    top_field, bottom_field = top_field.astype(jnp.int32), bottom_field.astype(jnp.int32)
-    special = (top_field == 0) | (top_field == 255) | (bottom_field == 0) | (bottom_field == 255)
-    negative = top_sign != bottom_sign
-    # A normal operand's significand, exact in [1, 2); any bits give one in that range, so a special
-    # lane's steps stay normal too, and its result is the division's.
-    top, bottom = (jax.lax.bitcast_convert_type(fraction | np.uint32(0x3F800000), jnp.float32)
-                   for fraction in (top_fraction, bottom_fraction))
-    significand, residual = _rounded_significand(top, bottom)
-    exponent = top_field - bottom_field - lowered
-    # The rounded significand's fields (`raw_fields`), a positive normal's: its biased exponent once scaled,
-    # 1 to 254 a normal float, set back in its bits.
-    bits, _, significand_field, _ = raw_fields(significand)
-    field = significand_field.astype(jnp.int32) + exponent
-    normal = jax.lax.bitcast_convert_type(bits + jax.lax.bitcast_convert_type(exponent << 23, jnp.uint32),
-                                          jnp.float32)
-    # Below the normal range: the significand on the grid of 2^-149, a value under 2^23 whose
-    # integer part and half are exact in fp32; within the float32 range scaled by 2^shift.
-    shift = jnp.clip(exponent + 149, -126, 127)
-    scaled = significand * exact_power2(shift, jnp.float32)
-    whole = jnp.floor(scaled)
-    fraction = scaled - whole
-    odd = (whole.astype(jnp.int32) & 1) == 1
-    half_up = (residual > 0) | ((residual == 0) & odd)
-    up = (fraction > 0.5) | ((fraction == 0.5) & half_up)
-    subnormal = jax.lax.bitcast_convert_type((whole.astype(jnp.int32) + up.astype(jnp.int32)),
-                                             jnp.float32)
-    magnitude = jnp.where(field >= 255, jnp.inf, jnp.where(field >= 1, normal, subnormal))
-    signed = jnp.where(negative, -magnitude, magnitude)
-    return jnp.where(special, plain, signed)
-
-
-@_protected
-def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The correctly rounded fp32 quotient of two significands in [1, 2), and the sign of the exact
-    quotient's distance from it (+1 above, -1 below, 0 exact).
-
-    A Dekker TwoProduct gives the exact residual of the approximate
-    quotient, split into two fp32 values. One residual correction puts the
-    quotient within one ulp; comparing its exact residual with each
-    neighbour's half-spacing times the divisor chooses nearest-even. Its
-    neighbours are its bits' (a positive normal float's next and previous
-    floats), and that threshold product is exact because the half-spacing
-    is a power of two, every intermediate normal at these magnitudes. The
-    rounded quotient's residual is the corrected one's less the move, one
-    spacing times the divisor, exact, and within a factor of two of the
-    corrected residual where the quotient moves (Sterbenz), so its sign needs
-    no further product. Each residual is an error-free step, so the whole is
-    one protected span."""
-    quotient = numerator / denominator
-    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
-    residual = (numerator - product) - error
-    quotient = quotient + residual / denominator
-    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
-    high, low = two_sum(numerator - product, -error)
-    bits = jax.lax.bitcast_convert_type(quotient, jnp.uint32)
-    above, below = (jax.lax.bitcast_convert_type(bits + step, jnp.float32) for step in (1, -1))
-    upper = (above - quotient) * 0.5 * denominator
-    lower = (quotient - below) * 0.5 * denominator
-    odd = (bits & 1) != 0
-    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
-    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
-    rounded = jnp.where(up, above, jnp.where(down, below, quotient))
-    # The exact quotient's side of the rounded one: the rounded quotient's exact residual, the numerator
-    # less its product with the divisor, which is zero only where the two are equal.
-    side = jnp.where(up, (high - 2 * upper) + low, jnp.where(down, (high + 2 * lower) + low, high))
-    return rounded, jnp.sign(side)
-
-
-correctly_rounded_divide_p = core.Primitive("correctly_rounded_divide")
-"""The correctly rounded fp32 division of two arrays (`correctly_rounded_divide`), an operation of its own so
-that its derivatives divide as it does. Its operands broadcast as a binary operation's do: the function
-gives it two of one shape, and a batching of one of them leaves the other a scalar or of unit axes
-(`batching.defbroadcasting`). Its rounding is a selection among neighbours, so its
-tangent is the division's, each quotient in it correctly rounded: `g / d` in the numerator and
-`-g * (n / d) / d` in the denominator, the order PyTorch's backward divides in, and its transpose in the
-numerator `ct / d`. As `jnp.divide`'s, they divided as XLA does: by the divisor's rounded reciprocal where it
-is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 50% of quotients on a GPU, so
-a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
-5277). It is entrywise (`Primitive.elementwise`), which the analyses of a program's entries read."""
-correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
-# Its result is typed as JAX types its own division's: the operands' broadcast shape, their dtype, and
-# their sharding and varying axes, which a mesh's Explicit axis carries in a value's type.
-correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
-mlir.register_lowering(correctly_rounded_divide_p,
-                       mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
-
-
-@functools.cache
-def triton_lowerings() -> None:
-    """Register `correctly_rounded_divide_p`'s Pallas Triton lowering lazily
-    (`dew.nn.kernels.launches.pallas_call`, row 9794) so importing `precision` loads no Pallas Triton
-    machinery."""
-    from jax._src.pallas.triton import lowering as triton_lowering
-    from jax.experimental.pallas import triton as pltriton
-
-    def divided(numerator, denominator):
-        numerator, denominator = jnp.broadcast_arrays(numerator, denominator)
-        [quotient] = pltriton.elementwise_inline_asm(
-            "div.rn.f32 $0, $1, $2;", args=[numerator, denominator], constraints="=r,r,r", pack=1,
-            result_shape_dtypes=[jax.ShapeDtypeStruct(numerator.shape, numerator.dtype)])
-        return quotient
-
-    triton_lowering.register_lowering(correctly_rounded_divide_p)(
-        triton_lowering.lower_fun(divided, multiple_results=False))
-
-
-batching.defbroadcasting(correctly_rounded_divide_p)
-correctly_rounded_divide_p.elementwise = True
-# It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.
-UNROUNDED[correctly_rounded_divide_p] = jnp.divide
-
-
-@contracted("test_the_precision_seams_hold_every_order")
-def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
-    """The correctly rounded fp32 quotient `numerator / denominator` (`_correctly_rounded_divide`), IEEE
-    division's on every backend, differentiable at every order, each of its derivatives' divisions
-    correctly rounded too (`correctly_rounded_divide_p`)."""
-    numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
-                                                  jnp.asarray(denominator, jnp.float32))
-    return correctly_rounded_divide_p.bind(numerator, denominator)
-
-
-def _divide_transpose(cotangent, numerator, denominator):
-    """The division's transpose in its numerator, the one operand it is linear in: the cotangent over the
-    denominator."""
-    if not ad.is_undefined_primal(numerator) or ad.is_undefined_primal(denominator):
-        raise TypeError("a correctly rounded division is linear in its numerator alone")
-    if type(cotangent) is ad.Zero:
-        return [ad.Zero(numerator.aval), None]
-    quotient = correctly_rounded_divide_p.bind(cotangent, denominator)
-    # A numerator the division broadcast (a scalar's, or along a unit axis) takes the sum of the quotients
-    # it was broadcast to.
-    shape = numerator.aval.shape
-    leading = quotient.ndim - len(shape)
-    widened = (*range(leading), *(leading + axis for axis, size in enumerate(shape)
-                                  if size != quotient.shape[leading + axis]))
-    return [jnp.reshape(jnp.sum(quotient, axis=widened), shape) if widened else quotient, None]
-
-
-ad.defjvp2(correctly_rounded_divide_p,
-           lambda tangent, quotient, numerator, denominator: correctly_rounded_divide(tangent, denominator),
-           lambda tangent, quotient, numerator, denominator: -tangent * correctly_rounded_divide(
-               quotient, denominator))
-ad.primitive_transposes[correctly_rounded_divide_p] = _divide_transpose
-
-
-def divided(numerator, rate):
-    """`numerator / rate` as a source written in PyTorch divides a state by a rate, or an array by a
-    constant: IEEE division, whatever the backend's own division does (XLA takes a division by a
-    constant as a product with its rounded reciprocal, on a CPU and an A100 alike, row 1402). A
-    float32, bfloat16 or float16 quotient is `correctly_rounded_divide`'s of the operands widened to
-    float32, rounded to its dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A
-    float64 one is the plain division."""
-    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
-    dtype = jnp.result_type(numerator, rate)
-    if not jnp.issubdtype(dtype, jnp.floating):
-        return numerator / rate
-    if dtype == jnp.float64:
-        return numerator / rate
-    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
 def vanishing(dtype, base2: bool = False) -> float:
