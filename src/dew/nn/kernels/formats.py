@@ -281,17 +281,20 @@ def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
     return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
 
 def mxfp8_scale_bytes(largest: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A 32-value block's MXFP8 scale from its largest magnitude `largest` (a float32's values: a float64
-    truth's are float32's), read from the float32 exponent field: the exponent its codes are scaled by
-    (int32, the field less 135, E4M3's largest's 8 below the magnitude's own, clipped to E8M0's -127 to 127:
-    a zero's or a subnormal's -127) and its stored E8M0 byte (uint32, the exponent plus 127), a block whose
-    largest is an infinity or a NaN (the field all ones) its codes at a unit scale (0) and its byte the NaN
-    scale `0xFF` (row 13164). Integer arithmetic on the bits alone: the one mapping `MxFp8.quantized` and the
-    GEMM's quantizing epilogue (`quantized._mxfp8_quantize_epilogue`, in a kernel) share (row 13249)."""
-    biased = ((jax.lax.bitcast_convert_type(largest.astype(jnp.float32), jnp.uint32) >> jnp.uint32(23))
-              & jnp.uint32(0xFF)).astype(jnp.int32)
-    finite = biased != 0xFF
-    exponent = jnp.where(finite, jnp.clip(biased - 135, -127, 127), 0)
+    """A 32-value block's MXFP8 scale from its largest magnitude `largest` (float32's, or a float64 truth's),
+    read from its own exponent field (`float_bits.raw_fields`): the exponent its codes are scaled by (int32,
+    the magnitude's binade less E4M3's largest's 8, clipped to E8M0's -127 to 127: a zero's or a subnormal's
+    -127) and its stored E8M0 byte (uint32, the exponent plus 127); a block whose largest is an infinity or a
+    NaN (the field all ones) its codes at a unit scale (0) and its byte the NaN scale `0xFF` (row 13164).
+    Integer arithmetic on the bits alone: the one mapping `MxFp8.quantized` and the GEMM's quantizing
+    epilogue (`quantized._mxfp8_quantize_epilogue`, in a kernel) share (row 13249)."""
+    from dew.nn.float_bits import raw_fields
+
+    limits = jnp.finfo(largest.dtype)
+    biased = raw_fields(largest)[2].astype(jnp.int32)
+    finite = biased != (1 << limits.nexp) - 1
+    top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
+    exponent = jnp.where(finite, jnp.clip(biased - (limits.maxexp - 1) - top, -127, 127), 0)
     return exponent, jnp.where(finite, exponent + 127, 0xFF).astype(jnp.uint32)
 
 

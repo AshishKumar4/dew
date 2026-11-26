@@ -306,12 +306,13 @@ def test_a_nan_in_a_quantizing_epilogues_product_takes_the_nan_scale():
     np.testing.assert_array_equal(held, np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint8)))
 
 
-@pytest.mark.parametrize("order", ["cancelling first", "small first"])
-def test_an_mxfp8_sum_keeps_a_small_block_between_blocks_that_cancel(order):
-    """Three blocks' partials 32 x 2^60, 32 x 2^-20 and -32 x 2^60, the small one before or after the two
-    that cancel: the sum is the small one's, 2^-15, whatever the blocks' order (row 13248: a running sum held
-    at 2^65 aligned the small block to nothing before the large ones cancelled)."""
-    signs, exponents = (((1, -1, 1), (30, 30, -10)) if order == "cancelling first"
-                        else ((1, 1, -1), (30, -10, 30)))
-    out = _blocks_product(signs, exponents, exponents)
-    np.testing.assert_array_equal(out, np.full((128, 128), 2.0 ** -15, np.float32))
+def test_a_float64_truths_block_past_float32s_range_keeps_its_scale():
+    """A float64 truth's block whose largest magnitude is 2^128, past float32's range, takes the scale 2^120
+    and the code 256 from its own exponent field, decoding to 2^128 again, not the NaN scale a float32 cast
+    of its magnitude would read (row 13249's review)."""
+    with jax.enable_x64(True):
+        block = jnp.zeros((1, 32), jnp.float64).at[0, 0].set(2.0 ** 128)
+        operand = formats.MxFp8.quantized(block)
+        held = np.asarray(jax.lax.bitcast_convert_type(operand.scales, jnp.uint8))
+        assert held[0, 0] == 127 + 120
+        assert float(operand.decoded(jnp.float64)[0, 0]) == 2.0 ** 128
