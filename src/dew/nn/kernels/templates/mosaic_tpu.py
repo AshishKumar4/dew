@@ -164,7 +164,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def written(self, smem, value: jax.Array) -> None:
         smem[...] = value.astype(smem.dtype)
 
-    def products(self, acc: jax.Array, lhs, rhs, *, accumulate: bool = True) -> jax.Array:
+    def products(self, acc: jax.Array, lhs, rhs, *, accumulate: bool = True, support=None) -> jax.Array:
+        mosaic.whole_products(self, support)
         return acc + _product(lhs, rhs) if accumulate else _product(lhs, rhs)
 
     def settled(self, pending: int = 0) -> None:

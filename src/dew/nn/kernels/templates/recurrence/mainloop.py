@@ -1329,7 +1329,8 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
             product = Issuer(call).summed([("intra", block(rows_of, c), block("keys", c).T)
                                            for c in range(width // call.block)])
             system = algebra.keyed(product, gate, low, betas, *columns)
-            lower = algebra.solved(system, _merging(merges, call))
+            merging = _merging(merges, call)
+            lower = algebra.solved(system, merging, supported=merging.supported)
             if keeps:
                 held.store(a_ref, lower, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             if not applies:

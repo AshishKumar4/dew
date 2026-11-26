@@ -304,6 +304,21 @@ class Issuer:
             return None
         return formed(self.call, value, count)
 
+    def supported(self, name: str, lhs, rhs, support: product.Support) -> jax.Array:
+        """`self(name, lhs, rhs)` of `support`'s terms alone (`Family.products`'), where the family's
+        instructions each take a tile of their own (`Family.term_tile`) and its operands stage in shared
+        memory as at most two parts each (`Family.issued`'s); else the whole product, the same where its
+        operands are finite."""
+        family = self.call.family
+        if family.term_tile is None or self._registered(name, lhs) is not None:
+            return self(name, lhs, rhs)
+        left = self._operand(lhs, name, rhs)
+        right = self._operand(rhs, name, lhs)
+        if max(len(left), len(right)) > 2:
+            return family.apart((lhs.shape[0], rhs.shape[1]), left, right, self.call.interpret)
+        return family.summed((lhs.shape[0], rhs.shape[1]), lambda acc: family.issued(
+            acc, left, right, self.call.interpret, support=support))
+
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
         """The product `lhs @ rhs`: its operands' parts' products (`product.terms`), each into its own
         accumulator where an operand takes three parts (an fp32 call's accurate forms, `Family.apart`: a part
