@@ -254,7 +254,8 @@ def _streamed_tangents(
         if shared:
             # The same linear form makes both means with shared weights, one column per mean.
             centers = jnp.stack((cx0, cy0), axis=-1)
-            d_centers = SymbolicZero(jax.typeof(centers).to_tangent_aval()) if d_columns is None else d_columns
+            d_centers = (SymbolicZero(jax.typeof(centers).to_tangent_aval())
+                         if d_columns is None else d_columns)
             weight = dw0 if held else dw0[..., None]
             moving = (1,) if d_columns is None else (0,) if held else (0, 1)
             means = _ratio_jvp_only((centers, w0[..., None], present[..., None], unit[..., None]),
