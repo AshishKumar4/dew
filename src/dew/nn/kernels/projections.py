@@ -656,7 +656,8 @@ class Formed:
     (`dot_general`'s `formed`) multiplies `operand` as it is and differentiates through the hook (`gemm`'s
     prologue and its formed operand, `applied`): its reverse mode holds `rows` and `sides`, which their own
     products' reverse modes hold already, and never `operand`, a `[tokens, hidden]` value a gated MLP less
-    (Qwen3.5-4B's 18 GiB at 8 x 4096 tokens unrematerialized), formed again where the kernel gradient reads it."""
+    (priced at 18 GiB a step for Qwen3.5-4B at 8 x 4096 tokens unrematerialized, M-NG-46), formed again
+    where the kernel gradient reads it."""
 
     operand: jax.Array
     rows: jax.Array
@@ -713,7 +714,8 @@ def dot_general(xla, path: tuple | None = None):
             if formed is not None:
                 def shard(lhs, rhs, rows, *sides):
                     held = Formed(lhs, rows, sides, formed.hook)
-                    return product(lhs, rhs, dimension_numbers, precision, preferred_element_type, formed=held)
+                    return product(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                   formed=held)
                 return added(on_shards(shard, split, (lhs, rhs, formed.rows, *formed.sides),
                                        gathered=gathered))
             return added(on_shards(lambda lhs, rhs: product(lhs, rhs, dimension_numbers, precision,
