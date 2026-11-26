@@ -2373,6 +2373,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`), its spans an
     interval a query (`KeySpans.per_query`)."""
     hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
+    walked_initial(hooks.initial)
     op = MosaicBackward(score_mod=hooks.score.fn,
                         score_kinds=kinds_of(hooks.score.sides),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),

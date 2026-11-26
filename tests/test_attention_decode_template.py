@@ -488,6 +488,37 @@ def test_a_resumed_decode_state_is_no_walks_initial_state():
                 walk(query, key, value, spans, template.Hooks(initial=state))
 
 
+def test_a_resumed_decode_state_is_no_backwards_initial_state():
+    """A resumed decode state (`Initial.normalized`) is refused by every standalone backward given the
+    forward's residuals, as by every walk: the route's, the Triton mainloop's, the portable one's and Mosaic
+    GPU's binding. Taken, the state's gradient divided its output by its total a second time (an output of 6
+    over a total of 3 weighed as 2, train 1318's review)."""
+    from dew.nn.kernels.templates import (
+        attention_mosaic,
+        attention_portable,
+        attention_route,
+        attention_triton,
+    )
+
+    query = key = value = dout = jnp.zeros((1, 4, 2, 64), jnp.float32)
+    spans = template.spans(4, 4, 1)
+    state = template.Initial(jnp.zeros((1, 2, 4)), jnp.full((1, 2, 4), 3.0), jnp.full((1, 2, 4, 64), 6.0),
+                             normalized=True)
+    residuals = (jnp.zeros((1, 2, 4)), jnp.ones((1, 2, 4)), None, None)
+    hooks = template.Hooks(initial=state)
+    tiles = attention_portable.Tiles(16, 16, 16)
+    backwards = (
+        lambda: attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals),
+        lambda: attention_triton.backward(query, key, value, spans, hooks, dout, residuals),
+        lambda: attention_portable.backward(tiles, query, key, value, spans, hooks, dout, residuals),
+        lambda: attention_mosaic._backward_call(query, key, value, spans, hooks, dout, residuals, scale=None,
+                                                natural=False, accurate=False))
+    with generation.assumed("sm90"):
+        for backward in backwards:
+            with pytest.raises(ValueError):
+                backward()
+
+
 def test_a_resumed_states_output_spans_fp32s_range_as_its_finish_held_it():
     """A finished state whose output holds fp32's largest and least magnitudes in one row (2^127 and
     2^-149) over a total of four, resumed (`attention_decode.resumable`) and taken back as a merge takes an

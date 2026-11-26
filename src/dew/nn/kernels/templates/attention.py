@@ -2307,8 +2307,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
     two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
     summed in XLA); the Mosaic one-launch schedule adds dQ's tiles and a key head's query heads' dK and dV
-    atomically, in their arrival order."""
+    atomically, in their arrival order. A resumed decode state (`Initial.normalized`) is refused
+    (`walked_initial`), as every walk refuses it: its `acc` the output, which the state's gradient would
+    divide by its total again."""
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     if hooks.output.fn is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
     # Each gradient linear in the values (dQ, dK, the hooks' and the state's maximum and denominator)
