@@ -1171,7 +1171,6 @@ dew.telemetry.profile.CaptureOptions
   host_tracer_level: int = 2
   python_tracer_level: int = 0
   activity_cap: int = 2097152
-  hlo: bool = True
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau

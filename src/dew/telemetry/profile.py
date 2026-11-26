@@ -123,10 +123,6 @@ class CaptureOptions:
     host_tracer_level: int = 2
     python_tracer_level: int = 0
     activity_cap: int = ACTIVITY_CAP
-    hlo: bool = True
-    """Whether the capture exports every live executable's HLO, which XProf's reports read; a capture whose
-    reader reads its trace alone (a TPU call's device time, `dew.telemetry.benchmark.TpuTime`) leaves it
-    out."""
 
     def profile_options(self) -> jax.profiler.ProfileOptions:
         """JAX's options for a capture of these (`jax.profiler.start_trace`'s `profiler_options`)."""
@@ -137,7 +133,7 @@ class CaptureOptions:
         # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
         # 400 unrelated compiled programs made a CPU capture of small work take
         # 15 s and 75 MB.
-        options.enable_hlo_proto = self.hlo
+        options.enable_hlo_proto = True
         if jax.default_backend() == "tpu":
             options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
         elif jax.default_backend() == "gpu":

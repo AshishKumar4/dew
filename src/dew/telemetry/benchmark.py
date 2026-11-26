@@ -479,7 +479,10 @@ class TpuTime:
             raise AmbiguousCapture(f"{fn}'s call names no device its arrays are on, so its ops are not told "
                                    "apart from another device's")
         with tempfile.TemporaryDirectory() as directory:
-            profiler = Profiler(directory, options=CaptureOptions(hlo=False).profile_options(), reports=False)
+            options = CaptureOptions().profile_options()
+            # Its trace alone read: no live executable's HLO exported beside it.
+            options.enable_hlo_proto = False
+            profiler = Profiler(directory, options=options, reports=False)
             try:
                 profiler.start()
             except RuntimeError as error:
