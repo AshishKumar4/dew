@@ -1377,8 +1377,8 @@ the selective scan's packed and unpacked decay. A paired surrogate declaration c
 FP16 rounded-operand bodies and preserves their written higher-order rule. Other cases cover the masked
 softcap hook and its slope, projected sink state,
 document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
-Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8, MXFP8 and NVFP4 epilogues. Exact
-byte witnesses also cover the MX scale exponent and the NVFP4 packed payload. Each case has an independent
+Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
+witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload. Each case has an independent
 reference. The template component suites check their primitives on the CPU.
 Production still uses the written bodies (row 3272).
 

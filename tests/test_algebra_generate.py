@@ -70,7 +70,7 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "kda_strict_band", "gdn_value_pullback", "ssd_chunk_forward",
                                   "ssd_chunk_pullback",
                                   "gemm_partial_scale", "fp8_epilogue", "mxfp8_scale", "mxfp8_epilogue",
-                                  "nvfp4_epilogue", "nvfp4_payload", "rounded", "rounded_tangent",
+                                  "nvfp4_scale", "nvfp4_payload", "rounded", "rounded_tangent",
                                   "rounded_fp16", "rounded_fp16_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):

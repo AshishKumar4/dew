@@ -795,44 +795,28 @@ def _mxfp8_draw(seed, operands):
     return (acc,)
 
 
-def _nvfp4_epilogue(acc, tensor):
-    codes, scales = quantized.quantize_nvfp4_epilogue()(acc, tensor)
-    return codes, jax.lax.bitcast_convert_type(scales, jnp.uint8)
+def _nvfp4_scale(codes):
+    return jax.lax.bitcast_convert_type(bits.scales_decoded(codes), jnp.uint32)
 
 
-def _nvfp4_epilogue_truth(acc, tensor):
-    blocks = acc.reshape(acc.shape[0], -1, 16)
-    magnitude = jnp.abs(blocks)
-    peak = jnp.max(magnitude, axis=-1, keepdims=True)
-    codes = jnp.arange(127, dtype=jnp.int32)
-    field, fraction = codes >> 3, codes & 7
+def _nvfp4_scale_truth(codes):
+    magnitude = codes.astype(jnp.uint32) & 127
+    field, fraction = magnitude >> 3, magnitude & 7
     significand = fraction.astype(jnp.float64) * 0.125 + (field > 0)
-    levels = jnp.ldexp(significand, jnp.maximum(field, 1) - 7)
-    width = tensor[:, None, None]
-    seen = jnp.sum(peak[..., None] > (levels * 6) * width[..., None], axis=-1)
-    scale_code = jnp.minimum(seen, 126).astype(jnp.uint8)
-    scale = levels[scale_code] * width
-    mid = jnp.asarray([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], jnp.float64)
-    threshold = mid * scale[..., None]
-    above = magnitude[..., None] > threshold
-    tied = (magnitude[..., None] == threshold) & (jnp.arange(7) % 2 == 1)
-    nibble = jnp.sum(above | tied, axis=-1).astype(jnp.uint8)
-    nibble |= jnp.where(jnp.signbit(blocks), 8, 0).astype(jnp.uint8)
-    nibble = jnp.where(scale != 0, nibble, jnp.uint8(0))
-    return nibble.reshape(acc.shape), jnp.broadcast_to(scale_code, blocks.shape).reshape(acc.shape)
+    exact = jnp.ldexp(significand, jnp.maximum(field, 1).astype(jnp.int32) - 7)
+    rounded = jax.lax.bitcast_convert_type(exact.astype(jnp.float32), jnp.uint32)
+    return jnp.where(magnitude == 127, jnp.uint32(0x7fc00000), rounded) | (
+        (codes.astype(jnp.uint32) & 0x80) << 24)
 
 
-def _nvfp4_draw(seed, operands):
-    (acc, _) = _arrays(seed, operands)
-    tensor = np.exp2(np.arange(acc.shape[0], dtype=np.float32) % 4 - 2)
-    acc *= tensor[:, None]
-    acc[0, :16] = 0
-    acc[1, :8] = tensor[1] * np.array([6, -0.0, 0.25, 0.75, -1.25, 1.75, 2.5, -5], np.float32)
-    return acc, tensor
+def _nvfp4_scale_draw(seed, operands):
+    rows, columns = operands[0].shape
+    codes = np.arange(rows * columns, dtype=np.uint32).astype(np.uint8)
+    return (np.roll(codes, seed).reshape(rows, columns),)
 
 
 def _nvfp4_payload(codes):
-    return bits.nvfp4_codes(bits.packed(codes, bits.E2M1))
+    return bits.nvfp4_codes(bits.packed(codes.T, bits.E2M1).T)
 
 
 def _nvfp4_payload_truth(codes):
@@ -853,8 +837,9 @@ MXFP8_SCALE = declare(__name__, "mxfp8_scale", ComponentForm(_mxfp8_scale, _mxfp
     _mx_scale_draw, seeds=8, policies=("default",))))
 MXFP8_EPILOGUE = declare(__name__, "mxfp8_epilogue", ComponentForm(_mxfp8_epilogue, _mxfp8_epilogue_truth,
     dataclasses.replace(_cases(((32, 128),), ((64, 128),)), draw=_mxfp8_draw)))
-NVFP4_EPILOGUE = declare(__name__, "nvfp4_epilogue", ComponentForm(_nvfp4_epilogue, _nvfp4_epilogue_truth,
-    dataclasses.replace(_cases(((32, 128), (32,)), ((64, 128), (64,))), draw=_nvfp4_draw)))
+NVFP4_SCALE = declare(__name__, "nvfp4_scale", ComponentForm(_nvfp4_scale, _nvfp4_scale_truth, Cases(
+    tuple((jax.ShapeDtypeStruct(shape, jnp.uint8),) for shape in ((32, 8), (64, 8))),
+    _nvfp4_scale_draw, seeds=8, policies=("default",))))
 NVFP4_PAYLOAD = declare(__name__, "nvfp4_payload", ComponentForm(_nvfp4_payload, _nvfp4_payload_truth, Cases(
     tuple((jax.ShapeDtypeStruct(shape, jnp.uint32),) for shape in ((16, 32), (32, 64))),
     _nvfp4_payload_draw, seeds=8, policies=("default",))))
