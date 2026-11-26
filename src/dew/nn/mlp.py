@@ -380,12 +380,13 @@ class GatedMLP(nn.Module):
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
 
     def _down(self, hidden, train: bool, halves: Callable[[], tuple] | None = None):
-        """The down projection of `hidden`, its units dropped while training. `halves`, where given (the gated
-        product differentiating as its portable product, `activations.portable_derivative`), gives the gate's
-        and the up projection's values `hidden` is the gated product of, and its activation's name, read only
-        where the projection takes them: undropped, the projection reads `hidden` as formed from them
-        (`projections.FormedInput`, the product's hook `gated_hook`'s), so its reverse mode holds them, which the projections' own hold already, and
-        never `hidden`, a `[tokens, hidden]` value a layer less."""
+        """The down projection of `hidden`, its units dropped while training. `halves`, where given (the
+        gated product differentiating as its portable product, `activations.portable_derivative`), gives the
+        gate's and the up projection's values `hidden` is the gated product of, and its activation's name,
+        read only where the projection takes them: undropped, the projection reads `hidden` as formed from
+        them (`projections.FormedInput`, the product's hook `gated_hook`'s), so its reverse mode holds them,
+        which the projections' own hold already, and never `hidden`, a `[tokens, hidden]` value a layer
+        less."""
         if self.dropout_rate:
             hidden, halves = self.dropout(hidden, deterministic=not train), None
         if halves is None or not (isinstance(self.down_proj, ReadsFormed) and self.down_proj.reads_formed):
