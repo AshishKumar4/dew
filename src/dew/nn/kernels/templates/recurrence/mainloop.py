@@ -804,6 +804,10 @@ class Launch:
     """What its plan read (`resources.plan`'s launch: its streams scoped at each depth, its registers and
     roles) where its ring's depth is its tiles' (`Tiles.stages`, `launch_kernel`'s `ringed`), which
     `deepened` plans at another depth; None for every other launch, whose plan no depth of the tiles moves."""
+    reducing: int = 0
+    """The warpgroups whose arithmetic reduces across their warps implicitly, each its share of Mosaic GPU's
+    scratch (`launch_kernel`'s `reducing`): an own pairs' launch taking anchored products
+    (`anchored.step`, `anchored.back`), whose guard reduces a tile."""
 
     def deepened(self, stages: int, target: generation.GpuTarget) -> "Launch":
         """This launch as a trace at tiles `stages` deep on `target` records it: its plan at that depth
@@ -1110,7 +1114,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         stepped = sum(math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in blocks.values())
         record = Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)), registers,
                         stages, stepped, found.programs if found else 0, consumers, family, producer,
-                        planning if ringed else None)
+                        planning if ringed else None, consumers * reducing)
         return functools.partial(_recorded, collected, record, out_type)
 
     def entry(*arrays):

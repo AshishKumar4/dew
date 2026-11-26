@@ -162,3 +162,31 @@ def test_a_sub_chunks_compact_columns_are_its_square_strictly_before_or_after(tr
                 elif not transposed and other < place:
                     expected[token, h * SUB + c] = pairs[token, h * CHUNK + other]
     assert np.array_equal(found, expected)
+
+
+@pytest.mark.parametrize("target", ["sm86", "sm120"])
+def test_kimis_training_plan_anchors_its_own_pairs(target):
+    """Kimi delta attention's bf16 training step as the template plans it on `target`: its forward's own pairs
+    anchored (`intra_own` reducing its guard across warps, `mainloop.Launch.reducing`), and its backward's
+    (`key_pairs_own`), an anchored block of it holding a program: an RTX A6000's at 32 keys, an RTX PRO
+    6000's at 16."""
+    from test_recurrence_mosaic import RESOURCE_SHAPES, resource_operands
+
+    from dew.nn.kda import KimiDeltaAttention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.recurrence_chunk import template_bind
+    from dew.nn.kernels.templates.recurrence import template
+
+    assert RESOURCE_SHAPES['kimi-linear-kda'][-1], "Kimi's decay a key dimension's"
+    operands = [jnp.zeros(shape.shape, shape.dtype) for shape in
+                resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 512)]
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        call, _ = template_bind(*operands, rounded=True, decay_bound=KimiDeltaAttention.lower_bound)
+        _, bound = call.bound['mosaic_gpu']
+        tiles = template.MOSAIC.derived(bound, facts)
+        launches = {launch.name: launch for launch in template.MOSAIC.launches(bound, tiles, facts,
+                                                                             backward=True)}
+    reducing = {name: launches[name].reducing
+                for name in ("recurrence_intra_own", "recurrence_key_pairs_own")}
+    assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 1}, reducing
