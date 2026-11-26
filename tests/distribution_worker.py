@@ -245,7 +245,7 @@ def main() -> None:
         initial = None
         if args.float64:
             # The float32 run's start, drawn by a trainer of the float32 model, its optimizer built over the
-            # run's length as each fit builds the run's (`Trainer.scheduled`), widened.
+            # run's length as each fit builds the run's (`Trainer._horizon`), widened.
             narrowed = trainer_of(None)
             narrowed._horizon(args.steps)
             initial = widened_start(narrowed)

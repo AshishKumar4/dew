@@ -1240,7 +1240,7 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
                                       examples: int | None = None, resume: Resume = "auto") -> Batch:
     """The batch `trainer`'s first step takes from `loader`, as `fit` would start the run: an input its
     objective names alone declared first (`Trainer._declare_input`), the loader read through its device
-    steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer.reading`), the
+    steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer._reading`), the
     run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
     (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
     checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,

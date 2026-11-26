@@ -314,7 +314,7 @@ class Trainer(Generic[Loss, Effects]):
     start."""
 
     _counting = False
-    """Whether its read counts its passes on the host for a cadence of them (`reading`), set as it reads."""
+    """Whether its read counts its passes on the host for a cadence of them (`_reading`), set as it reads."""
 
     def __init__(
         self,
@@ -1070,10 +1070,10 @@ class Trainer(Generic[Loss, Effects]):
 
     def _update_known(self) -> None:
         """Refuse a state or a step of an update of tokens before a loader states the token batches it pools
-        (`reading`, which `fit` calls): its window would hold one batch, its step commit every batch."""
+        (`_reading`, which `fit` calls): its window would hold one batch, its step commit every batch."""
         if not self._update_read:
             raise ValueError(f"an update of {self.update.tokens} tokens pools the data's token batches, "
-                             "which no loader has stated yet: read one first (Trainer.reading), as fit does")
+                             "which no loader has stated yet: fit it with a loader, which states one")
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
@@ -1316,7 +1316,7 @@ class Trainer(Generic[Loss, Effects]):
         cooldowns: Cooldowns | None = None,
     ) -> FitPlan:
         """What `fit` over these arguments (`FitArguments`) runs, before it places anything: its data compiled
-        and read (`run_data`, `reading`), its optimizer built for its updates (`scheduled`), and its
+        and read (`run_data`, `_reading`), its optimizer built for its updates (`_horizon`), and its
         cadences, scores and policies (`FitPlan`). Its defaults are `fit`'s, stated here alone, which a run
         compiled ahead plans its evaluations by too (`dew.training.ahead.fit_plan`)."""
         startup = Startup()
