@@ -43,30 +43,17 @@ def _rounded_tangent_0(x1, x2, x3):
 
 
 def _scores_0(x1, x2, x3):
-    v4 = lax.iota_p.bind(dtype=jnp.dtype('int32'), shape=(16, 16), dimension=0, sharding=None)
-    v5 = lax.iota_p.bind(dtype=jnp.dtype('int32'), shape=(16, 16), dimension=1, sharding=None)
+    v4 = lax.iota_p.bind(
+        dtype=jnp.dtype('int32'), shape=(x1.shape[0], x1.shape[0]), dimension=0, sharding=None)
+    v5 = lax.iota_p.bind(
+        dtype=jnp.dtype('int32'), shape=(x1.shape[0], x1.shape[0]), dimension=1, sharding=None)
     v6 = lax.sub_p.bind(v4, v5)
     v7 = lax.ge_p.bind(v6, np.array(0, dtype=jnp.dtype('int32')))
     v8 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(16, 16),
+        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[0]),
         broadcast_dimensions=(), sharding=None)
     v9 = lax.mul_p.bind(x1, x2, out_dtype=None)
-    v10 = lax.broadcast_in_dim_p.bind(x3, shape=(1, 16), broadcast_dimensions=(1,), sharding=None)
-    v11 = lax.mul_p.bind(v9, v10, out_dtype=None)
-    v12 = lax.select_n_p.bind(v7, v8, v11)
-    return (v12,)
-
-
-def _scores_1(x1, x2, x3):
-    v4 = lax.iota_p.bind(dtype=jnp.dtype('int32'), shape=(32, 32), dimension=0, sharding=None)
-    v5 = lax.iota_p.bind(dtype=jnp.dtype('int32'), shape=(32, 32), dimension=1, sharding=None)
-    v6 = lax.sub_p.bind(v4, v5)
-    v7 = lax.ge_p.bind(v6, np.array(0, dtype=jnp.dtype('int32')))
-    v8 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(32, 32),
-        broadcast_dimensions=(), sharding=None)
-    v9 = lax.mul_p.bind(x1, x2, out_dtype=None)
-    v10 = lax.broadcast_in_dim_p.bind(x3, shape=(1, 32), broadcast_dimensions=(1,), sharding=None)
+    v10 = lax.broadcast_in_dim_p.bind(x3, shape=(1, x1.shape[0]), broadcast_dimensions=(1,), sharding=None)
     v11 = lax.mul_p.bind(v9, v10, out_dtype=None)
     v12 = lax.select_n_p.bind(v7, v8, v11)
     return (v12,)
@@ -99,6 +86,6 @@ def scores(*operands, policy: str = 'default', target: str = 'sm90'):
         ('default', 'sm90', (((16, 16), 'float32'), ((16, 16), 'float32'), ((16,), 'float32'))):
             _scores_0,
         ('default', 'sm90', (((32, 32), 'float32'), ((32, 32), 'float32'), ((32,), 'float32'))):
-            _scores_1,
+            _scores_0,
     }
     return forms[(policy, target, case)](*operands)[0]
