@@ -332,8 +332,9 @@ def structure_of(invars: Sequence[jcore.Var], eqns: Sequence[jcore.JaxprEqn],
     equations = []
     for equation in eqns:
         primitive, params = equation.primitive, equation.params
-        signature = terms.parameters_key(primitive, params)
-        if primitive is jax.lax.dot_general_p and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32:
+        signature: Hashable = terms.parameters_key(primitive, params)
+        if (primitive is jax.lax.dot_general_p
+                and params.get("precision") == jax.lax.DotAlgorithmPreset.F32_F32_F32):
             # Empty operand meshes do not imply that the dot was traced outside an explicit scope.
             signature = (signature, terms.unplaced_dot(equation))
         equations.append((signature,
