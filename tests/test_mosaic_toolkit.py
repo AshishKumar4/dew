@@ -2187,7 +2187,7 @@ def test_a_slot_a_branch_reads_first_is_the_steps_own_past_the_branch(bundle):
     step's reads after it, which acquire the slot again (a wait again for the same turn returns at once).
     Interpreted on the host's CPU, the branch's row and the walk's product reach the output, `x @ w + w[0]`
     exactly; traced for an H100, the branch waits on the slot's load before it reads the slot, and the step
-    waits again past the branch. A slot held from the branch's read carried
+    waits on that barrier again past the branch. A slot held from the branch's read carried
     its index past the branch, a value of a trace that had ended: an sm120 attention training step's fused
     backward raised as it lowered (row 13106); a branch that formed its slot with no wait of its own read
     it before its load (row 13113)."""
@@ -2208,9 +2208,13 @@ def test_a_slot_a_branch_reads_first_is_the_steps_own_past_the_branch(bundle):
     order = [inner.primitive.name for inner in reading.eqns
              if inner.primitive.name in ("barrier_wait", "get")]
     assert order[:2] == ["barrier_wait", "get"], order
+    # The barrier the branch waits on, as the step's trace holds it: the cond's operand the branch reads.
+    (waited,) = [inner.invars[0] for inner in reading.eqns if inner.primitive.name == "barrier_wait"][:1]
+    barrier = branch.invars[1 + reading.invars.index(waited)]
     (around,) = [jaxpr for jaxpr in _jaxprs(traced.jaxpr) if branch in jaxpr.eqns]
     past = around.eqns[around.eqns.index(branch) + 1:]
-    assert any(equation.primitive.name == "barrier_wait" for equation in past)
+    assert any(equation.primitive.name == "barrier_wait" and equation.invars[0] is barrier
+               for equation in past)
 
 
 def _jaxprs(jaxpr):

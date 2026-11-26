@@ -413,9 +413,10 @@ def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:
 
 
 def repeats_bit_for_bit(step: Callable, *inputs, runs: int = 2, names: Iterable[str] | None = None) -> None:
-    """`step(*inputs)` run `runs` times, the second compiled afresh (`jax.clear_caches`): every leaf of every
-    run's output the first run's bits, so a schedule the compiler picks repeats as well as one it is handed
-    (kernel-templates.md's reproducibility); each leaf named by `names` where given, else by its path."""
+    """`step(*inputs)` run `runs` times, the second retraced and reloaded (`jax.clear_caches`, JAX's caches in
+    memory; a persistent compilation cache may hand it the first's executable): every leaf of every run's
+    output the first run's bits (kernel-templates.md's reproducibility); each leaf named by `names` where
+    given, else by its path."""
     import jax
     import numpy as np
 
