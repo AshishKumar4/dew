@@ -37,6 +37,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     head_slice,
     indexed_views,
+    params_read,
     riding,
     score_stream,
     score_views,
@@ -151,11 +152,10 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
     values (`held_params`), those riding its stream (`streamed`, by index: `riding`) the step's `slots`'
     from `at`, every other read from its ref."""
     held = (None,) * len(kinds) if held is None else held
-    laid = zip(refs, kinds, held, strict=True)
-    return tuple(_param(family, ref, kind, row, head, first, like, k_first, keys_first=keys_first, held=kept,
-                        slot=slots[score_stream(index)] if slots is not None and index in streamed else None,
-                        at=at)
-                 for index, (ref, kind, kept) in enumerate(laid))
+    return params_read(refs, kinds, lambda index, ref, kind, origins: _param(
+        family, ref, kind, row, head, first, like, k_first, keys_first=keys_first, held=held[index],
+        slot=slots[score_stream(index)] if slots is not None and index in streamed else None, at=at,
+        origins=origins))
 
 def _read(value):
     """Resolve a deferred reader (`functools.partial`), or return an eager value unchanged."""

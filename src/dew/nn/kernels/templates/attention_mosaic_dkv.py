@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import (
     across,
     attention_algebra as algebra,
     attention_gradient as gradient,
+    band,
     mosaic,
     mosaic_sm100,
     outputs,
@@ -27,7 +28,7 @@ from dew.nn.kernels.templates import (
     stores,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power
+from dew.nn.kernels.templates.attention import DKV_GRADS, TILED, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -35,6 +36,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    band_paired,
     column_share,
     head_first,
     head_layout,
@@ -240,7 +242,8 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
         dk_acc = issued_into(family, dk_acc, (logits,), q_columns, walk.interpret)
         add_dq(logits, q_first)
     if _grading(shares):
-        store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
+        store_tiles(q_first, [(kind, piece) for kind, piece in zip(kinds, pieces, strict=True)
+                              if kind in TILED])
         key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
         carry = tuple(total + piece for total, piece in zip(carry, key_pieces, strict=True))
     return carry, (dk_acc, dv_acc)
@@ -493,15 +496,31 @@ def _grading(shares: tuple) -> bool:
 
 
 def _tiles_stored(family: mosaic.Family, refs, stage, place: tuple, k_first, index, first, pieces) -> None:
-    """Each tile gradient of `pieces` (`[bk, its queries]`, queries from `first`) written to its place in the
-    keys-first `[B, H, Kp, Qp]` refs (`refs`), the program's row's and head's (`place`, `_grad_buffers`),
-    through consumer `index`'s `stage`: its one writer's, stored, not added (an A100's `red.add.f32` flushed
-    a subnormal entry added into its zero), the tiles no walk reads their zeros."""
+    """Each tile gradient of `pieces` (its kind and `[bk, its queries]`, queries from `first`) written to its
+    place in the keys-first refs (`refs`: each tile's `[B, H, Kp, Qp]`, each band's `[B, H, Kb, Qp]` with its
+    origins), the program's row's and head's (`place`, `_grad_buffers`), through consumer `index`'s `stage`:
+    its one writer's, stored, not added (an A100's `red.add.f32` flushed a subnormal entry added into its
+    zero), the tiles no walk reads their zeros; a band's at the keys' column of its queries' band, where the
+    tile lies within it (`band.band_column`), past it no entry to write."""
     row, head = place
-    for ref, piece in zip(refs, pieces, strict=True):
+    tiles, bands = refs
+    tiles, bands = iter(tiles), iter(bands)
+    for kind, piece in pieces:
         assert stage is not None
-        view = ref.at[row, head, pl.ds(k_first, piece.shape[0]), pl.ds(first, piece.shape[1])]
-        family.stored((piece,), (view,), smem=stage.at[index])
+        rows = pl.ds(first, piece.shape[1])
+        if kind is Kind.TILE:
+            view = next(tiles).at[row, head, pl.ds(k_first, piece.shape[0]), rows]
+            family.stored((piece,), (view,), smem=stage.at[index])
+            continue
+        ref, origins = next(bands)
+        origin_row, _ = shared_place(origins.shape, row, 0)
+        origin = family.scalar_of(origins.at[origin_row, 0, pl.ds(first, 1)])
+        column, inside = band.band_column(origin, k_first, piece.shape[0], ref.shape[-2])
+
+        @pl.when(inside)
+        def _(ref=ref, piece=piece, column=column, rows=rows):
+            view = ref.at[row, head, pl.ds(column, piece.shape[0]), rows]
+            family.stored((piece,), (view,), smem=stage.at[index])
 
 
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, *, index) -> None:
@@ -523,21 +542,27 @@ def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple,
         family.stored((family.as_row(key_sum),), (key_view,), smem=rows_stage)
 
 
-def _grad_buffers(graded: list[Kind], batch: int, heads: int, queries: int, keys_padded: int) -> list[tuple]:
+def _grad_buffers(graded: list[Kind], batch: int, heads: int, queries: int, keys_padded: int,
+                  widths: tuple[int, ...] = ()) -> list[tuple]:
     """Each graded parameter's gradient buffer's shape (`_dkv_launched`): the call's batch rows and heads
     whatever rows and heads the parameter shares, so a row's part lands at its own scale (the values it was
     taken beneath, `template.value_shift`) and `template.gradients` sums the shared rows after, each at its
-    own (`template.hook_gradient`), then its keys, and for a tile its queries."""
-    return [(batch, heads, keys_padded) if kind == Kind.KEY else (batch, heads, keys_padded, queries)
-            for kind in graded]
+    own (`template.hook_gradient`), then its keys, and for a tile its queries; a band's its columns (each of
+    `widths` in turn) and its queries."""
+    widths = iter(widths)
+    return [(batch, heads, keys_padded) if kind == Kind.KEY
+            else (batch, heads, next(widths), queries) if kind is Kind.BAND
+            else (batch, heads, keys_padded, queries) for kind in graded]
 
-def _graded(kinds: tuple, shares: tuple, shape: tuple, keys_padded: int
+def _graded(kinds: tuple, shares: tuple, shape: tuple, keys_padded: int, params: tuple = ()
             ) -> tuple[list[Kind], list[tuple], tuple[tuple[int, ...], ...]]:
     """The kinds of the hook gradients a dK/dV program of `shares` writes (`DKV_GRADS`; none for a later
-    share's), their buffers' shapes (`_grad_buffers`) and the groups of one shape (`stacked.groups`),
-    for a call whose queries are `shape` `[B, Q, H, D]`."""
+    share's), their buffers' shapes (`_grad_buffers`, a band's its `params`' columns) and the groups of one
+    shape (`stacked.groups`), for a call whose queries are `shape` `[B, Q, H, D]`."""
     graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
-    buffers = _grad_buffers(graded, shape[0], shape[2], shape[1], keys_padded)
+    widths = tuple(param.shape[-1] for param, kind in zip(params, kinds, strict=True)
+                   if kind is Kind.BAND and graded)
+    buffers = _grad_buffers(graded, shape[0], shape[2], shape[1], keys_padded, widths)
     return graded, buffers, stacked.groups(buffers)
 
 
@@ -612,7 +637,7 @@ def _output_stages(refs, *, widths: bool, vectors: bool) -> tuple:
 def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
     """Each tile kind's of `arrays` (a score hook parameter's or gradient's, `[B, H, ., .]`) with its last two
     axes swapped, between the call's queries-first entries and the dK/dV program's keys-first ones."""
-    return tuple(jnp.swapaxes(array, -1, -2) if kind == Kind.TILE else array
+    return tuple(jnp.swapaxes(array, -1, -2) if kind in TILED else array
                  for array, kind in zip(arrays, kinds, strict=True))
 
 def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout, shares: tuple,
@@ -701,17 +726,21 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     split, placing = split_queries(family), family.places_on_role
     pair, count = holders(family, consumers) * block_k, block_q // consumers if split else block_q
     q_steps, stages = queries // block_q, min(program.tiles.stages, queries // block_q)
-    graded, buffers, groups = _graded(kinds, shares, query.shape, key.shape[1])
+    graded, buffers, groups = _graded(kinds, shares, query.shape, key.shape[1], score_params)
     # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
     scaled_in = None if program.tiles.staged_logits else head_layout(family, scaled)
     leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop, scaled_in))
-    tiled = Kind.TILE in graded
+    tiled = any(kind in TILED for kind in graded)
 
     def body(*refs, streams, after=None):
-        inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
+        inputs, unflattened, outputs, held, (key_refs, tile_refs, band_refs) = _dkv_refs(
             refs, treedef, len(leaves), graded, groups, widths=value_width == width, split=split,
             fused=walk.fused, after=after is not None, vectors=family.stages_vectors)
         spans_of, score_refs, drop_of, l_ref = unflattened
+        # Each band's gradient ref beside its origins, what its tiles' columns are read by.
+        banded = tuple(zip(band_refs, [origins for origins, kind in zip(band_paired(score_refs, kinds), kinds,
+                                                                         strict=True) if kind is Kind.BAND],
+                           strict=True))
         dq_ref, dk_ref, dv_ref = outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
@@ -742,8 +771,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             stage = _logits_stage(family, consumers, logits_stages, index)
             step = _consumer_step(_relayed(walk, relay, index), (row, head), k_first, index, holder, part,
                                   stage, shares,
-                                  refs=(tile_refs, tile_stage, spans_of, drop_of, score_refs, k_smem, v_smem,
-                                        dq_ref, fused_stages),
+                                  refs=((tile_refs, banded), tile_stage, spans_of, drop_of, score_refs,
+                                        k_smem, v_smem, dq_ref, fused_stages),
                                   statistics=rows_of)
             # Each consumer's walk over the key block's readers (`Family.walk_own`).
             run = program.whole_run(k_first, q_steps, spans_of)

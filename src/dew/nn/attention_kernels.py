@@ -219,9 +219,10 @@ class AttentionCase:
     does the reference path's, so it takes them where a call or a run names it. None where no rule owns
     them."""
     separable_bias: bool = False
-    """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's), which the
-    template reads as its two terms in O(S) and every other route writes out, `[B, H, S, S]`: not a dense
-    bias (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
+    """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's) or a band of
+    keys about each query (`attention.BandBias`, Inkling 2's relative one), which the template reads as its
+    terms or its band, in O(S) or O(S E), and every other route writes out, `[B, H, S, S]`: not a dense bias
+    (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
     query_sinks: bool = False
     """Whether the call's sinks are each query's own (`[B, S, H]`, projected from its input), not a head's
     (`[H]`): the template's initial state (`template.sinks`) and the portable softmax's column read them,

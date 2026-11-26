@@ -22,6 +22,7 @@ from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     assembled,
     attention_algebra as algebra,
+    band,
     cost,
     emission,
     mosaic,
@@ -36,6 +37,7 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    TILED,
     AttentionLaunch,
     Gradients,
     Hooks,
@@ -270,6 +272,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
                 and whole_tiles(family, config, parts=self.parts if isinstance(self, MosaicForward) else 1)
+                and _band_held(self.score_kinds, config)
                 and self.refusal(ba, family) is None and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
@@ -344,6 +347,18 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
                                                shared=staged, target=target, tmem=tmem, joined=joined).most)
 
 @dataclasses.dataclass(frozen=True)
+def _band_held(kinds: tuple[Kind, ...], config) -> bool:
+    """Whether every query tile `config`'s launches read a band side of (`Kind.BAND`) lies within one of its
+    origins' groups (`band.BAND_GROUP`), a tile's origin one scalar (`attention_mosaic_program._param`): a
+    forward's consumers' rows, a backward's dQ tile's and its dK/dV walk's."""
+    if Kind.BAND not in kinds:
+        return True
+    rows = [getattr(config, "consumers", 1) * config.block_q]
+    if getattr(config, "dkv", None) is not None:
+        rows.append(config.dkv.block_q)
+    return all(band.BAND_GROUP % each == 0 for each in rows)
+
+
 class MosaicForward(_Mainloop[Tiles]):
     """The template's forward on this mainloop over the call's own arrays (`forward` gives them): queries
     `[B, Q, H, D]` over keys `[B, K, Hk, D]` and values `[B, K, Hk, Dv]`, each query's keys `start` to `end`
@@ -2247,7 +2262,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             dkv_stages = min(config.stages, padded_q // config.dkv.block_q)
             launches = [(dkv_family, config.dkv, _dkv_allocations(
                 dkv_family, config.dkv, width, value_width, dtype, stages=dkv_stages, columns=config.columns,
-                tiled=Kind.TILE in self.score_kinds, params=self.score_types), True, True, config.fused)]
+                tiled=any(kind in TILED for kind in self.score_kinds), params=self.score_types), True, True,
+                         config.fused)]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k),

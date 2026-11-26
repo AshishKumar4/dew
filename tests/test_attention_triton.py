@@ -28,6 +28,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_portable,
     attention_triton,
+    band,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.parity import FEWEST_SEEDS
@@ -294,12 +295,21 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
                "resumed": ("resumed",), "custom-vjp": ("custom",), "row-indexed": ("indexed",),
-               "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
+               "softcap-sinks-alibi": ("softcap", "sinks", "alibi"), "band-bias": ("band",)}
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a query's temperature (divided by, so padding's zeros would be infinite slopes), a per-key bias,
 a dense bias, a softcap through a `jax.custom_vjp` (which forward-mode differentiation refuses), a bias
-indexed off the query's coordinates' column (which reads them at their tile rank); and the softmax's
-initial state as sinks or as a resumed partial."""
+indexed off the query's coordinates' column (which reads them at their tile rank), a band of keys about each
+query (`template.Kind.BAND`: a row's every key within its band, another's past it, `BAND_ORIGINS`); and the
+softmax's initial state as sinks or as a resumed partial."""
+
+BAND_EXTENT = 1
+"""A band side's extent in the hooks' draws: its band `band.band_width(1)`, 1024 columns, every key of a
+call of the hooks' geometry within it at an origin of -256."""
+
+BAND_ORIGINS = (-256, -1024)
+"""Each row's band origin in the hooks' draws (the key its column 0 is, a whole `band.BAND_ALIGN`): the first
+row's band holds every key, the second's none, so the step reads and writes it at its column and past it."""
 
 
 @jax.custom_vjp
@@ -340,6 +350,9 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
                                      ("query", template.Kind.QUERY), ("key", template.Kind.KEY),
                                      ("tile", template.Kind.TILE))
              if name in names]
+    if "band" in names:
+        # Its values, then its origins, the QUERY side after it (`template.Kind.BAND`).
+        kinds += [template.Kind.BAND, template.Kind.QUERY]
 
     def base_score_mod(s, q_pos, k_pos, *values):
         values = list(values)
@@ -352,6 +365,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
         if "temperature" in names:
             s = s / values.pop(0).astype(s.dtype)
         for _ in range(("query" in names) + ("key" in names) + ("tile" in names)):
+            s = s + values.pop(0).astype(s.dtype)
+        if "band" in names:
             s = s + values.pop(0).astype(s.dtype)
         return s
 
@@ -374,6 +389,11 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             params.append(jax.random.normal(streams[1], (rows, heads, keys)))
         if "tile" in names:
             params.append(jax.random.normal(streams[2], (rows, heads, queries, keys)))
+        if "band" in names:
+            params.append(jax.random.normal(jax.random.fold_in(streams[2], 1),
+                                            (rows, heads, queries, band.band_width(BAND_EXTENT))))
+            origins = jnp.asarray([BAND_ORIGINS[row % len(BAND_ORIGINS)] for row in range(rows)], jnp.int32)
+            params.append(jnp.broadcast_to(origins[:, None, None], (rows, 1, queries)))
         initial = None
         if "sinks" in names:
             initial = template.sinks(jnp.asarray(SINKS[:heads], jnp.float32), rows, queries, value_width)
@@ -383,7 +403,7 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *,
             initial = template.Initial(jax.random.normal(streams[5], (rows, heads, queries)), total, acc)
         return tuple(params), initial
 
-    scored = {"softcap", "custom", "indexed", "alibi", "temperature", "query", "key", "tile"}
+    scored = {"softcap", "custom", "indexed", "alibi", "temperature", "query", "key", "tile", "band"}
     scoring = bool(scored & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
 
