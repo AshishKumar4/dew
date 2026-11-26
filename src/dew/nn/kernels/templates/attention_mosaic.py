@@ -136,6 +136,7 @@ from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegister
 from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 from dew.nn.kernels.templates.base import Template
 from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side
+from dew.nn.precision import asks_default_precision
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1299,6 +1300,13 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
+        if self.parts > 1 and not asks_default_precision(None, configured=True):
+            # Its parts' products sum in the tensor cores' accumulator, which an fp32 product above the
+            # default precision asks exact (`product.promoted`): on an H100 its forward was 11.8 to 16.8
+            # times the reference's error under HIGHEST, its accurate form alike (M-NA-48, row 13498), where
+            # the Pallas-Triton mainloop's held check 1.
+            return Refusal('dtype', "the Mosaic mainloop's fp32 parts sum in the tensor cores' accumulator, "
+                           "an fp32 product's sums above the default precision unpromoted")
         if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")

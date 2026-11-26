@@ -1779,6 +1779,24 @@ def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
     _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
 
 
+def test_an_fp32_forwards_parts_are_refused_above_the_default_precision():
+    """An fp32 inference call's Mosaic forward on an H100 (its operands' bf16 parts, `MosaicForward.parts`)
+    at the default precision is taken, and refused under HIGHEST (row 13498): its parts' products sum in
+    the tensor cores' accumulator, 11.8 to 16.8 times the reference's error there (M-NA-48), which an fp32
+    product above the default precision asks exact (`product.promoted`); another mainloop takes it."""
+    query = jax.ShapeDtypeStruct((1, 128, 2, 64), jnp.float32)
+    spans = template.spans(128, 128, 1, causal=True)
+    with generation.assumed("sm90"):
+        family = attention_mosaic_program.bundle("sm90", jnp.float32)
+        op, args = attention_mosaic._forward_call(query, query, query, spans, None, scale=None, natural=False)
+        bound = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        assert op.parts > 1
+        assert op.refusal(bound, family) is None
+        with jax.default_matmul_precision("highest"):
+            refused = op.refusal(bound, family)
+    assert refused is not None and refused.code == "dtype"
+
+
 @ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
