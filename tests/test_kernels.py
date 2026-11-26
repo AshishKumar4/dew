@@ -347,10 +347,13 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80, sm90 and sm1xx")
     lengths = [700, 1, 0, 333, 64]
     starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
-    # Each document's rows as slices, which no statement of the arms holds (`truths_ahead.arm_role`), so its
-    # run compiles them on its GPU: FlashAttention's wheel traces nothing for a compile-only one ("Unknown
-    # backend: 'gpu' requested", train 1310's prepare at f37f47cdf, where their bounds stated them).
-    documents = [slice(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
+    # Each document's rows as bounds, which a statement of the arms holds (a slice has none: its arms ran
+    # unprepared, row 13171), and its raw wheel calls lowered for the call's target as Dew's own are
+    # (`attention_kernels.flash_target`): stated none, they read the host's GPU, which a part's prepare has
+    # none of ("Unknown backend: 'gpu' requested", train 1310's prepare at f37f47cdf).
+    from dew.nn.attention_kernels import flash_target
+    flash.targeting(flash_target)
+    documents = [(begin, end) for begin, end in itertools.pairwise(starts.tolist()) if end > begin]
     window = (63, 0 if causal else 63) if sunk else (-1, -1)
     ids = np.repeat(np.arange(1, len(lengths) + 1), lengths)[None]
 
@@ -370,13 +373,13 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
 
     def dense(q, k, v, *s):
         # Each document alone, its rows put back where the packed call holds them.
-        return jnp.concatenate([flash.flash_mha(q[None, at], k[None, at], v[None, at], **options(s))[0]
-                                for at in documents])
+        return jnp.concatenate([flash.flash_mha(q[None, b:e], k[None, b:e], v[None, b:e], **options(s))[0]
+                                for b, e in documents])
 
     def by_document(leaves):
         # Each document's rows a leaf of their own, so a document's error answers to its own budget (a
         # one-token document's exactly zero where the reference's is); the sinks' gradient summed whole.
-        return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
+        return (*(leaf[b:e] for leaf in leaves[:4] for b, e in documents), *leaves[4:])
 
     # A label a cell's own: a part's store of compiled truths holds one site a label.
     label = f"packed documents {head_dim} {'causal' if causal else 'full'}{' sunk' if sunk else ''}"

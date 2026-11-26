@@ -83,8 +83,10 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
 def _scores_whole(attend, *operands) -> bool:
     """Whether `attend`'s program forms a whole score array of its operands' every row, head, query and key
     (`[..., Q, K]` of `B H Q K` entries) in the memory its kernels' launches read and write, at any depth
-    but a kernel's own (`programs.bodies`): the reference path's, which a streamed kernel never holds; a
-    key mask, `[B, 1, Q, K]`, holds no head's."""
+    but a kernel's own (`reference_error.equations` past `programs.opaque`): the reference path's, which a
+    streamed kernel never holds; a key mask, `[B, 1, Q, K]`, holds no head's."""
+    from reference_error import equations
+
     from dew.nn import programs
 
     rows, queries, heads, _ = operands[0].shape
@@ -93,12 +95,8 @@ def _scores_whole(attend, *operands) -> bool:
     def whole(shape) -> bool:
         return tuple(shape[-2:]) == (queries, keys) and np.prod(shape) >= rows * heads * queries * keys
 
-    def formed(jaxpr) -> bool:
-        outputs = (getattr(var.aval, "shape", ()) for equation in jaxpr.eqns for var in equation.outvars)
-        return any(map(whole, outputs)) or any(
-            formed(inner) for equation in jaxpr.eqns for inner in programs.bodies(equation))
-
-    return formed(jax.make_jaxpr(attend)(*operands).jaxpr)
+    return any(whole(getattr(var.aval, "shape", ())) for equation in equations(
+        jax.make_jaxpr(attend)(*operands).jaxpr, skip=programs.opaque) for var in equation.outvars)
 
 
 def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them():
