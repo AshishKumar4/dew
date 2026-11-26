@@ -21,12 +21,12 @@ import numpy as np
 
 from dew import _records
 from dew._records import JSON
-from dew.nn.inputs import Media, pad_token_rows
+from dew.nn.inputs import pad_token_rows
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
-    from dew.interop.processors import ProcessorCall
+    from dew.interop.processors import HostMedia, ProcessorCall
 
 CHECKER = 8
 """The side of the checkerboard an RGBA image is laid over, in pixels."""
@@ -109,7 +109,7 @@ class InklingProcessor:
                             "token")
         self.image_token = held
 
-    def __call__(self, *, images: Media | None = None,
+    def __call__(self, *, images: HostMedia | None = None,
                  **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
         """The fields of the call's `text` rows and `images`, each row's placeholders taking the next images
         in order, each placeholder made as many as its image's merged tokens: `input_ids` and
@@ -150,23 +150,11 @@ class InklingProcessor:
 
     def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
                             **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]:
-        """The tokenizer's template over `conversation`; asked for its tokens as named fields (`tokenize`,
-        `return_dict`), the template's text and its image parts' images through this processor's own call
-        (`dew.interop.processors.chat_images`)."""
-        from dew.interop.processors import chat_images, hosts
+        """The tokenizer's template over `conversation`, its images through this processor's own call
+        (`dew.interop.processors.chat_call`)."""
+        from dew.interop.processors import chat_call
 
-        tokenizer = self.tokenizer
-        if not hosts(tokenizer):
-            raise TypeError("Inkling 2's tokenizer lacks a host processor operation")
-        if not (kwargs.get("tokenize") and kwargs.get("return_dict")):
-            return tokenizer.apply_chat_template(conversation, **kwargs)
-        options = {name: value for name, value in kwargs.items()
-                   if name not in ("tokenize", "return_dict", "return_tensors")}
-        text = tokenizer.apply_chat_template(conversation, tokenize=False, **options)
-        if not isinstance(text, str):
-            raise TypeError("Inkling 2's chat template must render text")
-        return self(text=text, images=chat_images(conversation, type(self).__name__),
-                    return_tensors=_records.text(kwargs.get("return_tensors", "np"), "return_tensors"))
+        return chat_call(self, self.tokenizer, conversation, "Inkling 2", **kwargs)
 
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]:
         return self.tokenizer.batch_decode(sequences, skip_special_tokens=skip_special_tokens)

@@ -129,6 +129,26 @@ def _chat_image(image: object) -> Media | str | bytes:
 type MediaInput = Media | str | bytes | bytearray | Path | Sequence[MediaInput]
 
 
+def chat_call(processor: HostProcessor, tokenizer: PreTrainedTokenizerBase,
+              conversation: Sequence[Mapping[str, object]], name: str,
+              **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]:
+    """A Dew-owned processor's chat (`OWN_PROCESSORS`'): the tokenizer's template over `conversation`; asked
+    for its tokens as named fields (`tokenize`, `return_dict`), the template's text and its image parts'
+    images (`chat_images`) through `processor`'s own call, as a release's processor reads a chat. `name`
+    names the source in a refusal."""
+    if not hosts(tokenizer):
+        raise TypeError(f"{name}'s tokenizer lacks a host processor operation")
+    if not (kwargs.get("tokenize") and kwargs.get("return_dict")):
+        return tokenizer.apply_chat_template(conversation, **kwargs)
+    options = {key: value for key, value in kwargs.items()
+               if key not in ("tokenize", "return_dict", "return_tensors")}
+    text = tokenizer.apply_chat_template(conversation, tokenize=False, **options)
+    if not isinstance(text, str):
+        raise TypeError(f"{name}'s chat template must render text")
+    return processor(text=text, images=_as_host_media(chat_images(conversation, type(processor).__name__)),
+                     return_tensors=_records.text(kwargs.get("return_tensors", "np"), "return_tensors"))
+
+
 def is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
     """Whether `value` is a sequence of media items rather than one atomic path, byte buffer or array."""
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))

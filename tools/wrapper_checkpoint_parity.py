@@ -10,17 +10,13 @@ import dataclasses
 import functools
 import json
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import jax
 import numpy as np
 import torch
-from transformers import (
-    AutoConfig,
-    AutoModelForImageTextToText,
-    AutoProcessor,
-    GenerationMixin,
-    PreTrainedModel,
-)
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor, PreTrainedModel
+from transformers.generation.utils import GenerateDecoderOnlyOutput
 
 from dew._accuracy import distance
 from dew.interop import PretrainedDecoder
@@ -29,6 +25,13 @@ from dew.sampling.text import Sampling
 
 CONTINUATION = 3
 """Greedy tokens each batch continues by, Dew's and the reference's."""
+
+
+@runtime_checkable
+class _Generating(Protocol):
+    """The generation this tool asks of its reference: a greedy continuation and its logits."""
+
+    def generate(self, **kwargs: object) -> GenerateDecoderOnlyOutput: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,11 +105,12 @@ class Runs:
     def continued(self, batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Dew's greedy continuation of `batch` by CONTINUATION tokens, the reference's, and the reference's
         logits at each of its steps."""
-        # A transformers 5 model generates where its class mixes generation in (`GenerationMixin`), which
-        # `PreTrainedModel` no longer does: narrowed to it, as a checker reads it (rows 8266, 8484).
+        # A transformers 5 model generates where its class mixes generation in, which `PreTrainedModel` no
+        # longer does: narrowed to the call this tool makes (`_Generating`), as a checker reads it (rows 8266,
+        # 8484), transformers' own protocol of `generate`'s host asking more than a checker can see.
         model = self.reference_model
-        if not isinstance(model, GenerationMixin):
-            raise TypeError(f"{type(model).__name__} generates no continuation (no GenerationMixin)")
+        if not isinstance(model, _Generating):
+            raise TypeError(f"{type(model).__name__} generates no continuation")
         with torch.no_grad():
             generated = model.generate(
                 **tensors(batch), max_new_tokens=CONTINUATION, do_sample=False, eos_token_id=None,
