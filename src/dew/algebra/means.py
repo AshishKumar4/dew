@@ -76,9 +76,10 @@ def _unsettled(totals, anchors, axis: int) -> jax.Array:
     (anchors common to the states beside totals of a batch, or the other way)."""
     laid = jnp.broadcast_shapes(jnp.shape(totals), jnp.shape(anchors))
     totals, anchors = jnp.broadcast_to(totals, laid), jnp.broadcast_to(anchors, laid)
-    return _joined_anchor(jnp.max(jnp.where(_mass(totals)[0], anchors, -jnp.inf), axis=axis, keepdims=True),
-                          jnp.max(jnp.where(jnp.isfinite(anchors), anchors, -jnp.inf), axis=axis,
-                                  keepdims=True))
+    available = jnp.where(jnp.isfinite(anchors), anchors, -jnp.inf)
+    return _joined_anchor(
+        jnp.max(jnp.where(holding(totals), available, -jnp.inf), axis=axis, keepdims=True),
+        jnp.max(available, axis=axis, keepdims=True))
 
 
 def _joined_anchor(massive: jax.Array, finite: jax.Array) -> jax.Array:
@@ -130,10 +131,8 @@ def _weights(totals, anchors, joined):
     """Each state's weight given the `joined` anchor (`_weighed`'s): where it holds mass, its total and its
     anchor as the law weighs them (a state at a time, so a chunk's are its own, `merged_state_chunked`)."""
     holds, weighed = _mass(totals)
-    placed = holds | jnp.isfinite(anchors)
-    totals = jnp.where(weighed, totals, 0.0)
-    totals = jnp.where(placed, totals, jax.lax.stop_gradient(totals))
-    return holds, totals, jnp.where(placed, anchors, joined), joined
+    present = jnp.isfinite(anchors)
+    return holds & present, jnp.where(weighed & present, totals, 0.0), jnp.where(present, anchors, joined), joined
 
 
 
@@ -195,7 +194,7 @@ def merged_total(totals: jax.Array, anchors: jax.Array, units: Units,
     total past the format's least, as no anchor of the format holds it."""
     axis = axis % totals.ndim
     unsettled = _unsettled(totals, anchors, axis)
-    _, totals, anchors, joined = _weighed(totals, anchors, axis)
+    _, totals, anchors, joined = _weights(totals, anchors, _settled(unsettled))
     form = _total_form(axis, units)
     # The masses' sum at the joined anchor as the total sums and lands it (`_ratio_sum`), the one sum the
     # landing reads: a sequential rounded sum lost three masses of 2^102 beside the format's largest the
@@ -304,9 +303,10 @@ def merged_state_chunked(load, chunks: int, units: Units, axis: int):
     def joining(c, carry):
         joined, finite, least, most, held = carry
         outputs, totals, anchors, valid = load(c)
-        mass_holds = _mass(totals)[0]
-        holds = mass_holds if valid is None else valid & mass_holds
-        finite_anchor = jnp.isfinite(anchors) if valid is None else valid & jnp.isfinite(anchors)
+        finite_anchor = jnp.isfinite(anchors)
+        if valid is not None:
+            finite_anchor = valid & finite_anchor
+        holds = finite_anchor & holding(totals)
         laid = _laid(holds, outputs)
         return (jnp.maximum(joined, jnp.max(jnp.where(holds, anchors, -jnp.inf), axis=axis, keepdims=True)),
                 jnp.maximum(finite, jnp.max(jnp.where(finite_anchor, anchors, -jnp.inf),

@@ -452,6 +452,53 @@ def test_an_empty_rows_anchor_is_chosen_by_the_law_before_its_mass_and_tangent()
     assert float(empty) == -math.inf
 
 
+def test_nonfinite_anchors_remove_stale_mass_and_its_derivatives():
+    units = windows.Units()
+    outputs = np.broadcast_to(np.asarray([2, 13, 4], np.float32)[:, None, None], (3, 3, 1))
+    totals = np.ones((3, 3), np.float32)
+    anchors = np.asarray([[0, 0, 0], [-np.inf, np.inf, np.nan], [0, 0, 0]], np.float32)
+    direction = np.broadcast_to(np.asarray([1, 2.0 ** 127, 0], np.float32)[:, None], totals.shape)
+
+    def orders(y, t, a, dt):
+        def run(w):
+            return means.merged_state(y, w, a, units, 0)
+
+        def forward(w):
+            return jax.jvp(run, (w,), (dt,))
+
+        found, tangent = forward(t)
+        mixed = jax.jvp(lambda w: forward(w)[1][0], (t,), (dt,))[1]
+        transpose = jax.grad(lambda w: run(w)[0].sum())(t)
+        return found, tangent, mixed, transpose
+
+    (mean, mass, peak), (dm, dmass, dpeak), mixed, transpose = jax.jit(orders)(outputs, totals, anchors,
+                                                                             direction)
+    np.testing.assert_array_equal(mean, np.full((3, 1), 3))
+    np.testing.assert_array_equal(mass, [2, 2, 2])
+    np.testing.assert_array_equal(peak, [0, 0, 0])
+    np.testing.assert_array_equal(dm, np.full((3, 1), -0.5))
+    np.testing.assert_array_equal(dmass, [1, 1, 1])
+    np.testing.assert_array_equal(dpeak, [0, 0, 0])
+    np.testing.assert_array_equal(mixed, np.full((3, 1), 0.5))
+    np.testing.assert_array_equal(transpose, np.broadcast_to([[-0.5], [0], [0.5]], totals.shape))
+
+
+def test_a_streamed_empty_walk_does_not_put_stale_readouts_in_its_hull():
+    units = windows.Units()
+    outputs = np.asarray([[[2.], [17.]], [[13.], [19.]]], np.float32)
+    totals = np.asarray([[0., 2.], [1., 1.]], np.float32)
+    anchors = np.asarray([[0., 8.], [-np.inf, np.nan]], np.float32)
+    valid = np.asarray([[True, False], [True, True]])
+
+    @jax.jit
+    def merged(y, t, a, v):
+        return means.merged_state_chunked(lambda i: (y[i], t[i], a[i], v[i]), 2, units, 0)
+
+    mean, mass, peak = merged(outputs, totals, anchors, valid)
+    np.testing.assert_array_equal(mean, [0.])
+    assert float(mass) == 0.0 and float(peak) == 0.0
+
+
 @pytest.mark.parametrize("jitted", [True, False], ids=["jitted", "op by op"])
 def test_a_merged_totals_anchor_and_move_are_formed_together_in_its_units(jitted):
     """64 float32 totals of `2^127` at anchors `-2^127`, at a scale of `2^-126`: the move their mass `2^133`
