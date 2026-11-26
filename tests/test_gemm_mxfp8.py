@@ -310,7 +310,7 @@ def test_a_float64_truths_block_past_float32s_range_keeps_its_scale():
     """A float64 truth's block whose largest magnitude is 2^128, past float32's range, takes the scale 2^120
     and the code 256 from its own exponent field, decoding to 2^128 again, not the NaN scale a float32 cast
     of its magnitude would read (row 13249's review)."""
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         block = jnp.zeros((1, 32), jnp.float64).at[0, 0].set(2.0 ** 128)
         operand = formats.MxFp8.quantized(block)
         held = np.asarray(jax.lax.bitcast_convert_type(operand.scales, jnp.uint8))
