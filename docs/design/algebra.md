@@ -352,8 +352,10 @@ fitted to them, and a rule set ships only with measured receipts.
   does not replace the dots, cross a rematerialization name, or choose a launch. The measurement arm
   `fusion.lower_decode(..., enabled=True)` takes a contiguous, unplaced region into one nested JAX
   program. It preserves the written dot and activation equations and keys replay by the recorded
-  equation contexts and provenance. Interleaved, placed or unshareable bodies stay as written. XLA may
-  inline the call: this is not a new GPU kernel or a launch-count promise. Compare with the command-buffer
+  equation contexts and provenance. Interleaved, placed or unshareable bodies stay as written. The
+  packed `GatedMLP` names the packed pair before activation for rematerialization policies; neither a
+  packed reshape by itself nor crossing those names gives an equivalent experiment. XLA may inline
+  the nested call: this is not a new kernel or a launch-count promise. Compare with the command-buffer
   control in M-AL-3 before pursuing a native form.
 - **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
   attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is

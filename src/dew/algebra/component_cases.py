@@ -354,7 +354,7 @@ def _backward_weights(logits, peak, total, *, keys_first):
 
 def _backward_weights_truth(logits, peak, total, *, keys_first):
     maximum = _per_query(jnp.where(peak == -jnp.inf, jnp.inf, peak), keys_first)
-    exponential = jnp.exp(jnp.minimum(logits - maximum, 0.0))
+    exponential = jnp.exp(logits - maximum)
     mass = _per_query(jnp.where(total == 0, 1.0, total), keys_first)
     return exponential, exponential / mass
 
@@ -377,12 +377,14 @@ def _attention_recompute_cases(*, keys_first, dropped):
         shape = operands[0].shape
         if keys_first:
             shape = shape[::-1]
-        logits = rng.standard_normal(shape).astype(np.float32)
         peak = rng.standard_normal((shape[0],)).astype(np.float32)
+        logits = peak[:, None] - rng.uniform(0, 6, shape).astype(np.float32)
         total = rng.uniform(2, 4, (shape[0],)).astype(np.float32)
-        # Neither an empty row's mass nor a score rounded above the forward maximum creates a weight > 1.
+        # The empty row weighs zero. Plain fast recomputation does not clamp a logit that rounds
+        # just above the forward's peak.
         logits[0], peak[0], total[0] = -np.inf, -np.inf, 0
-        logits[1, 0], peak[1] = 1, 0
+        peak[1] = 1
+        logits[1, 0] = np.nextafter(np.float32(1), np.float32(np.inf))
 
         def tiles(value):
             return value.T.copy() if keys_first else value
@@ -402,6 +404,7 @@ def _attention_recompute_cases(*, keys_first, dropped):
             # dropped key, an explicit anchor and a masked key, each read by a different branch.
             extreme = np.float32(2.0 ** 127)
             anchor[2], delta[2], total[2] = -extreme, 0, 4
+            logits[2] = np.minimum(logits[2], 0)
             products[2, 1], keep[2, 1], logits[2, 1], peak[2] = extreme, 1, 0, 0
         return (tiles(logits), tiles(products), peak, total, anchor, delta, tiles(keep),
                 tiles(seen), tiles(at_anchor))
