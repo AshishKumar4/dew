@@ -55,7 +55,7 @@ def _chunked_cov(x, y, w):
 def test_chunked_moments_holds_every_order(taken):
     """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
     (`moments.chunked_covariance`, merge) hold every derivative order across float32's exponent edges.
-    Use the plain mathematical declarations in float64 as independent truth, not the same chunked AD rule.
+    Use the plain declarations in float64 as independent truth, not the same chunked AD rule."""
     x, y, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
     dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
     c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
