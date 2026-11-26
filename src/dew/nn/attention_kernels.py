@@ -742,8 +742,11 @@ class Timed:
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
-    # Interim, until M-NA-44 times them: up to 32768 tokens, cited from M-ET-51, which holds no sums.
-    **{(where, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for where in ('sm80', 'sm90')},
+    # M-NA-44's A100 sweep, exactly: 1024 to 32768 tokens, widths 64 and 128, 32/8, causal and full.
+    ('sm80', CallKind.of(jnp.bfloat16)): Timed(1024, 32768, (64, 128), (4,), windows=False, documents=False,
+                                               dtypes=("bfloat16",)),
+    # Interim on an H100, until M-NA-44's GH200 rows land: up to 32768 tokens, cited from M-ET-51.
+    ('sm90', CallKind.of(jnp.bfloat16)): Timed(0, 32768),
     **{(where, CallKind.of(jnp.float32)): Timed(0, 1024) for where in ('sm80', 'sm90')},
     ('sm100', CallKind.of(jnp.bfloat16)): Timed(
         256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
@@ -760,13 +763,18 @@ unwindowed, cuDNN against the template's forward and training step (`DECLARED`);
 none timed; 128 tokens waits for the grid's other rounds, its margins 1.09 to 1.60 against five-round
 receipts' spread of up to 1.33. Its calls of packed documents those of 12288 tokens, 16/4 at width 256,
 causal (Qwen3.5-4B's decision row), the one shape their receipt timed.
-On an H100 and an A100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training
-step, an interim placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
-(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100, CELLS-a100), and M-ET-51, which meant to time
-FlashAttention against the template from 1024 to 32768 tokens there, holds no sums (its GH200 half timed
-out, neither half's survive, its record's provenance correction of 2026-11-20); M-NA-44 times that sweep,
-and its receipt replaces this placeholder. An fp32 call's: up to 1024 tokens, a training step's attention
-at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100).
+On an A100 a bf16 call's: 1024 to 32768 tokens (4 x 1024, 2 x 2048, 2 x 4096, 1 x 8192, 1 x 16384,
+1 x 32768), widths 64 and 128, 32 query heads over 8, causal and full, unwindowed and of no documents
+(M-NA-44-a100 at c0a4b1ce7, check 1 over 40 draws and five interleaved rounds): FlashAttention-2's forward
+holds check 1 at every one and runs 1.007 to 1.70 times faster than the template's, and its training fails
+it at every one (dK 1.73 to 1.79 times the reference's error, dV to 1.65 where causal, against 1.5), so
+the cell's kernel infers on FlashAttention-2 and trains on the template ('flash_inference').
+On an H100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training step, an interim
+placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
+(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100), and M-ET-51 holds no sums; M-NA-44's GH200 rows time
+that sweep, and their receipt replaces this placeholder.
+On an H100 and an A100 an fp32 call's: up to 1024 tokens, a training step's attention at Qwen3-8B's widths,
+1 x 1024 (CELLS-h100, CELLS-a100).
 On an RTX PRO 6000 a bf16 call's: 1 x 4096 at width 64, 32 query heads over 8, causal, its forward and its
 training step, exactly (M-NA-35-prefill-g4: FlashAttention-2 against the template, causal 271.4 against
 311.0 us, the causal step 935.6 against 1501.1; its full forward 420.9 against 537.5, its full training no
