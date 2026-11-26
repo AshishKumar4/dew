@@ -540,21 +540,32 @@
 "tests/test_attention_mosaic_flops.py::test_the_mosaic_launches_state_the_models_attention_flops[causal]"
 ],
 "tests/test_attention_placed.py": [
-"tests/test_attention_placed.py::test_a_refusal_of_the_rows_forwards_rewalk_alone_steps_its_rewalk_alone_interpreted",
+"tests/test_attention_placed.py::test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving[causal]",
+"tests/test_attention_placed.py::test_a_rows_forwards_tmem_store_and_load_wait_mutations_are_caught[load wait left out-unordered]",
 "tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[fused-causal-128]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[fused-full-128]",
 "tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[fused-full-64]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-causal-128]",
 "tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-causal-64]",
-"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-full-64]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-full-128]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-causal-128]",
 "tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-causal-64]",
-"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-full-64]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving[full-one-d256]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[causal-folded-256]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[full-folded-64]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[one-causal-kept]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-full-128]",
+"tests/test_attention_placed.py::test_the_correction_warpgroup_at_d256_holds_check_1_interpreted[causal]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_at_d256_holds_every_property_in_every_interleaving[causal-two-d64]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted[causal-192]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[causal-folded-128]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[causal-natural-256]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[full-folded-256]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[full-natural-64]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted[320]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-causal-partners apart]",
 "tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-full-moved after kept]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-full-partners apart]",
 "tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_streams_values_its_keys_columns_as_handed_interpreted",
+"tests/test_attention_placed.py::test_the_walked_backward_at_width_256_holds_check_1_interpreted[causal]",
 "tests/test_attention_placed.py::test_the_walked_backward_at_width_256_holds_check_1_interpreted[full]",
-"tests/test_attention_placed.py::test_two_consumers_with_distinct_queries_on_tcgen05s_rows_match_reference_interpreted"
+"tests/test_attention_placed.py::test_the_walked_backward_states_each_product_its_issuers_walk[fused]"
 ],
 "tests/test_attention_prologues.py": [
 "tests/test_attention_prologues.py::test_a_prologued_forward_compiles_spill_free_at_its_derived_config[inference-rounded]",
@@ -1818,6 +1829,9 @@
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[mamba hybrid]",
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[memory hybrid]",
 "tests/test_forked_calls.py::test_the_per_layer_embedding_reads_each_documents_chain_over_forks[one token each]"
+],
+"tests/test_fp8_base.py": [
+"tests/test_fp8_base.py::test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_moves_neither"
 ],
 "tests/test_fp8_preset.py": [
 "tests/test_fp8_preset.py::test_a_grouped_output_projection_takes_the_recipe_group_by_group",
