@@ -22,6 +22,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_decode,
     emission,
     merged,
     merged_mosaic,
@@ -317,13 +318,16 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
 
 
+@contextlib.contextmanager
 def _mosaic_served(name: str):
-    """Mosaic GPU serving `name`'s unhooked merges as they lower: a config pinned (`tuning.pinned`) where
-    Pallas Triton serves the generation's unhooked merge (`merged.MOSAIC_SLOWER`), 16 channels a program,
-    which every width and split here takes; else nothing held."""
+    """Mosaic GPU serving `name`'s unhooked merges as they lower: named (`generation.chosen(merge=...)`)
+    where Pallas Triton serves the generation's unhooked merge (`merged.MOSAIC_SLOWER`), its config pinned
+    at 16 channels a program, which every width and split here takes; else nothing held."""
     if name not in merged.MOSAIC_SLOWER:
-        return contextlib.nullcontext()
-    return tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)})
+        yield
+        return
+    with generation.chosen(merge="mosaic"), tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+        yield
 
 
 @COMPILES_ON_CPU
@@ -406,16 +410,18 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "pinned"])
+@pytest.mark.parametrize("where", [*sorted(merged.MOSAIC_SLOWER), "hooked", "named"])
 def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
-    """Rows 9795, 12398: the generations where Mosaic GPU's merge measured slower (`merged.MOSAIC_SLOWER`,
-    an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled executables carry it: a
-    plain merge, and a finished one with a resumed state (`Initial`, the form row 11857's GPU run found
-    Pallas Triton refusing), each unhooked as the measured one was. Mosaic serves there a hooked merge (a
-    sigmoid output hook) and one whose config is pinned, as its executable carries its kernel; Pallas Triton
-    lowers no Mosaic GPU primitive rule's `platform_index`. Each generation's Triton compiles, and the
-    Hopper's hooked and pinned Mosaic ones, a case of its own (`where`: together 189 s, the two Mosaic
-    compiles 161 s, row 12698)."""
+    """Rows 9795, 12398, 12480: the generations where Mosaic GPU's merge measured slower
+    (`merged.MOSAIC_SLOWER`, an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled
+    executables carry it: a plain merge, and a finished one with a resumed state (`Initial`, the form row
+    11857's GPU run found Pallas Triton refusing), each unhooked as the measured one was, a held config's pin
+    moving none (it flipped the lowering unseen), and a hooked one named Triton
+    (`generation.chosen(merge=...)`). Mosaic serves there a hooked merge (a sigmoid output hook) and one
+    named Mosaic, as its executable carries its kernel; Pallas Triton lowers no Mosaic GPU primitive rule's
+    `platform_index`. A merge named Mosaic as it traces lowers on it past the block that names it (row
+    13170). Each generation's Triton compiles, and the Hopper's hooked and named Mosaic ones, a case of its
+    own (`where`: together 189 s, the two Mosaic compiles 161 s, row 12698)."""
     from fla_gdn_support import KernelCase
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
@@ -447,9 +453,12 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
         plgpu_core.WGxWG_SEMANTICS]
     if where in merged.MOSAIC_SLOWER:
         with generation.assumed(where):
-            records = compile_kernels([
-                KernelCase("plain", lambda: (plain, (padded, stacked))),
-                KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], where)
+            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+                records = compile_kernels([
+                    KernelCase("plain", lambda: (plain, (padded, stacked))),
+                    KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], where)
+            with generation.chosen(merge="triton"):
+                records += compile_kernels([KernelCase("hooked", lambda: (hooked, small))], where)
         for record in records:
             assert "error" not in record and sorted(record["thunks"]) == ["merged_padded"], record
         return
@@ -457,9 +466,13 @@ def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower(where):
         if where == "hooked":
             records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
         else:
-            with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
-                records = compile_mosaic_kernels(
-                    [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
+            def named(p, s):
+                # Named as it traces, inside the jitted body: its lowering, past the block, takes it.
+                with generation.chosen(merge="mosaic"):
+                    return plain(p, s)
+
+            records = compile_mosaic_kernels(
+                [KernelCase("named", lambda: (named, (padded, stacked)))], "sm90")
     for record in records:
         assert not mosaic_failures([record]), record
         assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
@@ -890,8 +903,8 @@ def test_a_finished_split_merge_preserves_subnormal_initial_mass():
                     "finished split merge preserves subnormal initial mass", seeds=FEWEST_SEEDS)
 
 def test_resumable_split_merge_preserves_subnormal_initial_mass():
-    """Row 10818: `algebra.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps its
-    natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
+    """Row 10818: `attention_decode.resumable` on a finished state carrying subnormal mass (`2^-127`) keeps
+    its natural maximum instead of replacing it with `LEAST`, so a subsequent `merged.merged_finished` with a
     low-logit slice (`-140`) preserves the resumed output instead of letting the low-logit slice overwrite
     it."""
     batch, slices, rows, kv_heads, width, queries = 1, 2, 4, 1, 16, 2
@@ -910,9 +923,9 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     low_stacked = jnp.stack([low_m, low_t])
 
     def step(p_in, st_in, low_s):
-        resumed = algebra.resumable(spec, st_in)
+        resumed = attention_decode.resumable(spec, st_in)
         next_init = template.Initial(jnp.swapaxes(resumed.m, 1, 2), jnp.swapaxes(resumed.total, 1, 2),
-                                     jnp.swapaxes(resumed.acc, 1, 2))
+                                     jnp.swapaxes(resumed.acc, 1, 2), normalized=True)
         out = merged.merged_finished(spec, p_in, low_s, queries=queries, width=width,
                                      out_dtype=jnp.float32, out_heads=queries, initial=next_init)
         return resumed.m, out

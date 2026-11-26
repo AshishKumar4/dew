@@ -39,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     reference,
     takes_output_residuals,
+    walked_initial,
 )
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import configured_precision
@@ -88,6 +89,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     which the Mosaic forward reads from the key's slot, the keys loaded once (`_Config.in_key`).
     """
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     if hooks.output.fn is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
@@ -394,6 +396,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     resources, else the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
     them (`rounded` False, `_Config.operand_dtype`). `interpret` runs the GPU mainloops on the CPU, as the
     device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
+    walked_initial(hooks.initial)
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": scale, "natural": natural, "accurate": accurate}
     on_mosaic = _on_mosaic() or interpret

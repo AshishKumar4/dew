@@ -24,6 +24,10 @@ class Wrapper:
     an item's frames and pooling them (`TowerGeometry.pools_frames`)."""
     video: bool = False
     """Whether its processor carries videos (`pixel_values_videos`)."""
+    merged_blocks: bool = False
+    """Inkling 2's processor: each image's merged tokens as pixel blocks `[side, side, channels]`, its grid
+    counted in merged tokens, which the reader takes as packed patch vectors and patch grids
+    (`Processor._unmerged`)."""
     head_tied_by_default: bool = True
     """Whether its head ties to its embedding where its config leaves `tie_word_embeddings` unset:
     Transformers ties by the wrapper config's own field, which Qwen 3.5's and Muse Glimmer's configs leave
@@ -42,6 +46,7 @@ WRAPPERS: dict[str, Wrapper] = {
     'muse_glimmer': Wrapper(packed_media=True, video=True, head_tied_by_default=False),
     'lfm3_vl': _PACKED, 'mimo_v2': _PACKED, 'kimi_k25': _PACKED, 'kimi_k3': _PACKED,
     'gemma4': _GEMMA4, 'gemma4_unified': _GEMMA4,
+    **dict.fromkeys(('inkling2_loop', 'inkling2_loop_text'), Wrapper(packed_media=True, merged_blocks=True)),
 }
 """Each multimodal wrapper type whose kind a reader asks of (`wrapper`)."""
 

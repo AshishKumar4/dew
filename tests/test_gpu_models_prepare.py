@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 WORKER = r"""
 import json
 import os
@@ -38,13 +40,14 @@ from truths_ahead import (
 
 from dew.training.ahead import AheadPrograms
 
-base = Path(sys.argv[1])
+base, part = Path(sys.argv[1]), sys.argv[2]
 cpus = jax.devices("cpu")
 assert len(cpus) >= 2, f"expected >=2 cpu devices, got {cpus}"
 
 CAUSAL_CELL = "a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels"
 
-# 1. Real sm90 prepare of both GPU model cells (pattern of test_flow_cells.py).
+# 1. Real sm90 prepare of this part's GPU model cell (pattern of test_flow_cells.py): the causal decoder's, or
+#    ModernBERT's beside the CPU prepare and run below; each part its own process, so each fits its group.
 sm90_store = base / "sm90_store"
 os.environ[model_flows.TOPOLOGY] = str(node_topology(base / "topology.bin", gpu="sm90"))
 os.environ[tier_wire.PREPARE] = "1"
@@ -52,15 +55,16 @@ os.environ["PYTEST_CURRENT_TEST"] = (
     "tests/test_gpu_models.py::test_the_models_run_their_gpu_kernels_as_a_users_process_does (call)"
 )
 with prepared(sm90_store, stamp="a", target=node_target()):
-    run_cells([
-        Cell(CAUSAL_CELL, causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels),
-        Cell("ModernBERT's states in bf16 on its GPU kernels",
-             modernbert.modernbert_states_in_bf16_on_the_gpu_kernels),
-    ])
+    run_cells([Cell(CAUSAL_CELL, causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels)]
+              if part == "causal" else
+              [Cell("ModernBERT's states in bf16 on its GPU kernels",
+                    modernbert.modernbert_states_in_bf16_on_the_gpu_kernels)])
 
 ro = CompiledTruths(sm90_store, prepare=False, stamp="a")
-assert ro.holds("a bf16 decoder on its GPU kernels"), "causal truths not prepared"
-assert ro.holds(armed("ModernBERT bf16 states")), "ModernBERT bf16 dew arm not prepared"
+if part == "causal":
+    assert ro.holds("a bf16 decoder on its GPU kernels"), "causal truths not prepared"
+else:
+    assert ro.holds(armed("ModernBERT bf16 states")), "ModernBERT bf16 dew arm not prepared"
 
 # 2. Capture both cells' arms in PREPARE (cpus[0]) and RUN (cpus[1]) and prove
 #    every arm has a statement and keeps the same arm_role across devices.
@@ -85,39 +89,46 @@ with jax.default_device(cpus[1]):
     modernbert.modernbert_states_in_bf16_on_the_gpu_kernels()
 run_causal, run_mb = captured[0], captured[1]
 
-c_label = prep_causal[3]
-c_dew_prep = arm_role("dew", prep_causal[0], c_label)
-c_dew_run = arm_role("dew", run_causal[0], c_label)
-assert c_dew_prep is not None, "causal dew arm has no statement"
-assert c_dew_prep == c_dew_run, f"causal dew arm_role drifted across devices: {c_dew_prep} != {c_dew_run}"
+if part == "causal":
+    c_label = prep_causal[3]
+    c_dew_prep = arm_role("dew", prep_causal[0], c_label)
+    c_dew_run = arm_role("dew", run_causal[0], c_label)
+    assert c_dew_prep is not None, "causal dew arm has no statement"
+    assert c_dew_prep == c_dew_run, f"causal dew arm_role drifted across devices: {c_dew_prep} != {c_dew_run}"
 
-c_ref_prep = arm_role("reference", prep_causal[1], c_label)
-c_ref_run = arm_role("reference", run_causal[1], c_label)
-assert c_ref_prep is not None, "causal reference arm has no statement"
-assert c_ref_prep == c_ref_run, f"causal reference arm_role drifted across devices: {c_ref_prep}, {c_ref_run}"
+    c_ref_prep = arm_role("reference", prep_causal[1], c_label)
+    c_ref_run = arm_role("reference", run_causal[1], c_label)
+    assert c_ref_prep is not None, "causal reference arm has no statement"
+    assert c_ref_prep == c_ref_run, (
+        f"causal reference arm_role drifted across devices: {c_ref_prep}, {c_ref_run}")
+
+    # The causal site's sm90 programs: where its prepare compiled them ahead, each arm's by the key the run
+    # looks it up by, an arm this deviceless prepare lowers none of (cuDNN's launch, `selection.Unlowerable`)
+    # marked compiled at run apart, by the lookup the run reads (`_stored_arm`: `_unlowered_arm`), and its
+    # reference arm, portable XLA, always stored; or its site marked compiled at run whole, each arm compiled
+    # on the GPU (`CompiledTruths.at_run`). Or its cell deferred whole to its run, recorded so
+    # (`gpu_flow.run_cells`, `DEFERRED`), its arms' site never reached, each arm compiled on the GPU.
+    c_sample = drawn_on_the_host(run_causal[2], 0)
+    if not ro.holds(armed(c_label)):
+        deferred = json.loads((sm90_store / tier_wire.DEFERRED).read_text())
+        assert any(reason["error"].startswith(CAUSAL_CELL) for reason in deferred["reasons"]), deferred
+    elif ro.at_run(armed(c_label)) is None:
+        c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
+        assert ro.at_run(_unlowered_arm(armed(c_label), c_ref_run)) is None, (
+            "the XLA reference arm went to run")
+        for role_name in (c_dew_run, c_ref_run):
+            if ro.at_run(_unlowered_arm(armed(c_label), role_name)) is None:
+                assert named(role_name, c_sample) in c_programs, (
+                    named(role_name, c_sample), sorted(c_programs))
+    raise SystemExit(0)
 
 m_label = prep_mb[3]
 m_dew_prep = arm_role("dew", prep_mb[0], m_label)
 m_dew_run = arm_role("dew", run_mb[0], m_label)
 assert m_dew_prep is not None, "ModernBERT dew arm has no statement"
 assert m_dew_prep == m_dew_run, f"ModernBERT dew arm_role drifted across devices: {m_dew_prep} != {m_dew_run}"
-
-# The causal site's sm90 programs: where its prepare compiled them ahead, each arm's by the key the run looks
-# it up by, an arm this deviceless prepare lowers none of (cuDNN's launch, `selection.Unlowerable`) marked
-# compiled at run apart, by the lookup the run reads (`_stored_arm`: `_unlowered_arm`), and its reference
-# arm, portable XLA, always stored; or its site marked compiled at run whole, each arm compiled on the GPU
-# (`CompiledTruths.at_run`). Or its cell deferred whole to its run, recorded so (`gpu_flow.run_cells`,
-# `DEFERRED`), its arms' site never reached, each arm compiled on the GPU.
+c_label = prep_causal[3]
 c_sample = drawn_on_the_host(run_causal[2], 0)
-if not ro.holds(armed(c_label)):
-    deferred = json.loads((sm90_store / tier_wire.DEFERRED).read_text())
-    assert any(reason["error"].startswith(CAUSAL_CELL) for reason in deferred["reasons"]), deferred
-elif ro.at_run(armed(c_label)) is None:
-    c_programs = AheadPrograms.load(ro.path(armed(c_label)) / PROGRAMS).programs
-    assert ro.at_run(_unlowered_arm(armed(c_label), c_ref_run)) is None, "the XLA reference arm went to run"
-    for role_name in (c_dew_run, c_ref_run):
-        if ro.at_run(_unlowered_arm(armed(c_label), role_name)) is None:
-            assert named(role_name, c_sample) in c_programs, (named(role_name, c_sample), sorted(c_programs))
 
 # Confirm ModernBERT's run-side program name matches what sm90 prepare stored.
 mb_sample = drawn_on_the_host(run_mb[2], 0)
@@ -157,13 +168,17 @@ assert not (cpu_store / UNPREPARED).exists(), (cpu_store / UNPREPARED).read_text
 """
 
 
-def test_gpu_models_cells_prepare_and_match_arm_roles_across_devices(tmp_path):
+@pytest.mark.parametrize("part", ["causal", "modernbert"])
+def test_gpu_models_cells_prepare_and_match_arm_roles_across_devices(tmp_path, part):
     """Both `a_bf16_decoder_trains_and_serves_through_its_gpu_kernels` and
     `modernbert_states_in_bf16_on_the_gpu_kernels` state every arm without device sharding so prepare
-    (cpu:0) and run (a distinct device) compute identical `arm_role` fingerprints with no MissingTruth."""
+    (cpu:0) and run (a distinct device) compute identical `arm_role` fingerprints with no MissingTruth.
+    Each `part` prepares one cell for sm90 in its own process, ModernBERT's beside the CPU prepare and run
+    of both cells' arms: one process for both took 163 s past its group's 120 (row 13134), the causal
+    decoder's sm90 prepare 109 s of it."""
     flags = (os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=2").strip()
     proc = subprocess.run(
-        [sys.executable, "-c", WORKER, str(tmp_path)],
+        [sys.executable, "-c", WORKER, str(tmp_path), part],
         cwd=Path(__file__).parent,
         env={**os.environ, "XLA_FLAGS": flags},
         capture_output=True,

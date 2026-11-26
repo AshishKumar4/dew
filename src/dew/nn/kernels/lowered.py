@@ -48,15 +48,18 @@ class KernelCall:
     model_flops: float | None = None
     """The model's share of `flops` a Mosaic GPU kernel declares (`instrumentation.MODEL_FLOPS`, its launch's
     `model_flops`), None where it declares none."""
-    operands: tuple[tuple[int, ...], ...] = ()
-    """The shapes of the arrays the call reads, as its program reads them: a device's shard's where the
-    call runs per shard (within a `shard_map`), the whole array's otherwise."""
     signature: tuple[tuple[Typed, ...], tuple[Typed, ...]] = ((), ())
-    """The arrays the call reads and those it returns, each as its shape and element type: what a device's
-    call is, operand for operand and result for result (a per-shard launch's against one device's)."""
+    """The arrays the call reads and those it returns (`typed`), each as its shape and element type, as its
+    program reads them: a device's shard's where the call runs per shard (within a `shard_map`), the whole
+    array's otherwise; what a device's call is, operand for operand and result for result."""
     caller: str | None = None
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
     beside its name; None where its call states none."""
+
+    @property
+    def operands(self) -> tuple[tuple[int, ...], ...]:
+        """The shapes of the arrays the call reads (`signature`'s)."""
+        return tuple(shape for shape, _ in self.signature[0])
 
     @property
     def launched(self) -> str | None:
@@ -302,22 +305,21 @@ def operations(lowered: jax.stages.Lowered) -> list[str]:
     return [name for name, _ in _read(lowered, lambda operation: operation.name)]
 
 
-def _ranked(values) -> list:
-    """The ranked tensor types of `values`, in order."""
-    return [ir.RankedTensorType(value.type) for value in values
-            if isinstance(value.type, ir.RankedTensorType)]
-
-
-def _shapes(values) -> tuple[tuple[int, ...], ...]:
-    """The shapes of `values`' ranked tensors, in order."""
-    return tuple(tuple(kind.shape) for kind in _ranked(values))
+def typed(values) -> tuple[Typed, ...]:
+    """Each ranked tensor of `values`, a lowered operation's operands or results, in order, as its shape and
+    element type (MLIR's spelling, `bf16`): every reader of a lowered call's arrays reads them here."""
+    ranked = [kind for kind in (value.type for value in values) if isinstance(kind, ir.RankedTensorType)]
+    return tuple((tuple(kind.shape), str(kind.element_type)) for kind in ranked)
 
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
     """Every custom call a lowered program makes, as lowered (`_read`), each once."""
-    return [call for call, _ in _read_calls(lowered, lambda target, operation: CustomCall(
-        target, _shapes(operation.operands), _shapes(operation.results),
-        tuple(str(kind.element_type) for kind in _ranked(operation.operands))))]
+    def call(target: str, operation: ir.Operation) -> CustomCall:
+        reads, returns = typed(operation.operands), typed(operation.results)
+        return CustomCall(target, tuple(shape for shape, _ in reads), tuple(shape for shape, _ in returns),
+                          tuple(kind for _, kind in reads))
+
+    return [found for found, _ in _read_calls(lowered, call)]
 
 
 def kernel_calls(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list[KernelCall]:
@@ -343,10 +345,8 @@ def kernel_call(target: str, operation: ir.Operation) -> KernelCall | None:
     kind = custom_call_kind(target)
     if kind == "no_matmul":
         return None
-    reads, returns = (tuple((tuple(each.shape), str(each.element_type)) for each in _ranked(values))
-                      for values in (operation.operands, operation.results))
     return dataclasses.replace(_kernel_call(kind, target, operation),
-                               operands=tuple(shape for shape, _ in reads), signature=(reads, returns))
+                               signature=(typed(operation.operands), typed(operation.results)))
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:

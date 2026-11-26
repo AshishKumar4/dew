@@ -182,9 +182,41 @@ class SeparableBias(NamedTuple):
         return self.rows[..., :, None] + self.columns[..., None, :]
 
 
-def dense_bias(bias):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class BandBias:
+    """An additive bias held within a band of keys about each query, `values` `[B or 1, H or 1, Q,
+    template.band_width(extent)]`: query `q`'s column `c` the bias of key `template.band_origins(offset, Q,
+    extent)[q] + c`, every key outside its band biased by nothing. Every key within `extent - 1` before a
+    query's place through its place (`offset`, `[]` or `[B]` int32: a query's place less its index, the key
+    it is at; 0 from the first key) lies in its band: an input-conditioned relative bias (Inkling 2's,
+    `attention_terms.relative_band`) at `Q band_width` entries a head, where its `[B, H, Q, K]` writing out
+    holds 96 GiB at 32768 keys. Every route takes it written out (`dense`)."""
+
+    values: jax.Array
+    offset: jax.Array
+    extent: int = dataclasses.field(metadata={"static": True})
+
+    def __post_init__(self):
+        # A tree's rebuild (`jax.tree.map`'s, a transform's) passes leaves of any kind: an array's checked.
+        if not hasattr(self.values, "shape"):
+            return
+        if self.extent < 1 or self.values.shape[-1:] != (template.band_width(self.extent),):
+            raise ValueError(f"a band of extent {self.extent} holds {template.band_width(self.extent)} "
+                             f"columns a query, got values {jnp.shape(self.values)}")
+
+    def dense(self, keys: int) -> jax.Array:
+        """The bias written out over `keys`, `[B or 1, H or 1, Q, K]` (`template.band_dense`)."""
+        return template.band_dense(self.values, self.offset, self.extent, keys)
+
+
+def dense_bias(bias, keys: int | None = None):
     """`bias` as an array a route adds to its logits: a `SeparableBias` written out (`SeparableBias.dense`),
-    any other as it is."""
+    a `BandBias` over `keys` (`BandBias.dense`), any other as it is."""
+    if isinstance(bias, BandBias):
+        if keys is None:
+            raise ValueError("a band bias is written out over the call's keys, which its caller states")
+        return bias.dense(keys)
     return bias.dense() if isinstance(bias, SeparableBias) else bias
 
 
@@ -838,7 +870,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     without `causal` to the keys within w - 1 of i (`window_sides`); both read
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table) or is a
-    `SeparableBias` (FoX's). `sinks` is one learned value-free logit per query head
+    `SeparableBias` (FoX's) or a `BandBias` (a bias within a band of keys about each
+    query, Inkling 2's relative one). `sinks` is one learned value-free logit per query head
     in the denominator. `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits`
     forms them wide, which the reference alone does (`reference_only`). `scale_logits`
     applies the scale `D ** -0.5` to the fp32 logits after the product (jax.nn's
@@ -914,6 +947,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
     words = template.dropout_seed(dropout_rng) if dropping else None
+    bias = bias.dense(key.shape[-3]) if isinstance(bias, BandBias) else bias  # every route's, written out
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -1216,14 +1250,6 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
     resolved = resolve_implementation(implementation, query, key, **facts).kernel
-    taking = ('template', 'inference', 'xla', 'reference')
-    if sinks is not None and sinks.ndim != 1 and resolved not in taking:
-        # A query's own sink is the template's initial state (`template.sinks`) or the portable softmax's
-        # column (`sink_column`); a kernel taking a head's sinks alone declines it, by name where named.
-        if implementation != 'auto':
-            raise ValueError(f"the {resolved} kernel takes a head's sinks, not a query's: attend a query's "
-                             "own sinks on the template or the reference")
-        resolved = 'template'
     if resolved != 'template' or FORWARD_MODE.get():
         # The template reads a separable bias as its two terms (`template_attention`); every other route,
         # 'inference''s two among them, adds it written out, as forward mode's reference and kernel do.
@@ -1523,7 +1549,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
                     and not isinstance(bias, SeparableBias)),
         separable_bias=isinstance(bias, SeparableBias),
-        sinks=sinks is not None, softcap=softcap,
+        sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),

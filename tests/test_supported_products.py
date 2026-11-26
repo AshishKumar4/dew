@@ -128,11 +128,6 @@ def test_the_doublings_merges_issue_their_supports_instructions_alone(target):
     assert found == expected < whole // 4, (found, expected, whole)
 
 
-def _on_mma_sync() -> bool:
-    return (jax.default_backend() == "gpu"
-            and generation.family(generation.gpu_target().generation) == "mma.sync")
-
-
 def _products_of(target: str, support: product.Support | None):
     """A kernel of `target`'s family taking `lhs @ rhs` `[SIZE, SIZE]` fp32 (TF32) in shared memory, of
     `support`'s terms alone where given (`Issuer.products`'), its accumulator back in device memory."""
@@ -173,12 +168,12 @@ def test_a_product_of_a_support_issues_its_tiles_instructions_alone(target):
     assert count == {"support": int(tiles.sum()), "whole": tiles.size}, count
 
 
-@pytest.mark.skipif(not _on_mma_sync(), reason="a product of a support issues on mma.sync's GPUs alone")
-def test_a_product_of_its_support_is_the_whole_product_bit_for_bit_on_this_gpu():
-    """On this GPU (an mma.sync part's), each of the doubling's merges (`_merges_support`) issued of its
-    support's terms alone (`Issuer.products`' `support`) is the whole product of the same operands, drawn
-    finite in its support and zero outside it, bit for bit at every output it keeps up to a zero's sign:
-    each instruction skipped held only zero terms (the toolkit's review of d345808b0)."""
+def a_product_of_its_support_is_the_whole_product_bit_for_bit():
+    """On this GPU (an mma.sync part's, tests/test_gpu_recurrence.py's cell), each of the doubling's merges
+    (`_merges_support`) issued of its support's terms alone (`Issuer.products`' `support`) is the whole
+    product of the same operands, drawn finite in its support and zero outside it, bit for bit at every
+    output it keeps up to a zero's sign: each instruction skipped held only zero terms (the toolkit's review
+    of d345808b0)."""
     target = generation.gpu_target().generation
     draw = np.random.default_rng(0).standard_normal
     whole = _products_of(target, None)

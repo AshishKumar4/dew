@@ -34,9 +34,10 @@ LENGTHS = (1, 63, 300, 512)
 several, every slot; a paged pool's pages `PAGE` slots each, which both paged kernels read (the Pallas
 kernel's pages at most its `BLOCK`, the template's several to a key tile)."""
 
-CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop"})
+CHOICES = frozenset({"decode", "paged_decode", "attention_mainloop", "merge"})
 """The kernel choices (`generation.CHOICES`) its cells run: a dense cache's step's selector and a paged
-pool's, and the template's mainloop where a cell names the template's decode."""
+pool's, the template's mainloop where a cell names the template's decode, and the merge of its split walk's
+slices (`merged.merged_finished`) at its generation's lowering (`generation.chosen(merge=...)` unnamed)."""
 KERNELS = {"decode": frozenset({"decode", "cudnn", "template"}),
            "paged_decode": frozenset({"triton", "template", "tpu"})}
 """The kernels its cells run under test, each named by its choice (`generation.chosen`, the `kernel` axis):

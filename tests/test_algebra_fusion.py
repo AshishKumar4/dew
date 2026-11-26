@@ -38,6 +38,33 @@ def ran(fn, label: str, *operands):
     return ahead_arm(jax.jit(fn), label)(*operands)
 
 
+@pytest.mark.parametrize("boundary", ["none", "escaped_gate", "extra_hidden_read", "separate_rows"])
+def test_decode_region_keeps_shared_projections_and_their_actual_outputs(boundary):
+    from dew.algebra.fusion import decode_regions
+    from dew.nn.activations import gated_product
+
+    def layer(x, other, w_gate, w_up, w_down):
+        gate, up = x @ w_gate, (other if boundary == "separate_rows" else x) @ w_up
+        hidden = gated_product("swiglu", implementation="xla")(gate, up)
+        down = hidden @ w_down
+        if boundary == "escaped_gate":
+            return down, gate
+        if boundary == "extra_hidden_read":
+            return down + hidden.sum()
+        return down
+
+    shapes = ((1, 8), (1, 8), (8, 16), (8, 16), (16, 8))
+    traced = jax.make_jaxpr(layer)(*(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in shapes)).jaxpr
+    found = decode_regions(traced, rows=1)
+    if boundary != "none":
+        assert not found
+        return
+    region, = found
+    assert region.inputs == (traced.invars[0], *traced.invars[2:])
+    assert region.outputs == tuple(traced.outvars)
+    assert not decode_regions(traced, rows=8)
+
+
 def _passed(fn, *operands, kernels: bool = True):
     """`fn` under the algebra pass (`algebra.rewritten`, its kernels too where `kernels`), made where it is
     traced: a program of it is stated by `fn` (`truths_ahead.arm_role`), where the pass's own closure holds

@@ -237,8 +237,11 @@ modeling code, its configuration code, and its config and causal LM classes."""
 
 FIELDS = {"renamed-moe": {"tie_word_embeddings": True},
           "qwen3-5-hybrid": _DELTA_NETS,
-          # Every layer's feed-forward dense (`mlp_only_layers`), which a hybrid's routed block is not read.
-          "qwen3-next-hybrid": {**_DELTA_NETS, "mlp_only_layers": [0, 1]},
+          # Its delta layer's feed-forward routed (four experts, two a token, beside a sigmoid-gated shared
+          # expert), its attention layer's dense (`mlp_only_layers`): both read (row 13143).
+          "qwen3-next-hybrid": {**_DELTA_NETS, "mlp_only_layers": [1], "num_experts": 4,
+                                "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+                                "shared_expert_intermediate_size": 48},
           # A delta attention layer beside a latent one, both feed-forwards dense (`mlp_layer_types`), the
           # latent's keys a head each (its keys expand to every head, as DeepSeek's do).
           "kimi-linear-hybrid": {"linear_num_heads": 2, "linear_head_dim": 16, "linear_conv_kernel_dim": 4,
