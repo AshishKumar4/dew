@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import qkv
+from flax import linen as nn
 from reference_error import assert_as_exact, with_gradients
 from test_mixers import VOCAB, tiny
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
@@ -274,7 +275,7 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     rng = np.random.default_rng(0x59)
     hidden = jnp.asarray(rng.standard_normal((rows, length, embed)), jnp.float32)
     indexer = block_sparse.MsaIndexer(groups=groups, width=width)
-    params = indexer.init(jax.random.key(0), hidden)
+    params = nn.unbox(indexer.init(jax.random.key(0), hidden))
     scores = np.asarray(indexer.apply(params, hidden))
     wq = np.asarray(params["params"]["wq"]["kernel"], np.float64)
     wk = np.asarray(params["params"]["wk"]["kernel"], np.float64)
