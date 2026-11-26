@@ -27,6 +27,7 @@ import numpy as np
 import optax
 from flax import linen, struct
 from flax.training import dynamic_scale as dynamic_scale_lib
+from jax.typing import DTypeLike
 from typing_extensions import TypeVar
 
 from dew._coordination import read_by_holders
@@ -820,14 +821,16 @@ def stated_compute[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tu
     """The compute dtypes the Flax modules `objective` trains state (their `dtype` fields), each once, in
     order: a model computes in the dtype it was built with, a field of its own no trainer sets; none for a
     module that states none (Flax's None, its compute inferred from its inputs and its submodules')."""
-    stated = (held.get("dtype") for held in _trained_fields(objective))
-    return tuple(dict.fromkeys(jnp.dtype(dtype).name for dtype in stated if dtype is not None))
+    return tuple(dict.fromkeys(jnp.dtype(dtype).name for dtype in _trained_dtypes(objective, "dtype")))
 
 
-def _trained_fields[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[dict[str, object]]:
-    """Each Flax module `objective` trains, as its fields by name."""
-    return [{field.name: getattr(entry.module, field.name) for field in dataclasses.fields(entry.module)}
-            for entry in objective.program_key() if entry.trained and isinstance(entry.module, linen.Module)]
+def _trained_dtypes[LossT, EffectsT](objective: Objective[LossT, EffectsT], name: str) -> list[DTypeLike]:
+    """The dtypes the Flax modules `objective` trains state in their field `name` (`dtype`, `param_dtype`),
+    in order; none for a module that states none."""
+    return [value for entry in objective.program_key()
+            if entry.trained and isinstance(entry.module, linen.Module)
+            for field in dataclasses.fields(entry.module)
+            if field.name == name and (value := getattr(entry.module, name)) is not None]
 
 
 def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
@@ -837,8 +840,7 @@ def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     (`dew.config.RunConfig.trained_numerics`). A module `objective` trains that states another compute dtype
     than `numerics`' (`stated_compute`) is refused: the trainer cannot set it, and the loss would be scaled
     for a compute the model does not run."""
-    drawn = numerics.drawn_dtype([jnp.dtype(dtype) for held in _trained_fields(objective)
-                                  if (dtype := held.get("param_dtype")) is not None])
+    drawn = numerics.drawn_dtype(_trained_dtypes(objective, "param_dtype"))
     compute = jnp.dtype(numerics.dtypes.compute).name
     if other := [dtype for dtype in stated_compute(objective) if dtype != compute]:
         raise ValueError(f"the model computes in {' and '.join(other)} and the run's numerics in {compute}: "
