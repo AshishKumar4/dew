@@ -519,9 +519,10 @@ def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_ot
     def scaled(x):
         return x * 2.0
 
-    x = jnp.ones((8,), jnp.float32)
-    jitted = jax.jit(scaled)
-    compiled = jitted.lower(x).compile()
+    # On this host's CPU, whatever device a prepare makes the default (a compile-only GPU's holds no array).
+    with jax.default_device(jax.local_devices(backend="cpu")[0]):
+        jitted = jax.jit(scaled)
+        compiled = jitted.lower(jnp.ones((8,), jnp.float32)).compile()
     assert _program_of(compiled) is compiled and _module_of(compiled) == "jit_scaled"
     for refused in (jitted, scaled):
         with pytest.raises(AmbiguousCapture):
