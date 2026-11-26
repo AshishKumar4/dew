@@ -1813,8 +1813,16 @@ def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form, cappe
     from certified import assert_certified
 
     from dew.nn import precision
+    from dew.nn.kernels import options
+
+    def released():
+        # The programs earlier tests traced under the suite's wide arithmetic (a jitted helper's trace,
+        # one Dew keeps past jit's caches) traced again without it, and this test's not left to later ones.
+        options.release()
+        jax.clear_caches()
 
     monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
+    released()
     tiles = attention_portable.Tiles(8, 8, 8)
     spans = template.spans(24, 24, 1, **CERTIFIED_FORMS[form])
     hooks = template.Hooks(score=Hook(template.Capped(5.0))) if capped else template.Hooks()
@@ -1830,5 +1838,9 @@ def test_the_plain_jax_mainloops_forward_and_backward_certify(dtype, form, cappe
         return tuple(jnp.asarray(rng.standard_normal((1, 24, 2, 16)), dtype) for _ in range(4))
 
     label = f"{jnp.dtype(dtype).name} {form} {'capped' if capped else 'plain'}"
-    assert_certified(forward, draw, f"the plain-JAX forward, {label}", seeds=2)
-    assert_certified(backward, draw, f"the plain-JAX backward, {label}", seeds=2)
+    try:
+        assert_certified(forward, draw, f"the plain-JAX forward, {label}", seeds=2)
+        assert_certified(backward, draw, f"the plain-JAX backward, {label}", seeds=2)
+    finally:
+        monkeypatch.undo()
+        released()
