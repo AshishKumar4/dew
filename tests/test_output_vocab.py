@@ -113,15 +113,16 @@ def test_an_unscored_column_enters_no_product_of_a_bf16_models_head(tied):
             params["lm_head"] = {**params["lm_head"], "kernel": kernel.at[:, SCORED + 3].set(value)}
         return {**variables, "params": params}
 
+    # The bf16 product stated (`rounds_to_bf16`), whose operands round to bf16, the stored column's to inf.
+    rounding = decoder.clone(precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32)
+
     def pulled(variables):
-        logits, pull = jax.vjp(lambda states: decoder.apply(variables, states, method="logits_from_hidden"),
+        logits, pull = jax.vjp(lambda states: rounding.apply(variables, states, method="logits_from_hidden"),
                                hidden)
         return logits, pull(jnp.ones_like(logits))[0]
 
-    # Run op by op, as an unjitted call runs: compiled, the unfixed head's pullback came out finite here (its
-    # compiler free to drop the product over the cotangent's zero columns), op by op NaN.
-    logits, gradient = pulled(with_row(float(np.finfo(np.float32).max)))
-    zero_logits, zero_gradient = pulled(with_row(0.0))
+    logits, gradient = jax.jit(pulled)(with_row(float(np.finfo(np.float32).max)))
+    zero_logits, zero_gradient = jax.jit(pulled)(with_row(0.0))
     assert logits.shape[-1] == SCORED and bool(jnp.all(jnp.isfinite(gradient)))
     np.testing.assert_array_equal(np.asarray(logits, np.float32), np.asarray(zero_logits, np.float32))
     np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.asarray(zero_gradient, np.float32))
