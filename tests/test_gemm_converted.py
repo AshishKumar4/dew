@@ -20,7 +20,7 @@ from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates import mosaic
 
 FORMATS = {"e4m3": jnp.float8_e4m3fn, "e5m2": jnp.float8_e5m2}
-ROWS, DEPTH, WIDTH = 72, 200, 136
+ROWS, DEPTH, WIDTH, SKINNY = 72, 200, 136, 8
 """A product's rows, depth and width, none a whole tile: the depth and width padded with zero codes to whole
 steps (`converted.STEP`), the rows a partial tile's."""
 
@@ -41,12 +41,12 @@ def test_every_fp8_code_converts_exactly_where_no_tensor_core_multiplies_fp8(nam
     assert np.array_equal(converted[~nan].astype(jnp.bfloat16).astype(np.float32), widened[~nan])
 
 
-def _operands(name: str, seed: int) -> tuple[np.ndarray, np.ndarray]:
+def _operands(name: str, seed: int, rows: int = ROWS) -> tuple[np.ndarray, np.ndarray]:
     """A step's codes and a frozen site's codes, each a normal draw cast to the format (NumPy's: a GPU
     tier's prepare computes on no device)."""
     rng = np.random.default_rng(seed)
     dtype = FORMATS[name]
-    return (rng.normal(size=(ROWS, DEPTH)).astype(dtype), rng.normal(size=(WIDTH, DEPTH)).astype(dtype))
+    return (rng.normal(size=(rows, DEPTH)).astype(dtype), rng.normal(size=(WIDTH, DEPTH)).astype(dtype))
 
 
 def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
@@ -54,8 +54,8 @@ def _product(kernel: str, lhs, rhs, *, interpret_on_cpu: bool) -> jax.Array:
         return gemm.fp8_codes_product(lhs, rhs, out_dtype=jnp.float32, interpret_on_cpu=interpret_on_cpu)
 
 
-def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, interpret_on_cpu: bool = False
-                                                                   ) -> None:
+def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, interpret_on_cpu: bool = False,
+                                                                   rows: int = ROWS) -> None:
     """On an A100, the product of FP8 codes through the template named, its matrix's stages converted
     exactly into bfloat16 before its products read them (`converted.MosaicConvertedGmm`), on par with XLA's
     widened product (check 1) from float64; the routes it records name the template."""
@@ -65,17 +65,38 @@ def an_fp8_codes_product_through_the_converting_template_is_on_par(name: str, in
     with generation.routes() as routes:
         assert_as_exact(jax.jit(functools.partial(_product, "mosaic", interpret_on_cpu=interpret_on_cpu)),
                         jax.jit(functools.partial(_product, "xla", interpret_on_cpu=interpret_on_cpu)),
-                        functools.partial(_operands, name), f"fp8 codes product {name}", seeds=8,
+                        functools.partial(_operands, name, rows=rows), f"fp8 codes product {name} {rows}",
+                        seeds=8,
                         truth_fn=truth)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
+@pytest.mark.parametrize("rows", [ROWS, SKINNY], ids=["rows", "skinny"])
 @pytest.mark.parametrize("name", list(FORMATS))
-def test_an_fp8_codes_product_through_the_converting_template_is_on_par(name):
+def test_an_fp8_codes_product_through_the_converting_template_is_on_par(name, rows):
     """`an_fp8_codes_product_through_the_converting_template_is_on_par` interpreted on a CPU as an A100 runs
-    it (the GPU's native cell, tests/test_gpu_gemm.py, runs it compiled)."""
+    it (the GPU's native cell, tests/test_gpu_gemm.py, runs it compiled), at a partial tile's rows and at a
+    decode's, whose tile runs swapped (`test_a_decode_sized_fp8_codes_product_plans_swapped_on_an_a100`)."""
     with generation.assumed("sm80"):
-        an_fp8_codes_product_through_the_converting_template_is_on_par(name, interpret_on_cpu=True)
+        an_fp8_codes_product_through_the_converting_template_is_on_par(name, interpret_on_cpu=True, rows=rows)
+
+
+def test_a_decode_sized_fp8_codes_product_plans_swapped_on_an_a100():
+    """On an A100, the converting launch plans a decode-sized product's tile swapped, its codes the products'
+    rows (`converted.MosaicConvertedGmm._swapped`, row 5387), and a partial tile's rows unswapped."""
+    from dew.nn.kernels.templates.gemm import converted
+
+    def planned(rows):
+        launch = converted.MosaicConvertedGmm()
+        bound = launch.bind(jax.ShapeDtypeStruct((rows, 256), jnp.bfloat16),
+                            converted.Codes(jax.ShapeDtypeStruct((1, 192, 256), jnp.float8_e4m3fn)),
+                            jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None,
+                            out_dtype="float32", trans_rhs=True, interpret=True, dense=True, exact_sums=False)
+        return gemm._planned(launch, bound)
+
+    with generation.assumed("sm80"):
+        assert planned(SKINNY).swapped
+        assert not planned(ROWS * 4).swapped
 
 
 def test_an_fp8_codes_product_unnamed_is_xlas_widened_product_until_a_receipt():

@@ -210,10 +210,13 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     held = family.staging('fixed', [(axes.named(axes.held(prologue_axes[i]), extent),
                                      _typed(prologue_dtypes[i])) for i in fixed])
     shared = packing.shared_decode(tiles, interpret=interpret)
-    decoded = ([] if not (is_packed or converted) or packed_rows
-               else [plgpu.SMEM((family.in_flight + 2, block_n, block_k), jnp.bfloat16)]
-               if shared else [plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, block_n, block_k),
-                                          jnp.bfloat16)])
+    # A swapped call's rows of codes beside a 16-bit matrix, each consumer's converted on its own (row 5387).
+    own_rows = packing.converted(rhs_dtype, dtype)
+    into = dtype if converted else rhs_dtype if own_rows else jnp.bfloat16
+    decoded = ([plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, tiles.share, block_k), into)] if own_rows
+               else [] if not (is_packed or converted) or packed_rows
+               else [plgpu.SMEM((family.in_flight + 2, block_n, block_k), into)]
+               if shared else [plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, block_n, block_k), into)])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers'], decoded),
                        quantized.outputs(part, dtypes, forms),
@@ -511,7 +514,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     their steps over the programs, the program walking a tile's first step adding its partials and storing
     it (`tail.Tail`, `mosaic.Family.fixed_up`), once a configuration; `chained` on: `guarded_walk`'s."""
     family = family_of(tiles, _products_dtype(lhs, {'matrix': rhs}, packed_rows))
-    decode = packed_format or (packing.CODES if packing.converted(lhs.dtype, rhs.dtype) else None)
+    decode = packed_format or packing.decode_of(lhs.dtype, rhs.dtype)
     (prologue, prologue_axes, epilogue, epilogue_axes), (prologue_operands, epilogue_operands) = hooks, sides
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, part = tiles.warpgroups, tiles.cluster, (tiles.share, block_n)
@@ -1460,8 +1463,10 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
 
 def _products_dtype(lhs, matrices: dict, packed_rows: bool):
     """Dew: the dtype `gmm`'s products take, which names its family: its rows', or its matrix's where the
-    rows are a packed matrix's words (`packed_rows`)."""
-    return matrices['matrix'].dtype if packed_rows else lhs.dtype
+    rows are a packed matrix's words (`packed_rows`) or codes each stage converts into its dtype
+    (`packed.converted`)."""
+    matrix = matrices['matrix'].dtype
+    return matrix if packed_rows or packing.converted(matrix, lhs.dtype) else lhs.dtype
 
 
 def _reads(prologue_gmems, prologue_axes: tuple, read: tuple, group, groups: int) -> dict:
@@ -1548,8 +1553,8 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
     `boundary` (the walk's prefetch, `_gmm_prefetch`: a plain step's one product), its product issued from
     its `prefetched` first fragments, the next step's read under its last (`Issuer.products_across`),
     returning its carry beside them."""
-    read = {name: slots[name] for name in matrices if decoded is None}
-    if decoded is not None:
+    read = {name: slots[name] for name in matrices if decoded is None or decoded.converts_rows}
+    if decoded is not None and not decoded.converts_rows:
         decode_layout = None if interpret or not family.budgets_registers else family.layout
         read['matrix'] = decoded.decode(index, slots, interpret, layout=decode_layout, family=family)
         family.published()
@@ -1588,6 +1593,9 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         return nothing, tuple(issued(acc, lambda acc=acc, name=name, left=left: family.register_products(
             acc, (left,), oriented[name])) for acc, name in zip(accumulators, matrices, strict=True))
     rows_of = _rows_of(slots, matrices, mine_rows, transpose_lhs)
+    if decoded is not None and decoded.converts_rows:
+        rows_of = dict.fromkeys(matrices, decoded.decode(index, slots, interpret, family=family,
+                                                         rows=mine_rows))
     if summed:
         scale = None if scaling is None else scaling(index, slots)
         return nothing, tuple(

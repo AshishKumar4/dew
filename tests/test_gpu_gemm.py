@@ -225,10 +225,10 @@ def _converted_cells() -> tuple[Cell, ...]:
     """The converting FP8 codes product's check 1 on an A100, each format's (row 8548): its first native
     run qualifies the accuracy its receipt's timing rests on."""
     on_par = gemm_converted.an_fp8_codes_product_through_the_converting_template_is_on_par
-    return tuple(Cell(f"an fp8 codes product through the converting template is on par ({name})",
-                      functools.partial(on_par, name), "sm80", mosaic=True,
-                      native={"launch": "converted fp8 gmm", "format": name})
-                 for name in gemm_converted.FORMATS)
+    return tuple(Cell(f"an fp8 codes product through the converting template is on par ({name}, {rows} rows)",
+                      functools.partial(on_par, name, rows=rows), "sm80", mosaic=True,
+                      native={"launch": "converted fp8 gmm", "format": name, "rows": rows})
+                 for name in gemm_converted.FORMATS for rows in (gemm_converted.ROWS, gemm_converted.SKINNY))
 
 
 def _scale_edge_cells() -> tuple[Cell, ...]:
