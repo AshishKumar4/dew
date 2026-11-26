@@ -30,8 +30,10 @@ from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
 from dew.interop import Pretrained
+from dew.mesh import LayoutRefused
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.projections import inference_projections, pending, projection_groups
+from dew.nn.protocols import Looped
 from dew.nn.sharding import pipeline_microbatches
 from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 from dew.registry import ModelConfig, wrapper_layers
@@ -177,7 +179,9 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
 @pytest.mark.mesh(devices=2)
 def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
     """Two stages, two microbatches of one row: the stage axis stacks the scales as it stacks the
-    kernels."""
+    kernels. A checkpoint looping a block of its layers (Inkling 2's) runs part of its stack in passes,
+    which a pipeline cuts into stages of its own: its staged run is refused (`LayoutRefused`), naming
+    the loop."""
     mesh = MeshSpec(stage=2).build(jax.devices()[:2])
     placed = jax.device_put(stored.variables, Layout().shardings(mesh, stored.variables))
     staged = jax.jit(stored.model.apply)
@@ -188,6 +192,11 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
         with jax.set_mesh(mesh), pipeline_microbatches(2):
             return staged(placed, jnp.asarray(ids, jnp.int32))
 
+    loop = stored.model.loop if isinstance(stored.model, Looped) else None
+    if loop is not None and loop.layers is not None:
+        with pytest.raises(LayoutRefused):
+            view(np.zeros((2, 8), np.int32))
+        return
     assert_stored_view(view, stored, "two stages")
 
 
