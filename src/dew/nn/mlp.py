@@ -28,8 +28,10 @@ from .activations import (
     GatedActivation,
     Situ,
     Xielu,
+    gated_hook,
     gated_product,
     packed_gated_product,
+    placed_gate_up,
     swiglu_clamped,
     ungated_activation,
 )
@@ -38,7 +40,7 @@ from .flops import projection_flops
 from .gated_mlp import gated_mlp
 from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
-from .kernels.projections import recipe_chain
+from .kernels.projections import Formed, recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
@@ -276,7 +278,11 @@ class GatedMLP(nn.Module):
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
                 gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
-                return self._down(packed_gated_product(activation, axes=axes)(gate_up), train)
+                # The halves read apart where the product reads them (`placed_gate_up`), for the down
+                # projection's reverse mode to hold in place of the product.
+                placed = placed_gate_up(gate_up)
+                return self._down(packed_gated_product(activation, axes=axes)(gate_up), train,
+                                  (placed[..., 0, :], placed[..., 1, :], activation))
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -290,7 +296,8 @@ class GatedMLP(nn.Module):
         gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        return self._down(gated_product(activation, axes=axes)(gate, up), train)
+        halves = (gate, up, activation) if isinstance(activation, str) else None
+        return self._down(gated_product(activation, axes=axes)(gate, up), train, halves)
 
     def _fusable(self) -> bool:
         """Whether the gated product and its three projections may run fused (`dew.nn.gated_mlp`), where the
@@ -369,10 +376,20 @@ class GatedMLP(nn.Module):
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
 
-    def _down(self, hidden, train: bool):
+    def _down(self, hidden, train: bool, halves: tuple | None = None):
+        """The down projection of `hidden`, its units dropped while training. `halves`, where given, the
+        gate's and the up projection's values `hidden` is the gated product of, and its activation's name:
+        undropped, the projection reads `hidden` as formed from them (`projections.Formed`, the product's
+        hook `gated_hook`'s), so its reverse mode holds them, which the projections' own hold already, and
+        never `hidden`, a `[tokens, hidden]` value a layer less."""
         if self.dropout_rate:
-            hidden = self.dropout(hidden, deterministic=not train)
-        return scaled(checkpoint_name(self.down_proj(hidden), Residual.DOWN_PROJ), self.down_multiplier)
+            hidden, halves = self.dropout(hidden, deterministic=not train), None
+        if halves is None or not isinstance(self.down_proj, Dense):
+            out = self.down_proj(hidden)
+        else:
+            gate, up, activation = halves
+            out = self.down_proj(hidden, formed=Formed(hidden, gate, (up,), gated_hook(activation)))
+        return scaled(checkpoint_name(out, Residual.DOWN_PROJ), self.down_multiplier)
 
     def _gate_up(self, x):
         """The gate and up projections as one `[..., 2, H]` output: the packed

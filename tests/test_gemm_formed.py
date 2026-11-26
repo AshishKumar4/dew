@@ -9,12 +9,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from generation_support import COMPILES_ON_CPU, generations
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.mlp import GatedMLP
 
 ROWS, FEATURES, HIDDEN = 136, 128, 256
 """Rows no tile divides, the features a gated MLP reads and writes, its hidden width."""
@@ -237,3 +239,84 @@ def test_a_remat_keeping_the_projections_forms_the_hidden_activation_by_no_produ
         launched = {name: sum(times for _, times in kernel_launches(lowered_for(step, shapes, "sm90")))
                     for name, step in steps.items()}
     assert launched["saved"] == launched["whole"], launched
+
+
+class _HoldingItsHidden(GatedMLP):
+    """A gated MLP whose down projection multiplies its gated product as any input, holding it for reverse
+    mode: the path before the projection read it as formed (`GatedMLP._down`'s `halves`)."""
+
+    def _down(self, hidden, train: bool, halves: tuple | None = None):
+        return super()._down(hidden, train)
+
+
+GATED_LAYERS = {
+    "swiglu": {},
+    "clamped geglu": {"activation": "geglu", "swiglu_limit": 1.5},
+    "packed": {"packed": True},
+    "scaled gate": {"gate_multiplier": 0.5},
+}
+
+
+@pytest.mark.parametrize("fields", GATED_LAYERS.values(), ids=GATED_LAYERS.keys())
+def test_a_gated_mlp_holds_its_halves_not_its_hidden_product(fields):
+    """A bf16 gated MLP, its gate and up apart or packed (`[..., 2, H]`), clamped or its gate scaled,
+    unrematerialized: its output and every gradient under a cotangent (each kernel's and the input's) as
+    exact as the path holding its hidden product from float64 truth (check 1), and its reverse mode holds
+    the gate's and the up projection's values (the halves the product reads) and never the down
+    projection's input, which the path holding it shows held: a `[tokens, hidden]` value a layer less."""
+    tokens, hidden, features = (2, 12), 48, 16
+    layer, holding, truth = (cls(hidden_features=hidden, out_features=features, dtype=dtype, **fields)
+                             for cls, dtype in ((GatedMLP, jnp.bfloat16), (_HoldingItsHidden, jnp.bfloat16),
+                                                (GatedMLP, jnp.float64)))
+    shapes = jax.eval_shape(layer.init, jax.random.key(0), jnp.zeros((*tokens, features), jnp.bfloat16))
+    leaves, tree = jax.tree.flatten(shapes)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(*tokens, features)), jnp.bfloat16),
+                *(jnp.asarray(rng.normal(size=leaf.shape) / np.sqrt(leaf.shape[0]), jnp.bfloat16)
+                  for leaf in leaves),
+                jnp.asarray(rng.normal(size=(*tokens, features)), jnp.bfloat16))
+
+    def applied(module):
+        return lambda x, *kernels: module.apply(jax.tree.unflatten(tree, kernels), x)
+
+    assert_as_exact(with_gradients(applied(layer)), jax.jit(with_gradients(applied(holding))), draw,
+                    "a gated MLP's down projection of its formed product", seeds=SEEDS,
+                    truth_fn=with_gradients(applied(truth)))
+
+    x, *kernels, _ = draw(0)
+    seen = {}
+
+    def read(next_fun, args, kwargs, context):
+        out = next_fun(*args, **kwargs)
+        if context.method_name == "__call__":
+            seen[context.module.name] = args[0] if context.module.name == "down_proj" else out
+        return out
+
+    with nn.intercept_methods(read):
+        applied(layer)(x, *kernels)
+    gate, up = ((seen["gate_up_proj"].reshape(*tokens, 2, hidden)[..., at, :] for at in (0, 1))
+                if fields.get("packed") else (seen["gate_proj"], seen["up_proj"]))
+    if "swiglu_limit" in fields:
+        gate, up = jnp.minimum(gate, 1.5), jnp.clip(up, -1.5, 1.5)
+    if "gate_multiplier" in fields:
+        gate = (gate.astype(jnp.float32) * 0.5).astype(gate.dtype)
+
+    def held(module) -> list:
+        """The arrays `module`'s reverse mode holds (its pullback's leaves), compiled as a step is."""
+        _, pull = jax.vjp(jax.jit(applied(module)), x, *kernels)
+        return jax.tree.leaves(pull)
+
+    def holds(values: list, value) -> bool:
+        """Whether one of `values` holds `value`'s entries exactly, in any layout or wider dtype (a product's
+        rows flattened, a CPU's sum widened)."""
+        value = np.asarray(value, np.float64).ravel()
+        return any(each.size == value.size and np.array_equal(np.asarray(each, np.float64).ravel(), value)
+                   for each in values)
+
+    product = seen["down_proj"]
+    assert holds(held(holding), product), "the path holding its hidden product shows it held"
+    mine = held(layer)
+    assert not holds(mine, product)
+    assert holds(mine, gate) and holds(mine, up)
