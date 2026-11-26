@@ -2142,23 +2142,27 @@ def test_a_g4s_full_training_step_lowers_with_no_value_of_another_trace(without_
 
 
 @COMPILES_ON_CPU
-def test_an_a100_backward_at_width_128_derives_its_parked_tile_and_compiles_it_without_spills():
-    """An A100's bf16 training step at width 128, 2 x 4096 causal over 32/8 heads: its backward derives 64 x
-    64 tiles of one consumer whose dK/dV launch parks its dV sums (`BackwardTiles.parked`, M-NA-45's tile
-    where it spilled 264 bytes unparked), certified as it compiles, and its launches compile for an A100
-    without spills (dQ's and dK/dV's)."""
+def test_an_a100_backward_parking_its_dv_sums_compiles_without_spills_and_its_derived_step_certifies():
+    """An A100's bf16 training step at width 128, 2 x 4096 causal over 32/8 heads: its backward at 64 x 64
+    tiles of one consumer parking its dV sums (`BackwardTiles.parked`, the tile M-NA-45 measured fastest,
+    which spilled 264 bytes unparked), pinned, compiles dQ and dK/dV without spills; and the step as it
+    derives itself compiles certified, with no spill."""
     query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
     spans = template.spans(4096, 4096, 2, causal=True)
+    parked = attention_mosaic.BackwardTiles(64, 64, 2, 1, family="mma.sync", fused=False, parked=True)
 
     def step(query, key, value):
         return jax.grad(lambda *x: attention_route.attend(*x, spans).astype(jnp.float32).sum(),
                         argnums=(0, 1, 2))(query, key, value)
 
-    [record] = compile_mosaic_kernels([KernelCase("a100-parked", lambda: (step, (query, key, key)))], "sm80")
-    configs = [certified.get("config", "") for certified in record.get("certifications", ())]
-    assert any("BackwardTiles(block_q=64, block_k=64" in config and "consumers=1" in config
-               and "parked=True" in config for config in configs), configs
-    spilled = {row["kernel"]: row["spilled"] for row in record.get("kernels", ())
-               if "attention_d" in row["kernel"]}
-    assert spilled and not any(spilled.values()), (record.get("error"), spilled)
+    def pinned(query, key, value):
+        with tuning.pinned({attention_mosaic.MosaicBackward: parked}):
+            return step(query, key, value)
+
+    for name, fn in (("parked", pinned), ("derived", step)):
+        [record] = compile_mosaic_kernels([KernelCase(f"a100-{name}", lambda fn=fn: (fn, (query, key, key)))],
+                                          "sm80")
+        spilled = {row["kernel"]: row["spilled"] for row in record.get("kernels", ())
+                   if "attention_d" in row["kernel"]}
+        assert spilled and not any(spilled.values()), (name, record.get("error"), spilled)

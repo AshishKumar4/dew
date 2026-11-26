@@ -1749,6 +1749,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # mainloop's legality refuses it (`_Mainloop.legal`).
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
             return False
+        # Parked dV sums (`BackwardTiles.parked`) are the two launches' keys-first dK/dV walk's on a family
+        # holding its sums and operands in registers, each consumer its own key block: none on a fused or
+        # shared-keys launch, a placed walk's tensor memory or consumers sharing a block (`split_queries`).
+        if config.parked and (config.fused or config.shared_keys or not dkv_family.operands_in_registers
+                              or dkv_family.places_on_role or split_queries(dkv_family)):
+            return False
         # A placement takes the launch it is written for (`placed.walked_launch`): keys first the dK/dV
         # launch's, queries first the dQ launch's; the one launch's keys first apart from its config's own.
         dq_named = found.get(config.family)
