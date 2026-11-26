@@ -10,6 +10,7 @@ from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from egglog import get_callable_args
 from jax.core import ShapedArray
@@ -109,6 +110,16 @@ class Program(Protocol):
 
 class Refused(ValueError):
     """A declaration the derivation cannot express as monoids along its walked axis, and why."""
+
+
+def scalar_case_batch(function: Callable, size: int, batched, *operands):
+    """Front one batch axis so the dispatch can choose a single scalar branch for all its rows."""
+    def front(value, mapped):
+        return value if mapped else jnp.broadcast_to(value, (size, *value.shape))
+
+    placed = jax.tree.map(front, operands, tuple(batched))
+    chosen = function(*placed)
+    return chosen, jax.tree.map(lambda _: True, chosen)
 
 
 def evaluate(closed, env: dict, needed: set) -> None:

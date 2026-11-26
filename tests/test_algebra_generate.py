@@ -142,6 +142,40 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
                         seeds=8, truth_fn=whole)
 
 
+@pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
+def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
+    from dew.algebra.component_cases_derived import chunk_solve_level, chunk_weighted
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, values, strengths):
+        place = jnp.arange(size)
+        identity = jnp.eye(size, dtype=system.dtype)
+        paired = (place[:, None] % 2 == 1) & (place[None, :] == place[:, None] - 1)
+        inverse = identity - jnp.where(paired, system, 0)
+        for level in range(1, size.bit_length() - 1):
+            inverse = chunk_solve_level(system, inverse, jnp.asarray(level, jnp.int32))
+        return chunk_weighted(inverse - identity, values, strengths)
+
+    def written(system, values, strengths):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
+
+    def truth(system, values, strengths):
+        rhs = values * strengths[:, None]
+        return jax.lax.linalg.triangular_solve(system, rhs, left_side=True, lower=True, unit_diagonal=True)
+
+    def draw(seed):
+        system = component_cases._chunk_system(seed, size)
+        rng = np.random.default_rng(seed)
+        rhs = rng.uniform(-0.25, 0.25, (size, columns)).astype(np.float32)
+        strength = rng.uniform(0.125, 0.5, size).astype(np.float32)
+        strength[1] = 0
+        return system, rhs, strength
+
+    assert_as_exact(generated, written, draw, "generated recurrence solve and value application",
+                    seeds=8, truth_fn=truth)
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

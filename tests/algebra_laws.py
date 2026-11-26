@@ -331,9 +331,11 @@ def _truncated(x, y) -> int:
     return quotient if (int(x) >= 0) == (int(y) > 0) else -quotient
 
 
-_INTEGRAL: dict[str, Callable] = {"div": _truncated, "rem": lambda x, y: int(x) - int(y) * _truncated(x, y)}
-"""An integer division and remainder as XLA's `div` and `rem` take them, toward zero (a program's index
-arithmetic: a tile's rows by block, a mask's parity), where `_ELEMENTWISE`'s are the reals'."""
+_INTEGRAL: dict[str, Callable] = {
+    "div": _truncated, "rem": lambda x, y: int(x) - int(y) * _truncated(x, y),
+    "and": lambda x, y: int(x) & int(y),
+}
+"""Concrete integer index arithmetic; the similarly named Boolean/real rules stay in `_ELEMENTWISE`."""
 
 _SAME = frozenset({"convert_element_type", "copy", "copy_p", "optimization_barrier", "stop_gradient",
                    "reduce_precision"})
@@ -350,6 +352,16 @@ def _equation(equation, values) -> list:
         return list(values)
     if name == "integer_pow":
         return [np.vectorize(lambda x: x ** params["y"], otypes=[object])(values[0])]
+    if name == "shift_right_arithmetic":
+        width = jnp.iinfo(equation.outvars[0].aval.dtype).bits
+
+        def shifted(x, amount):
+            amount = int(amount)
+            if not 0 <= amount < width:
+                raise TypeError(f"arithmetic shift outside its {width}-bit width: {amount}")
+            return int(x) >> amount
+
+        return [np.vectorize(shifted, otypes=[object])(*np.broadcast_arrays(*values))]
     if name in _INTEGRAL and jnp.issubdtype(equation.outvars[0].aval.dtype, jnp.integer):
         operands = np.broadcast_arrays(*values)
         return [np.vectorize(_INTEGRAL[name], otypes=[object])(*operands)]

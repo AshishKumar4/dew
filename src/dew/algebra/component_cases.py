@@ -225,6 +225,60 @@ def _chunk_pullback_inputs(seed, operands):
     return grad, keys, weights, queries, out_grad, local, kept
 
 
+def _chunk_level(system, inverse, level):
+    rows, cols = recurrence_algebra.tile_indices(system.shape)
+    return recurrence_algebra.doubled_level(-system, inverse, rows, cols, level, _carry_product)
+
+
+def _chunk_level_truth(system, inverse, level):
+    width = 1 << level
+    groups = jnp.arange(system.shape[0]) // width
+    join = (groups[:, None] % 2 == 1) & (groups[:, None] == groups[None, :] + 1)
+    return inverse + jnp.where(join, inverse @ -system, 0) @ inverse
+
+
+def _chunk_level_draw(seed, operands):
+    size = operands[0].shape[0]
+    system = _chunk_system(seed, size)
+    level = 1 + seed % (size.bit_length() - 2)
+    group = np.arange(size) // (1 << level)
+    identity = np.eye(size, dtype=np.float64)
+    diagonal = np.where(group[:, None] == group[None, :], system, 0)
+    inverse = np.linalg.solve(diagonal + identity, identity).astype(system.dtype)
+    return system, inverse, np.asarray(level, np.int32)
+
+
+def _chunk_weighted(lower, values, strengths):
+    return recurrence_algebra.weighted("apply_u", lower, values, strengths, _carry_product)
+
+
+def _chunk_weighted_truth(lower, values, strengths):
+    return (jnp.eye(lower.shape[0], dtype=lower.dtype) + lower) @ (values * strengths[:, None])
+
+
+def _chunk_system(seed, size):
+    rng = np.random.default_rng(seed)
+    system = np.tril(rng.standard_normal((size, size)).astype(np.float32) / (2 * size), -1)
+    # Split at a padded token: neither side may read across the block boundary.
+    middle = system.shape[0] // 2
+    system[middle:, :middle] = 0
+    if seed % 2:
+        # Isolate a top-binade edge: the inverse holds it without a product of two huge edges.
+        system[:2], system[2:, :2] = 0, 0
+        system[1, 0] = 2.0 ** 127
+    return system
+
+
+def _chunk_weighted_draw(seed, operands):
+    lower, values, weights = _arrays(seed, operands)
+    lower = np.tril(lower * 0.25, -1)
+    weights = (np.abs(weights) * 0.25).astype(weights.dtype)
+    weights[1] = 0
+    if seed % 2:
+        lower[1, 0], values[0], weights[0] = 2.0 ** 127, 0.125, 0.5
+    return lower, values, weights
+
+
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 ROUNDED = declare(__name__, "rounded", ComponentForm(
@@ -256,3 +310,12 @@ CHUNK_PULLBACK = declare(__name__, "chunk_pullback", ComponentForm(
     _chunk_pullback, _chunk_pullback_truth, dataclasses.replace(
         _cases(*[((k, v), (c, k), (c, k), (c, k), (c, v), (c, v), (k, 1))
                  for c, k, v in ((16, 32, 32), (64, 64, 32))]), draw=_chunk_pullback_inputs)))
+CHUNK_SOLVE_LEVEL = declare(__name__, "chunk_solve_level", ComponentForm(
+    _chunk_level, _chunk_level_truth, Cases(
+        tuple((jax.ShapeDtypeStruct((c, c), jnp.float32), jax.ShapeDtypeStruct((c, c), jnp.float32),
+               jax.ShapeDtypeStruct((), jnp.int32)) for c in (16, 32, 64)),
+        _chunk_level_draw, seeds=8, policies=("default",))))
+CHUNK_WEIGHTED = declare(__name__, "chunk_weighted", ComponentForm(
+    _chunk_weighted, _chunk_weighted_truth,
+    dataclasses.replace(_cases(*[((c, c), (c, v), (c,)) for c, v in ((16, 32), (32, 32), (64, 64))]),
+                        draw=_chunk_weighted_draw)))
