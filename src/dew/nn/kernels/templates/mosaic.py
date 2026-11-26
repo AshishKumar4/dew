@@ -1315,10 +1315,12 @@ class Issuer[Accumulator](abc.ABC):
         done); of `support`'s terms alone where given, which only an issuer whose instructions each take a
         tile of their own (`term_tile`) issues, its others refusing it (`whole_products`)."""
 
-    term_tile: tuple[int, int] | None = None
-    """The tile of a product's outputs each of its instructions takes, rows by columns, every thread's share
-    of it issued together, so an instruction skipped is skipped for every thread alike (`products`'
-    `support`); None where its instructions take the whole product at once (a warpgroup's, a CTA's)."""
+    @property
+    def term_tile(self) -> tuple[int, int] | None:
+        """The tile of a product's outputs each of its instructions takes, rows by columns, every thread's
+        share of it issued together, so an instruction skipped is skipped for every thread alike (`products`'
+        `support`); None where its instructions take the whole product at once (a warpgroup's, a CTA's)."""
+        return None
 
     def issued_unless(self, idle: jax.Array, acc, issue: Callable):
         """`issue()`'s accumulator, its products issued only where `idle` (traced, one value across the

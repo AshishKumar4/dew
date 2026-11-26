@@ -2,7 +2,6 @@
 doubling's merges (`recurrence_algebra.doubled`), whose supports hold every term the whole products sum,
 issued on mma.sync of those terms alone, its instructions fewer and its outputs the whole products'."""
 
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -85,29 +84,27 @@ def _solve_call(target: str):
     return forward, run, (q, k, v, g, beta)
 
 
-def _tf32_products(target: str) -> int:
-    """The TF32 mma.sync instructions of the solve launch (`recurrence_alone_solved`) its module issues."""
+def _tf32_products(lowered, name: str) -> int:
+    """The TF32 mma.sync instructions the Mosaic GPU kernel `name` begins in `lowered` issues."""
     import jax.experimental.mosaic.gpu as mgpu
     from jax.extend.mlir import ir
 
     from dew.nn.kernels.lowered import kernel_calls
 
-    _, run, operands = _solve_call(target)
-    lowered = lowered_for(run, operands, target)
     (kernel,) = [each for each in kernel_calls(lowered)
-                 if each.kind == "mosaic_gpu" and each.name.startswith("recurrence_alone_solved")]
+                 if each.kind == "mosaic_gpu" and each.name.startswith(name)]
     module = mgpu.deserialized(kernel.ir)
-    pending, found = [module.operation], 0
+    found = []
+
+    def counted(operation):
+        if operation.name == "llvm.inline_asm":
+            text = ir.StringAttr(operation.attributes["asm_string"]).value
+            found.append("mma.sync" in text and ".tf32" in text)
+        return ir.WalkResult.ADVANCE
+
     with module.context:
-        while pending:
-            for region in pending.pop().regions:
-                for block in region.blocks:
-                    for inner in block.operations:
-                        if inner.operation.name == "llvm.inline_asm":
-                            text = ir.StringAttr(inner.operation.attributes["asm_string"]).value
-                            found += "mma.sync" in text and ".tf32" in text
-                        pending.append(inner.operation)
-    return found
+        module.operation.walk(counted)
+    return sum(found)
 
 
 @COMPILES_ON_CPU
@@ -126,7 +123,9 @@ def test_the_doublings_merges_issue_their_supports_instructions_alone(target):
                 for support in algebra._merges_support(tiles.chunk, width)]
     expected = pairs * sum(int(support.tiles(rows, columns, 8).sum()) for support in supports)
     whole = pairs * len(supports) * (tiles.chunk // rows) * (tiles.chunk // columns) * (tiles.chunk // 8)
-    assert _tf32_products(target) == expected < whole // 4, (expected, whole)
+    _, run, operands = _solve_call(target)
+    found = _tf32_products(lowered_for(run, operands, target), "recurrence_alone_solved")
+    assert found == expected < whole // 4, (found, expected, whole)
 
 
 def _on_mma_sync() -> bool:
@@ -134,33 +133,60 @@ def _on_mma_sync() -> bool:
             and generation.family(generation.gpu_target().generation) == "mma.sync")
 
 
+def _products_of(target: str, support: product.Support | None):
+    """A kernel of `target`'s family taking `lhs @ rhs` `[SIZE, SIZE]` fp32 (TF32) in shared memory, of
+    `support`'s terms alone where given (`Issuer.products`'), its accumulator back in device memory."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn.kernels.templates import mosaic
+
+    family = bundles.of(target, jnp.float32)
+    tile = (SIZE, SIZE)
+
+    def body(lhs_gmem, rhs_gmem, out_gmem, lhs, rhs, out):
+        lhs[...] = lhs_gmem[...]
+        rhs[...] = rhs_gmem[...]
+        mosaic.synced(interpret=False)
+        acc = family.products(family.zeros(tile), lhs, rhs, support=support)
+        out[...] = acc
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(out, out_gmem)
+        plgpu.wait_smem_to_gmem(0)
+
+    return jax.jit(plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(tile, jnp.float32), num_threads=1,
+                                thread_name="wg", scratch_types=[plgpu.SMEM(tile, jnp.float32)] * 3,
+                                compiler_params=mosaic.compiler_params()))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target", [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm120")])
+def test_a_product_of_a_support_issues_its_tiles_instructions_alone(target):
+    """Lowered for an A100 and an RTX PRO 6000, a TF32 product of a doubling merge's support
+    (`Issuer.products`' `support`) issues one instruction a tile `Support.tiles` gives a term, the whole
+    product one a tile of its every tile."""
+    support = algebra._merges_support(SIZE, 8)[0]
+    rows, columns = bundles.of(target, jnp.float32).term_tile
+    shapes = (jax.ShapeDtypeStruct((SIZE, SIZE), jnp.float32),) * 2
+    count = {key: _tf32_products(lowered_for(_products_of(target, given), shapes, target), "")
+             for key, given in (("support", support), ("whole", None))}
+    tiles = support.tiles(rows, columns, 8)
+    assert count == {"support": int(tiles.sum()), "whole": tiles.size}, count
+
+
 @pytest.mark.skipif(not _on_mma_sync(), reason="a product of a support issues on mma.sync's GPUs alone")
-def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(monkeypatch):
-    """On this GPU (an mma.sync part's), Qwen3.5-27B's gated delta net training step with its solve's merges
-    issued of their supports alone is the same step with every merge whole, its output and every gradient
-    (which read the stored inverse) bit for bit up to a zero's sign, all finite, over draws as its layer
-    gives them (unit keys, write gates a sigmoid's, decays a log sigmoid's): each instruction skipped held
-    only zero terms (head review of 09a5084ee)."""
-    from dew import _cache
-    from dew.nn.kernels.templates import operands
-
-    _, run, shapes = _solve_call(generation.gpu_target().generation)
-    q, k, v, g, beta = (np.random.default_rng(index).standard_normal(x.shape)
-                        for index, x in enumerate(shapes))
-    q, k = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (q, k))
-    given = [jnp.asarray(x, shape.dtype) for x, shape in zip(
-        (q, k, v, np.log(1 / (1 + np.exp(-(g + 3.0)))), 1 / (1 + np.exp(-beta))), shapes, strict=True)]
-
-    def step():
-        with _cache.uncached():
-            out, pull = jax.vjp(run, *given)
-            return [np.asarray(x, np.float32) for x in (out, *pull(jnp.ones_like(out)))]
-
-    supported = step()
-    monkeypatch.setattr(operands.Issuer, "supported",
-                        lambda self, name, lhs, rhs, support: self(name, lhs, rhs))
-    whole = step()
-    for found, expected in zip(supported, whole, strict=True):
-        assert np.isfinite(expected).all()
-        # Equal values, a zero's sign aside (`product.Support`'s contract).
-        np.testing.assert_array_equal(found, expected)
+def test_a_product_of_its_support_is_the_whole_product_bit_for_bit_on_this_gpu():
+    """On this GPU (an mma.sync part's), each of the doubling's merges (`_merges_support`) issued of its
+    support's terms alone (`Issuer.products`' `support`) is the whole product of the same operands, drawn
+    finite in its support and zero outside it, bit for bit at every output it keeps up to a zero's sign:
+    each instruction skipped held only zero terms (the toolkit's review of d345808b0)."""
+    target = generation.gpu_target().generation
+    draw = np.random.default_rng(0).standard_normal
+    whole = _products_of(target, None)
+    for width in (2, 4, 8, 16, 32):
+        for support in algebra._merges_support(SIZE, width):
+            lhs, rhs = (jnp.asarray(np.where(held, draw((SIZE, SIZE)), 0.0), jnp.float32)
+                        for held in (support.left, support.right))
+            found, expected = (np.asarray(each(lhs, rhs)) for each in (_products_of(target, support), whole))
+            assert np.isfinite(expected).all()
+            np.testing.assert_array_equal(np.where(support.kept, found, 0.0),
+                                          np.where(support.kept, expected, 0.0), err_msg=str(width))

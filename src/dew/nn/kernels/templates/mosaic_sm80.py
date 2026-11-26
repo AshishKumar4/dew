@@ -723,7 +723,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return acc
 
     @property
-    def term_tile(self) -> tuple[int, int]:
+    def term_tile(self) -> tuple[int, int] | None:
         # Each instruction's tile of the accumulator, `m_warps * 16` rows by `atom_columns` (`MMALayouts`'
         # base tile, every warp's 16 x 8 share of it issued together): one skipped is skipped for every warp.
         return self.m_warps * 16, self.atom_columns
@@ -738,7 +738,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         if jnp.dtype(lhs.dtype) != self.dtype:
             return self.for_dtype(lhs.dtype)._supported(acc, lhs, rhs, support)
         depth = self.fragment_depth(int(rhs.shape[0]))
-        rows, columns = self.term_tile
+        rows, columns = self.m_warps * 16, self.atom_columns
         if not support.divides(rows, columns, depth):
             # Its instructions do not tile the product: whole.
             return self.products(acc, lhs, rhs)
