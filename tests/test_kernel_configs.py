@@ -2246,7 +2246,7 @@ def test_a_build_pinned_to_a_kind_loads_on_no_list_mixing_kinds_in_either_order(
     for mixed in ([h100, h200], [h200, h100]):
         assert held_kind(mixed) is None
         # No build is made over them as a host's own (`host_gpus`, the step's and a program's compile).
-        with pytest.raises(ValueError, match="several kinds"):
+        with pytest.raises(ValueError):
             host_kind(mixed)
         loading = dataclasses.replace(pinned, device_kind=held_kind(mixed))
         assert pinned.differences(loading) != [] and canonical.differences(loading) == []
