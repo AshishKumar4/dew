@@ -133,8 +133,10 @@ def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
                                       err_msg=name)
     np.testing.assert_array_equal(np.asarray(processed.kwargs()['image_indices']),
                                   np.asarray(placed(jnp.asarray(ids))))
-    # A grid not [images, 3] of positive integers is refused before it is scaled: `[[1]]` would broadcast.
-    for grid in ([[1]], [[1, 2, 0], [1, 3, 2]]):
+    # A grid not [images, 3] of positive integers, or none, is refused before it is scaled: `[[1]]` over one
+    # merged block and one placeholder would broadcast to a grid the packed reader accepts.
+    one = np.asarray([[IMAGE_TOKEN]], np.int32)
+    single = {'input_ids': one, 'attention_mask': np.ones_like(one), 'pixel_values': blocks[0][:1]}
+    for given in ({**single, 'image_grid_thw': np.asarray([[1]])}, single):
         with pytest.raises(ValueError):
-            processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
-                               'pixel_values': np.concatenate(blocks), 'image_grid_thw': np.asarray(grid)})
+            processor.from_hf(given)
