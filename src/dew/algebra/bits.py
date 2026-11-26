@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
 from dew.nn.float_bits import raised_exactly, raw_fields
 from dew.nn.kernels.templates.cost import Work
@@ -983,6 +984,22 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return packed(codes.T, E2M1).T, scales, tensor
 
 
+def _encoded_amax(value, magnitude):
+    return jax.lax.bitcast_convert_type(jnp.max(magnitude), value.dtype)
+
+
+def _amax_tangent(primals, tangents):
+    value, magnitude = primals
+    moved, _ = tangents
+    # Only the value needs the raw-word rule. The floating max keeps its original tie pullback.
+    _, tangent = jax.jvp(lambda value: jnp.max(jnp.abs(value)), (value,), (moved,))
+    return _nvfp4_amax(value, magnitude), tangent
+
+
+_nvfp4_amax = contracted("test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative")(
+    declared_tangent(Protected(), _encoded_amax, _amax_tangent))
+
+
 def nvfp4_tensor_scale(largest: jax.Array, quotient=None) -> jax.Array:
     """NVFP4's tensor scale of a tensor whose largest magnitude is `largest` (`nvfp4_coded`'s rule): it over
     6 * 448, at least fp32's least normal, 1 where it is zero, each quotient IEEE fp32 division's
@@ -1034,7 +1051,7 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
     words, sign, _, _ = raw_fields(x)
     magnitude = words ^ sign
     if tensor is None:
-        largest = jax.lax.bitcast_convert_type(jnp.max(magnitude), x.dtype)
+        largest = _nvfp4_amax(x, magnitude)
         tensor = nvfp4_tensor_scale(largest, quotient)
     else:
         tensor = nvfp4_given_scale(tensor)
