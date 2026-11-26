@@ -88,20 +88,22 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     a kernel of Dew's, written as that call (the module's account): `families` in order (`ATTENTION`,
     `RECURRENCES`, `NORMS`), an anchor's candidates in the order its family names them, the first equal one
     taken, no two regions sharing an equation nor one `held` (a product's epilogue's). Each region's choice
-    is held by its structure and its constants' values (`_HELD_REGIONS`), the body's whole recognition by its
-    structure and constants (`_HELD_BODIES`). A body binding none of the families' anchors, at any depth of
-    the programs it nests (`_bound`), has no region to find and is answered at once, before any key of it is
-    built: most bodies of a model built of Dew's own layers, whose kernels its selectors already call (a
-    Qwen3.5-4B training step's plan keyed and searched 7,034 bodies, half of one equation, for no region, 37
-    of its seconds, row 5556)."""
+    is held by structure and constant values (`_HELD_REGIONS`), the body's recognition by its key
+    (`_HELD_BODIES`). A body with no local unclaimed anchor is answered before its key is built;
+    nested control bodies are searched separately, not anchored at their enclosing equation."""
     if _bound(jaxpr).isdisjoint(family.anchor for family in families):
         return []
+    anchors = tuple(tuple(place for place, equation in enumerate(jaxpr.eqns)
+                          if place not in held and equation.outvars and _holds(equation, family.anchor))
+                    for family in families)
+    if not any(anchors):
+        return []
     base = fusion.base_context() if _base is None else _base
-    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families),
-           fusion.choice_context_of(base))
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context_of(base))
+
     def recognizing() -> list:
         return [_positioned(jaxpr, written)
-                for written in _recognizing(jaxpr, index, held, families, _base=base)]
+                for written in _recognizing(jaxpr, index, held, families, anchors, _base=base)]
     found = _cache.holding(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
     return [_placed(jaxpr, written) for written in found]
 
@@ -149,18 +151,16 @@ def _placed(jaxpr: jcore.Jaxpr, held: tuple) -> fusion.Written:
                           tuple(values[place] for place in outputs), at, call, key)
 
 
-def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
-                 families: Sequence[Family], *,
+def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int], families: Sequence[Family],
+                 anchors: Sequence[tuple[int, ...]], *,
                  _base: tuple[Hashable, Hashable] | None = None) -> list[fusion.Written]:
     """`recognized`'s search."""
     accurate = generation.numerics().forms == "accurate"
     found: list[fusion.Written] = []
     claimed: set[int] = set(held)
-    for family in families:
-        for place, equation in enumerate(jaxpr.eqns):
-            # An anchor makes the value its region is read around: a launch writing refs in place, its body
-            # binding the anchor's primitive, makes none (an in-place rewalk, `attention_mosaic_forward`).
-            if place in claimed or not equation.outvars or not _holds(equation, family.anchor):
+    for family, local in zip(families, anchors, strict=True):
+        for place in local:
+            if place in claimed:
                 continue
             spans = [(candidate, places) for candidate in family.candidates(index, place)
                      if (places := _between(index, candidate.operands, candidate.outputs)) is not None

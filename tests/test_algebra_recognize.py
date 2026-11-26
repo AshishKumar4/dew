@@ -1035,6 +1035,11 @@ def test_outer_containers_never_anchor_recognition_and_swiglu_stays_inside_eleme
         assert list(recognize._swiglus(outer_index, place)) == []
         assert list(recognize._norms(outer_index, place)) == []
         assert list(recognize._attentions(outer_index, place)) == []
+    with generation.assumed("sm90"):
+        assert not recognize.recognized(closed.jaxpr, outer_index, recognize.NORMS)
+    # The enclosing scan has reachable sigmoids and roots but no local anchor. Do not hash the layer
+    # and its nested bodies just to cache an empty result at the scan site.
+    assert outer_index.key is None
 
     # Even directly around `pjit[layer]`, outer `_swiglus`/`_norms` emit 0 candidates (container holds dot).
     closed_call = jax.make_jaxpr(layer)(*shapes)
