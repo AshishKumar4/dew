@@ -506,8 +506,8 @@ def _program_of(fn: Callable) -> jax.stages.Compiled:
     operands than its call (static arguments)."""
     if isinstance(fn, jax.stages.Compiled):
         return fn
-    raise AmbiguousCapture(f"{fn} is no compiled program: a TPU call is timed as one (`jax.stages.Compiled`), "
-                           "called with its dynamic operands")
+    raise AmbiguousCapture(f"{fn} is no compiled program: a TPU call is timed as one "
+                           "(`jax.stages.Compiled`), called with its dynamic operands")
 
 
 def _module_of(program: jax.stages.Compiled) -> str:
