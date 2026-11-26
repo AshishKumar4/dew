@@ -127,12 +127,13 @@ def test_mxfp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
 
 
 def test_a_block_holding_an_infinity_takes_the_nan_scale_quantized_or_in_the_epilogue():
-    """A 32-column block of a product whose fp32 sum overflows takes the NaN scale (`0xFF`), its codes at a
-    unit scale, and its row's finite block its own scale, alike whether `formats.MxFp8.quantized` quantizes
-    the product or the GEMM's quantizing epilogue does (`gemm.gemm_quantized(..., MxFp8)`), bit for bit
-    (row 13164: the epilogue's 247 against the quantizer's 118)."""
+    """A 32-column block of a product whose fp32 sum overflows in half its columns takes the NaN scale
+    (`0xFF`), its finite values coded at a unit scale, and its row's finite block its own scale, alike
+    whether `formats.MxFp8.quantized` quantizes the product or the GEMM's quantizing epilogue does
+    (`gemm.gemm_quantized(..., MxFp8)`), bit for bit (row 13164: the epilogue's 247 against the
+    quantizer's 118)."""
     x = jnp.zeros((16, 64), jnp.bfloat16).at[:, 1].set(1).at[0, 0].set(2.0 ** 127)
-    w = jnp.zeros((64, 64), jnp.bfloat16).at[1, :].set(1).at[0, :32].set(4)
+    w = jnp.zeros((64, 64), jnp.bfloat16).at[1, :].set(1).at[0, :16].set(4)
     product = jnp.dot(x, w, preferred_element_type=jnp.float32)
     fused = gemm.gemm_quantized(x, w, minifloat=formats.MxFp8)
     assert isinstance(fused, formats.MxFp8)
@@ -146,8 +147,10 @@ def test_a_block_holding_an_infinity_takes_the_nan_scale_quantized_or_in_the_epi
     np.testing.assert_array_equal(codes[0], codes[1])
     unit = np.asarray(jax.lax.bitcast_convert_type(jnp.ones((), jnp.float8_e4m3fn), jnp.uint8))
     assert scales[0][0, 0] == 0xFF and scales[0][0, 1] == 127 - 8 and (scales[0][1:] == 127 - 8).all()
-    np.testing.assert_array_equal(codes[0][0, 32:], np.full(32, unit))
+    # The overflowing block's finite values (its columns 16 to 31, each one) coded at the unit scale.
+    np.testing.assert_array_equal(codes[0][0, 16:32], np.full(16, unit))
     assert bool(jnp.all(jnp.isnan(fused.decoded()[0, :32])))
+    np.testing.assert_array_equal(np.asarray(fused.decoded()[0, 32:]), np.ones(32, np.float32))
 
 
 def test_an_mxfp8_products_least_scale_meets_its_largest_in_the_exponents():
