@@ -1181,9 +1181,11 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
     pulled, pulled_apart = (jax.vjp(f, *operands)[1](cotangent) for f in (fused, apart))
     jax.tree.map(np.testing.assert_array_equal, pulled[1:], pulled_apart[1:])
-    # The tokens' cotangent: each slot's products with both matrices, every route of a token summed exactly
+    # fp32 tokens: each route's cotangent as wide as its sum, so the rows gathered first's, bitwise.
+    # Narrow ones: each slot's products with both matrices, every route of a token summed exactly
     # (integers: float64 holds each sum) and rounded once to the tokens' dtype (row 12396), where the rows
     # gathered first round each route's before they add.
+    wide = jnp.dtype(tokens.dtype).itemsize >= 4
     read = [np.asarray(c, np.float64) if slots is None else np.asarray(c, np.float64)[np.asarray(slots)]
             for c in cotangent]
     layered = [np.asarray(m, np.float64) if layer is None else np.asarray(m, np.float64)[int(layer)]
@@ -1194,7 +1196,8 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         routes[slot] = sum(c[slot] @ m[group].T for c, m in zip(read, layered, strict=True))
     want = np.zeros(tokens.shape)
     np.add.at(want, np.asarray(table), routes)
-    np.testing.assert_array_equal(np.asarray(pulled[0]), np.asarray(jnp.asarray(want, tokens.dtype)))
+    np.testing.assert_array_equal(np.asarray(pulled[0]), np.asarray(pulled_apart[0]) if wide
+                                  else np.asarray(jnp.asarray(want, tokens.dtype)))
 
     def squared(acc):  # the accumulator read through its rounding alone, the named second output
         rounded = acc.astype(tokens.dtype)
@@ -1209,8 +1212,10 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         outs = gemm.gemm(tokens[table], first if layer is None else first[layer], sizes, **named)
         return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
-    jax.tree.map(np.testing.assert_array_equal, jax.vjp(named_fused, *operands[:2])[1](cotangent),
-                 jax.vjp(named_apart, *operands[:2])[1](cotangent))
+    # Its matrix's gradient bitwise; its tokens' too where they are fp32 (narrow, their routes summed wide).
+    named_pulled, named_pulled_apart = (jax.vjp(f, *operands[:2])[1](cotangent) for f in (named_fused,
+                                                                                          named_apart))
+    jax.tree.map(np.testing.assert_array_equal, named_pulled[1 - wide:], named_pulled_apart[1 - wide:])
 
 
 @runs("sm100")

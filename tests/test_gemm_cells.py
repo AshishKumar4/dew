@@ -152,3 +152,19 @@ def test_a_steps_products_are_priced_at_the_rate_its_mma_issues(operands, rate):
     step = pricing.step_seconds(tiles, h100, (size, size), issued=jnp.dtype(operands))
     rates = cost.rates(h100, device=False)
     assert step == 2 * 128 * 256 * 64 / {"eight": rates.eight, "tensor": rates.tensor}[rate]
+
+
+def test_a_launchs_scratch_budget_is_its_output_where_that_is_past_the_reference_workspace():
+    """A launch's scratch on an H100 (`pricing.within_budget`): a GH200 tail's 33 MiB of fp32 partials,
+    past cuBLAS's 32 MiB workspace, is admitted beside an output written as 40 MiB (8192 x 2560 bf16, the
+    4B forward M-NG-29 found 14.4% slower held to the workspace) and refused beside a 16 MiB one; a split's
+    slices, copies of the output, stay within the workspace alone; off a CUDA GPU none is bounded."""
+    from dew.nn.kernels.templates.gemm import pricing
+
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+    tail, output = 33 * 2**20, 8192 * 2560 * 2
+    assert pricing.within_budget(target, tail, output)
+    assert not pricing.within_budget(target, tail, 16 * 2**20)
+    assert pricing.within_split_budget(target, 32 * 2**20) and not pricing.within_split_budget(target, tail)
+    assert pricing.within_budget(None, tail, 0)
