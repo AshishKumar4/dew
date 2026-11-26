@@ -80,33 +80,45 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
                                      implementation=implementation, sinks=jnp.zeros(2))
 
 
-def test_a_querys_own_sinks_are_refused_by_the_kernels_taking_a_heads_alone_as_they_are_selected():
-    """On a TPU, a causal bf16 call splash takes with a head's sinks (`[H]`) routes to splash, and one
-    weighing each query's own (`[B, S, H]`, projected) is refused by it at selection: 'auto' streams it on
-    the template, not the reference path's whole scores, and a call naming 'tpu' raises, its refusals naming
-    the requirement. A decode step on an H100 takes the decode kernel with a head's sinks and the template
-    with a query's. The route was
-    overridden after selection, so a published route named splash while the template ran (row 13108)."""
-    from dew.nn.attention import resolve_implementation
+def _scores_whole(attend, *operands) -> bool:
+    """Whether `attend`'s program forms a whole `[..., Q, K]` score array of its operands' queries and keys
+    at any depth (`programs.equations`): the reference path's, which a streamed kernel never holds."""
+    from dew.nn import programs
+
+    queries, keys = operands[0].shape[1], operands[1].shape[1]
+    traced = jax.make_jaxpr(attend)(*operands).jaxpr
+    return any(getattr(var.aval, "shape", ())[-2:] == (queries, keys)
+               for equation in programs.equations(traced) for var in equation.outvars)
+
+
+def test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them():
+    """Each query's own sinks (`[B, S, H]`, projected) on a TPU's causal bf16 call and an H100's decode step:
+    splash, which takes a head's (`[H]`), refuses them by name, its refusals naming the requirement, and the
+    call left to its selectors streams them, forming no whole score array as the reference path does. The
+    route was overridden after selection, so a published route named splash while the template ran, and
+    then left to the reference path's whole scores (row 13108)."""
+    from dew.nn.attention import scaled_dot_product_attention
     from dew.nn.kernels import generation
     from dew.nn.kernels.selection import KernelRefused
 
+    def attend(sinks, **options):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, sinks=sinks, **options)
+
     query = jnp.zeros((1, 512, 4, 128), jnp.bfloat16)
-    heads, queries = jnp.zeros((4,), jnp.float32), jnp.zeros((1, 512, 4), jnp.float32)
+    sinks = jnp.zeros((1, 512, 4), jnp.float32)
     with generation.assumed("v5e"):
-        assert resolve_implementation("auto", query, query, causal=True, sinks=heads).kernel == "tpu"
-        assert resolve_implementation("auto", query, query, causal=True, sinks=queries).kernel == "template"
         with pytest.raises(KernelRefused) as refused:
-            resolve_implementation("tpu", query, query, causal=True, sinks=queries)
+            attend(sinks, causal=True, implementation="tpu")(query, query, query)
         assert "query_sinks" in {refusal.code for refusal in refused.value.refusals}
-    # A decode step's: the decode kernel reads a head's sinks alone.
-    step, cache = jnp.zeros((1, 1, 4, 128), jnp.bfloat16), jnp.zeros((1, 4096, 4, 128), jnp.bfloat16)
-    lengths = jnp.asarray([3000], jnp.int32)
+        assert not _scores_whole(attend(sinks, causal=True), query, query, query)
+        assert _scores_whole(attend(sinks, causal=True, implementation="reference"), query, query, query)
+    # Two rows, so a row's key validity `[B, K]` is no step's scores `[..., 1, K]`.
+    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 4096, 4, 128), jnp.bfloat16)
+    lengths, own = jnp.asarray([3000, 2000], jnp.int32), jnp.zeros((2, 1, 4), jnp.float32)
     with generation.assumed("sm90"):
-        assert resolve_implementation("auto", step, cache, key_value_seq_lengths=lengths,
-                                      sinks=heads).kernel == "decode"
-        assert resolve_implementation("auto", step, cache, key_value_seq_lengths=lengths,
-                                      sinks=jnp.zeros((1, 1, 4), jnp.float32)).kernel == "template"
+        assert not _scores_whole(attend(own, key_value_seq_lengths=lengths), step, cache, cache)
+        assert _scores_whole(attend(own, key_value_seq_lengths=lengths, implementation="reference"),
+                             step, cache, cache)
 
 
 @pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
