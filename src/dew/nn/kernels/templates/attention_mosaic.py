@@ -429,8 +429,7 @@ class MosaicForward(_Mainloop[Tiles]):
             arguments.get("residuals"), config, arguments.get("table"),
             arguments.get("sources"), arguments.get("scales"),
             arguments.get("initial"), arguments.get("drop"), arguments.get("start"),
-            peaks=peaks, columns=columns, decides=decides, priced=priced, masked=masked, target=target,
-            ids=arguments.get("query_ids") is not None)
+            peaks=peaks, columns=columns, decides=decides, priced=priced, masked=masked, target=target)
 
     def deciding(self, ba: tokamax.BoundArguments, config: Tiles,
                  target: generation.GpuTarget | None = None) -> bool:
@@ -447,7 +446,7 @@ class MosaicForward(_Mainloop[Tiles]):
                        table=None, sources=None, scales=None, initial=None, drop=None, start=None, *,
                        peaks: bool = False, columns: int | None = None, decides: bool | None = None,
                        priced: bool = True, masked: bool = False,
-                       target: generation.GpuTarget | None = None, ids: bool = False,
+                       target: generation.GpuTarget | None = None,
                        ) -> tuple[bool, ForwardRegisters, int | None]:
         """Resolve whether `config` decides its scaled walk, its `ForwardRegisters`, and (when `priced`) its
         register count in one pass (rows 8843, 11987): builds the register facts once and reuses the scaled
@@ -455,7 +454,7 @@ class MosaicForward(_Mainloop[Tiles]):
         resolved = self.launch_target() if target is None else target
         family = bundle_of(config, query.dtype, target=resolved)
         base = self.registered(query, value, score_params, residuals, table, sources, scales, initial, drop,
-                               start, ids=ids)
+                               start)
         if decides is not None:
             model = dataclasses.replace(base, scaled=True) if decides else base
             count = model.at(family, config, peaks=peaks, columns=columns, masked=masked) if priced else None
@@ -507,7 +506,7 @@ class MosaicForward(_Mainloop[Tiles]):
         target = self.launch_target()
         decides, registered, _ = self._decided_model(query, value, score_params, residuals, config, table,
                                                      sources, scales, initial, drop, start, priced=False,
-                                                     target=target, ids=query_ids is not None)
+                                                     target=target)
         family = bundle_of(config, query.dtype, target=target)
         products = None
         if family.places_on_role and residuals is not Kept.SPLIT and self.parts == 1:
@@ -1259,13 +1258,12 @@ class MosaicForward(_Mainloop[Tiles]):
         return self._decides_and_registers(ba, config, target, peaks=peaks, columns=columns,
                                            decides=decides, masked=masked)[2]
 
-    def registered(self, query, value, score_params, residuals, table=None, sources=None, scales=None,
-                   initial=None, drop=None, start=None, *, ids: bool = False) -> ForwardRegisters:
+    def registered(self, query, value, score_params, residuals, table=None, sources=None,
+                   scales=None, initial=None, drop=None, start=None) -> ForwardRegisters:
         """The call's base register facts (`ForwardRegisters`): an `initial` state merges past an inference
         walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it; a `drop`
         over fp16 values takes its kept weights in two parts (`algebra.kept_parts`); a spans call's `start`
-        `[B, Q, R]` names the R key runs a query sees the union of, each further run's bounds held; `ids` that
-        its walk compares document ids (`ForwardRegisters.documents`)."""
+        `[B, Q, R]` names the R key runs a query sees the union of, each further run's bounds held."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
@@ -1285,7 +1283,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)),
                                 prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0,
                                 out_dtype=self.out_dtype,
-                                has_output_mod=self.output_mod is not None, documents=ids)
+                                has_output_mod=self.output_mod is not None)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -1505,8 +1503,7 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                          f"the call derives {family.name}, whose sums its issuer keeps in tensor memory")
     arguments = ba.arguments
     registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
-                               drop=arguments.get("drop"), start=arguments.get("start"),
-                               ids=arguments.get("query_ids") is not None)
+                               drop=arguments.get("drop"), start=arguments.get("start"))
     if hooks.query.fn is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
         query = prologued(query, hooks.query.fn, hooks.query.sides)
