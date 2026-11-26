@@ -105,6 +105,9 @@ template <class K, class Prepare>
 const char* run(Prepare prepare, const void* lhs, const void* rhs, void* out, const int32_t* group_sizes,
                 int groups, int k, int n, Shape<int, int, int> extents, cudaStream_t stream,
                 const Allocate& allocate, int device, int multiprocessors) {
+  // No group, no GEMM: CUTLASS's group scheduler reads the first group's shape at its construction, which none
+  // holds. The handlers' zeroing writes a forward's rows; a weight gradient of no group has no block.
+  if (groups == 0) return nullptr;
   const int m_extent = get<0>(extents), n_extent = get<1>(extents), k_extent = get<2>(extents);
   const auto stride_a = cutlass::make_cute_packed_stride(typename K::StrideA{}, make_shape(m_extent, k_extent, 1));
   const auto stride_b = cutlass::make_cute_packed_stride(typename K::StrideB{}, make_shape(n_extent, k_extent, 1));
