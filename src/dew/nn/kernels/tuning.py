@@ -1651,12 +1651,22 @@ def noted(found: Seen) -> None:
         collected.found.taken.extend(found.taken)
 
 
+def _measuring_device() -> jax.Device:
+    """The device a measurement here makes its operands on and runs on (`_measured`): JAX's default device
+    (`jax.default_device`), a backend named the first of its local devices, else the default backend's."""
+    default = jax.config.jax_default_device
+    if isinstance(default, jax.Device):
+        return default
+    return jax.local_devices(backend=default)[0]
+
+
 def _on_its_tpu() -> bool:
-    """Whether a trace here targets the TPU this process runs on: its platform a TPU's (`generation.backend`)
-    and its generation the default device's own (`generation.device_target`), so a measurement times the
-    launches it traced on the device they target."""
-    return (generation.backend() == jax.default_backend() == "tpu"
-            and generation.device_target(jax.devices()[0]).generation == generation.gpu_target().generation)
+    """Whether a trace here targets the TPU a measurement here runs on (`_measuring_device`): its platform a
+    TPU's (`generation.backend`) and its generation that device's own (`generation.device_target`), so a
+    measurement times the launches it traced on the device they target."""
+    device = _measuring_device()
+    return (generation.backend() == device.platform == "tpu"
+            and generation.device_target(device).generation == generation.gpu_target().generation)
 
 
 def tune(lower: Callable[[], jax.stages.Lowered], *,

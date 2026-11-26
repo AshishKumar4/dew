@@ -59,7 +59,8 @@ class Kernel:
     stats: tuple[tuple[str, object], ...]
 
 
-def device_events(directory: str | Path) -> tuple[dict[str, list[Kernel]], list[str]]:
+def device_events(directory: str | Path, tpu_line: str = "XLA Ops"
+                  ) -> tuple[dict[str, list[Kernel]], list[str]]:
     """The kernel events of the newest JAX trace under `directory`, by device
     plane (`/device:GPU:0`) in the trace's order, and the names of every
     device line.
@@ -68,7 +69,8 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[Kernel]], list[
     Modules` lines are derived from the same kernels, and a module's span
     runs across the idle gaps between them, so only stream lines count. A TPU
     plane runs its HLO ops on one `XLA Ops` line, named after the HLO
-    instruction (`fusion.12`, `convolution.3`)."""
+    instruction (`fusion.12`, `convolution.3`); `tpu_line` reads another of its
+    lines instead (`XLA Modules`, a program's runs, each named after its module)."""
     from jax.profiler import ProfileData
 
     traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
@@ -85,7 +87,7 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[Kernel]], list[
         for line in plane.lines:
             lines.add(f"{plane.name}:{line.name}")
             if (line.name.lower().startswith("stream") if match.group(1) == "GPU"
-                    else line.name == "XLA Ops"):
+                    else line.name == tpu_line):
                 planes.setdefault(plane.name, []).extend(
                     Kernel(event.name, event.start_ns, event.end_ns, event.duration_ns, tuple(event.stats))
                     for event in line.events)
