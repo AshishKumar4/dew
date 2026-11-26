@@ -80,7 +80,7 @@ def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
         return False
     if (capped := _built_in_capped(score_mod)) is not None:
         cap = abs(float(capped.softcap))
-        scaled = abs(float(np.float32(scale / capped.softcap))) if cap else 0.0
+        scaled = abs(float(np.float32(scale * capped.reciprocal))) if cap else 0.0
         return 0.0 < scaled < 1e30 and cap * LOG2E < FOLD_REACH
     factor = abs(float(np.float32(scale * prescale * LOG2E)))
     return score_mod is None and factor < 1.0
@@ -984,7 +984,7 @@ def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Arr
         cap = capped.softcap
         # `base2_maximum`'s fp32 product: a key at the cap cancels a state resumed there (`resumed`).
         logits = (float(np.float32(cap) * np.float32(LOG2E))
-                  * jnp.tanh(s * float(np.float32(spec.scale / cap))))
+                  * jnp.tanh(s * float(np.float32(spec.scale * capped.reciprocal))))
         return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
     logits = s * factor
     if spec.score_mod is not None:

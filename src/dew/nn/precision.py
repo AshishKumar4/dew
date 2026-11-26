@@ -44,6 +44,7 @@ from jax.extend import core
 from jax.typing import DTypeLike
 from numpy.lib.array_utils import normalize_axis_tuple
 
+from dew import _facts
 from dew.nn.derivatives import (
     Protected,
     bound_span,
@@ -749,8 +750,10 @@ program is lowered for (`platform_dependent`, or for a loop's carry the platform
 for), so a test that lowers for an accelerator keeps the target's."""
 
 
+@_facts.traced_fact
 def wide_cpu_arithmetic() -> bool:
-    """Whether this process runs wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`)."""
+    """Whether this process runs wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`): a fact each trace reading it
+    records, so a value held from one (a rewritten body, a marked span) is made again under the other."""
     return os.environ.get(WIDE_CPU_ARITHMETIC) == "1"
 
 
