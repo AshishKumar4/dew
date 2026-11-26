@@ -888,10 +888,10 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
         params_key: Hashable = ()
         if params:
             if in_process:
-                items = params.items()
+                parameters_by_name = params.items()
+                ordered = sorted(parameters_by_name) if len(params) > 1 else parameters_by_name
                 params_key = tuple((name, _collect_opaque(
-                    _in_process_param_key(part, reject_device=reject_device), opaques))
-                    for name, part in (sorted(items) if len(params) > 1 else items))
+                    _in_process_param_key(part, reject_device=reject_device), opaques)) for name, part in ordered)
             else:
                 params_key = _collect_opaque(parameters_key(equation.primitive, params)[1], opaques)
         effects_key = _collect_opaque(parameter_key(equation.effects), opaques) if equation.effects else ()

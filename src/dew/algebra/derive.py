@@ -1018,8 +1018,7 @@ def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
         elif primitive is jax.lax.broadcast_in_dim_p:
             dims = tuple(int(d) for d in params["broadcast_dimensions"])
             after = tuple(int(s) for s in params["shape"])
-            for axis, to in enumerate(dims):
-                facts.append(lays(parameter, i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to)) for axis, to in enumerate(dims))
             if dims == tuple(range(len(after))):
                 facts.append(identity_broadcast(parameter))
             elif len(dims) == len(after) - 1:
@@ -1028,19 +1027,18 @@ def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
                     facts.append(inserts_axis(parameter, i64(missing[0])))
         elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
-            for axis in range(len(permutation)):
-                facts.append(lays(parameter, i64(axis), i64(permutation.index(axis))))
+            facts.extend(lays(parameter, i64(axis), i64(permutation.index(axis)))
+                         for axis in range(len(permutation)))
         elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
-            for axis, to in _moved(primitive, params, region, index):
-                facts.append(lays(parameter, i64(axis), i64(to)))
+            facts.extend(lays(parameter, i64(axis), i64(to))
+                         for axis, to in _moved(primitive, params, region, index))
             if primitive is jax.lax.reshape_p and params.get("dimensions") is None:
-                for axis in _inserted_reshape_axes(region, index):
-                    facts.append(inserts_axis(parameter, i64(axis)))
+                facts.extend(inserts_axis(parameter, i64(axis))
+                             for axis in _inserted_reshape_axes(region, index))
         elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
-            for axis in range(_rank_before(region, index, reduced)):
-                if axis not in reduced:
-                    facts.append(reduces(parameter, i64(axis), i64(axis - sum(r < axis for r in reduced))))
+            facts.extend(reduces(parameter, i64(axis), i64(axis - sum(r < axis for r in reduced)))
+                         for axis in range(_rank_before(region, index, reduced)) if axis not in reduced)
         elif kind == "product":
             (left_contracted, right_contracted), (left_batch, right_batch) = params["dimension_numbers"]
             left_rank, right_rank = _dot_ranks(region, index)
@@ -1051,15 +1049,14 @@ def _register_param_moves(graph: EGraph, region: terms.Region) -> None:
             for position, (left, right) in enumerate(zip(left_batch, right_batch, strict=True)):
                 facts.append(left_of(parameter, i64(int(left)), i64(position)))
                 facts.append(right_of(parameter, i64(int(right)), i64(position)))
-            for position, axis in enumerate(left_free):
-                facts.append(left_of(parameter, i64(axis), i64(len(left_batch) + position)))
-            for position, axis in enumerate(right_free):
-                place = len(left_batch) + len(left_free) + position
-                facts.append(right_of(parameter, i64(axis), i64(place)))
-            for axis in left_contracted:
-                facts.append(contracts_left(parameter, i64(int(axis))))
-            for axis in right_contracted:
-                facts.append(contracts_right(parameter, i64(int(axis))))
+            left_at = len(left_batch)
+            right_at = left_at + len(left_free)
+            facts.extend(left_of(parameter, i64(axis), i64(left_at + position))
+                         for position, axis in enumerate(left_free))
+            facts.extend(right_of(parameter, i64(axis), i64(right_at + position))
+                         for position, axis in enumerate(right_free))
+            facts.extend(contracts_left(parameter, i64(int(axis))) for axis in left_contracted)
+            facts.extend(contracts_right(parameter, i64(int(axis))) for axis in right_contracted)
     if facts:
         graph.register(*facts)
 
