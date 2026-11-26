@@ -317,19 +317,19 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1, keepdims=True))
         peak = jnp.where(jnp.isfinite(peak), peak, 0)
         spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak), 0), axis=-1))
+        # Each term at its share of the groups' mean (`weight`, the teacher's over the groups), so no group's
+        # own KL past fp32's range is rounded before the mean takes it back.
+        weight = target / groups
         held = jnp.where(taken, scores, 0)
         gap = peak - held
-        gaps = jnp.where(taken, jnp.where(jnp.isfinite(gap), target * gap, target * peak - target * held), 0)
-        entropy = jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)), 0)
-        divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread + compensated_sum(
+        gaps = jnp.where(taken, jnp.where(jnp.isfinite(gap), weight * gap, weight * peak - weight * held), 0)
+        entropy = jnp.where(taken, weight * jnp.log(jnp.where(taken, target, 1)), 0)
+        divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
         return jnp.where(jnp.any(keep, axis=-1), divergence, 0)
 
-    # The groups' mean at their largest's scale, each group's KL within fp32 however near its largest.
-    kls = jnp.stack([kl(group) for group in range(groups)])
-    largest = jax.lax.stop_gradient(jnp.max(jnp.abs(kls), axis=0))
-    unit = jnp.where((largest > 0) & jnp.isfinite(largest), largest, 1)
-    return unit * jnp.mean(kls / unit, axis=0)
+    # The groups' mean: each group's KL already at its share (`kl`'s `weight`), summed.
+    return compensated_sum(jnp.stack([kl(group) for group in range(groups)]), (0,))
 
 
 INFLLM_STRIDE = 16

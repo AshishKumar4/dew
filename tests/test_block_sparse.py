@@ -356,8 +356,8 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     inside the logarithm (MaxText's, `mla.indexer_kl`'s) capped the loss near 8.5 and stilled the low
     score's gradient; scored 64 apart at 2^30, its exact KL rounded to fp32; scored fp32's largest and
     least, its KL fp32's largest (its exact value rounds there), not an infinity, over one group and as
-    the mean of two; and over one selected token beside a key it does not select, nothing, the selected
-    token's score fp32's least."""
+    the mean of two, and as the mean of one group's KL past fp32's range and another's 0; and over one
+    selected token beside a key it does not select, nothing, the selected token's score fp32's least."""
     query = jnp.zeros((1, 2, 1, 4), jnp.float32)
     key = jnp.zeros((1, 2, 1, 4), jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
@@ -389,6 +389,14 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
         extremes = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]] * groups], jnp.float32)
         np.testing.assert_array_equal(np.asarray(grouped(extremes))[0],
                                       np.asarray([0.0, largest], np.float32))
+    # One group's KL past fp32's range (2 F, its teacher all on the token scored -F) beside a group's 0: their
+    # mean F, at its share before the group's own rounds.
+    point = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 1, 0, 0].set(1.0)
+    keys = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 0, 0, 0].set(-128.0)
+    apart = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]], [[0.0, -np.inf], [0.0, 0.0]]]], jnp.float32)
+    beside = block_sparse.msa_query_kls(apart, point, keys, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                        scale=1.0)
+    np.testing.assert_array_equal(np.asarray(beside)[0], np.asarray([0.0, largest], np.float32))
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0
