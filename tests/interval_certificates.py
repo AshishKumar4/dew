@@ -125,6 +125,9 @@ class Lane:
     """Whether a sub-chunk's own pairs fold each decay into the key before the row (`algebra.decayed_key`,
     `mainloop.Call.unit_pairs`, a layer's unit queries and keys and write gates at most one:
     `own_pairs.own_bands`, `algebra.key_diagonal_bands`), not the row times the key first (`key_diagonal`)."""
+    anchored: bool = False
+    """Whether a sub-chunk's own pairs are one anchored product (`anchored.anchoring`, a layer's decay
+    bound: `recurrence_witness.key_anchored`), not each pair its own decay (`key_diagonal`)."""
     merged: int = 0
     """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
     rounded_prefix: bool = False

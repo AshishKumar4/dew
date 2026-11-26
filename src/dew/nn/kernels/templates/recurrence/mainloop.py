@@ -868,14 +868,15 @@ which their names read."""
 def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *, once: dict | None = None,
                       consumers: int = 1, swizzles: dict[str, int] | None = None, reduces: bool = True,
                       after: tuple = (), issues: bool = True, together: tuple[int, ...] = (),
-                      sums: tuple[int, ...] = ()
+                      sums: tuple[int, ...] = (), reducing: int = 0
                       ) -> tuple[Callable[[int], dict], Callable[[int], resources.Scope], tuple, dict]:
     """A launch's shared memory at a ring depth, as `launch_kernel` lays it: its walked streams' and its
     streams loaded once' allocations (each its own; a pipelined family's stages are its allocation's), which
     a program opens with their views by name ('walked', 'once'), the scope they make with its staging and
     landing tiles a role (`_roles_staged`, `_landed`), whose bytes `resources.shared_bytes` counts, and those
     staging tiles (its landing's last) and landing tiles: the one account a launch's legality and its plan
-    both read; a launch issuing no products (not `issues`) scopes none of theirs."""
+    both read; a launch issuing no products (not `issues`) scopes none of theirs, and one whose arithmetic
+    reduces across warps implicitly its `reducing` warpgroups' share of the scratch (`resources.Scope`)."""
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
@@ -891,8 +892,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return allocation_scope(family, allocations(depth), (*staged, *products), reduces=reduces,
-                                after=after, addresses=addresses)
+        return dataclasses.replace(allocation_scope(family, allocations(depth), (*staged, *products),
+                                                    reduces=reduces, after=after, addresses=addresses),
+                                   reducing_warpgroups=reducing)
 
     return allocations, scope, staged, landed
 
@@ -1045,7 +1047,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
                   name: str | None = None, issues: bool = True, ringed: bool = False,
-                  together: tuple[int, ...] = (), sums: tuple[int, ...] = ()):
+                  together: tuple[int, ...] = (), sums: tuple[int, ...] = (), reducing: bool = False):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -1075,7 +1077,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     to write while its products read them. `together` are the widths of the groups a step sums together
     (`Issuer.summed_together`), each its own accumulator in the products' scratch; `sums` the widths of the
     sums its walk holds across its steps (`mosaic.Walk.sums`), which a family keeping them in memory of its
-    own scopes there (`Issuer.keeps_sums`)."""
+    own scopes there (`Issuer.keeps_sums`). A `reducing` program's roles reduce across their warps
+    implicitly (`own_pairs._anchored_step`'s guard), each its share of scratch (`reducing_warpgroups`)."""
     family = call.family
     name = named(name or f"recurrence{program.__qualname__.split('.')[0]}", call)
     producer = call.producers.of(name)
@@ -1084,7 +1087,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
                                                              reduces=reduces, after=after, issues=issues,
-                                                             together=together, sums=sums)
+                                                             together=together, sums=sums,
+                                                             reducing=consumers * reducing)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(consumers)
 
@@ -1155,7 +1159,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                                          stored(*arrays, *jax.tree.leaves(out_type))),
                              model_flops=int(model * tiles),
                              resident=found.programs if found else 1, registers=registers,
-                             producer=producer)(*arrays)
+                             producer=producer, reducing_warpgroups=consumers * reducing)(*arrays)
 
     return launched
 
