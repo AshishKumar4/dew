@@ -1839,30 +1839,84 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
                     truth_fn=torch_arm(wide, float64))
 
 
-def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(tmp_path):
-    """An unregistered source on Dew's attention (`dew_attention`), whose cache opens unlooped, opens none
-    looped: its
-    block runs once a pass, a cache keeping one entry a layer. Its loop exits no pass but its last, so a
-    loss weighing each pass's exit is refused as it is built, where a native looped decoder's is taken."""
+def test_a_looped_source_on_dews_attention_decodes_each_prefix_as_its_repeated_layers_run_it(tmp_path):
+    """An unregistered source on Dew's attention (`dew_attention`) looping its first layer (Cohere's, all
+    full layers) opens a decode cache whose later pass keeps entries of its own (row 13142), and decodes
+    through it: a prompt prefilled whole, then a token a call, each step's logits holding check 1 against
+    transformers' decoder of those layers repeated running that prefix whole, its float64 twin's one forward
+    the truth; its greedy generation (`TextGeneration`, as a run's preview and a saved run's task draw) is the
+    looped forward's argmax at each step. Its loop exits no pass but its last, so a loss weighing each
+    pass's exit is refused as it is built, where a native looped decoder's is taken."""
     from test_pass_weights import looped as native_looped
 
+    from dew.inference import TextGeneration
     from dew.objectives.lm import LMObjective
+    from dew.sampling import Sampling
 
-    saved_cohere(tmp_path)
+    model = saved_cohere(tmp_path)
     with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=16)
     assert isinstance(loaded, PretrainedFallback) and loaded.model.graph.dew_attention
-    loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
-    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1)))
-    with pytest.raises(Lacks):
-        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
-    with pytest.raises(Lacks):
-        looped.apply(loaded.variables, np.zeros((2, 1), np.int32), decode=True, mutable=["cache"])
+    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1), step_norm=False))
     with pytest.raises(ValueError):
         LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights="mean")
     # Weights on the last pass alone are its own loss, which reads no earlier exit.
     LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights=(0.0, 1.0))
     LMObjective(native_looped(), 16, pass_weights="mean")
+    state = model.state_dict()
+
+    def repeated(dtype):
+        config = transformers.CohereConfig(**{**COHERE, "num_hidden_layers": 3})
+        built = transformers.CohereForCausalLM(config)
+        weights = {name: value for name, value in state.items() if not name.startswith("model.layers.")}
+        for index, layer in enumerate((0, 0, 1)):
+            prefix = f"model.layers.{layer}."
+            weights |= {f"model.layers.{index}.{name.removeprefix(prefix)}": value
+                        for name, value in state.items() if name.startswith(prefix)}
+        built.load_state_dict(weights)
+        built.set_attn_implementation("eager")
+        return built.to(dtype).eval()
+
+    steps, vocab = 4, COHERE["vocab_size"]
+
+    @jax.jit
+    def decoded(variables, prompt, continued):
+        state = looped.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
+        logits, state = looped.apply({**variables, **state}, prompt, decode=True, mutable=["cache"])
+        stepped = [logits[:, -1]]
+        for step in range(steps):
+            logits, state = looped.apply({**variables, **state}, continued[:, step:step + 1], decode=True,
+                                         mutable=["cache"])
+            stepped.append(logits[:, 0])
+        return jnp.stack(stepped, axis=1)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x13142, seed])
+        return (rng.integers(0, vocab, (2, 6)).astype(np.int32),
+                rng.integers(0, vocab, (2, steps)).astype(np.int32))
+
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids).long()).logits.double().numpy()
+
+        def run(prompt, continued):
+            ids = np.concatenate([prompt, continued], axis=1)
+            if stepped:
+                return np.stack([forward(ids[:, :6 + step])[:, -1] for step in range(steps + 1)], axis=1)
+            return forward(ids)[:, 5:6 + steps]
+        return as_given(run)
+
+    with float64():
+        wide = repeated(torch.float64)
+    assert_as_exact(as_given(lambda prompt, continued: np.asarray(
+        decoded(loaded.variables, prompt, continued), np.float64)), theirs(repeated(torch.float32)), draw,
+        "looped tier 3 cached logits", seeds=8, truth_fn=theirs(wide, float64, stepped=False))
+    prompt, _ = draw(0)
+    task = TextGeneration(looped, loaded.variables, sampling=Sampling(temperature=0.0))
+    generated = np.asarray(task(prompt.tolist(), steps, key=0).tokens)
+    full = np.asarray(looped.apply(loaded.variables, jnp.asarray(generated)))
+    np.testing.assert_array_equal(generated[:, 6:], full[:, 5:-1].argmax(-1))
 
 
 def test_a_recomputed_layer_that_drops_draws_its_forwards_draws(tmp_path):

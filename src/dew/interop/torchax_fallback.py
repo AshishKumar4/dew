@@ -584,14 +584,15 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                                             **{**dropping, "dropout_rng": rng})
 
     if call.cache is not None:
-        held = call.cache.held.get(module.layer_idx)
+        entry = _cache_entry(module.layer_idx)
+        held = call.cache.held.get(entry)
         if held is None:
             # A cache being opened: its layer's keys and values give its shape, and nothing is held.
             held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
         out, keys, values = attested(cached, CAUSAL_ATTENTION)(q, k, v, held["cached_key"],
                                                                held["cached_value"], call.cache.slots,
                                                                call.cache.filled, sinks, rng)
-        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
+        call.cache.written[entry] = {"cached_key": keys, "cached_value": values}
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
         visible = jnp.asarray(call.visible, bool)
@@ -1074,15 +1075,17 @@ class TorchGraph:
 
     def step(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array], tokens: jax.Array, *,
              cache: Mapping[int, Mapping[str, jax.Array]], slots: jax.Array, filled: jax.Array,
-             positions: jax.Array, reach: jax.Array | None = None, precision: jax.lax.PrecisionLike = None
-             ) -> tuple[jax.Array, dict[int, dict[str, jax.Array]]]:
+             positions: jax.Array, reach: jax.Array | None = None, precision: jax.lax.PrecisionLike = None,
+             loop: Loop | None = None) -> tuple[jax.Array, dict[int, dict[str, jax.Array]]]:
         """A decoding call: the logits for `tokens` at their `positions` `[B, S]` (which transformers'
         rotary reads), each layer writing its keys and values into `cache` at `slots` and attending
-        over its row's `filled` slots (`_Cached`), and every layer's cache after the call. `reach` is
-        each token's reach (`_reaching`), its row's furthest position where None."""
+        over its row's `filled` slots (`_Cached`), and every layer's cache after the call, a `loop`'s
+        later passes each its own entries (`_cache_entry`). `reach` is each token's reach (`_reaching`),
+        its row's furthest position where None."""
         (logits, _), written = self._run(
             (dict(params), dict(buffers), tokens, None, positions, None, None, None, None, None,
-             (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1)
+             (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1,
+            loop=loop)
         return logits, written
 
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int,
@@ -1501,6 +1504,18 @@ def _state_of(output):
     return output if _is_tensor(output) else output[0]
 
 
+def _cache_entry(layer: int) -> int:
+    """The decode cache entry a decoder layer's keys and values keep (`_Cached`): its own index, and a later
+    pass of this trace's loop (`_SEAM`, `_PASS`) its own apart, after the stack's (`looping.pass_offset`),
+    as a native loop's cache keeps its passes' (`looping.pass_entries`, row 13142)."""
+    from dew.nn.backbones.looping import pass_offset
+
+    seam, step = _SEAM.get(), _PASS.get()
+    if seam is None or seam.loop is None or not step:
+        return layer
+    return pass_offset(seam.loop, len(seam.stack), step) + layer - seam.first
+
+
 @contextlib.contextmanager
 def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | None) -> Iterator[None]:
     """This trace's seam over `model`'s decoder layers (`_Seam`), which their dispatchers (`_dispatched`,
@@ -1825,7 +1840,8 @@ class TorchCausalLM(nn.Module):
         params, buffers, compute = self._operands(variables)
         precision = self._products(compute)
         return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
-                               positions=places, reach=reach, precision=precision)
+                               positions=places, reach=reach, precision=precision,
+                               loop=None if self.loop is None else runnable_loop(self.loop))
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
@@ -1872,13 +1888,11 @@ class TorchCausalLM(nn.Module):
 
     def _refuse_cache(self) -> None:
         """Refuse a decode cache to a model on transformers' own attention, which keeps none Dew's
-        attention writes, or one that loops (`loop`), as the capability it lacks."""
+        attention writes, as the capability it lacks. A loop's later passes keep entries of their own
+        (`_cache_entry`)."""
         if not self.graph.dew_attention:
             raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
                                  "Dew's attention writes")
-        if self.loop is not None:
-            raise Lacks("cache", "a tier-3 loop runs its block's layers once a pass, and a decode cache "
-                                 "keeps one entry a layer")
 
     def _laid(self, packing: Mapping[str, object]) -> Coordinates | None:
         """The rows' `Coordinates`, their layout past `__call__` (ledger 1122), None for none: a model on
