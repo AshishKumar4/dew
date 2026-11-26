@@ -71,6 +71,23 @@ def _checked_form(stored, expected: np.ndarray, label: str, factory: str, *, for
                          f"weights (`{factory}`)")
 
 
+def normal_scale_checked(scale, label: str, factory: str) -> None:
+    """Refuse a packed matrix's fp32 `scale` holding a subnormal entry, each addressable shard read on the
+    host (a traced scale, checked where it is restored, `checked`): a scale is zero or normal, its products
+    then normal wherever their values are, as a process that flushes a subnormal operand (XLA's CPU) forms
+    them (row 13340)."""
+    if isinstance(scale, Tracer):
+        return
+    pieces = [shard.data for shard in scale.addressable_shards] if isinstance(scale, jax.Array) else [scale]
+    for piece in pieces:
+        held = np.abs(np.asarray(piece, np.float32))
+        if ((held > 0) & (held < np.finfo(np.float32).tiny)).any():
+            least = held[(held > 0) & (held < np.finfo(np.float32).tiny)].min()
+            raise ValueError(f"{label} scale {least!r} is subnormal: a packed matrix's fp32 scale is zero or "
+                             f"normal (row 13340); serve these weights unpacked, or pack them at a normal "
+                             f"scale (`{factory}`)")
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class NvFp4:
@@ -443,7 +460,8 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 class TernaryWeights:
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
-    absmean/per-column/per-group `scale` fp32, and `form` digest."""
+    absmean/per-column/per-group `scale` fp32, each entry zero or normal (`normal_scale_checked`, row
+    13340), and `form` digest."""
     words: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
@@ -453,7 +471,8 @@ class TernaryWeights:
     def of(cls, weights: jax.Array | np.ndarray, *,
            scale: jax.Array | np.ndarray | float | None = None) -> "TernaryWeights":
         """Quantize `weights` (`[..., depth, width]`, `depth % 256 == 0`) to BitNet b1.58 `{-1, 0, +1}`
-        under absmean `scale` (computed automatically when None) and pack into staged `uint32` words."""
+        under absmean `scale` (computed automatically when None, at least 1e-5) and pack into staged
+        `uint32` words; a given subnormal `scale` refused (`normal_scale_checked`)."""
         source = jnp.asarray(weights, jnp.float32)
         if source.ndim not in (2, 3) or source.shape[-2] % TERNARY_STAGE != 0:
             raise ValueError(
@@ -471,6 +490,7 @@ class TernaryWeights:
         else:
             scale_arr = jnp.asarray(scale, jnp.float32)
         scale_checked(scale_arr.shape, source.shape)
+        normal_scale_checked(scale_arr, "TernaryWeights", "TernaryWeights.of")
         quantized = jnp.clip(jnp.round(source / jnp.where(scale_arr > 0, scale_arr, jnp.float32(1.0))),
                              -1.0, 1.0)
         codes = jnp.where(quantized > 0, jnp.uint32(1),
@@ -489,9 +509,11 @@ class TernaryWeights:
         return (*groups, 16 * words, width)
 
     def checked(self, form=None) -> "TernaryWeights":
-        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
+        """Verify stored `form` version (every addressable shard), scale shape and its normal or zero entries
+        (`normal_scale_checked`) match this Dew's encoder."""
         _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
         scale_checked(jnp.shape(self.scale), self.shape)
+        normal_scale_checked(self.scale, "TernaryWeights", "TernaryWeights.of")
         return self
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:

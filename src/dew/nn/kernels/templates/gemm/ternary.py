@@ -72,7 +72,9 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     optionally quantizes `lhs` per token to int8 (`quantize_activations=True`, STE gradient w.r.t. `lhs`),
     decodes staged uint32 ternary words inline in the GEMM mainloop on sm80/sm90 into exact bf16
     `{-1, 0, +1}`, accumulates exact integer products in fp32, applies `(peak / 127) * weights.scale` via
-    `precision.twice_scaled`, and rounds once to `out_dtype`."""
+    `precision.twice_scaled`, and rounds once to `out_dtype`. Its scale is zero or normal
+    (`TernaryWeights.checked`: a subnormal one refused, row 13340), so its products are normal wherever their
+    values are, a process that flushes a subnormal operand forming them as a GPU does."""
     if not isinstance(weights.form, Tracer):
         weights.checked()
     else:
