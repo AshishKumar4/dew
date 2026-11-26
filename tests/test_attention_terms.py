@@ -121,3 +121,25 @@ def test_a_zero_head_passes_its_gradient_through_the_clip():
     (gradient,) = pull(cotangent)
     np.testing.assert_array_equal(np.asarray(gradient[0]), np.asarray(cotangent[0]))
     assert bool(jnp.all(jnp.isfinite(gradient)))
+
+
+@attending("reference")
+def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_counts():
+    """A layer scored over a causal pairwise mask, its keys' visibility places stated from 100 on
+    (`attention_key_positions`, which a windowless layer's visibility does not read), computes what the same
+    call with no places stated does: its relative bias reads its tokens' slots on both sides, as
+    transformers' does (`get_relative_distance`)."""
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+
+    layer = _layer()
+    rng = np.random.default_rng(0xA772)
+    x = jnp.asarray(rng.normal(size=(ROWS, LENGTH, FEATURES)), jnp.float32)
+    params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(scale=0.5, size=leaf.shape), leaf.dtype),
+                          nn.unbox(layer.init(jax.random.key(0), x)))
+    causal = jnp.broadcast_to(jnp.tril(jnp.ones((LENGTH, LENGTH), bool)), (ROWS, LENGTH, LENGTH))
+    places = jnp.broadcast_to(jnp.arange(LENGTH) + 100, (ROWS, LENGTH))
+
+    def run(key_positions):
+        call = MixerCall(AttentionMetadata(pairwise_mask=causal, key_positions=key_positions))
+        return np.asarray(attending("reference")(jax.jit(layer.apply))(params, x, call))
+    np.testing.assert_array_equal(run(places), run(None))

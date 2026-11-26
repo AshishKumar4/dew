@@ -1169,10 +1169,18 @@ class CausalSelfAttention(nn.Module):
             bias = position_bias if bias is None else bias + position_bias
         if self.relative_bias is not None:
             # Its distances in the stream's slots, as the reference's (`get_relative_distance`): a cached
-            # step's write slot against the cache's, a scored row's tokens counted within their documents
-            # against its keys' (`counted`), whatever places the caller gives.
-            key_slots = jnp.arange(masking.key.shape[-3]) if decode else masking.key_places
-            relative = self._relative_bias(x, places, positions if decode else counted, key_slots)
+            # step's write slots against the cache's, a scored row's tokens counted within their documents
+            # (`counted`) on both sides, whatever places the caller gives.
+            if decode:
+                query_slots, key_slots = positions, jnp.arange(masking.key.shape[-3])
+            elif masking.key.shape[-3] == S:
+                # A scored call's keys are its own tokens: the same counted slots, whatever places its
+                # visibility counts keys at (`attention_key_positions`).
+                query_slots = key_slots = counted
+            else:
+                raise ValueError(f"{self.name}: a relative bias scores a call's own keys, and this call's "
+                                 f"{masking.key.shape[-3]} keys are not its {S} tokens")
+            relative = self._relative_bias(x, places, query_slots, key_slots)
             bias = relative if bias is None else bias + relative
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value, progress)
