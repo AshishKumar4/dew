@@ -10,7 +10,7 @@ import dataclasses
 import enum
 import functools
 import json
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Iterator, Sequence
 
 import jax
 from jax._src import config as jax_config
@@ -23,7 +23,8 @@ from dew.algebra.program import replaying
 from dew.nn.kernels.options import OuterProgram, abstract_signature, held_context, owned_program
 
 
-def drawing() -> contextlib.AbstractContextManager[None]:
+@contextlib.contextmanager
+def drawing() -> Iterator[None]:
     """Where a fresh state's program is lowered, wherever it is (`placed_start`, `start_compiled`,
     `start_compiling`): on a GPU, JAX's threefry draws as rolled loops over their rounds
     (`jax_threefry_rolled_lowering`, Dew's JAX build's from post100), in place of each draw's twenty rounds
@@ -35,8 +36,14 @@ def drawing() -> contextlib.AbstractContextManager[None]:
     partitioned as the leaf is (a 1 GB draw over eight GPUs held one shard of temporaries, and no
     collective, where JAX's threefry kernel, unpartitioned, held 6.44 GB). The setting is in JAX's trace
     context and jit key, so every site of the program enters it alike; a step, whose draws fuse into what
-    reads them, keeps JAX's default."""
-    return jax_config.threefry_rolled_lowering(new_val=True)
+    reads them, keeps JAX's default.
+    The algebra pass is off within it (`dew.algebra.passes`): the forward an init traces makes no variable,
+    so its bodies, rewritten again under this program's own trace context, rewrote nothing the run reads (an
+    every-template step's start missed 562 of its 803 structural lookups on an sm100, row 11803)."""
+    from dew.algebra import passes
+
+    with jax_config.threefry_rolled_lowering(new_val=True), passes(on=False):
+        yield
 
 
 def passed_through[Tree, Built, Picked](function: Callable[[Tree, jax.Array], Built],
@@ -155,7 +162,11 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
         # certified in turn they took a start's tracing thread before its step's lowering (row 5324); a
         # launch the settling refused leaves the start's lowering to step past it.
         # A draw selects no kernel (`generation.drawing`): its forward's values reach none of the variables.
-        with report.certifying_aside(), generation.drawing():
+        from dew.algebra import passes
+
+        # Nor is a body of its forward rewritten (`drawing`'s algebra pass off): none of its values is a
+        # variable.
+        with report.certifying_aside(), generation.drawing(), passes(on=False):
             trace = owned_program(traced).trace(held, key)
         abstract = trace.out_info
         leaves = jax.tree.structure(parts.split(abstract)[1]).num_leaves
