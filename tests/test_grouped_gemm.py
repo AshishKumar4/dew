@@ -1463,7 +1463,7 @@ def test_each_tuning_variant_of_a_tpu_projection_holds_check_1_interpreted():
         assert_as_exact(
             jax.jit(dew_fn),
             jax.jit(lambda x, w: jax.lax.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)),
-            draw, f"v5e variant {config}", seeds=2,
+            draw, f"v5e variant {config}", seeds=8,
             truth_fn=lambda x, w: jax.lax.dot(x.astype(jnp.float64), w.astype(jnp.float64),
                                               preferred_element_type=jnp.float64))
 
