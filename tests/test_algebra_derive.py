@@ -1472,7 +1472,7 @@ def test_covariance_means_keep_distinct_value_directions_with_shared_weights():
     dw = jnp.asarray([1.0, -1.0], jnp.float32)
 
     def means(x, y, w):
-        a, b, _, _ = moments.chunked_covariance(x, y, w, tile=1, mode="walk")
+        a, b, _ = moments.chunked_covariance(x, y, w, tile=1, mode="walk")
         return jnp.stack((a, b))
 
     @jax.jit

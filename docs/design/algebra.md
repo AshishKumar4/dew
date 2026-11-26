@@ -169,9 +169,10 @@ glue is (ยง6.2), reorderings over its values held by the dominance rule alone (ย
   - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
     dev-only until a changed default-route executable has a native receipt (row 9777). M-DC-14's
     compile-only survey forcing XLA attention found a changed 4B step; the subsequent default-route
-    survey fired no match and did not time it. An equal term is one e-class and extraction prices a shared one once, so a value written twice is
-    read once without a rule. The rules relate a new value to another the program holds or hoist a division
-    past a broadcast or square root: a quotient by a value whose reciprocal the program holds, `a / y` as
+    survey fired no match and did not time it. An equal term is one e-class and extraction prices a shared
+    one once, so a value written twice is read once without a rule. The rules relate a new value to another
+    the program holds or hoist a division past a broadcast or square root: a quotient by a value whose
+    reciprocal the program holds, `a / y` as
     `a (1/y)`, a quotient by a broadcast divisor hoisted to a per-row reciprocal, `a / broadcast(y)` as
     `a * broadcast(y^-1)` (`lax.integer_pow(..., -1)`), and a quotient by a root (directly or broadcast),
     `a / sqrt(v)` as `a rsqrt(v)` (merging into any sibling `rsqrt(v)` when present). Over benchmark_step's
