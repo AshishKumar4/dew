@@ -830,14 +830,13 @@ def _joined() -> tuple[RuleFamily, ...]:
     axes = var("axes", Vec[i64])
     params, added = vars_("params added", i64)
     length = var("length", i64)
-    facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    power = i64(1)
     new = x.binary("add", y, added)
     reduced = new.reduce("sum", axes, params)
     left, right = x.reduce("sum", axes, params), y.reduce("sum", axes, params)
     return (RuleFamily("two counts along an axis", (rule(
         eq(t).to(left.binary("add", right, added)), eq(shape(x)).to(shape(y)), plain(added),
-        counting_sum(left), counting_sum(right), eq(length).to(sum_length(left)),
-        *facts, *dominated(power + length, "new")).then(
+        counting_sum(left), counting_sum(right), eq(length).to(sum_length(left))).then(
         union(t).with_(reduced), *made(new, power), *made(reduced, power + length)),),
         (lambda x, y, a: jnp.sum((x > a).astype(x.dtype), -1) + jnp.sum((y > a).astype(y.dtype), -1),
          lambda x, y, a: jnp.sum((x > a).astype(x.dtype) + (y > a).astype(y.dtype), -1), _ROWS)),)

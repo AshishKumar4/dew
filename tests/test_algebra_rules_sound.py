@@ -718,17 +718,20 @@ def test_every_stated_magnitude_is_at_least_the_tables(name, index, rule):
     """A new intermediate's stated power of two is at least the bound the magnitude table proves of it from
     its operands' stated powers, at every instantiation and every assignment of `POWERS`."""
     matched, conditions, actions = _parts(rule)
+    counted = _named(conditions, "counting_sum")
     checked = 0
     for evaluated, _ in itertools.islice(_instantiations(matched, conditions, symbolic=False), 64):
         names = sorted(evaluated.arrays)
-        for powers in itertools.product(POWERS, repeat=len(names)):
+        powers_of = [(0,) if name in counted else POWERS for name in names]
+        for powers in itertools.product(*powers_of):
             stated_powers = dict(zip(names, powers, strict=True))
             for kind, action in actions:
                 if kind != "set" or _set_name(action) != "log2_bound":
                     continue
                 made = action.call.args[0]
                 stated = _power(action.rhs, rule, stated_powers, evaluated)
-                operands = [jnp.asarray(evaluated.arrays[n], jnp.float32) for n in names]
+                operands = [jnp.asarray(np.floor(evaluated.arrays[n]) % 2 if n in counted else evaluated.arrays[n],
+                                        jnp.float32) for n in names]
 
                 def computed(*values, made=made, names=names, evaluated=evaluated):
                     return Traced(evaluated, dict(zip(names, values, strict=True)),
