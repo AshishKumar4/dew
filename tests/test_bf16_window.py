@@ -142,6 +142,8 @@ def test_a_window_products_rows_cotangent_keeps_an_infinite_weight():
     route (interpreted) and XLA's: the rows' cotangent is XLA's plain product's of the weights (the
     infinity's depth infinite, no NaN a split cotangent's zero parts would make), bit for bit."""
     weights = np.full((256, 64), 0.5, jnp.bfloat16)
+    # Its group's window anchored at the largest finite binade, which an infinity's group holds.
+    weights[:128, 3] = np.asarray(2.0 ** 126, jnp.bfloat16)
     weights[7, 3] = np.asarray(np.inf, jnp.bfloat16)
     window = Bf16Window.of(weights)
     rows = jnp.ones((8, 256), jnp.bfloat16)
@@ -171,7 +173,7 @@ def test_a_window_launch_takes_its_staged_matrix_and_refuses_its_rows_swapped():
     columns' meta) is refused where the same call of a ternary matrix is taken (an H100's warpgroup MMA)."""
     from dew.nn.kernels.templates.gemm import packed, pricing, tiling
 
-    tiles = tiling.Tiles(128, 64, 256, 2, 2, family="wgmma")
+    tiles = tiling.Tiles(128, 64, 256, 2, 1, warpgroups=2, family="wgmma")
     with generation.assumed("sm90"):
         family = pricing.family_of(tiles, jnp.bfloat16)
     words = jax.ShapeDtypeStruct((1, 64, 256 // 128 * 48), jnp.uint32)
