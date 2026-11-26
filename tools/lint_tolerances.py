@@ -14,15 +14,20 @@ import functools
 import importlib
 import inspect
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping, Set
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol, TypeGuard
 
 import lint_scopes as scopes
 
 
 class Calls(Protocol):
-    """The definitions of a file's functions a call reaches, read where it is made."""
+    """The definitions of a file's functions a call reaches, read where it is made, and what each scope
+    binds each of its names to (None a name bound more than once)."""
+
+    @property
+    def bindings(self) -> Mapping[int, Mapping[str, ast.AST | None]]: ...
 
     def reached(self, scope: ast.AST, call: ast.Call) -> Iterable[ast.AST]: ...
 
@@ -766,3 +771,38 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                          if isinstance(target, ast.Name) and TOLERANCE_NAME.search(target.id)]
                 if named:
                     yield node, f"a tolerance, `{named[0].id}`"
+
+
+def read(path: Path, tree: ast.Module, parent: Sequence[str], calls: Callable[[ast.Module], Calls]
+         ) -> Iterator[tuple[ast.expr | ast.stmt, str]]:
+    """SLOP020's comparisons in the module at `path`, parsed as `tree` (`comparisons`), its imports read
+    from its own package `parent` and its calls resolved by the reader `calls` builds of a tree
+    (tools/lint_slop.py's, as SLOP018 resolves them). A function imported by a bare module name from a
+    file beside it, as tests import their support (`from test_pipeline_core import delivered`), is read as
+    that file's own reading proves it (`_support_functions`), as the same function defined in the test
+    would be."""
+    held = tuple(parent)
+    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(held))}
+
+    def imported(called: str) -> Imported | None:
+        source, _, name = called.rpartition(".")
+        beside = path.parent / f"{source}.py"
+        if not source or "." in source or not beside.is_file():
+            return None
+        return _support_functions(beside, held, beside.stat().st_mtime_ns, calls).get(name)
+
+    return comparisons(tree, tables, calls(tree), imported)
+
+
+@functools.cache
+def _support_functions(path: Path, parent: tuple[str, ...], modified: int,
+                       calls: Callable[[ast.Module], Calls]) -> dict[str, Imported]:
+    """What the file at `path` proves of each of its module-level functions (`support_functions`), read as
+    of its modification time `modified`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
+    reader = calls(tree)
+    # A name the module binds twice, or to anything but its one definition, is no one's.
+    bound = reader.bindings[id(tree)]
+    return {name: found for name, found in support_functions(tree, tables, reader).items()
+            if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef)}

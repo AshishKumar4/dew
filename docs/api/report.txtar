@@ -952,6 +952,8 @@ dew.nn.backbones.decoder_stack.Loop
   theta_passes: int | None = None
   messages: dew.nn.cross_pass.CrossPass | None = None
   gathered: bool = False
+  exit_at: Literal['coda', 'block'] = 'coda'
+  exit_by: Literal['token', 'row'] = 'token'
 dew.nn.cross_pass.CrossPass
   block_size: int = 4
   rank: int = 64

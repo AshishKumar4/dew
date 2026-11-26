@@ -16,7 +16,7 @@ import functools
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import ClassVar, Concatenate, NamedTuple
+from typing import ClassVar, Concatenate, Literal, NamedTuple
 
 import jax
 import jax.extend
@@ -225,6 +225,32 @@ class Loop:
     coda and final norm as the last pass's, sown as its `states` where the
     caller opens `exits`, as a loss that weighs every pass reads them
     (`dew.objectives.passes.PassWeights`); a gate implies it (`exiting`).
+    `exit_at` places the gate: on each pass's exit state after the coda
+    (`'coda'`, Ouro's), or on the block's own output, normed as the stack's
+    output is (`CausalTransformer.exit_states`: under attention residuals
+    the depth state collapsed through the output site), so a threshold's
+    pass runs the coda once, on the states it selects (`'block'`), each
+    token's coda reading its prefix's own selected states: by token, a
+    prefix of mixed passes, which a coda trained on one pass's states at a
+    time (a loss weighing each pass's exit through its coda) has not seen
+    unless trained so; a loss that weighs every pass still runs each pass's
+    coda for its head. `exit_by`
+    pools it: each token's own hazard, causal (`'token'`), or one a row, the
+    gate of the row's exit states' mean over its real tokens
+    (`AttentionMetadata.valid`), every token of the row exiting at its pass
+    (`'row'`): whole-row scoring's (a decision's), whose later tokens decide
+    its earlier ones' passes, refused where a token is scored causally (an
+    LM's loss, `LMObjective`), in a packed row (its documents' tokens would
+    decide each other's) and in decode (its row is the tokens so far).
+    Under `exit_threshold` scoring (no cache, no training) stops its passes
+    once every real token has exited (`looping._Passes.stopping`), its output
+    unchanged, and under `exit_by='row'` it runs each later pass over the rows
+    still looping alone, gathered into a smaller batch (`looping.compacted`).
+    A cached call of one token a row skips passes only under `shared_cache`
+    and `exit_at='block'`, each row's cache its token's exiting pass's writes
+    and the coda's cache its one run's; a call of several tokens, and a loop
+    over per-pass caches, runs every pass, as a later token reading an
+    earlier one's pass would find nothing it skipped.
 
     `remat` checkpoints each pass of the block, the first included, with one
     Flax lifted checkpoint. Backpropagation keeps each pass's input and
@@ -312,6 +338,8 @@ class Loop:
     theta_passes: int | None = None
     messages: CrossPass | None = None
     gathered: bool = False
+    exit_at: Literal["coda", "block"] = "coda"
+    exit_by: Literal["token", "row"] = "token"
 
     PASSED: ClassVar[tuple[str, ...]] = ("steps", "backprop_steps", "remat", "implicit", "exit_threshold",
                                          "exits", "gathered")
@@ -359,6 +387,10 @@ class Loop:
         if self.exit_threshold is not None and (not self.exit_gate or not 0 < self.exit_threshold <= 1):
             raise ValueError("an exit threshold is a cumulative probability in (0, 1] over the passes the "
                              f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
+        if (self.exit_at, self.exit_by) != ("coda", "token") and not self.exit_gate:
+            raise ValueError(f"exit_at={self.exit_at!r} and exit_by={self.exit_by!r} place and pool the exit "
+                             "gate, which the loop does not draw (exit_gate)")
+
 
 
 @dataclasses.dataclass

@@ -92,14 +92,17 @@ def modernbert_states_in_bf16_on_the_gpu_kernels():
     with ModernBertModel's own bf16 run over drawn ids (check 1), from the
     float64 twin of its float32 load."""
     with ahead_on_the_host():
-        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
-        loaded = Pretrained.load(DIRECTORY, dtype='bfloat16')
+        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859),
+        # its weights host arrays (`on_host`) so the arm's statement holds no device sharding.
+        loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', on_host=True)
+    model, variables = loaded.model, loaded.variables
     reference, truth = transformers_arms(
         transformers_model(DIRECTORY, masked=True, dtype='bfloat16'),
         lambda model, ids: model.model(ids).last_hidden_state,
         source=transformers_model(DIRECTORY, masked=True))
+
     def states(ids):
-        return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states)
+        return model.apply(variables, ids, method=CausalTransformer.hidden_states)
 
     # The fixture's ids as a JAX array, so the gate traces the arm alone: a NumPy draw runs every plain
     # arm once eagerly to catch NumPy arithmetic (`reference_error._refuse_numpy_arms`), which compiled this

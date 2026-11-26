@@ -79,6 +79,7 @@ from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template
 from .precision import (
+    EXACT_FLOAT32,
     asks_default_precision,
     at_least_fp32,
     at_precision,
@@ -1399,7 +1400,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
         if generation.numerics().forms == "accurate":
-            precision = jax.lax.Precision.HIGHEST
+            precision = EXACT_FLOAT32
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,

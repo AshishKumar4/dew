@@ -50,7 +50,7 @@ from jax.typing import DTypeLike
 
 from dew.batch import Coordinates
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import capped_logits, head_product, scaled_logits
+from dew.nn.precision import EXACT_FLOAT32, capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from flax.linen.module import Interceptor
@@ -261,7 +261,7 @@ class OutputTable:
             wide = jnp.promote_types(states.dtype, jnp.float32)
             logits = head_product(subscripts, states.astype(wide),
                                   matrix.astype(jnp.promote_types(matrix.dtype, jnp.float32)),
-                                  jax.lax.Precision.HIGHEST, compute=wide)
+                                  EXACT_FLOAT32, compute=wide)
         else:
             logits = head_product(subscripts, states, matrix, self.precision, compute=self.compute)
         scale = None if self.scale is None else jnp.take(self.scale, index)
