@@ -1352,9 +1352,10 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 ### 6.11 The generator
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). The component pilots generate recurrence scores and the two
-rounded-operand bodies, check them against independent references, and share the `--check` writer.
-Production still derives recurrence forms at trace time and traces the original surrogate bodies (row 3272).
+(`ComponentForm`, rows 6109 and 6110). The component pilots cover attention backward's masked
+query-first cotangents and its key-first weight consumer, recurrence scores and strict lower pairs,
+and rounded operands at bfloat16 and float16. One `--check` writer holds all cases against their own
+references. Production still uses the trace-time derivations and original surrogates (row 3272).
 
 ```python
 @dataclass(frozen=True)
