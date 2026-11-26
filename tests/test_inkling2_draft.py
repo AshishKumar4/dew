@@ -4,6 +4,7 @@ Dew's Markov block drafter (`dew.nn.block_draft`), against vLLM's draft ported t
 taps: tools/inkling2_fixture.py --draft writes the tiny draft beside tests/fixtures/hf/inkling2-tiny's decoder
 and records both there (recorded_draft.npz)."""
 
+import dataclasses
 import json
 import shutil
 from pathlib import Path
@@ -18,7 +19,9 @@ from reference_error import assert_as_exact, declared_seeds, indexed_recording, 
 from dew.batch import coordinates as laid_out
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
+from dew.nn.block_draft import BlockDrafter, Context, DraftAttention, MarkovBlockDraft, draft
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
 from dew.sampling import Sample, Sampling, Speculative, generate
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'inkling2-tiny'
@@ -177,6 +180,93 @@ def test_a_draft_layer_norms_its_stream_before_rounding_it():
     stream, normed = norm.apply(params, x, method=lambda module, x: added_norm(module, x, residual))
     np.testing.assert_array_equal(np.asarray(stream, np.float32), [[1.0, 1.0]])
     assert float(normed[0, 1]) == 1.0 - 2.0 ** -8 and float(normed[0, 0]) == 1.0, normed
+
+
+TINY_DRAFT = MarkovBlockDraft(layers=1, num_heads=1, num_kv_heads=1, head_dim=2, mlp_features=2, block_size=3,
+                              taps=(0, 1, 2), markov_rank=1, rope_theta=10000.0, norm_eps=1e-6)
+"""A draft of one layer over two-wide states and three taps, small enough to set its weights by hand."""
+
+
+def tiny_drafter() -> BlockDrafter:
+    return BlockDrafter(TINY_DRAFT, emb_features=2, vocab_rows=4, kv_cache=KVCache(), max_seq_len=8,
+                        dtype=jnp.bfloat16)
+
+
+def test_a_drafts_taps_mix_by_their_weights_rounded():
+    """The taps' mixing weights round to the draft's dtype after their softmax, as vLLM's
+    (`refresh_derived_weights`): weights `softmax([0, 0, log 3])` over taps whose first coordinates are `[3,
+    0, -1]` mix it to `3 (0.2) - 0.6`, zero in fp32 and `-2^-10` with the bf16 weights `0.2002` and
+    `0.6016`, which the Markov head's carried taps keep, normed, clearly below zero."""
+    drafter = tiny_drafter()
+    taps = jnp.asarray([[[3.0, 1.0, 0.0, 1.0, -1.0, 1.0]]], jnp.bfloat16)
+    params = drafter.init(jax.random.key(0), taps, None, 1, decode=False, method='contexts')['params']
+    params = {**params, 'fuse_weight': jnp.zeros((2, 3)).at[:, 2].set(np.log(3.0))}
+    _, carried = drafter.apply({'params': params}, taps, None, 1, decode=False, method='contexts')
+    assert float(carried[0, 0]) < -1e-3, carried
+
+
+def test_a_drafts_attention_weighs_its_values_unrounded():
+    """A draft layer's attention weighs its values by its probabilities unrounded and rounds its output once,
+    as vLLM's: three keys of equal scores (its queries zero) over values `1, 1, 1 + 2^-7` weigh to `1 +
+    2^-7 / 3`, which rounds to 1 in bf16, where probabilities rounded to `0.334` weigh them to `1 + 2^-7`."""
+    attention = DraftAttention(TINY_DRAFT, emb_features=2, local=False, kv_cache=KVCache(), max_seq_len=8,
+                               dtype=jnp.bfloat16)
+    one = 1.0 + 2.0 ** -7
+    context = Context(jnp.zeros((1, 2, 1, 2), jnp.bfloat16),
+                      jnp.asarray([[[[1.0, 1.0]], [[one, one]]]], jnp.bfloat16),
+                      jnp.asarray([[0, 1]]), jnp.ones((1, 2), bool), jnp.asarray([2]))
+    x = jnp.asarray([[[1.0, 0.0]]], jnp.bfloat16)
+    params = attention.init(jax.random.key(0), x, context)['params']
+    params = {**params, 'q_proj': {'kernel': jnp.zeros((2, 2))},
+              'v_proj': {'kernel': jnp.asarray([[1.0, 1.0], [0.0, 0.0]])},
+              'o_proj': {'kernel': jnp.eye(2)}}
+    out = attention.apply({'params': params}, x, context)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), [[[1.0, 1.0]]])
+
+
+def test_a_drafts_head_scores_its_states_and_its_correction_apart():
+    """A drafted place's logits are the head's scores of its states and of the Markov head's correction,
+    each rounded to the draft's dtype, summed and rounded again (vLLM's `markov_logits`), never the scores
+    of their sum: every score the head gives (`scores_of`) is of a place's states or a correction alone,
+    and each place's logits are its two scores' rounded sum."""
+    drafter = tiny_drafter()
+    taps = jnp.ones((1, 4, 6), jnp.bfloat16)
+    anchor = jnp.zeros((1,), jnp.int32)
+    embedded = jnp.ones((1, 2), jnp.bfloat16)
+    row = jnp.asarray([[1.0], [1.0]], jnp.bfloat16)
+    scored = []
+
+    def scores_of(x):
+        out = (x @ row).astype(jnp.float32)
+        scored.append((x, out))
+        return out
+
+    def drafting(module):
+        return draft(module, taps, None, anchor, lambda tokens: embedded, scores_of, None, decode=False)
+
+    variables = drafter.init(jax.random.key(0), method=drafting)
+    scored.clear()
+    logits = drafter.apply(variables, method=drafting).logits
+    (states, base), *corrections = scored
+    places = TINY_DRAFT.block_size - 1
+    assert states.shape == (1, places, 2) and len(corrections) == places
+
+    def rounded(x):
+        return x.astype(jnp.bfloat16).astype(jnp.float32)
+
+    for index, (_, correction) in enumerate(corrections):
+        np.testing.assert_array_equal(np.asarray(logits[:, index]),
+                                      np.asarray(rounded(rounded(base[:, index]) + rounded(correction))))
+
+
+def test_a_markov_draft_through_a_head_not_linear_in_its_states_is_refused():
+    """A Markov block drafter sums the head's scores of a place's states and of its correction, which a head
+    bias would count twice: a decoder with one is refused as it is built; the fixture's builds."""
+    model = translate_config(RELEASE).value
+    tokens = jnp.zeros((1, 4), jnp.int32)
+    jax.eval_shape(lambda: model.init(jax.random.key(0), tokens))
+    with pytest.raises(ValueError):
+        jax.eval_shape(lambda: dataclasses.replace(model, head_bias=True).init(jax.random.key(0), tokens))
 
 
 def built(taps):

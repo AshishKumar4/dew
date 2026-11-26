@@ -209,9 +209,11 @@ def _dew_chunk_rule(original: Callable) -> Callable:
         # Attested causal over the queries' positions (`sequence_causality.CAUSAL_ATTENTION`): each token's
         # output reads its own and earlier tokens' queries, keys, values, decays and writes and the whole
         # entering memory, the final memory every token.
-        out, final = attested(lambda q, k, v, decay, write, state: chunk_gated_delta_rule(
-            q, k, v, decay, write, state, chunk_size, **declared),
-            CAUSAL_ATTENTION, inputs=5, outputs=1)(q, k, v, decay, write, state)
+        # A program of its own named for the rule (`DELTA_RULE`), which the step's program holds as a call.
+        def delta_rule(q, k, v, decay, write, state):
+            return chunk_gated_delta_rule(q, k, v, decay, write, state, chunk_size, **declared)
+
+        out, final = attested(delta_rule, CAUSAL_ATTENTION, inputs=5, outputs=1)(q, k, v, decay, write, state)
         return (torch_view(out.astype(jax_view(query).dtype)),
                 torch_view(final) if output_final_state else None)
     return rule

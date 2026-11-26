@@ -449,8 +449,9 @@ def settle_fields(model: CausalTransformer) -> None:
 
 def _check_block_draft(model: CausalTransformer) -> None:
     """Raise `ValueError` for a Markov block drafter its trunk cannot feed: beside another drafter, over a
-    loop whose passes exit (each exit's coda a visit of its own), or tapping visits past its forward's,
-    the last tap standing for its final states (`MarkovBlockDraft.taps`)."""
+    loop whose passes exit (each exit's coda a visit of its own), through a head that is not linear in its
+    states, or tapping visits past its forward's, the last tap standing for its final states
+    (`MarkovBlockDraft.taps`)."""
     spec = model.block_draft
     assert spec is not None
     if model.dspark is not None or model.num_nextn_predict_layers:
@@ -458,6 +459,10 @@ def _check_block_draft(model: CausalTransformer) -> None:
     if model.loop is not None and model.loop.exiting:
         raise ValueError("a Markov block drafter reads its target's visits in a forward's order, which a "
                          "loop whose passes exit runs apart")
+    if model.head_bias or model.head_transform is not None or model.continuum is not None:
+        raise ValueError("a Markov block drafter scores a place's states and its correction apart with the "
+                         "target's head and sums them, which a linear head alone sums as it scores their "
+                         "sum: no head bias, head transform or continuum levels")
     visits = len(model.visits())
     if spec.taps[-1] != visits:
         raise ValueError(f"a Markov block drafter's last tap is its target's {visits} visits, standing for "

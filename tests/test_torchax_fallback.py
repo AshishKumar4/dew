@@ -1728,10 +1728,8 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
     parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
     the CPU's float32 witness reaches XLA's arithmetic alone."""
-    from unittest import mock
-
-    from dew.nn.kernels import recurrence_chunk
     from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.programs import equations
 
     torch.manual_seed(0)
     model = transformers.Qwen3NextForCausalLM(transformers.Qwen3NextConfig(**QWEN3_NEXT_GPU)).eval()
@@ -1745,21 +1743,16 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     def loss(params):
         return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
 
-    # The queries', keys' and values' dtypes each call of the delta rule takes, as the tier-3 part hands
-    # them over (`torchax_kernels._dew_chunk_rule` reads the rule off its module at each call).
-    handed = []
-    rule = recurrence_chunk.chunk_gated_delta_rule
-
-    def recorded(query, key, value, *args, **kwargs):
-        handed.append((query.dtype, key.dtype, value.dtype))
-        return rule(query, key, value, *args, **kwargs)
-
-    with mock.patch.object(recurrence_chunk, "chunk_gated_delta_rule", recorded):
-        # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's,
-        # the recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
-        stepped = [call for call in kernel_calls(jax.jit(jax.grad(loss)).lower(params))
-                   if call.kind in ("triton", "mosaic_gpu")]
-    names = sorted({call.name for call in stepped})
+    step = jax.jit(jax.grad(loss))
+    # The queries', keys' and values' dtypes each call of the delta rule takes in the step's program, as
+    # the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`).
+    handed = [tuple(var.aval.dtype for var in eqn.invars[:3])
+              for eqn in equations(jax.make_jaxpr(jax.grad(loss))(params).jaxpr)
+              if eqn.primitive.name == "jit" and eqn.params["name"] == "delta_rule"]
+    # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's, the
+    # recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
+    names = sorted({call.name for call in kernel_calls(step.lower(params))
+                    if call.kind in ("triton", "mosaic_gpu")})
     for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
         assert any(name.startswith(kernel) for name in names), (kernel, names)
     # The delta rule takes the projections' bf16 operands, as a native layer's port does, and its kernels
