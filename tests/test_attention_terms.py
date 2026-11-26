@@ -186,9 +186,9 @@ def test_a_relative_band_holds_the_relative_bias_it_writes_out(extent, offset):
                                   np.asarray(relative_logits(states, bank, places, np.arange(keys))))
     ones = BandBias(jnp.ones((1, 1, BAND_QUERIES, template.band_width(extent)), jnp.float32),
                     jnp.asarray(offset, jnp.int32), extent)
-    held = np.asarray(ones.dense(keys))[:, 0]
     distance = places[:, :, None] - np.arange(keys)[None, None, :]
-    assert (held[np.broadcast_to((distance >= 0) & (distance < extent), held.shape)] == 1).all()
+    held = np.broadcast_to(np.asarray(ones.dense(keys))[:, 0], distance.shape)
+    assert (held[(distance >= 0) & (distance < extent)] == 1).all()
 
 
 def test_a_relative_band_holds_a_groups_products_at_a_time():
