@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew.nn.kernels import xla_products
-from dew.nn.kernels.templates.gemm import sides as hook_sides
+from dew.nn.kernels.templates.gemm import sides
 from dew.nn.precision import at_least_fp32, effective_precision, precision_names
 from dew.nn.sharding import explicit_spec
 
@@ -115,8 +115,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     rows = ((lhs, *(each for each, _ in chained)) if chained else (lhs,) * len(matrices) if joined is None
             else (lhs, joined))
     epilogue = mosaic_gpu.joined_sum if joined is not None else epilogue
-    prologue_arrays = hook_sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
-    epilogue_arrays = hook_sides.rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
+    prologue_arrays = sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
+    epilogue_arrays = sides.rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)

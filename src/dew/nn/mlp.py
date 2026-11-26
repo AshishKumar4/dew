@@ -35,7 +35,7 @@ from .activations import (
 )
 from .blocks import normal_kernel
 from .flops import projection_flops
-from .gated_mlp import fuses, gated_mlp
+from .gated_mlp import gated_mlp
 from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
 from .kernels.projections import recipe_chain
@@ -252,19 +252,17 @@ class GatedMLP(nn.Module):
                 up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
                 out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
-        if isinstance(activation, str) and self._fusable() and self.swiglu_limit is None:
-            chained = self._chained(x, (self.gate_proj, self.up_proj, self.down_proj),
-                                    gated_product(activation), train)
-            if chained is not None:
-                return scaled(chained, self.down_multiplier)
         # A packed MLP holds no gate_proj apart (`_fusable`): its projections are read past that.
-        if (isinstance(activation, str) and self._fusable()
-                and fuses(projections := (self.gate_proj, self.up_proj, self.down_proj), x, activation,
-                          self.swiglu_limit)):
-            fused = gated_mlp(x, projections, activation,
-                              limit=self.swiglu_limit,
+        if isinstance(activation, str) and self._fusable():
+            projections = self.gate_proj, self.up_proj, self.down_proj
+            if self.swiglu_limit is None:
+                chained = self._chained(x, projections, gated_product(activation), train)
+                if chained is not None:
+                    return scaled(chained, self.down_multiplier)
+            fused = gated_mlp(x, projections, activation, limit=self.swiglu_limit,
                               names=(Residual.GATE_PROJ, Residual.UP_PROJ, Residual.DOWN_PROJ))
-            return scaled(fused, self.down_multiplier)
+            if fused is not None:
+                return scaled(fused, self.down_multiplier)
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
                 and self.ngpt is None):
@@ -296,7 +294,7 @@ class GatedMLP(nn.Module):
 
     def _fusable(self) -> bool:
         """Whether the gated product and its three projections may run fused (`dew.nn.gated_mlp`), where the
-        fused MLP's selector takes them (`gated_mlp.fuses`): its projections held apart (not packed) and its
+        fused MLP's selector takes them: its projections held apart (not packed) and its
         hidden activation neither dropped, sparsified, rescaled nor nGPT's."""
         return (not self.activation_sparsity and self.ngpt is None and self.gate_multiplier == 1.0
                 and not self.dropout_rate and not self._packed())

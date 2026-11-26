@@ -346,7 +346,7 @@ def _summing(summands, axes, top, ceiling, form: scaled.Format, carry):
     return held, error, low, below
 
 
-def _windows(summands_of, chunks: int, axes: list[tuple[int, ...]], bits: list[int], dtype):
+def _windows(summands_of, chunks: int | jax.Array, axes: list[tuple[int, ...]], bits: list[int], dtype):
     """Sums of states `summands_of(c)` gives `chunks` at a time (each sum's `(high, low, exponent)` terms
     along its `axes`, one along them after), each `(high, low, exponent)`: summed a window at a time, from its
     largest summands down (`lax.while_loop`), each window two passes over the chunks (`lax.fori_loop`, a
@@ -363,7 +363,7 @@ def _windows(summands_of, chunks: int, axes: list[tuple[int, ...]], bits: list[i
     placement, reach = form.largest - 1, form.least + form.mantissa + 1
 
     def looped(step, carry):
-        if chunks == 1:
+        if isinstance(chunks, int) and chunks == 1:
             return step(0, carry)
         return jax.lax.fori_loop(0, chunks, step, carry)
 

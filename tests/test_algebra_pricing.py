@@ -147,17 +147,17 @@ def test_a_chunk_forms_vmem_traffic_is_priced_on_a_tpu():
     assert priced.price.value > unmeasured.price.value
 
 
-def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes():
-    """A sum JAX's derivatives accumulate with (`add_any`, a leaf of the region, outside the language) is
-    priced as the add it computes, one CUDA-core operation an element, as the template's emission prices it:
-    a product and an `add_any` of it cost what a product and an add do. Its work was dropped, its leaf's
-    bytes alone charged, so a prologue holding one compared cheaper than it computes (the audit of
-    2026-11-19pm, 8964)."""
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.int32])
+def test_a_derivatives_sum_is_priced_as_the_sum_it_computes(dtype):
+    """Price a cotangent sum's work whether it is a floating add term or an opaque integer equation."""
     from jax._src.ad_util import add_jaxvals_p
 
     def priced(fn):
-        x, y = jnp.ones((64, 128), jnp.float32), jnp.ones((64, 128), jnp.float32)
-        region = terms.region(jax.make_jaxpr(fn)(x, y))
+        x, y = jnp.ones((64, 128), dtype), jnp.ones((64, 128), dtype)
+        traced = jax.make_jaxpr(fn)(x, y)
+        if (out := traced.jaxpr.eqns[-1]).primitive is add_jaxvals_p:
+            assert terms.spoken_as(out) == ("add" if dtype == jnp.float32 else None)
+        region = terms.region(traced)
         graph, bundle, _ = program.graphed(region)
         return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
                              cost_model=cost.model(region, cost.fused(generation.TARGETS["sm90"])))[1].work
@@ -165,6 +165,7 @@ def test_a_derivatives_sum_outside_the_language_is_priced_as_the_sum_it_computes
     accumulated = priced(lambda x, y: add_jaxvals_p.bind(x * y, x))
     added = priced(lambda x, y: x * y + x)
     assert accumulated.operations == added.operations
+    assert accumulated.integer_operations == added.integer_operations
 
 
 def test_a_product_of_two_16_bit_formats_is_priced_at_the_dtype_jax_gives_it():
@@ -318,9 +319,8 @@ def test_a_terms_arithmetic_is_what_the_kernels_counter_prices_its_operation_at(
 def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
     """An XLA program's fp32 division priced for an H100 issues `div.rn.f32`'s MUFU and refinement
     (`emission.IEEE_DIVISION`, M-FS-77) on whatever host prices it, and for a TPU an operation an element; an
-    int32 division and a bfloat16 one an operation an element on either, a division of a program of other
-    than fp32 values unproven fp32 (the review of lane/toolkit 58143d37f: the algebra priced on the
-    process's own target, every division at fp32)."""
+    int32 division and a bfloat16 one an operation an element on either. Traced casts to fp32 make an fp32
+    quotient even when its operands are stored in bf16 (rows 12974, 13033)."""
     hopper, tpu = generation.TARGETS["sm90"], generation.TARGETS["v5e"]
     elements = 64 * 128
 
@@ -337,6 +337,11 @@ def test_an_xla_programs_division_prices_on_its_target_at_its_dtype():
     rows = jax.ShapeDtypeStruct((64, 128), jnp.float32)
     masked = jax.make_jaxpr(lambda x, y: jnp.where(y > 0, x / y, 0.0))(rows, rows).jaxpr
     assert program.priced(masked, hopper).work.exponentials == elements
+    narrow = jax.ShapeDtypeStruct((64, 128), jnp.bfloat16)
+    mixed = jax.make_jaxpr(lambda x, y: x.astype(jnp.float32) / y.astype(jnp.float32))(narrow, narrow).jaxpr
+    mixed_work = program.priced(mixed, hopper).work
+    assert (mixed_work.conversions, mixed_work.exponentials, mixed_work.operations) == (
+        2 * elements, elements, 6 * elements)
     # A quotient a rewrite made, which no trace typed (`rules._ranged`'s of a bfloat16 program), its dtype
     # unproven: an operation an element, as a bfloat16 one (the review of lane/toolkit f8963150b).
     assert cost._priced(jax.lax.div_p, {}, [(64,), (64,)], (64,), hopper) == cost.Work(operations=64)
@@ -360,6 +365,16 @@ def test_an_xla_programs_special_function_and_power_price_their_forms_at_fp32_al
     assert (priced(jnp.log, jnp.float32).operations, priced(jnp.log, jnp.float32).exponentials) == (
         log.operations * elements, 0)
     assert priced(lambda x: x ** -2, jnp.float32).exponentials == elements
+    narrow = jax.ShapeDtypeStruct((64, 128), jnp.bfloat16)
+    wide = jax.ShapeDtypeStruct((64, 128), jnp.float32)
+    index = jax.ShapeDtypeStruct((64, 128), jnp.int32)
+    mixed = jax.make_jaxpr(lambda x: jnp.log(x.astype(jnp.float32)))(narrow).jaxpr
+    indexed = jax.make_jaxpr(lambda x, i: (jnp.log(x), i + 1))(wide, index).jaxpr
+    for traced, conversions, integer_operations in ((mixed, 1, 0), (indexed, 0, 1)):
+        work = program.priced(traced, hopper).work
+        assert (work.operations, work.conversions, work.integer_operations, work.exponentials) == (
+            log.operations * elements, (log.conversions + conversions) * elements,
+            (log.integer_operations + integer_operations) * elements, 0)
     with jax.enable_x64(new_val=True):
         assert (priced(jnp.log, jnp.float64).exponentials, priced(jnp.log, jnp.float64).operations) == (
             elements, 0)

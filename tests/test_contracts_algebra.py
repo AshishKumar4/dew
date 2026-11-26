@@ -2,11 +2,12 @@
 contracts): every order finite wherever its float64 truth is a normal float32 and its plain float32 formula is
 finite."""
 
+import jax
 import jax.numpy as jnp
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
-from dew.algebra import means, moments, windows
+from dew.algebra import means, moments, scan, windows
 
 
 def _plain(outputs, totals, anchors):
@@ -48,11 +49,13 @@ def _chunked_cov(x, y, w):
     return moments.chunked_covariance(x, y, w, tile=4, mode="merge")
 
 
-@pytest.mark.parametrize("taken", ORDER_SETS)
+# Reverse-over-reverse needs about 8 GiB cold, leaving too little room for other tests' compilers.
+@pytest.mark.parametrize("taken", [pytest.param(order, marks=pytest.mark.fresh_process)
+                                  if order == "grad of grad" else order for order in ORDER_SETS])
 def test_chunked_moments_holds_every_order(taken):
     """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
-    (`moments.chunked_covariance`, merge) hold every derivative order finite against float64 truth and their
-    plain declarations across float32's exponent edges (`EDGES`)."""
+    (`moments.chunked_covariance`, merge) hold every derivative order across float32's exponent edges.
+    Use the plain declarations in float64 as independent truth, not the same chunked AD rule."""
     x, y, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
     dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
     c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
@@ -60,10 +63,27 @@ def test_chunked_moments_holds_every_order(taken):
         w_pos = ((jnp.abs(w) + 0.25) * scale).at[:, 0].set(0.0)
         assert_contract(_chunked_weighted, (x * scale, w_pos), (dx * scale, dw * scale), (c_mean, c_cov),
                         f"chunked moments {edge}", plain_fn=moments.weighted_moments,
-                        taking=ORDER_SETS[taken])
+                        truth_fn=moments.weighted_moments, taking=ORDER_SETS[taken])
         assert_contract(_chunked_cov, (x * scale, y * scale, w_pos), (dx * scale, dy * scale, dw * scale),
                         (c_mean, c_my, c_cov), f"chunked covariance {edge}",
-                        plain_fn=moments.weighted_covariance, taking=ORDER_SETS[taken])
+                        plain_fn=moments.weighted_covariance, truth_fn=moments.weighted_covariance,
+                        taking=ORDER_SETS[taken])
+
+
+def test_a_decayed_pair_holds_its_derivatives():
+    keys = jnp.asarray([[2.0, 0.0], [0.0, 0.0]], jnp.float32)
+    decay = jnp.zeros((2, 2, 2), jnp.float32).at[1, 0, 0].set(0.5)
+
+    def paired(x):
+        rows = jnp.zeros_like(keys).at[1, 0].set(x)
+        return scan._paired(rows, keys, decay)[1, 0]
+
+    assert jax.jit(jax.grad(jax.grad(lambda x: jnp.square(paired(x)))))(jnp.float32(3)) == 2
+
+    # The user input is finite; the read it produces overflows, but d(read)/dx and the held factors do not.
+    value, gradient = jax.jit(jax.value_and_grad(lambda x: paired(2 * x)))(jnp.float32(2.0 ** 127))
+    assert jnp.isposinf(value)
+    assert gradient == 2
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

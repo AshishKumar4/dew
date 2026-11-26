@@ -599,8 +599,8 @@ def _split(producer, values):
         return producer(jax.tree.unflatten(treedef, list(leaves)))
 
     # The producer as the algebra pass rewrites it, before the fuser stages it (docs/design/algebra.md §2).
-    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(algebra.rewritten(flat))(*leaves)))(
-        *leaves)
+    source = jax.make_jaxpr(algebra.rewritten(flat))(*leaves)
+    closed = jax.make_jaxpr(functools.partial(_inlined, source))(*leaves)
     jaxpr = closed.jaxpr
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
@@ -624,8 +624,9 @@ def _split(producer, values):
     # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
     arrays = jax_core.jaxpr_as_fun(jax_core.Jaxpr(jaxpr.replace(outvars=[base, *sides]),
                                                   closed.consts))(*leaves)
-    whole = functools.partial(_staged, jax_core.Jaxpr(
-        jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
+    debug = jax_core.DebugInfo("gemm_prologue", "prologue tile", None, None)
+    staged = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage, debug_info=debug)
+    whole = functools.partial(_staged, jax_core.Jaxpr(staged, closed.consts))
     axes = _prologue_axes(whole, arrays, shape)
     if isinstance(axes, Refusal):
         return axes
@@ -633,18 +634,53 @@ def _split(producer, values):
                                     if axis is not None))
                 for array, side_axes in zip(arrays[1:], axes, strict=True)]
     named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
-    function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
+    types = tuple(jax.typeof(array) for array in arrays)
+    function = functools.partial(_prologue_tile, whole, types, axes)
     places = tuple(given.get(var) for var in (base, *sides))
-    jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
     # Priced (`Formed`): the element stage the prologue runs, counted as its launch's body is (`priced`), and
     # XLA's programs beside it.
-    staged = jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage)
     # XLA's program of the sides: the producer's, read back from them (its extraction prices what they read
     # alone); none where every side is an input the stage reads as given.
     computed = any(not isinstance(var, jax_core.Literal) and var not in jaxpr.invars for var in sides)
+    whole_jvp = functools.partial(_whole_jvp, flat, tuple(leaves), places,
+                                  tuple(array.shape for array in arrays))
+    if computed or any(not jnp.issubdtype(array.dtype, jnp.inexact) for array in arrays):
+        jvp = whole_jvp
+    elif any(programs.own_derivative(eq.primitive) for eq in programs.equations(source.jaxpr)):
+        jvp = _tile_jvp(whole_jvp, arrays, types, axes)
+        if isinstance(jvp, Refusal):
+            return jvp
+    else:
+        jvp = None
     formed = Formed(staged, closed.replace(jaxpr=jaxpr.replace(outvars=list(sides))) if computed else None,
                     closed, float(sum(array.size * array.dtype.itemsize for array in squeezed)))
     return arrays[0], function, squeezed, named, jvp, formed
+
+
+def _tile_jvp(whole_jvp, arrays: list, types: tuple, axes: tuple):
+    """Prove the producer's own JVP uses the offered primal and tangent tiles. Keep the original
+    derivative on whole arrays, where higher orders must read its nested custom rules."""
+    count = len(arrays)
+
+    def push(*values):
+        return whole_jvp(*values[:count])(*values[count:])
+
+    tangent = functools.partial(_inlined, jax.make_jaxpr(push)(*arrays, *arrays))
+    offered = (*axes, PROLOGUE_AXES, *axes)
+    taken = _prologue_axes(tangent, [*arrays, *arrays], arrays[0].shape)
+    if isinstance(taken, Refusal):
+        return taken
+    if offered != taken:
+        return Refusal("derivative_tiles", "the producer's derivative needs different tiles than its value")
+    return functools.partial(_jvp_on_tile, whole_jvp, tangent, (*types, *types), offered)
+
+
+def _jvp_on_tile(whole_jvp, derivative, types, axes, base, *sides):
+    # Mosaic can stage a proposal on small synthetic tiles before entering a launch context.
+    whole = all(array.shape == aval.shape for array, aval in zip((base, *sides), types, strict=False))
+    if whole and not _on_tiles():
+        return whole_jvp(base, *sides)
+    return functools.partial(_prologue_tile, derivative, types, axes, base, *sides)
 
 
 def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):

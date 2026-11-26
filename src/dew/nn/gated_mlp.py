@@ -18,24 +18,23 @@ otherwise, as `GatedMLP` ran them.
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.core import meta
-from flax.linen.dtypes import canonicalize_dtype
+from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn import activations
-from dew.nn.dense import Dense, _promoted
 from dew.nn.joined import Projections, projection_requirements, projections_of
 from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
+from dew.nn.kernels.templates.gemm import wide
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
 from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.residuals import RECOMPUTED, Residual
 from dew.nn.sharding import automatic_axes, on_shards
 
 FUSION_ROW = 'ledger 1958'
@@ -72,6 +71,8 @@ class GatedCase:
     gather: jax.ShapeDtypeStruct | None = None
     scatter: jax.ShapeDtypeStruct | None = None
     layer: jax.ShapeDtypeStruct | None = None
+    placement: tuple[jax.sharding.PartitionSpec, dict, jax.ShapeDtypeStruct] | None = dataclasses.field(
+        default=None, compare=False)
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -108,6 +109,45 @@ class GatedCase:
             return False
         tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
         return hook_lowers(self.hook, (tile, tile), gpu_target())
+
+    def wide_launched(self) -> bool:
+        """Whether the GEMM template launches the wide split-epilogue product (`wide.gated_product`) and
+        plain down product (`projections.launches`) on this device, asked only where `wide` is chosen."""
+        from dew.nn.kernels import generation, grouped_matmul, selection
+        from dew.nn.kernels.selection import KernelRefused
+
+        if self.grouped or self.kernels is None or self.hook is None or not self.whole:
+            return False
+        gate, down = self.kernels
+        if gate.shape[-1] % wide.GROUP:
+            return False
+        saved = not _recomputes_gate_up()
+        wide_kernel = jax.ShapeDtypeStruct((1, gate.shape[0], 2 * gate.shape[-1]), self.dtype)
+        sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+        hidden = jax.ShapeDtypeStruct((self.rows.shape[0], gate.shape[-1]), self.dtype)
+        epilogue = wide.Gated(self.hook, self.dtype, saved)
+        with generation.routes(alone=True):
+            try:
+                call, product = gemm._gemm_call(
+                    self.rows, wide_kernel, sizes, None, (), (), epilogue, (), (),
+                    (self.dtype,) * (1 + saved), several=True, transpose_rhs=False, interpret=False,
+                    precision=self.precision, dense=True, paired=None, first=None, gather=None,
+                    scatter=None, summed_as=())
+                case = grouped_matmul.grouped_case(*call, product=product, whole=self.whole)
+                if selection.selected(grouped_matmul.GROUPED, case).name != grouped_matmul.MOSAIC.name:
+                    return False
+                if not projections.launches(hidden, down, self.dtype, self.precision, whole=self.whole):
+                    return False
+            except KernelRefused:
+                return False
+        tile = jax.ShapeDtypeStruct((128, 128), self.dtype)
+        return hook_lowers(self.hook, (tile, tile), gpu_target())
+
+
+def _recomputes_gate_up() -> bool:
+    """Whether an enclosing remat rung recomputes the gate or up projection (`RECOMPUTED`)."""
+    recomputed = RECOMPUTED.get()
+    return Residual.GATE_PROJ in recomputed or Residual.UP_PROJ in recomputed
 
 
 def _grouped_stack(matrix: jax.ShapeDtypeStruct, dtype: jnp.dtype,
@@ -207,7 +247,33 @@ FUSED_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
 them runs its projections apart even where the fused MLP is named."""
 
 FUSED = Kernel[GatedCase]('fused', FUSED_SUPPORTS)
-"""The three products on the template's hooks (`gated_mlp`)."""
+"""The three products on the template's hooks (`fused_products`)."""
+
+WIDE_SUPPORTS: tuple[Requirement[GatedCase], ...] = (
+    *projection_requirements(lambda case: case.projections, "the wide fused MLP"),
+    Requirement('dense', lambda case: not case.grouped,
+                "the wide split-epilogue product takes dense projections alone", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('uniform', lambda case: case.uniform,
+                "the projections differ in dtype, precision or promotion", row=INHERENT, kind='handoff'),
+    Requirement('biased', lambda case: not case.biased,
+                "a projection adds a bias, which no hook of the fused MLP adds yet", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('aligned_hidden', lambda case: (
+                    case.kernels is not None and case.kernels[0].shape[-1] % wide.GROUP == 0),
+                f"the hidden width is not a multiple of {wide.GROUP} columns", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('hook', lambda case: case.hook is not None,
+                "the gated activation has no elementwise hook to lower on the template", row=FUSION_ROW,
+                kind='handoff'),
+    Requirement('wide_launched', lambda case: case.wide_launched(),
+                "no launch of the GEMM template stores the narrowed wide gated product or takes the down "
+                "product here", row=FUSION_ROW, kind='handoff'),
+)
+"""What the wide split-epilogue MLP needs to stand in for the projections' own calls."""
+
+WIDE = Kernel[GatedCase]('wide', WIDE_SUPPORTS)
+"""One wide interleaved gate+up product with a narrowed split-epilogue and plain down (`wide_products`)."""
 
 FUSED_CELLS: dict[tuple[str | None, jnp.dtype | tuple[jnp.dtype, str]], tuple[Kernel[GatedCase], str]] = {}
 """The fused MLP's declared cells, `(device generation, dtype)` for dense or `(device generation, (dtype,
@@ -215,10 +281,10 @@ FUSED_CELLS: dict[tuple[str | None, jnp.dtype | tuple[jnp.dtype, str]], tuple[Ke
 product holds a cell (`norm_swiglu.SWIGLU_CELLS`), a cell here is declared only from the fused MLP's own
 receipt on that generation."""
 
-GATED_MLP: Op[GatedCase] = Op(Choice.GATED_MLP, (FUSED, Kernel('apart', (), generic=True)),
+GATED_MLP: Op[GatedCase] = Op(Choice.GATED_MLP, (FUSED, WIDE, Kernel('apart', (), generic=True)),
                               lambda case: 'apart', declared=FUSED_CELLS)
-"""The fused MLP's selector: the projections apart, but fused where a receipt declares it faster
-(`FUSED_CELLS`) or the block names it, and its requirements hold."""
+"""The fused MLP's selector: the projections apart, or `fused`/`wide` where a receipt declares it on par or
+faster (`FUSED_CELLS`) or the block names it, and its requirements hold."""
 
 
 def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
@@ -229,24 +295,27 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
     found = projections_of(projections_)
     # A kernel a wrapper owns the products of (a served model's quantized kernel, `found.intercepted`) is
     # the wrapper's to read, never an array of the products' dtype.
-    kernels = (tuple(meta.unbox(projection.get_variable('params', 'kernel')) for projection in projections_)
-               if found.held and not found.intercepted else None)
-    # The gate's and the down projection's kernels promote with the rows, as `gated_mlp` promotes them.
-    dtype = canonicalize_dtype(x, *(() if kernels is None else (kernels[0], kernels[2])), dtype=gate.dtype)
+    kernels = found.leaves.kernels if found.leaves is not None and not found.intercepted else None
+    dtype = canonicalize_dtype(x, *(() if kernels is None else (kernels[0],)), dtype=gate.dtype)
+    uniform = all((p.dtype, p.precision, p.promote_dtype) == (gate.dtype, gate.precision, promote_dtype)
+                  for p in projections_)
+    if uniform and kernels is not None and gate.dtype is None:
+        # An apart down projection takes the gated product's dtype, not the original input's.
+        up = canonicalize_dtype(x, kernels[1])
+        uniform = up == dtype and jnp.result_type(dtype, kernels[2].dtype) == dtype
     # Where the rows run per shard (`_placement`), the products are each shard's, of its rows and the
     # kernels gathered whole in the map.
     placement = None if kernels is None else _placement(x, projections_, kernels)
     rows = (x.size // x.shape[-1], x.shape[-1]) if placement is None else placement[2].shape
     return GatedCase(
         projections=found,
-        uniform=len({(projection.dtype, projection.precision, projection.promote_dtype)
-                     for projection in projections_}) == 1,
+        uniform=uniform,
         biased=any(projection.use_bias for projection in projections_),
         rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[2].shape, dtype)),
         whole=placement is not None or not automatic_axes(),
-        precision=gate.precision, hook=activations.gated_hook(activation, limit))
+        precision=gate.precision, hook=activations.gated_hook(activation, limit), placement=placement)
 
 
 def _placement(x: jax.Array, projections_: Sequence[nn.Module], kernels: tuple[jax.Array, ...]):
@@ -255,17 +324,6 @@ def _placement(x: jax.Array, projections_: Sequence[nn.Module], kernels: tuple[j
     map from where the traced program's layout places it, as a projection's product maps its rows
     (`projections.mapped_shards`); None elsewhere."""
     return projections.shard_placement(x, kernels, tuple(map(projections.kernel_path, projections_)))
-
-
-def fuses(projections_: Sequence[nn.Module], rows: jax.Array, activation: str,
-          limit: float | None = None) -> TypeGuard[Sequence[Dense]]:
-    """Whether a gated MLP's projections (gate, up, down) of `rows`, its gated product `activation`'s clamped
-    at `limit`, run fused (`gated_mlp`), as the fused MLP's selector reports it (`GATED_MLP`), so each a
-    bare `Dense` (its `dense` requirement), which the answer states of them for `gated_mlp`. Initialization
-    creates each projection's parameters through its own call."""
-    if projections_[0].is_initializing():
-        return False
-    return select(GATED_MLP, gated_case(rows, projections_, activation, limit)).kernel == 'fused'
 
 
 _GROUPED_PROJECTIONS = Projections(
@@ -336,28 +394,55 @@ def fuses_grouped(rows: jax.Array | jax.ShapeDtypeStruct,
         group_sizes=group_sizes, gather=gather, scatter=scatter, layer=layer)).kernel == 'fused'
 
 
-def gated_mlp(x: jax.Array, projections_: Sequence[nn.Dense], activation: str, *,
-              limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array:
-    """A gated MLP's output of `x` through its projections (gate, up, down), fused (`fused_products`), each
-    kernel read and cast as its projection's call casts it."""
-    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
-                for projection in projections_]
-    inputs = promoted[0][0]
-    kernels = tuple(kernel for _, kernel, _ in promoted)
+def gated_mlp(x: jax.Array, projections_: Sequence[nn.Module], activation: str, *,
+              limit: float | None = None, names: tuple[str, str, str] | None = None) -> jax.Array | None:
+    """Select and run the gated MLP once. None leaves the projections to their own calls; a fused route
+    uses the kernels, dtype and placement already read for its admission."""
+    if projections_[0].is_initializing():
+        return None
+    case = gated_case(x, projections_, activation, limit)
+    form = select(GATED_MLP, case).kernel
+    leaves = case.projections.leaves
+    if form == 'apart' or leaves is None:
+        return None
+    runner = wide_products if form == 'wide' else fused_products
+    # Both kernels admit only the standard uniform promotion. Cast the common input once.
+    inputs = jnp.asarray(x, dtype=case.dtype)
+    kernels = tuple(jnp.asarray(kernel, dtype=case.dtype) for kernel in leaves.kernels)
 
     def products(inputs, gate, up, down):
-        out = fused_products(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
-                             precision=projections_[0].precision, names=names)
+        out = runner(inputs.reshape(-1, inputs.shape[-1]), (gate, up, down), activation, limit=limit,
+                     precision=case.precision, names=names)
         return out.reshape(*inputs.shape[:-1], out.shape[-1])
 
-    # On a mesh splitting its rows alone, each device's rows are its own products' (`_placement`, as
-    # `fuses` read them), its kernels gathered whole there, so each one's gradient leaves the map
-    # reduce-scattered back to its placement.
-    placement = _placement(x, projections_, kernels)
+    # Each device reads its own rows and gathers the kernels, so gradients are reduce-scattered back.
+    placement = case.placement
     if placement is None:
         return products(inputs, *kernels)
     split, gathered, _ = placement
     return on_shards(products, split, (inputs, *kernels), gathered=gathered)
+
+
+def wide_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Array], activation: str, *,
+                  limit: float | None = None, precision=None, names: tuple[str, str, str] | None = None,
+                  interpret_on_cpu: bool = False) -> jax.Array:
+    """`rows`' output through a gated MLP's kernels (gate, up, down; `[in, hidden]`, `[in, hidden]`,
+    `[hidden, out]`), using one wide interleaved gate+up product with a narrowed split-epilogue
+    (`wide.gated_product`, formulation (C), docs/design/kernel-templates.md §3) and a plain down product
+    (`gemm.gemm`). Recomputes the gate+up residual (`saved=False`) when an enclosing remat rung names
+    `Residual.GATE_PROJ` or `Residual.UP_PROJ` (`RECOMPUTED`)."""
+    dtype = rows.dtype
+    hook = activations.gated_hook(activation, limit)
+    if hook is None:
+        raise ValueError(f"gated activation {activation!r} has no elementwise hook for wide_products")
+    saved = not _recomputes_gate_up()
+    labels = names[:2] if names is not None else (Residual.GATE_PROJ, Residual.UP_PROJ)
+    combined = wide.interleaved(kernels[0], kernels[1])
+    hidden = wide.gated_product(rows, combined, hook, out_dtype=dtype, saved=saved, name=labels,
+                                precision=precision, interpret_on_cpu=interpret_on_cpu)
+    out = gemm.gemm(hidden, kernels[2], out_dtype=dtype, precision=precision,
+                    interpret_on_cpu=interpret_on_cpu)
+    return out if names is None else checkpoint_name(out, names[2])
 
 
 def fused_products(rows: jax.Array, kernels: tuple[jax.Array, jax.Array, jax.Array], activation: str, *,

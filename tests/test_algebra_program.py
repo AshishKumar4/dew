@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, assert_computes_the_oracle, equations
-from test_algebra import cheaper_spliced, rows, traces_cheaper, two_sums
+from test_algebra import cheaper_spliced, count_above, rows, traces_cheaper, two_sums
 
 from dew import algebra
 from dew.algebra import cost, program, terms
@@ -188,9 +188,7 @@ def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pa
                          ids=lambda dtype: jnp.dtype(dtype).name)
 def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
     """A literal 2 of each float dtype, numpy's own (float32) and ml_dtypes' (bfloat16, float8), which numpy's
-    type tree does not place among its floats: its magnitude (`terms.region`) and its power of two's exact and
-    positive scale (`rules.exact_scale`, `rules.positive_scale`) stated alike, where a bfloat16 or float8
-    literal had none."""
+    type tree does not place among its floats: its magnitude and its positive scale are stated alike."""
     from egglog import EGraph, i64
 
     closed = jax.make_jaxpr(lambda x: x * jnp.asarray(2.0, dtype))(jnp.ones((4,), dtype))
@@ -199,7 +197,6 @@ def test_a_literal_of_any_float_dtype_states_its_magnitude_and_scale(dtype):
     graph = EGraph()
     program.stated(graph, region)
     assert region.magnitudes[terms.key(literal)] == 1
-    assert graph.check_bool(algebra.rules.exact_scale(literal))
     assert graph.check_bool(algebra.rules.positive_scale(literal))
 
 
@@ -418,24 +415,25 @@ def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
                                   jax.jit(algebra.rewritten(two_sums))(*operands))
 
 
-def test_two_sums_join_into_one_where_the_model_prices_it_cheaper():
-    """Two sums of bounded values (`sum(tanh(x)) + sum(tanh(y))`): the model reads each operand once either
-    way and counts one reduction's operations and one addition fewer joined, so the pass splices a form it
-    prices cheaper, and the program computes what it computes (check 1)."""
-    def two(x, y):
-        return jnp.sum(jnp.tanh(x), axis=-1) + jnp.sum(jnp.tanh(y), axis=-1)
+@pytest.mark.parametrize(("length", "reductions"), [(128, 1), (129, 2)])
+def test_floating_count_join_respects_the_accumulators_exact_integer_range(length, reductions):
+    def counted(x, y):
+        left = jax.lax.reduce_sum((x > 0).astype(x.dtype), (0,))
+        right = jax.lax.reduce_sum((y > 0).astype(y.dtype), (0,))
+        return left + right
 
-    shapes = ((64, 128), (64, 128))
-    assert cheaper_spliced(two, *rows(3, *shapes))
-    assert_as_exact(jax.jit(algebra.rewritten(two)), jax.jit(two), lambda seed: rows(seed, *shapes),
-                    "two sums", seeds=16)
+    x = jnp.ones((length,), jnp.bfloat16)
+    y = x.at[0].set(0)
+    run = algebra.rewritten(counted)
+    traced = jax.make_jaxpr(run)(x, y)
+    assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in equations(traced.jaxpr)) == reductions
+    np.testing.assert_array_equal(jax.jit(run)(x, y), jax.jit(counted)(x, y))
 
 
 def _clamped_products(x, a, b, lower, upper, operand=jnp.tanh):
-    """A clamped value (of `operand(x)`) read by two products of bounded values, which the pass joins into
-    one product of their sum."""
+    """A clamped value read by both products of an elementwise sum, eligible for distributivity."""
     clamped = jax.lax.clamp(lower, operand(x), upper)
-    return jnp.sum(clamped * jnp.tanh(a), axis=-1) + jnp.sum(clamped * jnp.tanh(b), axis=-1)
+    return jnp.sum(clamped * jnp.tanh(a) + clamped * jnp.tanh(b), axis=-1)
 
 
 CLAMP_EDGES = np.asarray([np.inf, -np.inf, 0.0, -0.0, 0.3, 1.0, -2.0, 5.0, 2.0 ** -140], np.float32)
@@ -654,19 +652,16 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     with report.refusals():
         options.program(joined).compiled(x, y, a)
         [made] = report.rewrites()
-    assert made.fired.get("linear", 0) > 0
+    assert made.fired.get("joined", 0) > 0
     assert made.after < made.before
     assert made.seconds > 0
     assert made.spliced == 1
 
 
 def test_a_pass_without_a_rule_set_leaves_its_rewrites_untaken():
-    """A pass that leaves sets out (`algebra.program.passes`' `without`, a rule set's receipt's arm) admits
-    them nowhere and takes none of their rewrites: the sums the `linear` set joins (as the test above
-    records) are rewritten without it by `joined`, the other set that joins them, and by no `linear` match,
-    and without both by none at all, their program computing what the program with no pass computes. A
-    derivation's own set an arm may name (`carry`'s) is taken; a dev-time set, a derivation's defining set
-    and a name no set registers are refused, as an arm without them would measure nothing."""
+    """A pass that leaves sets out admits none of their rewrites: only `joined` can join these counts.
+    Without it they compute what the program with no pass computes. A derivation's named set can be
+    left out; a dev-time set, a derivation's defining set and an unregistered name are refused."""
     from dew.algebra.program import passes
 
     def joined(x, y, a):
@@ -812,27 +807,20 @@ def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rule
     assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
                     seeds=8)
 
-def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
-    """A contraction's result scaled by a power of two (a derived walk's `ds k * scale`, docs/design/
-    algebra.md §1.4) scales its smaller operand instead, the product being linear in each and the scale
-    rounding nothing: the rewritten program takes that cheaper form (4 x 4 values multiplied where 4 x 16
-    were), on par with the program as written against the float64 truth (check 1). A scale of another value
-    is rewritten into nothing, as moving it reorders rounding."""
+@pytest.mark.parametrize("factor", [0.25, 0.3])
+def test_a_scale_after_a_contraction_stays_after_the_product(factor):
+    """A bounded contraction has no lower-range proof for its operands or their products."""
     def scaled(g, i):
-        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.25
-
-    def other(g, i):
-        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.3
+        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * factor
 
     g, i = rows(6, (4, 4), (4, 16))
-    assert not cheaper_spliced(other, g, i)
-    assert cheaper_spliced(scaled, g, i)
+    assert not cheaper_spliced(scaled, g, i)
 
     def draw(seed):
         return rows(seed, (4, 4), (4, 16))
 
     assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
-                    "a scale through a contraction", seeds=16)
+                    "a scalar kept after its contraction", seeds=16)
 
 
 @pytest.mark.parametrize("scaled", ["left", "right"])
@@ -1144,11 +1132,8 @@ def test_an_algebra_span_joins_the_windows_around_it():
     marked call left, and the program computes what it computes (check 1)."""
     from dew.nn.derivatives import Algebra, marked
 
-    def inside(x, a):
-        return jnp.sum(jnp.tanh(a) * jnp.tanh(x), axis=-1)
-
     def spanning(x, y, a):
-        return marked(Algebra(), inside)(x, a) + jnp.sum(jnp.tanh(a) * jnp.tanh(y), axis=-1)
+        return marked(Algebra(), count_above)(x, a) + count_above(y, a)
 
     assert cheaper_spliced(spanning, *rows(13, *SHAPES_MARKED))
     assert _marked_kinds(jax.make_jaxpr(algebra.rewritten(spanning))(*rows(13, *SHAPES_MARKED))) == []

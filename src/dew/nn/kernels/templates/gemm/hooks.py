@@ -92,13 +92,13 @@ def kept_outputs(named: tuple, residuals: int = 0) -> tuple[int, ...]:
 
 
 def held_outputs(out, named: tuple, several: bool, residuals: int = 0) -> tuple:
-    """`gemm`'s forward's outputs `out` (several, or one) and what it saves (`kept_outputs`): each output
-    `named` names a residual under its name, the one array the output and the residual are; the first
-    `residuals` (`Residualized`'s) saved, named or not, and never returned."""
+    """Return the visible outputs and the saved outputs. A named output can have multiple checkpoint
+    aliases; the first residuals outputs are saved but not returned, with or without a name."""
     outs = list(out if several else (out,))
-    names = tuple(named) + (None,) * (len(outs) - len(named))
-    outs = [checkpoint_name(each, name) if name is not None else each
-            for each, name in zip(outs, names, strict=True)]
+    for at, names in enumerate(named):
+        if names is not None:
+            for name in (names,) if isinstance(names, str) else names:
+                outs[at] = checkpoint_name(outs[at], name)
     saved = tuple(outs[at] for at in kept_outputs(named, residuals))
     return (tuple(outs[residuals:]) if several else outs[0]), saved
 
