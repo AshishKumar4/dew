@@ -8,7 +8,7 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, cast
 
 import jax
 import jax.numpy as jnp
@@ -252,8 +252,9 @@ def _streamed_tangents(
         else:
             # Both outputs take the same linear form, with one value column per mean and shared weights.
             centers = jnp.stack((cx0, cy0), axis=-1)
+            directions = cast(tuple[jax.Array, jax.Array], (dx0, dy0))
             d_centers = (SymbolicZero(jax.typeof(centers).to_tangent_aval()) if x_still
-                         else jnp.stack((dx0, dy0), axis=-1))
+                         else jnp.stack(directions, axis=-1))
             weight = dw0 if held else dw0[..., None]
             moving = (1,) if x_still else (0,) if held else (0, 1)
             means = _ratio_jvp_only((centers, w0[..., None], present[..., None], unit[..., None]),
