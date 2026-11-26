@@ -51,7 +51,7 @@ from jax.custom_batching import custom_vmap
 
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, scaled, terms
-from dew.algebra.forms import Derived, Refused
+from dew.algebra.forms import Derived, Refused, scalar_case_batch
 from dew.algebra.scan import (
     _carry_type,
     _exp,
@@ -601,12 +601,7 @@ def _scored(queries, keys, dots, values, weights):
     return lax.cond(jnp.any(~jnp.isfinite(dots)), recover, ordinary, queries, keys, dots, values, weights)
 
 
-@_scored.def_vmap
-def _batch_scored(size, batched, *operands):
-    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)),
-                          operands, tuple(batched))
-    found = _scored(*placed)
-    return found, jax.tree.map(lambda _: True, found)
+_scored.def_vmap(functools.partial(scalar_case_batch, _scored))
 
 
 def _mapped(chunk: Chunked, state, w, issue=None):

@@ -53,7 +53,7 @@ from jax.extend import core as jcore
 from dew import _cache
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, ratios, terms, windows
-from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
+from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, scalar_case_batch
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.kernels.templates.axes import laid
@@ -1288,13 +1288,7 @@ def _pair_dispatch(left, right, decay, after):
     return lax.cond(repair, lambda: _pair_sum(_pair_factors(left, right, decay, after)), lambda: ordinary)
 
 
-@_pair_dispatch.def_vmap
-def _batch_pair_dispatch(size, batched, *operands):
-    # Reduce across the batch before choosing the path so vmap does not evaluate both. Shape-safe
-    # broadcasting allows further enclosing maps to add axes using this same rule.
-    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)),
-                         operands, tuple(batched))
-    return _pair_dispatch(*placed), True
+_pair_dispatch.def_vmap(functools.partial(scalar_case_batch, _pair_dispatch))
 
 
 _portable_pairs = contracted("test_a_decayed_pair_holds_its_derivatives")(
