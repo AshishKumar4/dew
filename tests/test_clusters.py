@@ -141,8 +141,8 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone(monkeypatch):
     states none; else its places among the GPUs the pool's list shows as CUDA enumerates it on the host's
     `nvidia-smi -L` listing, by index or UUID, up to an entry naming none of them (row 13104: `0,2,-1,1`
     shows 0 and 2); refused before any process starts where the list shows too few, or CUDA's enumeration
-    of it is not known (the host lists none of its GPUs, one GPU named twice, MIG devices). A pool kept off
-    its GPUs takes its devices by their places. The host answers through
+    of it is not known (the host lists none of its GPUs, one GPU named twice, MIG devices, indices and
+    UUIDs mixed). A pool kept off its GPUs takes its devices by their places. The host answers through
     `subprocess`, whatever machine runs this."""
     import subprocess
 
@@ -169,8 +169,10 @@ def test_dew_launch_shows_each_process_its_own_gpus_alone(monkeypatch):
     assert by_uuid == [("GPU-3d44", "0"), ("GPU-1b", "0")]
     # Refused: a list showing too few (`0,99,1` shows 0 alone), none checked (no listing), one naming no GPU,
     # one GPU named twice (by index and UUID), and MIG devices, whose enumeration CUDA decides.
+    # And a list mixing indices and UUIDs, whose GPUs CUDA numbers in an order of its own (row 13118): `0`
+    # and `GPU-1b22` may be one GPU where CUDA's order is not the list's.
     refused = ((LISTING, "0,99,1"), (None, "0,1"), (LISTING, "GPU-9f,0"), (LISTING, "0,GPU-0a11"),
-               (LISTING, "MIG-5e55,MIG-6f66"))
+               (LISTING, "MIG-5e55,MIG-6f66"), (LISTING, "0,GPU-1b22"))
     for listing, visible in refused:
         with pytest.raises(ValueError):
             pool(listing, "JAX_PLATFORMS=cuda", f"CUDA_VISIBLE_DEVICES={visible}")

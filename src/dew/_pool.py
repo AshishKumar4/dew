@@ -105,12 +105,13 @@ class GpuListing:
             return int(entry) < len(self.gpus)
         return sum(uuid.startswith(entry) for uuid in (*self.gpus, *self.migs)) == 1
 
-    def gpu(self, entry: str) -> int | None:
-        """The index of the whole GPU an entry it names (`names`) is, by index or UUID; None for a MIG
-        device, which CUDA enumerates by its own rules (at most one compute instance a GPU instance)."""
+    def gpu(self, entry: str) -> str | None:
+        """The whole GPU an entry it names (`names`) is, as its kind names it: an index as itself, a UUID or
+        its start as the UUID it starts; None for a MIG device, which CUDA enumerates by its own rules (at
+        most one compute instance a GPU instance)."""
         if entry.isdigit():
-            return int(entry)
-        found = [index for index, uuid in enumerate(self.gpus) if uuid.startswith(entry)]
+            return entry
+        found = [uuid for uuid in self.gpus if uuid.startswith(entry)]
         return found[0] if found else None
 
 
@@ -130,14 +131,18 @@ def visible_list(visible: str, listing: GpuListing | None = None) -> list[str]:
 
 def verified_visible(visible: str, listing: GpuListing | None) -> list[str] | None:
     """The GPUs `visible` makes visible on a host whose GPUs `listing` lists (`visible_list`), where CUDA's
-    enumeration of them is known: each a whole GPU, named once (an index and its UUID name one GPU twice).
-    None where it is not: the host lists none, a MIG device is among them (CUDA shows at most one compute
-    instance a GPU instance, whichever it picks), or a GPU is named twice."""
+    enumeration of them is known: each a whole GPU, named once, all by index or all by UUID. None where it
+    is not: the host lists none, a MIG device is among them (CUDA shows at most one compute instance a GPU
+    instance, whichever it picks), a GPU is named twice, or indices and UUIDs are mixed, as CUDA numbers its
+    devices in an order of its own that `nvidia-smi` may not list them in (row 13118: an index and a UUID
+    can name one GPU, or two indices' GPUs be told apart from what the list shows)."""
     if listing is None:
         return None
     shown = visible_list(visible, listing)
     gpus = [listing.gpu(entry) for entry in shown]
     if any(gpu is None for gpu in gpus) or len(set(gpus)) < len(gpus):
+        return None
+    if len({entry.isdigit() for entry in shown}) > 1:
         return None
     return shown
 
