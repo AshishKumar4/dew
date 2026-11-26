@@ -1443,19 +1443,19 @@ def _step_scaling(index, slots, *, per: int, offset, mine_rows) -> Callable:
     """Dew: a step-scaled walk's scaling of a step's exact partial (`gmm`'s and `tgmm`'s `step_scales`,
     `mosaic.Issuer.summed_apart`'s `scale(start, columns, partial)`): times this consumer's rows' scales
     (`row_scales`) and the tile's columns' (`column_scales`: one a column, or the tile's block's at `offset`,
-    `per` columns a scale), in an order the scales choose for an E4M3 step's partial, zero or 2^-18 to 2^25
-    (`product.ranged_scaled`: no spurious overflow or underflow, rows 13257, 13274). `index` the step's."""
-    from dew.nn.kernels.templates.product import ranged_scaled
+    `per` columns a scale), in `precision.scaled_partial`'s order, as XLA's arm scales (two scales near 2^64
+    overflow multiplied first though the scaled partial is finite: rows 13257, 13274). `index` the step's."""
+    from dew.nn.precision import scaled_partial
 
     del index
     rows = slots['row_scales'].at[0, mine_rows][...]
     column_scales = slots['column_scales']
-    scaled = functools.partial(ranged_scaled, binades=(-18, 25))
     if per == 1:
-        return lambda start, columns, partial: scaled(
+        return lambda start, columns, partial: scaled_partial(
             partial, rows[:, None], column_scales.at[0, pl.ds(start, columns)][...][None, :])
     # A weight block's one scale beside the rows' vector, each broadcast over the partial's entries.
-    return lambda start, columns, partial: scaled(partial, rows[:, None], column_scales[0, offset])
+    block = column_scales[0, offset]
+    return lambda start, columns, partial: scaled_partial(partial, rows[:, None], block)
 
 
 def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, column_tile, *,

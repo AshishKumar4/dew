@@ -16,7 +16,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
 from ..derivatives import Protected, contracted, declared_tangent
-from ..precision import accumulated, at_least_fp32, rounded_operand, twice_scaled
+from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
 
@@ -250,9 +250,9 @@ def step_scaled(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, ro
 
     def added(index, partial, owner, total, aligned):
         columns = aligned(jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1))
-        # Each scale in the order that keeps the intermediate normal (`twice_scaled`, ledger 2715).
-        return total + twice_scaled(partial, row_scales[index][:, None].astype(jnp.float32),
-                                    columns.astype(jnp.float32))
+        # Each scale in the order that keeps the intermediate normal (`scaled_partial`, ledger 2715).
+        return total + scaled_partial(partial, row_scales[index][:, None].astype(jnp.float32),
+                                      columns.astype(jnp.float32))
 
     def start(zeros):
         return zeros

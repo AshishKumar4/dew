@@ -39,46 +39,115 @@ def test_a_blockwise_fp8_product_through_the_template_is_on_par(columns, groups)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
+def _every_block(code: float) -> np.ndarray:
+    """A row of `blockwise_matrix.DEPTH` codes, `code` first in each 128-deep block, every other zero."""
+    row = np.zeros(blockwise_matrix.DEPTH, np.float32)
+    row[0::128] = code
+    return row
+
+
+def _edge_product(row_codes, column_codes, scales: tuple[float, float], dtype, interpret_on_cpu: bool
+                  ) -> np.ndarray:
+    """The blockwise FP8 product through the template of rows each `row_codes` (`blockwise_matrix.DEPTH`
+    codes in `dtype`) and one matrix whose columns are each `column_codes`, every block's row and column
+    scales `scales`. Its routes name the template: a selector falling back to XLA, whose arm scales each
+    partial in `precision.scaled_partial`'s orders, would read the same exact value of no kernel (row
+    13292)."""
+    blocks = blockwise_matrix.DEPTH // 128
+    rows = np.broadcast_to(np.asarray(row_codes, np.float32), (blockwise_matrix.ROWS, blockwise_matrix.DEPTH))
+    matrices = np.broadcast_to(np.asarray(column_codes, np.float32),
+                               (1, blockwise_matrix.WIDTH, blockwise_matrix.DEPTH))
+    row_scales = np.full((blocks, blockwise_matrix.ROWS), scales[0], np.float32)
+    column_scales = np.full((1, blocks, blockwise_matrix.WIDTH), scales[1], np.float32)
+    with generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        out = jax.jit(lambda *ops: gemm.blockwise_fp8_product(
+            *ops[:2], blockwise_matrix._sizes(1), *ops[2:], out_dtype=jnp.float32,
+            interpret_on_cpu=interpret_on_cpu))(rows.astype(dtype), matrices.astype(dtype), row_scales,
+                                                column_scales)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+    return np.asarray(out)
+
+
 def a_blockwise_fp8_product_at_far_apart_scales_is_exact(interpret_on_cpu: bool = False) -> None:
     """A blockwise FP8 product through the template of codes 1.5 (one a 128-deep block in each row and
     column: each block's partial 2.25) at a subnormal row scale 2^-128 and a column scale 2^127: each block's
     scaled partial is 1.125 exactly, so the product is its blocks' count times 1.125, where the partial
-    times either scale first underflows or overflows (`precision.twice_scaled` takes the scales' own
-    product, row 13274). A GPU keeps the subnormal scale; a CPU's XLA flushes it."""
-    blocks = blockwise_matrix.DEPTH // 128
-    rows = np.zeros((blockwise_matrix.ROWS, blockwise_matrix.DEPTH), np.float32)
-    rows[:, 0::128] = 1.5
-    matrices = np.zeros((1, blockwise_matrix.WIDTH, blockwise_matrix.DEPTH), np.float32)
-    matrices[:, :, 0::128] = 1.5
-    row_scales = np.full((blocks, blockwise_matrix.ROWS), 2.0 ** -128, np.float32)
-    column_scales = np.full((1, blocks, blockwise_matrix.WIDTH), 2.0 ** 127, np.float32)
-    operands = (rows.astype(jnp.float8_e4m3fn), matrices.astype(jnp.float8_e4m3fn), row_scales, column_scales)
-    with generation.chosen(blockwise_fp8="mosaic"):
-        out = jax.jit(lambda *ops: gemm.blockwise_fp8_product(
-            *ops[:2], blockwise_matrix._sizes(1), *ops[2:], out_dtype=jnp.float32,
-            interpret_on_cpu=interpret_on_cpu))(*operands)
-    np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, blocks * 1.125, np.float32))
+    times either scale first underflows or overflows (the scales' own product first, row 13274). A GPU keeps
+    the subnormal scale; a CPU's XLA flushes it."""
+    out = _edge_product(_every_block(1.5), _every_block(1.5), (2.0 ** -128, 2.0 ** 127), jnp.float8_e4m3fn,
+                        interpret_on_cpu)
+    np.testing.assert_array_equal(out, np.full(out.shape, blockwise_matrix.DEPTH // 128 * 1.125, np.float32))
 
 
 def a_blockwise_fp8_product_at_large_finite_scales_is_finite(interpret_on_cpu: bool = False) -> None:
     """A blockwise FP8 product through the template of codes 2^-3 (one a 128-deep block in each row and
     column: each block's partial 2^-6) at row and column scales 2^64: each block's scaled partial is 2^122,
     finite, so the product is its blocks' count times 2^122, exactly, though the two scales' own product
-    overflows
-    (`mosaic_gpu._step_scaling` scales the partial in `precision.twice_scaled`'s order; row 13257)."""
-    blocks = blockwise_matrix.DEPTH // 128
-    rows = np.zeros((blockwise_matrix.ROWS, blockwise_matrix.DEPTH), np.float32)
-    rows[:, 0::128] = 2.0 ** -3
-    matrices = np.zeros((1, blockwise_matrix.WIDTH, blockwise_matrix.DEPTH), np.float32)
-    matrices[:, :, 0::128] = 2.0 ** -3
-    row_scales = np.full((blocks, blockwise_matrix.ROWS), 2.0 ** 64, np.float32)
-    column_scales = np.full((1, blocks, blockwise_matrix.WIDTH), 2.0 ** 64, np.float32)
-    operands = (rows.astype(jnp.float8_e4m3fn), matrices.astype(jnp.float8_e4m3fn), row_scales, column_scales)
-    with generation.chosen(blockwise_fp8="mosaic"):
-        out = jax.jit(lambda *ops: gemm.blockwise_fp8_product(
-            *ops[:2], blockwise_matrix._sizes(1), *ops[2:], out_dtype=jnp.float32,
-            interpret_on_cpu=interpret_on_cpu))(*operands)
-    np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, blocks * 2.0 ** 122, np.float32))
+    overflows (row 13257)."""
+    out = _edge_product(_every_block(2.0 ** -3), _every_block(2.0 ** -3), (2.0 ** 64, 2.0 ** 64),
+                        jnp.float8_e4m3fn, interpret_on_cpu)
+    np.testing.assert_array_equal(out, np.full(out.shape, blockwise_matrix.DEPTH // 128 * 2.0 ** 122,
+                                               np.float32))
+
+
+E5M2_EDGES = {
+    "row first": ((32768.0, 32768.0, 40960.0, 16384.0), (32768.0, 32768.0, 32768.0, 8192.0),
+                  ((2.0 ** 23 + 3) * 2.0 ** 25, 9942050.0 * 2.0 ** 25)),
+    "column first": ((32768.0, 32768.0, 40960.0, 16384.0), (32768.0, 32768.0, 32768.0, 8192.0),
+                     ((2.0 ** 23 + 3) * 2.0 ** 81, 9942050.0 * 2.0 ** -31)),
+}
+"""E5M2 steps whose scaled partial is fp32's largest (row 13291), each its leading codes in each row and in
+each column and its row and column scales: a partial (27/16) 2^31, past any E4M3 step's 2^25, times the row
+scale first, where the scales' rounded product first rounds past fp32's overflow midpoint; and times the
+column scale first, the row scale's intermediate past fp32's largest (`precision.scaled_partial`'s orders,
+XLA's arm's)."""
+
+
+def _e5m2_edge(edge: str) -> tuple[np.ndarray, np.ndarray, tuple[float, float], np.float32]:
+    """`E5M2_EDGES[edge]`'s codes as rows of `blockwise_matrix.DEPTH` (every code past them zero), its scales,
+    and its one scaled partial, fp32's largest (the portable arm's, `precision.scaled_partial`'s)."""
+    leading, columns, scales = E5M2_EDGES[edge]
+    rows, matrix = np.zeros(blockwise_matrix.DEPTH, np.float32), np.zeros(blockwise_matrix.DEPTH, np.float32)
+    rows[:len(leading)], matrix[:len(columns)] = leading, columns
+    return rows, matrix, scales, np.finfo(np.float32).max
+
+
+def an_e5m2_blockwise_product_at_fp32s_largest_is_finite(edge: str, interpret_on_cpu: bool = False) -> None:
+    """A blockwise E5M2 product through the template whose first 128-deep block holds `E5M2_EDGES[edge]`'s
+    codes at its scales: each entry fp32's largest, `precision.scaled_partial`'s, XLA's arm's (row 13291)."""
+    rows, matrix, scales, want = _e5m2_edge(edge)
+    out = _edge_product(rows, matrix, scales, jnp.float8_e5m2, interpret_on_cpu)
+    np.testing.assert_array_equal(out, np.full(out.shape, want, np.float32))
+
+
+def an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite(edge: str, interpret_on_cpu: bool = False
+                                                                 ) -> None:
+    """A blockwise E5M2 kernel gradient through the template, one group of one 128-row block whose depth
+    rows each hold `E5M2_EDGES[edge]`'s row codes and its columns its column codes, at its scales: each entry
+    fp32's largest, as the product's (`mosaic_gpu.tgmm`'s step scaling, row 13291). Its routes name the
+    template (row 13292)."""
+    rows, matrix, (row_scale, column_scale), want = _e5m2_edge(edge)
+    lhs_t = np.broadcast_to(rows[:128], (GRADIENT_DEPTH, 128)).astype(jnp.float8_e5m2)
+    rhs_t = np.broadcast_to(matrix[:128], (GRADIENT_WIDTH, 128)).astype(jnp.float8_e5m2)
+    scales = (np.full((1, GRADIENT_DEPTH), row_scale, np.float32), np.full((1, GRADIENT_WIDTH), column_scale,
+                                                                            np.float32))
+    with generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        out = jax.jit(lambda *ops: gemm.blockwise_fp8_kernel_gradient(
+            *ops[:2], np.asarray([1], np.int32), *ops[2:], out_dtype=jnp.float32,
+            interpret_on_cpu=interpret_on_cpu))(lhs_t, rhs_t, *scales)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+    np.testing.assert_array_equal(np.asarray(out), np.full(out.shape, want, np.float32))
+
+
+@pytest.mark.parametrize("edge", list(E5M2_EDGES))
+@pytest.mark.parametrize("witness", [an_e5m2_blockwise_product_at_fp32s_largest_is_finite,
+                                     an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite],
+                         ids=["product", "kernel gradient"])
+def test_an_e5m2_blockwise_walk_at_fp32s_largest_is_finite(witness, edge):
+    """Each E5M2 edge witness interpreted on a CPU as an H100 runs it (the GPU's native cells,
+    tests/test_gpu_gemm.py, run them compiled)."""
+    with generation.assumed("sm90"):
+        witness(edge, interpret_on_cpu=True)
 
 
 def test_a_blockwise_fp8_product_at_large_finite_scales_is_finite():

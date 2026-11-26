@@ -221,8 +221,8 @@ def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
 
 
 def _scale_edge_cells() -> tuple[Cell, ...]:
-    """The blockwise FP8 template's exact witnesses at its scales' ends (rows 13257, 13274), each an exact
-    value its run reads."""
+    """The blockwise FP8 template's exact witnesses at its scales' ends (rows 13257, 13274, 13291), each an
+    exact value its run reads through the template's route."""
     return (
         Cell("a blockwise FP8 product at far-apart scales is exact",
              gemm_blockwise.a_blockwise_fp8_product_at_far_apart_scales_is_exact, "sm90",
@@ -230,6 +230,15 @@ def _scale_edge_cells() -> tuple[Cell, ...]:
         Cell("a blockwise FP8 product at large finite scales is finite",
              gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *(Cell(f"an E5M2 blockwise {name} at fp32's largest is finite ({edge})",
+               functools.partial(witness, edge), "sm90", at_run=EXACT_OVERFLOW,
+               native={"launch": launch, "pass": f"e5m2 step scaling, {edge}"})
+          for name, witness, launch in (
+              ("product", gemm_blockwise.an_e5m2_blockwise_product_at_fp32s_largest_is_finite,
+               "blockwise fp8 gmm"),
+              ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
+               "blockwise fp8 tgmm"))
+          for edge in gemm_blockwise.E5M2_EDGES),
     )
 
 

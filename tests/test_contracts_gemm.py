@@ -1129,39 +1129,37 @@ def _check_ternary_weight_product_contract(edge: str) -> None:
                         truth_fn=plain, plain_fn=plain, without=without)
 
 
-def test_twice_scaled_keeps_the_plain_products_overflow_and_non_finite_values():
-    """`precision.twice_scaled` picks the order of its three products, never the value: a product whose true
-    value overflows still overflows, a NaN, an infinity and a zero operand give the plain product's value,
-    and its derivative in each operand is the plain product's where every order is normal (row 13274)."""
-    from dew.nn.precision import twice_scaled
+def test_a_scaled_partial_keeps_the_plain_products_overflow_and_non_finite_values():
+    """`precision.scaled_partial` picks the order of its three products, never the value: a product whose true
+    value overflows still overflows (one rounding past the overflow midpoint whose scales' product first
+    reads fp32's largest among them), a NaN, an infinity and a zero operand give the plain product's value,
+    and its derivative in each operand is the plain product's where every order is normal (rows 13274,
+    13291)."""
+    from dew.nn.precision import scaled_partial
 
     f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
-    assert float(twice_scaled(f32(2.0 ** 100), f32(2.0 ** 20), f32(2.0 ** 10))) == np.inf
+    for product, first, second in ((2.0 ** 100, 2.0 ** 20, 2.0 ** 10),
+                                   (21 * 2.0 ** 27, 8388626 * 2.0 ** 25, 12782613 * 2.0 ** 25)):
+        assert float(scaled_partial(f32(product), f32(first), f32(second))) == np.inf
     for product, first, second in ((np.nan, 1.0, 1.0), (np.inf, 2.0, 0.5), (0.0, 2.0 ** 100, 2.0 ** 100),
                                    (np.inf, 0.0, 1.0), (1.0, np.inf, 0.5)):
-        got = float(twice_scaled(f32(product), f32(first), f32(second)))
+        got = float(scaled_partial(f32(product), f32(first), f32(second)))
         want = float(np.float32(product) * np.float32(first) * np.float32(second))
         assert got == want or (np.isnan(got) and np.isnan(want)), (product, first, second, got, want)
-    grads = jax.grad(lambda *ops: twice_scaled(*ops), argnums=(0, 1, 2))(f32(3.0), f32(0.5), f32(4.0))
+    grads = jax.grad(lambda *ops: scaled_partial(*ops), argnums=(0, 1, 2))(f32(3.0), f32(0.5), f32(4.0))
     assert tuple(float(g) for g in grads) == (2.0, 12.0, 1.5)
 
 
-def test_a_steps_scales_are_ordered_so_no_intermediate_overflows_or_underflows():
-    """`product.ranged_scaled` (an FP8 step's partial, 2^-18 to 2^25, times its row and column scales, the
-    native blockwise step's order): two scales near 2^64 give 2^122 of a 2^-6 partial, not infinity; two
-    near 2^-70 give 2^-120 of a 2^20 partial, not their product's underflow; far-apart normal scales
-    (2^100 and 2^-120) their product's; a true overflow overflows; zeros and NaN as the plain product
-    (rows 13257, 13274)."""
-    from dew.nn.kernels.templates.product import ranged_scaled
+def test_a_scaled_partial_joins_its_scales_where_neither_order_holds_and_differentiates_that_order():
+    """`precision.scaled_partial` in float16 (whose subnormals a CPU keeps, where it flushes fp32's): a
+    subnormal row scale 2^-16 beside a column scale 2^15 of a 2.25 partial, each order's intermediate
+    subnormal or past the largest, is 1.125, the scales' product first (row 13274), and its derivatives are
+    that order's alone, a cotangent of 1/4 giving 1/8, 18432 and 9 2^-20, where a cotangent through the
+    unchosen overflowing order reads NaN (row 13291's review)."""
+    from dew.nn.precision import scaled_partial
 
-    f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
-
-    def scaled(value, first, second):
-        return float(ranged_scaled(f32(value), f32(first), f32(second), binades=(-18, 25)))
-
-    assert scaled(2.0 ** -6, 2.0 ** 64, 2.0 ** 64) == 2.0 ** 122
-    assert scaled(2.0 ** 20, 2.0 ** -70, 2.0 ** -70) == 2.0 ** -120
-    assert scaled(3.0, 2.0 ** 100, 2.0 ** -120) == 3.0 * 2.0 ** -20
-    assert scaled(2.0 ** 25, 2.0 ** 64, 2.0 ** 64) == np.inf
-    assert scaled(0.0, 2.0 ** 100, 2.0 ** 100) == 0.0
-    assert np.isnan(scaled(1.0, np.nan, 2.0))
+    f16 = functools.partial(jnp.asarray, dtype=jnp.float16)
+    operands = (f16(2.25), f16(2.0 ** -16), f16(2.0 ** 15))
+    value, pull = jax.vjp(scaled_partial, *operands)
+    assert float(value) == 1.125
+    assert tuple(float(g) for g in pull(f16(0.25))) == (0.125, 18432.0, 9 * 2.0 ** -20)
