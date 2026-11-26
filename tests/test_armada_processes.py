@@ -75,8 +75,8 @@ def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", recycle
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
     split = kwargs.pop("split", "")
-    ci.tested("3.12", ["tests/test_recycled.py"], split, out, 600.0, "off", 5.0, "", {}, recycle_at=recycle_at,
-              **{"recorded": False, **kwargs})
+    ci.tested("3.12", ["tests/test_recycled.py"], split, out, 600.0, "off", 5.0, "", {},
+              recycle_at=recycle_at, **{"recorded": False, **kwargs})
     [row] = json.loads(out.read_text())["rows"]
     return row
 
