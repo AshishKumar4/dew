@@ -2271,7 +2271,7 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
             yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
-                                    residents=config.residents, keys=config.keys)
+                                    residents=config.residents, keys=mainloop.Keys())
             yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
