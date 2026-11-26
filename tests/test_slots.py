@@ -127,7 +127,8 @@ def _lightnet(q, k, v, state):
 
 
 def _slot_attention(q, k, v, s, keys_memory, values_memory, g=None):
-    return slots.slot_attention(q, k, v, s, g, state=(keys_memory, values_memory))
+    out, finals = slots.slot_attention(q, k, v, s, g, state=(keys_memory, values_memory))
+    return out, finals[:2]
 
 
 @pytest.mark.parametrize('dtype', [np.float32, jnp.bfloat16], ids=['fp32', 'bf16'])
@@ -193,7 +194,8 @@ def test_a_call_of_no_tokens_returns_its_entering_states():
                                               normalizer=entering)
     assert out.shape == (ROWS, 0, HEADS, VALUES) and np.array_equal(np.asarray(final), np.asarray(memory))
     assert np.array_equal(np.asarray(normalizer), np.asarray(entering))
-    memories = (jnp.ones((ROWS, HEADS, KEYS, SLOTS)), jnp.ones((ROWS, HEADS, SLOTS, VALUES)))
+    memories = (jnp.ones((ROWS, HEADS, KEYS, SLOTS)), jnp.ones((ROWS, HEADS, SLOTS, VALUES)),
+                jnp.full((ROWS, HEADS, SLOTS), 0.25))
     out, finals = slots.slot_attention(empty[KEYS], empty[KEYS], empty[VALUES], empty[SLOTS], state=memories)
     assert out.shape == (ROWS, 0, HEADS, VALUES)
     assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(finals, memories, strict=True))
@@ -220,3 +222,37 @@ def test_the_additive_gate_keeps_a_faint_increment():
     expected = np.asarray(jnp.logaddexp(jnp.float32(0.0), jnp.float32(-20.0)))
     assert expected > 0.0
     assert np.asarray(last)[0, 0] == expected and np.asarray(log_decay)[0, 1, 0] == -expected
+
+
+def test_an_abc_call_split_in_two_is_the_call_whole():
+    """ABC's call of two tokens split into calls of one, each entering the state the first returns (its
+    memories and its slots' normalizer), is the call whole bit for bit: two slots of zero logits (a softmax
+    over them a half each), values 2 and 4 in both channels, so the second token weighs a half and the
+    first decays by a half, both reading 3. Its normalizer dropped, the second call's gate started afresh
+    and read 6 (a review's P0 of 1a60ffc17)."""
+    q = jnp.ones((1, 2, 1, 2), jnp.float32)
+    s = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    v = jnp.asarray([[2.0, 2.0], [4.0, 4.0]], jnp.float32).reshape(1, 2, 1, 2)
+    whole, _ = slots.slot_attention(q, q, v, s)
+    first, state = slots.slot_attention(q[:, :1], q[:, :1], v[:, :1], s[:, :1])
+    second, _ = slots.slot_attention(q[:, 1:], q[:, 1:], v[:, 1:], s[:, 1:], state=state)
+    assert np.array_equal(np.asarray(whole), np.asarray(jnp.concatenate([first, second], axis=1)))
+    assert np.all(np.asarray(whole)[0, 1] == 3.0)
+
+
+def test_the_additive_gate_is_its_writes_shifted_by_a_common_large_offset():
+    """Integer writes shifted by 2^20 (each shift exact in fp32) weigh and decay as the writes themselves bit
+    for bit, and so LightNet's reads of them; and two equal writes at 2^24 weigh a half: the scan's relative
+    masses keep the increments a normalizer in absolute scale rounded off (`log 2` at 2^24, each weight one
+    where it is a half: a review's P0 of 1a60ffc17)."""
+    drawn = np.random.default_rng(13500).integers(-4, 4, (ROWS, LENGTH, HEADS, KEYS))
+    small = jnp.asarray(drawn, jnp.float32)
+    shifted = small + 2.0 ** 20
+    for gated, moved in zip(slots.additive_gate(small)[:2], slots.additive_gate(shifted)[:2], strict=True):
+        assert np.array_equal(np.asarray(gated), np.asarray(moved))
+    weights, log_decay, _ = slots.additive_gate(jnp.full((1, 2, 1), 2.0 ** 24, jnp.float32))
+    assert np.asarray(weights)[0, 1, 0] == 0.5 and np.asarray(log_decay)[0, 1, 0] < 0.0
+    q, v = (jnp.asarray(np.random.default_rng(seed).standard_normal((ROWS, LENGTH, HEADS, width)),
+                        jnp.float32) for seed, width in ((1, KEYS), (2, VALUES)))
+    reads = [slots.lightnet(q, k, v)[0] for k in (small, shifted)]
+    assert np.array_equal(np.asarray(reads[0]), np.asarray(reads[1]))
