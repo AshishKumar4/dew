@@ -224,6 +224,17 @@ def test_a_giant_heads_radial_derivative_keeps_epsilons_share():
     np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
 
 
+def test_a_subnormal_gain_keeps_a_normal_small_output():
+    """A 32-wide head of sixteen `2^126` and a `2` clipped to 2, its gain subnormal: the sixteen go to
+    `1/2` and the `2` to fp32's smallest normal `2^-126`, bit for bit, the quotient `2 / |y|` normal and
+    taken first, where the head over its length first formed a subnormal (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, expected = np.zeros(32, np.float32), np.zeros(32, np.float32)
+    x[:16], x[16], expected[:16], expected[16] = 2.0 ** 126, 2.0, 0.5, 2.0 ** -126
+    np.testing.assert_array_equal(np.asarray(clipped(jnp.asarray(x), 2.0, 1e-6)), expected)
+
+
 def test_an_unclipped_giant_heads_derivative_is_the_identity():
     """`[2^62, 2^62, 0, ...]` under `2^63`, a giant head the clip leaves as it is: a seed `[1, 2^-30, 0,
     ...]` passes through it unchanged both ways, where subtracting and adding back its part along the head
