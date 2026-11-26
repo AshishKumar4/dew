@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from arm_arithmetic import ahead_on_the_host
 from interop_support import extract_fixture
 from model_support import attending
 from qwen_image_draws import case_draw, pipeline_draw, prompts_of
@@ -171,37 +170,38 @@ an A100 and on a GH200 (M-ET-80c)."""
 def cudnn_case():
     """The cuDNN cell's site: two blocks of QwenImageTransformer in bf16 with a head width of 64, which
     cuDNN takes, its pullback over a padded prompt `(dew, reference, truth, draw)`: cuDNN's, xla's, and
-    the float64 twin's on xla, over latents, contexts and probes drawn by seed."""
+    the float64 twin's on xla, over latents, contexts and probes drawn by seed. Its parameters are drawn
+    with them, one program on whichever device draws, so a GPU tier part's prepare compiles each arm for
+    them as for any input (rows 8028, 13229: initialized apart, on the host or on a compile-only GPU,
+    they were a constant the prepare's arms and the run's did not share)."""
     model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
                                  context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16)
-    # On the host, before its site, as a GPU tier part's prepare runs it (row 8028); one program (row 6857):
-    # run op by op, the initializer compiled hundreds of small programs on the GPU the cell holds.
-    with ahead_on_the_host():
-        mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
-        times = jnp.asarray([731.0, 42.0])
-        condition = DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask)
-        # XLA's attention, as cuDNN's needs a GPU the host has none of; cuDNN's is the pullback's under test.
-        initialized = attending("xla")(jax.jit(model.init))
-        params = initialized(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times, condition)["params"]
+    mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
+    times = jnp.asarray([731.0, 42.0])
 
+    # XLA's attention initializes: cuDNN's is the pullback's under test.
     @jax.jit
+    @attending("xla")
     def draw(seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), 3)
-        return (jax.random.normal(keys[0], (2, 4, 6, 4)), jax.random.normal(keys[1], (2, 25, 16)),
+        latent = jax.random.normal(keys[0], (2, 4, 6, 4))
+        params = model.init(jax.random.PRNGKey(0), jnp.zeros_like(latent), times,
+                            DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
+        return (params, latent, jax.random.normal(keys[1], (2, 25, 16)),
                 jax.random.normal(keys[2], (2, 4, 6, 4)))
 
-    def pullback(net, held, dtype):
-        def run(latent, context, probe):
+    def pullback(net, dtype):
+        def run(params, latent, context, probe):
             def forward(params, latent, context):
                 return net.apply({"params": params}, latent, times, DenoisingCondition(context, mask=mask))
+            held = jax.tree.map(lambda leaf: leaf.astype(dtype) if dtype == jnp.float64 else leaf, params)
             output, vjp = jax.vjp(forward, held, latent.astype(dtype), context.astype(dtype))
             return [output, *jax.tree.leaves(vjp(probe.astype(output.dtype)))]
         return run
 
     twin = model.clone(dtype=jnp.float64)
-    return (attending("cudnn")(pullback(model, params, jnp.float32)),
-            attending("xla")(pullback(model, params, jnp.float32)),
-            attending("xla")(pullback(twin, widened(params), jnp.float64)), draw)
+    return (attending("cudnn")(pullback(model, jnp.float32)), attending("xla")(pullback(model, jnp.float32)),
+            attending("xla")(pullback(twin, jnp.float64)), draw)
 
 
 def cudnn_attends_a_padded_batch_as_xla_does():
