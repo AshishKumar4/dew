@@ -409,9 +409,9 @@ def _read_kimi_delta_attention(view: PartView) -> Mapping[str, object]:
 
 def _read_unrotated_latent_attention(view: PartView) -> Mapping[str, object]:
     """Kimi Linear's latent attention: DeepSeek V3's (`_latent_attention`), its shared key's slice and
-    each head's rope slice left unrotated (`MultiHeadLatentAttention.rotary=False`; its model holds no
-    rotary), as Kimi K3's MLA."""
-    return _latent_attention(view, interleave=False, rotary=False)
+    each head's rope slice left unrotated (`mla_use_nope`; its model holds no rotary), as Kimi K3's MLA."""
+    # Its layer places no positions: no rotary base is read for it (`assemble`).
+    return {**_latent_attention(view, interleave=False, rotary=False), _LAYER: {'rotates': False}}
 
 
 def _read_grid_rotary(view: PartView) -> Mapping[str, object]:
@@ -854,7 +854,7 @@ def _latent_attention(view: PartView, *, interleave: bool, rotary: bool = True) 
             'mixer': {'class': 'mla', 'fields': {
                 'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
                 'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
-                'rope_interleave': interleave, 'rotary': rotary,
+                'rope_interleave': interleave, 'mla_use_nope': not rotary,
                 # Llama's RMSNorm's rounding, the latent norms' (`_read_latent_norm`).
                 'latent_scale_after_cast': True, 'latent_scale_offset': False}}}
 
@@ -1598,7 +1598,8 @@ def assemble(model: PreTrainedModel, inventory: Collection[str] | None = None) -
     # mixer an attention or beside one.
     count = _records.integer(fields['num_layers'], 'num_layers')
     rotating = [held for held in (assembler.layers.get(layer, {}) for layer in range(count))
-                if not held.get('nope') and ('parallel' in held or 'mixer' not in held)]
+                if not held.get('nope') and held.get('rotates', True)
+                and ('parallel' in held or 'mixer' not in held)]
     if rotating and 'rope_theta' not in fields:
         raise Ambiguous("no part states rope_theta")
     branches = assembler.parallel()
