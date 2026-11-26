@@ -2178,7 +2178,7 @@ def test_a_walk_stores_each_output_and_reads_each_epilogue_operand_at_its_dtype(
 
 def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_on_that_kind_alone():
     """A build that states the kind of GPU it compiled for (a host's own topology's) takes that part's facts
-    within its generation (`built_target`: a GH200's NVLink-C2C host link, not the canonical H100's PCIe),
+    within its generation (`built_target`: a GH200's own, not the canonical H100's),
     refuses a part of another generation, and keeps the canonical target for a kind the table names no part
     of; its build target loads on that kind alone, where a canonical build loads on any part of its
     generation (row 13252)."""
@@ -2187,8 +2187,7 @@ def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_o
 
     gh200 = built_target("sm90", device_kind="NVIDIA GH200 480GB")
     canonical = built_target("sm90")
-    assert gh200.device_kind == "NVIDIA GH200 480GB" and gh200.generation == canonical.generation
-    assert gh200.host_link_rate == 450e9 and canonical.host_link_rate == 64e9
+    assert gh200 == gpu_target("NVIDIA GH200 480GB") and gh200 != canonical
     assert built_target("sm90", 114, device_kind="NVIDIA GH200 480GB").multiprocessors == 114
     assert built_target("sm90", device_kind="NVIDIA H999 unknown") == canonical
     with pytest.raises(ValueError):

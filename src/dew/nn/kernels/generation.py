@@ -1143,9 +1143,12 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
     target = gpu_target(generation)
     if device_kind is not None:
         part = gpu_target(device_kind)
-        if part.generation not in (target.generation, part.device_kind):
+        # A kind the table names no part of resolves to a target of no generation of its own, its kind its
+        # generation (`gpu_target`'s last branch): such a build keeps the generation's canonical target.
+        named = part.generation != part.device_kind
+        if named and part.generation != target.generation:
             raise ValueError(f"a {device_kind} is an {part.generation} GPU, not one of {generation}")
-        if part.generation == target.generation:
+        if named:
             target = part
     if multiprocessors is not None and multiprocessors <= 0:
         raise ValueError(f"a GPU states a positive count of multiprocessors, not {multiprocessors}")
