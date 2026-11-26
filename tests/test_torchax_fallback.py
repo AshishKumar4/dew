@@ -45,7 +45,7 @@ from dew.data.dataset import Loader
 from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
-from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.interop.torchax_fallback import TorchCausalLM, TorchLayout, TransformersTierWarning
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
@@ -1746,10 +1746,14 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
         return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
 
     step = jax.jit(jax.grad(loss))
-    # The queries', keys' and values' dtypes each call of the delta rule takes in the step's program, as
-    # the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`).
+    # The queries', keys' and values' dtypes each call of the delta rule takes in the source's traced
+    # forward, as the tier-3 part hands them over (its call `delta_rule`, `torchax_kernels._dew_chunk_rule`),
+    # before the step's replay inlines it (`TorchGraph.traced`).
+    assert isinstance(loaded.model, TorchCausalLM)
+    forward, _, _ = loaded.model.graph.traced(params, loaded.variables["buffers"],
+                                              jnp.asarray(tokens[:, :-1]), None, train=False)
     handed = [tuple(var.aval.dtype for var in eqn.invars[:3] if isinstance(var.aval, ShapedArray))
-              for eqn in equations(jax.make_jaxpr(jax.grad(loss))(params).jaxpr)
+              for eqn in equations(forward.jaxpr)
               if eqn.primitive.name == "jit" and eqn.params["name"] == "delta_rule"]
     # The kernels the lowered step calls (`kernel_calls`): a Pallas kernel's and a Mosaic GPU one's, the
     # recurrence template's launched under its `mpmd_map`, which no `pallas_call` names.
