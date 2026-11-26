@@ -163,7 +163,7 @@ def _held_apart(apart: Apart, dtype) -> Apart:
     floor = (apart.floor if apart.floor is not None and int(floats.minexp) <= apart.floor < int(floats.maxexp)
              else None)
     dyadic = apart.dyadic_scale and dtype == jnp.float32
-    if (floor, unit, dyadic) == (apart.floor, apart.unit_norm, apart.dyadic_scale):
+    if floor == apart.floor and unit == apart.unit_norm and dyadic == apart.dyadic_scale:
         return apart
     return apart._replace(floor=floor, unit_norm=unit, dyadic_scale=dyadic)
 

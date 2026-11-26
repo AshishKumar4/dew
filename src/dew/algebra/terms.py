@@ -1428,7 +1428,8 @@ def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: l
     finite = made.finite and _within(bound, aval.dtype)
     dyadic = (name == "broadcast_in_dim" and operands[0].dyadic_scale
               or name == "select_n" and all(held.dyadic_scale for held in operands[1:]))
-    return _held_apart(made._replace(number=made.number or finite, finite=finite, dyadic_scale=dyadic), aval.dtype)
+    made = made._replace(number=made.number or finite, finite=finite, dyadic_scale=dyadic)
+    return _held_apart(made, aval.dtype)
 
 
 def _extremes(name: str, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:

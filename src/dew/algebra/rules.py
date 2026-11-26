@@ -825,7 +825,8 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
                     *contracted, *facts, *dominated(power, "new"), *more,
                     *dominated(scaled_power, "scaled")).then(
                     union(t).with_(s.shaped("broadcast_in_dim", lift).binary("mul", product, multiplied)),
-                    set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent), *made(product, power)))
+                    set_(shape(s.shaped("broadcast_in_dim", lift))).to(product_extent),
+                    *made(product, power)))
     return (
         RuleFamily("a row scale out of a product", tuple(lifted_by[0]),
                (lambda x, s, y: jnp.dot(x * s[:, None], y.T), lambda x, s, y: jnp.dot(x, y.T) * s[:, None],

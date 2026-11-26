@@ -158,6 +158,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
     comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
     attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
+    The direct transposed byte product distinguishes the RHS kept axis. It lifts a positive dyadic
+    scale only over exact byte casts and full float32 accumulation with at most 256 contracted entries
+    (row 13172): every integer partial sum fits, and the shift stays normal for each nonzero term.
+    The enclosing proof follows literal scales through broadcasts and selection. Arbitrary scales,
+    unproven modes and explicit/manual placements do not take this transposed rewrite.
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
     a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
     simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
