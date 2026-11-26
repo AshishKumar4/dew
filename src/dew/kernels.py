@@ -46,7 +46,7 @@ class Kernels:
     diagonal_scan: Literal['mosaic_gpu', 'xla'] | None = None
     gate_up: Literal['apart', 'joined'] | None = None
     gated_delta_rule: Literal['fla', 'mosaic_gpu', 'xla'] | None = None
-    gated_mlp: Literal['apart', 'fused'] | None = None
+    gated_mlp: Literal['apart', 'fused', 'wide'] | None = None
     gemm_epilogue: Literal['fused', 'xla'] | None = None
     gemm_prologue: Literal['fused', 'xla'] | None = None
     grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None

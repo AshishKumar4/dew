@@ -58,9 +58,70 @@ def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path
     (limits / "memory.max").write_text(f"{2 * 2**30}\n")
     (limits / "memory.current").write_text(f"{int(1.9 * 2**30)}\n")
     (limits / "memory.stat").write_text(f"anon {int(0.4 * 2**30)}\ninactive_file {int(1.5 * 2**30)}\n")
-    host = Host.current(own, root=tmp_path)
+    membership = tmp_path / "cgroup"
+    membership.write_text("0::/session\n")
+    host = Host.current(tmp_path, membership)
     assert host.cpus == min(2, len(os.sched_getaffinity(0)))
     assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
+
+
+def test_a_v1_memory_controllers_limit_bounds_automatic_loading_by_what_its_working_set_leaves(tmp_path):
+    """Under cgroup v1 a group's memory limit is its memory controller's (`memory.limit_in_bytes`, at that
+    controller's own mount), and its charge `memory.usage_in_bytes`, less the inactive page cache under it
+    (`memory.stat`'s hierarchical `total_inactive_file`, as its usage counts every descendant's): a group of
+    1 GiB with 0.9 GiB charged, 0.25 GiB of it cache, leaves 0.35 GiB, where the host read v2's limit alone
+    and sized a v1 container's loading by the machine's memory, then its limit without its charge left the
+    whole GiB (row 13035)."""
+    from dew.data.dataset import Host
+
+    membership = tmp_path / "cgroup"
+    membership.write_text("4:cpu,cpuacct:/job\n5:memory:/job\n")
+    job = tmp_path / "memory/job"
+    job.mkdir(parents=True)
+    (job / "memory.limit_in_bytes").write_text(f"{2**30}\n")
+    (job / "memory.usage_in_bytes").write_text(f"{int(0.9 * 2**30)}\n")
+    # The group's own inactive cache, which its usage of every descendant's does not stop at.
+    (job / "memory.stat").write_text(f"inactive_file {int(0.5 * 2**30)}\ntotal_inactive_file {2**28}\n")
+    assert Host.current(tmp_path, membership).memory == 2**30 - int(0.9 * 2**30) + 2**28
+
+
+def test_a_groups_cache_read_past_its_sampled_charge_leaves_no_more_than_its_limit(tmp_path):
+    """A group's charge and its cache are read one after the other, and v1's charge is approximate: cache
+    grown past the charge read before it holds nothing, so the group leaves no more than its limit, as
+    cAdvisor counts a working set, where the working set read negative left room past the limit (row
+    13035)."""
+    from dew.data.dataset import Host
+
+    membership = tmp_path / "cgroup"
+    membership.write_text("5:memory:/job\n")
+    job = tmp_path / "memory/job"
+    job.mkdir(parents=True)
+    (job / "memory.limit_in_bytes").write_text(f"{2**20}\n")
+    (job / "memory.usage_in_bytes").write_text(f"{2**19}\n")
+    (job / "memory.stat").write_text(f"total_inactive_file {2**20}\n")
+    assert Host.current(tmp_path, membership).memory == 2**20
+
+
+@pytest.mark.parametrize("name", [b"batch\xe2\x80\xa8worker", b"batch\rworker", b"batch\xffworker"],
+                         ids=["line separator", "carriage return", "not utf-8"])
+def test_a_cgroup_named_with_a_line_separator_is_read_as_named(tmp_path, name):
+    """Linux names a group as it was made, any byte but '/' and a newline, and /proc/self/cgroup states each
+    hierarchy's line as those bytes ending in a newline alone: a group whose name holds U+2028, which
+    `str.splitlines` splits on, a carriage return, which a text read turns into a newline, or a byte no UTF-8
+    decodes, is the process's own group and its limit binds, where its line read as two, or not at all, failed
+    loading's sizing outright (row 13056)."""
+    import os
+
+    from dew import _cgroups
+    from dew.data.dataset import Host
+
+    membership = tmp_path / "cgroup"
+    membership.write_bytes(b"0::/" + name + b"\n")
+    group = tmp_path / os.fsdecode(name)
+    group.mkdir()
+    (group / "memory.max").write_text(f"{2**20}\n")
+    assert _cgroups.own(tmp_path, membership) == group
+    assert Host.current(tmp_path, membership).memory == 2**20
 
 
 def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_before_dew(tmp_path):
@@ -87,14 +148,16 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
         f"root = Path({str(root)!r})\n"
         f"group = cgroups.own(root, Path({str(membership)!r}))\n"
         "levels = list(cgroups.levels(group, root))\n"
+        f"stated = cgroups.memory_limits(root, Path({str(membership)!r}))\n"
+        "limits = [[level.name, limit] for level, limit in stated]\n"
         "import json\n"
-        "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels],\n"
-        "                  [cgroups.memory(level) for level in levels],\n"
+        "print(json.dumps([group.name, [cgroups.cpus(level) for level in levels], limits,\n"
         "                  [cgroups.memory_peak(level) for level in levels],\n"
         "                  any(name.split('.')[0] == 'dew' for name in sys.modules)]))\n")
     (own / "memory.peak").write_text(f"{7 * 2**30}\n")
     done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=True)
-    assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], [7 * 2**30, None], False]
+    assert json.loads(done.stdout) == ["session", [None, 3], [["session", 3 * 2**30]], [7 * 2**30, None],
+                                       False]
 
 
 class _Filled:

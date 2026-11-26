@@ -493,7 +493,24 @@ _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 *
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
                              exponentials_per_clock=1.79e12 / (918e12 / 524288),
-                             fp32_by_bf16_precise=False, accurate_exp=False)}
+                             fp32_by_bf16_precise=False, accurate_exp=False),
+         # A v5p device is a chip, its two TensorCores one megacore (libtpu's `v5p:2x2x1` describes four
+         # devices of two cores each), each core four 128 x 128 MXUs (cloud.google.com/tpu/docs/v5p,
+         # /tpu/docs/system-architecture-tpu-vm): 2 x 4 x 128 x 128 multiply-adds a clock. A TPU7x device
+         # is one of a chip's two TensorCores (`tpu7x:2x2x1`: eight devices of one core), its MXUs 256 x 256
+         # (/tpu/docs/tpu7x, the system architecture page), how many a core no page states: no rate. Read
+         # from a compile-only TPU of each (the pinned libtpu): its scoped VMEM from a Mosaic kernel's
+         # refusal of its pipelined blocks ("size 16.50M and limit 16.00M exceeded scoped vmem limit" on a
+         # v5p, as on a v5e; "47.50M and limit 32.00M" on a TPU7x, as on a v6e: FS-9026-VMEM4, VMEM5), its
+         # VMEM from an allocation refusal ("would exceed memory (size=67108864)", VMEM1), its MXU's tile
+         # from its refusal of an fp32-by-bf16 product ("Bad rhs type: 128, 128" and "256, 256") and its
+         # float16 from its refusal of a float16 load ("Invalid vector type for load", FACTS1); its exp
+         # unmeasured, the v5e's as every TPU's no rule measures.
+         'v5p': Architecture(('tpu',), {'16bit': 2 * 4 * 128 * 128 * 2}, None, scoped_vmem=16 * 2 ** 20,
+                             vmem_bytes=64 * 2 ** 20, float16=False, fp32_by_bf16_precise=False,
+                             accurate_exp=False),
+         'tpu7x': Architecture(('tpu',), {}, None, scoped_vmem=32 * 2 ** 20, vmem_bytes=64 * 2 ** 20,
+                               float16=False, fp32_by_bf16_precise=False, accurate_exp=False)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -633,6 +650,10 @@ class GpuTarget:
     Pallas chain's fixed cost an iteration of reading and writing one 2 MiB fp32 block (4 MiB an iteration)
     beside its steps, on Colab's TPUs, two rounds each (rows 7201 and 7283, colab7062's rates2 and rates3);
     None where none was, so those bytes are priced by no time there."""
+    compile_topology: str | None = None
+    """A TPU's compile-only topology, as libtpu names one (`jax.experimental.topologies.get_topology_desc`):
+    a host's chips, a program compiled ahead for one of their devices (`dew.training.ahead.compile_only_tpus`,
+    the kernel compile gate); None off a TPU, or where libtpu describes none."""
     host_links: Mapping[str, float] = dataclasses.field(kw_only=True, hash=False)
     """Each part's link to its host's memory (by the device-kind prefixes `dense_peaks` keys), in bytes a
     second one way, its datasheet's peak: PCIe's x16 lanes or NVLink-C2C, whose sheets state both ways
@@ -1011,6 +1032,7 @@ TARGETS = {target.generation: target for target in (
     # derived from the peak, no stated clock. Its scoped VMEM and MXU rate are its family's (`_TPUS`).
     GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, multiprocessors=1,
               clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30, host_links={},
+              compile_topology='v5e:2x2',
               # A step of a form's chain on XLA's path, 0.89 us: half the substitution row's slope over 64 to
               # 1024 iterations, a row two steps (FS-STEP-SECONDS1's script on a Colab v5e, colab7062's
               # steps-v5e1, its two rounds 1.772 and 1.770 us a row, 1.8% from the line); its one-element
@@ -1020,8 +1042,11 @@ TARGETS = {target.generation: target for target in (
               kernel_step_seconds=133.8e-9,
               # 0.65 us an iteration of 4 MiB (`vmem_rate`).
               vmem_rate=6.5e12),
+    # A chip a device (its megacore), 459 TF of bf16 and 2765 GB/s of HBM (cloud.google.com/tpu/docs/v5p); the
+    # clock derived from the peak, as v5e's.
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}},
-              host_links={}),
+              multiprocessors=1, clock_hz=459e12 / (2 * 4 * 128 * 128 * 2), memory_bandwidth=2765e9,
+              host_links={}, compile_topology='v5p:2x2x1'),
     # One TensorCore a chip, of two 256 x 256 MXUs, 918 TF of bf16 and 1638 GB/s of HBM
     # (cloud.google.com/tpu/docs/v6e); the clock is 918e12 / 524288, derived from the peak as v5e's. Its host
     # link is "PCIe Gen5 x8 per chip" (the same page's system architecture): half a Gen5 x16's 64 GB/s each
@@ -1035,7 +1060,11 @@ TARGETS = {target.generation: target for target in (
               # In-kernel: a dependent lane reduction's 141.1 ns (its two rounds 141.12 and 141.07).
               kernel_step_seconds=141.1e-9,
               # 0.28 us an iteration of 4 MiB (`vmem_rate`).
-              vmem_rate=1.5e13),
+              vmem_rate=1.5e13, compile_topology='v6e:2x2'),
+    # A TensorCore a device, half a chip's 2307 TF of bf16, 4614 TF of fp8 and 7380 GB/s of HBM
+    # (cloud.google.com/tpu/docs/tpu7x; libtpu's `tpu7x:2x2x1` describes two devices a chip); no clock.
+    GpuTarget('tpu7x', 'TPU7x', dense_peaks={'TPU7x': {'bf16': 2307e12 / 2, 'fp8': 4614e12 / 2}},
+              multiprocessors=1, memory_bandwidth=7380e9 / 2, host_links={}, compile_topology='tpu7x:2x2x1'),
 )}
 
 
@@ -1268,13 +1297,6 @@ def _compile_only_gpus(generation: str, count: int, memory: int | None,
     return tuple(topology.devices[:count])
 
 
-def _compute_capability(device) -> str | None:
-    """`device`'s compute capability, '8.9' for an sm89 card. jax's Device
-    declares no such field, and a CUDA device carries it, so it is read at
-    this boundary; a device without one gives None."""
-    return getattr(device, 'compute_capability', None)
-
-
 def _multiprocessors(device) -> int | None:
     """`device`'s streaming multiprocessors. jax's Device declares no such
     field, and a CUDA device reports them as its cores, so it is read at this
@@ -1346,8 +1368,8 @@ launches run on (sm86, sm89 and sm120 hold 99 KiB), so a launch sized by it fits
 
 
 def tpu(target: GpuTarget) -> bool:
-    """Whether `target` is a TPU's: its device kind names one ('TPU v5 lite')."""
-    return target.device_kind.startswith('TPU ')
+    """Whether `target` is a TPU's: its device kind names one ('TPU v5 lite', 'TPU7x')."""
+    return target.device_kind.startswith('TPU')
 
 
 def shared_budget(target: GpuTarget) -> int:
@@ -1386,6 +1408,8 @@ def device_generation() -> str:
 def _generation(device) -> str:
     """`device`'s own generation: a CUDA device's by its compute capability, a TPU's by its kind, another
     platform's its name."""
+    from dew._devices import _compute_capability
+
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
@@ -2068,7 +2092,8 @@ def host_memory_share() -> int:
 
     from dew import _cgroups
 
-    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *_cgroups.memory_limits()]
+    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+              *(limit for _, limit in _cgroups.memory_limits())]
     address, _ = resource.getrlimit(resource.RLIMIT_AS)
     if address != resource.RLIM_INFINITY:
         limits.append(address)
@@ -2156,20 +2181,30 @@ def backend() -> str:
     return generation
 
 
+def lowering_capability() -> tuple[int, int] | None:
+    """The CUDA compute capability a call's kernels lower for, as Mosaic GPU infers its architecture:
+    within a non-interpreted `assumed`, its generation's; else the placed device's (`placed_device`,
+    concrete or a compile-only mesh's abstract one), whichever backend the process opened. None off a CUDA
+    GPU, or interpreted."""
+    if (found := assumption()) is not None:
+        return None if found.interpreted else capability(found.generation)
+    device = placed_device()
+    return capability(_generation(device)) if device.platform == 'gpu' else None
+
+
 def lowering_platform() -> str | None:
     """The platform JAX lowers a call's code for, as `lax.platform_dependent` names it: within a
     non-interpreted `assumed`, its generation's (`cuda` for an `smXY`, `tpu` for a TPU's); else the placed
-    platform's (`placed_platform`), a GPU's `cuda` where its device (`placed_device`, concrete or a
-    compile-only mesh's abstract one) states an NVIDIA compute capability. None where those facts do not name
-    it (a GPU device stating none)."""
-    import re
+    platform's (`placed_platform`), a GPU's its device's (`placed_device`, concrete or a compile-only mesh's
+    abstract one: `programs.lowering_platform`). None where those facts do not name it (an abstract GPU
+    device stating no compute capability)."""
+    from dew.nn import programs
 
     if (platform := backend()) != 'gpu':
         return platform
     if (found := assumption()) is not None and not found.interpreted:
         return 'cuda'
-    stated = _compute_capability(placed_device())
-    return 'cuda' if stated and re.fullmatch(r'\d+\.\d+', stated) else None
+    return programs.lowering_platform(placed_device())
 
 
 def triton_runs() -> bool:

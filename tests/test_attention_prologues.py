@@ -1,4 +1,4 @@
-"""The template's query and key prologues (`Hooks.query_mod`, `Hooks.key_mod`: kernel-templates.md's forward,
+"""The template's query and key prologues (`Hooks.query`, `Hooks.key`: kernel-templates.md's forward,
 row 5743): QK-norm and RoPE as a Qwen3 block writes them, taken where each mainloop loads its operands or as
 XLA's program before the launch, and their pullbacks past the kernels, on par with the prologue written out
 in plain JAX before the reference (check 1)."""
@@ -15,6 +15,7 @@ from test_attention_mosaic import SEEDS, WGMMA, _device, _pinned
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 ROWS, TOKENS, HEADS, KV_HEADS = 1, 128, 2, 1
 """A call's rows, tokens and heads, its draws each case's `SEEDS` (8, test_attention_mosaic's): the count
@@ -109,10 +110,9 @@ def written_reference(spans, width: int):
 def hooks(query_weight, key_weight, width: int, prologue=rotated) -> template.Hooks:
     """The query's and key's prologues (`rotated` by default), each its own weight `[1, D]` and the
     frequencies, width parameters (`template.Kind.WIDTH`)."""
-    frequency = template.Param(frequencies(width), template.Kind.WIDTH)
-    return template.Hooks(query_mod=prologue, key_mod=prologue,
-                          query_params=(template.Param(query_weight, template.Kind.WIDTH), frequency),
-                          key_params=(template.Param(key_weight, template.Kind.WIDTH), frequency))
+    frequency = Side(frequencies(width), template.Kind.WIDTH)
+    return template.Hooks(query=Hook(prologue, (Side(query_weight, template.Kind.WIDTH), frequency)),
+                          key=Hook(prologue, (Side(key_weight, template.Kind.WIDTH), frequency)))
 
 
 def drawing(dtype, width: int):
@@ -240,10 +240,10 @@ def test_a_prologued_route_call_over_narrowed_operands_differentiates_the_prolog
     spans = template.spans(TOKENS, TOKENS, ROWS, causal=True)
 
     def ours(query, key, value, query_weight, key_weight):
-        frequency = template.Param(frequencies(width), template.Kind.WIDTH)
+        frequency = Side(frequencies(width), template.Kind.WIDTH)
         hooked = template.Hooks(
-            query_mod=by_dtype, query_params=(template.Param(query_weight, template.Kind.WIDTH), frequency),
-            key_mod=by_dtype, key_params=(template.Param(key_weight, template.Kind.WIDTH), frequency))
+            query=Hook(by_dtype, (Side(query_weight, template.Kind.WIDTH), frequency)),
+            key=Hook(by_dtype, (Side(key_weight, template.Kind.WIDTH), frequency)))
         wide = [operand.astype(jnp.float32) for operand in (query, key, value)]
         return attention_route.attend(*wide, spans, hooked, operand_dtype=jnp.bfloat16).astype(query.dtype)
 
@@ -266,7 +266,7 @@ def test_the_certify_form_takes_its_prologues_as_the_forward_does_interpreted(dt
 
     def given(query_weight, key_weight):
         hooked = hooks(query_weight, key_weight, width, weighed)
-        return hooked if side == "both" else dataclasses.replace(hooked, query_mod=None, query_params=())
+        return hooked if side == "both" else dataclasses.replace(hooked, query=NO_HOOK)
 
     def ours(query, key, value, query_weight, key_weight):
         with generation.assumed("sm90"):
@@ -288,13 +288,11 @@ def test_the_certify_form_takes_its_prologues_as_the_forward_does_interpreted(dt
                     seeds=SEEDS)
 
 
-def test_a_prologues_parameters_without_its_prologue_are_refused():
-    """A query or key prologue's parameters given with no prologue to read them (`Hooks.query_mod`,
-    `key_mod` None) are refused where the hooks are built, as no prologue would differentiate along them."""
-    weight = template.Param(jnp.ones((1, 32), jnp.float32), template.Kind.WIDTH)
-    for side in ("query", "key"):
-        with pytest.raises(ValueError):
-            template.Hooks(**{f"{side}_params": (weight,)})
+def test_a_hooks_side_operands_without_its_function_are_refused():
+    """A hook's side operands given with no function to read them (`hooks.Hook`'s `fn` None, a prologue's as
+    any site's) are refused where the hook is built, as no hook would differentiate along them."""
+    with pytest.raises(ValueError):
+        Hook(None, (Side(jnp.ones((1, 32), jnp.float32), template.Kind.WIDTH),))
 
 
 @INTERPRETS
@@ -312,9 +310,9 @@ def test_a_query_prologue_taken_in_the_launch_is_bitwise_the_one_taken_before_it
     query, key, value, query_weight, key_weight = drawing(jnp.bfloat16, width)(0)[:5]
     dtype = ROUNDED.get(prologue, jnp.float32)
     hooked = hooks(query_weight.astype(dtype), key_weight.astype(dtype), width, PROLOGUES[prologue])
-    taken = dataclasses.replace(hooked, query_mod=None, query_params=())
+    taken = dataclasses.replace(hooked, query=NO_HOOK)
     with _device(interpret=True, target=target), _pinned(tiles):
         fused = attention_mosaic.forward(query, key, value, spans, hooked, interpret=True)
-        before = attention_mosaic.forward(template.prologued(query, hooked.query_mod, hooked.query_params),
+        before = attention_mosaic.forward(template.prologued(query, hooked.query.fn, hooked.query.sides),
                                           key, value, spans, taken, interpret=True)
     np.testing.assert_array_equal(np.asarray(fused, np.float32), np.asarray(before, np.float32))

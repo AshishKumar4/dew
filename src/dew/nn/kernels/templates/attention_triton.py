@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.attention import (
     DQ_GRADS,
     DTYPES,
     NATURAL,
-    TRACED_TILE,
     WARPS,
     AttentionLaunch,
     Gradients,
@@ -57,6 +56,7 @@ from dew.nn.kernels.templates.attention import (
     kernel_dot,
     kernel_rows,
     key_tiles,
+    kinds_of,
     launch_arguments,
     launch_cotangent,
     output_split,
@@ -68,6 +68,7 @@ from dew.nn.kernels.templates.attention import (
     within,
 )
 from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.hooks import TRACED_TILE
 from dew.nn.precision import power2
 
 
@@ -207,7 +208,7 @@ def _holding(op: Template, ba: tokamax.BoundArguments, launch: str, *, certified
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
-    """A hook parameter's values for a tile, as `kind` lays them out (`Kind.axes`, its block
+    """A hook parameter's values for a tile, as `kind` lays them out (its `Kind`, its block
     `_param_spec`'s): the head's scalar, the tile's entries over its keys `keys` (a score tile's, a
     singleton along an axis it does not vary on, `scored`) or its output rows'."""
     del queries
@@ -220,7 +221,7 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None
 def _held(kind: Kind) -> tuple[str, ...]:
     """A parameter's axes a program's block holds (`_param_spec`, `_key_param_spec`): all but its batch row's
     and head's, which the block indexes away."""
-    return tuple(axis for axis in kind.axes if axis not in ("batch", "heads"))
+    return tuple(axis for axis in kind if axis not in ("batch", "heads"))
 
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
@@ -656,13 +657,13 @@ def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundA
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
-    """How a program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole `[H]`,
+    """How a program reads a hook parameter of `kind` (its `Kind`): a head's scalar from the whole `[H]`,
     else its batch row's and head's block (`_block_of`) of its queries' block, every key and the whole
     width."""
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda i, b, h: (0,))
     extents = {"batch": None, "heads": None, "queries": block_q, "keys": keys, "width": param.shape[-1]}
-    return pl.BlockSpec(axes.named(kind.axes, extents),
+    return pl.BlockSpec(axes.named(kind, extents),
                         lambda i, b, h: _block_of(kind, param, b, h, queries=i))
 
 
@@ -673,7 +674,7 @@ def _block_of(kind: Kind, param: jax.Array, row, head, **walked) -> tuple:
     table read by every row, never broadcast), an output's at its own."""
     if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
         row, head = shared_place(param.shape, row, head)
-    return axes.placed(kind.axes, {"batch": row, "heads": head, **walked}, 0)
+    return axes.placed(kind, {"batch": row, "heads": head, **walked}, 0)
 
 
 @overload
@@ -734,11 +735,11 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         m0, total0 = call.rows(initial.m, algebra.LEAST), call.rows(initial.total)
         acc0 = jnp.pad(call.rows(initial.acc),
                        ((0, 0),) * 3 + ((0, call.value.shape[-1] - value.shape[-1]),))
-    op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
-                       score_kinds=tuple(param.kind for param in hooks.score_params),
-                       output_kinds=tuple(param.kind for param in hooks.output_params),
-                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
-                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
+    op = TritonForward(score_mod=hooks.score.fn, output_mod=hooks.output.fn,
+                       score_kinds=kinds_of(hooks.score.sides),
+                       output_kinds=kinds_of(hooks.output.sides),
+                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
+                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural,
@@ -1285,14 +1286,14 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 
 def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) -> pl.BlockSpec:
-    """How a dK/dV program reads a hook parameter of `kind` (`Kind.axes`): a head's scalar from the whole
+    """How a dK/dV program reads a hook parameter of `kind` (its `Kind`): a head's scalar from the whole
     `[H]`, else its batch row's and head's block (`_block_of`) of every query and its key block."""
     if kind is Kind.OUTPUT:
         raise ValueError("an output hook's parameter has no score tile")
     if kind is Kind.HEAD:
         return pl.BlockSpec(param.shape, lambda j, b, h: (0,))
     extents = {"batch": None, "heads": None, "queries": queries, "keys": block_k}
-    return pl.BlockSpec(axes.named(kind.axes, extents),
+    return pl.BlockSpec(axes.named(kind, extents),
                         lambda j, b, h: _block_of(kind, param, b, h, keys=j))
 
 
@@ -1346,7 +1347,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     # The prologues taken as XLA's program before the launch (`prologues_taken`).
     query, key, hooks = prologues_taken(query, key, hooks)
     if residuals is None:
-        plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
+        plain = Hooks() if hooks is None else Hooks(score=hooks.score, initial=hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
                                                    residuals=Kept.SPLIT, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums

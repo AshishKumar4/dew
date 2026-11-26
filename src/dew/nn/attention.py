@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.programs import holes, own_preset
 from dew.nn.residuals import Residual
 
@@ -459,21 +460,20 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
         capped = None if softcap is None else template.Capped(softcap)
         if rows_bias is not None and columns_bias is not None:
-            params = (template.Param(rows_bias, template.Kind.QUERY),
-                      template.Param(columns_bias, template.Kind.KEY))
+            params = (Side(rows_bias, template.Kind.QUERY),
+                      Side(columns_bias, template.Kind.KEY))
         elif bias is None:
             params = ()
         elif bias.shape[2] == 1:
-            params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
+            params = (Side(bias[:, :, 0], template.Kind.KEY),)
         else:
-            params = (template.Param(bias, template.Kind.TILE),)
+            params = (Side(bias, template.Kind.TILE),)
         score_mod = capped if not params else template.Biased(capped)
         if fill is not None:
             score_mod, params = template.Filled.over(spans, fill, score_mod, params)
             spans = template.spans(queries, keys, batch)
         hooks = template.Hooks(
-            score_mod=score_mod,
-            score_params=params,
+            score=Hook(score_mod, params),
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
         if quantized:

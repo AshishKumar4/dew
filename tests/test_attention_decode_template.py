@@ -31,6 +31,7 @@ from dew.nn.kernels.templates import (
     emission,
     report,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 KEYS = 256
 SEEDS = 8
@@ -54,7 +55,7 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     if hook == "sinks":
         return template.Hooks(initial=template.sinks(sinks, len(LENGTHS), positions, 64))
     if hook == "softcap":
-        return template.Hooks(template.Capped(2.0))
+        return template.Hooks(score=Hook(template.Capped(2.0)))
     return None
 
 
@@ -1227,7 +1228,7 @@ def _query_gated(o, q_p):
 @pytest.mark.parametrize("kind", ["stateless", "head", "query", "output"])
 @pytest.mark.parametrize("mode", ["single", "split"])
 def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kind, mode):
-    """Row 5385: `attention_decode.attend` admits and fuses `output_mod` (`stateless`, `Kind.HEAD`,
+    """Row 5385: `attention_decode.attend` admits and fuses an output hook (`stateless`, `Kind.HEAD`,
     `Kind.QUERY`, and `Kind.OUTPUT` bf16 gate) on both single-slice (`at.slices == 1`, fused in
     `MosaicForward`) and split-KV (`at.slices > 1`, fused in `merged.merged_finished`) GQA decode steps,
     matching `template.reference` under check 1, and rejects `finished=False` or unsupported kinds."""
@@ -1254,15 +1255,15 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
 
     def hooks_of(*extra):
         if kind == "stateless":
-            return template.Hooks(initial=initial, output_mod=lambda o: jnp.tanh(o * 0.5))
+            return template.Hooks(initial=initial, output=Hook(lambda o: jnp.tanh(o * 0.5)))
         if kind == "head":
-            return template.Hooks(initial=initial, output_mod=lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
-                                  output_params=(template.Param(extra[0], template.Kind.HEAD),))
+            return template.Hooks(initial=initial, output=Hook(lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
+                                                               (Side(extra[0], template.Kind.HEAD),)))
         if kind == "query":
-            return template.Hooks(initial=initial, output_mod=_query_gated,
-                                  output_params=(template.Param(extra[0], template.Kind.QUERY),))
-        return template.Hooks(initial=initial, output_mod=lambda o, g: o * jax.nn.sigmoid(g),
-                              output_params=(template.Param(extra[0], template.Kind.OUTPUT),))
+            return template.Hooks(initial=initial,
+                                  output=Hook(_query_gated, (Side(extra[0], template.Kind.QUERY),)))
+        return template.Hooks(initial=initial, output=Hook(lambda o, g: o * jax.nn.sigmoid(g),
+                                                           (Side(extra[0], template.Kind.OUTPUT),)))
 
     def ours(q, k, v, *extra):
         with generation.assumed("sm90"):
@@ -1272,10 +1273,11 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
         hooks = hooks_of(*extra)
         wide = jnp.promote_types(q.dtype, jnp.float32)
         wide_params = tuple(
-            template.Param(p.value.astype(jnp.promote_types(p.value.dtype, wide))
-                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.kind)
-            for p in hooks.output_params)
-        return template.reference(q, k, v, spans, dataclasses.replace(hooks, output_params=wide_params))
+            Side(p.value.astype(jnp.promote_types(p.value.dtype, wide))
+                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.axes)
+            for p in hooks.output.sides)
+        return template.reference(q, k, v, spans, dataclasses.replace(
+            hooks, output=dataclasses.replace(hooks.output, sides=wide_params)))
 
     sample = draw(0)
     assert attention_decode.packable(hooks_of(*sample[3:]))
@@ -1288,11 +1290,8 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
 
     if kind == "output" and mode == "single":
         assert not attention_decode.packable(
-            template.Hooks(output_params=(template.Param(sample[3], template.Kind.OUTPUT),)))
-        assert not attention_decode.packable(
-            template.Hooks(output_mod=lambda o, x: o + x,
-                           output_params=(template.Param(jnp.zeros((batch, heads, keys)),
-                                                         template.Kind.KEY),)))
+            template.Hooks(output=Hook(lambda o, x: o + x, (Side(jnp.zeros((batch, heads, keys)),
+                                                                 template.Kind.KEY),))))
         with generation.assumed("sm90"), pytest.raises(ValueError):
             attention_decode.attend(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]),
                                     interpret=True, finished=False)
@@ -1325,8 +1324,8 @@ def _hooked_step(step: str) -> tuple:
         sinks = jnp.zeros((8,), jnp.float32)
 
         def gated(q_in, k_in, v_in, g_in):
-            hooks = template.Hooks(initial=template.sinks(sinks, batch, 1, 128), output_mod=_gated,
-                                   output_params=(template.Param(g_in, template.Kind.OUTPUT),))
+            hooks = template.Hooks(initial=template.sinks(sinks, batch, 1, 128),
+                                   output=Hook(_gated, (Side(g_in, template.Kind.OUTPUT),)))
             return attention_decode.attend(q_in, k_in, v_in, spans, hooks, interpret=False)
 
         return gated, (q, k, k, q), _gated if step == "split" else None
@@ -1339,7 +1338,7 @@ def _hooked_step(step: str) -> tuple:
     spans = template.spans(1, 256, 32, causal=False)
 
     def deferred(q_in, k_in, v_in, p_in):
-        hooks = template.Hooks(output_mod=mod, output_params=(template.Param(p_in, kind),))
+        hooks = template.Hooks(output=Hook(mod, (Side(p_in, kind),)))
         return attention_decode.attend(q_in, k_in, v_in, spans, hooks, interpret=False)
 
     return deferred, (q, k, k, param), mod
@@ -1413,7 +1412,7 @@ def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
     k_s = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.bfloat16)
     sp_s = template.spans(1, 4096, 1, lengths=jnp.array([4096], jnp.int32))
     op_cap, _ = attention_mosaic._forward_call(
-        q_s, k_s, k_s, sp_s, template.Hooks(cap), scale=64 ** -0.5, natural=False)
+        q_s, k_s, k_s, sp_s, template.Hooks(score=Hook(cap)), scale=64 ** -0.5, natural=False)
     prepared_spec = algebra.Forward("spans", 4096, ids=False, scale=64 ** -0.5,
                                     score_mod=op_cap.score_mod, natural=False)
     assert prepared_spec.base2 and not prepared_spec.reaches and not prepared_spec.raw
@@ -1451,7 +1450,7 @@ def test_a_folded_cap_and_a_state_resumed_at_it_hold_one_logit():
 
 def _softcap_or_windowed(case: str) -> tuple:
     """`test_softcap_and_windowed_decode_compile_spill_free`'s call `case` and its operands."""
-    capped = template.Hooks(template.Capped(30.0))
+    capped = template.Hooks(score=Hook(template.Capped(30.0)))
     if case == "softcap-d64-decode":
         spans = template.spans(1, 32768, 32, lengths=jnp.full((32,), 32768, jnp.int32))
         operands = (jax.ShapeDtypeStruct((32, 1, 32, 64), jnp.bfloat16),

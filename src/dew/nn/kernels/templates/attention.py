@@ -9,11 +9,11 @@ to a query exactly when it lies in the query's interval and, with ids, carries t
 sequence (aligned to their last keys, `dew.nn.documents.CrossDocuments`), key lengths and key starts
 all narrow the interval. Every implementation reads the same predicate, so they mean the same keys.
 
-A hook is a plain JAX callable the kernel's body traces, pointwise in the score tile:
-`score_mod(s, q_pos, k_pos, *params)` on the scaled logits (softcap, ALiBi, a bias, a forget-gate
-decay), with each parameter loaded as its kind says (`Param`); the softmax starts from an initial state
-(`Initial`: sinks, a resumed partial); `output_mod(o, *params)` on the normalized output tile. Absent,
-a hook adds no op.
+A hook is a plain JAX callable the kernel's body traces (`templates.hooks.Hook`), pointwise in the score
+tile: a score hook `fn(s, q_pos, k_pos, *sides)` on the scaled logits (softcap, ALiBi, a bias, a
+forget-gate decay), each side operand loaded as its axes say (`hooks.Side` on a `Kind`); the softmax
+starts from an initial state (`Initial`: sinks, a resumed partial); an output hook `fn(o, *sides)` on the
+normalized output tile. Absent, a hook adds no op.
 
 Precision, every implementation's contract: the products of the inputs accumulate in fp32, the logits'
 scale, hooks and softmax run in fp32, and the probabilities round to the values' dtype for each product
@@ -44,6 +44,7 @@ from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import scaled_contraction
+from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side, laid
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
@@ -680,35 +681,39 @@ def ranges_walk(ranges: jax.Array) -> tuple[jax.Array, Callable[[jax.Array], jax
     return jnp.sum(lengths), tile
 
 
-class Kind(enum.Enum):
-    """How a hook parameter is laid out and loaded per tile."""
+class Kind(tuple, enum.Enum):
+    """How a hook's side operand is laid out and loaded per tile: its axes by name, in its layout's order
+    (`hooks.Side.axes`, `templates/axes.py`'s vocabulary: 'batch', 'heads', 'queries', 'keys' and 'width'),
+    a kind being its axes. Each backend composes its blocks, its loads and its broadcasts from them
+    (`axes.named`, `axes.placed`, `hooks.laid`), so none restates a kind's layout."""
 
-    HEAD = "head"
+    HEAD = ("heads",)
     """`[H]`: one value a query head, the head's scalar."""
-    QUERY = "query"
+    QUERY = ("batch", "heads", "queries")
     """`[B, H, Q]`: one value a query, the tile's queries' `[block_q]`."""
-    KEY = "key"
+    KEY = ("batch", "heads", "keys")
     """`[B, H, K]`: one value a key, the tile's keys' `[block_k]`."""
-    TILE = "tile"
+    TILE = ("batch", "heads", "queries", "keys")
     """`[B, H, Q, K]`: one value an entry, the tile's `[block_q, block_k]` (a dense bias)."""
-    OUTPUT = "output"
+    OUTPUT = ("batch", "queries", "heads", "width")
     """`[B, Q, H, Dv]`: one value an output entry, the output tile's `[block_q, Dv]` (a gate)."""
-    WIDTH = "width"
+    WIDTH = ("heads", "width")
     """`[H, D]`: one value a head's width entry, a prologue's row's `[D]` (QK-norm's weight); a head extent
     of 1 every head shares."""
 
-    @property
-    def axes(self) -> tuple[str, ...]:
-        """The parameter's logical axes by name, in its layout's order (`templates/axes.py`'s vocabulary):
-        'batch', 'heads', 'queries', 'keys' and 'width'. Each backend composes its blocks, its loads and
-        its broadcasts from them (`axes.named`, `axes.placed`, `scored`), so none restates a kind's
-        layout."""
-        return _KIND_AXES[self]
+    def __repr__(self) -> str:
+        # A launch's identity reads its op's repr (`report._identity`), so a kind's names it, never its axes.
+        return f"<{type(self).__name__}.{self.name}: {self.name.lower()!r}>"
 
 
-_KIND_AXES = {Kind.HEAD: ("heads",), Kind.QUERY: ("batch", "heads", "queries"),
-              Kind.KEY: ("batch", "heads", "keys"), Kind.TILE: ("batch", "heads", "queries", "keys"),
-              Kind.OUTPUT: ("batch", "queries", "heads", "width"), Kind.WIDTH: ("heads", "width")}
+def kind_of(side: Side) -> Kind:
+    """A hook's side operand's kind: its axes, as `Kind` names them."""
+    return Kind(side.axes)
+
+
+def kinds_of(sides: tuple[Side, ...]) -> tuple[Kind, ...]:
+    """Each of a hook's side operands' kind (`kind_of`)."""
+    return tuple(map(kind_of, sides))
 
 
 BAND_GROUP = 768
@@ -753,20 +758,12 @@ def band_dense(values: jax.Array, offset: jax.Array, extent: int, keys: int) -> 
 
 
 def scored(tile: jax.Array, kind: Kind) -> jax.Array:
-    """A score parameter's values over its own tile axes (`Kind.axes`' queries and keys, as a launch loads
-    them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on."""
-    if "queries" not in kind.axes:
+    """A score side operand's values over its own tile axes (its kind's queries and keys, as a launch loads
+    them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on (`hooks.laid`
+    over `SCORE_TILE`)."""
+    if "queries" not in kind:
         return tile[None, :]
-    return tile if "keys" in kind.axes else tile[:, None]
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class Param:
-    """A hook's parameter: its array and how a tile reads it (`Kind`)."""
-
-    value: jax.Array
-    kind: Kind = dataclasses.field(metadata={"static": True})
+    return tile if "keys" in kind else tile[:, None]
 
 
 @jax.tree_util.register_dataclass
@@ -871,16 +868,16 @@ class Filled(tuning.FieldHook):
 
     @classmethod
     def over(cls, spans: KeySpans, fill: float, score_mod: Callable | None,
-             params: tuple[Param, ...]) -> tuple["Filled", tuple[Param, ...]]:
+             params: tuple[Side, ...]) -> tuple["Filled", tuple[Side, ...]]:
         """The hook over `spans` beside `score_mod` and its `params`, and the parameters the two read: the
         inner hook's, then each run's start, each run's end, and the documents' ids where `spans` packs
         them."""
         spans = spans.per_query()
         start, end = ((bound[..., None] if bound.ndim == 2 else bound) for bound in (spans.start, spans.end))
-        own = [Param(bound[:, None, :, run], Kind.QUERY) for bound in (start, end)
+        own = [Side(bound[:, None, :, run], Kind.QUERY) for bound in (start, end)
                for run in range(bound.shape[-1])]
         ids = [] if spans.query_ids is None or spans.key_ids is None else [
-            Param(spans.query_ids[:, None, :], Kind.QUERY), Param(spans.key_ids[:, None, :], Kind.KEY)]
+            Side(spans.query_ids[:, None, :], Kind.QUERY), Side(spans.key_ids[:, None, :], Kind.KEY)]
         return cls(fill, start.shape[-1], bool(ids), score_mod, len(params)), (*params, *own, *ids)
 
 
@@ -1075,47 +1072,40 @@ def coded(p: jax.Array, bound: float) -> jax.Array:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:
-    """The template's hooks, each absent where None: `score_mod(s, q_pos, k_pos, *params)` on the scaled
-    logits `s` `[..., q, k]` with `q_pos` `[q, 1]` and `k_pos` `[1, k]` the entries' query and key
-    indices, pointwise in the entries; `initial` the softmax's start; `output_mod(o, *params)` on the
-    normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a kernel applies it
-    to an output tile whose head width pads to a power of two. A pytree whose callables are static and
-    whose parameters and state are its leaves, so a compiled call takes new values of them. `drop` is
-    probability dropout's weights hook (`Dropout`), absent where None. `rounds`, static, is a quantized
-    model's weights hook: each weight in the value product its code at its row's maximum
-    (`coded`, `round(rounds p)` clipped, a Qwix int8 rule's bound 127.5, whose weights
-    quantize by each row's largest, 1 at the maximum), the denominator the weights themselves, absent where
-    None. The prologues (kernel-templates.md's forward: RoPE, QK-norm), `query_mod(q, q_pos, *params)` on
-    a tile of a query head's rows `[q, D]` with `q_pos` `[q, 1]` their indices, and `key_mod(k, k_pos,
-    *params)` on a key head's `[k, D]` alike, each a row's own (a row's reduction over its width is its
-    own), returning the tile in its dtype, which the products take; their parameters a HEAD's, a QUERY's
-    (a query prologue's) or a KEY's (a key prologue's), each `[rows, 1]` there, and a WIDTH's `[1, D]`
-    (`prologue_kinds`): a Mosaic consumer gives the last two as the tile's entries, `[rows, D]`, which a
-    prologue reads alike where it broadcasts them. Its rows' indices are their places in the call's
-    sequence; a position of another count (a document's own, under packed documents) is a QUERY's or KEY's
-    parameter."""
+    """The template's hooks (`hooks.Hook`), each absent where `NO_HOOK`: `score`, `fn(s, q_pos, k_pos,
+    *sides)` on the scaled logits `s` `[..., q, k]` with `q_pos` `[q, 1]` and `k_pos` `[1, k]` the entries'
+    query and key indices, pointwise in the entries; `initial` the softmax's start; `output`, `fn(o,
+    *sides)` on the normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a
+    kernel applies it to an output tile whose head width pads to a power of two. Each side operand is laid
+    as its `Kind` says. A pytree whose functions are static and whose side operands and state are its
+    leaves, so a compiled call takes new values of them. `drop` is probability dropout's weights hook
+    (`Dropout`), absent where None. `rounds`, static, is a quantized model's weights hook: each weight in
+    the value product its code at its row's maximum (`coded`, `round(rounds p)` clipped, a Qwix int8 rule's
+    bound 127.5, whose weights quantize by each row's largest, 1 at the maximum), the denominator the
+    weights themselves, absent where None. The prologues (kernel-templates.md's forward: RoPE, QK-norm),
+    `query`, `fn(q, q_pos, *sides)` on a tile of a query head's rows `[q, D]` with `q_pos` `[q, 1]` their
+    indices, and `key`, `fn(k, k_pos, *sides)` on a key head's `[k, D]` alike, each a row's own (a row's
+    reduction over its width is its own), returning the tile in its dtype, which the products take; their
+    side operands a HEAD's, a QUERY's (a query prologue's) or a KEY's (a key prologue's), each `[rows, 1]`
+    there, and a WIDTH's `[1, D]` (`prologue_kinds`): a Mosaic consumer gives the last two as the tile's
+    entries, `[rows, D]`, which a prologue reads alike where it broadcasts them. Its rows' indices are
+    their places in the call's sequence; a position of another count (a document's own, under packed
+    documents) is a QUERY's or KEY's side operand."""
 
-    score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
-    score_params: tuple[Param, ...] = ()
+    score: Hook = NO_HOOK
     initial: Initial | None = None
-    output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
-    output_params: tuple[Param, ...] = ()
+    output: Hook = NO_HOOK
     drop: Dropout | None = None
     rounds: float | None = dataclasses.field(default=None, metadata={"static": True})
-    query_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
-    query_params: tuple[Param, ...] = ()
-    key_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
-    key_params: tuple[Param, ...] = ()
+    query: Hook = NO_HOOK
+    key: Hook = NO_HOOK
 
     def __post_init__(self):
-        for side, mod, params in (("query", self.query_mod, self.query_params),
-                                  ("key", self.key_mod, self.key_params)):
-            if params and mod is None:
-                raise ValueError(f"a {side} prologue's parameters take its prologue ({side}_mod), none given")
-            kinds = prologue_kinds(side)
-            if any(param.kind not in kinds for param in params):
-                raise ValueError(f"a {side} prologue's parameters are of {[kind.value for kind in kinds]}, "
-                                 f"not {[param.kind.value for param in params]}")
+        for site, hook in (("query", self.query), ("key", self.key)):
+            kinds = prologue_kinds(site)
+            if any(side.axes not in kinds for side in hook.sides):
+                raise ValueError(f"a {site} prologue's side operands are of {[kind.name for kind in kinds]}, "
+                                 f"not {[side.axes for side in hook.sides]}")
 
 
 def prologue_kinds(side: str) -> tuple[Kind, ...]:
@@ -1124,8 +1114,8 @@ def prologue_kinds(side: str) -> tuple[Kind, ...]:
     return (Kind.HEAD, Kind.QUERY if side == "query" else Kind.KEY, Kind.WIDTH)
 
 
-def prologued(operand: jax.Array, mod: Callable | None, params: tuple[Param, ...]) -> jax.Array:
-    """`operand` `[B, T, H, D]` under its prologue `mod` (`Hooks.query_mod` or `key_mod`): each batch row's
+def prologued(operand: jax.Array, mod: Callable | None, params: tuple[Side, ...]) -> jax.Array:
+    """`operand` `[B, T, H, D]` under its prologue `mod` (`Hooks.query`'s or `key`'s): each batch row's
     and head's tile `[T, D]` at its rows' indices, each reading its own parameters (`_prologue_param`);
     `operand` itself where `mod` is None."""
     if mod is None:
@@ -1146,10 +1136,10 @@ def key_prologue_taken(key: jax.Array, hooks: Hooks) -> tuple[jax.Array, Hooks]:
     reads every key tile it walks, so a prologue taken where a program loads them would run once a query
     tile a key, where XLA's program before the launch takes it once (the 4B decision call's 12,288 keys a
     head are read by its 96 query tiles)."""
-    if hooks.key_mod is None:
+    if hooks.key.fn is None:
         return key, hooks
-    return (prologued(key, hooks.key_mod, hooks.key_params),
-            dataclasses.replace(hooks, key_mod=None, key_params=()))
+    return (prologued(key, hooks.key.fn, hooks.key.sides),
+            dataclasses.replace(hooks, key=NO_HOOK))
 
 
 @overload
@@ -1166,18 +1156,18 @@ def prologues_taken(query: jax.Array, key: jax.Array, hooks: Hooks | None
                     ) -> tuple[jax.Array, jax.Array, Hooks | None]:
     """`query` and `key` under `hooks`' prologues (`prologued`), and `hooks` without them: a mainloop whose
     program is XLA's (the plain-JAX one's) takes them so at its entry, where XLA fuses them with its loads."""
-    if hooks is None or (hooks.query_mod is None and hooks.key_mod is None):
+    if hooks is None or (hooks.query.fn is None and hooks.key.fn is None):
         return query, key, hooks
-    return (prologued(query, hooks.query_mod, hooks.query_params),
-            prologued(key, hooks.key_mod, hooks.key_params),
-            dataclasses.replace(hooks, query_mod=None, query_params=(), key_mod=None, key_params=()))
+    return (prologued(query, hooks.query.fn, hooks.query.sides),
+            prologued(key, hooks.key.fn, hooks.key.sides),
+            dataclasses.replace(hooks, query=NO_HOOK, key=NO_HOOK))
 
 
-def _prologue_param(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
+def _prologue_param(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
     """A prologue's `param` as a batch row's and head's tile reads it (`prologued`): a head's scalar, its
     rows' `[T, 1]`, a width's `[1, D]`, each from the row and head it shares (`shared_place`)."""
     value = param.value
-    match param.kind:
+    match kind_of(param):
         case Kind.HEAD:
             return value[head]
         case Kind.WIDTH:
@@ -1194,12 +1184,12 @@ def shared_place(shape: tuple[int, ...], row, head) -> tuple:
     return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
 
 
-def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
+def _per_head(param: Side, row: jax.Array, head: jax.Array) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and key."""
     value = param.value
-    if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    if param.axes in (Kind.QUERY, Kind.KEY, Kind.TILE):
         row, head = shared_place(value.shape, row, head)
-    match param.kind:
+    match kind_of(param):
         case Kind.HEAD:
             return value[head]
         case Kind.QUERY:
@@ -1283,11 +1273,11 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
            scale: float | None = None) -> jax.Array:
     """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
     of `query` `[B, Q, H, D]` and `key` `[B, K, Hk, D]` accumulated in fp32 (fp64 for fp64 inputs), the
-    scale, then `hooks.score_mod`; -inf where `spans` hides the key. The query and key are taken under their
+    scale, then `hooks.score.fn`; -inf where `spans` hides the key. The query and key are taken under their
     prologues first (`prologued`)."""
     hooks = Hooks() if hooks is None else hooks
-    query = prologued(query, hooks.query_mod, hooks.query_params)
-    key = prologued(key, hooks.key_mod, hooks.key_params)
+    query = prologued(query, hooks.query.fn, hooks.query.sides)
+    key = prologued(key, hooks.key.fn, hooks.key.sides)
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
@@ -1301,16 +1291,16 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
 
 
 def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
-    """`hooks.score_mod` over scaled products `[B, H, Q, K]` at their positions, each row and head reading
+    """`hooks.score.fn` over scaled products `[B, H, Q, K]` at their positions, each row and head reading
     its own parameters (`_per_head`); the products where the hooks have no score_mod."""
-    score_mod = hooks.score_mod
+    score_mod = hooks.score.fn
     if score_mod is None:
         return products
     batch, heads, queries, keys = products.shape
     q_pos, k_pos = jnp.arange(queries)[:, None], jnp.arange(keys)[None, :]
 
     def one(row, head):
-        params = (_per_head(p, row, head) for p in hooks.score_params)
+        params = (_per_head(p, row, head) for p in hooks.score.sides)
         return score_mod(products[row, head], q_pos, k_pos, *params)
 
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
@@ -1385,7 +1375,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         if hooks.initial is None or hooks.initial.valueless:
             normalized = held_mean(acc, total, value.dtype, functools.partial(
                 _scaled_mean, logits, value, m0, total0, acc0))
-        if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
+        if hooks.output.fn is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
     else:
@@ -1405,7 +1395,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn,
                                                                    cotangent_wide=value.dtype == jnp.float16)
 
-    out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
+    out = output_hooked(normalized, hooks.output.fn, hooks.output.sides)
     out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
 
@@ -1569,7 +1559,7 @@ def derivative_of(out: jax.Array) -> jax.Array:
     return jnp.where(jnp.isfinite(value), out - value, 0.0)
 
 
-def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
+def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Side, ...]) -> jax.Array:
     """The normalized output `out` `[B, H, Q, Dv]` under `output_mod`, each batch row's and head's `[Q, Dv]`
     with its parameters as the reference reads them (`_per_head`); `out` itself where there is no hook."""
     if output_mod is None:
@@ -1712,7 +1702,7 @@ def head_width(width: int) -> int:
     return power_of_two(width) if width <= WIDEST_POWER else whole(width, 64)
 
 
-def _padded(param: Param, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
+def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
     """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
     (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
     the reference gives it, `prologued`): zeros past its queries, keys and value width, and a head vector
@@ -1720,7 +1710,7 @@ def _padded(param: Param, queries: int, keys: int, value_width: int, *, widened:
     value = param.value
     if widened and jnp.issubdtype(value.dtype, jnp.floating):
         value = value.astype(jnp.float32)
-    match param.kind:
+    match kind_of(param):
         case Kind.HEAD:
             return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
         case Kind.QUERY:
@@ -1763,7 +1753,7 @@ class PaddedCall:
     """The queries each of `start`'s and `end`'s intervals holds (`KeySpans.per_span`), unpadded where more
     than one: a program reads them by position."""
     query_params: tuple[jax.Array, ...] = ()
-    """The query prologue's parameters (`Hooks.query_params`) at the padded call's shapes, each in its own
+    """The query prologue's parameters (`Hooks.query`'s sides) at the padded call's shapes, each in its own
     dtype, a width parameter's at the query's padded width."""
 
     @property
@@ -1826,11 +1816,11 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
                   else (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q)))
     return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
-                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
-                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score.sides),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output.sides),
                    queries, keys, table, page, spans.per_span,
                    tuple(_padded(param, padded_q, padded_k, padded_d, widened=False)
-                         for param in hooks.query_params))
+                         for param in hooks.query.sides))
 
 
 def kept_dtype(dtype) -> str:
@@ -1855,8 +1845,10 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
     return hooked
 
 
-TRACED_TILE = 16
-"""The tile a hook is traced at for its picks' key (`hook_program`)."""
+SITES = {"score_mod": ("queries", "keys"), "output_mod": ("queries", "width"),
+         "query_mod": ("queries", "width"), "key_mod": ("keys", "width")}
+"""Each hook site's tile by its axes, which its side operands are laid over (`hooks.laid`): the score tile's
+queries by keys, the output tile's and a query prologue's queries by width, a key prologue's keys by width."""
 
 
 def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
@@ -1865,17 +1857,18 @@ def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ..
     """What a score, output or prologue hook computes, as its launch's picks key it (`tuning.program`): a
     score hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
     call's padded value `width`, a prologue (`query_mod`, `key_mod`) at `TRACED_TILE` rows of the head
-    `width` in the `operand` dtype, the entries' indices and each parameter as its kind lays it out there,
-    in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's pullback too, so a hook whose
-    derivative is its own rule (`jax.custom_vjp`) keys by that rule (a prologue's pullback runs past the
-    kernels, `jax.vjp` of `prologued`). None or an already traced key as it is."""
+    `width` in the `operand` dtype, the entries' indices and each side operand laid over its site's tile
+    (`SITES`, `hooks.laid`), in its dtype in the kernels (`dtypes`); `differentiated`, a score hook's
+    pullback too, so a hook whose derivative is its own rule (`jax.custom_vjp`) keys by that rule (a
+    prologue's pullback runs past the kernels, `jax.vjp` of `prologued`). None or an already traced key as
+    it is."""
     if hook is None or isinstance(hook, str):
         return hook
     tile = TRACED_TILE
     prologue = name in ("query_mod", "key_mod")
-    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (tile, 1) if prologue else (1, tile),
-               Kind.TILE: (tile, tile), Kind.OUTPUT: (tile, width), Kind.WIDTH: (1, width)}
-    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
+    extents = {"queries": tile, "keys": tile, "width": width}
+    params = [jax.ShapeDtypeStruct(laid(SITES[name], kind, extents), dtype)
+              for kind, dtype in zip(kinds, dtypes, strict=True)]
     square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
     if name == "output_mod":
         return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
@@ -1997,7 +1990,7 @@ def takes_output_residuals(hooks: Hooks, dtype, *, accurate: bool) -> bool:
     backward's D is then the rounded output's, as FlashAttention's is, which check 1 judges a term at a time.
     The accurate form, an initial state (whose anchor keeps a sink's share) and fp32 keep the anchor's."""
     return (jnp.dtype(dtype).itemsize == 2 and not accurate and hooks.initial is None and hooks.drop is None
-            and hooks.output_mod is None)
+            and hooks.output.fn is None)
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
@@ -2013,7 +2006,7 @@ tiles' entries."""
 @dataclasses.dataclass(frozen=True)
 class Gradients:
     """The backward's gradients: of the queries, keys and values, of each score hook parameter (the
-    order `Hooks.score_params` gives them), and of the softmax's initial state where it has one."""
+    order `Hooks.score`'s sides give them), and of the softmax's initial state where it has one."""
 
     query: jax.Array
     key: jax.Array
@@ -2030,7 +2023,7 @@ def launch_cotangent(dout: jax.Array, dtype: DTypeLike, hooks: Hooks, totals: ja
     output the reference's zero), whose weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`), and whose
     `dO` of `inf` would take its row's values beneath a shift no visited query asks for."""
     dout = dout.astype(dtype)
-    if hooks.score_mod is None:
+    if hooks.score.fn is None:
         return dout
     return jnp.where(jnp.swapaxes(totals, 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
 
@@ -2066,8 +2059,8 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                                  (0, call.value.shape[-1] - value_width)))
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
-    kinds = tuple(param.kind for param in hooks.score_params)
-    dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score_params)
+    kinds = kinds_of(hooks.score.sides)
+    dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides)
     maxima, totals, anchors, split = residuals
     key_index = call.rows(anchors.astype(jnp.int32))
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
@@ -2082,7 +2075,7 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     maximum = call.rows(maxima.astype(jnp.float32))
     arrays = (*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value, shift,
               others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows)
-    params = {"score_mod": hooks.score_mod, "score_kinds": kinds, "score_dtypes": dtypes, "scale": scale,
+    params = {"score_mod": hooks.score.fn, "score_kinds": kinds, "score_dtypes": dtypes, "scale": scale,
               "prescale": power}
     return arrays, params, (call, starts, cotangent)
 
@@ -2189,13 +2182,13 @@ def _raised(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Arr
     return aligned_sum([(grad, *factors)], axis=axes)
 
 
-def hook_gradient(grad: jax.Array, shift: jax.Array, param: Param) -> jax.Array:
+def hook_gradient(grad: jax.Array, shift: jax.Array, param: Side) -> jax.Array:
     """A score hook parameter's gradient from a launch's fp32 parts, a batch row's and query head's each
     (`[B, H, ...]`; a head's partial sums `[., B, H, 1]`) beneath their shift `[B, H]` (`beneath_shift`):
     raised and summed over the rows and heads `param` shares (`shared_place`; a head's over every row and
     partial sum) at once (`raised_sum`), in its own shape. Every launch writes a row's and head's apiece, so
     no sum across rows precedes the one that takes each at its own scale."""
-    if param.kind == Kind.HEAD:
+    if param.axes == Kind.HEAD:
         return raised_sum(grad, shift[None, :, :, None], (0, 1))[0, 0, :param.value.shape[0], 0]
     laid = shift.reshape(*shift.shape, *(1,) * (grad.ndim - 2))
     shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
@@ -2300,7 +2293,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     summed in XLA); the Mosaic one-launch schedule adds dQ's tiles and a key head's query heads' dK and dV
     atomically, in their arrival order."""
     hooks = Hooks() if hooks is None else hooks
-    if hooks.output_mod is not None:
+    if hooks.output.fn is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
     # Each gradient linear in the values (dQ, dK, the hooks' and the state's maximum and denominator)
     # restored last by the power of two they were taken beneath (`beneath_shift`), from the launch's own
@@ -2337,8 +2330,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     dk = restored(dk)
     grads = []
-    for param in hooks.score_params:
-        match param.kind:
+    for param in hooks.score.sides:
+        match kind_of(param):
             case Kind.HEAD:
                 grads.append(hook_gradient(dq_grads.pop(0), shift, param))
             case Kind.QUERY:
@@ -2359,6 +2352,6 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key_dtype),
                      dv[:, :keys, :, :value_width].astype(value_dtype),
-                     tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score_params,
+                     tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score.sides,
                                                                                  strict=True)),
                      initial)

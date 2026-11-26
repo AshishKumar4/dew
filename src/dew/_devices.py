@@ -120,6 +120,13 @@ def deviceless(device) -> bool:
     return device.client.runtime_type == "compile_only_runtime"
 
 
+def _compute_capability(device) -> str | None:
+    """`device`'s compute capability, '9.0' for an H100's, read at this boundary: jax's Device declares no
+    such field, a CUDA device and an abstract one (a compile-only mesh's) carry it; None without one. The one
+    reading of it platform detection (`dew.nn.programs`) and generation selection take."""
+    return getattr(device, "compute_capability", None)
+
+
 def xla_flag(name: str) -> str | None:
     """The value `--<name>` carries in XLA_FLAGS, or None when it is absent.
 
