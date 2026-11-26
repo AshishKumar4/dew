@@ -743,12 +743,10 @@ class Slots:
             raise ValueError("a step whose products run past it gives back no slot early nor reads one ahead")
         self.acquire_all()
 
-    def acquire_all(self) -> None:
-        """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
-        loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
-        index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
-        step that reads its slots in a loop acquires them before it. A stream read ahead is not its own to
-        acquire."""
+def acquire_all(self) -> None:
+        """Every slot the step has not read acquired in the step's own trace, so its reads inside a loop's
+        body (a rolled `lax.fori_loop`) or a branch take the step's slot: a read first made there acquires
+        within it, a wait each trip of the loop. A stream read ahead is not its own to acquire."""
         for name in self._rings:
             if name not in self._ahead:
                 self[name]
