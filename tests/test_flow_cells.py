@@ -181,6 +181,17 @@ def test_a_classs_covering_holds_every_native_value_and_pair_and_every_named_fau
     assert held >= set().union(*(gpu_flow.held(cell.native) for cell in mine))
 
 
+def test_the_recurrence_decode_cells_covering_keeps_both_its_idle_row_checks():
+    """The recurrence's decode cells (tests/test_gpu_recurrence.py `decode_cells`): an idle row's exact bits,
+    run-only, and the drawing rows' check 1 beside it, prepared, each kept by the GPU's covering
+    (`gpu_flow.covering`), neither dropped as the other's tie (row 13548, review of 936188b63)."""
+    import test_gpu_recurrence
+
+    kept = {cell.label for cell in gpu_flow.covering(test_gpu_recurrence.decode_cells())}
+    assert {"the decode kernel leaves an idle row alone",
+            "the decode kernel's drawing rows step beside idle ones as with none"} <= kept
+
+
 def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_path, monkeypatch):
     """A matrix case pinned to its generation (`generation_support.pinned`, as every *_matrix.py pins its
     cases) runs in a GPU part's prepare on the node's CPU when the node is that generation, as its run runs

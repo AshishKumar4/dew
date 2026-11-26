@@ -417,11 +417,13 @@ def walk_cells() -> list[Cell]:
 def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
+        # Each its rows' check, so the covering keeps both (`gpu_flow.covering`: a cell no native value
+        # distinguishes is dropped).
         Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone,
-             native={"launch": "decode step"}, at_run=BITWISE),
+             native={"launch": "decode step", "rows": "idle"}, at_run=BITWISE),
         Cell("the decode kernel's drawing rows step beside idle ones as with none",
              the_decode_kernels_drawing_rows_step_beside_idle_ones_as_with_none,
-             native={"launch": "decode step"}),
+             native={"launch": "decode step", "rows": "drawing"}),
         Cell("the fused decode step gives the same bits however its launches are timed",
              the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed, fault=RACES,
              at_run=BITWISE),
