@@ -1385,10 +1385,11 @@ and the reference implementation. They add no run-time dispatch to the algebra e
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
   order. Print value-taking components of `forms.Derived` (prepare, step, merge, finish, mapped, and
   backward where present) over a flat array signature. The wrapper restores the named state and operand
-  trees and keeps `init` and slot metadata as static shapes, not executable array programs. For a
-  template with a product issuer, emit its pure factors and finish expressions; the template still owns
-  the actual dot, tile schedule and accumulation callbacks. A callback that cannot be separated from its
-  math is not a printable case. Declared reduction backward tiles use their own declarations; scan
+  trees. The existing initializer still owns the actual slot values, including reduction floors and
+  corrected scans' identity matrices; slot metadata records their order and types. For a template with
+  a product issuer, emit its pure factors and finish expressions; the template still owns the dot, tile
+  schedule and accumulation callbacks. A callback that cannot be separated from its math is not a
+  printable case. Declared reduction backward tiles use their own declarations; scan
   backward retains its incoming state, output cotangent and outgoing state cotangent inputs. Do not use a
   derivative of the generated forward in place of either.
 - **Surrogates.** A `SurrogateBodies` entry names the forward and tangent bodies passed to
