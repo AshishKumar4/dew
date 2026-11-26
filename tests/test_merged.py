@@ -1123,6 +1123,20 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
                                        output_specs=(g_s,))
               for hook in (strict, gating, subtracting)}
     assert worked[gating].exponentials > worked[subtracting].exponentials, worked
+    # Keyed as traced for the launch's target, not the ambient one: hooks alike on an A100 and apart on a
+    # B200 hold their own B200 plans.
+
+    def on_b200(alike, apart):
+        def hook(o, g):
+            return apart(o, g) if generation.gpu_target().generation == "sm100" else alike(o, g)
+        return hook
+
+    with generation.assumed("sm80"):
+        gated, subtracted = (merged.launch_work(
+            spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
+            output_mod=on_b200(lambda o, g: o + g, apart), output_kinds=(template.Kind.OUTPUT,),
+            output_specs=(g_s,)) for apart in (lambda o, g: o * jax.nn.sigmoid(g), lambda o, g: o - g))
+    assert gated.exponentials > subtracted.exponentials, (gated, subtracted)
     # A merge's plan is held by what its hook computes (`hook_program`, row 12420): a hook closing over an
     # array is planned once for its program, as one that holds none is.
     captured = jnp.ones((), jnp.float32)

@@ -418,8 +418,10 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
 
     total_slices = padded.shape[1] + int(has_initial)
     blocks = _candidate_blocks(width, total_slices)
-    hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks,
-                                mosaic=_uses_mosaic(target, output_mod))
+    # Traced for the target its launch is counted for (`_launch_for_block`), whatever the ambient one.
+    with generation.as_target(target):
+        hooked = _epilogue_programs(output_mod, output_kinds, output_specs, blocks,
+                                    mosaic=_uses_mosaic(target, output_mod))
     key = (units, padded, stacked, queries, width, target, has_initial, raw_scale, out_dtype, out_heads,
            output_kinds, output_specs, hooked, fusion.choice_context())
     return _cache.holding(_PLANNED, key, lambda: _compute_planned_block(
