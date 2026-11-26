@@ -158,9 +158,9 @@ def expression(value: Operand) -> str:
         return f"{_callee(value.callee)}({', '.join(_arguments(value))})"
     if isinstance(value, Layout):
         return _tuple(map(expression, value.dimensions))
-    if isinstance(value, Literal):
     if isinstance(value, tuple):
         return _tuple(map(expression, value))
+    if isinstance(value, Literal):
         dtype = np.dtype(value.dtype)
         if isinstance(value.integer, Ref):
             return f"np.array({value.integer.name}, dtype=jnp.dtype({value.dtype!r}))"
