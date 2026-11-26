@@ -321,6 +321,29 @@ def test_a_row_both_arms_hold_exactly_is_not_carried_and_the_site_judges_as_befo
     assert_as_exact(jnp.matmul, jnp.matmul, zeroed_draw, "rows held exactly", seeds=8)
 
 
+def test_check_1_reads_a_discrete_leaf_in_its_own_representation():
+    """A discrete leaf's errors are taken before the gate's float64 (row 13543): an int64 count of 2^53 the
+    truth and the reference hold, which Dew's arm holds as 2^53 + 1 (float64 rounds both to 2^53), fails
+    Dew's arm, where its own exact value passes; and the exact difference reaches the evidence, two leaves
+    one apart holding a squared error of one."""
+    from dew.parity import _error_rows
+
+    big = np.int64(2**53)
+    [(log_mse, *_)] = _error_rows([np.asarray([big + 1])], [np.asarray([big])], xp=np)
+    assert log_mse == 0.0
+
+    def counted(value):
+        return as_given(lambda seed: {"count": np.asarray([value], np.int64)})
+
+    def draw(seed):
+        return (seed,)
+
+    assert_as_exact(counted(big), counted(big), draw, "an exact count", seeds=8, truth_fn=counted(big))
+    with pytest.raises(GateFailure):
+        assert_as_exact(counted(big + 1), counted(big), draw, "a count one off", seeds=8,
+                        truth_fn=counted(big))
+
+
 def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_its_inputs():
     """Planted controls (ledger 2641): a draw from a generator its seed does not fix, and an arm drawing a
     noise of its own, each compare draws no seed pairs, and check 1 refuses both before judging them

@@ -882,14 +882,31 @@ def _truth_rows(truths, terms, *, xp):
     return found
 
 
+def _discrete_errors(reference, truth, xp):
+    """A discrete leaf's errors (integers, booleans), taken in its own representation before the gate's
+    float64 (`_laid`): its values' differences exact, where float64 rounds integers past 2^53 alike and
+    would make two that differ by one agree (row 13543); None for a leaf of floats. Each difference is
+    exact in float64 where it is below 2^53."""
+    held, true = xp.asarray(reference), xp.asarray(truth)
+    if not all(xp.issubdtype(leaf.dtype, xp.integer) or leaf.dtype == bool for leaf in (held, true)):
+        return None
+    kind = xp.result_type(held, true)
+    kind = xp.int8 if xp.dtype(kind) == xp.dtype(bool) else kind
+    held, true = held.astype(kind), true.astype(kind)
+    # The larger less the smaller, which no unsigned or signed operand wraps, signed by its order.
+    apart = (xp.maximum(held, true) - xp.minimum(held, true)).astype(_wide(reference))
+    return xp.where(held >= true, apart, -apart)
+
+
 def _error_rows(references, truths, *, xp):
     """Each reference leaf against its truth: its mean squared error's log (`log_mean_square`), whether
     its every value is finite, and its error's rows' RMS (`_scaled_rms`) and largest share
     (`_largest_share`)."""
     found = []
     for reference, truth in zip(references, truths, strict=True):
+        errors = _discrete_errors(reference, truth, xp)
         values, truth = _laid(reference, xp), _laid(truth, xp)
-        errors = values - truth
+        errors = values - truth if errors is None else errors
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
         truth_rows = truth.reshape(-1, width) if width else xp.zeros((0, 1))

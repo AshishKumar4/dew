@@ -509,6 +509,30 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
         ct.assert_certified(lambda x: jnp.tan(x), lambda seed: (x,), "tangent", seeds=1)
 
 
+@pytest.mark.parametrize("flushes", [True, False], ids=["flushing", "gradual"])
+def test_a_sum_of_exact_zeros_is_held_exactly_zero(flushes):
+    """A sum of exact zeros has no rounding below the normal range on any path: a reduction of [+0, +0]
+    is +0 alone, its underflow slack refused (2^-126 a flushing lane's, 2^-149 a gradual one's, row 13544),
+    -0 too; one of [-0, -0] -0 or +0 (an identity +0 started from or not); a sum of nonzero terms keeps its
+    slack."""
+    plus, minus = np.zeros((1, 2)), np.full((1, 2), -0.0)
+    for native, terms, held in ((0.0, plus, True), (-0.0, plus, False), (2.0 ** -126, plus, False),
+                                (2.0 ** -149, plus, False), (-0.0, minus, True), (0.0, minus, True),
+                                (2.0 ** -149, minus, False)):
+        assert ct._terms_hold(np.float32([native]), terms, oc.FLOAT32, flushes)[0] == held, (native, terms)
+    tiny = np.float32([[2.0 ** -126, -2.0 ** -126]])
+    assert ct._terms_hold(np.float32([0.0]), tiny, oc.FLOAT32, flushes)[0]
+
+
+def test_check2_refuses_a_run_of_no_seeds():
+    """`assert_certified` over no seeds checks nothing and is refused (row 13546), however uncertifiable
+    the function: the tangent the run-wide control already refuses at one seed."""
+    x = np.float32(np.linspace(0.1, 3, 32))
+    for seeds in (0, -1):
+        with pytest.raises(ValueError):
+            ct.assert_certified(lambda x: jnp.tan(x), lambda seed: (x,), "tangent", seeds=seeds)
+
+
 def test_an_equation_whose_result_nothing_reads_is_held_too():
     """Check 2 holds every equation the program executes: a primitive without a contract whose result the
     output never reads (a tangent dropped before the return, inside a call too) is still a finding."""
