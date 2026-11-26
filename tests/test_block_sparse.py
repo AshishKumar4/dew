@@ -287,15 +287,19 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
                                atol=1e-4)
     assert np.all(np.isneginf(scores[..., ~causal]))
 
+    for initial, local, forcing in ((0, 1, "MSA's own block"), (1, 2, "M3's first and two local")):
+        selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k + 2,
+                                                         initial=initial, local=local))
+        assert selected.shape == (rows, groups, length, top_k + 2), forcing
+        for row, group, at in np.ndindex(rows, groups, length):
+            own = at // block
+            forced = set(range(initial)) | {b for b in range(own - local + 1, own + 1) if b >= 0}
+            maxima = np.array([scores[row, group, at, b * block:min((b + 1) * block, at + 1)].max()
+                               if b * block <= at else -np.inf for b in range(length // block)])
+            maxima[list(forced)] = -np.inf
+            picked = {int(b) for b in selected[row, group, at] if b >= 0}
+            assert picked == _top(maxima, top_k + 2 - initial - local, forced), (forcing, row, group, at)
     selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k))
-    assert selected.shape == (rows, groups, length, top_k)
-    for row, group, at in np.ndindex(rows, groups, length):
-        own = at // block
-        maxima = np.array([scores[row, group, at, b * block:min((b + 1) * block, at + 1)].max()
-                           if b * block <= at else -np.inf for b in range(length // block)])
-        maxima[own] = -np.inf
-        picked = {int(b) for b in selected[row, group, at] if b >= 0}
-        assert picked == _top(maxima, top_k - 1, {own}), (row, group, at)
 
     logits = jnp.asarray(rng.standard_normal((rows, heads * groups, length, length)), jnp.float32)
     loss = float(block_sparse.msa_indexer_kl(jnp.asarray(scores), logits, jnp.asarray(selected), block=block))

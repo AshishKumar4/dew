@@ -5,9 +5,9 @@ A selection is each query's key blocks `[B, R, Q, S]` (-1 where it selects none;
 query head's), from a scoring pass the model runs in XLA, selecting through
 `dew.nn.sparse_selection.top_k_selection`: MoBA's gate over chunk-mean keys (`moba_selection`), NSA's
 compressed branch's weights (`nsa_selection`), MiniMax's learned indexer max-pooled to blocks
-(`pooled_selection`; MSA's index branch `MsaIndexer`, its selection `msa_selection` and its loss
-`msa_indexer_kl`), InfLLM-V2's two-window pooling (`infllm_selection`; its attention, dense below 8192
-keys, `infllm_attention`) or a caller's block mask
+(`pooled_selection`; MSA's index branch `MsaIndexer`, its selection `msa_selection`, MiniMax M3's at its
+forced first and local blocks, and its loss `msa_indexer_kl`), InfLLM-V2's two-window pooling
+(`infllm_selection`; its attention, dense below 8192 keys, `infllm_attention`) or a caller's block mask
 (`masked_selection`). `dew.nn.sparse_selection.selected_attention` runs it, each selected block one of the
 key runs `scaled_dot_product_attention` takes (`key_runs`), which the template's mainloops walk as the
 selected tiles alone (`attention_mosaic_program.indexed_walk`): work a query block's selected blocks, not
@@ -232,12 +232,25 @@ class MsaIndexer(nn.Module):
         return jnp.where(place[None, :] <= place[:, None], scores, -jnp.inf)
 
 
-def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16) -> jax.Array:
-    """MSA's selection (arXiv 2606.13392 eq. 7, §A row 59): its index scores `[B, G, Q, K]` max-pooled onto
-    blocks of `block` (eq. 6), each group's `top_k` blocks a query, the block holding the query among them
-    (one of the `top_k`, forced): `[B, G, Q, top_k]` (`pooled_selection`'s, `top_k - 1` beside the local
-    one). The paper's deployment: blocks of 128, the top 16."""
-    return pooled_selection(index_scores, block=block, top_k=top_k - 1, local=1)
+def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16, initial: int = 0,
+                  local: int = 1) -> jax.Array:
+    """MSA's selection (arXiv 2606.13392 eq. 7, §A row 59) and MiniMax M3's (§A row 37a): index scores
+    `[B, G, Q, K]` (-inf past each query) max-pooled onto blocks of `block` (eq. 6), each group's `top_k`
+    blocks a query, the first `initial` and the `local` ending at the query's own forced among them:
+    `[B, G, Q, top_k]`, -1 a slot past the blocks the query sees. MSA forces its own block alone (blocks of
+    128, the top 16); M3 the first block and the two ending at its own, its top 16 counting them, a single
+    index head every group shares (`G` 1; the M3 index kernels of github.com/dphnAI/sonar,
+    models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum, the forced pages
+    prioritized within `topk`)."""
+    rows, groups, queries, _ = index_scores.shape
+    assert top_k > initial + local, "the selection counts its forced blocks among its top"
+    pooled = block_maxima(index_scores, None, block)
+    keep = _earlier_blocks(queries, pooled.shape[-1], block) & (pooled > -jnp.inf)
+    own = jnp.arange(queries)[:, None] // block
+    forced = jnp.concatenate([jnp.broadcast_to(jnp.arange(initial)[None], (queries, initial)),
+                              own - jnp.arange(local)[None, ::-1]], axis=-1)
+    forced = jnp.broadcast_to(jnp.where(forced >= 0, forced, -1), (rows, groups, *forced.shape))
+    return top_k_selection(pooled, keep, top_k - initial - local, forced=forced)
 
 
 def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Array, *,
