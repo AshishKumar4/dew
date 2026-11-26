@@ -32,7 +32,7 @@ own (a custom derivative's call is refused, its rule not a value's)."""
 
 IMPORTS = ({"Callable": "from collections.abc import Callable"},
            {"jnp": "import jax.numpy as jnp", "np": "import numpy as np", "lax": "from jax import lax"},
-           {"precision": "from dew.nn import precision"})
+           {"_generated": "from dew.algebra import _generated", "precision": "from dew.nn import precision"})
 """The imports a printed function or a generated module may read, by the name it reads, in the tree's
 sections (the standard library's, the third parties', Dew's) and order (`imports`)."""
 

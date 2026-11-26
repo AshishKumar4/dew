@@ -1352,9 +1352,11 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 ### 6.11 The generator
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). The component pilots generate recurrence scores and the two
-rounded-operand bodies, check them against independent references, and share the `--check` writer.
-Production still derives recurrence forms at trace time and traces the original surrogate bodies (row 3272).
+(`ComponentForm`, rows 6109 and 6110). The component pilots cover attention backward's masked
+query-first cotangents and its key-first weight consumer, recurrence scores and compensated prefix
+differences, and two shapes of rounded-operand forward and tangent bodies. One `--check` writer holds
+all cases against their own references. Production still uses the trace-time derivations and original
+surrogates (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1427,10 +1429,11 @@ their trees and flags. The pilots add no run-time dispatch to the algebra engine
   dtypes. `tests/test_algebra_generate.py` holds Check 1 and checks regeneration in both processes.
 - The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
   parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
-  measured, a compensated form's sums through `dew.nn.precision`, with no import of `dew.algebra`, linted
-  and typed as any module, and a header naming the declarations, the sets, their receipts and the egglog
-  version. Nothing of the engine is imported at runtime. A program with an equation no plain call writes (a
-  custom derivative's call) is refused.
+  measured, with a compensated form's sums through `dew.nn.precision`. Its only Algebra-package
+  dependency is `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
+  target without importing the registry, rules or extractor. Generated modules are linted and typed
+  as usual; their headers name the declarations, rule sets, receipts and egglog version. The writer
+  refuses equations it cannot print as plain calls, such as a call with a custom derivative rule.
 - `--check` regenerates in memory and fails where the checked-in output differs; it runs as a test
   (`generate(check=True)`) on every train, so a changed rule, chooser or declaration lands as a reviewed diff of
   generated code, with no step of the lint lane's own.

@@ -93,6 +93,17 @@ def test_a_component_preserves_one_result_convention_across_cases():
         generate._chosen("bad.component", generate.ComponentForm(changed, changed, cases))
 
 
+def test_generated_query_cotangents_default_to_the_accurate_small_weight_order():
+    from dew.algebra.component_cases_derived import queries_cotangent
+
+    cases = component_cases.QUERIES_COTANGENT.cases
+    inputs = cases.draw(1, cases.operands[0])
+    _, weights, cotangents = jax.jit(queries_cotangent)(*inputs)
+    assert weights[0, 1] == 0
+    # The shared Check 1 draw also checks this value against independent float64 arithmetic.
+    assert cotangents[0, 1] > jnp.finfo(cotangents.dtype).tiny
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

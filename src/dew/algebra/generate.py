@@ -2,9 +2,10 @@
 its cases, saturated with every rule set dev time runs (`rules.admitted(dev=True)`), its candidates measured
 against its float64 truth on its cases' draws (check 1, `dew.parity.judge`) and the cheapest its policy
 admits chosen (`dew.algebra.error.choose`, §1.5) under each policy, priced for each target; the choices
-written beside the declaring module as ordinary Python (`<module>_derived.py`: plain JAX, no import of
-`dew.algebra`, `printed.source`), headed by the declarations, the sets and their receipts and the egglog
-version. `python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
+written beside the declaring module as ordinary Python (`<module>_derived.py`, `printed.source`). The
+generated module uses only `dew.algebra._generated` for case dispatch, not the registry, rules or
+extractor. Its header names the declarations, rule sets, receipts and egglog version.
+`python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
 where a written module differs, which tests/test_algebra_generate.py runs on every train.
 
 A declaration's choice is the platform's that measures it: the draws are seeded and fixed, so generation is
@@ -30,6 +31,7 @@ from jax.extend import core as jcore
 
 from dew import parity
 from dew.algebra import error, printed, rules
+from dew.algebra._generated import case_of
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 
@@ -186,7 +188,7 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
 def _check_cases(cases: Cases) -> None:
     if any(arg.sharding is not None or arg.weak_type for operands in cases.operands for arg in operands):
         raise printed.Unprintable("a flat component case must be unplaced and strongly typed")
-    for variants in (tuple(map(_case, cases.operands)), cases.policies, cases.targets):
+    for variants in (tuple(map(case_of, cases.operands)), cases.policies, cases.targets):
         if len(set(variants)) != len(variants):
             raise ValueError("a component has duplicate dispatch keys")
 
@@ -244,16 +246,17 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     for name in sorted({found.name for found in chosen}):
         own = [found for found in chosen if found.name == name]
         single = own[0].single
-        body += ["", "", f"def {name}(*operands, policy: str = 'default', target: str = {own[0].target!r}):",
-                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
-                 "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
-                 "    forms: dict[tuple, Callable[..., tuple]] = {"]
+        policy, target = own[0].policy, own[0].target
+        table = f"_{name}_forms"
+        body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
         for found in own:
-            operands = [repr(operand) for operand in _case(found.operands)]
-            body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
+            operands = [repr(operand) for operand in case_of(found.operands)]
+            body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"            {named[found]},")
-        body += ["    }", f"    return forms[(policy, target, case)](*operands){'[0]' if single else ''}"]
+            body.append(f"        {named[found]},")
+        body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
+                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
+                 f"    return _generated.call({table}, operands, policy, target, single={single})"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
 
 
@@ -269,10 +272,6 @@ def _single_result(shaped) -> bool:
     if isinstance(shaped, tuple) and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shaped):
         return False
     raise ValueError(f"a declaration returns an array or a tuple of arrays, not {jax.tree.structure(shaped)}")
-
-
-def _case(operands: tuple[jax.ShapeDtypeStruct, ...]) -> tuple:
-    return tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
 
 
 def _flowed(lines: list[str]) -> list[str]:
