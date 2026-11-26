@@ -1301,7 +1301,8 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jax
     sum in the broadcast value's own dtype (jax-ml/jax#30310), where torch's
     autograd reduces a bf16 gradient in fp32 and rounds the sum once, so a norm
     weight's or a bias's gradient summed in bf16 sat 2-5 times further from
-    float64 than torch's."""
+    float64 than torch's. A scan's body and a switch's branches (a tier-3 loop's passes, `_Seam.scanned`) are
+    evaluated alike, inside the scan and the switch they were."""
 
     def evaluate(jaxpr, consts, values):
         held = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, values, strict=True))
@@ -1323,6 +1324,10 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jax
                 outputs = jax.checkpoint(functools.partial(_evaluated, evaluate, inner))(*inputs)
             elif inner is not None:
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
+            elif equation.primitive is jax.lax.scan_p:
+                outputs = _accumulated_scan(evaluate, equation, inputs)
+            elif equation.primitive is jax.lax.cond_p:
+                outputs = _accumulated_switch(evaluate, equation, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),
                                             tuple(equation.params["broadcast_dimensions"]))]
@@ -1343,6 +1348,31 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array, recomputed: Sequence[Jax
         return [read(var) for var in jaxpr.outvars]
 
     return evaluate(closed.jaxpr, closed.consts, arguments)
+
+
+def _accumulated_scan(evaluate, equation, inputs: list) -> list[jax.Array]:
+    """A scan `equation` over `inputs`, its body evaluated by `evaluate` (`_accumulating`'s) step by step
+    under `lax.scan` as its parameters state it: its constants, its carry and its scanned inputs."""
+    params = equation.params
+    body, constants, carried = params["jaxpr"], params["num_consts"], params["num_carry"]
+    consts, carry = inputs[:constants], inputs[constants:constants + carried]
+    scanned = inputs[constants + carried:]
+
+    def step(carry, row):
+        outputs = evaluate(body.jaxpr, body.consts, [*consts, *carry, *row])
+        return outputs[:carried], outputs[carried:]
+
+    carry, stacked = jax.lax.scan(step, list(carry), list(scanned), length=params["length"],
+                                  reverse=params["reverse"], unroll=params["unroll"])
+    return [*carry, *stacked]
+
+
+def _accumulated_switch(evaluate, equation, inputs: list) -> list[jax.Array]:
+    """A switch (`cond_p`) `equation` over `inputs`, its index first, each branch evaluated by `evaluate`
+    (`_accumulating`'s) under `lax.switch`."""
+    branches = [functools.partial(lambda branch, *operands: evaluate(branch.jaxpr, branch.consts, operands),
+                                  branch) for branch in equation.params["branches"]]
+    return jax.lax.switch(inputs[0], branches, *inputs[1:])
 
 
 def _evaluated(evaluate, inner: Jaxpr, *inputs: jax.Array) -> list[jax.Array]:
@@ -1498,10 +1528,10 @@ class _Seam:
 
     def scanned(self, state: jax.Array, loop: Loop) -> jax.Array:
         """The later passes over `state` under one `lax.scan`, the block traced once whatever `loop.steps`
-        (row 13144): its program (`_accumulating`'s, each broadcast's gradient summed wide and each layer
-        recomputed under `remat` as the forward's) the scan's body, torchax's key its carry, so each pass
-        draws its own. Under a count (`passes`), a pass at or past it skipped and one before the last
-        `backprop_steps` it allows run passing no gradient back, as a native loop's counted pass
+        (row 13144): its program the scan's body (which `_accumulating` evaluates as the forward's, each
+        broadcast's gradient summed wide and each layer recomputed under `remat`), torchax's key its carry,
+        so each pass draws its own. Under a count (`passes`), a pass at or past it skipped and one before the
+        last `backprop_steps` it allows run passing no gradient back, as a native loop's counted pass
         (`looping.counted_branch`), each branch its own (`lax.switch`)."""
         from dew.nn.backbones.looping import counted_branch
 
@@ -1517,10 +1547,12 @@ class _Seam:
 
         closed = jax.make_jaxpr(one)(state, held, jnp.int32(1))
         env.prng_key = held
-        programs = self.layers or ()
 
         def run(carry, step):
-            return tuple(_accumulating(closed, *carry, step, recomputed=programs))
+            # The pass's program as traced, its attested programs whole for the causality walk
+            # (`certify`);
+            # `_accumulating` evaluates the scan's body as it evaluates the rest (`_accumulated_scan`).
+            return tuple(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *carry, step))
 
         def held_back(carry, step):
             moved, key = run(carry, step)
