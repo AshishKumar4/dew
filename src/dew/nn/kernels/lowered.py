@@ -222,8 +222,11 @@ def _trips(loop: ir.Operation) -> float:
     constant positive step, while it is below a constant bound: the loop every `scan` and `fori_loop` with
     static bounds lowers to, by the rule an executable's loop is read by (`instrumentation.counted_trips`);
     where that bound is one side of an `and`, at most its trips, a bound as a branch's every side counted is
-    (a loop of at most one trip, `attention_algebra.once`). Infinite for any other loop."""
+    (a loop of at most one trip, `attention_algebra.once`); none where its condition is a constant false (a
+    `while_loop` whose condition its trace decided). Infinite for any other loop."""
     condition, body = (region.blocks[0] for region in loop.regions)
+    if _constant(_terminator(condition).operands[0]) == 0:
+        return 0.0
     root = _result_of(_terminator(condition).operands[0])
     sides = ([_result_of(side) for side in root.operands] if root is not None and root.name == "stablehlo.and"
              else [root])
