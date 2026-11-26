@@ -1931,3 +1931,24 @@ def test_two_variants_of_one_source_trace_side_by_side_as_each_does_alone(tmp_pa
         for each in runs:
             for got, wanted in zip(jax.tree.leaves(each), jax.tree.leaves(alone[index]), strict=True):
                 np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+
+
+def test_a_plain_trace_nested_in_a_looped_ones_seam_runs_its_own_layers_and_leaves_the_mode(tmp_path):
+    """A tier-3 source's plain call traced inside another trace's loop seam (`_layer_seam`, its layers' one
+    dispatcher shared) runs its layers once, at the first pass, as it does alone, bit for bit: a trace's
+    seam is its own even where it runs none (row 13139's review); and a training call leaves the source
+    model in the mode it was loaded in (eval), where its wrapper's flag was restored onto it."""
+    from dew.interop.torchax_fallback import _environment, _layer_seam
+
+    torch.manual_seed(0)
+    transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    source = loaded.model.graph.module._model
+    (ids,) = token_draw(0x13139, LLAMA["vocab_size"], (2, 12))(1)
+    alone = loaded.model.apply(loaded.variables, ids)
+    assert not source.training
+    loaded.model.apply(loaded.variables, ids, train=True)
+    assert not source.training
+    with _layer_seam(source, _environment(), layers=None, loop=Loop(steps=3, layers=(0, 1), step_norm=False)):
+        nested = loaded.model.apply(loaded.variables, ids)
+    np.testing.assert_array_equal(np.asarray(nested), np.asarray(alone))
