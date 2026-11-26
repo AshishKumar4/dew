@@ -1228,7 +1228,7 @@ def test_an_a100s_decode_walk_prices_its_larger_key_tile_at_or_below_its_smaller
         walk = attention_decode.WALKS["plain"]
         single_op, single_ba = attention_decode._stream_op(packed, key, key, every, None, scale=None,
                                                            table=None, sources=None, scales=None,
-                                                           chosen=walk, in_key=False)
+                                                           out_dtype=None, chosen=walk, in_key=False)
         single = single_op.streaming(single_ba, single_op.remaining(single_ba), target)
         programs = attention_decode.launch_programs(packed, single)
         longest = math.ceil(keys / single.block_k) // (2 * min(single.stages, 2))
