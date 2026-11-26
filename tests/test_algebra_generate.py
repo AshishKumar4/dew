@@ -357,12 +357,15 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
 
     def value(operands):
         x, y = operands["x"], operands["y"]
-        return {"difference": x - y, "sum": x + y}
+        return {"difference": x - y, "sum": x + y} if x.shape == (8,) else (x - y, x + y)
 
     def tangent(primals, directions, written):
         (operands,), (directions_by_name,) = primals, directions
         dx, dy = (jnp.zeros_like(operands[name]) if isinstance(d, SymbolicZero) else d
                   for name, d in directions_by_name.items())
+        if isinstance(written, tuple):
+            difference, total = written
+            return difference * (dx - dy), total * (dx + dy)
         return {"difference": written["difference"] * (dx - dy), "sum": written["sum"] * (dx + dy)}
 
     def flat_value(x, y):
@@ -377,7 +380,9 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
 
     tile = jax.ShapeDtypeStruct((8,), jnp.float32)
     forward = generate.ComponentForm(flat_value, flat_value, generate.Cases(((tile, tile),), draw, 8))
-    active = generate.ComponentForm(active_tangent, active_tangent, generate.Cases(((tile,) * 5,), draw, 8))
+    small = jax.ShapeDtypeStruct((4,), jnp.float32)
+    active = generate.ComponentForm(active_tangent, active_tangent,
+                                    generate.Cases(((tile,) * 5, (small,) * 5), draw, 8))
     case = generate.SurrogateCase("partial", forward, {(1,): active},
                                   input_tree=jax.tree.structure(({"x": tile, "y": tile},)),
                                   output_tree=jax.tree.structure({"difference": tile, "sum": tile}))
@@ -409,6 +414,15 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     np.testing.assert_array_equal(direction["sum"], (x + y) * dx)
     assert called == set(reachable.values())
 
+    # The tangent key is valid at this size, but the forward fallback returns a different PyTree.
+    called.clear()
+    pair, direction = jax.jit(moved)(x[:4], y[:4], dx[:4])
+    np.testing.assert_array_equal(pair[0], x[:4] - y[:4])
+    np.testing.assert_array_equal(pair[1], x[:4] + y[:4])
+    np.testing.assert_array_equal(direction[0], (x[:4] - y[:4]) * dx[:4])
+    np.testing.assert_array_equal(direction[1], (x[:4] + y[:4]) * dx[:4])
+    assert not called
+
 
 def nested(x, y):
     """A jit within the program and a constant it closes over."""
@@ -427,6 +441,7 @@ PROGRAMS = {
                                                           x.astype(jnp.bfloat16).astype(jnp.float32)),
     "a sort's several results": lambda x, y: jax.lax.sort((x, y), num_keys=1),
     "a sort's one result": lambda x, y: jax.lax.sort(x),
+    "no outputs": lambda x, y: (),
     "a NaN's payload": lambda x, y: jax.lax.bitcast_convert_type(jnp.full_like(x, PAYLOAD), jnp.int32),
 }
 

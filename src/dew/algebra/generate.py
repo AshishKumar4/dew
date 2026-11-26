@@ -89,12 +89,10 @@ class SurrogateCase:
     name: str
     forward: ComponentForm
     tangents: Mapping[tuple[int, ...], ComponentForm]
+    output_tree: jax.tree_util.PyTreeDef
     input_tree: jax.tree_util.PyTreeDef | None = None
-    output_tree: jax.tree_util.PyTreeDef | None = None
 
     def restore(self, flat):
-        if self.output_tree is None:
-            return flat
         leaves = flat if isinstance(flat, tuple) else (flat,)
         return jax.tree.unflatten(self.output_tree, leaves)
 
@@ -144,7 +142,7 @@ class SurrogateBodies:
             case = self.cases.get(tuple(fixed))
             leaves = jax.tree.leaves(directions, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
             inactive = tuple(i for i, leaf in enumerate(leaves) if isinstance(leaf, SymbolicZero))
-            if case is None:
+            if case is None or jax.tree.structure(value) != case.output_tree:
                 return self.tangent(*values)
             component = case.tangents.get(inactive)
             if component is not None and (flat := _case_leaves(case, primals)) is not None:

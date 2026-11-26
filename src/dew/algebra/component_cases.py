@@ -127,7 +127,8 @@ def _rounding_case(name, dtype):
         functools.partial(_rounded, dtype=dtype), functools.partial(_rounded_truth, dtype=dtype),
         _cases(((16, 32),), ((8, 64),))), {(): ComponentForm(
             functools.partial(_tangent, dtype=dtype), _tangent_truth,
-            _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))]))})
+            _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))]))},
+                         output_tree=jax.tree.structure(0))
 
 
 def _online_step(acc, peak, total, logits, values):

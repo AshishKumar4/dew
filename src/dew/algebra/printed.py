@@ -130,9 +130,8 @@ class Body:
         lines = wrapped(f"def {name}(", list(self.inputs), "):")
         for statement in self.statements:
             lines.extend([statement] if isinstance(statement, str) else statement.lines())
-        if self.outputs:
-            lines.extend(wrapped("    return (", list(map(expression, self.outputs)),
-                                 ",)" if len(self.outputs) == 1 else ")"))
+        lines.extend(wrapped("    return (", list(map(expression, self.outputs)),
+                             ",)" if len(self.outputs) == 1 else ")"))
         return "\n".join(lines) + "\n"
 
 
