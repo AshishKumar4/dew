@@ -1932,15 +1932,27 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     input's block scale near float32's largest (2**113 for inputs near 2**122) overflows the codes' product
     the kernel's scale (2**-9) brings back in range, and one near the least normal underflows it the other
     way (ledger 2715), as two tensor scales near 2**-76 do multiplied first (an NVFP4 product of operands
-    near 2**-65), so no one order holds both ends; the result overflows only where the product does. Its
-    tests are comparisons alone (finite: a magnitude below infinity), so a kernel's epilogue runs it as XLA
-    does: Mosaic GPU lowers no `is_finite` (`gemm.nvfp4_block_finished`, row 12721)."""
+    near 2**-65), so no one order holds both ends; and a subnormal scale against one near the largest
+    (2**-128 and 2**127 of a 2.25 partial: 1.125) is neither, its scales' own product first (row 13274), so
+    of the three orders the first whose intermediate is normal (or the product zero) is taken, else the
+    second's: the result overflows only where the product does. Its tests are comparisons alone (finite: a
+    magnitude below infinity), so a kernel's epilogue runs it as XLA does: Mosaic GPU lowers no `is_finite`
+    (`gemm.nvfp4_block_finished`, row 12721)."""
     tiny = jnp.finfo(product.dtype).tiny
+
+    def normal(value):
+        # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a
+        # kernel.
+        magnitude = jnp.abs(value)
+        return (magnitude < np.inf) & (magnitude >= tiny)
+
     once = product * first
-    magnitude = jnp.abs(once)
-    # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
-    kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
-    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+    kept = normal(once) | (product == 0)
+    scales = first * second
+    joined = ~kept & ~normal(product * second) & normal(scales)
+    # Each order's operands chosen before they multiply: no cotangent reaches an unchosen product.
+    left = jnp.where(joined, product, jnp.where(kept, once, product * second))
+    return left * jnp.where(joined, scales, jnp.where(kept, second, first))
 
 
 @_protected
