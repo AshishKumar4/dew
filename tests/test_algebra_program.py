@@ -2081,6 +2081,18 @@ def test_in_process_digest_distinguishes_which_link_each_equation_reads():
     assert key != terms.jaxpr_digest(different, in_process=True)
 
 
+def test_process_digest_keeps_repeated_descriptors_in_equation_order():
+    def formed(x, first, second):
+        return jax.lax.reduce_precision(jax.lax.reduce_precision(x, 8, first), 8, second)
+
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32)
+    direct = jax.make_jaxpr(functools.partial(formed, first=4, second=8))(shape)
+    reboxed = jax.make_jaxpr(lambda x: formed(x, 4, 8))(shape)
+    reversed_ = jax.make_jaxpr(functools.partial(formed, first=8, second=4))(shape)
+    assert terms.body_key(direct) == terms.body_key(reboxed)
+    assert terms.body_key(direct) != terms.body_key(reversed_)
+
+
 def _bf16_rms(x, w):
     """Plain RMSNorm in fp32 statistics for structural body-cache tests."""
     mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
