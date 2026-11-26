@@ -73,8 +73,9 @@ def test_a_chunked_loss_over_a_narrow_head_reads_its_scored_rows_alone(tied):
 
 def test_an_unscored_row_enters_no_product_of_the_head():
     """A head scoring 48 of its 64 rows, an unscored row holding fp32's largest values, which round to
-    bf16's infinity in its bf16 product: its logits and their pullback to the states are finite, the row entering
-    neither, where a product over every row multiplied the discarded columns' zero cotangents by it."""
+    bf16's infinity in its bf16 product: its logits and their pullback to the states are finite, the row
+    entering neither, where a product over every row multiplied the discarded columns' zero cotangents by
+    it."""
     from dew.nn.protocols import OutputTable
 
     rng = np.random.default_rng(0x0B2)
