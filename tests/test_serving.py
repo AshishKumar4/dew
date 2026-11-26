@@ -2054,7 +2054,7 @@ def test_a_chunked_server_over_row_groups_shares_pages_below_the_crossover():
     lone = banked_task(sampling)
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    assert 128 < SHARED_PAGES_FROM
+    assert SHARED_PAGES_FROM > 128
     server, tickets = served_alongside(banked_task(sampling, devices=2), cache=PagedKV(shared=True), chunk=16)
     assert server.groups == 2 and isinstance(server.rows, PagedRows)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
