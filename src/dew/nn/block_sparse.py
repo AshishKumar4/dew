@@ -5,7 +5,8 @@ A selection is each query's key blocks `[B, R, Q, S]` (-1 where it selects none;
 query head's), from a scoring pass the model runs in XLA, selecting through
 `dew.nn.sparse_selection.top_k_selection`: MoBA's gate over chunk-mean keys (`moba_selection`), NSA's
 compressed branch's weights (`nsa_selection`), MiniMax's learned indexer max-pooled to blocks
-(`pooled_selection`), InfLLM-V2's two-window pooling (`infllm_selection`; its attention, dense below 8192
+(`pooled_selection`; MSA's index branch `MsaIndexer`, its selection `msa_selection` and its loss
+`msa_indexer_kl`), InfLLM-V2's two-window pooling (`infllm_selection`; its attention, dense below 8192
 keys, `infllm_attention`) or a caller's block mask
 (`masked_selection`). `dew.nn.sparse_selection.selected_attention` runs it, each selected block one of the
 key runs `scaled_dot_product_attention` takes (`key_runs`), which the template's mainloops walk as the
@@ -21,9 +22,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.dense import Dense
 from dew.nn.documents import CrossDocuments, DocumentWindows, document_windows
 from dew.nn.inspection import QK
 from dew.nn.kv_cache import cached_validity
@@ -202,6 +205,61 @@ def pooled_selection(index_scores: jax.Array, *, block: int, top_k: int, local: 
     forced = own - jnp.arange(local)[None, ::-1]
     forced = jnp.broadcast_to(jnp.where(forced >= 0, forced, -1), (rows, groups, *forced.shape))
     return top_k_selection(pooled, keep, top_k, forced=forced)
+
+
+class MsaIndexer(nn.Module):
+    """MiniMax Sparse Attention's index branch (arXiv 2606.13392 §3, eqs. 5, 6, 11): an index query head a GQA
+    group (`wq`, `groups` heads of `width`) and one index key head every group shares (`wk`), both of the
+    detached hidden states, so the main loss trains neither (its own, `msa_indexer_kl`, trains these alone).
+    Its scores `[B, G, N, N]` (fp32) are each query's scaled products with every key, -inf past it (eq. 6's
+    `j <= i`); `msa_selection` max-pools them onto blocks and takes each group's top blocks."""
+
+    groups: int
+    width: int
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.compact
+    def __call__(self, hidden: jax.Array) -> jax.Array:
+        rows, length, _ = hidden.shape
+        hidden = jax.lax.stop_gradient(hidden)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        query = dense(self.groups * self.width, name="wq", kernel_axes=("embed", "index"))(hidden)
+        key = dense(self.width, name="wk", kernel_axes=("embed", "index"))(hidden)
+        query = query.reshape(rows, length, self.groups, self.width)
+        scores = float32_einsum("bngd,bmd->bgnm", query, key, precision=self.precision) * self.width ** -0.5
+        place = jnp.arange(length)
+        return jnp.where(place[None, :] <= place[:, None], scores, -jnp.inf)
+
+
+def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16) -> jax.Array:
+    """MSA's selection (arXiv 2606.13392 eq. 7, §A row 59): its index scores `[B, G, Q, K]` max-pooled onto
+    blocks of `block` (eq. 6), each group's `top_k` blocks a query, the block holding the query among them
+    (one of the `top_k`, forced): `[B, G, Q, top_k]` (`pooled_selection`'s, `top_k - 1` beside the local
+    one). The paper's deployment: blocks of 128, the top 16."""
+    return pooled_selection(index_scores, block=block, top_k=top_k - 1, local=1)
+
+
+def msa_indexer_kl(index_scores: jax.Array, logits: jax.Array, selected: jax.Array, *,
+                   block: int) -> jax.Array:
+    """MSA's indexer loss (arXiv 2606.13392 eqs. 9, 10): over each query's visible tokens of its group's
+    selected blocks, the KL divergence of the index branch's softmax (`index_scores` `[B, G, Q, K]`) from the
+    detached mean of its group's heads' attention softmaxes (`logits` `[B, H, Q, K]`, the main branch's, `H`
+    a multiple of `G`), averaged over the queries and groups. `selected` `[B, G, Q, S]` (`msa_selection`'s,
+    -1 a slot of none)."""
+    rows, groups, queries, keys = index_scores.shape
+    per = logits.shape[1] // groups
+    place = jnp.arange(keys)
+    chosen = jnp.any(selected[..., None] == (place // block), axis=-2)
+    tokens = chosen & (place[None, :] <= jnp.arange(queries)[:, None])
+    teacher = jax.nn.softmax(jnp.where(tokens[:, :, None], logits.reshape(rows, groups, per, queries, keys
+                                                                          ).astype(jnp.float32), -jnp.inf),
+                             axis=-1)
+    teacher = jax.lax.stop_gradient(jnp.where(tokens, teacher.mean(axis=2), 0.0))
+    student = jax.nn.log_softmax(jnp.where(tokens, index_scores.astype(jnp.float32), -jnp.inf), axis=-1)
+    divergence = jnp.where(tokens & (teacher > 0), teacher * (jnp.log(jnp.where(teacher > 0, teacher, 1.0))
+                                                               - student), 0.0)
+    return divergence.sum() / (rows * queries * groups)
 
 
 def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int = 64, kernel: int = 32,

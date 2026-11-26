@@ -264,6 +264,61 @@ def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_p
                     "InfLLM-V2's attention past its dense cut", seeds=SEEDS)
 
 
+def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them():
+    """MSA's index branch (arXiv 2606.13392 eqs. 5-7, 9-11), each against its equation written out in numpy:
+    the scores of each group's index query against the one shared index key (scaled, -inf past the query),
+    the selection of each group's top blocks with the query's own forced, and the KL loss of the indexer's
+    softmax from its group's mean head softmax over the visible selected tokens. Its loss's gradient
+    reaches the index projections alone: none flows to the hidden states (eq. 11's detach)."""
+    rows, length, embed, groups, width, block, top_k, heads = 2, 64, 24, 2, 8, 8, 3, 4
+    rng = np.random.default_rng(0x59)
+    hidden = jnp.asarray(rng.standard_normal((rows, length, embed)), jnp.float32)
+    indexer = block_sparse.MsaIndexer(groups=groups, width=width)
+    params = indexer.init(jax.random.key(0), hidden)
+    scores = np.asarray(indexer.apply(params, hidden))
+    wq = np.asarray(params["params"]["wq"]["kernel"], np.float64)
+    wk = np.asarray(params["params"]["wk"]["kernel"], np.float64)
+    query = (np.asarray(hidden, np.float64) @ wq).reshape(rows, length, groups, width)
+    key = np.asarray(hidden, np.float64) @ wk
+    expected = np.einsum("bngd,bmd->bgnm", query, key) / np.sqrt(width)
+    causal = np.tril(np.ones((length, length), bool))
+    np.testing.assert_allclose(np.where(causal, scores, 0.0), np.where(causal, expected, 0.0), rtol=1e-4,
+                               atol=1e-4)
+    assert np.all(np.isneginf(scores[..., ~causal]))
+
+    selected = np.asarray(block_sparse.msa_selection(jnp.asarray(scores), block=block, top_k=top_k))
+    assert selected.shape == (rows, groups, length, top_k)
+    for row, group, at in np.ndindex(rows, groups, length):
+        own = at // block
+        maxima = np.array([scores[row, group, at, b * block:min((b + 1) * block, at + 1)].max()
+                           if b * block <= at else -np.inf for b in range(length // block)])
+        maxima[own] = -np.inf
+        picked = {int(b) for b in selected[row, group, at] if b >= 0}
+        assert picked == _top(maxima, top_k - 1, {own}), (row, group, at)
+
+    logits = jnp.asarray(rng.standard_normal((rows, heads * groups, length, length)), jnp.float32)
+    loss = float(block_sparse.msa_indexer_kl(jnp.asarray(scores), logits, jnp.asarray(selected), block=block))
+    total = 0.0
+    for row, group, at in np.ndindex(rows, groups, length):
+        blocks = {int(b) for b in selected[row, group, at] if b >= 0}
+        tokens = [j for j in range(at + 1) if j // block in blocks]
+        heads_of = np.asarray(logits, np.float64)[row, group * heads:(group + 1) * heads, at][:, tokens]
+        teacher = (np.exp(heads_of - heads_of.max(-1, keepdims=True))
+                   / np.exp(heads_of - heads_of.max(-1, keepdims=True)).sum(-1, keepdims=True)).mean(0)
+        student = scores[row, group, at, tokens].astype(np.float64)
+        student = student - student.max() - np.log(np.exp(student - student.max()).sum())
+        total += float(np.sum(teacher * (np.log(teacher) - student)))
+    np.testing.assert_allclose(loss, total / (rows * groups * length), rtol=1e-4)
+
+    def trained(params, hidden):
+        return block_sparse.msa_indexer_kl(indexer.apply(params, hidden), logits, jnp.asarray(selected),
+                                           block=block)
+
+    by_params, by_hidden = jax.grad(trained, argnums=(0, 1))(params, hidden)
+    assert np.any(np.asarray(by_params["params"]["wq"]["kernel"]) != 0)
+    np.testing.assert_array_equal(np.asarray(by_hidden), 0.0)
+
+
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
     """NSA's attention (`nsa_attention`): the compressed branch (each compressed key `length` keys every
     `stride`, read once a query reaches its last), the selected blocks its weights pick (through the
