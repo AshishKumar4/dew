@@ -152,6 +152,29 @@ def test_a_finite_head_whose_squares_overflow_clips_to_the_threshold(head, thres
     assert bool(jnp.all(jnp.isfinite(gradient)))
 
 
+def test_a_clipped_heads_small_component_keeps_its_derivative_both_ways():
+    """A head `[2^62, 2^-100, 0, ...]` clipped to `2^61` halves: its derivative along its small component
+    is the gain, a tangent `2^-100` there going to `2^-101` and a cotangent `2^64` coming back as `2^63`,
+    bit for bit, where a derivative taken in the head's scaled space lost the first and overflowed the
+    second (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x = np.zeros(8, np.float32)
+    x[0], x[1] = 2.0 ** 62, 2.0 ** -100
+    tangent = np.zeros(8, np.float32)
+    tangent[1] = 2.0 ** -100
+    _, moved = jax.jvp(lambda x: clipped(x, 2.0 ** 61, 1e-6), (jnp.asarray(x),), (jnp.asarray(tangent),))
+    expected = np.zeros(8, np.float32)
+    expected[1] = 2.0 ** -101
+    np.testing.assert_array_equal(np.asarray(moved), expected)
+    _, pull = jax.vjp(lambda x: clipped(x, 2.0 ** 61, 1e-6), jnp.asarray(x))
+    cotangent = np.zeros(8, np.float32)
+    cotangent[1] = 2.0 ** 64
+    (gradient,) = pull(jnp.asarray(cotangent))
+    expected[1] = 2.0 ** 63
+    np.testing.assert_array_equal(np.asarray(gradient), expected)
+
+
 @attending("reference")
 def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_counts():
     """A layer scored over a causal pairwise mask, its keys' visibility places stated from 100 on
