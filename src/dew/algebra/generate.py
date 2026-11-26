@@ -245,16 +245,17 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
         own = [found for found in chosen if found.name == name]
         single = own[0].single
         policy, target = own[0].policy, own[0].target
-        body += ["", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
-                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
-                 "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
-                 "    forms: dict[tuple, Callable[..., tuple]] = {"]
+        table = f"_{name}_forms"
+        body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
         for found in own:
             operands = [repr(operand) for operand in _case(found.operands)]
-            body += printed.wrapped(f"        ({found.policy!r}, {found.target!r}, (", operands,
+            body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"            {named[found]},")
-        body += ["    }", f"    return forms[(policy, target, case)](*operands){'[0]' if single else ''}"]
+            body.append(f"        {named[found]},")
+        body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
+                 f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
+                 "    case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)",
+                 f"    return {table}[(policy, target, case)](*operands){'[0]' if single else ''}"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
 
 

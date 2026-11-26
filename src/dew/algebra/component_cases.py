@@ -113,7 +113,8 @@ def _tangent_truth(x, dx, value):
 
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
-ROUNDED = declare(__name__, "rounded", ComponentForm(_rounded, _rounded_truth, _cases(((16, 32),), ((8, 64),))))
+ROUNDED = declare(__name__, "rounded", ComponentForm(
+    _rounded, _rounded_truth, _cases(((16, 32),), ((8, 64),))))
 TANGENT = declare(__name__, "rounded_tangent", ComponentForm(
     _tangent, _tangent_truth, _cases(*[((m, n),) * 3 for m, n in ((16, 32), (8, 64))])))
 PREFIX_DIFFERENCE = declare(__name__, "prefix_difference", ComponentForm(
