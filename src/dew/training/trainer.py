@@ -63,10 +63,10 @@ from dew.distributed.batches import (
 )
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, device_mesh, placed_shapes
-from dew.held_updates import waiting
+from dew.held_updates import holds_back, input_held, waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
-from dew.nn.dense import NVFP4_HISTORY
+from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
@@ -295,6 +295,13 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
 
 
+def _objective_axes(objective: Objective[Loss, Effects]) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
+    """Read `objective`'s declared parameter axes (`Objective.parameter_axes`) without closing over its
+    `Trainer`, so `declaring` never pins a dropped trainer and its compiled executables through its
+    optimizer."""
+    return lambda: objective.parameter_axes
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -360,9 +367,10 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
-        self._config, self._optimizer = ((None, declaring(objective.optimizer(optimizer), self._boxed_axes))
-                                         if isinstance(optimizer, optax.GradientTransformation) else
-                                         (optimizer.claiming(*objective.fresh_trained()), None))
+        self._config, self._optimizer = (
+            (None, declaring(objective.optimizer(optimizer), _objective_axes(objective)))
+            if isinstance(optimizer, optax.GradientTransformation) else
+            (optimizer.claiming(*objective.fresh_trained()), None))
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
@@ -425,7 +433,8 @@ class Trainer(Generic[Loss, Effects]):
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self.skip_nonfinite, self._compiler.ns_group)
+                            self.skip_nonfinite, self._compiler.ns_group,
+                            self._config if self._config is not None else self._given)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -472,6 +481,10 @@ class Trainer(Generic[Loss, Effects]):
         with self._staging.held():
             opt_state = self.optimizer.init(params["params"])
         ema = self.objective.ema
+        reference = ema is not None and self.objective.ema_is_reference
+        if NVFP4_HISTORY in params and holds_back(opt_state):
+            # What the calls an optimizer applies no update in record waits for the one that does (row 12994).
+            params = {**params, NVFP4_PENDING: pending_amax(params[NVFP4_HISTORY])}
         state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -483,9 +496,13 @@ class Trainer(Generic[Loss, Effects]):
             variables=params, opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers, copied by the transfer: the
             # step donates the state, and a buffer can be donated once.
-            # No amax history is averaged: an averaged forward reads the committed one (`with_ema`).
+            # No amax history is averaged: an averaged forward reads the committed one (`with_ema`); but a
+            # frozen reference (`Objective.ema_is_reference`: DPO's, GRPO's) holds its start's histories with
+            # its start's weights (row 12993).
+            # What waits to roll (`NVFP4_PENDING`) is the live run's, never averaged.
             ema=None if ema is None else jax.tree.map(transferred_copy, select(
-                params, lambda path: path[0] != NVFP4_HISTORY and ema.select(path))),
+                params, lambda path: path[0] != NVFP4_PENDING and (path[0] != NVFP4_HISTORY or reference)
+                and ema.select(path))),
             key=run_key,
             consumed=None if self._shape.examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
@@ -869,8 +886,10 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        template = self._configured(placed_shapes(abstract, shardings))
+        template = _waiting_restored(self._configured(placed_shapes(abstract, shardings)))
+        _refuse_lost_reference(template, checkpoints, resume)
         state, position = self._staging.restore(checkpoints, template, resume, share)
+        _refuse_lost_waiting(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints.rung(resume))
@@ -1234,6 +1253,7 @@ class Trainer(Generic[Loss, Effects]):
             # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
             # owns the capture.
             tracer = profiler if profiler is not None else telemetry_profile.active_profile()
+            ahead = self._compiler.ahead
             try:
                 # A run handed a step compiled ahead runs every program compiled with it as compiled
                 # (`_taking`).
@@ -1265,7 +1285,8 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
-        return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
+        with contextlib.nullcontext() if ahead is None else ahead.taking():
+            return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
 
     def _fit_plan(
         self,
@@ -1334,7 +1355,7 @@ class Trainer(Generic[Loss, Effects]):
             return
         built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
         self._shape = dataclasses.replace(self._shape, updates=updates)
-        self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
+        self._optimizer = declaring(self.objective.optimizer(built), _objective_axes(self.objective))
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
@@ -2340,3 +2361,47 @@ class Trainer(Generic[Loss, Effects]):
 
     # ------------------------------------------------------------------ Validation
     # ------------------------------------------------------------------
+
+
+def _waiting_restored(template: TrainState) -> TrainState:
+    """`template` with what waits to roll into its amax histories (`NVFP4_PENDING`) held as nothing waiting,
+    placed: a checkpoint an earlier Dew wrote holds no such collection, and a restore keeps a leaf the
+    template holds concretely where the checkpoint lacks it (`Checkpoints.restore`); one that holds it
+    restores it over this."""
+    if NVFP4_PENDING not in template.variables:
+        return template
+    nothing = jax.tree.map(lambda leaf: jax.device_put(jnp.full(leaf.shape, -1.0, leaf.dtype), leaf.sharding),
+                           template.variables[NVFP4_PENDING])
+    return dataclasses.replace(template, variables={**template.variables, NVFP4_PENDING: nothing})
+
+
+def _refuse_lost_reference(template: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
+    """Refuse a frozen reference's restore (`Objective.ema_is_reference`) from a checkpoint an earlier Dew
+    wrote, which kept no amax histories of the reference (`NVFP4_HISTORY` under `ema`, row 13057): its start's
+    histories are recorded nowhere, a trained start's among them, which set the reference's scales and so its
+    loss, and no live history stands for them."""
+    if template.ema is None or NVFP4_HISTORY not in template.ema:
+        return
+    if NVFP4_HISTORY not in (checkpoints.stored(step).get("ema") or {}):
+        raise ValueError(
+            f"the checkpoint at step {step} in {checkpoints.directory} holds no amax histories of its "
+            f"frozen reference: the Dew that wrote it kept the reference's delayed-scaling NVFP4 histories "
+            f"nowhere, so its reference cannot be restored as it scaled; resume it with the Dew that wrote "
+            f"it, or start the run again from its weights")
+
+
+def _refuse_lost_waiting(state: TrainState, checkpoints: Checkpoints, step: int | str) -> None:
+    """Refuse a restored state whose checkpoint holds no record of what waits to roll into its amax
+    histories (`NVFP4_PENDING`, which an earlier Dew wrote none of) while its optimizer holds an input it
+    took (an `optax.MultiSteps` window part filled): what that taken call recorded is lost, and no restore
+    can recover it (row 12994). A checkpoint that holds the collection restores it as it was written,
+    nothing waiting among what it may hold."""
+    if NVFP4_PENDING not in state.variables or not bool(input_held(state.opt_state)):
+        return
+    if NVFP4_PENDING not in (checkpoints.stored(step).get("variables") or {}):
+        raise ValueError(
+            f"the checkpoint at step {step} in {checkpoints.directory} was written partway through an "
+            f"update its optimizer holds back, by a Dew that kept no record of the amax its taken calls "
+            f"recorded ({NVFP4_PENDING!r}), so the delayed-scaling NVFP4 histories that update rolls cannot "
+            f"be restored; resume it from a checkpoint written where an update applied, or with the Dew "
+            f"that wrote it")

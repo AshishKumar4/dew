@@ -57,7 +57,7 @@ On one machine, `dew launch` runs the program after `--` once per GPU:
 dew launch -- python recipes/lm/train.py
 ```
 
-On a four-GPU machine this starts four processes, each holding one GPU through `JAX_LOCAL_DEVICE_IDS`. The program needs no flag to join the pool, because `dew launch` puts the pool's size and each process's rank in the environment, and `prepare_process` joins the pool it finds there. With `--trainer.multi-host True`, a run refuses to start alone when no pool is configured; with `False`, it never joins one.
+On a four-GPU machine this starts four processes, each seeing only its own GPU through `CUDA_VISIBLE_DEVICES`, so each keeps XLA's CUDA graphs. The program needs no flag to join the pool, because `dew launch` puts the pool's size and each process's rank in the environment, and `prepare_process` joins the pool it finds there. With `--trainer.multi-host True`, a run refuses to start alone when no pool is configured; with `False`, it never joins one.
 
 The launcher prints one `pool:` line with the process count, the devices per process and the coordinator address, then one `[r] rank r of 4 on localhost, GPU r, pid ...` line per rank. Each process prints `Joined the JAX process pool: process r of 4` when it joins.
 

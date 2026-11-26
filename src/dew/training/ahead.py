@@ -1842,6 +1842,12 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             added_tokens(counted.tokens, counted.tokens)
             with _collected(programs, _arguments):
                 copied(together(moving, frozen))
+    if trainer._staging.stages == 1:
+        # One stage's fit unstacks its returned state onto its stored layers (`Trainer.fit`, row 7322).
+        moving = shapes_of(planned.executable.out_info)[0]
+        with _collected(programs, _arguments):
+            trainer._staging.stored(dataclasses.replace(together(moving, frozen), compute=None),
+                                    consumed=True)
     if plan is not None:
         with _collected(programs, _weights_among(trainer.objective._pipeline_weights(placed, None))):
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,

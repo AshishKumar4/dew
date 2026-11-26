@@ -377,7 +377,9 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
     four = built(4)[1].built.memory
     # A host-kept average is fetched beside the state, which may raise the need past the step's.
     assert four == plain.built.memory if average != "host" else four >= plain.built.memory
-    evaluator, evaluating = built(64)
+    # Scoring 256 batches' rows at a time: past what the fit's returned unstack holds, which a step's build
+    # carries since row 7322 (at 64 its need was the unstack's, the plain build's).
+    evaluator, evaluating = built(256)
     evaluations = [evaluating.starts[digest].memory for digest in set(evaluating.starts) - set(plain.starts)]
     need = evaluating.built.memory
     assert evaluations and need is not None and need > plain.built.memory

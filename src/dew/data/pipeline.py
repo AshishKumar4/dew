@@ -1021,31 +1021,52 @@ class Workers:
     count: int
     buffer: int = WORKER_BUFFER
 
-    def shared(self, weights: Sequence[float], index: int) -> Workers:
+    def shared(self, weights: Sequence[float], index: int, capacities: Sequence[int | None] = ()) -> Workers:
         """The workers the `index`th corpus reads in, of these shared by corpora read at `weights` (a
-        mixture's draw weights; equal for phases or a concatenation), each at this buffer: in proportion to
-        the weights by their largest remainders (the earlier corpus first among equal ones), then one each a
-        drawn corpus given none, taken from the corpus holding the most, so a corpus drawn from 97% of the
-        time reads in nearly every worker where an equal share gave a 3% corpus as many; where there are
-        fewer workers than drawn corpora (a weight above zero), one each the heaviest. A corpus given none
-        reads in the reading process."""
-        drawn = [at for at, weight in enumerate(weights) if weight > 0]
-        if self.count < len(drawn):
-            heaviest = sorted(drawn, key=lambda at: (-weights[at], at))[:self.count]
-            return Workers(int(index in heaviest), self.buffer)
+        mixture's draw weights; equal for phases or a concatenation), each at this buffer (`allocation`)."""
+        return Workers(allocation(self.count, tuple(weights), tuple(capacities))[index], self.buffer)
+
+
+@functools.lru_cache(maxsize=256)
+def allocation(count: int, weights: tuple[float, ...], capacities: tuple[int | None, ...] = ()
+               ) -> tuple[int, ...]:
+    """`count` workers shared by corpora read at `weights` (`Workers.shared`), worked out once for them all,
+    which every member's build and the read's topology read (a thousand members each worked it out whole):
+    in proportion to the weights by their largest remainders (the earlier corpus first among equal ones),
+    then one each a drawn corpus given none, taken from the corpus holding the most, so a corpus drawn from
+    97% of the time reads in nearly every worker where an equal share gave a 3% corpus as many; where there
+    are fewer workers than drawn corpora (a weight above zero), one each the heaviest. A corpus holds no more
+    workers than its `capacities` entry where one is stated (a stream of whole compressed files deals each
+    worker a file of its own), those past it given to the corpora with room, the heaviest first, and any no
+    corpus has room for left unused. A corpus given none reads in the reading process."""
+    drawn = [at for at, weight in enumerate(weights) if weight > 0]
+    held = dict.fromkeys(range(len(weights)), 0)
+    if count < len(drawn):
+        for at in sorted(drawn, key=lambda at: (-weights[at], at))[:count]:
+            held[at] = 1
+    else:
         # Each weight a share of the largest first, so no product or sum of weights a mix may state
         # overflows (Grain's mix scales them down by its least).
         largest = max(weights[at] for at in drawn)
         scaled = {at: weights[at] / largest for at in drawn}
         total = sum(scaled.values())
-        exact = {at: self.count * scaled[at] / total for at in drawn}
-        held = {at: math.floor(share) for at, share in exact.items()}
-        for at in sorted(drawn, key=lambda at: (held[at] - exact[at], at))[:self.count - sum(held.values())]:
+        exact = {at: count * scaled[at] / total for at in drawn}
+        held.update({at: math.floor(share) for at, share in exact.items()})
+        for at in sorted(drawn, key=lambda at: (held[at] - exact[at], at))[:count - sum(held.values())]:
             held[at] += 1
         for at in (at for at in drawn if not held[at]):
             held[max(drawn, key=lambda most: (held[most], -most))] -= 1
             held[at] = 1
-        return Workers(held.get(index, 0), self.buffer)
+    limits = dict(enumerate(capacities))
+    spare = 0
+    for at in drawn:
+        if (limit := limits.get(at)) is not None and held[at] > limit:
+            spare, held[at] = spare + held[at] - limit, limit
+    for at in sorted(drawn, key=lambda at: (-weights[at], at)):
+        limit = limits.get(at)
+        room = spare if limit is None else min(spare, limit - held[at])
+        held[at], spare = held[at] + room, spare - room
+    return tuple(held[at] for at in range(len(weights)))
 
 
 @dataclasses.dataclass(frozen=True)

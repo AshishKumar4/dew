@@ -32,11 +32,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 
+from dew import _cache
 from dew.nn.derivatives import (
     Surrogate,
     contracted,
     declared_derivative,
     marked_call_p,
+    unheld_while,
     with_gradients_formed,
 )
 from dew.nn.finite import zeroed_unless
@@ -218,10 +220,17 @@ class InBackward:
     moments and norms, None for what it reads beside them (its input, its rows' values)."""
 
 
-_PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)
-_GATE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_gate", default=None)
-_FINITE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_in_backward_finite",
-                                                                          default=None)
+_PLAN: contextvars.ContextVar[InBackward | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward", default=None)))
+_GATE: contextvars.ContextVar[jax.Array | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward_gate", default=None)))
+_FINITE: contextvars.ContextVar[jax.Array | None] = unheld_while(_cache.untraced(
+    contextvars.ContextVar("dew_in_backward_finite", default=None)))
+"""A step's plan and gates for `scanned_run`, which no trace's key states (`_cache.untraced`), so a trace kept
+by `options.trace_context()` (`projections._DECISIONS`, `algebra.fusion`, keyed by their operands and
+regions) neither misses at every step nor holds the plan's update closures, its transaction, its trainer and
+executables, or its tracers (row 12980); and within which no marked span is held (`unheld_while`), whose
+trace may read them."""
 
 
 @contextlib.contextmanager
