@@ -169,14 +169,15 @@ def test_padded_rows_score_as_they_do_alone():
     ordered = sorted(rows(checkpoint, parallel=False), key=lambda row: row[0])
     batch = DecisionInputs.collate([encoded for _, _, encoded in ordered], checkpoint.specials.pad)
     widths = [len(markers(encoded)) for _, _, encoded in ordered]
-    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, batch))[:, 0]
-    assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
 
     def in_one_batch(dtype, inputs):
         scores = model_at(dtype).logits(variables_of(dtype, inputs), batch)[:, 0]
         return {**dew(dtype, inputs), "sequential": jnp.concatenate(
             [scores[row, :width] for row, width in enumerate(widths)])}
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, in_one_batch, "batched Laya logits")
+    # After the check-1 site, which a GPU tier's prepare compiles ahead of its run (row 8060).
+    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, batch))[:, 0]
+    assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
 
 
 @attending("xla")

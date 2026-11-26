@@ -1134,3 +1134,36 @@ def test_a_captured_array_differing_only_in_what_its_bytes_do_not_hold_refuses_e
     assert resumed_changes(read_exactly(step(saved)), state) == ()
     with pytest.raises(ValueError):
         resumed_changes(read_exactly(step(other)), state)
+
+
+@dataclasses.dataclass(frozen=True)
+class Keyed:
+    """A transform holding a typed PRNG key as its seed."""
+
+    key: jax.Array
+
+    def __call__(self, row):
+        return row
+
+
+def test_a_step_holding_a_typed_key_is_stated_by_its_key_data_and_implementation():
+    """A dataclass transform whose field is a typed PRNG key (`jax.random.key`) is stated (`StepIdentity.of`)
+    and its read compiles: by the key's data, so another seed is another step and the same seed, made again,
+    the same; and by its implementation, so a key of another implementation with the same data is another
+    step (row 12998: the key went to `np.asarray`, which refused it before any plan was made)."""
+    def config(key) -> str:
+        return StepIdentity.of(Keyed(key)).config
+
+    assert config(jax.random.key(0)) == config(jax.random.key(0)) != config(jax.random.key(1))
+    data = jax.random.key_data(jax.random.key(0, impl="rbg"))
+    assert config(jax.random.wrap_key_data(data, impl="rbg")) != config(
+        jax.random.wrap_key_data(data, impl="unsafe_rbg"))
+    chain = Pipeline(ROWS).map(Keyed(jax.random.key(0))).batch(2)
+
+    def first(reader):
+        try:
+            return next(reader)
+        finally:
+            reader.close()
+
+    assert first(compile(chain, loading=READ).train(DataPartition()))["id"].shape == (2,)

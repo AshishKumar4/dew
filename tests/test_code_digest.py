@@ -56,6 +56,15 @@ def loaded(name):
 """A module importing by a computed name, through an alias of `import_module`."""
 
 
+def _edited_run(script: str, tree: Path, tmp_path: Path, edits: tuple[Path, ...]) -> dict:
+    """`script`'s printed JSON, run fresh over the copied package `tree` once each of `edits` has a line
+    appended."""
+    for path in edits:
+        path.write_text(path.read_text() + "\n# edited\n")
+    return fresh(script, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
+                 variables={"XDG_CACHE_HOME": str(tmp_path)})
+
+
 def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whole_package(tmp_path):
     """An edit of Dew's code outside the certification's and the communicators' (a trainer's), of a module
     only a `TYPE_CHECKING` block imports and of the release's version keeps every digest; an edit of a
@@ -75,10 +84,7 @@ def test_a_stores_digest_follows_its_code_and_an_unreviewed_import_keys_the_whol
         (package / name).write_text("")
 
     def digests(*edits: Path) -> dict:
-        for path in edits:
-            path.write_text(path.read_text() + "\n# edited\n")
-        return fresh(DIGESTS, source=tree, platforms="cpu", cache_dir=tmp_path / "xla",
-                     variables={"XDG_CACHE_HOME": str(tmp_path)})
+        return _edited_run(DIGESTS, tree, tmp_path, edits)
 
     before = digests()
     assert before["computed"] == before["whole"]
@@ -357,3 +363,108 @@ def test_a_kept_closure_holds_the_lookups_of_its_own_walk_alone(tmp_path):
     after = fresh(FOOTPRINT, "whole", platforms="cpu", cache_dir=tmp_path / "after")
     assert alone == after
 
+
+def test_a_callable_instance_of_a_class_of_dews_is_its_class_code_and_any_other_callable_is_all_of_it():
+    """A value's provenance (`dew._code.provenance`) holds a callable instance of a class of Dew's at its
+    module's top level by that class's module, as any other instance (a Flax module, a template's
+    `Capped` hook); a function, a `functools.partial` over one of Dew's, an instance of a class made in a
+    function, and a class of Dew's holding a function, are code no class states: all of Dew's (None)."""
+    import functools
+
+    from dew._code import provenance
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels.templates import attention as template
+
+    def local():
+        class Made:
+            def __call__(self):
+                return None
+
+        return Made()
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                              max_seq_len=8)
+    assert provenance([template.Capped(30.0)]) == {"dew.nn.kernels.templates.attention"}
+    assert "dew.nn.backbones.causal_transformer" in (provenance([model]) or ())
+    assert [provenance([held]) for held in (
+        local(), provenance, functools.partial(provenance, ()),
+        template.Biased(lambda logits, q, k: logits))] == [None] * 4
+
+
+RUNG_CODE = """
+import dataclasses
+import json
+
+import jax
+import optax
+
+from dew._code import op_provenance, provenance, provenance_code, whole_digest
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels.templates.attention import Capped
+from dew.nn.kernels.templates.attention_triton import TritonForward
+from dew.objectives.lm import LMObjective
+from dew.objectives.residuals import Residuals
+from dew.objectives.supervised import Supervised
+from dew.optim import Adam, OptimConfig, Optax
+from dew.training import Trainer
+from dew.training.rungs import _code
+
+
+class Fitted(Residuals):
+    def fresh_variables(self, key, held):
+        return {"params": {"p": 0.0}}
+
+    def residuals(self, variables, batch, step):
+        return batch["x"] - variables["params"]["p"]
+
+
+model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=1, mlp_features=8,
+                          max_seq_len=8)
+lm = LMObjective(model, 4)
+configured = Trainer(lm, OptimConfig(optimizer=Adam(), lr=1e-3), key=jax.random.key(0))._settings()
+handed = Trainer(lm, optax.sgd(1e-2), key=jax.random.key(0))._settings()
+criterion = Supervised(model, lambda outputs, batch: outputs.sum(), inputs="text")
+def factory(learning_rate) -> optax.GradientTransformation:
+    return optax.sgd(learning_rate)
+
+
+elsewhere = OptimConfig(optimizer=Optax(path="__main__:factory"), lr=1e-3)
+pathed = dataclasses.replace(configured, optimizer_source=elsewhere)
+whole = [whole_digest()]
+launch = op_provenance(TritonForward(score_mod=Capped(30.0)), {})
+print(json.dumps({"lm": _code(configured, lm.program_key(), None),
+                  "opaque": [_code(handed, lm.program_key(), None) == whole,
+                             _code(pathed, lm.program_key(), None) == whole,
+                             _code(dataclasses.replace(configured, objective=Fitted()), (), None) == whole,
+                             _code(dataclasses.replace(configured, objective=criterion), (), None) == whole],
+                  "launch": provenance_code("dew.nn.kernels.templates.report", launch) == whole,
+                  "capped": provenance_code("dew.nn.kernels.templates.report", provenance([Capped(30.0)]))}))
+"""
+
+
+def test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else(tmp_path):
+    """A rung record keys on the code that builds its step (`dew.training.rungs._code`), not every file of
+    Dew's, as the compiler hands it the run's settings: a file no step's code imports leaves an LM's whose
+    optimizer is a config alike, and its model's module moves it. A step whose code no value names keys on
+    all of Dew's: an optimizer handed in as a transformation or named by an import path outside Optax, a
+    user's objective (a model-free `Residuals`'s subclass), and one of Dew's holding a user's criterion.
+    Every file's digest made each rung test's CI key every file of Dew's (22% of the suite's rows). A hook
+    of a class of Dew's (`Capped`), keyed by every file before, keys on its class's module: an edit there
+    moves its code, an unrelated file's leaves it; a launch holding it (a Triton forward's score hook,
+    `op_provenance`) holds it prepared, its runner a function, and keys on all of Dew's as before."""
+    tree = tmp_path / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(REPO_ROOT / "src" / name, tree / name, ignore=shutil.ignore_patterns("__pycache__"))
+    package = tree / "dew"
+
+    def codes(*edits: Path) -> dict:
+        return _edited_run(RUNG_CODE, tree, tmp_path, edits)
+
+    (package / "_spare_rung.py").write_text("")
+    before = codes()
+    assert before["opaque"] == [True, True, True, True] and before["launch"]
+    assert codes(package / "_spare_rung.py") == before
+    hooked = codes(package / "nn" / "kernels" / "templates" / "attention.py")
+    assert hooked["capped"] != before["capped"]
+    model = codes(package / "nn" / "backbones" / "causal_transformer.py")
+    assert model["lm"] != hooked["lm"]

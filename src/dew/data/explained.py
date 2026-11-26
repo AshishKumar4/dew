@@ -13,6 +13,7 @@ from dew._records import record
 
 if TYPE_CHECKING:
     from dew.data.dataset import Loader, Loading
+    from dew.data.pipeline import Workers
     from dew.data.sources.base import Read
 
 type Chooser = Literal["compile", "chain", "sources"]
@@ -43,15 +44,17 @@ class Sized:
 @dataclasses.dataclass(frozen=True)
 class TrainingRead:
     """How a compile reads its training batches: the read and who chose it, the loading its readers run
-    with as automatic loading sized it, the worker processes the read runs in, each corpus's own where a
-    read that drops records reads in workers of each corpus's (`dew.data.lowering._Build.pools`), and
-    a read that would read faster, which the compile leaves to be asked for."""
+    with as automatic loading sized it, the worker stage the read runs in (its count and the batches each
+    worker holds ready, a stage the chain writes as written: `dew.data.lowering.worker_stage`), each
+    corpus's own where a read that drops records reads in workers of each corpus's
+    (`dew.data.lowering._Build.pool_stages`, one share's), and a read that would read faster, which the
+    compile leaves to be asked for."""
 
     read: Read
     chooser: Chooser
     loading: Loading
-    workers: int
-    pools: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    workers: Workers
+    pools: Mapping[str, Workers] = dataclasses.field(default_factory=dict)
     faster: Read | None = None
     """`memory`, where another read was taken and every source can be read into memory, its chain lowering
     there: a memory read takes each record from RAM after one load of the corpus, with no read of its store
@@ -96,11 +99,12 @@ def explained(loader: Loader) -> str:
 
 def _loading_lines(reading: TrainingRead) -> list[str]:
     """The workers and buffers `reading` reads in, and what automatic loading measured to size them."""
-    loading = reading.loading
-    held = (f"each holding {loading.ahead} batches ready" if reading.workers else "in the training process")
-    lines = [f"workers: {reading.workers}, {held}; {loading.threads} threads a reader, "
+    loading, workers = reading.loading, reading.workers
+    held = (f"each holding {workers.buffer} batches ready" if workers.count else "in the training process")
+    lines = [f"workers: {workers.count}, {held}; {loading.threads} threads a reader, "
              f"{loading.read_buffer} reads ahead"]
-    lines.extend(f"  {corpus}: {count} workers" for corpus, count in reading.pools.items())
+    lines.extend(f"  {corpus}: {stage.count} workers, each holding {stage.buffer} batches ready"
+                 for corpus, stage in reading.pools.items())
     if (sized := loading.sized) is not None:
         run = "an unstated count of" if sized.batches is None else str(sized.batches)
         lines.append(f"sized for {run} batches from {sized.sampled} sampled: {sized.python * 1e3:.2f} ms of "

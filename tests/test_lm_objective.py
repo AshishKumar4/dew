@@ -1028,9 +1028,15 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     def draw(seed):
         return (np.asarray(token_batch(seed=seed)[TEXT_KEY]),)
 
+    # Each of the 256 draws through one compiled program, not op by op: applied eagerly, the draws' forwards
+    # took 209 s of the case's 220 on armada (row 12910).
+    @jax.jit
     def objective(tokens):
         loss, aux = with_z.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
         return {"loss": jnp.atleast_1d(loss), "z term": jnp.atleast_1d(aux.metrics["z_loss"])}
+
+    narrow = jax.jit(plain.model.apply)
+    wide = jax.jit(plain.model.clone(dtype=jnp.float64).apply)
 
     def oracle(dtype):
         """The oracle on the model's logits in `dtype`, its float32 run on the float32 ones."""
@@ -1039,11 +1045,11 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
             ids = jnp.asarray(tokens[:, :-1], jnp.int32)
             weights = (tokens[:, 1:] != pad_id).astype(np.float64)
             if dtype == np.float32:
-                logits = np.asarray(plain.model.apply(params, ids))
+                logits = np.asarray(narrow(params, ids))
                 loss, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient,
                                                    dtype=np.float32)
             else:
-                logits = np.asarray(plain.model.clone(dtype=jnp.float64).apply(widened(params), ids))
+                logits = np.asarray(wide(widened(params), ids))
                 loss, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
             return {"loss": np.atleast_1d(np.float64(loss)), "z term": np.atleast_1d(np.float64(z_term))}
         return as_given(run)
