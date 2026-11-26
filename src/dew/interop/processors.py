@@ -129,7 +129,7 @@ def _chat_image(image: object) -> Media | str | bytes:
 type MediaInput = Media | str | bytes | bytearray | Path | Sequence[MediaInput]
 
 
-def _is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
+def is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
     """Whether `value` is a sequence of media items rather than one atomic path, byte buffer or array."""
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
@@ -416,10 +416,10 @@ class Processor:
         rows = [text] if isinstance(text, str) else list(text)
         # One image (an array, a PIL image, a path or bytes) or a sequence of them.
         given: list[MediaInput] = (
-            [] if images is None else list(images) if _is_image_collection(images) else [images]
+            [] if images is None else list(images) if is_image_collection(images) else [images]
         )
         per_row = len(rows) > 1 and len(given) == len(rows) and all(
-            _is_image_collection(entry) for entry in given
+            is_image_collection(entry) for entry in given
         )
         image_id, _ = _media_token_ids(self.record)
         blocks = self._merge_size() ** 2
@@ -427,7 +427,7 @@ class Processor:
         for index, row in enumerate(rows):
             if per_row:
                 entry = given[index]
-                taken = list(entry) if _is_image_collection(entry) else [entry]
+                taken = list(entry) if is_image_collection(entry) else [entry]
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]

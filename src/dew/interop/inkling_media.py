@@ -119,9 +119,12 @@ class InklingProcessor:
         if text is None or {"audio", "videos", "video_metadata"} & kwargs.keys() \
                 or kwargs.get("return_tensors", "np") != "np":
             raise ValueError("Inkling 2's processor here reads text and raw images into NumPy fields")
-        # A path or URL is one image, not a sequence of its characters.
-        atomic = images is None or isinstance(images, str | bytes) or not isinstance(images, Sequence)
-        given = [rgb(image) for image in ([] if images is None else [images] if atomic else images)]
+        from dew.interop.processors import is_image_collection
+
+        # A path, URL or byte buffer is one image, not a sequence of its characters (the host processor's
+        # one rule, `is_image_collection`).
+        given = [rgb(image) for image in ([] if images is None else images if is_image_collection(images)
+                                          else [images])]
         processed = [merged_blocks(image, self.side) for image in given]
         remaining = iter(processed)
         rows = []
