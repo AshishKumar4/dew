@@ -1648,33 +1648,35 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
 def _two_product(left, right, *, bit_split: bool, subtract: bool,
                  rounding: Callable[[jax.Array], jax.Array] | None) -> tuple[jax.Array, jax.Array]:
     """`two_product`'s arithmetic, its steps' roundings each their own (`rounding_alone`, `uncontracted`)."""
-    def rounded(value):
+    def rounded(value: jax.Array) -> jax.Array:
         return value if rounding is None else rounding(value)
 
-    def split(value):
+    def masked(bits, dtype, unsigned, mask: int, low: int):
+        if _odd(dtype):
+            # Half the cut's last bit added to the magnitude: the cut rounds to nearest.
+            bits = bits + unsigned(1 << (low - 1))
+        return bits & unsigned(mask)
+
+    def split(value) -> tuple[jax.Array, jax.Array]:
         if bit_split and isinstance(value, np.generic | np.ndarray):
-            # A constant (a kernel's static factor) splits where it is known, on the host.
-            constant = np.asarray(value, np.float32)
-            unsigned, mask, _ = split_bits(np.float32)
-            high = (constant.view(unsigned) & unsigned(mask)).view(np.float32)
+            # A known factor splits on the host at its stored dtype, not at float32.
+            constant = np.asarray(value, jax.dtypes.canonicalize_dtype(value.dtype))
+            unsigned, mask, low = split_bits(constant.dtype)
+            kept = masked(constant.view(unsigned), constant.dtype, unsigned, mask, low)
+            high = kept.view(constant.dtype)
             return jnp.asarray(high), jnp.asarray(constant - high)
-        # The value read as one (`uncontracted`): its split reads it twice (its high part from its bits or a
-        # scaled copy, then `value - high`), which a multiply that made it, contracted into the subtraction,
-        # would read exactly at one and rounded at the other, a spurious low part.
-        (value,) = uncontracted(value)
+        operand: jax.Array
+        (operand,) = uncontracted(value)
         if bit_split:
-            unsigned, mask, low = split_bits(value.dtype)
-            mask = np.array(mask, unsigned)
-            bits = jax.lax.bitcast_convert_type(value, unsigned)
-            if _odd(value.dtype):
-                # Half the cut's last bit added to the magnitude's bits: the cut rounds to nearest.
-                bits = bits + np.array(1 << (low - 1), unsigned)
-            high = jax.lax.bitcast_convert_type(bits & mask, value.dtype)
+            unsigned, mask, low = split_bits(operand.dtype)
+            bits = jax.lax.bitcast_convert_type(operand, unsigned)
+            high = jax.lax.bitcast_convert_type(
+                masked(bits, operand.dtype, unsigned, mask, low), operand.dtype)
         else:
-            splitter = (1 << 27) + 1 if value.dtype == jnp.float64 else (1 << 12) + 1
-            scaled = value * splitter
-            high = scaled - (scaled - value)
-        return high, rounded(value - high)
+            splitter = (1 << 27) + 1 if operand.dtype == jnp.float64 else (1 << 12) + 1
+            scaled = operand * splitter
+            high = scaled - (scaled - operand)
+        return high, rounded(operand - high)
 
     scale = None
     if bit_split and _odd(jnp.result_type(left, right)):

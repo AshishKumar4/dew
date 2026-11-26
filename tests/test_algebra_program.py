@@ -415,6 +415,77 @@ def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_diviso
     assert graph.check_bool(eq(quotient).to(product)) == admitted
 
 
+@pytest.mark.parametrize("dtype, folds", [(jnp.float32, True), (jnp.bfloat16, False)])
+def test_two_negations_are_an_identity_in_the_float32_window(dtype, folds):
+    from egglog import eq, i64
+
+    def twice(x):
+        return jax.lax.neg(jax.lax.neg(x))
+
+    closed = jax.make_jaxpr(twice)(jax.ShapeDtypeStruct((8,), dtype))
+    region = terms.region(closed)
+    graph, _, (result,) = program.graphed(region)
+    program.saturate(graph, region, (algebra.rules.RULES["identities"],), algebra.SATURATION)
+    assert graph.check_bool(eq(result).to(terms.Term.leaf(i64(0)))) is folds
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
+@pytest.mark.parametrize("case", ["normal", "infinity", "subnormal", "signaling", "quiet", "unknown",
+                                  "placed"])
+def test_a_widening_window_preserves_the_original_narrow_bits(dtype, case):
+    normal, infinity = (0x0400, 0x7C00) if dtype == jnp.float16 else (0x0080, 0x7F80)
+    other = {"normal": normal, "infinity": infinity, "subnormal": 1, "signaling": infinity | 1,
+             "quiet": infinity | (normal >> 1) | 1, "unknown": infinity | 1, "placed": normal}[case]
+    negative_zero = np.uint16(0x8000).view(dtype)
+    endpoint = np.uint16(other).view(dtype)
+
+    def layer(mask, payload):
+        x = (payload if case == "unknown" else
+             jax.lax.select(mask, jax.lax.full(mask.shape, negative_zero, dtype),
+                            jax.lax.full(mask.shape, endpoint, dtype)))
+        narrowed = x.astype(jnp.float32).astype(dtype)
+        return jnp.max(narrowed * dtype(2)), jax.lax.bitcast_convert_type(narrowed, jnp.uint16)
+
+    mask = np.arange(64) % 2 == 0
+    payload = np.where(mask, np.uint16(0x8000), np.uint16(other)).view(dtype)
+    rewritten = algebra.rewritten(layer)
+    folds = case in ("normal", "infinity")
+    if case == "placed":
+        mesh = jax.sharding.AbstractMesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
+        with jax.sharding.use_abstract_mesh(mesh):
+            traced = jax.make_jaxpr(rewritten)(mask, payload)
+    else:
+        traced = jax.make_jaxpr(rewritten)(mask, payload)
+    casts = [eq for eq in equations(traced.jaxpr) if eq.primitive is jax.lax.convert_element_type_p]
+    assert len(casts) == (0 if folds else 2)
+    bits = jax.jit(rewritten)(mask, payload)[1]
+    want = payload.view(np.uint16) if folds else jax.jit(layer)(mask, payload)[1]
+    np.testing.assert_array_equal(bits, want)
+
+
+@pytest.mark.parametrize("broadcast", [False, True])
+@pytest.mark.parametrize("floored", [False, True])
+def test_a_clamped_divider_reuses_its_held_negative_power_only_in_range(broadcast, floored):
+    def layer(a, z):
+        divisor = jax.lax.clamp(z.dtype.type(floored), jnp.abs(z), z.dtype.type(4))
+        reciprocal = jax.lax.integer_pow(divisor, -1)
+        return a / (divisor[:, None] if broadcast else divisor), reciprocal
+
+    def draw(seed):
+        a, z = rows(seed, (16, 32) if broadcast else (16,), (16,))
+        return a, np.where(z < 0, np.float32(0.5), np.float32(2))
+
+    with algebra.rules.enabling_dev("reuse"):
+        rewritten = algebra.rewritten(layer)
+        traced = jax.make_jaxpr(rewritten)(*draw(0))
+        ops = [eq.primitive for eq in equations(traced.jaxpr)]
+        assert ops.count(jax.lax.div_p) == (0 if floored else 1)
+        assert ops.count(jax.lax.integer_pow_p) == 1
+        if floored:
+            assert_as_exact(jax.jit(rewritten), jax.jit(layer), draw,
+                            "clamped dividend with a held reciprocal", seeds=8)
+
+
 @pytest.mark.parametrize("fn", [
     lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
     lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
@@ -1563,6 +1634,21 @@ def test_a_branch_a_pass_writes_an_ordered_effect_into_compiles_and_runs_both_wa
     assert [float(run(taken, x)), float(run(~taken, x))] == [4.0, 6.0]
 
 
+@pytest.mark.parametrize("rows", [1, 8])
+def test_the_raw_decode_splice_executes_without_retracing(rows):
+    """The spliced Jaxpr can run inside the original trace's compilation metadata, not a replay's."""
+    from reference_error import as_given
+    from test_algebra_fusion import _decode_draw, _decode_layer, _wide_decode
+
+    from dew.algebra.fusion import lower_decode
+
+    traced = jax.jit(_decode_layer).trace(*_decode_draw(rows, 6107)[:-1])
+    selected = lower_decode(traced.jaxpr.jaxpr, rows=rows, enabled=True)
+    run = program.traced_as(traced, traced.jaxpr.replace(jaxpr=selected)).lower().compile()
+    assert_as_exact(as_given(run), _decode_layer, lambda seed: _decode_draw(rows, seed)[:-1],
+                    "raw spliced decode forward", seeds=8, truth_fn=_wide_decode)
+
+
 def test_a_held_body_rewritten_under_another_tile_pin_takes_that_pin():
     """A body's rewrite is keyed by the tiles a tuning pins (`tuning.pinned`, which a launch reads at its
     rewrite, `KernelOp.pinned`): one held program rewritten again under another legal pin of its product's
@@ -1947,6 +2033,19 @@ def test_jaxpr_parameter_key_hashes_structure_and_isolates_opaques_and_consts():
     assert terms.opaque(kv1) == terms.opaque(kv2)
     with pytest.raises(_stated.Unestablished):
         _stated._plain(kv1, "custom_vjp_jaxpr")
+
+
+def test_repeated_primitive_slots_keep_distinct_primitive_identities():
+    from jax.extend import core
+
+    def negate_twice(x):
+        return jax.lax.neg(jax.lax.neg(x))
+
+    traced = jax.make_jaxpr(negate_twice)(jax.ShapeDtypeStruct((8,), jnp.float32))
+    first, second = traced.eqns
+    other = core.Primitive(second.primitive.name)
+    changed = traced.replace(jaxpr=traced.jaxpr.replace(eqns=[first, second.replace(primitive=other)]))
+    assert terms.jaxpr_digest(traced, in_process=True) != terms.jaxpr_digest(changed, in_process=True)
 
 
 def _bf16_rms(x, w):
