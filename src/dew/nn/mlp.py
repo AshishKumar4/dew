@@ -339,6 +339,8 @@ class GatedMLP(nn.Module):
         writes no float64), projections promoting their operands otherwise than flax's `promote_dtype` (the
         chain promotes nothing), and a sequence axis splitting the rows (the chain flattens them, past the
         hidden activation's placement)."""
+        if not x.size:
+            return None
         named = isinstance(self.activation, str) and (len(projections_) == 3 or self.activation in UNGATED)
         if not (named and plain_denses(projections_)
                 and all(projection.promote_dtype is promote_dtype for projection in projections_)):
@@ -382,6 +384,8 @@ class GatedMLP(nn.Module):
             if self.packed_order[0] != 'gate_proj':
                 return None
             return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
+        if not x.size:
+            return None
         projections = (self.gate_proj, self.up_proj)
         if joins(projections, Choice.GATE_UP):
             return joined_dense(x, projections, axis=-2)

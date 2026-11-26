@@ -673,11 +673,13 @@ def dot_general(xla, path: tuple | None = None):
 
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
+        # Empty products keep XLA's dimension numbers and bias rule but have no template work.
+        nonempty = lhs.size != 0 and rhs.size != 0
         # The run's low-precision recipe takes the product where the projection's role takes it.
-        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype,
-                                                    tensor_scale=tensor_scale)) is not None:
+        if nonempty and not kwargs and (recipe := recipe_general(
+                lhs, rhs, dimension_numbers, out_dtype, tensor_scale=tensor_scale)) is not None:
             return added(recipe)
-        plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
+        plain = (nonempty and not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
@@ -691,7 +693,7 @@ def dot_general(xla, path: tuple | None = None):
             if launched(rows, rhs, out_dtype, precision):
                 out = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return added(out.reshape(*lhs.shape[:-1], rhs.shape[1]))
-        elif not kwargs and lhs.dtype == rhs.dtype and batch[0] and not automatic_axes():
+        elif nonempty and not kwargs and lhs.dtype == rhs.dtype and batch[0] and not automatic_axes():
             # A batched projection's members as uniform groups (`grouped_rows`, Appendix C row 4): one
             # grouped GEMM where a launch takes any of its products, as a dense one's (DeepSeek V4's
             # `o_a_proj`, a `DenseGeneral` over its groups; spec alignment SA20261119pm F36).
