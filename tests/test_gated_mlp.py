@@ -642,27 +642,35 @@ def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed
                  for module in (layer, before))
     jax.tree.map(np.testing.assert_array_equal, got, want)
 
-    # The down projection's input, read where the layer makes it, and its projections' outputs.
-    seen = {}
+    def witnessed(module) -> tuple[bool, bool]:
+        """Whether `module`'s pullback holds its hidden product (the down projection's input, or before its
+        dropout the product's own output), and whether it holds its projections' outputs, each read where
+        the layer makes it, for its forward alone (`forward_only`: the same values, none hidden)."""
+        seen = {}
 
-    def read(next_fun, args, kwargs, context):
-        out = next_fun(*args, **kwargs)
-        if context.method_name == "__call__" and context.module.name in ("gate_proj", "up_proj",
-                                                                       "gate_up_proj", "down_proj"):
-            seen[context.module.name] = args[0] if context.module.name == "down_proj" else out
-        return out
+        def read(next_fun, args, kwargs, context):
+            out = next_fun(*args, **kwargs)
+            name = context.module.name
+            if context.method_name == "__call__" and name in ("gate_proj", "up_proj", "gate_up_proj"):
+                seen[name] = out
+            elif context.method_name == "__call__" and name in ("down_proj", "dropout"):
+                seen[f"{name} input"] = args[0]
+            return out
 
-    # Read for its forward alone (`forward_only`: no checkpoint of its own hides them), the same values.
-    with nn.intercept_methods(read), forward_only():
-        apply_of(layer)(params, x)
-    _, pull = jax.vjp(apply_of(layer), params, x)
-    held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
-            if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
+        with nn.intercept_methods(read), forward_only():
+            apply_of(module)(params, x)
+        _, pull = jax.vjp(apply_of(module), params, x)
+        held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)
+                if not jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)]
 
-    def holds(value) -> bool:  # held as made, or reshaped (the packed pair `[..., 2, H]`)
-        value = np.asarray(value)
-        return any(leaf.size == value.size and np.array_equal(leaf.ravel(), value.ravel()) for leaf in held)
+        def holds(value) -> bool:  # held as made, or reshaped (the packed pair `[..., 2, H]`)
+            value = np.asarray(value)
+            return any(leaf.size == value.size and np.array_equal(leaf.ravel(), value.ravel())
+                       for leaf in held)
 
-    assert not holds(seen["down_proj"]), "the down projection's input is held"
-    for name in ("gate_up_proj",) if packed else ("gate_proj", "up_proj"):
-        assert holds(seen[name]), name
+        hidden = [seen[name] for name in ("down_proj input", "dropout input") if name in seen]
+        projected = [seen[name] for name in (("gate_up_proj",) if packed else ("gate_proj", "up_proj"))]
+        return any(holds(value) for value in hidden), all(holds(value) for value in projected)
+
+    assert witnessed(before)[0], "the path holding its hidden product shows it held"
+    assert witnessed(layer) == (False, True)

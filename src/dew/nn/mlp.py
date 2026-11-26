@@ -378,14 +378,16 @@ class GatedMLP(nn.Module):
         them: a `[tokens, hidden]` residual a layer less, a third of an MLP's (Qwen3.5-4B's 18 GiB at 8 x
         4096 tokens unrematerialized). Its value and every gradient are the product's and the projection's
         as they are, bitwise: the same functions, the product's recomputation its forward's."""
-        def run(module, *held):
-            return module._down(product(*held), train)
-
         if not internal_remat():  # traced for its forward alone (`protocols.forward_only`)
-            return run(self, *halves)
-        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads; its
-        # body a checkpoint no remat rung sets (`fixed_remat`).
-        return nn.remat(fixed_remat(run), policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
+            return self._down(product(*halves), train)
+
+        # The product always recomputed, a checkpoint no remat rung sets (`fixed_remat`); the down
+        # projection's own values left at its rung's scope, which a rung's policy saves or drops by name.
+        def run(module, *held):
+            return module._down(fixed_remat(product)(*held), train)
+
+        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads.
+        return nn.remat(run, policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:
