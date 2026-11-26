@@ -785,18 +785,12 @@ def functional_experts(model: torch.nn.Module) -> None:
 
 def _routed_slots(x, index, weights, kernels, *, routed: int, activation: str):
     """Each token's experts, weighted and summed in at least fp32, its slots routed (an index below `routed`,
-    the expert's gated product through Dew's grouped dispatch, `dew.nn.moe.expert_dispatch`, over the rows
-    sorted by expert: the gate's and up projection's `kernels[:2]` one paired product, `activation`'s gate,
-    the down projection `kernels[2]`, each `[experts, in, out]`) or identity (one past them, which the
-    dispatch's sentinel holds at zero: the token itself); none routed where `kernels` is empty."""
-    from dew.nn.activations import gated_product
-    from dew.nn.moe import (
-        EXPERT_AXES,
-        expert_compute_dtype,
-        expert_dispatch,
-        expert_projection,
-        paired_projections,
-    )
+    the expert's gated MLP through Dew's grouped dispatch, `dew.nn.moe.expert_dispatch`, over the rows
+    sorted by expert, as a native bank computes it: `dew.nn.moe.gated_experts` over the gate's, up's and
+    down projection's `kernels`, each `[experts, in, out]`, `activation`'s gate, its grouped products the
+    run's (`implementation` 'auto', row 13140)) or identity (one past them, which the dispatch's sentinel
+    holds at zero: the token itself); none routed where `kernels` is empty."""
+    from dew.nn.moe import EXPERT_AXES, expert_compute_dtype, expert_dispatch, gated_experts
 
     identity = index >= routed
     slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
@@ -804,10 +798,9 @@ def _routed_slots(x, index, weights, kernels, *, routed: int, activation: str):
         compute = expert_compute_dtype(x, *kernels, dtype=None)
 
         def project(tokens, sizes, _ids, held):
-            gate, up = paired_projections(tokens, held[0], held[1], sizes, compute, "xla", None)
-            gated = gated_product(activation)(gate, up)
             # No history: a fallback's experts take no delayed-scaling recipe's state.
-            return jnp.asarray(expert_projection(gated, held[2], sizes, compute, "xla", None)), ()
+            out = gated_experts(tokens, *held, sizes, compute, "auto", None, activation, None)
+            return jnp.asarray(out), ()
 
         slots, _ = expert_dispatch(project, x, jnp.where(identity, routed, index), kernels,
                                    tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj", "down_proj")),
