@@ -298,6 +298,7 @@ def triton_trains_at_large_logits_on_par_with_xla():
                     seeds=LARGE_LOGIT_SEEDS)
 
 
+@pytest.mark.compiles_at_run(reason="compares the two kernels' finiteness on drawn inputs, no check-1 site")
 def triton_at_saturated_large_logits_is_finite_where_xla_is():
     """tokamax's kernel at logits near 1e4 whose rows mostly saturate on one key (`_large_logits`): the
     route is the default form, FlashAttention's math, whose D (rowsum(dO * O), the output rounded to bf16)
@@ -587,6 +588,7 @@ def a_mapped_flash_call_is_each_rows_own(without_deterministic_ops):
                         truth_fn=_mapped("truth", packed), terms=True)
 
 
+@pytest.mark.compiles_at_run(reason="maps flash over no call outside jit, no check-1 site")
 def a_fold_holds_the_kernels_grid_and_its_offsets(without_deterministic_ops):
     """The mapped calls a kernel call folds (`dew_flash_attn._mapped_groups`): as many as keep its rows
     within the 65,535 its grid holds and a packed fold's tokens within its int32 offsets, at least one:
