@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.continuum import HeadTerms, HeadTransform, _head_growth, _squared_norm, continuum_modules
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, watched_or_owned
 
 from ..activations import _SLOPES, UNGATED, ungated_activation
 from ..blocks import normal_kernel
@@ -110,9 +110,18 @@ def head_logits(decoder: CausalTransformer, x):
     width = decoder.logits_width
     if decoder.tie_embeddings:
         logits = head_product('...d,vd->...v', x, decoder.embed_tokens.embedding[:width], decoder.precision)
-    else:
-        # Every row the head stores, its first `width` scored (`output_vocab`).
+    elif decoder.lm_head.features == width or not _scored_alone(decoder):
+        # Every column the head stores, its first `width` scored (`output_vocab`).
         logits = decoder.lm_head(x)[..., :width]
+    else:
+        # Its first `width` columns alone contracted, by the layer's own promotion and product (its
+        # `dot_general`): a stored column past them, finite in fp32 and inf in the bf16 product's operands,
+        # would meet its zero cotangent in the states' pullback as inf times zero (row 13135).
+        head = decoder.lm_head
+        states, kernel, _ = head.promote_dtype(x, decoder.applied_kernel("lm_head")[:, :width], None,
+                                               dtype=head.dtype)
+        logits = head.dot_general(states, kernel, (((states.ndim - 1,), (0,)), ((), ())),
+                                  precision=head.precision)
     # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
     computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
     # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
@@ -121,6 +130,20 @@ def head_logits(decoder: CausalTransformer, x):
                                                width)),
                          decoder.final_logit_softcap).astype(
         output_dtype(computed if decoder.dtype is None else decoder.dtype))
+
+
+def _scored_alone(decoder: CausalTransformer) -> bool:
+    """Whether the untied head's call is its kernel's plain product, which `head_logits` takes over the
+    scored columns alone: not at init, which creates the kernel, nor where the layer holds more than its
+    kernel (an adapter's factors, a packed kernel's codes, a recipe's amax history) or another computes or
+    watches the call (`watched_or_owned`: an adapter's or a checkpoint quantization's interceptor, Qwix, a
+    capture of its output), nor over rounded operands (`linear_product`)."""
+    if decoder.is_initializing():
+        return False
+    head = decoder.lm_head
+    held = {collection: set(leaves) for collection, leaves in head.variables.items()}
+    return (held == {"params": {"kernel"}} and not watched_or_owned(head)
+            and decoder.linear_product("lm_head"))
 
 
 def output_table(decoder: CausalTransformer) -> OutputTable | None:

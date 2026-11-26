@@ -60,13 +60,15 @@ class CrossPass:
     rank: int = 64
     additive: bool = True
     normalize_values: bool = True
+    scale_by_input_rms: bool = True
+    norm_eps: float | None = None
+    normalize_message: bool = True
+    """Whether the message the gain scales is the depth mixture at unit RMS (the class docstring); it,
+    `scaled` and `gained` follow the fields before them, which a positional spelling fills (row 13136)."""
     scaled: bool = False
     """Each message score over the root of the width (Inkling 2's, `AttentionResiduals.scaled`)."""
     gained: bool = True
     """Whether each site's message query holds a gain (`AttentionResiduals.gained`; Inkling 2's none)."""
-    scale_by_input_rms: bool = True
-    normalize_message: bool = True
-    norm_eps: float | None = None
 
     def __post_init__(self):
         if self.block_size < 1 or self.rank < 1:
