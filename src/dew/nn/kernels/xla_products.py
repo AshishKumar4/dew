@@ -248,8 +248,8 @@ def step_scaled(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, ro
         raise ValueError(f"scales {row_scales.shape} and {column_scales.shape} do not cover a "
                          f"{tokens.shape} x {kernel.shape} product in {SCALE_DEPTH}-deep blocks")
 
-    def added(index, partial, owner, total):
-        columns = jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1)
+    def added(index, partial, owner, total, aligned):
+        columns = aligned(jnp.repeat(column_scales[:, index][owner], width // scaled, axis=1))
         # Each scale in the order that keeps the intermediate normal (`twice_scaled`, ledger 2715).
         return total + twice_scaled(partial, row_scales[index][:, None].astype(jnp.float32),
                                     columns.astype(jnp.float32))
@@ -269,73 +269,114 @@ def exponent_scaled(lhs_codes: jax.Array, lhs_exponents: jax.Array, kernel_codes
                     kernel_exponents: jax.Array, group_sizes: jax.Array, *, depth: int,
                     unscaled: jax.Array, kernel_unscaled: jax.Array) -> jax.Array:
     """Each group's rows of `lhs_codes` `[rows, k]` times its matrix of `kernel_codes` `[groups, k, width]`,
-    every `depth`-deep block's codes multiplied whole (each product exact; the block's fp32 partial their
-    sum, rounded as XLA's dot rounds it) and scaled by the power two of its row's and column's exponents
-    summed (`lhs_exponents` `[rows, k / depth]`, `kernel_exponents` `[groups, k / depth, width]`), added
-    in the blocks' order (`_block_walk`): a block-scaled product whose values no operand holds apart
-    (MXFP8's, `gemm.mxfp8_product`'s portable branch, OCP MX's dot). The blocks' sum is a compensated pair
-    (`precision.compensated_add`: what each addition rounds away kept, as testing.md asks of a product split
-    where its reference takes the depth whole) held at an exponent of its own: each partial brought to the
-    larger of its own and the sum's exponent by an exact power of two (`precision.power2`) before it is
-    added, the pair renormalized to its leading half's exponent after (an exact cancellation's zero back to
-    no exponent), the sum raised to its exponent once at the end. So no partial or running sum is a
-    subnormal a backend flushes: 2^-127 meets 2^127 in the exponents, partials of 2^-127 sum to a normal
-    2^-126, and a sum that cancels to a small remainder keeps it (row 13164). A block either of whose scales
-    is NaN (`unscaled`, `kernel_unscaled`, its exponents' shape) makes its sums NaN. The rows past the
-    groups are zero."""
-    from ..precision import compensated_add, power2
+    every `depth`-deep block's codes multiplied whole (each product exact; the block's partial their sum,
+    rounded as XLA's dot rounds it) and scaled by the power two of its row's and column's exponents summed
+    (`lhs_exponents` `[rows, k / depth]`, `kernel_exponents` `[groups, k / depth, width]`), summed in the
+    blocks' order (`_block_walk`): a block-scaled product whose values no operand holds apart (MXFP8's,
+    `gemm.mxfp8_product`'s portable branch, OCP MX's dot), so a scale of 2^-127 meets one of 2^127 in the
+    exponents, not as a subnormal operand a backend flushing subnormals reads as zero (row 13164). Its sum
+    holds its reference's error (testing.md's check 1): where a CPU sums wide
+    (`precision.WIDE_CPU_ARITHMETIC`, Dew's tests, in no scope stating `FP32_SUMS`) in float64 and rounded
+    once, as the decoded values' product sums there; elsewhere fp32's, a compensated pair
+    (`precision.compensated_add`) held at an exponent of its own, each partial brought to the larger of its
+    own and the sum's exponent by an exact power of two (`precision.power2`) before it is added and the pair
+    renormalized to its lead after, raised to its exponent once at the end: no partial or running sum a
+    flushable subnormal, partials of 2^-127 summing to a normal 2^-126. A cancellation of more binades than
+    the sum's significand holds (a double float's, float64's) loses what fp32's accumulation and the native
+    tcgen05 kernel's lose: check 1 holds a product to its reference's error, no exact accumulator's (Main's
+    ruling on row 13248). A block either of whose scales is NaN (`unscaled`, `kernel_unscaled`, its
+    exponents' shape) makes its sums NaN. The rows past the groups are zero."""
+    from ..precision import FP32_SUMS, compensated_add, power2, wide_cpu_arithmetic
+
+    def scaled_of(index, owner, aligned):
+        return lhs_exponents[:, index][:, None] + aligned(kernel_exponents[:, index][owner])
+
+    def poisoned_of(index, owner, aligned):
+        return unscaled[:, index][:, None] | aligned(kernel_unscaled[:, index][owner])
 
     def start(zeros):
         # Placed as the sum is (`_block_walk`'s zeros), each part of the carry alike.
         return (zeros, zeros, jnp.full_like(zeros, _NO_EXPONENT, dtype=jnp.int32),
                 jnp.zeros_like(zeros, dtype=bool))
 
-    def added(index, partial, owner, carry):
+    def added(index, partial, owner, carry, aligned):
         high, low, exponent, poisoned = carry
-        scale = lhs_exponents[:, index][:, None] + kernel_exponents[:, index][owner]
+        scale = scaled_of(index, owner, aligned)
         own = jnp.where(partial != 0, scale + jnp.frexp(partial)[1], _NO_EXPONENT)
         top = jnp.maximum(exponent, own)
         high, low = compensated_add((power2(high, exponent - top), power2(low, exponent - top)),
                                     (power2(partial, scale - top), jnp.zeros_like(partial)))
-        # The pair at its leading half's exponent: none where it cancelled to zero.
+        # The pair at its lead's exponent: none where it cancelled to zero.
         lead = jnp.where(high != 0, jnp.frexp(high)[1], 0)
         exponent = jnp.where(high != 0, top + lead, _NO_EXPONENT)
-        nan = unscaled[:, index][:, None] | kernel_unscaled[:, index][owner]
-        return power2(high, -lead), power2(low, -lead), exponent, poisoned | nan
+        poisoned = poisoned | poisoned_of(index, owner, aligned)
+        return power2(high, -lead), power2(low, -lead), exponent, poisoned
 
     def finished(carry):
         high, _, exponent, poisoned = carry
         return jnp.where(poisoned, jnp.float32(jnp.nan), power2(high, exponent))
 
-    return _block_walk(lhs_codes, kernel_codes, group_sizes, depth, start, added, finished,
-                       precision=jax.lax.Precision.DEFAULT)
+    def narrow():
+        return _block_walk(lhs_codes, kernel_codes, group_sizes, depth, start, added, finished,
+                           precision=jax.lax.Precision.DEFAULT)
+
+    if not wide_cpu_arithmetic() or jax.config.jax_default_matmul_precision == FP32_SUMS:
+        return narrow()
+
+    def wide():
+        with jax.enable_x64(new_val=True):
+            def widened(index, partial, owner, carry, aligned):
+                total, poisoned = carry
+                return (total + power2(partial, scaled_of(index, owner, aligned)),
+                        poisoned | poisoned_of(index, owner, aligned))
+
+            def rounded(carry):
+                total, poisoned = carry
+                return jnp.where(poisoned, jnp.float32(jnp.nan), total.astype(jnp.float32))
+
+            return _block_walk(lhs_codes, kernel_codes, group_sizes, depth,
+                               lambda zeros: (zeros, jnp.zeros_like(zeros, dtype=bool)), widened, rounded,
+                               precision=jax.lax.Precision.DEFAULT, dtype=jnp.float64)
+
+    # Eagerly, the platform the committed operands lie on, not the default device's (`committed_context`).
+    with committed_context((lhs_codes, kernel_codes)):
+        return jax.lax.platform_dependent(cpu=wide, default=narrow)
 
 
 def _block_walk(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, depth: int, start: Callable,
-                added: Callable, finished: Callable, *, precision: PrecisionLike) -> jax.Array:
+                added: Callable, finished: Callable, *, precision: PrecisionLike,
+                dtype=jnp.float32) -> jax.Array:
     """The block-scaled products' one walk (`step_scaled`'s, `exponent_scaled`'s): each `depth`-deep block of
-    each group's rows of `lhs` `[rows, k]` times its matrix of `kernel` `[groups, k, width]`, its fp32
-    partial added in the blocks' order into a carry (`start` of the zero sum, `added(index, partial,
-    owner, carry)`, `owner` each row's group) that `finished` makes the sum, placed as the products'
+    each group's rows of `lhs` `[rows, k]` times its matrix of `kernel` `[groups, k, width]`, its partial
+    in `dtype` added in the blocks' order into a carry (`start` of the zero sum, `added(index, partial,
+    owner, carry, aligned)`, `owner` each row's group, `aligned` placing a matrices'-side `[rows, width]`
+    operand as the sum) that `finished` makes the sum, placed as the products'
     operands place it (`ragged_placement`); then the rows past the groups zero, selected once after every
-    block, so a padded row's infinite scale leaves no NaN (row 13164). No contraction, no block: zeros."""
+    block, so a padded row's infinite scale leaves no NaN (row 13164). No contraction, or no group: zeros."""
     rows, groups, width = lhs.shape[0], kernel.shape[0], kernel.shape[2]
-    zeros = jnp.zeros((rows, width), jnp.float32,
-                      out_sharding=ragged_placement(((lhs, 0), (kernel, kernel.ndim - 1))))
+    placed = ragged_placement(((lhs, 0), (kernel, kernel.ndim - 1)))
+    zeros = jnp.zeros((rows, width), dtype, out_sharding=placed)
+
+    def aligned(value: jax.Array) -> jax.Array:
+        # A `[rows, width]` operand gathered by its rows' groups from the matrices' side, placed as the sum
+        # is: its columns' axis may be the rows' too, which their broadcast together could not place.
+        return value if placed is None else jax.sharding.reshard(value, placed)
     blocks = lhs.shape[1] // depth
-    if blocks == 0:
-        return zeros
+    if blocks == 0 or groups == 0:
+        # No contraction, or no group a row could belong to: the empty sum.
+        return zeros.astype(jnp.float32)
     owner = jnp.minimum(jnp.repeat(jnp.arange(groups), group_sizes, total_repeat_length=rows), groups - 1)
 
     def block(index, carry):
         lhs_block = jax.lax.dynamic_slice_in_dim(lhs, index * depth, depth, axis=1)
         kernel_block = jax.lax.dynamic_slice_in_dim(kernel, index * depth, depth, axis=1)
-        partial = xla_ragged_dot(lhs_block, kernel_block, group_sizes, precision=precision,
-                                 preferred_element_type=jnp.float32)
-        return added(index, partial, owner, carry)
+        partial = xla_ragged_dot(lhs_block.astype(dtype) if dtype == jnp.float64 else lhs_block,
+                                 kernel_block.astype(dtype) if dtype == jnp.float64 else kernel_block,
+                                 group_sizes, precision=precision, preferred_element_type=dtype)
+        return added(index, partial, owner, carry, aligned)
 
     total = finished(jax.lax.fori_loop(0, blocks, block, start(zeros)))
-    return jnp.where((jnp.arange(rows) < jnp.sum(group_sizes))[:, None], total, jnp.float32(0))
+    return jnp.where((jnp.arange(rows) < jnp.sum(group_sizes))[:, None], total, jnp.zeros((), total.dtype))
 
 
 def _portable_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,

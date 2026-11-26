@@ -16,7 +16,6 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew.algebra import bits
-from dew.nn.float_bits import exact_power2
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32, power2
@@ -248,21 +247,10 @@ class MxFp8:
         per = formats_of.MXFP8.depth
         blocks = x.reshape(*x.shape[:-1], x.shape[-1] // per, per)
         largest = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
-        # The largest magnitude is a fraction in [1/2, 1) times 2 to `binade`: its exponent is `binade` - 1.
-        binade = jnp.frexp(largest)[1]
-        top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
-        scale = formats_of.MXFP8.scale
-        bias = -jnp.finfo(scale).minexp
-        # A block holding an infinity or a NaN takes the NaN scale (`0xFF`), its codes at a unit scale, as
-        # the GEMM epilogue's quantizer takes it (`quantized._mxfp8_quantize_epilogue`; row 13164).
-        finite = jnp.isfinite(largest)
-        exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
-        exponent = jnp.where(finite, exponent, 0)
-        # The power its scale is, set in E8M0's bits by the one owner of an exact power (`exact_power2`: every
-        # biased exponent a power, none a zero; its byte the exponent plus 127, which its int8 sum wraps to
-        # past 127 and its bitcast reads back; row 8832).
-        scales = jnp.where(finite, exact_power2(exponent, scale),
-                           jax.lax.bitcast_convert_type(jnp.uint8(0xFF), scale))
+        # Its scale's exponent and E8M0 byte from the largest magnitude's own bits (`mxfp8_scale_bytes`, the
+        # GEMM epilogue's quantizer's too; row 13249).
+        exponent, stored = mxfp8_scale_bytes(largest)
+        scales = jax.lax.bitcast_convert_type(stored.astype(jnp.uint8), formats_of.MXFP8.scale)
         # Each value over its scale as its exponent (`precision.power2`, the one owner of scaling by a power
         # of two; row 8971), as `decoded` applies it: the least scale, a block of zeros' or of magnitudes
         # under 2^-118, is float32's subnormal 2^-127, which a program that flushes subnormals (XLA's CPU, op
@@ -291,6 +279,24 @@ def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
     for `0xFF`, `2^-127` for `0x00`) plus the boolean mask of `0x00` subnormal blocks (row 9040)."""
     held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.uint32)
     return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
+
+def mxfp8_scale_bytes(largest: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A 32-value block's MXFP8 scale from its largest magnitude `largest` (float32's, or a float64 truth's),
+    read from its own exponent field (`float_bits.raw_fields`): the exponent its codes are scaled by (int32,
+    the magnitude's binade less E4M3's largest's 8, clipped to E8M0's -127 to 127: a zero's or a subnormal's
+    -127) and its stored E8M0 byte (uint32, the exponent plus 127); a block whose largest is an infinity or a
+    NaN (the field all ones) its codes at a unit scale (0) and its byte the NaN scale `0xFF` (row 13164).
+    Integer arithmetic on the bits alone: the one mapping `MxFp8.quantized` and the GEMM's quantizing
+    epilogue (`quantized._mxfp8_quantize_epilogue`, in a kernel) share (row 13249)."""
+    from dew.nn.float_bits import raw_fields
+
+    limits = jnp.finfo(largest.dtype)
+    biased = raw_fields(largest)[2].astype(jnp.int32)
+    finite = biased != (1 << limits.nexp) - 1
+    top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
+    exponent = jnp.where(finite, jnp.clip(biased - (limits.maxexp - 1) - top, -127, 127), 0)
+    return exponent, jnp.where(finite, exponent + 127, 0xFF).astype(jnp.uint32)
+
 
 def e8m0_exponents(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
     """E8M0 `scales` as their powers' exponents (int32: a byte less 127, `0x00`'s -127 too) and the mask of
