@@ -37,7 +37,7 @@ import json
 import math
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Self
@@ -1358,7 +1358,8 @@ def _layer_seam(model, env, draws, *, layers: list | None, loop: Loop | None) ->
     after. Under `layers`, each call traced as a program of its own over its tensor arguments
     (`dew.nn.nested.nested`), each program `layers` takes: what `_accumulating` recomputes in a step's
     backward (`TorchCausalLM.remat`); a layer that draws (its dropout) is refused, as its program would hold
-    the draw's key, which torchax carries past it. Under `loop`, the block `loop.layers` runs `loop.steps`
+    the draw's key, which torchax carries past it (its key moved, whatever dispatch drew). Under `loop`,
+    the block `loop.layers` runs `loop.steps`
     times: past its last layer's first call, its later passes, each layer called with the arguments its own
     first pass took (the call's masks and rotary tables, which differ by layer kind), its hidden input the
     pass before's output, the decoder's `norm` between passes under `step_norm`, each pass's attention
@@ -1385,7 +1386,7 @@ def _layer_seam(model, env, draws, *, layers: list | None, loop: Loop | None) ->
     def state_of(output):
         return output if isinstance(output, torch.Tensor) else output[0]
 
-    def traced_apart(forward, args, kwargs):
+    def traced_apart(forward, args, kwargs, programs: list):
         leaves, structure = _pytree.tree_flatten((args, kwargs))
         tensors = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
 
@@ -1395,14 +1396,16 @@ def _layer_seam(model, env, draws, *, layers: list | None, loop: Loop | None) ->
                 given[index] = env.j2t_iso(value)
             args, kwargs = _pytree.tree_unflatten(given, structure)
             return env.t2j_iso(forward(*args, **kwargs))
-        drawn = draws.device
-        out = nested(run, traced=layers.append)(*(env.t2j_iso(leaves[index]) for index in tensors))
-        if draws.device != drawn:
+        # A draw inside advances torchax's key (`env.param.prng`), which would carry the program's key past
+        # it, through whatever torch dispatch reached the draw.
+        key = env.prng_key
+        out = nested(run, traced=programs.append)(*(env.t2j_iso(leaves[index]) for index in tensors))
+        if env.prng_key is not key:
             raise ValueError("tier 3 recomputes each decoder layer from its inputs, and this source's layers "
                              "draw (dropout): set its rates to 0, or train it unrecomputed")
         return env.j2t_iso(out)
 
-    def replayed(output):
+    def replayed(output, loop: Loop):
         replaying.append(True)
         try:
             for step in range(1, loop.steps):
@@ -1427,8 +1430,13 @@ def _layer_seam(model, env, draws, *, layers: list | None, loop: Loop | None) ->
             looping = loop is not None and first <= index < end and not replaying
             if looping:
                 captured[index] = (args, kwargs)
-            output = forward(*args, **kwargs) if layers is None else traced_apart(forward, args, kwargs)
-            return replayed(output) if looping and index == end - 1 else output
+            if layers is None:
+                output = forward(*args, **kwargs)
+            else:
+                output = traced_apart(forward, args, kwargs, layers)
+            if loop is not None and looping and index == end - 1:
+                return replayed(output, loop)
+            return output
         return call
 
     own = {index: vars(layer).get('forward') for index, layer in enumerate(stack)}
@@ -1539,13 +1547,41 @@ class TorchCausalLM(nn.Module):
     layers before and after it once, every pass reading the call's positions and masks, the decoder's
     final norm (its `norm`) between passes under `step_norm` (`_layer_seam`). A tier-3 source holds no
     exit gate, cross-pass messages or θ rows Dew would draw, so a loop stating any is refused as it runs
-    (`runnable_loop`), as is a cached call (its cache keeps one entry a layer). Set by construction: the
-    model offers no reconfiguration of its loop (`Looping`), whose run-config path would redraw it."""
+    (`runnable_loop`), as is a cached call (its cache keeps one entry a layer); a run sets it through
+    `Looping` (`with_loop`, `with_passes`), which declares no parameter the source lacks."""
+
+    @property
+    def exiting(self) -> bool:
+        return False
 
     @nn.nowrap
     def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
         """None of its passes exits (`loop` states no gate): no states, no logits."""
         return ExitPasses((), (), ())
+
+    @nn.nowrap
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None,
+                    implicit: bool | None = None, exit_gate: bool | None = None,
+                    exit_threshold: float | None = None, exits: bool | None = None,
+                    theta_passes: int | None = None, messages=None) -> Self | None:
+        """The source at `steps` passes of its block `layers` (`Looping.with_passes`), None where the loop
+        asks what a tier-3 source cannot run (`runnable_loop`) or states no steps it has none of. Its
+        parameters are the source's own: a run's loop (`DecoderRunConfig.looped`) keeps them, drawing none
+        (`Pretrained.with_model`)."""
+        if any(value not in (None, False) for value in (backprop_steps, remat, implicit, exit_gate,
+                                                         exit_threshold, exits, theta_passes, messages)):
+            return None
+        if self.loop is None and steps is None:
+            return None
+        held = self.loop or Loop(steps=steps)
+        return self.with_loop(replace(held, steps=held.steps if steps is None else steps,
+                                      layers=held.layers if layers is None else layers))
+
+    @nn.nowrap
+    def with_loop(self, loop: Loop) -> Self:
+        """The source running `loop` whole (`runnable_loop`'s refusals)."""
+        return self.clone(loop=runnable_loop(loop))
 
     @nn.nowrap
     def recompute_record(self) -> JSON:

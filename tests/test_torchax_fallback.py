@@ -1775,8 +1775,8 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
     """A source taken to tier 3 looping a block of its layers (`TorchCausalLM.loop`, no step norm): its logits
     over drawn ids hold check 1 against transformers' own decoder of those layers repeated in `order`, each
     the source's, its float64 twin the truth; each repeated layer reads its own masks and rotary tables (a
-    Gemma 3 block of a sliding and a full layer). A loop stating an exit gate runs nowhere, and a looped
-    model opens no decode cache."""
+    Gemma 3 block of a sliding and a full layer). A run sets the loop as a run's loop does
+    (`Pretrained.with_model`), the source's parameters its own; a loop stating an exit gate runs nowhere."""
     config = LLAMA if family == "llama" else GEMMA3
     torch.manual_seed(0)
     model = transformers.AutoModelForCausalLM.from_config(
@@ -1784,12 +1784,14 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
     model.save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert isinstance(loaded, PretrainedFallback)
-    looped = loaded.model.clone(loop=loop)
+    # A run's loop (`DecoderRunConfig.looped`): the source's own parameters, none drawn.
+    held = loaded.with_model(loaded.model.with_loop(loop), key=0)
+    looped = held.model
+    assert held.variables is loaded.variables and not held.fresh
     draw = token_draw(0x13046, config["vocab_size"], (2, 12))
     with pytest.raises(ValueError):
         loaded.model.clone(loop=dataclasses.replace(loop, exit_gate=True)).apply(loaded.variables, *draw(0))
-    with pytest.raises(Lacks):
-        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+    assert loaded.model.with_passes(loop.steps, loop.layers, exit_gate=True) is None
     forward = jax.jit(looped.apply)
     state = model.state_dict()
 
@@ -1818,3 +1820,27 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     theirs(repeated(torch.float32)), draw, f"looped tier 3 {family} logits", seeds=8,
                     truth_fn=theirs(wide, float64))
+
+
+def test_a_looped_source_on_dews_attention_opens_no_cache_and_weighs_no_passes(tmp_path):
+    """An unregistered source on Dew's attention (`dew_attention`), whose cache opens unlooped, opens none
+    looped: its
+    block runs once a pass, a cache keeping one entry a layer. Its loop exits no pass but its last, so a
+    loss weighing each pass's exit is refused as it is built, where a native looped decoder's is taken."""
+    from test_pass_weights import looped as native_looped
+
+    from dew.objectives.lm import LMObjective
+
+    saved_cohere(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert isinstance(loaded, PretrainedFallback) and loaded.model.graph.dew_attention
+    loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+    looped = loaded.model.with_loop(Loop(steps=2, layers=(0, 1)))
+    with pytest.raises(Lacks):
+        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+    with pytest.raises(Lacks):
+        looped.apply(loaded.variables, np.zeros((2, 1), np.int32), decode=True, mutable=["cache"])
+    with pytest.raises(ValueError):
+        LMObjective(dataclasses.replace(loaded, model=looped), SEQ, pass_weights="mean")
+    LMObjective(native_looped(), 16, pass_weights="mean")
