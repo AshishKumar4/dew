@@ -125,7 +125,7 @@ def test_stated_output_staging_narrows_with_a_chained_replay_and_stays_off_syrk_
 
         ce, bf16 = linear_ce.MOSAIC_LINEAR_CE, functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         ba = ce.bind(bf16((128, 128)), bf16((256, 128)), jax.ShapeDtypeStruct((128,), jnp.int32), None,
-                     transpose_rhs=True, softcap=None, interpret=False)
+                     transpose_rhs=True, interpret=False)
         derived = ce.derived(ba, target)
         assert derived is not None and ce.legal(ba, derived, target)
         staged = dataclasses.replace(derived, staging=(derived.block_n, 1))
