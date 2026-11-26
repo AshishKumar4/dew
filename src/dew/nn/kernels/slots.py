@@ -61,7 +61,7 @@ def log_normalizer(normalizer: tuple[jax.Array, jax.Array]) -> jax.Array:
 def _mass(a: tuple, b: tuple) -> tuple:
     """Two prefixes' writes combined, each `(largest, log mass relative to it)`: the larger largest and the
     log of both masses relative to it (`jnp.logaddexp`'s `log1p`, its increment kept); both absent (`-inf`),
-    `(-inf, 0)`, a constant with no derivative into either."""
+    `(-inf, 0)`, each leaf a constant with no derivative into either."""
     (top_a, mass_a), (top_b, mass_b) = a, b
     top = jnp.maximum(top_a, top_b)
     started = top > -jnp.inf
@@ -73,7 +73,8 @@ def _mass(a: tuple, b: tuple) -> tuple:
 
     ends = (relative(top_a, mass_a), relative(top_b, mass_b))
     summed = jnp.logaddexp(*(jnp.where(started, end, 0.0) for end in ends))
-    return top, jnp.where(started, summed, 0.0)
+    # Both absent, each leaf a constant: `maximum`'s own derivative splits between two absent writes.
+    return jnp.where(started, top, -jnp.inf), jnp.where(started, summed, 0.0)
 
 
 def lightnet(query: jax.Array, key: jax.Array, value: jax.Array, *, scale: float | None = None,

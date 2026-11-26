@@ -212,14 +212,15 @@ def test_a_call_of_no_tokens_returns_its_entering_states():
 
 def test_the_additive_gate_takes_an_unseeded_absent_write_with_no_gradient():
     """An absent write (`-inf`) with no normalizer entering: the normalizer stays none, the write weighs
-    zero, and the normalizer's gradient into it is zero (a both-absent combine a constant, not the larger of
-    its two)."""
+    zero, and each of the normalizer's leaves' gradient into it is zero (a both-absent combine a constant
+    in both leaves: `maximum`'s derivative sent half to each absent write, a review's P0 of b29675646)."""
     x = jnp.full((1, 2, 1), -jnp.inf, jnp.float32)
     weights, log_decay, last = slots.additive_gate(x)
     assert np.all(np.asarray(weights) == 0.0) and np.all(np.asarray(log_decay) == 0.0)
     assert _equal(last, tuple(jnp.full((1, 1), part) for part in NONE))
-    d_x = jax.grad(lambda x: slots.additive_gate(x)[2][1].sum())(x)
-    assert np.all(np.asarray(d_x) == 0.0)
+    for leaf in range(2):
+        d_x = jax.grad(lambda x, leaf=leaf: slots.additive_gate(x)[2][leaf].sum())(x)
+        assert np.all(np.asarray(d_x) == 0.0), leaf
 
 
 def test_the_additive_gate_keeps_a_faint_increment():
