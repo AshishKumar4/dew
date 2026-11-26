@@ -1,4 +1,4 @@
-"""Printable attention backward, recurrence and precision components, held off the runtime path."""
+"""Printable attention, recurrence and precision components, held off the runtime path."""
 
 from __future__ import annotations
 
@@ -10,8 +10,11 @@ import numpy as np
 
 from dew.algebra.generate import Cases, ComponentForm, declare
 from dew.nn import precision
+from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
+from dew.nn.kernels.templates import attention_algebra
 from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents, derived_from_weights
+from dew.nn.kernels.templates.operands import Parts
 
 
 def _arrays(seed, operands):
@@ -111,6 +114,117 @@ def _tangent_truth(x, dx, value):
     return dx
 
 
+def _online_step(acc, peak, total, logits, values):
+    rows, keys = logits.shape
+    spec = attention_algebra.Forward("full", keys, ids=False, scale=0.5, natural=False)
+    coords = attention_algebra.Coords(jnp.arange(rows)[:, None], jnp.arange(keys)[None, :])
+    operand = attention_algebra.Operand(values.shape, values.dtype, lambda: values)
+
+    def dot(a, b):
+        return jnp.matmul(a, b, precision=precision.EXACT_FLOAT32)
+
+    state = attention_algebra.plain_step(spec, attention_algebra.Partial(acc, peak, total),
+                                         attention_algebra.Keys(coords, logits, operand, dot))
+    return state.acc, state.m, state.total
+
+
+def _online_truth(acc, peak, total, logits, values):
+    maximum = jnp.maximum(peak, logits.max(axis=1))
+    old = jnp.exp2(peak - maximum)
+    weights = jnp.exp2(logits - maximum[:, None])
+    return old[:, None] * acc + weights @ values, maximum, old * total + weights.sum(axis=1)
+
+
+def _split_kv_merge(left, left_peak, left_total, right, right_peak, right_total):
+    spec = attention_algebra.Forward("full", 2, ids=False, scale=0.5, natural=False)
+    state = attention_algebra.merge(spec, attention_algebra.Partial(left, left_peak, left_total),
+                                    attention_algebra.Partial(right, right_peak, right_total))
+    return state.acc, state.m, state.total
+
+
+def _split_kv_truth(left, left_peak, left_total, right, right_peak, right_total):
+    floor = np.finfo(np.float32).min
+    left_peak, right_peak = jnp.maximum(left_peak, floor), jnp.maximum(right_peak, floor)
+    maximum = jnp.maximum(left_peak, right_peak)
+    a, b = jnp.exp2(left_peak - maximum), jnp.exp2(right_peak - maximum)
+    return a[:, None] * left + b[:, None] * right, maximum, a * left_total + b * right_total
+
+
+def _initial_draw(seed, operands):
+    initial, peak, mass, logits, values = _arrays(seed, operands)
+    mass = np.abs(mass) + 1
+    # A wholly masked tile keeps the live state, and a fresh row can take a new maximum.
+    logits[0] = -np.inf
+    initial[1], peak[1], mass[1] = 0, np.finfo(peak.dtype).min, 0
+    if seed % 2:
+        logits[2] += 12
+    return initial, peak, mass, logits, values
+
+
+def _split_kv_draw(seed, operands):
+    left, left_peak, left_total, right, right_peak, right_total = _arrays(seed, operands)
+    left_total, right_total = np.abs(left_total) + 1, np.abs(right_total) + 1
+    # One empty slice on either side and an empty join. At large anchors the maxima must
+    # remain separate from the masses; a scalar log-sum-exp would lose their ratio.
+    empty = -np.inf if seed % 2 else np.finfo(left_peak.dtype).min
+    left[0], left_peak[0], left_total[0] = 0, empty, 0
+    right[1], right_peak[1], right_total[1] = 0, empty, 0
+    left[2], left_peak[2], left_total[2] = 0, empty, 0
+    right[2], right_peak[2], right_total[2] = 0, empty, 0
+    left_peak[3], right_peak[3] = 2 ** 30, 2 ** 30
+    return left, left_peak, left_total, right, right_peak, right_total
+
+
+def _carry_product(name, left, right):
+    del name
+    left, right = (x.value() if isinstance(x, Parts) else x for x in (left, right))
+    return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION)
+
+
+def _chunk_carry(state, keys, values, weights, kept):
+    corrected = recurrence_algebra.corrected(values, lambda _: weights, [state], keys.dtype, _carry_product)
+    (leaving,) = recurrence_algebra.carried([state], lambda _: keys, corrected, [kept], keys.dtype,
+                                           _carry_product)
+    return leaving, corrected
+
+
+def _chunk_carry_truth(state, keys, values, weights, kept):
+    corrected = values - weights @ state
+    return kept * state + keys.T @ corrected, corrected
+
+
+def _chunk_pullback(grad, keys, weights, queries, out_grad, local, kept):
+    key_tile, weight_tile, query_tile = (Parts((a,), a.dtype) for a in (keys, weights, queries))
+    (entered,), corrected = recurrence_algebra.key_reverse_carried(
+        [grad], lambda _: key_tile, lambda _: weight_tile, lambda _: query_tile,
+        Parts((out_grad,), out_grad.dtype), local, [kept], keys.dtype, _carry_product)
+    return entered, corrected
+
+
+def _chunk_pullback_truth(grad, keys, weights, queries, out_grad, local, kept):
+    corrected = keys @ grad + local
+    return kept * grad + queries.T @ out_grad - weights.T @ corrected, corrected
+
+
+def _chunk_inputs(seed, operands):
+    state, keys, values, weights, kept = _arrays(seed, operands)
+    kept[:] = 2.0 ** -np.abs(np.round(kept))
+    # Padding supplies no write or correction. A huge surviving memory needs its own decay.
+    keys[0], values[0], weights[0] = 0, 0, 0
+    if seed % 2:
+        state[0], weights[:, 0], kept[0] = 2.0 ** 127, 0, 2.0 ** -126
+    return state, keys, values, weights, kept
+
+
+def _chunk_pullback_inputs(seed, operands):
+    grad, keys, weights, queries, out_grad, local, kept = _arrays(seed, operands)
+    kept[:] = 2.0 ** -np.abs(np.round(kept))
+    keys[0], weights[0], queries[0], out_grad[0], local[0] = 0, 0, 0, 0, 0
+    if seed % 2:
+        grad[0], keys[:, 0], kept[0] = 2.0 ** 127, 0, 2.0 ** -126
+    return grad, keys, weights, queries, out_grad, local, kept
+
+
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 ROUNDED = declare(__name__, "rounded", ComponentForm(
@@ -127,3 +241,18 @@ QUERIES_COTANGENT = declare(__name__, "queries_cotangent", ComponentForm(
     _queries_cotangent, _queries_truth,
     _backward_cases(((32, 64), (32, 64), (32,), (32,), (32,), (32,), (32, 64), (32, 64)),
                     mask_count=2, total_at=3, accurate=True)))
+ONLINE_STEP = declare(__name__, "online_softmax_step", ComponentForm(
+    _online_step, _online_truth, dataclasses.replace(
+        _cases(*[((q, d), (q,), (q,), (q, k), (k, d)) for q, k, d in ((32, 64, 64), (64, 64, 128))]),
+        draw=_initial_draw)))
+SPLIT_KV_MERGE = declare(__name__, "split_kv_merge", ComponentForm(
+    _split_kv_merge, _split_kv_truth, dataclasses.replace(
+        _cases(*[((q, d), (q,), (q,)) * 2 for q, d in ((32, 64), (64, 128))]), draw=_split_kv_draw)))
+CHUNK_CARRY = declare(__name__, "chunk_carry", ComponentForm(
+    _chunk_carry, _chunk_carry_truth, dataclasses.replace(
+        _cases(*[((k, v), (c, k), (c, v), (c, k), (k, 1)) for c, k, v in ((16, 32, 32), (64, 64, 32))]),
+        draw=_chunk_inputs)))
+CHUNK_PULLBACK = declare(__name__, "chunk_pullback", ComponentForm(
+    _chunk_pullback, _chunk_pullback_truth, dataclasses.replace(
+        _cases(*[((k, v), (c, k), (c, k), (c, k), (c, v), (c, v), (k, 1))
+                 for c, k, v in ((16, 32, 32), (64, 64, 32))]), draw=_chunk_pullback_inputs)))

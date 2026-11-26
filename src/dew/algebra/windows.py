@@ -19,7 +19,7 @@ from jax.sharding import PartitionSpec
 from dew.algebra import scaled
 from dew.algebra.scaled import Scaled
 from dew.nn.float_bits import exact_power2
-from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide, power2, two_product, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,6 +62,12 @@ other factors'), and a sum's beneath its largest."""
 
 
 
+def _units_scale(units: Units, dtype) -> tuple[float, int]:
+    """A static scale as an ordinary factor and a power of two applied to its operand first."""
+    magnitude = abs(units.scale)
+    return math.frexp(units.scale) if 0 < magnitude < jnp.finfo(dtype).tiny else (units.scale, 0)
+
+
 def _factors_value(anchors: jax.Array, joined: jax.Array, *, units: Units):
     """Each state's factor from its anchor to `joined` (the largest, kept on its axis) in `units`, a scaled
     value aligned once: its base-2 exponent's nearest integer the value's power of two and its remainder, in
@@ -71,20 +77,24 @@ def _factors_value(anchors: jax.Array, joined: jax.Array, *, units: Units):
     `2^-120`: -256), are taken at half each, exact, their scaled difference doubled after: the same bits
     wherever the difference is finite, a power of two moving no rounding (the base review's F2: merged to 0
     where float64's merge is 1629.34)."""
+    dtype = at_least_fp32(anchors.dtype)
+    anchors, joined = anchors.astype(dtype), joined.astype(dtype)
+    scale, shift = _units_scale(units, dtype)
+    if shift:
+        anchors, joined = power2(anchors, shift), power2(joined, shift)
     spilled = jnp.isinf(anchors - joined)
     half, twice = (jnp.where(spilled, np.asarray(power, anchors.dtype), np.asarray(1, anchors.dtype))
                    for power in (0.5, 2.0))
     if units.compensated:
         difference, error = two_sum(anchors * half, -(joined * half))
-        if units.scale != 1.0:
-            difference, rounding = two_product(difference, np.asarray(units.scale, anchors.dtype),
-                                               bit_split=anchors.dtype == jnp.float32)
-            error = rounding + error * units.scale
+        if scale != 1.0:
+            difference, rounding = two_product(difference, np.asarray(scale, dtype),
+                                               bit_split=dtype == jnp.float32)
+            error = rounding + error * scale
         high, low = scaled.base2(difference * twice)
         low = low + (error * twice) * math.log2(math.e)
     else:
-        high = (anchors * half - joined * half) * np.asarray(units.scale * math.log2(math.e),
-                                                             anchors.dtype) * twice
+        high = (anchors * half - joined * half) * np.asarray(scale * math.log2(math.e), dtype) * twice
         low = jnp.zeros_like(high)
     held = high > FLOOR
     # A factor past 2^CEILING is NaN (`CEILING`), its exponent held within the factor's reach meanwhile.
@@ -115,10 +125,13 @@ def _factor_values(operands, units: Units, rank: int) -> Callable[[tuple], Scale
 
     def value(factor: tuple) -> Scaled:
         if factor not in held:
-            if factor[0] == "v":
+            if factor[0] in ("v", "m"):
                 held[factor] = scaled.scaled(_laid_to(operands[factor[1]], rank))
             elif factor[0] == "s":
-                held[factor] = scaled.scaled(jnp.asarray(units.scale, operands[0].dtype))
+                dtype = at_least_fp32(operands[0].dtype)
+                scale, shift = _units_scale(units, dtype)
+                held[factor] = (Scaled(jnp.asarray(2 * scale, dtype), jnp.asarray(shift - 1, jnp.int32),
+                                       1 - shift) if shift else scaled.scaled(jnp.asarray(scale, dtype)))
             else:
                 significand, power2 = _factors_value(_laid_to(operands[factor[1]], rank),
                                                      _laid_to(operands[factor[2]], rank), units=units)
@@ -445,7 +458,7 @@ def _streamed(load, chunks: int, sums: list[_Sum], units: Units):
     loads) and a kernel's (its own loads of its refs) alike, a chunk's factors formed once for all its sums
     (`_factor_values`)."""
     operands, valid0 = load(0)
-    dtype = operands[0].dtype
+    dtype = at_least_fp32(operands[0].dtype)
     rank = max(operand.ndim for operand in operands)
 
     if chunks == 1:
