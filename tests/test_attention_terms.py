@@ -189,6 +189,26 @@ def test_a_giant_heads_tiny_gain_keeps_its_representable_derivative():
     np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
 
 
+@pytest.mark.parametrize(("width", "head", "threshold", "seed", "expected"), [
+    (8, {0: 2.0 ** 127}, 2.0 ** 126, {1: 2.0 ** -100}, {1: 2.0 ** -101}),
+    (32, dict.fromkeys(range(16), 2.0 ** 62), 2.0 ** 63, {16: 2.0 ** 65}, {16: 2.0 ** 64}),
+], ids=["half-gain-small-seed", "half-gain-large-seed"])
+def test_a_giant_heads_normal_gain_scales_its_seeds_whole(width, head, threshold, seed, expected):
+    """A giant head clipped to half its length moves a seed across it (a tangent forward, a cotangent back)
+    by half, bit for bit, at either end of the range: `2^-100` to `2^-101`, `2^65` to `2^64`, where the
+    gain applied in factors lost the first to a subnormal and overflowed the second (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seeded, wanted = (np.zeros(width, np.float32) for _ in range(3))
+    for held, values in ((x, head), (seeded, seed), (wanted, expected)):
+        for at, value in values.items():
+            held[at] = value
+    _, moved = jax.jvp(lambda x: clipped(x, threshold, 1e-6), (jnp.asarray(x),), (jnp.asarray(seeded),))
+    np.testing.assert_array_equal(np.asarray(moved), wanted)
+    _, pull = jax.vjp(lambda x: clipped(x, threshold, 1e-6), jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seeded))[0]), wanted)
+
+
 def test_an_ordinary_heads_clip_differentiates_as_its_formula():
     """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
     tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped
