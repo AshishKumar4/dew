@@ -2160,7 +2160,10 @@ def _branch_first_walk(x, w, *, family, interpret):
             multiplied = _multiplying(family, 'x', 'w', interpret)
 
             def step(index, slots, carry, accumulators):
-                pl.when(index == 0)(lambda: slots['w'])
+                @pl.when(index == 0)
+                def _():
+                    slots['w']
+
                 return multiplied(index, slots, carry, accumulators)
 
             views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
