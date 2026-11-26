@@ -512,6 +512,14 @@ class BlockSparseAttentionMixer(AttentionMixer):
         return ("block-selected attention reads each query's blocks as key runs, which a mixed serving step "
                 "lays none of")
 
+    def generation_refusal(self) -> str | None:
+        # InfLLM-V2's and MSA's selections read a row of one document's own tokens, uncached (`_infllm`,
+        # `_msa`): a generation step's cache they refuse.
+        if self.selection != "moba":
+            return (f"block_sparse_attention's {self.selection} selection reads a row's own tokens, "
+                    "uncached, where generation reads a cache")
+        return None
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:
             raise ValueError("block_sparse_attention requires causal=True: a query selects the blocks before "
@@ -519,9 +527,6 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if self.selection == "infllm" and self.block % INFLLM_STRIDE:
             raise ValueError(f"InfLLM-V2's selection pools keys every {INFLLM_STRIDE} places into whole "
                              f"blocks, so takes a block of them, got {self.block}")
-        if self.selection == "msa" and self.top_k < 2:
-            raise ValueError(f"MSA's selection counts its own block among its top_k, so takes 2 or more, got "
-                             f"{self.top_k}")
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")

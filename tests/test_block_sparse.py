@@ -498,6 +498,43 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
         np.testing.assert_array_equal(np.asarray(leaf), 0.0)
 
 
+def test_an_msa_decoder_of_a_top_of_one_attends_its_own_block_alone():
+    """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): each
+    query reads its own block alone, as the selection forces it (`msa_selection`), so its logits are the same
+    model's under MoBA's selection at a top of one, which reads its own block alone too, its index branch's
+    parameters apart."""
+    msa = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8),
+               dtype="float32")
+    moba = tiny(mixer=mixers.build("block_sparse_attention", block=4, top_k=1), dtype="float32")
+    tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
+    params = msa.init(jax.random.key(1), tokens)
+    shared = moba.init(jax.random.key(1), tokens)
+    shared = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: _at(params, path) if _at(params, path) is not None else leaf, shared)
+    np.testing.assert_allclose(np.asarray(msa.apply(params, tokens)), np.asarray(moba.apply(shared, tokens)),
+                               rtol=1e-5, atol=1e-5)
+
+
+def _at(tree, path):
+    """`tree`'s leaf at `path`, or None where it holds none there."""
+    for key in path:
+        name = getattr(key, "key", getattr(key, "idx", None))
+        if not isinstance(tree, dict) or name not in tree:
+            return None
+        tree = tree[name]
+    return tree
+
+
+@pytest.mark.parametrize(("selection", "refused"), [("moba", False), ("infllm", True), ("msa", True)])
+def test_generation_admits_a_block_sparse_decoder_whose_selection_reads_a_cache(selection, refused):
+    """Generation admits a decoder of block-selected attention whose selection reads a cache, MoBA's
+    (`generation_refusal` None), and refuses InfLLM-V2's and MSA's, which read a row's own tokens uncached
+    (row 13530)."""
+    model = tiny(mixer=mixers.build("block_sparse_attention", selection=selection, block=16, top_k=2),
+                 dtype="float32")
+    assert (model.generation_refusal() is not None) == refused
+
+
 def test_a_cached_generation_selects_the_blocks_its_full_forward_selects():
     """A decoder of block-selected attention (`block_sparse_attention`, MoBA's) at blocks of two places, a
     query's own and one earlier: a left-padded batch drawn through the cache, each step selecting over the
