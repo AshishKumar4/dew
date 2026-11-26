@@ -3,8 +3,10 @@ to whole blocks and chunks (`prepared`), its launches in turn (`templates.recurr
 inverse and the weighted keys and values, the states, then the output), and the values its fast backward
 reads kept (`kept_forward`)."""
 
+import contextlib
+import contextvars
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +18,7 @@ from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.intra import _intra, _prefix
 from dew.nn.kernels.templates.recurrence.mainloop import (
+    PLANNED,
     Call,
     Operand,
     Tiles,
@@ -31,6 +34,27 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table, turning_rows
+
+_OBSERVED: contextvars.ContextVar[list[Call] | None] = contextvars.ContextVar(
+    "recurrence_observed_calls", default=None)
+"""Dispatched `Call` records collected by `observed()` outside tile planning (`PLANNED`)."""
+
+
+@contextlib.contextmanager
+def observed() -> Iterator[list[Call]]:
+    """Collect each dispatched `Call` constructed by `prepared()` outside tile planning (`PLANNED`)."""
+    calls: list[Call] = []
+    token = _OBSERVED.set(calls)
+    try:
+        yield calls
+    finally:
+        _OBSERVED.reset(token)
+
+
+def _record_observed(call: Call) -> None:
+    """Record `call` when an `observed()` block is active outside tile planning (`PLANNED`)."""
+    if (calls := _OBSERVED.get()) is not None and PLANNED.get() is None:
+        calls.append(call)
 
 
 def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int,
@@ -384,10 +408,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # `mainloop.issued`), so a CPU's run takes the launches a plan for it takes.
     target = generation.interpreted_target() if interpret else generation.gpu_target()
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, target, tiles.chunk, ranged=ranged, apart=apart,
-                values_gated=values_gated, unit_pairs=unit_pairs,
-                decay_bound=decay_bound, producers=tiles.producers,
+                interpret, target, tiles.chunk, ranged=ranged, apart=apart, values_gated=values_gated,
+                unit_pairs=unit_pairs, decay_bound=decay_bound, producers=tiles.producers,
                 residents=tiles.residents, alone=not keeps)
+    _record_observed(call)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
     landed = jnp.dtype(jnp.float32 if skipped and not call.gated_keys else out_dtype or dtype)

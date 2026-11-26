@@ -12,12 +12,13 @@ from typing import Any
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src import core as jax_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import swizzling
+from dew.nn.kernels.templates import axes, swizzling
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
 
@@ -116,18 +117,14 @@ def viewed(view: "Among | tuple", block: tuple, step):
         share = (block[0] // len(ref), *block[1:])
         return Pieces(viewed((each, index_map), share, step) for each in ref)
 
-    def at(indices, block):
-        return ref.at[tuple(pl.ds(index * extent, extent)
-                            for index, extent in zip(indices, block, strict=True))]
-
     if isinstance(indices, Paired):
         pair = tuple(extent * 2 if axis == indices.along else extent for axis, extent in enumerate(block))
-        return Split(at(indices.indices, pair), indices.along)
+        return Split(axes.blocked(ref, pair, indices.indices), indices.along)
     if isinstance(indices, Rows):
         run = (indices.rows, *block[1:])
-        return Pieces(at((indices.table[indices.start + each], *indices.rest), run)
+        return Pieces(axes.blocked(ref, run, (indices.table[indices.start + each], *indices.rest))
                       for each in range(block[0] // indices.rows))
-    return at(indices, block)
+    return axes.blocked(ref, block, indices)
 
 
 def held_together(rings: dict) -> list[dict]:
@@ -679,7 +676,13 @@ class Slots:
     sooner (a slot its last product has read). A stream the walk reads a step `ahead` the step reads through
     the next step's slot (`following`, where `more` steps follow in its range): its own slot was acquired by
     the step before it, or by itself where it is its range's `first` (`opened`), and it gives that slot
-    back as any other."""
+    back as any other.
+
+    A slot is held from a read in the step's own trace, which every read after it is within. One read first
+    in a trace inside it (a branch's, a loop body's) is acquired there and not held: its wait passes none of
+    the step's reads outside it, and its slot's index is a value of that trace alone, which a read past it
+    would carry out of its trace (an sm120 attention backward's branch did, and its kernel failed to lower,
+    row 13106). A read after it acquires again, and a wait again for the same turn returns at once."""
 
     def __init__(self, rings: dict[str, Ring], turn: Turn, ahead: tuple[str, ...] = (), *, more=False,
                  first=True):
@@ -689,16 +692,20 @@ class Slots:
         # Each stream's barrier pair's streams (`held_together`): one wait and one release a step for them.
         self._together = {name: tuple(group) for group in held_together(rings) for name in group}
         self._ahead, self.more, self.first = ahead, more, first
+        self._trace = jax_core.find_top_trace(())
 
     def __getitem__(self, name: str):
         if name in self._ahead:
             raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
                              "the range's first step reads its own (`opened`)")
-        if name not in self._held:
-            ring = self._rings[name]
-            awaited = any(other in self._held for other in self._together[name])
-            self._held[name] = ring.slot(self._turn) if awaited else ring.acquire(self._turn)
-        return self._held[name]
+        if name in self._held:
+            return self._held[name]
+        ring = self._rings[name]
+        awaited = any(other in self._held for other in self._together[name])
+        slot = ring.slot(self._turn) if awaited else ring.acquire(self._turn)
+        if jax_core.find_top_trace(()) is self._trace:
+            self._held[name] = slot
+        return slot
 
     def opened(self, name: str):
         """Stream `name`'s own slot where the walk reads it ahead and no step before this one did: the range's
@@ -737,11 +744,9 @@ class Slots:
         self.acquire_all()
 
     def acquire_all(self) -> None:
-        """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
-        loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
-        index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
-        step that reads its slots in a loop acquires them before it. A stream read ahead is not its own to
-        acquire."""
+        """Every slot the step has not read acquired in the step's own trace, so its reads inside a loop's
+        body (a rolled `lax.fori_loop`) or a branch take the step's slot: a read first made there acquires
+        within it, a wait each trip of the loop. A stream read ahead is not its own to acquire."""
         for name in self._rings:
             if name not in self._ahead:
                 self[name]

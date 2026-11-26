@@ -22,6 +22,8 @@ from dew.nn.dense import Dense
 from dew.nn.joined import joined_dense
 from dew.nn.kernels import generation
 from dew.nn.sharding import boxed, placing
+from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.trace import collective
 
 LAYOUT = Layout(min_shard=1)
 """The layout the cases' programs trace under: Dew's own, every leaf split however small (its least share
@@ -342,3 +344,77 @@ def test_a_batched_projection_runs_its_members_as_one_grouped_gemm():
         assert_as_exact(under("mosaic", run), under("xla", run), draw, "a batched projection's grouped GEMM",
                         seeds=8, truth_fn=truth)
     assert ("grouped_matmul", "mosaic") in {(route.choice, route.kernel) for route in routes}, routes
+
+
+@pytest.mark.parametrize("axis", ["data", "fsdp"])
+def test_a_mapped_stacks_weight_reductions_complete_per_layer(axis):
+    """A rematerialized stack of four bf16 Dense layers mapped per shard (`on_shards`, `mapped_shards`)
+    under the trainer's collective combiner (`dew.training.memory.COLLECTIVES`) on two compile-only H100s:
+    each layer's weight-gradient collective (`all-reduce` on `data`, `reduce-scatter` on `fsdp`) completes
+    before its input cotangent enters the layer below (`sharding.on_shards` tying them with
+    `formed_together`, row 12898): every layer above the first has a collective of its own, scheduled before
+    the layers below's products, where XLA's combiner had merged all four layers' unreduced weight gradients
+    into one collective at the step's end."""
+    from kernel_compile import _device
+
+    from dew.training.memory import COLLECTIVES
+
+    layers = 4
+    mesh = _device("sm90", ((axis, 2),))
+    x_shape = (2, 1024, 512)
+    w_shape = (512, 512)
+    with (jax.sharding.use_abstract_mesh(mesh.abstract_mesh), nn.logical_axis_rules(DEFAULT_RULES),
+          _declared()):
+        weight = _kernel("first", w_shape, jnp.bfloat16)
+
+    def loss(x, kernels):
+        def block(h, kernel):
+            return h + Dense(512, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
+                             kernel_axes=KERNEL_AXES, name="first").apply({"params": {"kernel": kernel}}, h)
+
+        for kernel in kernels:
+            x = jax.checkpoint(block)(x, kernel)
+        return jnp.sum(x.astype(jnp.float32))
+
+    x_spec = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16,
+                                  sharding=jax.sharding.NamedSharding(mesh, PartitionSpec(axis)))
+    w_spec = jax.ShapeDtypeStruct(w_shape, jnp.bfloat16,
+                                  sharding=jax.sharding.NamedSharding(mesh, weight))
+    kernels = (w_spec,) * layers
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), jax.set_mesh(mesh),
+          nn.logical_axis_rules(DEFAULT_RULES), placing(LAYOUT), _declared()):
+        step = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(x_spec, kernels).compile(
+            compiler_options=COLLECTIVES)
+    # The entry computation in its schedule's order, read from the compiled module's own schema: XLA expands
+    # the tie's barrier away, its ordering what remains of it. Each layer's weight gradient (the step's
+    # outputs after the input's) leads back to its collective, and that to the product it reduces.
+    from jax._src import hlo_reader
+
+    module = step.runtime_executable().hlo_modules()[0]
+    proto = hlo_reader.message_class("xla.HloModuleProto").FromString(module.as_serialized_hlo_module_proto())
+    entry = next(each for each in proto.computations if each.id == proto.entry_computation_id)
+    names = {each.id: each.name for each in entry.instructions}
+    opcodes = {each.name: each.opcode for each in entry.instructions}
+    operands = {each.name: [names[operand] for operand in each.operand_ids] for each in entry.instructions}
+    scheduled = proto.schedule.sequences[entry.id].instruction_ids
+    order = {names[each]: index for index, each in enumerate(scheduled)}
+    flops = {name: instruction.flops for name, instruction in hlo_instructions(step).items()}
+
+    def reaching(name: str, found) -> str:
+        frontier, seen = [name], set()
+        while frontier:
+            if (each := frontier.pop(0)) not in seen:
+                seen.add(each)
+                if found(each):
+                    return each
+                frontier.extend(operands[each])
+        raise AssertionError(f"nothing before {name} holds")
+
+    expected = "reduce-scatter" if any(weight) else "all-reduce"
+    reduced = [reaching(output, lambda each: collective(opcodes[each]) == expected
+                        and not opcodes[each].endswith("-start"))
+               for output in operands[names[entry.root_id]][1:]]
+    products = [reaching(operands[each][0], lambda each: bool(flops.get(each))) for each in reduced]
+    assert len(set(reduced)) == layers, reduced
+    assert all(order[reduced[layer]] < order[products[layer - 1]] for layer in range(1, layers)), (
+        [order[each] for each in reduced], [order[each] for each in products])

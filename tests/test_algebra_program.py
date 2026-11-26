@@ -2359,18 +2359,14 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
 
     import dew
 
-    # 1. `float0` tangent literals/avals from differentiating integer operands never crash `_extended_dtype`.
     grad_int = jax.grad(lambda x, i: (x * i).sum(), allow_int=True)
     f0_closed = jax.make_jaxpr(grad_int)(
         jax.ShapeDtypeStruct((4,), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32))
-    assert terms.body_key(f0_closed) is not None
-    assert terms.jaxpr_digest(f0_closed, in_process=True)[0]
-    rewritten_f0 = program._closed(f0_closed, accurate=False, saturation=algebra.SATURATION, kernels=True)
-    assert rewritten_f0 is not None
+    assert terms.body_key(f0_closed) is not None and terms.jaxpr_digest(f0_closed, in_process=True)[0]
+    assert program._closed(f0_closed, accurate=False, saturation=algebra.SATURATION, kernels=True) is not None
     got_g = dew.jit(grad_int)(jnp.ones((4,), jnp.float32), jnp.arange(4, dtype=jnp.int32))
-    np.testing.assert_array_equal(np.asarray(got_g), np.arange(4, dtype=np.float32))
+    np.testing.assert_array_equal(np.asarray(got_g), np.arange(4, dtype=jnp.float32))
 
-    # 2. Depth-30 shared nested-jit diamond DAG keys and compares in O(depth), never O(2**depth).
     def build_dag(offset: float):
         fn = jax.jit(lambda x: x + offset)
         for _ in range(30):
@@ -2384,7 +2380,6 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
     assert terms.jaxpr_digest(dag_a, in_process=True) == terms.jaxpr_digest(dag_b, in_process=True)
     assert terms.jaxpr_digest(dag_a, in_process=True) != terms.jaxpr_digest(dag_diff, in_process=True)
 
-    # 3. Equation-local `cur_abstract_mesh` isolates structural reuse in both cache orders.
     mesh_a = AbstractMesh((2,), ("data",), axis_types=(AxisType.Explicit,))
     mesh_b = AbstractMesh((4,), ("data",), axis_types=(AxisType.Explicit,))
     shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
@@ -2394,28 +2389,23 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
             normed = _bf16_rms(x, w)
             with jax.sharding.use_abstract_mesh(mesh):
                 return normed + jnp.asarray(1.0, normed.dtype)
-
         body.__name__ = name
         return jax.make_jaxpr(body)(*shapes)
 
     for first_mesh, second_mesh, tag in ((mesh_a, mesh_b, "ab"), (mesh_b, mesh_a, "ba")):
-        c_first = make_scoped_body(first_mesh, f"ctx_{tag}_1")
-        c_second = make_scoped_body(second_mesh, f"ctx_{tag}_2")
-        assert terms.body_key(c_first) != terms.body_key(c_second)
-        assert terms.jaxpr_digest(c_first) != terms.jaxpr_digest(c_second)
+        c1, c2 = make_scoped_body(first_mesh, f"ctx_{tag}_1"), make_scoped_body(second_mesh, f"ctx_{tag}_2")
+        assert terms.body_key(c1) != terms.body_key(c2) and terms.jaxpr_digest(c1) != terms.jaxpr_digest(c2)
         with generation.assumed("sm90"):
-            r_first = program._closed(c_first, accurate=False, saturation=algebra.SATURATION, kernels=True)
-            r_second = program._closed(c_second, accurate=False, saturation=algebra.SATURATION, kernels=True)
-        assert r_first.jaxpr.eqns[-1].ctx.cur_abstract_mesh == first_mesh
-        assert r_second.jaxpr.eqns[-1].ctx.cur_abstract_mesh == second_mesh
+            r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
+            r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
+        assert r1.jaxpr.eqns[-1].ctx.cur_abstract_mesh == first_mesh
+        assert r2.jaxpr.eqns[-1].ctx.cur_abstract_mesh == second_mesh
 
-    # 4. A concrete `jax.Array` held only in a scoped `ContextVar` is never pinned by `_STRUCTURAL_CLOSED`.
     scoped_var: contextvars.ContextVar = contextvars.ContextVar("test_scoped_device_array", default=None)
 
     def run_in_scope() -> weakref.ref:
         buf = jnp.ones((16, 16), jnp.float32)
-        ref = weakref.ref(buf)
-        token = scoped_var.set(buf)
+        ref, token = weakref.ref(buf), scoped_var.set(buf)
         try:
             traced = jax.make_jaxpr(lambda x: x + 1.0)(jax.ShapeDtypeStruct((4,), jnp.float32))
             program._closed(traced, accurate=False, saturation=algebra.SATURATION, kernels=True)
@@ -2429,11 +2419,9 @@ def test_body_key_handles_float0_dag_scaling_equation_context_and_scoped_array_g
 
 
 def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layouts():
-    """Executable callable dataclasses (factory-made AND same-class stateless `eq=False` distinguishing by
-    `self is first`) never reuse structurally in `_STRUCTURAL_CLOSED` and keep distinct in-process digests;
-    `_NormTrack` rejects both permuting reshapes and singleton-axis broadcast expansion."""
-    import dataclasses
-
+    """Executable callable dataclasses (factory-made, `eq=False`, cyclic `eq=False`, and frozen cyclic
+    `compare=False` in bare nested `jax.jit`) never hit `RecursionError` or cross-hit `_STRUCTURAL_CLOSED`;
+    `_NormTrack` rejects permuting reshapes, singleton expansion, and lossy `bf16->fp16` casts."""
     import dew
 
     def make_factory_callback(offset: float):
@@ -2441,7 +2429,6 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
         class OffsetCallback:
             def __call__(self, arr):
                 return arr + np.float32(offset)
-
         return OffsetCallback()
 
     @dataclasses.dataclass(frozen=True, eq=False)
@@ -2449,51 +2436,65 @@ def test_body_key_distinguishes_callable_dataclasses_and_norm_rejects_bad_layout
         def __call__(self, arr):
             return arr + np.float32(1.0 if self is id_first else 2.0)
 
+    @dataclasses.dataclass(eq=False)
+    class CyclicCallback:
+        offset: float
+        parent: object = None
+        def __call__(self, arr):
+            return arr + np.float32(self.offset)
+
+    @dataclasses.dataclass(frozen=True)
+    class FrozenCyclic:
+        offset: float
+        parent: list = dataclasses.field(default_factory=list, compare=False, repr=False)
+        def __call__(self, arr):
+            return arr + np.float32(self.offset)
+
     id_first, id_second = IdentityCallback(), IdentityCallback()
+    cyc1, cyc2 = CyclicCallback(1.0), CyclicCallback(2.0)
+    cyc1.parent, cyc2.parent = cyc1, cyc2
+    fc1, fc2 = FrozenCyclic(1.0), FrozenCyclic(2.0)
+    fc1.parent.append(fc1)
+    fc2.parent.append(fc2)
     rms_shapes = (jax.ShapeDtypeStruct((256, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
-    x_in = jnp.ones((256, 256), jnp.bfloat16)
-    w_in = jnp.ones((256,), jnp.bfloat16)
-
-    def make_body(cb):
-        def fn(x, w):
-            normed = _bf16_rms(x, w).astype(jnp.float32)
-            return jax.pure_callback(cb, jax.ShapeDtypeStruct(normed.shape, normed.dtype), normed)
-
-        return fn
-
-    for cb1, cb2 in ((make_factory_callback(1.0), make_factory_callback(2.0)), (id_first, id_second)):
-        f1, f2 = make_body(cb1), make_body(cb2)
+    x_in, w_in = jnp.ones((256, 256), jnp.bfloat16), jnp.ones((256,), jnp.bfloat16)
+    exp2, exp3 = np.full((256, 256), 2.0, np.float32), np.full((256, 256), 3.0, np.float32)
+    def make_body(cb, *, nested: bool = False, bare: bool = False):
+        inner = jax.jit(lambda y: jax.pure_callback(cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))
+        return lambda x, w: (lambda y: inner(y) if nested else jax.pure_callback(
+            cb, jax.ShapeDtypeStruct(y.shape, y.dtype), y))(
+            x.astype(jnp.float32) if bare else _bf16_rms(x, w).astype(jnp.float32))
+    cases = ((make_factory_callback(1.0), make_factory_callback(2.0), True, False, False),
+             (id_first, id_second, False, False, False), (cyc1, cyc2, False, True, False),
+             (fc1, fc2, False, True, True))
+    for cb1, cb2, shareable, is_nested, is_bare in cases:
+        f1, f2 = (make_body(cb, nested=is_nested, bare=is_bare) for cb in (cb1, cb2))
         c1, c2 = jax.make_jaxpr(f1)(*rms_shapes), jax.make_jaxpr(f2)(*rms_shapes)
         k1, k2 = terms.body_key(c1), terms.body_key(c2)
-        assert k1 is not None and k2 is not None and k1 != k2
+        assert (k1 is not None and k2 is not None and k1 != k2) if shareable else (k1 is None and k2 is None)
         assert terms.jaxpr_digest(c1, in_process=True) != terms.jaxpr_digest(c2, in_process=True)
+        assert shareable or terms.jaxpr_digest(c1) != terms.jaxpr_digest(c2)
         with generation.assumed("sm90"):
             r1 = program._closed(c1, accurate=False, saturation=algebra.SATURATION, kernels=True)
             r2 = program._closed(c2, accurate=False, saturation=algebra.SATURATION, kernels=True)
         assert r1.jaxpr != r2.jaxpr
-        y1, y2 = dew.jit(f1)(x_in, w_in), dew.jit(f2)(x_in, w_in)
-        np.testing.assert_array_equal(np.asarray(y1), np.full((256, 256), 2.0, np.float32))
-        np.testing.assert_array_equal(np.asarray(y2), np.full((256, 256), 3.0, np.float32))
-
-    # 2. A same-shape permuting reshape `(0, 2, 1, 3)` on a norm denominator proves no unit bound.
-    def swapped_norm(x):
-        denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
-        swapped = jax.lax.reshape(denom, (4, 2, 2, 1), dimensions=(0, 2, 1, 3))
-        return x * jax.lax.rsqrt(swapped)
-
-    closed_swap = jax.make_jaxpr(swapped_norm)(jax.ShapeDtypeStruct((4, 2, 2, 8), jnp.float32))
-    swap_out = closed_swap.jaxpr.outvars[0]
-    held_s, apart_s = terms.proven(closed_swap.jaxpr, targets=(swap_out,), deep=True)
-    assert held_s[swap_out] is None and not apart_s[swap_out].unit_norm
-
-    # 3. Normalizing a singleton `[4, 2, 2, 1]` numerator and expanding its reciprocal to `[4, 2, 2, 64]`
-    # produces 64 copies of a unit scalar (squared norm 64) and must NOT be certified as `unit_norm`.
-    def expanded_singleton_norm(x):
-        denom = jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)
-        inv = jax.lax.broadcast_in_dim(jax.lax.rsqrt(denom), (4, 2, 2, 64), (0, 1, 2, 3))
-        return x * inv
-
-    closed_exp = jax.make_jaxpr(expanded_singleton_norm)(jax.ShapeDtypeStruct((4, 2, 2, 1), jnp.float32))
-    exp_out = closed_exp.jaxpr.outvars[0]
-    held_e, apart_e = terms.proven(closed_exp.jaxpr, targets=(exp_out,), deep=True)
-    assert held_e[exp_out] is None and not apart_e[exp_out].unit_norm
+        np.testing.assert_array_equal(np.asarray(dew.jit(f1)(x_in, w_in)), exp2)
+        np.testing.assert_array_equal(np.asarray(dew.jit(f2)(x_in, w_in)), exp3)
+    bad_norms = (
+        (lambda x: x * jax.lax.rsqrt(jax.lax.reshape(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6),
+            (4, 2, 2, 1), dimensions=(0, 2, 1, 3))), (4, 2, 2, 8), jnp.float32),
+        (lambda x: x * jax.lax.broadcast_in_dim(jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True) + jnp.float32(1e-6)),
+            (4, 2, 2, 64), (0, 1, 2, 3)), (4, 2, 2, 1), jnp.float32),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x.astype(jnp.float16).astype(jnp.float32)), axis=-1, keepdims=True)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.bfloat16),
+        (lambda x: x.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.sum(jnp.square(x), axis=-1, keepdims=True).astype(jnp.float32)
+            + jnp.float32(2.0 ** -100)), (4, 2, 2, 64), jnp.float16),
+    )
+    for bad_fn, shape, dt in bad_norms:
+        closed = jax.make_jaxpr(bad_fn)(jax.ShapeDtypeStruct(shape, dt))
+        held, apart = terms.proven(closed.jaxpr, targets=(closed.jaxpr.outvars[0],), deep=True)
+        assert held[closed.jaxpr.outvars[0]] is None and not apart[closed.jaxpr.outvars[0]].unit_norm

@@ -1070,7 +1070,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
-        held: collections.OrderedDict[Hashable, Held[_Held]] = collections.OrderedDict()
+        held: collections.OrderedDict[Hashable, Held[_Held | None]] = collections.OrderedDict()
 
         def calling(arguments: Mapping[str, object]):
             # `launch` called with `arguments` by name, as `signature.bind` gave them.
@@ -1101,7 +1101,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                 key = (tuple(statics.items()), operands, tuple(map(jax.typeof, leaves)), state, metadata)
                 made = []
 
-                def making() -> _Held:
+                def making() -> _Held | None:
                     def traced(*values):
                         return calling({**statics, **jax.tree.unflatten(operands, values)})
 
@@ -1113,10 +1113,17 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                         raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
                                          f"say it builds ({sorted(builds or ())}): it was given none of "
                                          "their config")
+                    if len(program.jaxpr.in_avals) != len(leaves):
+                        # It read a value of the trace around it that is none of its operands, which its
+                        # program takes ahead of them: no function of its key, so none is held and each call
+                        # runs the launch itself, as a static that may reach an array does.
+                        return None
                     made.append(_Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named)))
                     return made[-1]
 
                 found = _cache.holding(held, key, making, LAUNCHES_HELD)
+                if found is None:
+                    return calling(given)
                 if not made:
                     # A held trace taken: its kernels named for this launch again.
                     report.renamed(found.named)
@@ -1483,30 +1490,52 @@ def _store(device_kind: str, picks) -> None:
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
-"""Each compile target's certification verdicts this process read from its store or stored there
-(`stored_verdict`), by launch key, as the store holds them (`encoded`)."""
+"""Each store's certification verdicts this process read from it or stored there (`stored_verdict`), by its
+path (`_verdicts_path`: a compile target's in the compilation cache the process names now) and launch key, as
+the store holds them (`encoded`)."""
+
+
+_KEPT_IN: contextvars.ContextVar[str | None] = _cache.untraced(
+    contextvars.ContextVar("verdicts_kept_in", default=None))
+"""The directory a block keeps the verdicts in in place of the compilation cache's (`verdicts_kept_in`)."""
+
+
+@contextlib.contextmanager
+def verdicts_kept_in(directory: str) -> Iterator[None]:
+    """Certification's verdicts and the derived choices kept in `directory` for the block, in place of
+    beside the compilation cache (`_verdicts_path`): a store of their own, as a host that never certified
+    holds, the compilation cache itself untouched; the block's context's alone (its replays' workers copy
+    it, `report.capture`)."""
+    token = _KEPT_IN.set(directory)
+    try:
+        yield
+    finally:
+        _KEPT_IN.reset(token)
 
 
 def _verdicts_path(target: str) -> str:
     """The store of the certification verdicts of kernels assembled for `target` (a generation,
-    `report.verdict_target`), beside the GPU models' picks (`kernel_picks_path`): verdicts alone, each by
-    what decides its compile (`report._verdict_key`), where the picks are measured timings. An H100's, a
-    GH200's and a compile-only H100's alike (row 6717). Read and written under deterministic ops too,
-    which keep no picks (`dew._cache.keeps_picks`): a verdict is what the assembler said of a compile, the
-    same in every process alike in what its key states, the run's XLA flags among them (row 7308: the cuda
-    lane's warm start certified every launch again)."""
+    `report.verdict_target`), beside the GPU models' picks (`kernel_picks_path`), or in a directory a block
+    names (`verdicts_kept_in`): verdicts alone, each by what decides its compile (`report._verdict_key`),
+    where the picks are measured timings. An H100's, a GH200's and a compile-only H100's alike (row 6717).
+    Read and written under deterministic ops too, which keep no picks (`dew._cache.keeps_picks`): a verdict
+    is what the assembler said of a compile, the same in every process alike in what its key states, the
+    run's XLA flags among them (row 7308: the cuda lane's warm start certified every launch again)."""
+    if (kept := _KEPT_IN.get()) is not None:
+        return os.path.join(kept, f"certified {target}.json")
     return _cache.kernel_picks_path(f"certified {target}")
 
 
 def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
                   target: str, key: str, label: str) -> Rebuilt | None:
-    """Read `key` from `_verdicts_path(target)` (cached in `cache`) and decode it."""
+    """Read `key` from `_verdicts_path(target)` (cached in `cache` by the store's path, so a process that
+    names another compilation cache reads that one's) and decode it."""
+    path = _verdicts_path(target)
     with _LOADING:
-        if target not in cache:
-            cache[target] = {entry[key_field]: entry[value_field]
-                             for entry in _stored(_verdicts_path(target))
-                             if isinstance(entry, dict) and key_field in entry}
-        found = cache[target].get(key)
+        if path not in cache:
+            cache[path] = {entry[key_field]: entry[value_field] for entry in _stored(path)
+                           if isinstance(entry, dict) and key_field in entry}
+        found = cache[path].get(key)
     try:
         return None if found is None else decoded(found)
     except Unreadable as unread:
@@ -1527,7 +1556,7 @@ def _store_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, val
         write_atomically(dest, json.dumps({"target": target,
                                            "data": [*kept, {key_field: key, value_field: written}]}))
     with _LOADING:
-        cache.setdefault(target, {})[key] = written
+        cache.setdefault(dest, {})[key] = written
 
 
 def stored_verdict(target: str, key: str) -> Rebuilt | None:
@@ -1544,8 +1573,8 @@ def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, assembled
 
 
 _CHOICES: dict[str, dict[str, _records.JSON]] = {}
-"""Each compile target's derived choices this process read from its store or stored there
-(`stored_choice`), by key, beside its certification verdicts (`_verdicts_path`)."""
+"""Each store's derived choices this process read from it or stored there (`stored_choice`), by its path
+and key, beside its certification verdicts (`_verdicts_path`)."""
 
 
 def stored_choice(target: str, key: str) -> Rebuilt | None:

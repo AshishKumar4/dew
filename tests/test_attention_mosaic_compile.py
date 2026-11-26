@@ -2084,3 +2084,25 @@ def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without
         case = KernelCase(f"paired backward {config}", lambda: op.lowering(ba, config))
         found = compile_mosaic_kernels([case], "sm80")
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@lowers("sm120")
+def test_a_g4s_full_training_step_lowers_with_no_value_of_another_trace(without_deterministic_ops):
+    """A G4's (sm120) non-causal training step (32 query heads over 8 key heads 64 wide, bf16, 1 x 4096)
+    lowers: its fused backward's tile chooses masked or whole scores by a branch, whose rows a ring's slots
+    hold once read (`rings.Slots`), so they are read ahead of the branches; one read within the first left
+    the next a tracer of that branch's ended trace, a constant no lowering handles (row 13106, NA35's live
+    G4 run: `foreach()` in a held launch, "No constant handler for DynamicJaxprTracer" without one)."""
+    query = jax.ShapeDtypeStruct((1, 4096, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, 8, 64), jnp.bfloat16)
+
+    def step(q, k, v):
+        def loss(q, k, v):
+            out = scaled_dot_product_attention(q, k, v, causal=False, implementation="template")
+            return jnp.sum(out.astype(jnp.float32))
+        return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm120")
+    with generation.assumed("sm120"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(step).trace(query, key, key).lower(lowering_platforms=("cuda",))
+

@@ -1147,14 +1147,15 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
         assert len(decided) == 1, steps
 
 
-BALANCED_TAILS = ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
-"""The dense kernel gradients' rows, depth and width whose 11 output tiles leave a Hopper part of 8
-multiprocessors' last wave at most half full: at rows a step does not divide, and at a tile of 256 x 128."""
+BALANCED_TAILS = tuple((*shape, dtype) for shape in ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
+                       for dtype in (jnp.bfloat16, jnp.float32) if (*shape, dtype)[2:] != (1408, jnp.float32))
+"""Dense kernel gradients' rows, depth, width and dtype whose 11 output tiles leave a Hopper part of 8
+multiprocessors' last wave at most half full, which their launch balances: at rows a step does not divide,
+and at a tile of 256 x 128 (exactly summed into fp32 there, a cluster tile, whose tail it refuses)."""
 
 
 @runs("sm90")
-@pytest.mark.parametrize("out_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32, exact sums"])
-@pytest.mark.parametrize(("rows", "depth", "width"), BALANCED_TAILS)
+@pytest.mark.parametrize(("rows", "depth", "width", "out_dtype"), BALANCED_TAILS)
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
     wave at most half full (`pricing.balanced_tail`, its hand-off unmeasured, so the tail is taken at
@@ -1166,12 +1167,12 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
     a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype)
 
 
-def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int,
-                                                         out_dtype) -> None:
+def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int, out_dtype,
+                                                         generation_name: str = "sm90", tile=None) -> None:
     """`test_a_dense_kernel_gradients_balanced_tail_holds_check_1`'s check at one shape and output dtype,
-    interpreted on a CPU and compiled on a Hopper GPU."""
+    interpreted on a CPU and compiled on a Hopper GPU, at `tile` (else the derived one), its tail balanced."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
-    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    target = dataclasses.replace(generation.gpu_target(generation_name), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     gradient = grouped_matmul.MosaicTgmm()
     exact = jnp.dtype(out_dtype) == jnp.float32
@@ -1179,14 +1180,14 @@ def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, 
         call = gradient.bind(spec((rows, depth)), spec((rows, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
                              interpret=False, out_dtype=jnp.dtype(out_dtype).name, dense=True,
                              exact_sums=exact)
-        tile = gradient.derived(call, target)
-    assert pricing.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n),
-                                    -(-rows // tile.block_k), (2, 2), target, 8) is not None
+        tile = gradient.derived(call, target) if tile is None else tile
+        assert gradient.legal(call, tile, target) and gradient.balanced(call, tile, target), tile
 
     def dew(x, w, dy):
         del w
-        return gemm.gemm_t(x, dy, None, out_dtype=out_dtype, interpret_on_cpu=True,
-                           precision="highest" if exact else None)[0]
+        with tuning.pinned({grouped_matmul.MosaicTgmm: tile}):
+            return gemm.gemm_t(x, dy, None, out_dtype=out_dtype, interpret_on_cpu=True,
+                               precision="highest" if exact else None)[0]
 
     def plain(x, w, dy, wide=jnp.float32, out=out_dtype):
         del w

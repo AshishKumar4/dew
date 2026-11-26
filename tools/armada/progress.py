@@ -104,6 +104,16 @@ def ended(pid: str | None, code: int) -> None:
         progress.write(json.dumps({ENDED: pid, "code": code}) + "\n")
 
 
+def finished() -> None:
+    """This task's progress out of its artifacts once its process ends: only a next attempt of a task the
+    fleet recalled while it ran reads it (`resumed`, from what armada kept at the recall), so a task that
+    keeps nothing else leaves armada no archive to store (2026-11-24: 59% of a day's 323k artifact archives
+    held this file alone). Called by ci.py's own task process, never by a test running it in-process."""
+    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    if artifacts:
+        (Path(artifacts) / PROGRESS).unlink(missing_ok=True)
+
+
 def resumed(tests: list[str], owning: Callable[[str], str],
             sealed: bool) -> tuple[dict[str, float], set[str], int | None]:
     """The tests of `tests` (each node's file as `owning` reads it) an earlier attempt of this task passed

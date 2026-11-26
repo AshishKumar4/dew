@@ -9,6 +9,8 @@ registers read where they lie, no instruction; and an fp32 register tile rounded
 an instruction (`satfinite_bf16`: PTX's `cvt.rn.satfinite.bf16x2.f32`)."""
 
 
+import functools
+
 import numpy as np
 from jax import numpy as jnp
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
@@ -93,8 +95,16 @@ def split_groups(tile, group: int, layout) -> tuple:
     if group % atom or columns % (2 * group):
         raise ValueError(f"{columns} columns in {layout}'s {atom}-column tiles hold no whole pairs of "
                          f"{group}-column runs")
-    per = group // atom
     typed = plgpu.ShapeDtypeStruct((rows, columns // 2), jnp.dtype(tile.dtype), layout=layout)
+    split = _split_runs(group // atom)
+    return tuple(plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed, typed))(split)(tile))
+
+
+@functools.cache
+def _split_runs(per: int):
+    """The inline body splitting a tile's registers into its runs of `per` of its layout's column tiles
+    (`split_groups`), one body a `per`: `inline_work.body_work` holds a body's count by the body, so equal
+    calls reuse it (row 12991)."""
 
     def split(ctx, tile):
         del ctx
@@ -103,7 +113,7 @@ def split_groups(tile, group: int, layout) -> tuple:
                                                     _layout=tile.layout, _is_signed=tile.is_signed)
                      for half in (0, 1))
 
-    return tuple(plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed, typed))(split)(tile))
+    return split
 
 
 def satfinite_bf16(value, layout):
@@ -114,28 +124,30 @@ def satfinite_bf16(value, layout):
     to two clamps an element (`max.NaN`, `min.NaN`) before the pair's conversion: 272 of Kimi delta
     attention's intra walk's 1552 issues a step, its staged parts' (`product.bf16_parts`, M-JS-272)."""
     typed = plgpu.ShapeDtypeStruct(value.shape, jnp.dtype(jnp.bfloat16), layout=layout)
+    return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,))(_satfinite_bf16)(value)[0]
 
-    def narrowed(ctx, tile):
-        del ctx
-        i32 = mgpu_ir.IntegerType.get_signless(32)
-        out = np.empty_like(tile.registers)
-        for index, register in np.ndenumerate(tile.registers):
-            [count] = mgpu_ir.VectorType(register.type).shape
-            if count % 2:
-                raise ValueError(f"{layout}'s registers hold {count} elements, no whole pairs")
-            words = []
-            for at in range(0, count, 2):
-                low, high = (mgpu_vector.extract(register, dynamic_position=[],
-                                                 static_position=mgpu_ir.DenseI64ArrayAttr.get([at + i]))
-                             for i in (0, 1))
-                # The pair's later element in the word's upper half, `cvt`'s first operand.
-                words.append(mgpu_llvm.inline_asm(i32, [high, low], "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
-                                                  "=r,f,f"))
-            packed = mgpu_vector.from_elements(mgpu_ir.VectorType.get([count // 2], i32), words)
-            out[index] = mgpu_vector.bitcast(mgpu_ir.VectorType.get([count], mgpu_ir.BF16Type.get()), packed)
-        return (mgpu_fragments.FragmentedArray(_registers=out, _layout=tile.layout, _is_signed=None),)
 
-    return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,))(narrowed)(value)[0]
+def _satfinite_bf16(ctx, tile):
+    """`satfinite_bf16`'s inline body, one for every call: `inline_work.body_work` holds a body's count by the
+    body, so equal calls reuse it (row 12991)."""
+    del ctx
+    i32 = mgpu_ir.IntegerType.get_signless(32)
+    out = np.empty_like(tile.registers)
+    for index, register in np.ndenumerate(tile.registers):
+        [count] = mgpu_ir.VectorType(register.type).shape
+        if count % 2:
+            raise ValueError(f"{tile.layout}'s registers hold {count} elements, no whole pairs")
+        words = []
+        for at in range(0, count, 2):
+            low, high = (mgpu_vector.extract(register, dynamic_position=[],
+                                             static_position=mgpu_ir.DenseI64ArrayAttr.get([at + i]))
+                         for i in (0, 1))
+            # The pair's later element in the word's upper half, `cvt`'s first operand.
+            words.append(mgpu_llvm.inline_asm(i32, [high, low], "cvt.rn.satfinite.bf16x2.f32 $0, $1, $2;",
+                                              "=r,f,f"))
+        packed = mgpu_vector.from_elements(mgpu_ir.VectorType.get([count // 2], i32), words)
+        out[index] = mgpu_vector.bitcast(mgpu_ir.VectorType.get([count], mgpu_ir.BF16Type.get()), packed)
+    return (mgpu_fragments.FragmentedArray(_registers=out, _layout=tile.layout, _is_signed=None),)
 
 
 def halved(layout):

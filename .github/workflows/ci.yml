@@ -46,7 +46,9 @@ env:
   # the 2026-11-18 audit's cleanup). Armada 0b42045 grades a task's rows as written under its red exit
   # (.armada.json's task.redExit), so a packed red runs again alone; puts a pack's part again through a
   # dropped connection; and bounds an artifact's download by its silence, not its length (2026-11-20).
-  ARMADA: github:AshishKumar4/armada#0b42045994cef978d4d04b56d2d93fe38eec55ae
+  # Armada 69d0186 (wire 16) keeps a green run's log only where .armada.json's task.logs asks, and has a
+  # judge's container take only that judge's map tasks' artifacts (2026-11-25: R2's reads and writes).
+  ARMADA: github:AshishKumar4/armada#69d0186ad318c6bc3bd663a3d46896f529e4deef
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue

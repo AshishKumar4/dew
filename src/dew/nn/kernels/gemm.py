@@ -61,7 +61,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import epilogue_vjp, rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
-from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Formed, Hooks
+from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, ColumnLocal, Formed, Hooks, column_local
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import read_by
@@ -1915,11 +1915,12 @@ def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior
         operand, pull = jax.vjp(formed, *tiles)
         return (*pull(acc.astype(dtype)), operand)
 
+    hook = ColumnLocal(pulled) if column_local(prologue) else pulled  # as its prologue is declared
     sides = (*(() if prior is None else (prior,)), lhs, *arrays)
     outs = (jnp.dtype(lhs.dtype), *(jnp.dtype(array.dtype) for array in arrays), dtype)
-    if not _keeps_launch(d, matrix, group_sizes, pulled, sides, outs, (dtype,), options):
+    if not _keeps_launch(d, matrix, group_sizes, hook, sides, outs, (dtype,), options):
         return None
-    d_lhs, *d_sides, operand = _gemm(d, matrix, group_sizes, None, (), (), pulled, sides,
+    d_lhs, *d_sides, operand = _gemm(d, matrix, group_sizes, None, (), (), hook, sides,
                                      (('rows', 'columns'),) * len(sides), outs, several=True,
                                      summed_as=(dtype,), **options)
     return d_lhs, tuple(d_sides), operand

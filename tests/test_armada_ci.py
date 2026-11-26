@@ -851,6 +851,20 @@ def test_cis_tools_run_inside_a_recalled_task_read_and_write_none_of_its_progres
     assert (outer / "progress.jsonl").read_text() == passed
 
 
+def test_a_task_ends_leaving_no_progress_in_its_artifacts(ci, tmp_path, monkeypatch, cache_worker):
+    """A task's process, run to its end as armada starts it, leaves its artifacts without the progress it
+    kept as its tests passed: nothing reads it once the task has ended, and an artifacts directory holding
+    nothing else is no archive armada stores."""
+    (tmp_path / "tests/test_kept.py").write_text("def test_kept():\n    pass\n")
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    [row] = armada_task(ci, monkeypatch, tmp_path / "verdict.json", policy="off", ended=True)
+    assert row["exitCode"] == 0, row["output"]
+    assert list((tmp_path / "artifacts").iterdir()) == []
+
+
 def test_a_tasks_progress_keeps_a_test_that_changed_the_environment_naming_its_artifacts(tmp_path):
     """A task's progress is kept where its session started naming it (ARMADA_ARTIFACTS), whatever a test
     changes as it runs: one that clears it, as `loaded` does for the CI tools it runs apart, is still the

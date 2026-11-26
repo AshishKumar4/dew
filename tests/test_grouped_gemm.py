@@ -35,6 +35,7 @@ from dew.nn.kernels import (
     tuning,
 )
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
+from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -1338,8 +1339,9 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
 @lowers("sm90")
 def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
     """The GEMM register model holds legal multi-output epilogues and `dew_tgmm` spill-free under sm90 ptxas
-    while refusing wide multi-output tiles past the single-warpgroup budget, and scopes wgmma `tgmm` scalar
-    addressing away from tcgen05 (rows 8723, 11946, 11947)."""
+    while refusing wide multi-output tiles past the single-warpgroup budget, but where their hook is declared
+    column-local (read out 64 columns at a time), and scopes wgmma `tgmm` scalar addressing away from
+    tcgen05 (rows 8723, 11946, 11947, 1958)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1355,21 +1357,29 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
             out_dtypes=("bfloat16", "bfloat16"))
         ba_two = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                           hooks=two_out_hooks)
-        wide_last = grouped_matmul.Hooks(
-            epilogue=lambda acc: (acc.astype(jnp.bfloat16), acc + 1.0),
-            out_dtypes=("bfloat16", "float32"))
+        def mixed(acc):
+            return acc.astype(jnp.bfloat16), acc + 1.0
+
+        wide_last = grouped_matmul.Hooks(epilogue=mixed, out_dtypes=("bfloat16", "float32"))
         ba_wide_last = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
                                 hooks=wide_last)
+        # Declared column-local (`hooks.ColumnLocal`), its tile read out 64 columns at a time.
+        ba_local = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                            hooks=dataclasses.replace(wide_last, epilogue=ColumnLocal(mixed)))
         ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=False)
         t256 = tiling.Tiles(64, 256, 64, 3, 56, warpgroups=1, family="wgmma")
         # 128-col mixed (bf16, fp32) exercises per-output staging widths: 64-col bf16 and 32-col fp32.
         t128 = tiling.Tiles(64, 128, 64, 3, 56, warpgroups=1, family="wgmma")
         assert gmm.legal(ba_two, t256, sm90)
+        # Read out whole, the wide mixed tile is past one warpgroup's registers; a column-local hook's, 64
+        # columns at a time, is within them and compiles spill-free (row 1958).
         assert not gmm.legal(ba_wide_last, t256, sm90)
+        assert gmm.legal(ba_local, t256, sm90)
         assert gmm.legal(ba_wide_last, t128, sm90)
         assert tgmm.legal(ba_dw, t256, sm90)
         cases = [
             KernelCase("two_out_64x256", lambda: gmm.lowering(ba_two, t256)),
+            KernelCase("mixed_local_64x256", lambda: gmm.lowering(ba_local, t256)),
             KernelCase("mixed_64x128", lambda: gmm.lowering(ba_wide_last, t128)),
             KernelCase("tgmm_64x256", lambda: tgmm.lowering(ba_dw, t256)),
         ]
@@ -1584,21 +1594,12 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
                             truth_fn=functools.partial(dw_plain, wide=jnp.float64, out=jnp.float64))
 
 
-def _traced_on(target, fn, args):
-    """`fn` of `args` traced on `target` assumed, whatever generation its compile names."""
-    def traced(*arrays):
-        with generation.assumed(target):
-            return fn(*arrays)
-
-    return traced, args
-
-
 @lowers("sm90")
 def test_hopper_cluster2_balanced_tail_lowers_spill_free():
     """Hopper `128x256x64 cluster=2` dense `gmm` and `tgmm` with balanced tail compile under sm90 ptxas
-    with zero spills (row 10151), on an H100 PCIe's 114 multiprocessors, whose 57 pairs' partials (30 MiB)
-    are within cuBLAS's 32 MiB workspace; a GH200's 66 pairs' (33 MiB) are not, so it takes none (row
-    12850)."""
+    with zero spills (row 10151), its workspace a slot a program and one a tail tile (`tail_workspace`):
+    a GH200's 66 pairs and 14 tail tiles 21 MiB, within cuBLAS's 32 MiB workspace (two slots a program,
+    33 MiB, were past it: NG29, row 12850)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -1614,11 +1615,9 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         from dew.nn.kernels.templates.gemm import pricing
 
         tile_c2 = tiling.Tiles(128, 256, 64, 3, 4, warpgroups=2, cluster=2, family="wgmma")
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is None
-        sm90 = dataclasses.replace(sm90, multiprocessors=114)
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 114) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 114) is None
-        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 114) is not None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 9728, 2560), (2, 2), sm90, 132) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (16384, 2560, 9728), (2, 2), sm90, 132) is None
+        assert pricing.dense_tail(tile_c2, jnp.bfloat16, (2048, 2560, 8192), (2, 2), sm90, 132) is not None
         x_fwd = jax.ShapeDtypeStruct((2048, 8192), jnp.bfloat16)
         w_fwd = jax.ShapeDtypeStruct((1, 8192, 2560), jnp.bfloat16)
         x_dw = jax.ShapeDtypeStruct((8192, 2560), jnp.bfloat16)
@@ -1637,10 +1636,9 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         assert gmm._stated(ba_half, tile_c2_split, sm90)["balanced"] is False
         assert tgmm.legal(ba_dw, tile_c2, sm90) and tgmm.balanced(ba_dw, tile_c2, sm90)
         cases = [
-            KernelCase("sm90_cluster2_tail_fwd", lambda: _traced_on(sm90, *gmm.lowering(ba_fwd, tile_c2))),
-            KernelCase("sm90_cluster2_split2_fwd",
-                       lambda: _traced_on(sm90, *gmm.lowering(ba_half, tile_c2_split))),
-            KernelCase("sm90_cluster2_tail_dw", lambda: _traced_on(sm90, *tgmm.lowering(ba_dw, tile_c2))),
+            KernelCase("sm90_cluster2_tail_fwd", lambda: gmm.lowering(ba_fwd, tile_c2)),
+            KernelCase("sm90_cluster2_split2_fwd", lambda: gmm.lowering(ba_half, tile_c2_split)),
+            KernelCase("sm90_cluster2_tail_dw", lambda: tgmm.lowering(ba_dw, tile_c2)),
         ]
         records = compile_mosaic_kernels(cases, "sm90")
     for rec in records:

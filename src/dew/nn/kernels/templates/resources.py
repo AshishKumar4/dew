@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import copies
 
 if TYPE_CHECKING:
     from jax._src.pallas.core import MemoryRef
@@ -925,7 +926,7 @@ def addresses(tiles) -> int:
     def patterns(shape: tuple, dtype) -> int:
         itemsize = jnp.dtype(dtype).itemsize
         # A vector, or rows of no whole 16-byte chunk, stage unswizzled: one pattern.
-        if len(shape) < 2 or shape[-1] * itemsize % 16:
+        if len(shape) < 2 or not copies.whole_rows(shape[-1], dtype):
             return 1
         return max(1, widest_swizzle(dtype, shape[-1]) // (64 if itemsize == 2 else 32))
 

@@ -473,7 +473,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         # An epilogue chunk's columns of the vector held at once (`chunk_columns`), in the epilogue's layout.
         return super().column_registers(self.chunk_columns(columns), dtype)
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
+        del columns  # read out a chunk at a time whatever its hook takes (`hook_columns`, its read-out's)
         # Each chunk's columns read from each accumulator's tensor memory (`read`) as its consumer asks for
         # it, after the chunk before it is stored: read all at once, every load was in flight together and a
         # thread held the tile's whole row, ptxas's least spill-free cap 144 at 128 columns and 208 at 192
@@ -1439,10 +1440,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # its step's last wait is its product of the weights' on the role's `done` (`register_products`), and
         # a commit there right behind it, with nothing pending and no warpgroup barrier between, completes
         # the next phase before a lagging warp of the role has polled the last; that warp reads the phase
-        # after as the one it awaits, and the role waits on it for good (the 4B forward with its sums kept, a
-        # priority schedule of nvgpu-lean's B200 at its 31st query tile, 4 of 4 seeds,
-        # hang-20261114035236). Each barrier's own commits are a step apart, a warpgroup barrier between
-        # (the step's read of its logits).
+        # after as the one it awaits, and the role waits on it for good (a 4B forward with its sums kept hung
+        # so on a B200's simulated schedule). Each barrier's own commits are a step apart, a warpgroup
+        # barrier between (the step's read of its logits).
         del pending
         if _PRODUCTS.get() is None:
             return

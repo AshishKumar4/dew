@@ -22,7 +22,15 @@ from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn import programs
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import emission, handoffs, mosaic, outputs as stated_outputs, persistent, rings
+from dew.nn.kernels.templates import (
+    axes,
+    emission,
+    handoffs,
+    mosaic,
+    outputs as stated_outputs,
+    persistent,
+    rings,
+)
 from dew.nn.kernels.templates.cost import Stated
 
 STAGES = 2
@@ -50,9 +58,7 @@ class Streams:
         """Step `step`'s block of stream `name` into its ring's `slot`, by an asynchronous copy."""
         ref, block_indices = self.views[name]
         slots = self.rings[name]['slots']
-        block = slots.shape[1:]
-        source = ref.at[tuple(pl.ds(index * size, size)
-                              for index, size in zip(block_indices(step), block, strict=True))]
+        source = axes.blocked(ref, slots.shape[1:], block_indices(step))
         return pltpu.make_async_copy(source, slots.at[slot], self.rings[name]['sems'].at[slot])
 
 
@@ -364,7 +370,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             total *= extent
 
         def run(*staging):
-            def store(output, value, ref, place):
+            def store(output, value, ref, place, within=None):
+                del within  # each tile stored whole, its stores no chunks' (`stores_chunks` off)
                 # A DMA's HBM rows start at whole tiles of the layout (`copies_tiled_rows`): a tile's rows of
                 # the output stored as a whole window of them, read back first and its rows outside
                 # `first`'s `stored` kept (another group's); a window past the output's last row shifted
