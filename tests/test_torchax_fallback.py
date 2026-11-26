@@ -46,6 +46,7 @@ from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -237,6 +238,7 @@ def test_a_recomputed_step_recomputes_each_layer_and_its_gradients_are_transform
     _, model = source
     recomputed = dataclasses.replace(loaded, model=loaded.model.clone(remat=True))
     assert loaded.model.recompute_more() == recomputed.model and recomputed.model.recompute_more() is None
+    assert loaded.model.recompute_record() is None
     assert loaded.model.restore_recompute(recomputed.model.recompute_record()) == recomputed.model
     objective = LMObjective(recomputed, seq_len=SEQ, ema_decay=None)
     params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
@@ -1757,27 +1759,46 @@ def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_
                     truth_fn=theirs(wide, float64))
 
 
+GEMMA3 = {**TINY, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 4,
+          "layer_types": ["sliding_attention", "full_attention"], "intermediate_size": 64}
+"""A tiny Gemma 3 text decoder of one sliding and one full layer, whose masks and rotary tables differ by
+layer."""
+
+
 @attending("reference")
-def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_layers(tmp_path):
-    """A Llama taken to tier 3 looping its first layer three times (`TorchCausalLM.with_passes`, no step
-    norm): its logits over drawn ids hold check 1 against transformers' own Llama of those layers
-    repeated (layer 0 thrice, then layer 1, each the source's), its float64 twin the truth; a loop
-    asking for an exit gate is one it cannot run."""
+@pytest.mark.parametrize(("family", "order", "loop"), [
+    ("llama", (0, 0, 0, 1), Loop(3, (0, 1), step_norm=False)),
+    ("gemma3_text", (0, 1, 0, 1), Loop(2, (0, 2), step_norm=False)),
+], ids=["llama-one-layer", "gemma3-sliding-and-full"])
+def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_layers(tmp_path, family, order,
+                                                                                     loop):
+    """A source taken to tier 3 looping a block of its layers (`TorchCausalLM.loop`, no step norm): its logits
+    over drawn ids hold check 1 against transformers' own decoder of those layers repeated in `order`, each
+    the source's, its float64 twin the truth; each repeated layer reads its own masks and rotary tables (a
+    Gemma 3 block of a sliding and a full layer). A loop stating an exit gate runs nowhere, and a looped
+    model opens no decode cache."""
+    config = LLAMA if family == "llama" else GEMMA3
     torch.manual_seed(0)
-    model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).eval()
+    model = transformers.AutoModelForCausalLM.from_config(
+        transformers.AutoConfig.for_model(family, **config)).eval()
     model.save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert isinstance(loaded, PretrainedFallback)
-    assert loaded.model.with_passes(3, (0, 1), exit_gate=True) is None
-    looped = loaded.model.with_loop(dataclasses.replace(loaded.model.with_passes(3, (0, 1)).loop,
-                                                        step_norm=False))
+    looped = loaded.model.clone(loop=loop)
+    draw = token_draw(0x13046, config["vocab_size"], (2, 12))
+    with pytest.raises(ValueError):
+        loaded.model.clone(loop=dataclasses.replace(loop, exit_gate=True)).apply(loaded.variables, *draw(0))
+    with pytest.raises(Lacks):
+        looped.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
     forward = jax.jit(looped.apply)
-    order = (0, 0, 0, 1)
     state = model.state_dict()
 
     def repeated(dtype):
-        built = transformers.LlamaForCausalLM(transformers.LlamaConfig(
-            **{**LLAMA, "num_hidden_layers": len(order)})).to(dtype).eval()
+        stated = {**config, "num_hidden_layers": len(order)}
+        if family != "llama":
+            stated["layer_types"] = [config["layer_types"][layer] for layer in order]
+        built = transformers.AutoModelForCausalLM.from_config(
+            transformers.AutoConfig.for_model(family, **stated)).to(dtype).eval()
         weights = {name: value for name, value in state.items() if not name.startswith("model.layers.")}
         for index, layer in enumerate(order):
             prefix = f"model.layers.{layer}."
@@ -1794,7 +1815,6 @@ def test_a_looped_tier_three_source_runs_its_block_as_a_decoder_repeating_its_la
         return as_given(run)
     with float64():
         wide = repeated(torch.float64)
-    draw = token_draw(0x13046, LLAMA["vocab_size"], (2, 12))
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
-                    theirs(repeated(torch.float32)), draw, "looped tier 3 logits", seeds=8,
+                    theirs(repeated(torch.float32)), draw, f"looped tier 3 {family} logits", seeds=8,
                     truth_fn=theirs(wide, float64))
