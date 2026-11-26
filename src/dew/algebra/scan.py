@@ -223,7 +223,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def prepare(chunk, issue=None, transition: bool = False, window=None):
         affine = affine_of(chunk)
-        (exponent, *values), unlanded = _segment_parts(declaration, names, affine, chunk, window)
+        (exponent, *values), held_scale = _segment_parts(declaration, names, affine, chunk, window)
         read = declaration if window is None else _unreset(declaration)
         decays = _started(_decays(exponent, affine.base2), None if read.reset is None else chunk[read.reset])
         natural = _walked(exponent, affine.base2)
@@ -233,9 +233,8 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                                       affine.values_read, apart, affine.across is not None, affine.before,
                                       affine.erase is not None)
         corrected = affine.correction is not None
-        if unlanded:
-            split = _unlanded_split(extents, corrected=corrected, base2=affine.base2,
-                                    scale=affine.reader_scale)
+        if held_scale is not None:
+            split = _unlanded_split(extents, corrected=corrected, base2=affine.base2, scale=held_scale)
             given, entering = (tokens, decays, entering, _token_factors(exponent, affine.base2)), None
         else:
             form = _form(extents, corrected, saturation)
@@ -395,13 +394,15 @@ def _walked_tokens(declaration: Scan, chunk: Mapping) -> tuple[dict, dict]:
     return along, {name: chunk[name] for name in declaration.operands if name not in along}
 
 
-def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple[tuple, bool]:
-    """A chunk's tokens' parts and whether its reader scale stays apart until the contraction."""
+def _token_parts(
+    declaration: Scan, names: Sequence[str], affine, chunk: Mapping,
+) -> tuple[tuple, np.floating | None]:
+    """A chunk's parts and its held subnormal reader scale, if any."""
     along, every = _walked_tokens(declaration, chunk)
     parts = jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along)
     reader = parts[1 + TOKENS.index("Q")]
-    unlanded = _subnormal_scale(affine.reader_scale, jnp.result_type(affine.reader_scale, reader))
-    return (parts if unlanded else _with_reader_scale(affine, parts)), unlanded
+    held = subnormal_reader_scale(affine.reader_scale, jnp.result_type(affine.reader_scale, reader))
+    return (parts if held is not None else _with_reader_scale(affine, parts)), held
 
 
 def _with_reader_scale(affine, parts: tuple) -> tuple:
@@ -463,7 +464,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         _, cut = vanished(z, affine.base2)
         h = jnp.where(cut[:, None], 0.0, h)
         scale = affine.reader_scale
-        split_read = _subnormal_scale(scale, jnp.result_type(scale, q))
+        split_read = subnormal_reader_scale(scale, jnp.result_type(scale, q)) is not None
         decay = (_token_factors(z, affine.base2) if split_read
                  else jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],)))
         factors = jax.tree.map(lambda factor: factor[:, None], decay)
@@ -624,8 +625,11 @@ def _entered(outputs, entering: tuple, values_read: bool, h, *, scale: float | n
     return jnp.concatenate([first[None].astype(outputs.dtype), outputs[:-1]]) + free
 
 
-def _read(h, reader, values_read: bool, scale: float | np.floating):
+def _read(h, reader, values_read: bool, scale: float | np.floating, *, row_sum: bool = False):
     """A scaled read along the state's keys or values, its rank-one part contracted before it is formed."""
+    # The coupled token's ordinary read is a sum of elementwise products, not a dot.
+    if row_sum and subnormal_reader_scale(scale, jnp.result_type(scale, reader)) is None:
+        return jnp.sum((scale * reader)[:, None] * h, axis=0)
     dtype = np.asarray(scale).dtype if isinstance(scale, np.floating) else None
     if isinstance(h, tuple):
         left, right = h
@@ -1109,8 +1113,11 @@ def token_terms(parts, token: tuple, states: int = 1) -> tuple[tuple[int, ...], 
     return shape, along
 
 
-def _subnormal_scale(scale: float | np.floating, dtype) -> bool:
-    return jnp.issubdtype(dtype, jnp.floating) and 0 < abs(float(scale)) < float(jnp.finfo(dtype).tiny)
+def subnormal_reader_scale(scale: float | np.floating, dtype) -> np.floating | None:
+    """The typed scale to hold apart if multiplying it into the reader could flush it."""
+    if jnp.issubdtype(dtype, jnp.floating) and 0 < abs(float(scale)) < float(jnp.finfo(dtype).tiny):
+        return dtype.type(scale)
+    return None
 
 
 def _subnormal_contract(axes: Sequence[str], output: str, operands: tuple, scale, dtype):
@@ -1142,7 +1149,7 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
     def value(*operands):
         factor = scale if scale_dtype is None else jnp.asarray(scale, dtype=scale_dtype)
         first = jnp.result_type(factor, operands[0])
-        if _subnormal_scale(scale, first):
+        if subnormal_reader_scale(scale, first) is not None:
             return _subnormal_contract(axes, output, operands, scale, jnp.result_type(factor, *operands))
         return _portable_einsum(subscripts, factor * operands[0], *operands[1:])
 

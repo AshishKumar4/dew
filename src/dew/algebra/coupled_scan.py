@@ -59,6 +59,7 @@ from dew.algebra.scan import (
     _replay_backward,
     _traced,
     _walked_tokens,
+    subnormal_reader_scale,
     token_terms,
     token_type,
 )
@@ -421,14 +422,6 @@ class Chunked(NamedTuple):
     momentum_kept: scaled.Scaled
 
 
-def _reader(query, scale):
-    """Hold a subnormal scale apart; an ordinary scale still belongs to the query."""
-    dtype = jnp.result_type(scale, query)
-    if 0 < abs(float(scale)) < float(jnp.finfo(dtype).tiny):
-        return query, dtype.type(scale)
-    return scale * query, None
-
-
 def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool,
               reader_scale: float | np.floating) -> Chunked:
     """A chunk's values that read no state (`Chunked`), from its tokens' parts (`_chunk_parts`)."""
@@ -440,8 +433,12 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool,
     overlaps = _summed(_outer, (c.T, b.T), (c.shape[0], b.shape[0]))
     lower = scaled.mul(overlaps, _sliced(before, (..., slice(1, None))))
     ends = _sliced(g, -1)
-    q, scale = _reader(q, reader_scale)
-    dots = q @ b.T if scale is None else _UnlandedRead(_read(q, b.T), scaled.scaled(jnp.asarray(scale)))
+    scale = subnormal_reader_scale(reader_scale, jnp.result_type(reader_scale, q))
+    if scale is None:
+        q = reader_scale * q
+        dots = q @ b.T
+    else:
+        dots = _UnlandedRead(_read(q, b.T), scaled.scaled(jnp.asarray(scale)))
     return Chunked(
         lower=lower, inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
         momentum_before=_sliced(before, (..., 0)), dots=dots, sums=_sliced(g, (..., slice(1, None))),
@@ -655,9 +652,7 @@ def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chu
         alpha, faint_first = _decayed(first, first_exponent, parts.base2, cut)
         second = mu * second + b[:, None] * w[None, :] + faint_second
         first = alpha * first + lam * second + faint_first
-        q, scale = _reader(q, parts.reader_scale)
-        read = jnp.sum(q[:, None] * first, axis=0) if scale is None else _read_token(
-            first, q, values_read=False, scale=scale)
+        read = _read_token(first, q, values_read=False, scale=parts.reader_scale, row_sum=True)
         return (first, second), read + r
 
     # The pair carried in the type its update's parts widen it to (`scan._carry_type`, the single state's
