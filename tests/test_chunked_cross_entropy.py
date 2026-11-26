@@ -1338,7 +1338,7 @@ def test_a_bf16_whole_head_rounds_its_logits_once_its_sums_are_whole(devices):
     mesh = Mesh(np.array(compile_only_gpus("sm90", devices)), ("tensor",))
 
     def loss(states, matrix, targets):
-        losses, _, _ = chunked_cross_entropy(states, OutputTable(matrix, vocab_major=False), targets, 4,
+        losses, _, _ = chunked_cross_entropy(states, OutputTable(matrix, vocab_major=False), targets, 1,
                                              tile=None)
         return jnp.mean(losses)
 
