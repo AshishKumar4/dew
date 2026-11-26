@@ -262,9 +262,8 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
 
 def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
     """The fused linear cross entropy's launch at a softcap of 20, interpreted as an H100's, on par (check 1)
-    with the portable arm's loss of its capped logits (`precision.capped_logits`), each from an independent
-    float64 cross entropy of `cap * tanh(z / cap)` (row 13353)."""
-    from dew.nn.precision import capped_logits
+    with the production path's capped loss (`chunked`'s, `precision.capped_logits`), each from an
+    independent float64 cross entropy of `cap * tanh(z / cap)` (row 13353)."""
 
     rows, depth, vocab = 256, 128, 1024  # a loss a row: enough rows a seed that the gate resolves its ratio
 
@@ -283,8 +282,13 @@ def test_a_capped_linear_cross_entropy_launch_is_on_par_with_its_portable_cap():
             return loss
 
     def portable(x, w, t):
-        capped = capped_logits(jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32).T), 20.0)
-        return jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(rows), t]
+        # The production path's capped loss (`chunked`'s, its cap `precision.capped_logits`), chunked as the
+        # launch's online sums are.
+        with generation.chosen(linear_ce="xla"):
+            loss, _, _ = chunked.chunked_cross_entropy(
+                x, OutputTable(w, vocab_major=True, softcap=20.0, precision=chunked.BF16), t, chunks=4,
+                tile=(64, 256), predict=False)
+            return loss
 
     def truth(x, w, t):
         # Its operands widened to float64 by the gate (`assert_as_exact`): the cap's quotient exact there.
