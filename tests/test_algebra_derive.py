@@ -1463,6 +1463,32 @@ def test_mixed_covariance_in_a_constant_direction_is_zero(rows, states):
         np.testing.assert_array_equal(jax.jit(mixed)(x, w, dy), np.zeros((rows,), np.float64))
 
 
+def test_covariance_means_keep_distinct_value_directions_with_shared_weights():
+    from dew.algebra import moments
+
+    rows = jnp.asarray([[0.0, 4.0], [2.0, -2.0]], jnp.float32)
+    weights = jnp.asarray([1.0, 3.0], jnp.float32)
+    direction = jnp.asarray([[4.0, 0.0], [0.0, 4.0]], jnp.float32)
+    dw = jnp.asarray([1.0, -1.0], jnp.float32)
+
+    def means(x, y, w):
+        a, b, _, _ = moments.chunked_covariance(x, y, w, tile=1, mode="walk")
+        return jnp.stack((a, b))
+
+    @jax.jit
+    def differentiated(x, y, w, dx, dy, dw):
+        both = jax.jvp(means, (x, y, w), (dx, dy, dw))[1]
+        first = jax.jvp(lambda a: means(a, y, w), (x,), (dx,))[1]
+        _, pullback = jax.vjp(lambda q: means(x, y, q), w)
+        (weighted,) = pullback(jnp.asarray([2.0, -3.0], w.dtype))
+        return both, first, weighted
+
+    both, first, weighted = differentiated(*rows, weights, *direction, dw)
+    np.testing.assert_array_equal(both, [0.0, 4.0])
+    np.testing.assert_array_equal(first, [1.0, 0.0])
+    np.testing.assert_array_equal(weighted, [-3.75, 1.25])
+
+
 @pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_weighted_moments_keep_the_direction_when_dividing_first_would_flush(mode):
     from dew.algebra import moments
