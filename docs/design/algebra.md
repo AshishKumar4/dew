@@ -1376,14 +1376,39 @@ def declare(module: str, name: str, form: StableForm) -> StableForm: ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
-**Planned families (row 3272).** The same registry will accept a template's `Declaration` (a
-`Reduction` or `Scan`) and `SurrogateBodies` (row 3271). A surrogate declaration records its
-`forward` and `derivative` callables and their `Cases`; generation optimizes each body independently,
-never replaces the declared derivative with autodiff of the forward. Template generation emits the
-forward/backward tiled forms and their step, merge and finish as ordinary Python. Both families will
-emit checked-in modules with a gate site for every served case and deterministic `--check` regeneration;
-replacing an existing form requires the accuracy and efficiency bars in §4. Neither family is registered
-in the built `dict[str, StableForm]` yet.
+**Template and surrogate generation (rows 3272, 6109).** Keep one declaration registry and one writer.
+Extend the registry's value to a union of `StableForm`, a template declaration and `SurrogateBodies`;
+the built registry holds stable forms alone. The new records name the component functions, their cases,
+and the reference implementation. They add no run-time dispatch to the algebra engine.
+
+- **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
+  operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
+  order. Print value-taking components of `forms.Derived` (prepare, step, merge, finish, mapped, and
+  backward where present) over a flat array signature. The wrapper restores the named state and operand
+  trees and keeps `init` and slot metadata as static shapes, not executable array programs. For a
+  template with a product issuer, emit its pure factors and finish expressions; the template still owns
+  the actual dot, tile schedule and accumulation callbacks. A callback that cannot be separated from its
+  math is not a printable case. Declared reduction backward tiles use their own declarations; scan
+  backward retains its incoming state, output cotangent and outgoing state cotangent inputs. Do not use a
+  derivative of the generated forward in place of either.
+- **Surrogates.** A `SurrogateBodies` entry names the forward and tangent bodies passed to
+  `dew.nn.derivatives.surrogate`, their separate cases and their nondifferentiable arguments. A tangent
+  component traces over primals, active tangents and the original forward value; the case key includes
+  static arguments and which tangents are symbolic zeros. Generate each body against its own reference.
+  The existing surrogate wrapper still supplies the value dependency at higher orders and reassembles
+  the original PyTree. Hold tangent linearity and forward/reverse and higher-order behavior through that
+  wrapper. `dew.nn.precision.rounded_operand` is the first consumer: the value preserves its rounding
+  barrier; the derivative remains the input tangent, including after another differentiation.
+- **Admission and cutover.** Use the existing `printed.source` and reject effects, unprintable
+  primitives, or a changed component's state layout, output tree or placed types. Key by component, target,
+  precision policy, operand shapes and dtypes, and only the declared static flags that change its program.
+  Unknown cases continue through the current implementation; a named case not generated is a regeneration
+  error. Stage one of the ordinary attention reduction cells from M-ET-85 first: compare two different
+  tilings, an online walk and a merged walk, and all backward outputs with the trace-time and independent
+  float64 references. Then run Check 1 and Check 2 at the real launch, and compare latency and memory
+  against the existing template on the same device before activating it (§4). The checked-in module,
+  typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
+  no replacement. Template and surrogate generation remain design capabilities, not implemented claims.
 
 - `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
   saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
