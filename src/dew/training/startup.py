@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
 
-from dew._records import JSON
+from dew._records import JSON, record
 from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.handed import Handed
@@ -179,9 +179,9 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
     a pass count's sampled law among it, row 10783); and, for a trainer given a run's numerics
     (`TrainerAdvanced.numerics`), the numerics the checkpoint's programs ran under (its record's
-    `precision`, `generation.run_precision`), which no tree or loss scale shows, the precision its unpinned
-    products take among them, as a run config's precision is compared (`RunConfig.check_resume`, row
-    13537)."""
+    `precision`, `generation.run_precision`) that no tree or loss scale shows: the precision its unpinned
+    products take, its forms, its low-precision recipe and its outputs, its dtypes and loss scaling aside,
+    which its state's trees and scale state (row 13537)."""
     from dew.nn.precision import Numerics
     from dew.registry import to_record
 
@@ -191,10 +191,19 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
                and "sampled_passes" not in now else [])
     artifact = checkpoints.artifact(step)
-    precision = (_differing(artifact["precision"], to_record(trainer.numerics, Numerics), "precision")
-                 if trainer.numerics is not None and isinstance(artifact, dict) and "precision" in artifact
-                 else [])
+    precision: list[str] = []
+    held = artifact.get("precision") if isinstance(artifact, dict) else None
+    if trainer.numerics is not None and isinstance(held, dict):
+        running = record(to_record(trainer.numerics, Numerics), "precision")
+        unshown = [{name: value for name, value in stated.items() if name not in _SHOWN_BY_STATE}
+                   for stated in (held, running)]
+        precision = _differing(*unshown, "precision")
     return differing_records(artifact, trainer._artifact(), saved, now) + dropped + precision
+
+
+_SHOWN_BY_STATE = frozenset({"dtypes", "loss_scaling"})
+"""The fields of a run's numerics (`Numerics`) its state shows (its trees' dtypes, its loss scale), which a
+resume's restore compares as it reads them."""
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:

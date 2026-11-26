@@ -339,31 +339,19 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
-class _Counted:
-    """A record step counting the records this process made (`made`)."""
-
-    identity = "counted@1"
-    made = 0
-
-    def __call__(self, record):
-        _Counted.made += 1
-        return record
-
-
 def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
-    """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`); where it
-    would read in the process whatever the sample measured (`Loading.selects_none`: a run whose length
-    nothing states, one CPU, `max_workers` 0) its first batch, read with no thread reading ahead, is the
-    only one it made, no sample made beside it (row 13540: up to nine batches decoded at startup and made
-    again)."""
-    chain = Pipeline(Memory(_Indexed(30))).map(_Counted()).repeat().batch(4)
-    for host, steps, most in ((TWO_CPUS, None, None), (Host(1, 2**34, worker_start=1.0), 10**6, None),
-                              (TWO_CPUS, 10**6, 0)):
-        _Counted.made = 0
-        loading = Loading(workers="auto", threads=0, read_buffer=0, host=host, max_workers=most)
-        # Read in the process with no thread ahead: nothing runs past the batch read, so nothing is closed.
-        listed(compile(chain, seed=5, steps=steps, loading=loading).train(DataPartition()), 1)
-        assert _Counted.made == 4, (host, steps, most, _Counted.made)
+    """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`), which its
+    read's explanation states it was sized from; where it would read in the process whatever the sample
+    measured (`Loading.selects_none`: a run whose length nothing states, one CPU, `max_workers` 0) it
+    samples none (row 13540: up to nine batches decoded at startup and made again), where a run of a stated
+    length on a host of CPUs samples its batches."""
+    chain = Pipeline(Memory(_Indexed(30))).repeat().batch(4)
+    one_cpu = Host(1, 2**34, worker_start=1.0)
+    for host, steps, most, sampled in ((TWO_CPUS, None, None, False), (one_cpu, 10**6, None, False),
+                                       (TWO_CPUS, 10**6, 0, False), (TWO_CPUS, 10**6, None, True)):
+        loading = Loading(workers="auto", host=host, max_workers=most)
+        explained = compile(chain, seed=5, steps=steps, loading=loading).explain()
+        assert ("sampled:" in explained) == sampled, (host, steps, most, explained)
 
 
 def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
