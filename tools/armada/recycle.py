@@ -39,13 +39,21 @@ def resident() -> int:
     return 0
 
 
+def _malloc_trim():
+    """glibc's `malloc_trim`, or None where this process's C library has none."""
+    found = ctypes.util.find_library("c")
+    return None if found is None else getattr(ctypes.CDLL(found), "malloc_trim", None)
+
+
 def trimmed() -> int:
-    """`resident` after glibc returns its arenas' free pages to the system (`malloc_trim(0)`): what a process
-    keeps past a test is largely freed native memory its allocator still holds (row 13063: 5.02 GB resident
-    after the first orders' compiles, 0.93 GB trimmed, JAX's caches' release returning none of it)."""
-    libc = ctypes.util.find_library("c")
-    if libc is not None:
-        ctypes.CDLL(libc).malloc_trim(0)
+    """`resident` after glibc returns its arenas' free pages to the system (`malloc_trim(0)`, where the C
+    library has it): what a process keeps past a test is largely freed native memory its allocator still
+    holds (row 13063: 5.02 GB resident after the first orders' compiles, 0.93 GB trimmed, JAX's caches'
+    release returning none of it)."""
+    if "trim" not in _session:
+        _session["trim"] = _malloc_trim()
+    if _session["trim"] is not None:
+        _session["trim"](0)
     return resident()
 
 
@@ -54,7 +62,13 @@ def pytest_sessionstart(session) -> None:
 
 
 def pytest_collection_finish(session) -> None:
-    """The first process of a row writes what its session selected (`SELECTED`); a later one, nothing."""
+    """The tests after which this session ends, around each marked `FRESH` (the one before it and itself),
+    read once; and the first process of a row writes what its session selected (`SELECTED`), a later one
+    nothing."""
+    items = session.items
+    _session["fresh_after"] = {items[at + step].nodeid for at, item in enumerate(items)
+                               if item.get_closest_marker(FRESH) is not None
+                               for step in (-1, 0) if at + step >= 0}
     if (selected := os.environ.get(SELECTED)) and not Path(selected).exists():
         Path(selected).write_text(json.dumps({"selected": [item.nodeid for item in session.items]}))
 
@@ -65,9 +79,7 @@ def pytest_runtest_logfinish(nodeid: str, location) -> None:
     at, recycled, session = os.environ.get(RECYCLE_AT), os.environ.get(RECYCLED), _session.get("it")
     if not at or not recycled or session is None or not session.items or session.items[-1].nodeid == nodeid:
         return
-    at_item = next((index for index, item in enumerate(session.items) if item.nodeid == nodeid), None)
-    fresh = at_item is not None and any(item.get_closest_marker(FRESH) is not None
-                                        for item in session.items[at_item:at_item + 2])
+    fresh = nodeid in _session.get("fresh_after", ())
     # Past the bound only what the allocator cannot return: a process recycled is a row run again by each train.
     if fresh or (resident() > int(at) and trimmed() > int(at)):
         Path(recycled).write_text(nodeid)

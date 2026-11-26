@@ -74,7 +74,8 @@ def recycled_row(ci, tmp_path, monkeypatch, source: str, hook: str = "", recycle
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
-    ci.tested("3.12", ["tests/test_recycled.py"], "", out, 600.0, "off", 5.0, "", {}, recycle_at=recycle_at,
+    split = kwargs.pop("split", "")
+    ci.tested("3.12", ["tests/test_recycled.py"], split, out, 600.0, "off", 5.0, "", {}, recycle_at=recycle_at,
               **{"recorded": False, **kwargs})
     [row] = json.loads(out.read_text())["rows"]
     return row
@@ -145,6 +146,24 @@ def test_a_plain_task_runs_its_tests_past_its_recycle_bound_in_fresh_processes(c
     [row] = json.loads(out.read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
     assert len(set(pids.read_text().split())) == 2
+
+
+def test_a_resumed_groups_test_its_recalled_attempt_passed_is_no_test_its_recycled_processes_missed(
+        ci, tmp_path, monkeypatch):
+    """A split group's attempt resumed after a recall (its ARMADA_RESUME holding a test it passed, set aside
+    by `progress.resumed`) and run past a recycle is green: the test set aside ran, in the recalled attempt,
+    and is none its processes failed to report (`graded_across`)."""
+    resume = tmp_path.parent / f"{tmp_path.name}-resume"
+    resume.mkdir()
+    (resume / "progress.jsonl").write_text(
+        json.dumps({"node": "tests/test_recycled.py::test_a", "seconds": 0.01, "pid": 1}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    monkeypatch.setattr(ci.run_keys, "record", lambda *args: set())
+    row = recycled_row(ci, tmp_path, monkeypatch,
+                       "def test_a():\n    raise AssertionError('set aside, never run')\n"
+                       "def test_b():\n    pass\ndef test_c():\n    pass\n",
+                       recorded=True, split="1/1")
+    assert row["exitCode"] == 0, row["output"]
 
 
 def test_a_recycled_rows_later_process_runs_on_the_commits_checkout(ci, tmp_path, monkeypatch):
