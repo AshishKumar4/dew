@@ -156,3 +156,60 @@ def test_a_bidirectional_layer_holds_no_relative_bias():
     canvas = causal.clone(ctx=dataclasses.replace(causal.ctx, causal=False))
     with pytest.raises(ValueError):
         canvas.init(jax.random.key(0), x)
+
+
+BAND_QUERIES = 1600
+"""A band's queries in its tests: past two of its groups (`template.BAND_GROUP`), so three origins."""
+
+
+@pytest.mark.parametrize("extent, offset", [(1, 0), (5, 37), (300, [0, 1000]), (1024, 1)],
+                         ids=["one", "five-chunked", "rows-apart", "inkling"])
+def test_a_relative_band_holds_the_relative_bias_it_writes_out(extent, offset):
+    """Row 13138: an input-conditioned relative bias as a band (`relative_band`), written out over the call's
+    keys (`BandBias.dense`), is the bias `relative_logits` forms over every query and key, at a prefill from
+    the first key, at a chunk's (`offset` its first place) and at rows a chunk apart, over three of the
+    band's query groups, integer states and bank so either's sums are exact; and its every key within
+    `extent - 1` before a query's place through its place lies in the query's band."""
+    from dew.nn.attention import BandBias
+    from dew.nn.attention_terms import relative_band, relative_logits
+    from dew.nn.kernels.templates import attention as template
+
+    rng = np.random.default_rng([0x13138, extent])
+    rows, heads, rank = 2, 2, 3
+    starts = np.broadcast_to(np.asarray(offset, np.int32), (rows,))
+    keys = BAND_QUERIES + int(starts.max())
+    states = jnp.asarray(rng.integers(-3, 4, (rows, BAND_QUERIES, heads, rank)), jnp.float32)
+    bank = jnp.asarray(rng.integers(-3, 4, (rank, extent)), jnp.float32)
+    band = relative_band(states, bank, jnp.asarray(offset, jnp.int32))
+    places = starts[:, None] + np.arange(BAND_QUERIES)[None, :]
+    np.testing.assert_array_equal(np.asarray(band.dense(keys)),
+                                  np.asarray(relative_logits(states, bank, places, np.arange(keys))))
+    ones = BandBias(jnp.ones((1, 1, BAND_QUERIES, template.band_width(extent)), jnp.float32),
+                    jnp.asarray(offset, jnp.int32), extent)
+    held = np.asarray(ones.dense(keys))[:, 0]
+    distance = places[:, :, None] - np.arange(keys)[None, None, :]
+    assert (held[np.broadcast_to((distance >= 0) & (distance < extent), held.shape)] == 1).all()
+
+
+def test_a_relative_band_holds_a_groups_products_at_a_time():
+    """Row 13138: a relative band (`relative_band`) forms each query group's products against the bank and
+    reads them into the band, never every query's at once beside it: no array of its program holds the
+    call's `[Q, extent]` products (an Inkling 2 prefill's 32768 queries', 3.2 GiB a layer)."""
+    from dew.nn import programs
+    from dew.nn.attention_terms import relative_band
+    from dew.nn.kernels.templates import attention as template
+
+    extent = 64
+    states = jax.ShapeDtypeStruct((1, BAND_QUERIES, 2, 3), jnp.float32)
+    bank = jax.ShapeDtypeStruct((3, extent), jnp.float32)
+    traced = jax.make_jaxpr(lambda s, b: relative_band(s, b, jnp.int32(0)).values)(states, bank).jaxpr
+
+    def shapes(jaxpr):
+        for equation in jaxpr.eqns:
+            yield from (getattr(var.aval, "shape", ()) for var in equation.outvars)
+            for inner in programs.bodies(equation):
+                yield from shapes(inner)
+
+    found = list(shapes(traced))
+    assert any(shape[-2:] == (template.BAND_GROUP, extent) for shape in found), found
+    assert not any(shape[-2:] == (BAND_QUERIES, extent) for shape in found)
