@@ -19,7 +19,7 @@ from reference_error import assert_as_exact, equations
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates import product, rings
 from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
-from dew.nn.kernels.templates.hooks import Hook, Side
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 SEEDS = 8
 """The gathered product's check-1 seeds, the template's grouped products' count."""
@@ -1081,3 +1081,60 @@ def test_gathered_prologued_paired_layered_with_compute_holds_check_1_and_compil
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.parametrize("prologue", [None, "identity", "doubled"])
+def test_a_gathered_rows_cotangent_sums_its_routes_wide_before_it_rounds(prologue):
+    """A bf16 row read by two routes of a gathered projection (`gemm`'s `gather`), their cotangents 256 and
+    -255.5 times a unit matrix: the row's cotangent is the routes' fp32 sum, 0.5 (1.0 through a doubling
+    prologue at fp32, `compute`), rounded once to bf16, where each route rounded first (256 and -256, 255.5
+    a bf16 tie) summed 0 (row 12396, as the packed kernel's pullback sums them)."""
+    tokens = jnp.ones((1, 64), jnp.bfloat16)
+    matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
+    table = jnp.zeros((2,), jnp.int32)
+    cotangent = jnp.zeros((2, 64), jnp.float32).at[:, 0].set(jnp.asarray([256.0, -255.5]))
+    hook = {None: NO_HOOK, "identity": Hook(lambda rows: rows), "doubled": Hook(lambda rows: rows * 2)}
+
+    def product(rows):
+        return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), prologue=hook[prologue],
+                         compute=None if prologue is None else jnp.float32, out_dtype=jnp.float32,
+                         gather=table)
+
+    (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
+    assert float(d_tokens[0, 0]) == (1.0 if prologue == "doubled" else 0.5)
+
+
+def test_a_gathered_prologue_pulls_back_at_its_forwards_branch():
+    """A gathered call's prologue pulled back at the dtype its forward ran it (`compute`), its branch the
+    forward's: fp32 rows of 1 + 2^-9, a bf16 prologue `where(x > 1, x, 0)` that reads them as 1 (its zero
+    branch), so the rows' cotangent is zero, as its forward-mode tangent is (row 12396's review)."""
+    tokens = jnp.full((1, 64), 1 + 2.0 ** -9, jnp.float32)
+    matrix = jnp.ones((1, 64, 64), jnp.float32)
+    table = jnp.zeros((2,), jnp.int32)
+
+    def product(rows):
+        return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32),
+                         prologue=Hook(lambda x: jnp.where(x > 1, x, 0)), compute=jnp.bfloat16,
+                         out_dtype=jnp.float32, gather=table)
+
+    (d_tokens,) = jax.vjp(product, tokens)[1](jnp.ones((2, 64), jnp.float32))
+    _, tangent = jax.jvp(product, (tokens,), (jnp.ones_like(tokens),))
+    np.testing.assert_array_equal(np.asarray(d_tokens), np.zeros_like(tokens))
+    np.testing.assert_array_equal(np.asarray(tangent), np.zeros((2, 64), np.float32))
+
+
+def test_a_gathered_rows_fp64_cotangents_sum_in_fp64():
+    """A bf16 row's two routes of fp64 cotangents, 2^24 + 1 and -2^24, through a unit matrix and an fp64
+    output, sum in fp64 to 1 (the cotangents' own width, row 12396's review), where an fp32 sum (2^24 + 1
+    rounding to 2^24) reads 0."""
+    with jax.enable_x64(new_val=True):
+        tokens = jnp.ones((1, 64), jnp.bfloat16)
+        matrix = jnp.zeros((1, 64, 64), jnp.bfloat16).at[0, 0, 0].set(1.0)
+        table = jnp.zeros((2,), jnp.int32)
+        cotangent = jnp.zeros((2, 64), jnp.float64).at[:, 0].set(jnp.asarray([2.0 ** 24 + 1, -(2.0 ** 24)]))
+
+        def product(rows):
+            return gemm.gemm(rows, matrix, jnp.asarray([2], jnp.int32), out_dtype=jnp.float64, gather=table)
+
+        (d_tokens,) = jax.vjp(product, tokens)[1](cotangent)
+        assert float(d_tokens[0, 0]) == 1.0

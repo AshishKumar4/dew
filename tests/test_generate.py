@@ -325,9 +325,10 @@ def test_continuations_run_on_a_routed_expert_decoder(rng):
 def test_generate_refuses_an_exchange_wherever_the_decoder_routes_it(rng, site):
     """A decoder routes either in its feed-forward slot (its `mixture`) or in a
     layer kind's mixer slot (Nemotron-H's `MLPMixer` with a mixture of its own);
-    either exchange runs a shard_map that the loop's checks cannot reach
-    (jax-ml/jax#40907), so the decoder reports it (`Generating`) and `generate`
-    refuses it, where the same layers under the global dispatch generate."""
+    either exchange reads its expert axis off a mesh in context, which `generate`
+    does not run under (row 13493), so the decoder reports it (`Generating`) and
+    `generate` refuses it, where the same layers under the global dispatch
+    generate."""
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.mlp import MLPMixer
 

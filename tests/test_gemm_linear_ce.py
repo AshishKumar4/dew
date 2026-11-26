@@ -171,7 +171,7 @@ def test_linear_cross_entropy_mixed_dtype_refuses_native():
     with generation.assumed("sm90"):
         ba = linear_ce.MOSAIC_LINEAR_CE.bind(
             jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((64, 64), jnp.float32),
-            jax.ShapeDtypeStruct((64,), jnp.int32), None, transpose_rhs=True, softcap=None, interpret=True)
+            jax.ShapeDtypeStruct((64,), jnp.int32), None, transpose_rhs=True, interpret=True)
         assert not linear_ce.MOSAIC_LINEAR_CE.eligible(ba, generation.gpu_target())
         tile = linear_ce.derive_linear_ce((64, 64, 64), jnp.bfloat16, generation.gpu_target(), interpret=True)
         assert tile is not None
@@ -258,3 +258,4 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
                 x, head, targets, chunks=1, tile=(64, 64), predict=False)
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
+

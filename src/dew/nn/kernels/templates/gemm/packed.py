@@ -181,7 +181,7 @@ def decoding(decoded: list, tiles, wg, interpret: bool, *,
     shared or its own (`shared_decode`); None for a matrix of no words."""
     if not decoded:
         return None
-    if shared_decode(tiles, interpret=interpret):
+    if weight_fmt != ROW_CODES and shared_decode(tiles, interpret=interpret):
         return Decoding(decoded[0], wg, tiles.warpgroups, weight_fmt=weight_fmt)
     return Decoding(decoded[0].at[wg], 0, 1, weight_fmt=weight_fmt)
 
@@ -198,6 +198,17 @@ def shared_decode(tiles, *, interpret) -> bool:
 CODES = "codes"
 """Dew: the decode of a matrix of 8-bit codes beside 16-bit rows (`Decoding`'s `weight_fmt`), each stage
 converted exactly (`mosaic_gpu.gmm`'s, row 8548), where no format's words are packed."""
+
+
+ROW_CODES = "row codes"
+"""Dew: the decode of rows of 8-bit codes beside a 16-bit matrix (`Decoding`'s `weight_fmt`): a swapped
+call's, its codes matrix the products' rows (row 5387), each consumer converting its own rows' stage."""
+
+
+def decode_of(rows, matrix) -> str | None:
+    """Dew: a stage decode a call of `rows` beside `matrix` takes where no packed format names one (`gmm`'s):
+    its matrix's codes converted (`CODES`), or its rows' (`ROW_CODES`); None where neither is codes."""
+    return CODES if converted(rows, matrix) else ROW_CODES if converted(matrix, rows) else None
 
 
 def converted(rows, matrix) -> bool:
@@ -223,9 +234,14 @@ class Decoding:
     consumers: int
     weight_fmt: str | None = None
 
-    def decode(self, index, slots, interpret: bool, *, layout=None, family=None):
+    @property
+    def converts_rows(self) -> bool:
+        """Whether it converts the rows' stage, a swapped call's codes (`ROW_CODES`), not the matrix's."""
+        return self.weight_fmt == ROW_CODES
+
+    def decode(self, index, slots, interpret: bool, *, layout=None, family=None, rows=None):
         """Step `index`'s stage of words (and NVFP4 scales) or of 8-bit codes (`slots`'), this consumer's
-        share of it, decoded into its buffer, which it returns."""
+        share of it (its own `rows` of a rows' stage), decoded into its buffer, which it returns."""
         if self.consumers > 1:
             # A tile's first step restarts the buffers' rotation (`index` is the tile's own): every consumer
             # has drained its last tile's products, which read them, before any decodes into them.
@@ -233,13 +249,14 @@ class Decoding:
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])
-        if self.weight_fmt == CODES:
+        if self.weight_fmt in (CODES, ROW_CODES):
             # Codes (`gmm_allocations`' `converted`): the warpgroup met where it converts alone, its threads
             # reading each other's writes (`mosaic.synced`); consumers sharing them meet (`met`).
             from dew.nn.kernels.templates import mosaic
 
             assert family is not None, "a stage of codes converts on its products' family"
-            family.converted(slots['matrix'].at[mine], buffer.at[mine], interpret)
+            codes = slots['rows'].at[rows] if self.converts_rows else slots['matrix'].at[mine]
+            family.converted(codes, buffer if self.converts_rows else buffer.at[mine], interpret)
             if self.consumers == 1:
                 mosaic.synced(interpret)
         elif self.weight_fmt is not None:

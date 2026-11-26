@@ -50,6 +50,7 @@ from dew.mesh import (
 )
 from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.kernels.templates.gemm import rows_gathered_wide
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import Residual
 
@@ -1379,7 +1380,9 @@ def _exchange_shard[Parameters](
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
     rows = order // top_k
-    send = tokens[rows]
+    # Each route's cotangent comes back over the exchange in the rows' own dtype, rounded there once, and a
+    # token's routes sum wide (`rows_gathered_wide`, as a gathered product's do, row 12396).
+    send = rows_gathered_wide(tokens, rows)
     if input_weights is not None:
         send = send * input_weights.ravel()[order][:, None].astype(send.dtype)
     # Every device's slots for every expert, `[sender, expert]` (a dropped slot's sentinel expert sorts last

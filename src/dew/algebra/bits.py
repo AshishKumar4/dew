@@ -22,7 +22,7 @@ import numpy as np
 
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
-from dew.nn.float_bits import raised_exactly, raw_fields
+from dew.nn.float_bits import quiet_nan, raised_exactly, raw_fields
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
@@ -336,7 +336,7 @@ class BitForm:
         """The most registers a word's decode holds at once: its stored word and each step's value, each
         from the step that makes it to the step that last reads it (whose result may take its register),
         an output register's to the decode's end: what a consumer prices beside its tiles before it admits
-        one (`grouped_matmul.MosaicPackedGmm.registers`). `NVFP4_BFLOAT16_FORM` holds five."""
+        one (`grouped_quantized.MosaicPackedGmm.registers`). `NVFP4_BFLOAT16_FORM` holds five."""
         end = len(self.steps) + 1
         last = {value: value for value in range(end)}
         for index, step in enumerate(self.steps, start=1):
@@ -749,10 +749,6 @@ E4M3_SCALE_OWED = 2.0 ** 120
 2^120, restored exactly by integer exponent arithmetic (`float_bits.raised_exactly`)."""
 
 
-def _quiet_nan(sign: jax.Array) -> jax.Array:
-    return jax.lax.bitcast_convert_type(sign | np.uint32(0x7FC00000), jnp.float32)
-
-
 def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx_registers`,
@@ -763,7 +759,7 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
     held = codes.astype(jnp.uint32)
     (pattern,) = E4M3_SCALE_FORM.traced(held)
     value = raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
-    return jnp.where(held & 0x7F == 0x7F, _quiet_nan((held & np.uint32(0x80)) << np.uint32(24)), value)
+    return jnp.where(held & 0x7F == 0x7F, quiet_nan((held & np.uint32(0x80)) != 0, jnp.float32), value)
 
 
 E8M0_SCALE_FORM = BitForm(
@@ -888,7 +884,8 @@ def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
         if inf_code > minifloat.largest:
             inf = jax.lax.bitcast_convert_type(sign | word(0x7F800000), jnp.float32)
             value = jnp.where(magnitude == word(inf_code), inf, value)
-        value = jnp.where(magnitude > word(max(minifloat.largest, inf_code)), _quiet_nan(sign), value)
+        nan = magnitude > word(max(minifloat.largest, inf_code))
+        value = jnp.where(nan, quiet_nan(sign != 0, jnp.float32), value)
     return value
 
 

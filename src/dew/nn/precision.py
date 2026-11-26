@@ -1749,12 +1749,21 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     near 2**-65), so no one order holds both ends; the result overflows only where the product does. Its
     tests are comparisons alone (finite: a magnitude below infinity), so a kernel's epilogue runs it as XLA
     does: Mosaic GPU lowers no `is_finite` (`gemm.nvfp4_block_finished`, row 12721)."""
+    left, right = twice_scaled_operands(product, first, second)
+    return left * right
+
+
+def twice_scaled_operands(product: jax.Array, first: jax.Array,
+                          second: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`twice_scaled`'s last multiply's two operands, in its order: the product times the scale whose
+    intermediate is normal, and the other scale; a caller rounding that multiply itself takes them (the
+    int8-row ternary epilogue's one rounding past a flushing platform, `factored.lowered_product`)."""
     tiny = jnp.finfo(product.dtype).tiny
     once = product * first
     magnitude = jnp.abs(once)
     # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
     kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
-    return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+    return jnp.where(kept, once, product * second), jnp.where(kept, second, first)  # no cotangent unchosen
 
 
 def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax.Array:
@@ -1763,7 +1772,7 @@ def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax
     or the scales' own product first where neither intermediate is normal and it is: a subnormal row scale
     beside a column scale near the largest (2**-128 and 2**127 of a 2.25 partial: 1.125, row 13274), which
     a recipe's block scales may be, as no NVFP4 tensor scale is. The one rule a blockwise product's every
-    arm scales its own partials by, a kernel's step and XLA's (`mosaic_gpu._step_scaling`,
+    arm scales its own partials by, a kernel's step and XLA's (`step_scales.scaled_step`,
     `xla_products.step_scaled`), whatever its codes' format (row 13291): the same partial and scales give
     the same value in each, though a step's partial itself is each arm's (Hopper's tensor cores align
     within a step where XLA's fp32 sum does not, docs/design/testing.md). Each order's operands are chosen

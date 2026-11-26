@@ -75,8 +75,10 @@ class Tail:
         # The tail tile's slot of its first program's partial (`mosaic.Family.fixed_up`'s `firsts`): a slot a
         # tile, which a segment past the tail's tiles (walking none) reads as its last.
         slot = jnp.minimum(jnp.where(whole, 0, tail_tile), self.tiles - 1)
+        # A whole wave's tile is its program's alone, whatever the tail's partitions: a program past them
+        # (idle in the tail, `_partitions`' split) still stores its whole waves' tiles.
         return (jnp.minimum(tile, tiles - 1), start, jnp.maximum(end - start, 0),
-                (first, jnp.minimum(gathered, self.partitions), slot))
+                (first, jnp.where(whole, gathered, jnp.minimum(gathered, self.partitions)), slot))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,17 +119,38 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *, handoff
     back through device memory (`partial_bytes` each, `Tail.partials`); and a family whose walk is scoped to
     its block (`scoped`: mma.sync's, `mosaic.Family.walks_scoped`), launched persistent where its tail
     balances, its whole waves' blocks drifting out of the L2 (`_drift`, rows 5363, 11945). Each round takes
-    its MMA step, or its missed bytes at the memory's rate where longer."""
+    its MMA step, or its missed bytes at the memory's rate where longer.
+
+    Its programs share the steps as every program a range (stream-K's), or as a whole number of ranges a
+    tile (`_partitions`: each tile's depth split alike, CUTLASS's split-K tail), whichever prices least:
+    split alike, the programs on a tile row's or column's tiles walk the same steps together, so each reads
+    the blocks the others read (a GH200's 2048 x 2560 x 8192 tail, 14 tiles over 66 pairs: a quarter of
+    each tile's depth a program reads its blocks from the L2 and leaves 42 partials, where stream-K's 66
+    ranges cross its tiles out of step, a quarter of their rounds the memory's, and leave 64; M-NG-32b)."""
     waves, tail = divmod(tiles, programs)
     if waves == 0 or tail == 0 or steps == 0:
         return None
     iterations = tail * steps
-    candidate = Tail(waves, iterations, min(programs, iterations), steps)
     rows, columns = snaked(np.arange(waves * programs, tiles), traffic.grid, 1, traffic.band)
-    shared = (_rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
-              + 2 * candidate.partials() * partial_bytes / traffic.bandwidth
-              + (_drift(waves, steps, programs, traffic) if scoped else 0.0))
-    return candidate if shared < _walked(steps, rows, columns, traffic) else None
+    drift = _drift(waves, steps, programs, traffic) if scoped else 0.0
+
+    def shared(candidate: Tail) -> float:
+        return (_rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
+                + 2 * candidate.partials() * partial_bytes / traffic.bandwidth + drift)
+
+    # The cheapest, the first of equal prices (stream-K's), each priced once.
+    price, _, partitions = min((shared(Tail(waves, iterations, partitions, steps)), at, partitions)
+                               for at, partitions in enumerate(_partitions(tail, steps, programs)))
+    return (Tail(waves, iterations, partitions, steps) if price < _walked(steps, rows, columns, traffic)
+            else None)
+
+
+def _partitions(tail: int, steps: int, programs: int) -> tuple[int, ...]:
+    """The ranges a balanced tail of `tail` tiles of `steps` steps may share among `programs`: one a
+    program (stream-K's), and each tile's depth split into `split` alike, from two to as many as the
+    programs hold (`tail * split`), each part a step at least; a split of one is the tail walked."""
+    return tuple(dict.fromkeys((min(programs, tail * steps),
+                                *(tail * split for split in range(2, min(programs // tail, steps) + 1)))))
 
 
 def _drift(waves: int, steps: int, programs: int, traffic: Traffic) -> float:

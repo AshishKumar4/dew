@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +33,7 @@ products): a 64-column tile's and a bfloat16 step's least (`MosaicConvertedGmm.c
 class Codes:
     """A matrix of FP8 codes as the converting launch binds it (`MosaicConvertedGmm`, `trans_rhs`): `codes`
     K-major, `[groups, width, depth]`, its shape theirs and its dtype the bfloat16 they widen to exactly, the
-    products', as a packed matrix states its decoded one (`grouped_matmul._PackedMatrix`)."""
+    products', as a packed matrix states its decoded one (`grouped_quantized._PackedMatrix`)."""
 
     codes: jax.Array | jax.ShapeDtypeStruct
 
@@ -48,52 +47,94 @@ class Codes:
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
-    """`MosaicPackedGmm` of a matrix of FP8 codes (`Codes`) beside bfloat16 rows on a family of no FP8
+class MosaicConvertedGmm(grouped_matmul.MosaicGmm):
+    """`MosaicGmm` of a matrix of FP8 codes (`Codes`) beside bfloat16 rows on a family of no FP8
     products: its codes streamed as they lie, K-major, a byte each, each stage converted exactly into the
-    consumers' bfloat16 buffers (`mosaic_gpu.gmm_allocations`' `converted`), at the family's own steps,
-    never swapped (no register decode takes a code's byte)."""
-
-    STEPS: ClassVar[tuple[int, ...] | None] = None
+    consumers' bfloat16 buffers (`packed.CODES`), at the family's own steps. A decode-sized call runs
+    swapped where the family swaps a bfloat16 call (mma.sync's: `MosaicGmm._swaps_on`): the codes the
+    products' rows, each consumer converting its own rows' stage (`packed.ROW_CODES`), the call's rows the
+    columns (row 5387)."""
 
     @property
     def _scaled(self) -> bool:
         # Its codes' layout is the caller's, whole steps and tiles (`STEP`): the call is not padded.
         return True
 
-    def _streamed_matrix(self, kernel: Codes | grouped_matmul._PackedMatrix, trans_rhs: bool) -> tuple:
+    def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
         assert isinstance(kernel, Codes), "a converting launch streams a matrix of codes"
         return kernel.codes, True, {}
 
+    def _matrix_transposed(self, ba) -> bool:
+        # Its codes K-major, or a swapped call's rows read transposed (`_swapped`), whatever the binding.
+        del ba
+        return True
+
+    def _legal(self, ba, config: tiling.Tiles, target) -> bool:
+        return config.splits == 1 and super()._legal(ba, config, target)
+
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family):
         from dew.nn.kernels.templates.gemm import mosaic_gpu
 
+        rows, matrix = (_stored_dtype(ba.arguments[name]) for name in ('tokens', 'kernel'))
         return mosaic_gpu.gmm_allocations(
-            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=ba.arguments['kernel'].codes.dtype,
-            transpose_rhs=True, prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
-            dtypes=(ba.arguments['out_dtype'],))
+            config, family, dtype=rows, rhs_dtype=matrix, transpose_rhs=True, prologue_axes=(),
+            prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(), dtypes=(ba.arguments['out_dtype'],))
 
-    def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
-        del family, dtype
-        return False
+    def candidate(self, ba, config: tiling.Tiles, target) -> bool:
+        # A matrix's stage converts whole 64-column fragments (`Family.converted`'s layout, the products'
+        # accumulator's); a swapped call's rows of codes convert at any width, so its narrow columns (a
+        # decode's rows) take a tile.
+        whole = isinstance(ba.arguments['tokens'], Codes) or config.block_n % 64 == 0
+        return (config.cluster == 1 and config.splits == 1 and not config.swapped and whole
+                and super().candidate(ba, config, target))
+
+    def _swapped(self, ba, target):
+        # The bfloat16 call's swapped binding (`MosaicGmm._swapped`), its rows the matrix's codes.
+        swapped = super()._swapped(ba, target)
+        if swapped is None:
+            return None
+        codes = ba.arguments['kernel'].codes
+        return type(swapped)(swapped.op, {**swapped.arguments, 'tokens': Codes(jax.ShapeDtypeStruct(
+            swapped.arguments['tokens'].shape, codes.dtype))})
+
+    def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
+                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+                       hooks, exact_sums: bool, dense: bool, config: tiling.Tiles, formats: dict, target):
+        if not config.swapped:
+            return super()._launched_call(
+                tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather, scatter,
+                joined, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
+                exact_sums=exact_sums, dense=dense, config=config, formats=formats, target=target)
+        # The codes the products' rows (`_swapped`), each consumer's converted in its stage (`ROW_CODES`).
+        return self._swapped_launch(kernel.codes[0], tokens, sizes, out_dtype=out_dtype, interpret=interpret,
+                                    exact_sums=exact_sums, config=config, target=target, **formats)
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
-        # Its rows' bytes and its codes' one, each stage converted into a bfloat16 buffer its consumers share
-        # or each holds (`packed.shared_decode`).
+        # Its rows' bytes and its codes' one, each stage of codes converted into bfloat16 buffers: the
+        # matrix's its consumers share or each holds (`packed.shared_decode`); a swapped call's rows each
+        # consumer converts its own share of, one stage's whole between them (`Decoding.converts_rows`).
         from dew.nn.kernels.templates.gemm import packed
 
         rows = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
+        if tile.swapped:
+            return (1.0, rows), ((rows, 1), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
         return (rows, 1.0), (None, (rows, copies))
 
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
-        # Beside the plain product's live set, a conversion's chunk of a consumer's share of the stage's
-        # columns (`mosaic.Family.converted`: a widened code and its fp32 value an entry).
-        columns = config.block_n // config.warpgroups
-        converted = 2 * columns * min(config.block_k, 128)
-        return grouped_matmul._beside(grouped_matmul.MosaicGmm._registers(
-            self, ba, config, merging=merging, target=target), converted // resources.THREADS)
+        # Beside the plain product's live set, a conversion's chunk of a consumer's share of its stage of
+        # codes, the matrix's columns or a swapped call's rows (`mosaic.Family.converted`: a widened code
+        # and its fp32 value an entry).
+        share = (config.block_m if isinstance(ba.arguments['tokens'], Codes) else config.block_n)
+        converted = 2 * share // config.warpgroups * min(config.block_k, 128)
+        return grouped_matmul._beside(super()._registers(ba, config, merging=merging, target=target),
+                                      converted // resources.THREADS)
+
+
+def _stored_dtype(operand) -> jnp.dtype:
+    """An operand's dtype as its stream stores it: a matrix of codes' (`Codes`), else its own."""
+    return jnp.dtype(operand.codes.dtype if isinstance(operand, Codes) else operand.dtype)
 
 
 FP8_CODES: selection.Op[gemm.WordPackedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (

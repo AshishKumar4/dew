@@ -18,7 +18,7 @@ from jax.typing import DTypeLike
 
 from dew.algebra import bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
-from dew.nn.float_bits import exact_power2, raw_fields, rounded_binary
+from dew.nn.float_bits import exact_power2, quiet_nan, raw_fields, rounded_binary
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
@@ -299,12 +299,7 @@ def _mxfp8_decoded(dtype, codes, exponents, invalid):
     stored = jax.lax.bitcast_convert_type(codes, jnp.uint8)
     special = (stored & np.uint8(0x7F)) == np.uint8(0x7F)
     negative = (stored == np.uint8(0xFF)) & ~invalid
-    limits = jnp.finfo(landed.dtype)
-    word = jnp.dtype(f"uint{limits.bits}")
-    quiet = word.type((((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1)))
-    bits = quiet | (negative.astype(word) << word.type(limits.bits - 1))
-    nan = jax.lax.bitcast_convert_type(bits, landed.dtype)
-    return jnp.where(special | invalid, nan, landed).astype(dtype)
+    return jnp.where(special | invalid, quiet_nan(negative, landed.dtype), landed).astype(dtype)
 
 
 def _mxfp8_decode_tangent(dtype, primals, tangents):
@@ -616,3 +611,9 @@ def _ternary_decode_tangent(dtype, primals, tangents):
 _decode_ternary = contracted("test_decoded_ternary_preserves_its_linear_scale_rule")(
     declared_tangent(Protected(), _ternary_decoded, _ternary_decode_tangent,
                      nondiff_argnums=(0,), symbolic_zeros=True))
+
+
+PACKED_FORMATS = (NvFp4, TernaryWeights)
+"""The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
+codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
+(`checkpoints._packed_checked`)."""

@@ -18,7 +18,7 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_quantized, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 from dew.nn.kernels.templates.hooks import Hook, Side
 
@@ -212,7 +212,7 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     matrix, values = nvfp4(13, 1024, 256, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(14).integers(-3, 4, size=(13, 1024)), jnp.float32)
     swapped = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
-    launch = grouped_matmul.MosaicPackedGmm()
+    launch = grouped_quantized.MosaicPackedGmm()
 
     def product(x, kernel):
         with generation.chosen(nvfp4=kernel):
@@ -223,8 +223,8 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
             product(rows, "packed")
         assert all(launch.legal(ba, config, generation.gpu_target())
                    for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, grouped_matmul.MosaicPackedGmm)), launches.taken
-        with tuning.pinned({grouped_matmul.MosaicPackedGmm: swapped}):
+                   if isinstance(op, grouped_quantized.MosaicPackedGmm)), launches.taken
+        with tuning.pinned({grouped_quantized.MosaicPackedGmm: swapped}):
             got = product(rows, "packed")
         want = product(rows, "xla")
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -1129,3 +1129,16 @@ def test_an_amax_history_is_a_whole_number_of_steps(history):
 
     with pytest.raises(ValueError):
         LowPrecision(recipe="nvfp4", tensor_scaling="delayed", amax_history=history)
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_grouped_nvfp4_product_of_no_depth_is_zero(generation_name):
+    """A grouped NVFP4 product of rows of no depth and a bank of one empty matrix `[1, 0, 64]` is zeros,
+    its launch priced by its format's bytes a value (a bank of no values, row 5387's review: a byte count
+    divided by its size raised before its route was chosen)."""
+    matrix = formats.NvFp4.of(np.zeros((1, 0, 64), np.float32), np.zeros((1, 0, 64), ml_dtypes.float8_e4m3fn),
+                              np.ones((1,), np.float32))
+    with generation.assumed(generation_name):
+        out = gemm.nvfp4_product(jnp.zeros((8, 0), jnp.float32), matrix, jnp.asarray([8], jnp.int32),
+                                 out_dtype=jnp.float32, interpret_on_cpu=True)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((8, 64), np.float32))

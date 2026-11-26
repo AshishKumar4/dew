@@ -38,6 +38,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import checkify
 
 from dew.nn.precision import at_least_fp32, weighted_total
 
@@ -73,9 +74,11 @@ def masked_whiten(x: jax.Array, mask: jax.Array,
 
     Tunix and verl both whiten GAE advantages this way, Bessel correction
     included. Both also leave the positions outside the mask in the output,
-    for the loss to mask again. With only one unmasked position the
-    correction divides by zero. verl raises an error there; this function
-    runs under jit and cannot.
+    for the loss to mask again. Unbiased whitening needs at least two
+    unmasked entries over everything it reads (`total`): fewer is refused
+    where the call is checked (`checkify`, as a sampler's draws are) and
+    costs nothing where it is not, so a caller validates at its own boundary,
+    as PPO's collector does before it scores (verl raises there too).
 
     `total` sums the moments over every share of the data the whitening
     reads, a pool's processes for PPO's rollout; by default `x` is all of it.
@@ -85,6 +88,8 @@ def masked_whiten(x: jax.Array, mask: jax.Array,
     weights = mask.astype(x.dtype)
     kept, count = weighted_total(x, weights)
     count, kept = total(jnp.stack([count, kept]))
+    checkify.check(count >= 2, "unbiased whitening needs at least two unmasked entries, got {count}",
+                   count=count, debug=True)
     mean = kept / (count + MEAN_EPS)
     deviations = jnp.where(weights != 0, x - mean, 0)
     variance = total(weighted_total(jnp.square(deviations), weights)[0]) / (count + MEAN_EPS)
