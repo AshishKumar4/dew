@@ -148,7 +148,7 @@ def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entri
 @pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
 def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a_cpu(quantize):
     """A ternary product at a subnormal scale (`2**-127`, a row of one) traced where the default device is a
-    CUDA one and lowered for a CPU, which flushes subnormals: it returns `2**-127`, the lowered platform
+    GPU one and lowered for a CPU, which flushes subnormals: it returns `2**-127`, the lowered platform
     choosing the scale's software arm (`factored.flushing`, row 13569), not the traced one's multiply."""
     values = np.zeros((256, 2), np.float32)
     values[0] = (1.0, -1.0)
@@ -161,7 +161,7 @@ def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a
         return gemm.ternary_weight_product(rows, weights, quantize_activations=quantize,
                                            out_dtype=jnp.float32)
 
-    with jax.default_device("cuda"):
+    with jax.default_device("gpu"):
         lowered = jax.jit(product).trace(rows).lower(lowering_platforms=("cpu",))
     got = np.asarray(lowered.compile()(rows), np.float32)
     np.testing.assert_array_equal(got.view(np.uint32),
