@@ -19,10 +19,10 @@ from .common import (
     ProjectorLayout,
     TowerLayout,
     _vision_section,
+    axial_rope_part,
     block_routes,
     integer_field,
     number_field,
-    rope_base,
 )
 
 _TENSORS = MappingProxyType({
@@ -84,22 +84,6 @@ def _inkling_weights(hf_tensors: Mapping[str, Stored], path_of: Callable[[str], 
     return placed(tensors, path_of, param_dtype)
 
 
-def _read_rope(vision: Mapping[str, object], used: set[str],
-               record: NativeFields[InklingVision]) -> NativeFields[InklingVision]:
-    """The axial rotary's base: Inkling 2's trunk turns no other (Inkling2VisionRotaryEmbedding)."""
-    used.update(("rope_parameters", "rope_theta"))
-    rope = _records.record(vision.get("rope_parameters") or {"rope_type": "axial"}, "rope_parameters")
-    if rope.get("rope_type", "axial") != "axial":
-        raise ValueError(f"Inkling 2's trunk turns its axial rotary alone, not {rope.get('rope_type')!r}")
-    record["rope_theta"] = rope_base({**vision, "rope_parameters": rope}, InklingVision.rope_theta,
-                                     axial=True)
-    return record
-
-
-def _write_rope(tower: InklingVision) -> Mapping[str, object]:
-    return {"rope_parameters": {"rope_type": "axial", "rope_theta": tower.rope_theta}}
-
-
 def _mlp_width(vision: Mapping[str, object], used: set[str],
                record: NativeFields[InklingVision]) -> NativeFields[InklingVision]:
     """The feed-forward width: `intermediate_size`, else `mlp_ratio` times the width (the config class's
@@ -122,7 +106,7 @@ _CONFIG = ConfigLayout(
     integer_field("posemb_grid_size", default=32), number_field("layer_norm_eps", default=1e-5),
     number_field("layer_scale_init_value", default=0.1),
     ConfigPart(_mlp_width, lambda tower: {"intermediate_size": tower.intermediate_size}),
-    ConfigPart(_read_rope, _write_rope))
+    axial_rope_part(InklingVision.rope_theta, "Inkling 2"))
 """An Inkling2VisionConfig's fields and its defaults (configuration_inkling2.py), as the release spells
 them (`native_patch_size`, `adapter_merge_size`), or as transformers writes them (`patch_size`,
 `spatial_merge_size`, the config class's names for those)."""

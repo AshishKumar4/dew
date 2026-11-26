@@ -803,7 +803,8 @@ def _routed_slots(x, index, weights, kernels, *, routed: int, activation: str):
 
         def project(tokens, sizes, _ids, held):
             # No history: a fallback's experts take no delayed-scaling recipe's state.
-            out = gated_experts(tokens, *held, sizes, compute, "auto", None, activation, None)
+            gate, up, down = held
+            out = gated_experts(tokens, gate, up, down, sizes, compute, "auto", None, activation, None)
             return jnp.asarray(out), ()
 
         slots, _ = expert_dispatch(project, x, jnp.where(identity, routed, index), kernels,
@@ -1530,9 +1531,10 @@ class _Seam:
         """The later passes over `state` under one `lax.scan`, the block traced once whatever `loop.steps`
         (row 13144): its program the scan's body (which `_accumulating` evaluates as the forward's, each
         broadcast's gradient summed wide and each layer recomputed under `remat`), torchax's key its carry,
-        so each pass draws its own. Under a count (`passes`), a pass at or past it skipped and one before the
-        last `backprop_steps` it allows run passing no gradient back, as a native loop's counted pass
-        (`looping.counted_branch`), each branch its own (`lax.switch`)."""
+        so each pass draws its own. Under a count (`passes`), a pass at or past it skipped, as a native loop's
+        counted pass (`looping.counted_branch`), each branch its own (`lax.switch`)."""
+        from jax.core import eval_jaxpr
+
         from dew.nn.backbones.looping import counted_branch
 
         env, passes = self.env, self.passes
@@ -1552,19 +1554,14 @@ class _Seam:
             # The pass's program as traced, its attested programs whole for the causality walk
             # (`certify`);
             # `_accumulating` evaluates the scan's body as it evaluates the rest (`_accumulated_scan`).
-            return tuple(jax.core.eval_jaxpr(closed.jaxpr, closed.consts, *carry, step))
-
-        def held_back(carry, step):
-            moved, key = run(carry, step)
-            return jax.lax.stop_gradient(moved), key
+            return tuple(eval_jaxpr(closed.jaxpr, closed.consts, *carry, step))
 
         def body(carry, step):
             if passes is None:
                 return run(carry, step), None
-            branches = ((lambda carry, step: carry, run) if loop.backprop_steps is None
-                        else (lambda carry, step: carry, held_back, run))
-            index = counted_branch(step, passes, loop.backprop_steps)
-            return jax.lax.switch(index, branches, carry, step), None
+            # Skipped or run (a tier-3 loop cuts no gradient: `runnable_loop`).
+            index = counted_branch(step, passes, None)
+            return jax.lax.switch(index, (lambda carry, step: carry, run), carry, step), None
 
         (state, key), _ = jax.lax.scan(body, (state, held), jnp.arange(1, loop.steps, dtype=jnp.int32))
         if any(drew):
@@ -1618,7 +1615,8 @@ def _cache_entry(layer: int) -> int:
     from dew.nn.backbones.looping import pass_offset
 
     seam, step = _SEAM.get(), _PASS.get()
-    if seam is None or seam.loop is None or not step:
+    # A decoding call's passes run pass by pass, each its step (`_Seam.replayed`); a scan's keep no cache.
+    if seam is None or seam.loop is None or not isinstance(step, int) or not step:
         return layer
     return pass_offset(seam.loop, len(seam.stack), step) + layer - seam.first
 

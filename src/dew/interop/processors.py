@@ -663,6 +663,8 @@ class Processor:
         """
         kind = config_wrapper(self.config)
         qwen, packed, gemma = kind.qwen35, kind.packed_media, kind.gemma4
+        if kind.merged_blocks:
+            values = self._unmerged(values)
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
@@ -829,6 +831,25 @@ class Processor:
         tower = self.record.get("tower")
         return (tower is not None
                 and towers.from_record(_records.record(tower, "tower")).geometry().pools_frames)
+
+    def _unmerged(self, values: Mapping[str, object]) -> Mapping[str, object]:
+        """Inkling 2's processor output as packed patches (`Wrapper.merged_blocks`): its `pixel_values`,
+        each merged token's pixels `[merge * patch, merge * patch, channels]` (processing_inkling2.py), as
+        each patch's vector, channels then rows then columns, its merged token's patches row by row, and
+        its `image_grid_thw` counted in merged tokens as the patches' grid."""
+        if "pixel_values" not in values:
+            return values
+        merge = self._merge_size()
+        blocks = np.asarray(values["pixel_values"])
+        if blocks.ndim != 4 or blocks.shape[1] != blocks.shape[2] or blocks.shape[1] % merge:
+            raise ValueError("Inkling 2's pixel_values are square merged-token blocks [tokens, side, side, "
+                             f"channels] tiled by its merge size {merge}")
+        tokens, side, _, channels = blocks.shape
+        patch = side // merge
+        patches = blocks.reshape(tokens, merge, patch, merge, patch, channels).transpose(0, 1, 3, 5, 2, 4)
+        grid = np.asarray(values["image_grid_thw"]) * np.asarray([1, merge, merge])
+        return {**values, "pixel_values": patches.reshape(tokens * merge * merge, channels * patch * patch),
+                "image_grid_thw": grid}
 
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's

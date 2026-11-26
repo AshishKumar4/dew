@@ -153,8 +153,8 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     Each layout keeps the source's own tensor name and points at the leaf path
     the loader built, so an export writes the names the source shipped. The
     language model's tensors bind through the readings its load placed
-    (`language`, by its local names), an alias of a local name through the
-    same one; the media components' through the layouts their readers placed
+    (`language`, by its local names; one its family's `prepare` rewrote into others none), an alias of a
+    local name through the same one; the media components' through the layouts their readers placed
     them by (`media`). A media tensor no component computes with (SigLIP's
     pooling head, auxiliary tensors the reference ignores) keeps its source
     bytes for export.
@@ -168,19 +168,14 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     retained = {}
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
-        if group == "language_model" and local not in readings:
-            # A tensor the decoder family's `prepare` rewrote into others (Inkling 2's depth queries,
-            # stacked): read through those, bound under no raw name, as a decoder load binds its
-            # readings' names alone (`decoder_layouts`).
-            continue
-        if group == "language_model":
+        if group == "language_model" and local in readings:
             layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
                                     record["text_model_type"], language_tree, _in_language_model)
             if layout is None:
                 retained[name] = tensor
             else:
                 bindings.append(layout)
-        elif name not in placed:
+        elif group != "language_model" and name not in placed:
             retained[name] = tensor
     return tuple(bindings), retained
 

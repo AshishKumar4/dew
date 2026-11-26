@@ -25,18 +25,16 @@ PROMPT, IMAGE_TOKEN = 6, 120
 
 
 def draw(seed):
-    """Check 1's inputs, as the recorder drew them (`vision_draw`): each image NCHW in [-1, 1], and the ids
-    around them, each image's placeholders one a merged token."""
+    """Check 1's inputs, as the recorder drew them (`vision_draw`, in its order): each image NCHW in [-1, 1],
+    and the ids around them, each image's placeholders one a merged token."""
     rng = np.random.default_rng(seed)
     side = PATCH * MERGE
-    images = [rng.uniform(-1, 1, (3, rows * side, columns * side)).astype(np.float32)
-              for rows, columns in IMAGES]
-    ids = []
-    for rows, columns in IMAGES:
-        ids += list(rng.integers(0, IMAGE_TOKEN, PROMPT)) + [IMAGE_TOKEN] * (rows * columns)
-    ids += list(rng.integers(0, IMAGE_TOKEN, PROMPT))
-    return {'input_ids': np.asarray([ids], np.int32),
-            **{f'image_{index}': image for index, image in enumerate(images)}}
+    drawn = {f'image_{index}': rng.uniform(-1, 1, (3, rows * side, columns * side)).astype(np.float32)
+             for index, (rows, columns) in enumerate(IMAGES)}
+    spans = [np.concatenate([rng.integers(0, IMAGE_TOKEN, PROMPT), np.full(rows * columns, IMAGE_TOKEN)])
+             for rows, columns in IMAGES]
+    ids = np.concatenate([*spans, rng.integers(0, IMAGE_TOKEN, PROMPT)])
+    return {'input_ids': ids[None].astype(np.int32), **drawn}
 
 
 def media(inputs, dtype):
@@ -87,3 +85,50 @@ def test_its_image_features_and_logits_are_on_par_with_transformers():
     ran = jax.jit(run(loaded.model, jnp.float32))
     assert_as_exact(lambda index, inputs: ran(loaded.variables, inputs), reference, recorded,
                     'Inkling 2 vision', seeds=seeds, truth_fn=truth)
+
+
+class _NoText:
+    """A host processor whose text operations no test here reads: the processor's fields arrive processed
+    (`Processor.from_hf`)."""
+
+    def __call__(self, **_):
+        raise AssertionError("the fields arrive processed")
+
+    def save_pretrained(self, save_directory: str) -> None:
+        raise AssertionError("nothing is saved")
+
+    def apply_chat_template(self, conversation, **_):
+        raise AssertionError("no chat is templated")
+
+    def batch_decode(self, sequences, *, skip_special_tokens: bool) -> list[str]:
+        raise AssertionError("nothing is decoded")
+
+
+def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
+    """transformers' processor's fields for two images of other shapes (each merged token's pixels
+    `[8, 8, 3]`, the grids counted in merged tokens: processing_inkling2.py) read by Dew's processor
+    (`Processor.from_hf`, its `merged_blocks`) give the bundle's logits, bit for bit, as the images packed
+    by hand into the tower's patches do (row 12943's review)."""
+    import json
+
+    from dew.interop.processors import Processor
+
+    loaded = Pretrained.load(BUNDLE, dtype='float32')
+    config = json.loads((BUNDLE / 'config.json').read_text())
+    processor = Processor(_NoText(), config, loaded.model_config, config['text_config']['vocab_size'])
+    inputs = draw(0)
+    side = PATCH * MERGE
+    blocks = [inputs[f'image_{index}'].transpose(1, 2, 0).reshape(rows, side, columns, side, 3)
+              .transpose(0, 2, 1, 3, 4).reshape(-1, side, side, 3)
+              for index, (rows, columns) in enumerate(IMAGES)]
+    ids = inputs['input_ids']
+    processed = processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
+                                   'pixel_values': np.concatenate(blocks),
+                                   'image_grid_thw': np.asarray([[1, *grid] for grid in IMAGES])})
+    model, variables = loaded.model, loaded.variables
+    fields = processed.kwargs()
+    read = jax.jit(lambda variables: model.apply(variables, processed.tokens, **fields))(variables)
+    tokens = jnp.asarray(ids)
+    packed = jax.jit(lambda variables: model.apply(variables, tokens, image_indices=placed(tokens),
+                                                   conditioning=media(inputs, jnp.float32)))(variables)
+    np.testing.assert_array_equal(np.asarray(read), np.asarray(packed))
