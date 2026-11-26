@@ -1127,3 +1127,39 @@ def _check_ternary_weight_product_contract(edge: str) -> None:
     with generation.assumed("sm90"):
         assert_contract(product, (x,), (dx,), cotangent, f"ternary weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)
+
+
+def test_a_scaled_partial_keeps_the_plain_products_overflow_and_non_finite_values():
+    """`precision.scaled_partial` picks the order of its three products, never the value: a product whose true
+    value overflows still overflows (one rounding past the overflow midpoint whose scales' product first
+    reads fp32's largest among them), a NaN, an infinity and a zero operand give the plain product's value,
+    and its derivative in each operand is the plain product's where every order is normal (rows 13274,
+    13291)."""
+    from dew.nn.precision import scaled_partial
+
+    f32 = functools.partial(jnp.asarray, dtype=jnp.float32)
+    for product, first, second in ((2.0 ** 100, 2.0 ** 20, 2.0 ** 10),
+                                   (21 * 2.0 ** 27, 8388626 * 2.0 ** 25, 12782613 * 2.0 ** 25)):
+        assert float(scaled_partial(f32(product), f32(first), f32(second))) == np.inf
+    for product, first, second in ((np.nan, 1.0, 1.0), (np.inf, 2.0, 0.5), (0.0, 2.0 ** 100, 2.0 ** 100),
+                                   (np.inf, 0.0, 1.0), (1.0, np.inf, 0.5)):
+        got = float(scaled_partial(f32(product), f32(first), f32(second)))
+        want = float(np.float32(product) * np.float32(first) * np.float32(second))
+        assert got == want or (np.isnan(got) and np.isnan(want)), (product, first, second, got, want)
+    grads = jax.grad(lambda *ops: scaled_partial(*ops), argnums=(0, 1, 2))(f32(3.0), f32(0.5), f32(4.0))
+    assert tuple(float(g) for g in grads) == (2.0, 12.0, 1.5)
+
+
+def test_a_scaled_partial_joins_its_scales_where_neither_order_holds_and_differentiates_that_order():
+    """`precision.scaled_partial` in float16 (whose subnormals a CPU keeps, where it flushes fp32's): a
+    subnormal row scale 2^-16 beside a column scale 2^15 of a 2.25 partial, each order's intermediate
+    subnormal or past the largest, is 1.125, the scales' product first (row 13274), and its derivatives are
+    that order's alone, a cotangent of 1/4 giving 1/8, 18432 and 9 2^-20, where a cotangent through the
+    unchosen overflowing order reads NaN (row 13291's review)."""
+    from dew.nn.precision import scaled_partial
+
+    f16 = functools.partial(jnp.asarray, dtype=jnp.float16)
+    operands = (f16(2.25), f16(2.0 ** -16), f16(2.0 ** 15))
+    value, pull = jax.vjp(scaled_partial, *operands)
+    assert float(value) == 1.125
+    assert tuple(float(g) for g in pull(f16(0.25))) == (0.125, 18432.0, 9 * 2.0 ** -20)
