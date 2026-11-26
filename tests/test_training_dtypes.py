@@ -432,13 +432,35 @@ def test_a_trainer_given_numerics_traces_draws_and_scales_under_them(preset):
     assert 0 < drawn < len(traced) and all(seen == numerics for seen in traced)
 
 
+def test_a_step_compiled_ahead_traces_under_its_trainers_numerics():
+    """A trainer's step compiled ahead from Python (`compile_ahead`) for compile-only GPUs traces its start
+    and its step under the trainer's numerics, as its fit does (`under_numerics`)."""
+    from test_compile_ahead import gpus
+
+    from dew.training import MeshSpec
+    from dew.training.ahead import compile_ahead
+
+    numerics = Numerics(DTYPE_PRESETS["bf16-true"], matmul="highest", forms="accurate")
+    traced = []
+    trainer = Trainer(Fitted(numerics_reader(traced)(numerics.dtypes.compute)), optax.sgd(.1),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpus("sm90")),
+                      advanced=TrainerAdvanced(numerics=numerics))
+    compile_ahead(trainer, {"x": jnp.ones((8, 2), jnp.float32), "y": jnp.zeros((8, 1), jnp.float32)})
+    assert traced and all(seen == numerics for seen in traced)
+
+
 def test_a_trainer_refuses_numerics_its_model_computes_outside_or_beside_their_own_knobs():
     """Numerics whose compute dtype the model it trains states another of are refused, the model's dtype
     being its own field, as numerics set beside the `param_dtype` and `dynamic_scale` they state are."""
     numerics = Numerics(DTYPE_PRESETS["16-mixed"])
     read = numerics_reader([])
-    with pytest.raises(ValueError):
-        Trainer(Fitted(read(jnp.float32)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
+    # Stating float32, or none (Flax's None, computing in its float32 parameters).
+    for dtype in (jnp.float32, None):
+        with pytest.raises(ValueError):
+            Trainer(Fitted(read(dtype)), optax.sgd(.1), advanced=TrainerAdvanced(numerics=numerics))
+    # Stating none where its parameters are the numerics' compute dtype computes in it.
+    assert not Trainer(Fitted(read(None)), optax.sgd(.1),
+                       advanced=TrainerAdvanced(numerics=Numerics(DTYPE_PRESETS["32-true"]))).dynamic_scale
     for knobs in ({"param_dtype": "bfloat16"}, {"dynamic_scale": True}):
         with pytest.raises(ValueError):
             Trainer(Fitted(read(jnp.float16)), optax.sgd(.1),

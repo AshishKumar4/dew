@@ -84,16 +84,22 @@ class Numbered(Protocol):
     numerics: Numerics | None
 
 
+def under_numerics(numerics: Numerics | None) -> contextlib.AbstractContextManager[None]:
+    """The block every program a trainer traces is traced within, under its numerics where it holds any
+    (`TrainerAdvanced.numerics`, `generation.run_precision`): their products, forms, recipe and outputs. Its
+    entry points take it (`numbered`), and the preamble a step compiled ahead shares (`ahead._targeted`)."""
+    from dew.nn.kernels.generation import run_precision
+
+    return contextlib.nullcontext() if numerics is None else run_precision(numerics)
+
+
 def numbered[Owner: Numbered, **Arguments, Result](
         method: Callable[Concatenate[Owner, Arguments], Result]
 ) -> Callable[Concatenate[Owner, Arguments], Result]:
-    """`method`, every program it traces traced under its owner's numerics where it holds any
-    (`TrainerAdvanced.numerics`, `generation.run_precision`): their products, forms, recipe and outputs."""
+    """`method`, every program it traces traced under its owner's numerics (`under_numerics`)."""
     @functools.wraps(method)
     def run(owner: Owner, *args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        from dew.nn.kernels.generation import run_precision
-
-        with contextlib.nullcontext() if owner.numerics is None else run_precision(owner.numerics):
+        with under_numerics(owner.numerics):
             return method(owner, *args, **kwargs)
     return run
 

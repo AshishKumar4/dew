@@ -1588,8 +1588,12 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # before, in a build that sees no GPU, its initializer's launches took the CPU's routes and certified
     # nothing, so the run certified them on its GPU (rows 7322, 8299: five init-shape launches).
     # A host step's start runs on its CPU companion (`Trainer._started`), traced as that run traces it.
-    start = trainer._started() if trainer.host_master else None
-    with assumed(on, portable=portable), certifying:
+    # The trainer's numerics hold over all of it, its start's draw among it, as over a run's (`numbered`).
+    from dew.training.distributed import under_numerics
+
+    with under_numerics(trainer.numerics):
+        start = trainer._started() if trainer.host_master else None
+    with under_numerics(trainer.numerics), assumed(on, portable=portable), certifying:
         start = trainer._started() if start is None else start
         if start.resume is not None and trainer.checkpoints is not None:
             # A resumed run's step compiles at the rung its checkpoint records and the split its state was

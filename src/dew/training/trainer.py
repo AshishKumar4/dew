@@ -290,19 +290,19 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     """What the run watches at its sampled steps (`dew.training.inspection`)."""
     param_dtype: str | None = None
     """The dtype fresh parameters are stored in (Flax's `param_dtype`); None, each module's own."""
-    numerics: Numerics | None = None
-    """The run's numerics (`dew.nn.precision.Numerics`), a run config's `trainer.precision`: every program
-    the trainer traces runs under its products, forms, low-precision recipe and outputs
-    (`generation.run_precision`), the parameters it draws fresh are stored in its `dtypes.params` and its
-    `loss_scaling` scales the loss (`numerics_read`); a model it trains that computes in another dtype than
-    its `dtypes.compute` is refused. It states what `param_dtype` and `dynamic_scale` state, so it is set
-    without them."""
     diloco: DiLoCo | None = None
     """Trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`)."""
     phase_passes: Sequence[int] | None = None
     """A looped model's count of passes a phase of the run's data (`dew.training.phase_passes`)."""
     sampled_passes: SampledPasses | None = None
     """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
+    numerics: Numerics | None = None
+    """The run's numerics (`dew.nn.precision.Numerics`), a run config's `trainer.precision`: every program
+    the trainer traces runs under its products, forms, low-precision recipe and outputs
+    (`generation.run_precision`), its entry points' and a step compiled ahead's (`under_numerics`), the
+    parameters it draws fresh are stored in its `dtypes.params` and its `loss_scaling` scales the loss
+    (`numerics_read`); a model it trains computing in another dtype than its `dtypes.compute` is refused.
+    It states what `param_dtype` and `dynamic_scale` state, so it is set without them."""
 
 
 def _objective_axes(objective: Objective[Loss, Effects]) -> Callable[[], dict[tuple[str, ...], LogicalAxes]]:
