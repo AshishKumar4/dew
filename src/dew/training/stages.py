@@ -338,6 +338,7 @@ class StageLocal:
         if not consumed:
             return owned_program(stack, out_shardings=placement)(jax.device_put(state, laid)), placement
         from dew.state import apart, together  # read where called, as this module reads dew.state's types
+        from dew.training.planning import released
 
         # Placed whole giving the handed arrays over (`donate`), where a placement other than theirs copies
         # them, so no handed array outlives its copy; then stacked giving the copies over.
@@ -346,7 +347,11 @@ class StageLocal:
         frozen = jax.device_put(frozen, frozen_laid)
         stacking = owned_program(lambda moving, frozen: stack(together(moving, frozen)),
                                  out_shardings=placement, donate_argnums=0)
-        return stacking(moving, frozen), placement
+        stacked = stacking(moving, frozen)
+        # A layer stacked anew aliases no buffer it was given, which XLA leaves alive: freed too
+        # (`planning.released`), as nothing reads the handed state again.
+        released(moving)
+        return stacked, placement
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,
