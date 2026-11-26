@@ -109,7 +109,7 @@ def _carried():
     facts, power = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
     inner = var("inner", Vec[i64])
     outer = rules.product_magnitude(([], power), rules.magnitude(z, "z"), var("outer_length", i64))
-    sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), rules.matrix_product(m), rules.matrix(x),
+    sets.append(rule(eq(t).to(x.dot(y.dot(z, m), m)), eq(rules.matrix_product(m)).to(i64(1)), rules.matrix(x),
                      rules.matrix(y), rules.matrix(z), eq(reads(z)).to(one), *contracted, *facts,
                      *rules.dominated(power, "new"),
                      eq(inner).to(shape(y)),
@@ -118,7 +118,8 @@ def _carried():
                      *rules.dominated(outer[1], "outer")).then(
         union(t).with_(x.dot(y, m).dot(z, m)), *rules.made(x.dot(y, m), power)))
     for combined in ("add", "sub"):
-        plain = (rules.matrix_product(m), rules.plain(q), rules.matrix(x), rules.matrix(y), rules.matrix(z))
+        plain = (eq(rules.matrix_product(m)).to(i64(1)), rules.plain(q),
+                 rules.matrix(x), rules.matrix(y), rules.matrix(z))
         # x @ (y +- z) as x @ y +- x @ z: both new.
         with_y = rules.product_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"), length)
         with_z = rules.product_magnitude(rules.magnitude(x, "x2"), rules.magnitude(z, "z"), length)
@@ -314,7 +315,7 @@ def _products(graph: EGraph, region: terms.Region) -> None:
         # The plain product multiplies the transposed one's operands (`terms.Region.products`).
         made = region.interned(primitive, {**params, "dimension_numbers": plain}, region.products.get(index))
         swapped = region.interned(jax.lax.transpose_p, {"permutation": (1, 0)})
-        graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
+        graph.register(rules.plain(i64(made)), set_(rules.matrix_product(i64(made))).to(i64(1)),
                        set_(rules.mode_power(i64(made))).to(i64(slack)),
                        set_(plain_of(i64(index))).to(i64(made)), set_(swap_of(i64(index))).to(i64(swapped)))
 

@@ -104185,6 +104185,116 @@ null,
 7.309,
 613220352
 ],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[grad of grad-local]": [
+77.83,
+77.83,
+3065024512
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[grad of grad-mesh]": [
+100.73,
+100.73,
+3044466688
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[jvp of grad, nested jit]": [
+89.08,
+89.08,
+2931195904
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[jvp of grad, remat]": [
+72.26,
+72.26,
+2944200704
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[jvp of grad, scanned]": [
+73.56,
+73.56,
+3000553472
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[jvp of grad]": [
+78.54,
+78.54,
+2811863040
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[jvp]": [
+71.18,
+71.18,
+2483634176
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[primal]": [
+14.61,
+14.61,
+725860352
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[second jvp, remat]": [
+65.25,
+65.25,
+1931796480
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[second jvp]": [
+78.05,
+78.05,
+1844076544
+],
+"tests/test_contracts_moments.py::test_the_covariance_merge_holds_every_order[vjp]": [
+72.6,
+72.6,
+2334244864
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[grad of grad-local]": [
+59.25,
+59.25,
+2268131328
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[grad of grad-mesh]": [
+69.23,
+69.23,
+2254336000
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[jvp of grad, nested jit]": [
+73.63,
+73.63,
+2558578688
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[jvp of grad, remat]": [
+50.77,
+50.77,
+2454577152
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[jvp of grad, scanned]": [
+74.99,
+74.99,
+2378444800
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[jvp of grad]": [
+103.07,
+103.07,
+2423468032
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[jvp]": [
+40.09,
+40.09,
+1858752512
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[primal]": [
+9,
+9,
+719831040
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[second jvp, remat]": [
+16.74,
+16.74,
+1698021376
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[second jvp]": [
+71.63,
+71.63,
+1732550656
+],
+"tests/test_contracts_moments.py::test_the_weighted_moments_walk_holds_every_order[vjp]": [
+42.1,
+42.1,
+1804435456
+],
 "tests/test_contracts_norms.py::test_a_declared_derivative_holds_every_order[near the largest-declared_derivative]": [
 0.059,
 null,

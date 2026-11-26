@@ -283,7 +283,7 @@ def _chunked_weighted_jvp(tile: int, mode: Literal["walk", "merge"], primals, ta
     return (mean, var, n), (d_mean, d_var, d_n)
 
 
-_run_chunked_weighted = contracted("test_chunked_moments_holds_every_order")(
+_run_chunked_weighted = contracted("test_the_weighted_moments_walk_holds_every_order")(
     declared_tangent(Protected(), _chunked_weighted_primal, _chunked_weighted_jvp,
                      nondiff_argnums=(2, 3), symbolic_zeros=True))
 
@@ -303,7 +303,7 @@ def _chunked_cov_jvp(tile: int, mode: Literal["walk", "merge"], primals, tangent
     return (mean_x, mean_y, cov, n), (d_mx, d_my, d_cov, d_n)
 
 
-_run_chunked_cov = contracted("test_chunked_moments_holds_every_order")(
+_run_chunked_cov = contracted("test_the_covariance_merge_holds_every_order")(
     declared_tangent(Protected(), _chunked_cov_primal, _chunked_cov_jvp,
                      nondiff_argnums=(3, 4), symbolic_zeros=True))
 

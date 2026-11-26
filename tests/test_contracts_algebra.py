@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
-from dew.algebra import means, moments, scan, windows
+from dew.algebra import means, scan, windows
 
 
 def _plain(outputs, totals, anchors):
@@ -38,35 +38,6 @@ def test_the_convex_mean_holds_every_order(taken):
         primals = (outputs * scale, (jnp.abs(totals) + 0.25) * scale, anchors)
         direction = (along[0] * scale, along[1] * scale, along[2])
         assert_contract(_merged, primals, direction, cotangent, f"the convex mean {edge}", plain_fn=_plain,
-                        taking=ORDER_SETS[taken])
-
-
-def _chunked_weighted(x, w):
-    return moments.chunked_moments(x, w, tile=4, mode="walk")
-
-
-def _chunked_cov(x, y, w):
-    return moments.chunked_covariance(x, y, w, tile=4, mode="merge")
-
-
-# Reverse-over-reverse needs about 8 GiB cold, leaving too little room for other tests' compilers.
-@pytest.mark.parametrize("taken", [pytest.param(order, marks=pytest.mark.fresh_process)
-                                  if order == "grad of grad" else order for order in ORDER_SETS])
-def test_chunked_moments_holds_every_order(taken):
-    """Chunked weighted central moments (`moments.chunked_moments`, walk) and covariance
-    (`moments.chunked_covariance`, merge) hold every derivative order across float32's exponent edges.
-    Use the plain declarations in float64 as independent truth, not the same chunked AD rule."""
-    x, y, w = normal_draw(9045, (2, 8), (2, 8), (2, 8))
-    dx, dy, dw = normal_draw(9046, (2, 8), (2, 8), (2, 8))
-    c_mean, c_my, c_cov = normal_draw(9047, (2,), (2,), (2,))
-    for edge, scale in EDGES.items():
-        w_pos = ((jnp.abs(w) + 0.25) * scale).at[:, 0].set(0.0)
-        assert_contract(_chunked_weighted, (x * scale, w_pos), (dx * scale, dw * scale), (c_mean, c_cov),
-                        f"chunked moments {edge}", plain_fn=moments.weighted_moments,
-                        truth_fn=moments.weighted_moments, taking=ORDER_SETS[taken])
-        assert_contract(_chunked_cov, (x * scale, y * scale, w_pos), (dx * scale, dy * scale, dw * scale),
-                        (c_mean, c_my, c_cov), f"chunked covariance {edge}",
-                        plain_fn=moments.weighted_covariance, truth_fn=moments.weighted_covariance,
                         taking=ORDER_SETS[taken])
 
 

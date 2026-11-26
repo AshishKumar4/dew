@@ -144,11 +144,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
 
 ### 1.4 Facts and rules
 
-- **Facts about each value** (e-class analyses): its shape, and a bound on its magnitude where the program
-  proves one (§6.3). Its dtype and parameters are the region's tables (`terms.Region`). Constant and sharded
-  axes and a rounding class per value are not built: a hoisting rule reads a broadcast's laid axes, no price
-  reads a link, and a rule set states its rounding class (§6.4). Error is measured per candidate, never held
-  as a fact (§1.5).
+- **Facts about each value** (e-class analyses): shape, scalar dtype, and magnitude where the program
+  proves it (§6.3). The region's traced types and parameter table seed dtype propagation (§6.3).
+  Constant and sharded axes and a rounding class per value are not built: a hoisting rule reads a
+  broadcast's laid axes, no price reads a link, and a rule set states its rounding class (§6.4).
+  Error is measured per candidate, never held as a fact (§1.5).
 - **Rules,** in declared sets in one place, each set tagged with the modes it runs in:
   - **linear algebra** (compile time and dev time): join sums of floating counts when their partial
     counts fit the dtype exactly (`joined`); keep ordinary rounded reductions separate (row 13161).
@@ -158,6 +158,11 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     can be lifted along the axis a product keeps (`(diag(s) X) Yᵀ ≡ diag(s) (X Yᵀ)`). A positive scale
     comes out of a maximum or minimum (`max(c x) = c max(x)` for `c > 0`, a literal's sign its fact):
     attention's derived step takes its raw products' maximum and scales it once, as the hand step does;
+    The direct transposed byte product distinguishes the RHS kept axis. It lifts a positive dyadic
+    scale only over exact byte casts and full float32 accumulation with at most 256 contracted entries
+    (row 13172): every integer partial sum fits, and the shift stays normal for each nonzero term.
+    The enclosing proof follows literal scales through broadcasts and selection. Arbitrary scales,
+    unproven modes and explicit/manual placements do not take this transposed rewrite.
   - **identities** (compile time and dev time): commutativity, a saturation aid. A cast's widening round trip,
     a reciprocal square root's form, a negation negated and a magnitude's magnitude are XLA's algebraic
     simplifier's, which every compile runs. A value times its sign is its magnitude in exact arithmetic but not
@@ -1376,14 +1381,40 @@ def declare(module: str, name: str, form: StableForm) -> StableForm: ...
 def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
-**Planned families (row 3272).** The same registry will accept a template's `Declaration` (a
-`Reduction` or `Scan`) and `SurrogateBodies` (row 3271). A surrogate declaration records its
-`forward` and `derivative` callables and their `Cases`; generation optimizes each body independently,
-never replaces the declared derivative with autodiff of the forward. Template generation emits the
-forward/backward tiled forms and their step, merge and finish as ordinary Python. Both families will
-emit checked-in modules with a gate site for every served case and deterministic `--check` regeneration;
-replacing an existing form requires the accuracy and efficiency bars in §4. Neither family is registered
-in the built `dict[str, StableForm]` yet.
+**Template and surrogate generation (rows 3272, 6109).** Keep one declaration registry and one writer.
+Extend the registry's value to a union of `StableForm`, a template declaration and `SurrogateBodies`;
+the built registry holds stable forms alone. The new records name the component functions, their cases,
+and the reference implementation. They add no run-time dispatch to the algebra engine.
+
+- **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
+  operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
+  order. Print value-taking components of `forms.Derived` (prepare, step, merge, finish, mapped, and
+  backward where present) over a flat array signature. The wrapper restores the named state and operand
+  trees. The existing initializer still owns the actual slot values, including reduction floors and
+  corrected scans' identity matrices; slot metadata records their order and types. For a template with
+  a product issuer, emit its pure factors and finish expressions; the template still owns the dot, tile
+  schedule and accumulation callbacks. A callback that cannot be separated from its math is not a
+  printable case. Declared reduction backward tiles use their own declarations; scan
+  backward retains its incoming state, output cotangent and outgoing state cotangent inputs. Do not use a
+  derivative of the generated forward in place of either.
+- **Surrogates.** A `SurrogateBodies` entry names the forward and tangent bodies passed to
+  `dew.nn.derivatives.surrogate`, their separate cases and their nondifferentiable arguments. A tangent
+  component traces over primals, active tangents and the original forward value; the case key includes
+  static arguments and which tangents are symbolic zeros. Generate each body against its own reference.
+  The existing surrogate wrapper still supplies the value dependency at higher orders and reassembles
+  the original PyTree. Hold tangent linearity and forward/reverse and higher-order behavior through that
+  wrapper. `dew.nn.precision.rounded_operand` is the first consumer: the value preserves its rounding
+  barrier; the derivative remains the input tangent, including after another differentiation.
+- **Admission and cutover.** Use the existing `printed.source` and reject effects, unprintable
+  primitives, or a changed component's state layout, output tree or placed types. Key by component, target,
+  precision policy, operand shapes and dtypes, and only the declared static flags that change its program.
+  Unknown cases continue through the current implementation; a named case not generated is a regeneration
+  error. Stage one of the ordinary attention reduction cells from M-ET-85 first: compare two different
+  tilings, an online walk and a merged walk, and all backward outputs with the trace-time and independent
+  float64 references. Then run Check 1 and Check 2 at the real launch, and compare latency and memory
+  against the existing template on the same device before activating it (§4). The checked-in module,
+  typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
+  no replacement. Template and surrogate generation remain design capabilities, not implemented claims.
 
 - `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
   saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's
