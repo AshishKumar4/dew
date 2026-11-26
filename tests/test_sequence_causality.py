@@ -153,9 +153,14 @@ ADMITTED = {
     "heads split and merged": lambda tokens: embedded(tokens).reshape(1, tokens.shape[1], 2, 4).transpose(
         0, 2, 1, 3).transpose(0, 2, 1, 3).reshape(1, tokens.shape[1], D),
     "Dew's attention": lambda tokens: attested(lambda q, k, v: attention(q, k, v, causal=True),
-                                               CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
+                                               CAUSAL_ATTENTION, inputs=3, outputs=1)(
+        *(embedded(tokens),) * 3),
     "a token-wise call": lambda tokens: attested(lambda x: jnp.sort(x, axis=-1), TOKENWISE)(
         embedded(tokens)[0])[None],
+    # Tier 3's kernel parts: a token's norm over its features, its tokens on axis 1 (row 13044).
+    "a token-wise norm over [B, S, D]": lambda tokens: attested(
+        lambda x: x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1.0), TOKENWISE)(
+        embedded(tokens)),
     "layers scanned": lambda tokens: jax.lax.scan(lambda h, w: (jnp.cumsum(h @ w, axis=1), None),
                                                   embedded(tokens), jnp.ones((3, D, D)))[0],
     "a token's own random bits": lambda tokens: jax.vmap(jax.vmap(lambda token: jax.random.bits(
@@ -200,6 +205,22 @@ REFUSED = {
                                                                   CAUSAL_ATTENTION)(*(embedded(tokens),) * 3),
     "a left shift named token-wise": lambda tokens: named(lambda x: shifted_left(x[None])[0], TOKENWISE)(
         embedded(tokens)[0])[None],
+    # A norm reducing the axis the tokens lie on, though it is attested token-wise (row 13044's review).
+    "a norm over the positions attested token-wise": lambda tokens: attested(
+        lambda x: x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1.0), TOKENWISE)(
+        embedded(tokens).transpose(0, 2, 1)).transpose(0, 2, 1),
+    # A recurrence's final memory beside its causal output, shaped as the output is: it reads every
+    # position (`attested`'s `sequenced`, row 13044's review).
+    "a final memory shaped as the positions beside causal attention": lambda tokens: sum(attested(
+        lambda q, k, v: (attention(q, k, v, causal=True), jnp.broadcast_to(v.sum(axis=1, keepdims=True),
+                                                                           v.shape)),
+        CAUSAL_ATTENTION, inputs=3, outputs=1)(*(embedded(tokens),) * 3)),
+    # An entering memory shaped as the positions (its heads as many as the tokens), each of its rows
+    # reading no later token than its own, its last read by every output: the whole memory reaches the
+    # first output, where read as the keys' positions it reached the last alone (row 13044's review).
+    "an entering memory shaped as the positions beside causal attention": lambda tokens: attested(
+        lambda q, k, v, memory: attention(q, k, v, causal=True) + memory[:, -1:], CAUSAL_ATTENTION,
+        inputs=3, outputs=1)(*(embedded(tokens),) * 3, jnp.cumsum(embedded(tokens), axis=1)),
     "a reversed sequence": lambda tokens: embedded(tokens)[:, ::-1],
     "a primitive taking an entrywise name": lambda tokens: SPREAD.bind(embedded(tokens)),
     "an operation with no rule": lambda tokens: jax.lax.linalg.tridiagonal_solve(

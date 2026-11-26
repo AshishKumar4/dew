@@ -473,6 +473,34 @@ def test_representation_health_is_the_float64_statistics():
     assert all(float(collapsed[name].mean()[0]) < 1e-6 for name in ("repr_std", "repr_cov_offdiag"))
 
 
+def test_representation_health_counts_no_row_filling_a_batch():
+    """A batch's collapse measures over its real rows (`Objective.real_rows`), a repeat filling it marked
+    out (`VALID_ROWS`), are, bit for bit, those of its real rows alone, whatever the filler holds (a NaN
+    too), where the filler's rows moved both (the 2026-11-26 audit)."""
+    (z,) = redundant_embeddings(0)
+    filled = np.concatenate([z[:24], np.full((8, z.shape[1]), np.nan, np.float32)])
+    real = jnp.arange(32) < 24
+    marked = representation_health(jnp.asarray(filled), real)
+    alone = representation_health(jnp.asarray(z[:24]))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        np.testing.assert_array_equal(np.asarray(marked[name].mean()[0]), np.asarray(alone[name].mean()[0]),
+                                      err_msg=name)
+    # Microbatches of filler alone pool as nothing: two of them, then the real rows, read as the real rows.
+    from dew.objectives.base import Moments
+
+    empty = representation_health(jnp.asarray(filled[:8]), jnp.zeros(8, bool))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        pooled = Moments.pooled([empty[name], empty[name], alone[name]])
+        np.testing.assert_array_equal(np.asarray(pooled.mean()[0]), np.asarray(alone[name].mean()[0]),
+                                      err_msg=name)
+    # An empty part beside one real row of a magnitude whose square overflows, either order: the row's
+    # spread, zero, where the empty part's center left an infinite correction weighed by none.
+    large = representation_health(jnp.full((1, z.shape[1]), 2.0 ** 70, jnp.float32))
+    for name in ("repr_std", "repr_cov_offdiag"):
+        for parts in ([empty[name], large[name]], [large[name], empty[name]]):
+            assert float(Moments.pooled(parts).mean()[0]) == 0.0, name
+
+
 # --- EMA target encoder ----------------------------------------------------
 
 def make_jepa_trainer(mask, learning_rate=1e-3, fsdp=1, **kwargs):
