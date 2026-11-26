@@ -1355,7 +1355,8 @@ The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat com
 (`ComponentForm`, rows 6109 and 6110). The component pilots cover attention backward's masked
 query-first cotangents and its key-first weight consumer, recurrence scores and compensated prefix
 differences, and two shapes of rounded-operand forward and tangent bodies. One `--check` writer holds
-references. Production still uses the trace-time derivations and original surrogates (row 3272).
+all cases against their own references. Production still uses the trace-time derivations and original
+surrogates (row 3272).
 
 ```python
 @dataclass(frozen=True)
