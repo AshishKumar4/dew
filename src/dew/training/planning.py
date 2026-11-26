@@ -175,13 +175,13 @@ class Candidate:
     group hold by count (`dew.newton_schulz.joined_held`), every Muon transform's together, 0 where they
     join none: an estimate that orders its plan's release (`Parting`) and rules none out."""
     resident: Mapping[Hashable, int] = dataclasses.field(default_factory=dict)
+    """The bytes the state it was lowered from held on each of this process's devices as it was lowered
+    (`resident_on`), read off the placed arrays before their shapes stood for them (`prepared`): the
+    arguments its step reuses where they lie, which its compile's limit gives back (`FitSearch.limited`)."""
     arguments: Mapping[Hashable, int] = dataclasses.field(default_factory=dict)
     """The bytes its step's arguments take of each of this process's devices as XLA counts them (its
     prepared state's trees and its batch, placed), which a search before the state is placed reads its
     compile's limit by (`FitSearch.limited`)."""
-    """The bytes the state it was lowered from held on each of this process's devices as it was lowered
-    (`resident_on`), read off the placed arrays before their shapes stood for them (`prepared`): the
-    arguments its step reuses where they lie, which its compile's limit gives back (`FitSearch.limited`)."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
