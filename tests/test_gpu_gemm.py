@@ -343,7 +343,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, jnp.bfloat16, "sm80",
                                  tiling.Tiles(*tile, warpgroups=1, cluster=1, family="mma.sync", programs=2)),
-               "sm80", fault=BALANCED_TAIL)
+               # An A100's cp.async pipelines, which a GPU copying by TMA lowers as another kernel and refuses
+               # (`lowers_as`; main's GH200 tier, rows 13127, 13129, 13130).
+               "sm80", mosaic=True, fault=BALANCED_TAIL)
           for rows, depth, width, tile in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
