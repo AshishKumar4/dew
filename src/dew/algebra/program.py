@@ -382,8 +382,8 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
     of none stated is priced at (`product.product_mode`) and the rule sets the registry admits for those
     numerics (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later
     derives afresh."""
-    return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
-            rules.admitted_names(accurate))
+    return (accurate, saturation, cost.pricing_key(cost.target()),
+            str(jax.config.jax_default_matmul_precision), rules.admitted_names(accurate))
 
 
 def _held(jaxpr: jcore.Jaxpr) -> tuple[dict[jcore.Var, terms.Magnitude | None], dict[jcore.Var, terms.Apart]]:

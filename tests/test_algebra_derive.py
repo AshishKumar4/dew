@@ -409,6 +409,32 @@ def test_a_declaration_derives_once_whatever_routes_block_its_traces_record_into
     assert len(report.rewrites()) == before
 
 
+def test_a_walk_reuses_its_price_across_capacities_but_not_bandwidths():
+    import dataclasses
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
+
+    target = generation.gpu_target("sm90")
+    constrained = dataclasses.replace(target, memory=65_283_502_899)
+    slower = dataclasses.replace(constrained, memory_bandwidth=1e12)
+    forms = derive.derive(declared(softmax_beside_a_half_maximum), accurate=False, saturation=SATURATION)
+    tiles = shaped(tile_of(operands(*draw(0)), 0))
+
+    with report.refusals():
+        with generation.assumed(target):
+            first = forms.init(tiles)
+        with generation.assumed(constrained):
+            second = forms.init(tiles)
+        assert len(report.rewrites()) == 1
+        with generation.assumed(slower):
+            forms.init(tiles)
+        assert len(report.rewrites()) == 2
+
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
 REGISTERED_BETWEEN = """
 import json
 import sys
