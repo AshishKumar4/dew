@@ -1121,23 +1121,22 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
-    ("sm80", 4096, 128, True), ("sm90", 4096, 128, True), ("sm90", 32768, 128, False),
-    ("sm80", 2048, 128, False), ("sm90", 4096, 64, False), ("sm120", 4096, 64, True),
-    ("sm120", 4096, 128, False), ("sm86", 4096, 128, False),
-    ("sm100", 4096, 256, True), ("sm100", 32768, 128, True), ("sm100", 256, 64, True),
-    ("sm100", 128, 128, False), ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
-    ids=["a100-measured", "h100-measured", "h100-longer", "a100-shorter", "h100-narrower", "g4-measured",
+    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm120", 4096, 64, True),
+    ("sm120", 4096, 128, False), ("sm86", 4096, 128, False), ("sm100", 4096, 256, True),
+    ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
+    ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
+    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "g4-measured",
          "g4-wider", "a10-unmeasured", "b200-measured", "b200-longest", "b200-shortest", "b200-shorter",
          "b200-narrower", "b200-longer"])
 def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts_shapes(
         generation_name, tokens, width, declared):
     """A bf16 causal call over 8 key heads: on an A100 or an H100, whose declared cell names FlashAttention
-    (`attention_kernels.DECLARED`), in that cell at 4096 tokens a row and width 128 alone, the shape its
-    receipts timed (`MEASURED`; M-ET-51's sweep holds no sums); on a G4 at 4096 tokens and width 64
-    (M-NA-35); on an A10, an mma.sync GPU no receipt timed, in none (an A100's receipt declared its
-    FlashAttention-2 for every mma.sync GPU, 2026-11-26 audit); on a B200, whose cell names cuDNN, its
-    receipts' shapes alone: 256 to 32768 tokens at widths 64, 128 and 256, four query heads a key head. A
-    call none declares takes the template (row 5285)."""
+    (`attention_kernels.DECLARED`), in that cell up to 32768 tokens (`MEASURED`'s interim placeholder until
+    M-NA-44); on a G4 at 4096 tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
+    timed, in none (an A100's receipt declared its FlashAttention-2 for every mma.sync GPU, 2026-11-26
+    audit); on a B200, whose cell names cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64,
+    128 and 256, four query heads a key head. A call none declares takes the template (row 5285)."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
 
