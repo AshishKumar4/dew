@@ -12,10 +12,10 @@ times. Three algebraic laws (linearity of sums, pulling a per-row scalar out of 
 reduction independent, so all of them run in one pass. Today such rewrites are derived by hand as custom VJPs or
 template algebra. Dew instead holds every equivalent form of a computation in an e-graph, applies declared rules
 until no new form appears (equality saturation), and extracts the cheapest form whose error meets the precision
-policy. (Today: saturation also stops at limits derived from the region's size, §6.6; extraction is egglog's
-greedy DAG extractor under Dew's model, held to Dew's exact extractor where the oracle is on, §6.5; and the
-compile-time admission uses its rules' static rounding class. For declared stable forms, the dev-time
-generator measures candidates' error (§1.5) and emits reviewed Python. The compile-time pass rewrites
+policy. Today saturation also stops at limits derived from the region's size (§6.6). Extraction uses
+egglog's greedy DAG extractor under Dew's model, checked against exact extraction where the oracle is on
+(§6.5). Compile-time admission uses each rule's static rounding class. For declared stable forms, the
+dev-time generator measures candidates' error (§1.5) and emits reviewed Python. The compile-time pass rewrites
 the program a user composed, including its autodiff output. Nothing runs at runtime.
 
 ## 1. The engine: `dew.algebra`
