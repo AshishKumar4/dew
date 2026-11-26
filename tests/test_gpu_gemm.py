@@ -264,6 +264,10 @@ EXACT_TANGENT = "an exact value its run compiles and reads, no check-1 site for 
 tangent, bitwise, where a compile-only prepare's program has no device to run on (main f37f47cdf's sm90
 prepare: 'Executable' object has no attribute 'local_devices')."""
 
+EXACT_OVERFLOW = "an exact finite value its run compiles and reads, no check-1 site for a prepare to compile"
+"""Why the blockwise FP8 overflow witness runs at its run (`Cell.at_run`): it asserts one exact value of a
+native launch, which a compile-only prepare's device cannot run (row 13257)."""
+
 CUBLAS_BF16 = "cuBLASLt's dense bf16 product stored in bf16, which no CPU dot computes"
 """Why the XLA fallback's direct bf16 product stays on the GPU (the GEMM lane, 11-25)."""
 
@@ -362,7 +366,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
           for name in ("sm90", "sm100")),
         Cell("a blockwise FP8 product at large finite scales is finite",
              gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
-             native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",

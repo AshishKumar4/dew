@@ -352,7 +352,7 @@ def _block_walk(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, depth
     owner, carry, aligned)`, `owner` each row's group, `aligned` placing a matrices'-side `[rows, width]`
     operand as the sum) that `finished` makes the sum, placed as the products'
     operands place it (`ragged_placement`); then the rows past the groups zero, selected once after every
-    block, so a padded row's infinite scale leaves no NaN (row 13164). No contraction, no block: zeros."""
+    block, so a padded row's infinite scale leaves no NaN (row 13164). No contraction, or no group: zeros."""
     rows, groups, width = lhs.shape[0], kernel.shape[0], kernel.shape[2]
     placed = ragged_placement(((lhs, 0), (kernel, kernel.ndim - 1)))
     zeros = jnp.zeros((rows, width), dtype, out_sharding=placed)
@@ -362,7 +362,8 @@ def _block_walk(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, depth
         # is: its columns' axis may be the rows' too, which their broadcast together could not place.
         return value if placed is None else jax.sharding.reshard(value, placed)
     blocks = lhs.shape[1] // depth
-    if blocks == 0:
+    if blocks == 0 or groups == 0:
+        # No contraction, or no group a row could belong to: the empty sum.
         return zeros.astype(jnp.float32)
     owner = jnp.minimum(jnp.repeat(jnp.arange(groups), group_sizes, total_repeat_length=rows), groups - 1)
 

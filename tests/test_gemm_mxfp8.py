@@ -213,6 +213,19 @@ def test_an_mxfp8_products_partials_below_fp32s_normals_sum_to_its_normal_result
     np.testing.assert_array_equal(np.asarray(out), np.full((128, 128), 2.0 ** -126, np.float32))
 
 
+def test_an_mxfp8_product_of_no_groups_is_zero():
+    """An MXFP8 product of a padded row buffer (128 rows, 64 deep) over no group, its group table empty: no
+    row belongs to a group, so it is its zeros (row 13164's review: the block walk's broadcast of the rows'
+    exponents against no group's failed to trace)."""
+    unit = jax.lax.bitcast_convert_type(jnp.full((128, 2), 127, jnp.uint8), jnp.float8_e8m0fnu)
+    rows = formats.MxFp8(jnp.ones((128, 64), jnp.float8_e4m3fn), unit)
+    matrices = formats.MxFp8(jnp.ones((0, 64, 64), jnp.float8_e4m3fn), unit[:0, None].reshape(0, 64, 2))
+    with generation.chosen(mxfp8="xla"):
+        out = jax.jit(lambda a, b: gemm.mxfp8_product(a, b, jnp.zeros((0,), jnp.int32),
+                                                      out_dtype=jnp.float32))(rows, matrices)
+    np.testing.assert_array_equal(np.asarray(out), np.zeros((128, 64), np.float32))
+
+
 def test_an_mxfp8_product_of_no_depth_is_zero():
     """An MXFP8 product over no depth (no 32-deep block) is its zeros, as the empty sum is."""
     no_scales = jnp.zeros((128, 0), jnp.float8_e8m0fnu)
