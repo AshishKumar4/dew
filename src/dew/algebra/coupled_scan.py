@@ -586,7 +586,8 @@ def _scored(queries, keys, dots, values, weights):
 
 @_scored.def_vmap
 def _batch_scored(size, batched, *operands):
-    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)), operands, tuple(batched))
+    placed = jax.tree.map(lambda x, b: x if b else jnp.broadcast_to(x, (size, *x.shape)),
+                          operands, tuple(batched))
     found = _scored(*placed)
     return found, jax.tree.map(lambda _: True, found)
 

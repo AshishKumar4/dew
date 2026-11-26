@@ -109,7 +109,7 @@ def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(bat
     z = np.zeros(2, np.float32)
 
     def run(q, k, v, z):
-        tokens = dict(q=q, k=k, v=v, g=z, beta=jnp.ones_like(z), p=jnp.zeros_like(k), mu=z)
+        tokens = {"q": q, "k": k, "v": v, "g": z, "beta": jnp.ones_like(z), "p": jnp.zeros_like(k), "mu": z}
         state = forms.init({})
         prepared = forms.prepare(tokens)
         end, held = forms.step(state, prepared)
