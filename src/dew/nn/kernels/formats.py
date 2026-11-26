@@ -19,6 +19,7 @@ from jax.typing import DTypeLike
 from dew.algebra import bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
 from dew.nn.float_bits import exact_power2, raw_fields, rounded_binary
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32, power2
@@ -300,7 +301,15 @@ def _mxfp8_decode_tangent(dtype, primals, tangents):
     value = _decode_mxfp8(dtype, *primals)
     if isinstance(moved, SymbolicZero):
         return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
-    _, direction = jax.jvp(lambda c: _mxfp8_scale_arithmetic(dtype, c, exponents, invalid), (codes,), (moved,))
+    def applied(scales, direction):
+        return _decode_mxfp8(dtype, direction, *scales)
+
+    def pulled(scales, cotangent):
+        # Keep the established floating transpose, narrowing only to the stored code type.
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return _mxfp8_scale_arithmetic(wide, cotangent, *scales).astype(codes.dtype)
+
+    direction = generation.linear_map(applied, pulled, (exponents, invalid), moved, out_aval=jax.typeof(value))
     return value, direction
 
 
