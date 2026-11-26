@@ -1525,7 +1525,7 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
 
 
 def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare_filed(
-        ci, tmp_path, monkeypatch, cache_worker, capsys):
+        ci, tmp_path, monkeypatch, cache_worker):
     """A lane unit whose prepare filed its programs' memory (`tier_wire.needs_file`, its prepare told
     which unit it is by DEW_TIER_UNIT) is given no less than the least pool at which Dew's admission
     (dew.training.memory `least_limit`: `needed`, the GPU's memory, read as its pool's share)
@@ -1608,17 +1608,13 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         # holds it (rows 12893 and after: sized by its measured peak alone, each part refused it again).
         key = "/" + ci.records.need_key("3.12", "3.12:tests/test_flow.py", held)
         assert json.loads(stored[key])["need"] == need
-        holds = load("gpu_holds", "tools/armada")
-        monkeypatch.setattr(sys, "argv", ["gpu_holds.py", "--tests=tests/test_flow.py tests/test_old.py"])
-        capsys.readouterr()  # The lane's own output.
-        assert holds.main() == 0
-        assert json.loads(capsys.readouterr().out) == {"tests/test_flow.py": need}
+        holds = load("gpu_holds", "tools/armada").holds
+        assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
     # A need filed past NEED_DAYS sizes nothing: its file may have been cut otherwise since.
     old = "/" + ci.records.need_key("3.12", "3.12:tests/test_old.py", "NVIDIA-A10-x86")
     past = time.time() - (ci.records.NEED_DAYS + 1) * 86400
     stored[old] = json.dumps({"need": 50 * gib, "at": past}).encode()
-    assert holds.main() == 0
-    assert json.loads(capsys.readouterr().out) == {"tests/test_flow.py": need}
+    assert holds(["tests/test_flow.py", "tests/test_old.py"]) == {"tests/test_flow.py": need}
     # Held by a lane, its filed need is cleared: its run is measured from then, so a need it no longer has
     # sizes no part.
     filed((gib, gib // 2, gib // 4))
