@@ -954,7 +954,7 @@ def test_a_prepared_chunk_keeps_a_subnormal_read_scale_until_the_state_contracti
 
 def test_a_tiny_prepared_reader_leaves_a_steep_decays_factors_on_the_state():
     def step(h, q, b, v, g):
-        return jnp.exp2(g) * h + b[:, None] * v[None, :]
+        return jax.lax.exp2(g) * h + jnp.outer(b, v)
 
     def read(h, q, b, v, g):
         return np.float32(2.0 ** -128) * (q @ h)
@@ -968,14 +968,21 @@ def test_a_tiny_prepared_reader_leaves_a_steep_decays_factors_on_the_state():
         state = (jnp.zeros((), q.dtype), h)
         prepared = forms.prepare(chunk)
         leaving, kept = forms.step(state, prepared)
-        return forms.mapped(prepared, state, kept), leaving[1]
+        replayed, replayed_state = forms.replay(chunk, h)
+        cotangent = jnp.full_like(replayed, 2.0 ** 126)
+        dh, grads = forms.backward(chunk, state, jnp.zeros_like(h), cotangent)
+        return (forms.mapped(prepared, state, kept), leaving[1], replayed, replayed_state, dh, grads["q"])
 
     giant = np.float32(2.0 ** 127)
     rows = np.full((2, 1), giant, np.float32)
     memory = np.full((1, 1), giant, np.float32)
-    output, leaving = run(rows, memory, np.asarray([-149.5, 0], np.float32))
-    np.testing.assert_array_equal(output, np.full((2, 1), np.float32(2.0 ** -23.5)))
-    np.testing.assert_array_equal(leaving, np.full((1, 1), np.float32(2.0 ** -22.5)))
+    output, leaving, replayed, replayed_state, dh, dq = run(rows, memory, np.asarray([-149.5, 0], np.float32))
+    for values in (output, replayed):
+        np.testing.assert_array_equal(values, np.full((2, 1), np.float32(2.0 ** -23.5)))
+    for state in (leaving, replayed_state):
+        np.testing.assert_array_equal(state, np.full((1, 1), np.float32(2.0 ** -22.5)))
+    np.testing.assert_array_equal(dh, np.full((1, 1), np.float32(2.0 ** -23.5)))
+    np.testing.assert_array_equal(dq, np.full((2, 1), np.float32(2.0 ** -24.5)))
 
 
 def ones_chunk(g, dtype=jnp.float32):

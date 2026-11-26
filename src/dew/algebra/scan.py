@@ -461,7 +461,11 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
                    else jnp.where(step[declaration.reset], 0.0, h))
         _, cut = vanished(z, affine.base2)
         h = jnp.where(cut[:, None], 0.0, h)
-        decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
+        scale = affine.reader_scale
+        split_read = _subnormal_scale(scale, jnp.result_type(scale, q))
+        decay = (_token_factors(z, affine.base2) if split_read
+                 else jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],)))
+        factors = jax.tree.map(lambda factor: factor[:, None], decay)
         if affine.across is not None:
             # A decay along the values too (two-sided GLA's, `D h E`), at most 1 each.
             h = h * _exp(affine.base2, across)[None, :]
@@ -469,7 +473,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             # A token apart from its group's writes reads the state its group entered, decayed by every token
             # since it: the group's first takes the state as it enters (`h`, its vanishing decay's zero).
             apart = jnp.where(index % group == 0, h, jnp.where(cut[:, None], 0.0, apart))
-            apart = apart * decay[:, None]
+            apart = _scaled(apart, factors)
             entering = _read(apart, q, affine.values_read, affine.reader_scale) + r
         if affine.before:
             # The correction reads the state the token enters, before its decay (RWKV7's erase); its adjoint
@@ -482,21 +486,21 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
             correction = jnp.sum(c[:, None] * entered, axis=0)
             erased = (erase if affine.erase is not None else b)[:, None] * (strength * correction)[None, :]
             update = b[:, None] * u[None, :] - erased
-            along, scale = affine.values_read, affine.reader_scale
-            if along:
-                h = h * decay[:, None] + update
+            along = affine.values_read
+            if along or split_read:
+                h = _scaled(h, factors) + update
                 output = _read(h, q, along, scale) + r
             else:
-                output = _read(h, q * decay, along, scale) + _read(update, q, along, scale) + r
-                h = h * decay[:, None] + update
+                output = _read(h, _scaled(q, decay), along, scale) + _read(update, q, along, scale) + r
+                h = _scaled(h, factors) + update
         elif not affine.per_key:
             correction = jnp.sum(c[:, None] * h, axis=0)
-            transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
+            transitioned = _scaled(h - b[:, None] * (strength * correction)[None, :], factors)
             h = transitioned + b[:, None] * u[None, :]
             output = (_read(transitioned, q, affine.values_read, affine.reader_scale)
                       + _read((b, u), q, affine.values_read, affine.reader_scale) + r)
         else:
-            decayed = h * decay[:, None]
+            decayed = _scaled(h, factors)
             correction = jnp.sum(c[:, None] * decayed, axis=0)
             h = decayed + b[:, None] * (u - strength * correction)[None, :]
             output = _read(h, q, affine.values_read, affine.reader_scale) + r
@@ -1682,12 +1686,12 @@ def _exponents(exponent, floor: float) -> tuple:
 def _token_factors(exponent, base2: bool) -> _Split:
     live, cut = vanished(exponent, base2)
     if not base2:
-        return _factors(False, live, ~cut)
+        return _factors(base2, live, ~cut)
     # A native exp2 at the least normal can round below it before multiplying the state.
     # Put back an exact integral power after exponentiating just the fractional remainder.
     def formed(part):
         power = jnp.floor(part)
-        return _exp(True, part - power) * float_bits.exact_power2(power.astype(jnp.int32), part.dtype)
+        return _exp(base2, part - power) * float_bits.exact_power2(power.astype(jnp.int32), part.dtype)
 
     first, second, rest = map(formed, _exponents(live, jnp.finfo(exponent.dtype).minexp))
     return _Split(jnp.where(cut, -0.0, first), second, rest)
