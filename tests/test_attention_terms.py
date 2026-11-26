@@ -175,6 +175,33 @@ def test_a_clipped_heads_small_component_keeps_its_derivative_both_ways():
     np.testing.assert_array_equal(np.asarray(gradient), expected)
 
 
+def test_a_giant_heads_tiny_gain_keeps_its_representable_derivative():
+    """`[2^127, 0, ...]` clipped to `2^-50`, its gain `2^-177` below fp32's range: a tangent or cotangent
+    `2^100` across the head moves its clip by `2^-77`, bit for bit, where the gain rounded to zero first
+    lost it (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    x, seed, expected = (np.zeros(8, np.float32) for _ in range(3))
+    x[0], seed[1], expected[1] = 2.0 ** 127, 2.0 ** 100, 2.0 ** -77
+    _, moved = jax.jvp(lambda x: clipped(x, 2.0 ** -50, 1e-6), (jnp.asarray(x),), (jnp.asarray(seed),))
+    np.testing.assert_array_equal(np.asarray(moved), expected)
+    _, pull = jax.vjp(lambda x: clipped(x, 2.0 ** -50, 1e-6), jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(pull(jnp.asarray(seed))[0]), expected)
+
+
+def test_an_ordinary_heads_clip_differentiates_as_its_formula():
+    """A head whose squares sum in range clips by its formula as written, so JAX differentiates it: at the
+    tie `|x| + eps = threshold` (`[1]`, eps 1, threshold 2) its derivative is `min`'s half, `3/4`; clipped
+    (`[1]`, eps 1, threshold 1: `x / (x + 1)`), its second derivative `-1/4` (row 13137's review)."""
+    from dew.nn.attention_terms import clipped
+
+    def clip(threshold):
+        return lambda value: clipped(value[None], threshold, 1.0)[0]
+
+    assert float(jax.grad(clip(2.0))(jnp.float32(1.0))) == 0.75
+    assert float(jax.grad(jax.grad(clip(1.0)))(jnp.float32(1.0))) == -0.25
+
+
 @attending("reference")
 def test_a_relative_bias_reads_its_tokens_slots_whatever_places_its_visibility_counts():
     """A layer scored over a causal pairwise mask, its keys' visibility places stated from 100 on
