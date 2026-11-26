@@ -426,6 +426,14 @@ def test_a_constant_factor_splits_on_the_host_outside_its_protected_span():
     np.testing.assert_array_equal(np.asarray(low, np.float64), truth - np.asarray(high, np.float64))
 
 
+def test_a_bfloat16_host_factor_leaves_a_bfloat16_product_residual():
+    factor = np.asarray(1 + 2 ** -7, jnp.bfloat16)
+    left = jnp.asarray(1 - 2 ** -7, jnp.bfloat16)
+    high, low = jax.jit(lambda x: two_product(x, factor, bit_split=True))(left)
+    assert high.dtype == low.dtype == left.dtype
+    np.testing.assert_array_equal(np.asarray([high, low], np.float32), [1, -(2 ** -14)])
+
+
 def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     """The head's logits take `rounded_to`'s values and cotangents, bitwise;
     under CUDA the program holds them as bf16 instead of rounding fp32 in a

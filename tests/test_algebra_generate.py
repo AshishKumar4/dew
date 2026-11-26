@@ -104,6 +104,44 @@ def test_generated_query_cotangents_default_to_the_accurate_small_weight_order()
     assert cotangents[0, 1] > jnp.finfo(cotangents.dtype).tiny
 
 
+def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
+    from dew.algebra.component_cases_derived import online_softmax_step, split_kv_merge
+
+    def empty(logits, values):
+        rows = logits.shape[0]
+        return (jnp.zeros((rows, values.shape[1]), logits.dtype),
+                jnp.full((rows,), jnp.finfo(jnp.float32).min, logits.dtype), jnp.zeros((rows,), logits.dtype))
+
+    def generated(left, left_values, right, right_values):
+        start = empty(left, left_values)
+        first = online_softmax_step(*start, left, left_values)
+        second = online_softmax_step(*start, right, right_values)
+        return split_kv_merge(*first, *second)
+
+    def split(left, left_values, right, right_values):
+        start = empty(left, left_values)
+        first = component_cases._online_truth(*start, left, left_values)
+        second = component_cases._online_truth(*start, right, right_values)
+        return component_cases._split_kv_truth(*first, *second)
+
+    def whole(left, left_values, right, right_values):
+        logits = jnp.concatenate((left, right), axis=1)
+        values = jnp.concatenate((left_values, right_values), axis=0)
+        return component_cases._online_truth(*empty(logits, values), logits, values)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        left, right = rng.normal(size=(2, 32, 64)).astype(np.float32)
+        left[0], right[0], right[1] = -np.inf, -np.inf, -np.inf
+        right[2] += 12
+        first, second = rng.normal(size=(2, 64, 64)).astype(np.float32)
+        return left, first, right, second
+
+    with jax.default_matmul_precision("highest"):
+        assert_as_exact(jax.jit(generated), jax.jit(split), draw, "generated split-KV tile composition",
+                        seeds=8, truth_fn=whole)
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

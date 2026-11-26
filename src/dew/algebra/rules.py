@@ -88,6 +88,11 @@ def int8_values(term: Term) -> Unit: ...
 
 
 @function
+def exact_roundtrip(narrow: Term, original: Term) -> Unit: ...
+"""The actual casts preserve the input's shape, placement and floating-point bits."""
+
+
+@function
 def dyadic_scale(term: Term) -> Unit: ...
 """Every scale is a positive power of two from 2**-100 through 2**100."""
 
@@ -423,6 +428,17 @@ _SMALL = Drawn(((64, 1024),), scale=lambda rng, shape, drawn: (rng.uniform(-0.5,
                                                                * 10.0 ** rng.uniform(-6, 0, shape)))
 
 
+def _half_normals(rng: np.random.Generator, shape: tuple[int, ...], drawn: list[np.ndarray]) -> np.ndarray:
+    """Draw both signs of f16's normal encodings; the adversarial families add zeros."""
+    del drawn
+    magnitude = rng.integers(0x0400, 0x7C00, shape, dtype=np.uint16)
+    sign = rng.integers(0, 2, shape, dtype=np.uint16) << 15
+    return (sign | magnitude).view(np.float16)
+
+
+_HALF_ROWS = Drawn(_ROWS.shapes, scale=_half_normals, dtype=jnp.float16)
+
+
 def _fold(rng: np.random.Generator, shape: tuple[int, ...], drawn: list[np.ndarray]) -> np.ndarray:
     """A fold's operands in turn: its logits, their maximum along the row, and the total of their
     exponentials less it, which holds the maximum's unit weight and so is at least one."""
@@ -635,24 +651,25 @@ def _reuse() -> tuple[RuleFamily, ...]:
     # A divisor's reciprocal is a normal finite float (above least normal and under reach).
     normal = (i64(0) - floor <= reached, lowest <= i64(0) - bound - 1)
     reciprocals = []
-    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made))
+    makers = (u.binary("max", w, made), u.binary("add", w, made), u.reduce("sum", axes, made),
+              u.clamp(w, v))
     r_laid = r.shaped("broadcast_in_dim", laid)
     for y in makers:
-        for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
-            reciprocals += [
-                rule(
-                    eq(t).to(a.binary("div", y, divided)), eq(r).to(one.binary("div", y, inverted)),
-                    unit(one), plain(inverted), eq(shape(r)).to(shape(t)), eq(floor).to(log2_floor(y)),
-                    eq(bound).to(log2_bound(y)), *common, *normal,
-                    *dividend_guard).then(union(t).with_(a.binary("mul", r, multiplied))),
-                rule(
-                    eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
-                    eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted),
-                    eq(shape(r)).to(shape(y)), eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
-                    eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)), *common, *normal,
-                    *dividend_guard).then(
-                    union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
-            ]
+        held_forms = ((eq(r).to(one.binary("div", y, inverted)), unit(one), plain(inverted)),
+                      (eq(inv).to(stock("reciprocal")), eq(r).to(y.unary("integer_pow", inv))))
+        for observed in held_forms:
+            for dividend_guard in ((eq(held).to(log2_bound(a)), held - floor <= reached), (i64(0) <= floor,)):
+                divisor = (eq(floor).to(log2_floor(y)), eq(bound).to(log2_bound(y)))
+                reciprocals += [
+                    rule(eq(t).to(a.binary("div", y, divided)), *observed, eq(shape(r)).to(shape(t)),
+                         *divisor, *common, *normal, *dividend_guard).then(
+                        union(t).with_(a.binary("mul", r, multiplied))),
+                    rule(eq(t).to(a.binary("div", y.shaped("broadcast_in_dim", laid), divided)),
+                         *observed, eq(shape(r)).to(shape(y)),
+                         eq(extent).to(shape(y.shaped("broadcast_in_dim", laid))),
+                         *divisor, *common, *normal, *dividend_guard).then(
+                        union(t).with_(a.binary("mul", r_laid, multiplied)), set_(shape(r_laid)).to(extent)),
+                ]
     inv_v = v.unary("integer_pow", inv)
     inv_laid = inv_v.shaped("broadcast_in_dim", laid)
     hoisted_reciprocals = [
@@ -888,13 +905,20 @@ def _contracted() -> tuple[RuleFamily, ...]:
 
 
 def _identities() -> tuple[RuleFamily, ...]:
-    """Commutativity of addition and multiplication: each rounds as the form it replaces."""
+    """Exact identities within a window, not heads that open windows on their own."""
     x, y = vars_("x y", Term)
-    params = var("params", i64)
+    params, wide, narrow = vars_("params wide narrow", i64)
     return (RuleFamily("addition's commutativity", (birewrite(x.binary("add", y, params)).to(
         y.binary("add", x, params)),), (lambda x, y, a: x + y, lambda x, y, a: y + x, _ROWS)),
             RuleFamily("multiplication's commutativity", (birewrite(x.binary("mul", y, params)).to(
-                y.binary("mul", x, params)),), (lambda x, y, a: x * y, lambda x, y, a: y * x, _ROWS)))
+                y.binary("mul", x, params)),), (lambda x, y, a: x * y, lambda x, y, a: y * x, _ROWS)),
+            RuleFamily("two float32 negations", (rule(
+                eq(y).to(x.unary("neg", params).unary("neg", params)),
+                eq(dtype(x)).to(String("float32"))).then(union(y).with_(x)),),
+                (lambda x, y, a: jax.lax.neg(jax.lax.neg(x)), lambda x, y, a: x, _ROWS)),
+            RuleFamily("an exact widening round trip", (rule(
+                eq(y).to(x.convert(wide).convert(narrow)), exact_roundtrip(y, x)).then(union(y).with_(x)),),
+                (lambda x, y, a: x.astype(jnp.float32).astype(x.dtype), lambda x, y, a: x, _HALF_ROWS)))
 
 
 FACTS = _facts()

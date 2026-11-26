@@ -32,6 +32,7 @@ from jax.extend import core as jcore
 from dew import parity
 from dew.algebra import error, printed, rules
 from dew.algebra._generated import case_of
+from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 
@@ -205,7 +206,10 @@ def _component(form: ComponentForm, operands, policy: str, target: str, label: s
         if not isinstance(aval := atom.aval, ShapedArray) or not aval.sharding.mesh.empty:
             raise printed.Unprintable(f"{label}: a flat component cannot preserve placement")
     single = _single_result(shaped)
-    text, _ = printed.source(closed, "form", borrow_shapes=True)
+    body = closed.jaxpr
+    live = programs.live(body.eqns, body.outvars)
+    text, _ = printed.source(closed.replace(jaxpr=programs.with_equations(body, live)),
+                             "form", borrow_shapes=True)
     flat, reference = printed.loaded(text, "form"), jcore.jaxpr_as_fun(closed)
 
     def arm(fn):
