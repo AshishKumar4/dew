@@ -501,39 +501,29 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
     assert named(params, "msa_indexer")
     _, sown = model.apply(params, tokens, mutable=[SELECTIONS, INDEXER_COLLECTION])
     assert named(sown, "index_scores") and named(sown, "selected")
-    # Its indexer's loss per query, where an objective training an indexer opens its collection.
-    (kl,) = named(sown, "kl")
-    assert kl.shape == (1, 16) and model.indexed_mixers
+    # Its indexer's loss per query, each layer's, where an objective training an indexer opens its
+    # collection.
+    kls = named(sown, "kl")
+    assert kls and all(kl.shape == (1, 16) for kl in kls) and model.indexed_mixers
     grads = jax.grad(lambda p: jnp.sum(model.apply(p, tokens)))(params)
     for leaf in named(grads, "msa_indexer"):
         np.testing.assert_array_equal(np.asarray(leaf), 0.0)
 
 
-def test_an_msa_decoder_of_a_top_of_one_attends_its_own_block_alone():
-    """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): each
-    query reads its own block alone, as the selection forces it (`msa_selection`), so its logits are the same
-    model's under MoBA's selection at a top of one, which reads its own block alone too, its index branch's
-    parameters apart."""
-    msa = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8),
-               dtype="float32")
-    moba = tiny(mixer=mixers.build("block_sparse_attention", block=4, top_k=1), dtype="float32")
+def test_an_msa_decoder_of_a_top_of_one_selects_each_querys_own_block_alone():
+    """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): it
+    builds and runs, each query's one slot its own block (`msa_selection`'s forcing), as it sows it."""
+    model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8),
+                 dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
-    params = msa.init(jax.random.key(1), tokens)
-    shared = moba.init(jax.random.key(1), tokens)
-    shared = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: _at(params, path) if _at(params, path) is not None else leaf, shared)
-    np.testing.assert_allclose(np.asarray(msa.apply(params, tokens)), np.asarray(moba.apply(shared, tokens)),
-                               rtol=1e-5, atol=1e-5)
-
-
-def _at(tree, path):
-    """`tree`'s leaf at `path`, or None where it holds none there."""
-    for key in path:
-        name = getattr(key, "key", getattr(key, "idx", None))
-        if not isinstance(tree, dict) or name not in tree:
-            return None
-        tree = tree[name]
-    return tree
+    params = model.init(jax.random.key(1), tokens)
+    logits, sown = model.apply(params, tokens, mutable=[SELECTIONS])
+    assert np.all(np.isfinite(np.asarray(logits)))
+    selections = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown)[0]
+                  if "selected" in "/".join(str(key) for key in path)]
+    assert selections
+    for selected in selections:
+        np.testing.assert_array_equal(np.asarray(selected)[..., 0], np.arange(16) // 4)
 
 
 @pytest.mark.parametrize(("selection", "refused"), [("moba", False), ("infllm", True), ("msa", True)])

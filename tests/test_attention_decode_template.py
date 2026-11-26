@@ -72,6 +72,23 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64, va
     return draw
 
 
+def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
+    """`[B, K, KV, D]` keys as pools `[KV, P, page, D]` holding each row's at the pages its `table` names."""
+    rows, keys = cache.shape[:2]
+    pages = jnp.moveaxis(cache.reshape(rows * keys // page, page, *cache.shape[2:]), 2, 0)
+    return pages[:, jnp.argsort(table.reshape(-1))]
+
+
+def _one_query_draws(rows: int, heads: int, keys: int, kv_heads: int, dtype):
+    """A draw of `rows` rows' one query of `heads` heads 64 wide, and their keys and values over `keys`."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(streams[0], (rows, 1, heads, 64), dtype),
+                *(jax.random.normal(stream, (rows, keys, kv_heads, 64), dtype) for stream in streams[1:]))
+
+    return draw
+
+
 def _operands(query_shape: tuple[int, ...], keys: int):
     """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
     heads 64 wide."""
@@ -227,9 +244,7 @@ def test_an_absorbed_mla_window_over_a_paged_latent_cache_returns_its_partial_fo
                         jnp.int32)
 
     def pooled(cache):
-        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
-        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
-        return pages[:, jnp.argsort(table.reshape(-1))]
+        return _pooled(cache, table, page)
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 2)
@@ -275,10 +290,7 @@ def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
         pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
         return pool.at[:, table].set(held)
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        return (jax.random.normal(streams[0], (2, 1, heads, 64), jnp.bfloat16),
-                *(jax.random.normal(stream, (2, keys, kv_heads, 64), jnp.bfloat16) for stream in streams[1:]))
+    draw = _one_query_draws(2, heads, keys, kv_heads, jnp.bfloat16)
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
@@ -374,9 +386,7 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
         np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page), jnp.int32)
 
     def pooled(cache):
-        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
-        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
-        return pages[:, jnp.argsort(table.reshape(-1))]
+        return _pooled(cache, table, page)
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
@@ -1436,10 +1446,7 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
         walks, work)
     assert attention_decode.launch_programs(rows, tiles) == 64
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        return (jax.random.normal(streams[0], (8, 1, heads, 64), jnp.float32),
-                *(jax.random.normal(stream, (8, keys, kv_heads, 64), jnp.float32) for stream in streams[1:]))
+    draw = _one_query_draws(8, heads, keys, kv_heads, jnp.float32)
 
     def ours(query, key, value):
         with generation.assumed("sm90"), jax.default_matmul_precision("default"):

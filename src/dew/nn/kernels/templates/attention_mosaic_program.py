@@ -292,7 +292,8 @@ def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str
     its dV sums (`BackwardTiles.parked`), the family's own otherwise."""
     if tiles.narrow:
         return dict.fromkeys(names, swizzling.NARROWEST_SWIZZLE_BYTES)
-    return dict.fromkeys(names, PARKED_SWIZZLE_BYTES) if getattr(tiles, "parked", False) else {}
+    parked = isinstance(tiles, BackwardTiles) and tiles.parked
+    return dict.fromkeys(names, PARKED_SWIZZLE_BYTES) if parked else {}
 
 
 @dataclasses.dataclass(frozen=True, order=True)

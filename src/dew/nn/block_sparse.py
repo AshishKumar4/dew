@@ -287,7 +287,7 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
     kls = [indexer_kl(index_scores[:, group], query[:, :, group * per:(group + 1) * per],
                       jnp.repeat(key[:, :, group:group + 1], per, axis=2), tokens[:, group], scale)
            for group in range(groups)]
-    return sum(kls) / groups
+    return jnp.mean(jnp.stack(kls), axis=0)
 
 
 INFLLM_STRIDE = 16
