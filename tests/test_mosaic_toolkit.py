@@ -1714,6 +1714,9 @@ def _accesses(call) -> str:
     """The typed module `call` lowers to for an A100, in program order, as its warpgroup barriers ('B',
     `nvvm.barrier`), shared-memory stores ('W') and shared-memory reads ('R', `ldmatrix` or a load)."""
     import jax.experimental.mosaic.gpu as mgpu
+    from jax._src.lib.mlir import ir
+    from jax._src.lib.mlir.dialects import llvm
+    from jax.experimental.mosaic.gpu import utils as mgpu_utils
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -1723,13 +1726,20 @@ def _accesses(call) -> str:
     module = mgpu.deserialized(kernel.ir)
     found: list[str] = []
 
+    def in_shared(value) -> bool:
+        # A shared-memory ref, or an LLVM pointer into shared memory (`ldmatrix`'s).
+        kind = value.type
+        if isinstance(kind, ir.MemRefType):
+            return mgpu_utils.is_smem_ref(kind)
+        shared = mgpu_utils.WORKGROUP_NVPTX_ADDRESS_SPACE
+        return isinstance(kind, llvm.PointerType) and kind.address_space == shared
+
     def walk(operation) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
                     name = inner.operation.name
-                    shared = any("workgroup" in str(each.type) or ", 3>" in str(each.type)
-                                 for each in inner.operation.operands)
+                    shared = any(in_shared(each) for each in inner.operation.operands)
                     if name == "nvvm.barrier":
                         found.append("B")
                     elif shared and name.endswith("store"):
@@ -1767,11 +1777,15 @@ def _staged_twice(x):
 
     def body(x_gmem, first, second):
         def scoped(buffer):
+            # Both reads held in registers and written out past the second: no global store, and its own
+            # automatic barriers, between the buffer's read and the store over it.
             value = family.zeros((16, 64))
             family.staged(value + 1, buffer)
-            first[...] = family.tile_of(buffer).astype(jnp.float32)
+            read = family.tile_of(buffer)
             family.staged(value + 2, buffer)
-            second[...] = family.tile_of(buffer).astype(jnp.float32)
+            reread = family.tile_of(buffer)
+            first[...] = read.astype(jnp.float32)
+            second[...] = reread.astype(jnp.float32)
 
         pl.run_scoped(scoped, plgpu.SMEM((16, 64), jnp.bfloat16))
 
