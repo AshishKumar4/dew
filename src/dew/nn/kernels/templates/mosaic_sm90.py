@@ -135,7 +135,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
-    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True, support=None):
+        mosaic.whole_products(self, support)
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
         if interpret and isinstance(acc, jax.Array):
