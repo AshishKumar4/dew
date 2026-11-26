@@ -2142,6 +2142,56 @@ def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bun
     np.testing.assert_array_equal(got, PERSISTED_STEPS * first)
 
 
+def _branch_first_walk(x, w, *, family, interpret):
+    """`x @ w` through a plain walk of `PERSISTED_STEPS` steps whose step first reads `w`'s slot inside a
+    branch (`pl.when` at its first step), then multiplies by it: the read a branch makes acquires the slot
+    within that branch, which the step's own read then takes."""
+    rows, columns = family.rows, w.shape[1]
+    family = family.specialized(rows, columns)
+    shape = (rows, columns)
+
+    def body(x_gmem, w_gmem, o_gmem):
+        def scope(*, streams):
+            def read(carry, sums):
+                del carry
+                for first, (value,) in family.chunks(sums):
+                    o_gmem[:, pl.ds(first, value.shape[1])] = value
+
+            multiplied = _multiplying(family, 'x', 'w', interpret)
+
+            def step(index, slots, carry, accumulators):
+                pl.when(index == 0)(lambda: slots['w'])
+                return multiplied(index, slots, carry, accumulators)
+
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+            walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read)
+            family.run(streams["walked"], walk, interpret)
+
+        family.scoped(scope, streams={"walked": family.streams({'x': ((rows, PERSISTED_DEPTH), x.dtype),
+                                                               'w': ((PERSISTED_DEPTH, columns), w.dtype)},
+                                                              2, 1)})
+
+    out = jax.ShapeDtypeStruct(shape, jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="branch_first")(x, w)
+
+
+@pytest.mark.parametrize("bundle", ONCE_BUNDLES[:2])
+def test_a_slot_a_branch_reads_first_is_the_steps_own_past_the_branch(bundle):
+    """Interpreted, on the host's CPU: a walk's step whose first read of a slot is inside a branch (a cond's,
+    `pl.when`) and whose next is its own, past the branch: the branch's acquire, its wait and its slot's
+    index the branch's own, holds for none of the step's reads after it, which acquire the slot again (a wait
+    again for the same turn returns at once), so the walk's product is `x @ w`, exactly. A
+    slot held from the branch's read carried its index past the branch, a value of a trace that had ended:
+    an sm120 attention training step's fused backward raised as it lowered (row 13106)."""
+    family, target, interpret = _once_bundle(bundle)
+    x, w = _persisted_operands(family.rows)
+    x = x[:family.rows]
+    with generation.assumed(target), on_the_host():
+        got = np.asarray(_branch_first_walk(x, w, family=family, interpret=interpret))
+    np.testing.assert_array_equal(got, np.asarray(x, np.float32) @ np.asarray(w, np.float32))
+
+
 def _once_bundle(bundle: str):
     """`bundle`'s family, the target it is assumed on, and how its kernel is interpreted: a GPU family's by
     Mosaic GPU's interpreter, a TPU core's by Pallas's."""
