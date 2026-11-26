@@ -77,10 +77,11 @@ def step_bytes(kind: str, layers: int, feature: str = "plain", copies: bool = Tr
 
     constants = {key: value for key, value in variables.items() if key != "params"}
     # Traced for the GPU the step was compiled for (`AheadOfTime.target`: the generation's at the memory its
-    # compile-only devices state), whose derivations and launches the step's trace keyed: the generation's
+    # compile-only devices state, any GPU of it, `portable`), whose derivations and launches the step's trace
+    # keyed: the generation's
     # canonical target (an H100 of 80 GB) built each of them again (rows 6766, PF03: twelve derivations,
     # about 8 s of a sparse case).
-    with generation.assumed(ahead.target or "sm90"), nn.logical_axis_rules(DEFAULT_RULES):
+    with generation.assumed(ahead.target or "sm90", portable=True), nn.logical_axis_rules(DEFAULT_RULES):
         # The model traced once, its program replayed for both reads: what its backward saves and what
         # it casts narrower (a decoder's trace is seconds of a case, rows 6766 on).
         closed = jax.make_jaxpr(loss)(variables["params"], constants, tokens)
