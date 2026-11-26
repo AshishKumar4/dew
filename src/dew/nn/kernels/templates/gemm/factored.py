@@ -83,25 +83,23 @@ def raised_factor(factor: jax.Array) -> tuple[jax.Array, jax.Array]:
     return float_bits.raised_exactly(factor, k), k
 
 
-def _significand(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An fp32 `x` as its signed significand in `[1, 2)` and its binary exponent, read from its bits (a
-    subnormal's normalized, `float_bits.float_bits`); a zero, an infinity or a NaN as it is, exponent 0."""
-    sign, biased, fraction, normalized, exponent = float_bits.float_bits(x)
+def _held_apart(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An fp32 `x` as its signed significand in `[1, 2)` (`_significand`, read from its bits) and its binary
+    exponent; a zero, an infinity or a NaN as it is, exponent 0."""
+    _, biased, fraction, _, exponent = float_bits.float_bits(x)
     finite = (biased != 0xFF) & ((biased != 0) | (fraction != 0))
-    bits = sign | (127 << 23) | normalized
-    held = jax.lax.bitcast_convert_type(bits.astype(jnp.int32), jnp.float32)
-    return jnp.where(finite, held, x), jnp.where(finite, exponent, 0).astype(jnp.int32)
+    return jnp.where(finite, _significand(x), x), jnp.where(finite, exponent, 0).astype(jnp.int32)
 
 
 def lowered_product(left: jax.Array, right: jax.Array, k: jax.Array | int) -> jax.Array:
     """`left * right * 2**-k` (fp32 operands, `k` int32 at least 0, broadcast) rounded once to nearest even in
     fp32, however far below its least normal, whatever the platform flushes: each operand's significand in
-    `[1, 2)` read from its bits (a subnormal's normalized), their product formed exactly into a rounded
+    `[1, 2)` read from its bits (`_held_apart`, a subnormal's normalized), their product formed exactly into a rounded
     product and its residual (`precision.two_product`, every part of it a normal float32), its exponents
     carried apart and the product rounded once at its own place, the residual deciding a tie
     (`float_bits.rounded_binary`'s `tail`); a zero, an infinity or a NaN multiplied as IEEE's."""
     left, right = jnp.broadcast_arrays(jnp.asarray(left, jnp.float32), jnp.asarray(right, jnp.float32))
-    (left, left_exponent), (right, right_exponent) = _significand(left), _significand(right)
+    (left, left_exponent), (right, right_exponent) = _held_apart(left), _held_apart(right)
     high, low = precision.two_product(left, right)
     _, sign, biased, fraction = float_bits.raw_fields(high)
     biased = biased.astype(jnp.int32)
