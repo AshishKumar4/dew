@@ -1564,6 +1564,9 @@ class _Targeted(NamedTuple):
     generation: str
     capacity: int | None
     start: Start
+    kind: str | None
+    """The kind the step's launches derive from and its build is pinned to: its devices' where they are a
+    host's own (`host_kind`), else None, a canonical GPU's standing for any of its generation."""
 
 
 @contextlib.contextmanager
@@ -1627,7 +1630,7 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
         # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
         trainer.phase_passes.at(batch)
         with trainer.phase_passes.scoped(trainer, trainer._compiler):
-            yield _Targeted(devices, generation, capacity, start)
+            yield _Targeted(devices, generation, capacity, start, kind)
 
 
 def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
@@ -1641,7 +1644,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     try:
         with _targeted(trainer, batch, what="compile_ahead",
                        platforms=(frozenset({"gpu"}), frozenset({"tpu"}))) as targeted:
-            devices, generation, capacity, start = targeted
+            devices, generation, capacity, start, kind = targeted
             target = gpu_target()
             # A fresh run's start compiles beside its step's planning, which reads none of it.
             from dew.training.distributed import start_compiling
@@ -1674,7 +1677,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices),
-                                device_kind=None if topology is None else host_kind(devices)),
+                                device_kind=kind),
         refusals=report.refused_launches(), sampled=sampled,
         at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
         starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
