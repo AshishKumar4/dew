@@ -443,9 +443,9 @@ class TpuTime:
     ops its program ran on its devices in its one run, as one profiler capture of the call holds them
     (`tpu_ops`, through Dew's one reading of a capture), each its duration on the device, which no host
     dispatch enters. The call runs once untimed before it, warm as CUPTI reads a GPU's; a capture starts and
-    stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is timed as its one
-    compiled program (`_program_of`), whose module names its runs; a call of another kind, or whose devices
-    its arrays do not name, is refused (`AmbiguousCapture`)."""
+    stops a call, a second or so a read. A TPU's call runs unevicted (`eviction`). A call is a compiled
+    program called with its dynamic operands (`_program_of`), whose module names its runs; a call of another
+    kind, or whose devices its arrays do not name, is refused (`AmbiguousCapture`)."""
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """The ops one call of `fn(*args)` ran (`tpu_ops`); `evicted` is a GPU's (`DeviceTime.kernels`), whose
@@ -471,7 +471,7 @@ class TpuTime:
 
         from dew.telemetry.profile import CaptureOptions, Profiler
 
-        program = _program_of(fn, args)
+        program = _program_of(fn)
         module = _module_of(program)
         warm = jax.block_until_ready(program(*args))
         devices = (_devices_of(warm) or _devices_of(args))
@@ -498,16 +498,16 @@ def _devices_of(tree) -> set[int]:
             for device in leaf.devices()}
 
 
-def _program_of(fn: Callable, args: tuple) -> jax.stages.Compiled:
-    """The one executable a TPU call of `fn(*args)` is timed as: a compiled program itself, a jitted
-    function's compiled for `args` (its `.lower`), which the read calls in its place, so the program it names
-    is the one that runs (a jitted call under `jax.disable_jit` runs no program at all); a call of anything
-    else (several programs, or none) is refused (`AmbiguousCapture`)."""
+def _program_of(fn: Callable) -> jax.stages.Compiled:
+    """The one executable a TPU call is timed as: `fn` itself, compiled (`jax.stages.Compiled`, the kernel
+    tuner's), called with its dynamic operands, so the program its module names is the one that runs. Any
+    other callable is refused (`AmbiguousCapture`): a jitted function's call may run no program (under
+    `jax.disable_jit`) or a program its own call chooses (Dew's `OuterProgram`), and its compile takes other
+    operands than its call (static arguments)."""
     if isinstance(fn, jax.stages.Compiled):
         return fn
-    if callable(getattr(fn, "lower", None)):
-        return fn.lower(*args).compile()
-    raise AmbiguousCapture(f"{fn} is neither a compiled nor a jitted program: no one program names its ops")
+    raise AmbiguousCapture(f"{fn} is no compiled program: a TPU call is timed as one (`jax.stages.Compiled`), "
+                           "called with its dynamic operands")
 
 
 def _module_of(program: jax.stages.Compiled) -> str:
