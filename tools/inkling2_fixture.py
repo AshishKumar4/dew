@@ -328,7 +328,8 @@ def write_vision_recording() -> None:
             features = network.get_image_features(pixels, given['image_grid_thw'], return_dict=True)
             logits = network(input_ids=given['input_ids'], pixel_values=pixels,
                              image_grid_thw=given['image_grid_thw'], use_cache=False).logits
-        return {'image_features': features.pooler_output.numpy(), 'logits': logits.numpy()}
+        # `pooler_output` is split image by image; the images' merged tokens in order.
+        return {'image_features': torch.cat(features.pooler_output).numpy(), 'logits': logits.numpy()}
 
     def evaluate(drawn):
         with float64():
