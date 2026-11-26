@@ -83,6 +83,8 @@ SEARCHED_AGAIN = Path(__file__).with_name("searched_again_worker.py")
 again once placed."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
+TERNARY_SCALE = Path(__file__).with_name("ternary_scale_worker.py")
+"""The worker of the pool whose packed ternary scale lies across, or on one of, its processes."""
 REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
 """The worker of the pool that recovers a lost key from a replica."""
 CLOCKED = 17
@@ -1883,7 +1885,7 @@ def test_a_ternary_scale_spanning_processes_is_refused_on_every_rank_where_one_h
     left at its next collective; a normal scale on process 0's devices alone is admitted on each, neither
     waiting on the other, and a subnormal one there refused on both at a restore's pool-wide check (row
     13340's review)."""
-    reports = run_pool("ternary_scale", tmp_path / "pool", 2, timeout=180)
+    reports = run_pool("ternary_scale", tmp_path / "pool", 2, script=TERNARY_SCALE, timeout=180)
     assert [report["outcome"] for report in reports] == ["PeerFailure", "ValueError"]
     assert [report["alone"] for report in reports] == ["admitted", "admitted"]
     assert [report["restored"] for report in reports] == ["ValueError", "PeerFailure"]
