@@ -349,22 +349,36 @@ def test_msas_index_branch_scores_selects_and_trains_as_its_equations_write_them
     np.testing.assert_array_equal(np.asarray(by_hidden), 0.0)
 
 
-def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attention():
-    """MSA's indexer loss (`msa_query_kls`) where its index branch scores one of a query's two selected tokens
-    100 below the other and the attention weighs them alike: its KL is 50 - log 2, and its gradient on the
-    low score -1/2 (the branch's softmax there, ~e^-100, less the attention's 1/2), where an epsilon inside
-    the logarithm (MaxText's, `mla.indexer_kl`'s) capped the loss near 8.5 and stilled that gradient."""
+def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attention_or_at_fp32s_range():
+    """MSA's indexer loss (`msa_query_kls`) over a query's two selected tokens the attention weighs alike:
+    where its index branch scores one 100 below the other, its KL is 50 - log 2 (the float64 run, as a
+    float64 oracle writes it) and its gradient on the scores exactly (1/2, -1/2) in fp32, where an epsilon
+    inside the logarithm (MaxText's, `mla.indexer_kl`'s) capped the loss near 8.5 and stilled the low
+    score's gradient; scored fp32's largest and least, its KL fp32's largest (its exact value rounds
+    there), not an infinity; and over one selected token beside a key it does not select, nothing, the
+    selected token's score fp32's least."""
     query = jnp.zeros((1, 2, 1, 4), jnp.float32)
     key = jnp.zeros((1, 2, 1, 4), jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
-    scores = jnp.asarray([[[[0.0, -jnp.inf], [0.0, -100.0]]]], jnp.float32)
+    largest = np.finfo(np.float32).max
 
-    def loss(scores):
+    def loss(scores, query=query, key=key):
         return block_sparse.msa_query_kls(scores, query, key, selected, block=2, scale=0.5)
 
-    np.testing.assert_allclose(np.asarray(loss(scores))[0], [0.0, 50.0 - np.log(2.0)], rtol=1e-6, atol=1e-6)
-    gradient = np.asarray(jax.grad(lambda s: loss(s)[0, 1])(scores))[0, 0, 1]
-    np.testing.assert_allclose(gradient, [0.5, -0.5], rtol=1e-6)
+    low = [[[[0.0, -np.inf], [0.0, -100.0]]]]
+    with jax.enable_x64(new_val=True):
+        wide = (jnp.asarray(low, jnp.float64), query.astype(jnp.float64), key.astype(jnp.float64))
+        kls = np.asarray(loss(*wide))
+    expected = np.asarray([[0.0, 50.0 - np.log(2.0) + np.log1p(np.exp(-100.0))]])
+    assert_computes_the_oracle(kls, expected, "MSA's indexer loss at a token scored 100 below", roundings=8)
+    gradient = np.asarray(jax.grad(lambda s: loss(s)[0, 1])(jnp.asarray(low, jnp.float32)))[0, 0, 1]
+    np.testing.assert_array_equal(gradient, np.asarray([0.5, -0.5], np.float32))
+
+    extremes = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(loss(extremes))[0], np.asarray([0.0, largest], np.float32))
+    # The first query selects its own token alone (the second is past it), scored fp32's least.
+    hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
+    assert np.asarray(loss(hidden))[0, 0] == 0.0
 
 
 def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach():

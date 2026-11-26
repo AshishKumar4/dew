@@ -33,7 +33,7 @@ from dew.nn.kv_cache import cached_validity
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer, CausalSelfAttention
 from dew.nn.mla import SELECTIONS, indexer_target
-from dew.nn.precision import compensated_sum, float32_einsum
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 from dew.nn.residuals import Residual
 from dew.nn.sparse_selection import (
     SELECTING,
@@ -281,7 +281,7 @@ def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
     names a key's block and the key is no later than the query: the blocks' mask
     (`sparse_selection.selection_mask`, the groups folded into the batch) widened to their keys."""
     batch, groups, queries, _ = selected.shape
-    blocks = selection_mask(selected.reshape(batch * groups, queries, -1), -(-keys // block))
+    blocks = selection_mask(selected.reshape(batch * groups, queries, selected.shape[-1]), -(-keys // block))
     chosen = jnp.repeat(blocks, block, axis=-1)[..., :keys].reshape(batch, groups, queries, keys)
     return chosen & (jnp.arange(keys)[None, :] <= jnp.arange(queries)[:, None])
 
@@ -291,9 +291,10 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
     objective takes it (the objective's `IndexerTraining`): each group's KL of the index branch's softmax over
     the query's selected tokens from its heads' detached attention there (`mla.indexer_target`: their
-    softmaxes summed, normalized), averaged over the groups. The index branch's log-softmax is taken whole,
-    no epsilon (MaxText's, `mla.indexer_kl`'s, caps a token the branch scores far below the attention's at
-    -log(1e-8) and stills its gradient), a token the teacher gives no mass adding nothing. `query`
+    softmaxes summed, normalized), averaged over the groups. Its logarithms are taken whole, no epsilon
+    (MaxText's, `mla.indexer_kl`'s, caps a token the branch scores far below the attention's at -log(1e-8)
+    and stills its gradient), over the selected tokens alone, a token the teacher gives no mass adding
+    nothing. `query`
     `[B, Q, G * h, D]`, `key` `[B, K, G, D]`, `index_scores` `[B, G, Q, K]`."""
     groups, keys = index_scores.shape[1], index_scores.shape[3]
     per = query.shape[2] // groups
@@ -301,16 +302,25 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
 
     def kl(group: int) -> jax.Array:
         keep = tokens[:, group]
-        summed = indexer_target(query[:, :, group * per:(group + 1) * per],
-                                jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep, scale,
-                                dtype=jnp.result_type(index_scores, query, key))
+        wide = at_least_fp32(jnp.result_type(index_scores, query, key))
+        summed = jnp.where(keep, indexer_target(query[:, :, group * per:(group + 1) * per],
+                                                jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep,
+                                                scale, dtype=wide), 0)
         total = compensated_sum(summed, (summed.ndim - 1,))[..., None]
         target = jnp.where(total > 0, summed / jnp.where(total > 0, total, 1), 0)
-        wide = summed.dtype
-        scores = jnp.where(keep, index_scores[:, group].astype(wide), jnp.finfo(wide).min)
-        student = jax.nn.log_softmax(scores, axis=-1)
-        divergence = jnp.where(target > 0, target * (jnp.log(jnp.where(target > 0, target, 1)) - student), 0)
-        return compensated_sum(divergence, (divergence.ndim - 1,))
+        taken = target > 0
+        # KL = sum t log t + (m - sum t s) + log sum exp(s - m) over the selected keys alone, m their peak:
+        # no gap between two scores is rounded unweighted ([fp32's max, its least] at a uniform teacher is
+        # fp32's max - log 2, finite), and a key it does not select adds nothing, its score however low.
+        scores = jnp.where(keep, index_scores[:, group].astype(wide), -jnp.inf)
+        peak = jax.lax.stop_gradient(jnp.max(scores, axis=-1))
+        peak = jnp.where(jnp.isfinite(peak), peak, 0)
+        spread = jnp.log(jnp.sum(jnp.where(keep, jnp.exp(scores - peak[..., None]), 0), axis=-1))
+        weighted = compensated_sum(jnp.where(taken, target * jnp.where(taken, scores, 0), 0),
+                                   (scores.ndim - 1,))
+        entropy = compensated_sum(jnp.where(taken, target * jnp.log(jnp.where(taken, target, 1)), 0),
+                                  (target.ndim - 1,))
+        return jnp.where(jnp.any(keep, axis=-1), (peak - weighted) + spread + entropy, 0)
 
     return jnp.mean(jnp.stack([kl(group) for group in range(groups)]), axis=0)
 
