@@ -8,6 +8,7 @@ import warnings
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax._src import source_info_util
 from reference_error import assert_as_exact
 from test_algebra_program import _bf16_rms
@@ -51,6 +52,29 @@ def test_a_norm_of_norms_backward_reuses_a_reduction_through_a_cotangent_sum():
     assert any(eq.primitive is add_jaxvals_p for eq in selected)
     assert_as_exact(jax.jit(rewritten), jax.jit(gradient), lambda seed: _rows(seed, rows.shape),
                     "norm of norms backward", seeds=8)
+
+
+@pytest.mark.mesh(devices=2)
+def test_cotangent_reductions_keep_their_explicit_placements():
+    from jax._src.ad_util import add_jaxvals_p
+    from jax.sharding import AxisType, PartitionSpec as P
+
+    def reduced(a, b):
+        x = jax.lax.broadcast_in_dim(jnp.tanh(a), (128,), (), out_sharding=P("data"))
+        y = jax.lax.broadcast_in_dim(jnp.tanh(b), (128,), (), out_sharding=P(None))
+        return add_jaxvals_p.bind(jax.lax.reduce_sum_p.bind(x, axes=(0,)),
+                                  jax.lax.reduce_sum_p.bind(y, axes=(0,)))
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        inputs = jnp.float32(0.5), jnp.float32(1.0)
+        expected = jax.jit(reduced)(*inputs)
+        compute = algebra.rewritten(reduced)
+        actual = jax.jit(compute)(*inputs)
+        np.testing.assert_array_equal(actual, expected)
+        selected = _equations(jax.make_jaxpr(compute)(*inputs).jaxpr)
+        add, = (eq for eq in selected if eq.primitive is add_jaxvals_p)
+        assert [atom.aval.shape for atom in add.invars] == [(), ()]
 
 
 def test_structural_closed_preserves_equation_source_info_and_nested_body_provenance():

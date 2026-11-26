@@ -553,10 +553,11 @@ class Term(Expr):
   (`terms.OPERATIONS`, an `Operation` each): its symbol in the language, the term it is written as,
   what its value proves of its operand's magnitude and sign (§6.3), and its cost (§6.5). An equation is
   of the language by its primitive object, never its name. A foreign primitive is opaque. A JAX tangent
-  sum (`add_any`) is written as `add` for equal-shape float16, bfloat16, float32 and float64 arrays. Its
-  parameter slot retains JAX's original primitive for replay with the operands aligned as traced. Other
-  tangent sums remain opaque. This exposes one fewer reduction in a norm-of-norms backward (row 13132);
-  it is not a claim that every normalization backward runs in a single pass. What JAX itself states of a
+  sum (`add_any`) is written as `add` for equal-shape float16, bfloat16, float32 and float64 arrays
+  without explicit placement or manual mesh variation. Replay keeps JAX's original primitive. On
+  those meshes, changes in the operands' placement as a rule moves the add are not proven, so the
+  sum stays opaque. This exposes a shared reduction in a norm-of-norms backward (row 13132), not a
+  single pass for every normalization backward. What JAX itself states of a
   primitive (a call's program, an entrywise operation, a reduction) every reader takes from `dew.nn.programs`.
 - `terms.region(closed) -> Region` converts a window's equations (`program._windows`):
   - every equation outside the language becomes a `leaf` for each of its outputs;

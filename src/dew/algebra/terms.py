@@ -45,8 +45,7 @@ from egglog.declarations import (
     TypeRefWithVars,
 )
 from egglog.runtime import RuntimeExpr
-from jax._src import ad_util
-from jax._src import core as jax_core
+from jax._src import ad_util, core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.experimental.layout import Layout
@@ -1116,7 +1115,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     n_invars = len(jaxpr.invars)
 
     for eq_idx, equation in enumerate(jaxpr.eqns):
-        composed, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
+        operation = _in_language(equation)
+        composed, facts = _propagate_facts(equation, operation, laid, magnitude_of, apart_of)
         if composed is not None and facts is not None:
             origin, params_ = composed
             out = equation.outvars[0]
@@ -1127,8 +1127,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             _typed(dtypes, magnitudes, env[out], out, bound)
             depths[out] = depths.get(origin, 0) + 1
             continue
-        term = _term(equation, read, param)
-        if term is not None and facts is not None:
+        if operation is not None and facts is not None:
+            term = _term(equation, operation, read, param)
             out = equation.outvars[0]
             env[out] = term
             shapes.append((term, _shape(out)))
@@ -1176,18 +1176,17 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
                   }))
 
 
-def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnitude | None],
+def _prove_equation(equation: jcore.JaxprEqn, name: str, magnitude_of: Callable[..., Magnitude | None],
                     apart_of: Callable[..., Apart]) -> tuple[Magnitude | None, Apart]:
     """The finite magnitude bound and `Apart` proven of `equation`'s single output from its operands'."""
     operands = [magnitude_of(atom) for atom in equation.invars]
-    name = spoken_as(equation)
     held_apart = [apart_of(atom) for atom in equation.invars]
     # An exponential of a value at most 0 is at most 1 in the reals, at most 2 as computed: a native
     # exponential is not certified under 1 (`ex2.approx`'s relative error, 2**-22.5, is more than an ulp
     # of 1), so it is given one power.
     exponentiated = name in ("exp", "exp2") and held_apart[0].sign < 0
-    bound = UNIT + 1 if exponentiated else _bounded(equation, operands, held_apart)
-    proved = _apart(equation, held_apart, operands, bound)
+    bound = UNIT + 1 if exponentiated else _bounded(equation, name, operands, held_apart)
+    proved = _apart(equation, name, held_apart, operands, bound)
     # A bound is stated of a value proven finite alone, as a rewrite's side condition reads it (row 5780;
     # owner, 2026-11-14): a NaN's tanh is no number, and a product of a value that overflowed reads the
     # bound its real factors have and computes an infinity.
@@ -1210,6 +1209,11 @@ def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
                 or left.dtype != made.dtype or right.dtype != made.dtype
                 or not jax_core.definitely_equal_shape(left.shape, made.shape)
                 or not jax_core.definitely_equal_shape(right.shape, made.shape)):
+            return None
+        # Rewrites can move an add between ranks, which can change explicit layouts or manual-axis
+        # variation. Unlike an ordinary add, accumulation demands identical placed input types.
+        mesh = made.sharding.mesh
+        if mesh.explicit_axes or mesh.manual_axes:
             return None
     return operation
 
@@ -1237,6 +1241,7 @@ def _composed_broadcast(
 
 def _propagate_facts(
     equation: jcore.JaxprEqn,
+    operation: Operation | None,
     laid: dict[jcore.Var, tuple[jcore.Var, tuple[int, ...]]],
     magnitude_of: Callable[..., Magnitude | None],
     apart_of: Callable[..., Apart],
@@ -1248,8 +1253,8 @@ def _propagate_facts(
     if composed is not None:
         origin, _ = composed
         return composed, (magnitude_of(origin), apart_of(origin))
-    if _in_language(equation) is not None:
-        return None, _prove_equation(equation, magnitude_of, apart_of)
+    if operation is not None:
+        return None, _prove_equation(equation, operation.symbol, magnitude_of, apart_of)
     return None, None
 
 
@@ -1293,7 +1298,7 @@ def _proven_walk(jaxpr: jcore.Jaxpr, *, consts: Mapping[jcore.Var, object] | Non
             continue
         if deep and len(equation.outvars) == 1:
             made_eq[equation.outvars[0]] = equation
-        _, facts = _propagate_facts(equation, laid, magnitude_of, apart_of)
+        _, facts = _propagate_facts(equation, _in_language(equation), laid, magnitude_of, apart_of)
         if facts is not None:
             out = equation.outvars[0]
             bound, proved = softmax_track.step(equation, *facts, apart_of)
@@ -1358,7 +1363,7 @@ def _integer_range(dtype) -> Magnitude:
     return integers.bits - (integers.min < 0)
 
 
-def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
+def _apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart], bounds: list[Magnitude | None],
            bound: Magnitude | None) -> Apart:
     """What `equation`'s output holds beside its magnitude (`Apart`) from its operands' (`operands`), their
     magnitudes (`bounds`, each `|x| <= 2**a`) and its own (`bound`), by the real arithmetic over their
@@ -1408,7 +1413,6 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
         return NOWHERE
     if not jnp.issubdtype(aval.dtype, jnp.floating):
         # An integer keeps a sign through the operations that keep one alone: its arithmetic wraps.
-        name = spoken_as(equation)
         kept = name in KEEPING_SIGN and (
             name != "convert_element_type" or _keeps_sign(equation.invars[0], equation.outvars[0])) and not (
             name.startswith("reduce_") and _reduced(equation) < 1)
@@ -1418,7 +1422,7 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
         return _held_apart((operands[0] if kept else WHOLE)._replace(finite=proven), aval.dtype)
     if not operands:
         return NOWHERE
-    made = _float_apart(equation, operands, bounds, aval.dtype)
+    made = _float_apart(equation, name, operands, bounds, aval.dtype)
     # Finite where its operands make it so and its own bound is within its dtype; a finite value is a number.
     finite = made.finite and _within(bound, aval.dtype)
     return _held_apart(made._replace(number=made.number or finite, finite=finite), aval.dtype)
@@ -1457,11 +1461,10 @@ def _extreme(side: int, operands: list[Apart], bounds: list[Magnitude | None]) -
                  all(held.finite for held in operands))
 
 
-def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
-                 dtype: DTypeLike) -> Apart:
+def _float_apart(equation: jcore.JaxprEqn, name: str, operands: list[Apart],
+                 bounds: list[Magnitude | None], dtype: DTypeLike) -> Apart:
     """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
     own bound is read: whether its operands make it finite."""
-    name = spoken_as(equation)
     first, floors, signs = operands[0], [held.floor for held in operands], [held.sign for held in operands]
     numbers, finite = all(held.number for held in operands), all(held.finite for held in operands)
     known = [floor for floor in floors if floor is not None]
@@ -1575,8 +1578,8 @@ def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | No
     return Apart(floor, sign, operand.number, operand.number and operand.floor is not None)
 
 
-def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apart: list[Apart],
-                 dtype: DTypeLike) -> Magnitude | None:
+def _apart_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
+                 apart: list[Apart], dtype: DTypeLike) -> Magnitude | None:
     """`_real_bound`'s bound of an equation of a float `dtype` whose result shrinks with an operand or needs
     one away from zero, each operand's magnitude read only where it is proven finite (`Apart.finite`: an
     infinite dividend's quotient is infinite whatever bounds it, and a value that overflowed in a narrower
@@ -1595,7 +1598,7 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apa
       reciprocal of a power that underflows to zero is infinite)."""
     if not jnp.issubdtype(dtype, jnp.floating):
         return None
-    name, upper, held = spoken_as(equation), operands[0], apart[0]
+    upper, held = operands[0], apart[0]
     above = held.above
     if name == "div":
         floor = apart[1].floor
@@ -1632,7 +1635,7 @@ APART_BOUNDED = frozenset({"div", "sqrt", "rsqrt", "log", "log2", "pow"})
 """The operations whose bound `_apart_bound` states, a negative integer power's beside them."""
 
 
-def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
+def _bounded(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
              apart: list[Apart]) -> Magnitude | None:
     """A bound on the magnitude of `equation`'s output from its operands' (`operands`, `Magnitude`) and what
     they hold away from zero (`apart`), None where its primitive proves none (an exponential of a value of any
@@ -1650,11 +1653,10 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     dtype = np.dtype(aval.dtype)
     if dtype == np.bool_:
         return UNIT
-    real = _real_bound(equation, operands, apart, dtype)
+    real = _real_bound(equation, name, operands, apart, dtype)
     if not jnp.issubdtype(dtype, jnp.integer):
         return real
     full = _integer_range(dtype)
-    name = spoken_as(equation)
     source = equation.invars[0].aval
     from_unsigned = isinstance(source, ShapedArray) and jnp.issubdtype(source.dtype, jnp.unsignedinteger)
     wraps = jnp.issubdtype(dtype, jnp.unsignedinteger) and (
@@ -1664,8 +1666,8 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     return None if real is None else min(real, full)
 
 
-def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apart: list[Apart],
-                dtype: DTypeLike) -> Magnitude | None:
+def _real_bound(equation: jcore.JaxprEqn, name: str, operands: list[Magnitude | None],
+                apart: list[Apart], dtype: DTypeLike) -> Magnitude | None:
     """`_bounded`'s bound of an output of `dtype` as the real arithmetic on the operands' bounds proves it (a
     float's, or an integer's before its dtype wraps it), each operand `|x| <= 2**a` (`y`'s `2**b`). Each
     rule's reason over the box of its operands, and its float rounding's slack (a float rounds to nearest,
@@ -1695,7 +1697,6 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
       fast accumulation) proves none (`contraction_slack`).
     A quotient, a root, a logarithm and a power are bounded where an operand's floor holds them
     (`_apart_bound`). Any other equation proves none."""
-    name = spoken_as(equation)
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
     if name in BITWISE:
@@ -1707,7 +1708,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None], apar
         # One power past the real range for a native implementation's rounding.
         return UNIT + 1
     if name in APART_BOUNDED or (name == "integer_pow" and equation.params["y"] < 1):
-        return _apart_bound(equation, operands, apart, dtype) if real else None
+        return _apart_bound(equation, name, operands, apart, dtype) if real else None
     if name == "clamp":
         # Its operand where it lies between its bounds, else a bound: no larger than either bound, whatever
         # its operand is.
@@ -1947,13 +1948,10 @@ def held_bits(value) -> tuple[Hashable, np.ndarray]:
     return str(array.dtype), array
 
 
-def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., Node],
-                                   param: Callable) -> Node | None:
-    """`equation` as a term over its inputs' (`read`), written as its operation's kind is (`WRITTEN`), or
-    None where it is outside the language."""
-    operation, primitive = _in_language(equation), equation.primitive
-    if operation is None:
-        return None
+def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, operation: Operation,
+                                   read: Callable[..., Node], param: Callable) -> Node:
+    """An admitted equation over its inputs' terms, written with its operation's constructor."""
+    primitive = equation.primitive
     written = WRITTEN[operation.kind]
     first, *others = (read(atom) for atom in equation.invars)
     write = getattr(first, written.constructor)
