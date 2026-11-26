@@ -105,7 +105,7 @@ def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(bat
     forms = scan.derive_scan(spec, saturation=SATURATION)
     q = np.asarray([[0, 0], [2.0 ** 127, 2.0 ** 127]], np.float32)
     k = np.asarray([[2, -2], [0, 0]], np.float32)
-    v = np.asarray([[0.25], [0]], np.float32)
+    v = np.asarray([[0.125], [0]], np.float32)
     z = np.zeros(2, np.float32)
 
     def run(q, k, v, z):
@@ -119,8 +119,9 @@ def test_a_coupled_chunk_keeps_its_local_score_unlanded_until_the_state_read(bat
         _, gradient = forms.backward(tokens, state, jnp.zeros_like(end[1]), cotangent)
         return out, read, gradient["q"]
 
-    # Both token products are normal: 2^127 times ±0.5, not q times the bare key (±2^128).
-    state = (k[0].astype(np.float64) * float(v[0, 0]))[:, None]
+    # The same momentum enters both tokens' unit-weight memory updates. The resulting products
+    # are 2^127 times ±0.5, not q times the bare key (±2^128).
+    state = (k[0].astype(np.float64) * (2 * float(v[0, 0])))[:, None]
     if batched:
         q = np.stack((q, np.asarray([[0, 0], [3, 1]], q.dtype)))
         run = jax.vmap(run, in_axes=(0, None, None, None))
