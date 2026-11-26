@@ -103,15 +103,18 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
 
 
 def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
-    """`seed * coefficient`, a subnormal coefficient (`q / d` below the normal range) raised by `2^64`
+    """`seed * coefficient` of held values (no derivative), a subnormal factor (either) raised by `2^64`
     through a correctly rounded division by an exact power (`divided_in`, which reads a subnormal from its
-    bits) and the seed lowered by as much, so a CPU flushing subnormal operands multiplies normal values,
-    and both factors stay differentiable."""
-    held = jax.lax.stop_gradient(coefficient)
-    small = finite_nonzero(held) & ~normal(held)
-    shift = jnp.where(small, 64, 0)
-    return (seed * exact_power2(-shift, seed.dtype)) * divided_in(coefficient, exact_power2(-shift,
-                                                                                         coefficient.dtype))
+    bits) and the other lowered by as much, so a CPU flushing subnormal operands multiplies normal values:
+    the value PyTorch's order computes where subnormals are kept."""
+    seed, coefficient = jax.lax.stop_gradient((seed, coefficient))
+    small_coefficient = finite_nonzero(coefficient) & ~normal(coefficient)
+    small_seed = finite_nonzero(seed) & ~normal(seed) & ~small_coefficient
+    raised, lowered = (jnp.where(small_coefficient, coefficient, jnp.where(small_seed, seed, coefficient)),
+                       jnp.where(small_coefficient, seed, jnp.where(small_seed, coefficient, seed)))
+    shift = jnp.where(small_coefficient | small_seed, 64, 0)
+    return (lowered * exact_power2(-shift, lowered.dtype)) * divided_in(raised, exact_power2(-shift,
+                                                                                         raised.dtype))
 
 
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
@@ -148,8 +151,13 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
         kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))
         balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
                                                     for value in (numerator, denominator))
-        return jnp.where(torch, _flush_safe(moving, divided_in(kept_quotient, kept_denominator)),
-                         balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
-                                  (balanced_denominator, balanced_denominator)))
+        # PyTorch's order as its value is where subnormals are kept (`_flush_safe`), its derivatives that
+        # order's own (`plain`'s, JAX's at every order, as before row 13163): a flushing CPU's product
+        # carries no subnormal into the value, and no rescale into a derivative.
+        plain = moving * divided_in(kept_quotient, kept_denominator)
+        kept = jnp.where(special, plain, plain + jax.lax.stop_gradient(
+            jnp.where(special, 0, _flush_safe(moving, divided_in(kept_quotient, kept_denominator)) - plain)))
+        return jnp.where(torch, kept, balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
+                                               (balanced_denominator, balanced_denominator)))
 
     return linear_map(apply, apply, (quotient, numerator, denominator), tangent)
