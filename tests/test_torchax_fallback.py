@@ -2011,9 +2011,10 @@ def test_a_plain_trace_nested_in_a_looped_ones_seam_runs_its_own_layers_and_leav
 def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path):
     """A source taken to tier 3 looping its first layer three passes runs a count a call gives
     (`loop_passes`): its logits at each count are, bit for bit, the loop of that many passes' (each later pass
-    at or past the count skipped, as a native loop's counted pass, `looping.counted_branch`, row 13144); and
-    a trainer drawing each microbatch's count (`TrainerAdvanced.sampled_passes`) steps it at more than one
-    count, every loss finite."""
+    at or past the count skipped, as a native loop's counted pass, `looping.counted_branch`, row 13144); its
+    later passes run under one scan, the block traced once, so its program is as long at six passes as at
+    three; and a trainer drawing each microbatch's count (`TrainerAdvanced.sampled_passes`) steps it at more
+    than one count, every loss finite."""
     from dew.training.compiler import DrawingStep
     from dew.training.interval import Interval
     from dew.training.phase_passes import SampledPasses
@@ -2029,6 +2030,12 @@ def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path
         np.testing.assert_array_equal(
             np.asarray(counted(loaded.variables, ids, jnp.int32(count))),
             np.asarray(jax.jit(looped.with_passes(count).apply)(loaded.variables, ids)), err_msg=f"{count}")
+    # The block traced once under the passes' scan, whatever their count: one program as long at 3 as at 6.
+    def equations_at(steps):
+        model = looped.with_passes(steps)
+        return len(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(loaded.variables).jaxpr.eqns)
+
+    assert equations_at(3) == equations_at(6)
     held = dataclasses.replace(loaded, model=looped)
     trainer = Trainer(LMObjective(held, 11, ema_decay=None), optax.sgd(0.1), key=jax.random.key(0),
                       advanced=TrainerAdvanced(sampled_passes=SampledPasses(mean=2.0, dispersion=0.5, cap=3)))

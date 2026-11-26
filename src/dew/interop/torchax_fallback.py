@@ -534,8 +534,9 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
                          "given no 'dropout' rng")
 
     rng = jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None else None
-    if rng is not None and (step := _PASS.get()):
-        # A tier-3 loop's later pass drops its own (`_layer_seam`).
+    step = _PASS.get()
+    if rng is not None and not (isinstance(step, int) and step == 0):
+        # A tier-3 loop's later pass drops its own (`_layer_seam`), its step traced under the passes' scan.
         rng = jax.random.fold_in(rng, step)
     dropping = {"dropout_rate": float(dropout) if drawn else 0.0, "deterministic": not drawn,
                 "dropout_rng": rng}
@@ -1358,7 +1359,7 @@ def _layer_list(model):
     return stack if isinstance(stack, torch.nn.ModuleList) else None
 
 
-_PASS: contextvars.ContextVar[int] = contextvars.ContextVar("dew_tier3_pass", default=0)
+_PASS: contextvars.ContextVar[int | jax.Array] = contextvars.ContextVar("dew_tier3_pass", default=0)
 """The pass of a tier-3 loop a replayed layer runs in (`_layer_seam`), which Dew's attention folds into its
 dropout's key past the first (`_dew_attention`), so each pass drops its own."""
 
@@ -1480,36 +1481,65 @@ class _Seam:
         return env.j2t_iso(out)
 
     def replayed(self, output, loop: Loop):
-        """The block's later passes after its first's `output`: each from the pass before's state, the
-        decoder's norm between them under `step_norm`; under a count (`passes`), a pass at or past it
-        skipped and one before the last `backprop_steps` it allows run passing no gradient back, as a native
-        loop's counted pass (`looping.counted_branch`), each branch its own program (`lax.switch`)."""
-        from dew.nn.backbones.looping import counted_branch
-
-        env, passes = self.env, self.passes
+        """The block's later passes after its first's `output`, each from the pass before's state, the
+        decoder's norm between them under `step_norm`: a decoding call's pass by pass, each writing its own
+        cache entries (`_cache_entry`); any other's under one scan (`scanned`)."""
         self.replaying = True
         try:
-            for step in range(1, loop.steps):
-                if passes is None:
+            call = _ATTENDING.get()
+            if call is not None and call.cache is not None:
+                for step in range(1, loop.steps):
                     output = self.run_pass(output, loop, step)
-                    continue
-
-                def run(state, step=step):
-                    return env.t2j_iso(_state_of(self.run_pass(env.j2t_iso(state), loop, step)))
-
-                def held_back(state, step=step):
-                    return jax.lax.stop_gradient(run(state, step))
-
-                branches = (lambda state: state, run) if loop.backprop_steps is None else (
-                    lambda state: state, held_back, run)
-                index = counted_branch(step, passes, loop.backprop_steps)
-                state = jax.lax.switch(index, branches, env.t2j_iso(_state_of(output)))
-                output = _with_state(output, env.j2t_iso(state))
-            return output
+                return output
+            env = self.env
+            return _with_state(output, env.j2t_iso(self.scanned(env.t2j_iso(_state_of(output)), loop)))
         finally:
             self.replaying = False
 
-    def run_pass(self, output, loop: Loop, step: int):
+    def scanned(self, state: jax.Array, loop: Loop) -> jax.Array:
+        """The later passes over `state` under one `lax.scan`, the block traced once whatever `loop.steps`
+        (row 13144): its program (`_accumulating`'s, each broadcast's gradient summed wide and each layer
+        recomputed under `remat` as the forward's) the scan's body, torchax's key its carry, so each pass
+        draws its own. Under a count (`passes`), a pass at or past it skipped and one before the last
+        `backprop_steps` it allows run passing no gradient back, as a native loop's counted pass
+        (`looping.counted_branch`), each branch its own (`lax.switch`)."""
+        from dew.nn.backbones.looping import counted_branch
+
+        env, passes = self.env, self.passes
+        held = env.prng_key
+        drew: list[bool] = []
+
+        def one(state, key, step):
+            env.prng_key = key
+            moved = env.t2j_iso(_state_of(self.run_pass(env.j2t_iso(state), loop, step)))
+            drew.append(env.prng_key is not key)
+            return moved, env.prng_key
+
+        closed = jax.make_jaxpr(one)(state, held, jnp.int32(1))
+        env.prng_key = held
+        programs = self.layers or ()
+
+        def run(carry, step):
+            return tuple(_accumulating(closed, *carry, step, recomputed=programs))
+
+        def held_back(carry, step):
+            moved, key = run(carry, step)
+            return jax.lax.stop_gradient(moved), key
+
+        def body(carry, step):
+            if passes is None:
+                return run(carry, step), None
+            branches = ((lambda carry, step: carry, run) if loop.backprop_steps is None
+                        else (lambda carry, step: carry, held_back, run))
+            index = counted_branch(step, passes, loop.backprop_steps)
+            return jax.lax.switch(index, branches, carry, step), None
+
+        (state, key), _ = jax.lax.scan(body, (state, held), jnp.arange(1, loop.steps, dtype=jnp.int32))
+        if any(drew):
+            env.prng_key = key
+        return state
+
+    def run_pass(self, output, loop: Loop, step: int | jax.Array):
         """Later pass `step` of the block over the pass before's `output`, each layer called with the
         arguments its first pass took, its attention's dropout its own (`_PASS`)."""
         state, norm = _state_of(output), self.norm
