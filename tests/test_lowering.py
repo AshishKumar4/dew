@@ -964,11 +964,9 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     `dew.nn.kernels.lowered.triton_calls` reads it)."""
     from jax.extend.mlir import ir
 
-    found: list[Operation] = []
+    from dew.nn.kernels.lowered import typed
 
-    def typed(values) -> tuple:
-        tensors = [value.type for value in values if isinstance(value.type, ir.RankedTensorType)]
-        return tuple((tuple(tensor.shape), str(tensor.element_type)) for tensor in tensors)
+    found: list[Operation] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
         attributes = operation.attributes
@@ -985,13 +983,6 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
-
-
-def _mosaic_calls(operations: list[Operation]) -> list[tuple]:
-    """The Mosaic GPU calls among a lowered program's `operations` (`_operations`), each its operands' and
-    results' shapes."""
-    return [(operands, results) for name, target, operands, results in operations
-            if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
 
 
 def _collective(name: str) -> str | None:
@@ -1133,10 +1124,14 @@ def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows():
     program states it: lowered over two devices and two rows, its Mosaic GPU calls are one device's over one
     row, operand for operand, and it holds no collective (bible 7's multi-device lowering, row 1963). An
     A100's template refuses this scan: no config of mma.sync's fits it."""
-    sharded = _operations(_ssd_forward("sm90", rows=2, devices=2))
-    calls = _mosaic_calls(sharded)
-    assert calls and calls == _mosaic_calls(_operations(_ssd_forward("sm90", rows=1, devices=1)))
-    assert not [name for name, *_ in sharded if _collective(name)]
+    def launches(lowered) -> list:
+        # Its Mosaic GPU launches, each its operands' and results' shapes and types (`KernelCall.signature`).
+        return [call.signature for call in _own_launches(lowered) if call.kind == "mosaic_gpu"]
+
+    sharded = _ssd_forward("sm90", rows=2, devices=2)
+    calls = launches(sharded)
+    assert calls and calls == launches(_ssd_forward("sm90", rows=1, devices=1))
+    assert not [name for name, *_ in _operations(sharded) if _collective(name)]
 
 
 @pytest.mark.parametrize("generation, cores", [
