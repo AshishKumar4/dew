@@ -85,7 +85,9 @@ from dew.registry import resolve_dtype
 if TYPE_CHECKING:
     import torch
     from jax.extend.core import Jaxpr
+    from torch.nn import ModuleList
     from torchax.interop import JittableModule
+    from torchax.tensor import Environment
     from transformers import PreTrainedModel
 
     from dew.nn.backbones.decoder_stack import DecoderBank
@@ -1159,10 +1161,10 @@ class TorchGraph:
             # The module's training mode, its parameters' binding (`functional_call`), torchax's environment
             # and the layers' seam are this trace's alone: `_TRACING` holds other threads' traces apart, and
             # a trace nested in this one restores this one's mode (row 13139).
-            was = self.module.training
+            # The source model's own mode (the wrapper's flag is its own), restored to it whole.
+            was = self.module._model.training
             self.module.train(train)
-            seam = (contextlib.nullcontext() if layers is None and loop is None
-                    else _layer_seam(self.module._model, env, layers=layers, loop=loop))
+            seam = _layer_seam(self.module._model, env, layers=layers, loop=loop)
             try:
                 # The runtime property scoped to this trace whatever it is handed, so a draw inside (a refused
                 # nested layer's) leaves no key of its trace in the environment past it.
@@ -1423,8 +1425,8 @@ class _Seam:
     that trace, its replay's state (the arguments each layer's first pass took, and whether a replay runs)
     its own."""
 
-    stack: Sequence
-    env: object
+    stack: ModuleList
+    env: Environment
     layers: list | None
     loop: Loop | None
     first: int
@@ -1438,17 +1440,19 @@ class _Seam:
         looping = loop is not None and self.first <= index < self.end and not self.replaying
         if looping:
             self.captured[index] = (args, kwargs)
-        output = forward(*args, **kwargs) if self.layers is None else self.traced_apart(forward, args, kwargs)
+        programs = self.layers
+        output = forward(*args, **kwargs) if programs is None else self.traced_apart(forward, args, kwargs,
+                                                                                     programs)
         if loop is not None and looping and index == self.end - 1:
             return self.replayed(output, loop)
         return output
 
-    def traced_apart(self, forward, args, kwargs):
+    def traced_apart(self, forward, args, kwargs, programs: list):
         from torch.utils import _pytree
 
         from dew.nn.nested import nested
 
-        env, programs = self.env, self.layers
+        env = self.env
         leaves, structure = _pytree.tree_flatten((args, kwargs))
         tensors = [index for index, leaf in enumerate(leaves) if _is_tensor(leaf)]
 
@@ -1471,8 +1475,8 @@ class _Seam:
         self.replaying = True
         try:
             for step in range(1, loop.steps):
-                state = _state_of(output)
-                state = self.norm(state) if loop.step_norm else state
+                state, norm = _state_of(output), self.norm
+                state = norm(state) if loop.step_norm and norm is not None else state
                 token = _PASS.set(step)
                 try:
                     for index in range(self.first, self.end):
@@ -1506,18 +1510,30 @@ def _state_of(output):
 
 
 @contextlib.contextmanager
-def _layer_seam(model, env, *, layers: list | None, loop: Loop | None) -> Iterator[None]:
-    """Each of `model`'s decoder layers called through this trace's seam (`_Seam`), its dispatcher
-    (`_dispatched`, installed once) reading it from this context alone (`_SEAM`), so traces of variants
-    sharing the layers, nested or in other threads, keep their own. Under `layers`, each call traced as a
-    program of its own over its tensor arguments (`dew.nn.nested.nested`), each program `layers` takes:
-    what `_accumulating` recomputes in a step's backward (`TorchCausalLM.remat`); a layer that draws (its
-    dropout) is refused, as its program would hold the draw's key, which torchax carries past it (its key
-    moved, whatever dispatch drew). Under `loop`, the block `loop.layers` runs `loop.steps` times: past its
-    last layer's first call, its later passes, each layer called with the arguments its own first pass took
-    (the call's masks and rotary tables, which differ by layer kind), its hidden input the pass before's
-    output, the decoder's `norm` between passes under `step_norm`, each pass's attention dropout its own
-    (`_PASS`)."""
+def _layer_seam(model, env: Environment, *, layers: list | None, loop: Loop | None) -> Iterator[None]:
+    """This trace's seam over `model`'s decoder layers (`_Seam`), which their dispatchers (`_dispatched`,
+    installed once) read from this context alone (`_SEAM`), so traces of variants sharing the layers, nested
+    or in other threads, keep their own: none for a trace running neither `layers` nor `loop`, whose
+    layers run as their own forwards even nested in another's, at the first pass (`_PASS`). Under `layers`,
+    each call traced as a
+    program of its own over its tensor arguments and torchax's key (`dew.nn.nested.nested`), returning its
+    outputs and the key's successor, each program `layers` takes: what `_accumulating` recomputes in a step's
+    backward (`TorchCausalLM.remat`), its draws (its dropout) the forward's, from the same key. Under
+    `loop`, the block `loop.layers` runs `loop.steps` times: past its last layer's first call, its later
+    passes, each layer called with the arguments its own first pass took (the call's masks and rotary
+    tables, which differ by layer kind), its hidden input the pass before's output, the decoder's `norm`
+    between passes under `step_norm`, each pass's attention dropout its own (`_PASS`)."""
+    seam = None if layers is None and loop is None else _seam_of(model, env, layers, loop)
+    tokens = _SEAM.set(seam), _PASS.set(0)
+    try:
+        yield
+    finally:
+        _PASS.reset(tokens[1])
+        _SEAM.reset(tokens[0])
+
+
+def _seam_of(model, env: Environment, layers: list | None, loop: Loop | None) -> _Seam:
+    """`model`'s decoder layers' seam for one trace (`_layer_seam`), its loop's block checked against them."""
     held, stack = model.get_decoder(), _layer_list(model)
     if stack is None:
         raise ValueError(f"tier 3 runs a source's decoder layers apart, and {type(held).__name__} holds no "
@@ -1530,11 +1546,7 @@ def _layer_seam(model, env, *, layers: list | None, loop: Loop | None) -> Iterat
         raise ValueError(f"a loop's step norm is the decoder's final norm, and {type(held).__name__} holds "
                          "no `norm`")
     _dispatched(model)
-    token = _SEAM.set(_Seam(stack, env, layers, loop, first, end, norm))
-    try:
-        yield
-    finally:
-        _SEAM.reset(token)
+    return _Seam(stack, env, layers, loop, first, end, norm)
 
 
 _BROADCASTING = frozenset((primitives.add_p, primitives.sub_p, primitives.mul_p, primitives.div_p,
