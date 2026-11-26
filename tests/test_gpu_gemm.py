@@ -364,6 +364,9 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
+        Cell("a blockwise FP8 product at far-apart scales is exact",
+             gemm_blockwise.a_blockwise_fp8_product_at_far_apart_scales_is_exact, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "subnormal scale"}),
         Cell("a blockwise FP8 product at large finite scales is finite",
              gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
              at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
