@@ -485,6 +485,15 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
     with pytest.raises(AmbiguousCapture):
         tpu_ops(twice, {0}, "jit_run")
+    # Another program's run overlapping the call's, and its op inside the call's window: left out by program.
+    overlapped = tmp_path / "overlapped"
+    _tpu_capture(overlapped, [*ops, (0, "fusion.5", 0.5, 0.75, 9)], [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
+    assert [op.name for op in tpu_ops(overlapped, {0}, "jit_run")] == ["fusion.1", "custom-call.2"]
+    # A run stating no program: its ops are not told apart from another's.
+    unnamed = tmp_path / "unnamed"
+    _tpu_capture(unnamed, ops, [(0, "jit_run", 0.0, 1.0, None)])
+    with pytest.raises(AmbiguousCapture):
+        tpu_ops(unnamed, {0}, "jit_run")
 
 
 def test_a_tpu_calls_program_is_named_by_its_module_and_a_call_of_no_one_program_refused():

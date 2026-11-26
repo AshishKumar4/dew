@@ -407,9 +407,11 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     """The ops one call of the program `module` names ran on the TPU `devices` (their ids), as the newest
     capture under `directory` holds them (`dew.telemetry.trace.device_events`): its one run on each device
     (an `XLA Modules` event of its name, `jit_run` or `jit_run(7)`), and the ops of that run's program within
-    it (`XLA Ops`), each its device milliseconds; another program's ops, a host transfer and another device's
-    left out. A capture where the program ran on none of `devices` is refused (`NoKernels`), one where it ran
-    twice on one (`AmbiguousCapture`)."""
+    it (`XLA Ops`, its program_id), each its device milliseconds; another program's ops, a host transfer and
+    another device's left out. A call of one program always runs its module (`_module_of`), so a run of
+    another executable of the same name beside it is a second run, refused with the rest of a capture where
+    it ran twice on one device or states no program (`AmbiguousCapture`); one where it ran on none of
+    `devices` is refused (`NoKernels`)."""
     from dew.telemetry import trace
 
     named = {f"/device:TPU:{device}" for device in devices}
@@ -425,10 +427,12 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     planes, _ = trace.device_events(directory)
     timed = []
     for plane, (run,) in ((plane, each) for plane, each in runs.items() if each):
-        program = trace.program_of(run)
+        if (program := trace.program_of(run)) is None:
+            raise AmbiguousCapture(f"{module}'s run under {directory} states no program, so its ops are not "
+                                   "told apart from another program's beside it")
         timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in planes.get(plane, [])
                   if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns
-                  and trace.program_of(op) is not None and program in (None, trace.program_of(op))]
+                  and trace.program_of(op) == program]
     if not timed:
         raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {sorted(devices)}")
     return tuple(timed)

@@ -1651,21 +1651,14 @@ def noted(found: Seen) -> None:
         collected.found.taken.extend(found.taken)
 
 
-def _measuring_device() -> jax.Device:
-    """The device a measurement here makes its operands on and runs on (`_measured`): JAX's default device
-    (`jax.default_device`), a backend named the first of its local devices, else the default backend's."""
-    default = jax.config.jax_default_device
-    if isinstance(default, jax.Device):
-        return default
-    return jax.local_devices(backend=default)[0]
-
-
 def _on_its_tpu() -> bool:
-    """Whether a trace here targets the TPU a measurement here runs on (`_measuring_device`): its platform a
-    TPU's (`generation.backend`) and its generation that device's own (`generation.device_target`), so a
-    measurement times the launches it traced on the device they target."""
-    device = _measuring_device()
-    return (generation.backend() == device.platform == "tpu"
+    """Whether a trace here targets the TPU a measurement here runs on: the default device
+    (`get_default_device`, where `_measured` makes its operands), the process's default backend's own (whose
+    options, eviction and device time a measurement takes, `dew.telemetry.benchmark`) and a TPU, its
+    generation the trace's (`generation.backend`, `generation.device_target`), so a measurement times the
+    launches it traced on the device they target."""
+    device = get_default_device()
+    return (generation.backend() == device.platform == jax.default_backend() == "tpu"
             and generation.device_target(device).generation == generation.gpu_target().generation)
 
 
