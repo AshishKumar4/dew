@@ -21,6 +21,13 @@ def test_the_kernels_type_names_every_choice_with_exactly_its_kernels():
                                    for choice, found in kernel_matrix.ops().items()}
     for choice, named in generation.SITE_KERNELS.items():
         served.setdefault(str(choice), set()).update(named)
+    # The module's block is the one the tool writes from them (row 12776).
+    from tools import kernel_choices
+
+    text = kernel_choices.MODULE.read_text().splitlines()
+    first, last = kernel_choices.block("\n".join(text))
+    assert text[first:last + 1] == kernel_choices.rendered(kernel_choices.served(),
+                                                           kernel_choices.keyword_only_now())
     hints = typing.get_type_hints(kernels.Kernels)
     offered = {field.name: {value for member in typing.get_args(hints[field.name])
                             for value in typing.get_args(member)}
