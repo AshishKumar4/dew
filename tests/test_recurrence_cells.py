@@ -24,10 +24,9 @@ def test_a_b200s_port_cells_route_no_other_tcgen05_generation(timed, sibling):
     def forward(query, key, value, g, beta):
         return recurrence_chunk.chunk_gated_delta_rule(query, key, value, g, beta)[0]
 
-    measured = {name: any(found for _, found in _measured_routes(recurrence_chunk.GATED_DELTA.choice, name,
-                                                                forward, *shapes))
-                for name in (timed, sibling)}
-    assert measured == {timed: True, sibling: False}, measured
+    routes = {name: set(_measured_routes(recurrence_chunk.GATED_DELTA.choice, name, forward, *shapes))
+              for name in (timed, sibling)}
+    assert routes == {timed: {('fla', True)}, sibling: {('mosaic_gpu', False)}}, routes
 
 
 @pytest.mark.parametrize('sibling', ['sm86', 'sm89', 'sm120'])
@@ -47,7 +46,6 @@ def test_an_a100s_ssd_port_cells_route_no_other_mma_sync_generation(sibling):
               jax.ShapeDtypeStruct((1, 4096, 64), jnp.float32),
               *[jax.ShapeDtypeStruct((64,), jnp.float32)] * 2)
     training = jax.grad(loss, argnums=(0, 1, 2, 3))
-    measured = {name: any(found for _, found in _measured_routes(recurrence_chunk.SCAN.choice, name,
-                                                                training, *shapes))
-                for name in ('sm80', sibling)}
-    assert measured == {'sm80': True, sibling: False}, measured
+    routes = {name: set(_measured_routes(recurrence_chunk.SCAN.choice, name, training, *shapes))
+              for name in ('sm80', sibling)}
+    assert ('pallas', True) in routes['sm80'] and routes[sibling] == {('mosaic_gpu', False)}, routes
