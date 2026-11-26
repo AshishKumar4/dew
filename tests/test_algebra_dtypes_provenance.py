@@ -62,8 +62,7 @@ def test_cotangent_reductions_keep_their_explicit_placements():
     def reduced(a, b):
         x = jax.lax.broadcast_in_dim(jnp.tanh(a), (128,), (), out_sharding=P("data"))
         y = jax.lax.broadcast_in_dim(jnp.tanh(b), (128,), (), out_sharding=P(None))
-        return add_jaxvals_p.bind(jax.lax.reduce_sum_p.bind(x, axes=(0,)),
-                                  jax.lax.reduce_sum_p.bind(y, axes=(0,)))
+        return add_jaxvals_p.bind(jax.lax.reduce_sum(x, (0,)), jax.lax.reduce_sum(y, (0,)))
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
