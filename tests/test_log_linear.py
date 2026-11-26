@@ -92,6 +92,28 @@ def test_key_heads_serve_their_own_value_heads_packed():
                          length=LENGTH, seeds=SEEDS[True])
 
 
+def _two_tokens(weights, values=(1.0, 1.0)):
+    """Two tokens' log-linear attention, one level apart: unit queries and keys, no decay, a unit scale,
+    each token's level weights `weights` `[2, 2]` and its value `values`."""
+    ones = jnp.ones((1, 2, 1, 1), jnp.float32)
+    value = jnp.asarray(values, jnp.float32).reshape(1, 2, 1, 1)
+    return functools.partial(log_linear_attention, ones, ones, value, jnp.zeros((1, 2, 1), jnp.float32),
+                             scale=1.0), jnp.asarray(weights, jnp.float32).reshape(1, 2, 1, 2)
+
+
+def test_a_pairs_weight_is_its_own_levels_alone_both_ways():
+    """A token's weight at one level reaches that level's pairs alone, forward and back (head review of
+    fd3af8c41): an infinite weight at the token's own level leaves its pair with the other token finite,
+    its output infinite where a masked product's zero times it read NaN; and an infinite cotangent of its
+    own pair leaves the other level's weight's gradient finite, 2 where a product's transpose read NaN."""
+    attend, weights = _two_tokens([[1.0, 1.0], [np.inf, 1.0]])
+    np.testing.assert_array_equal(np.asarray(attend(weights)).ravel(), [1.0, np.inf])
+    attend, weights = _two_tokens([[0.5, 0.5], [0.5, 0.5]], values=(1.0, 2.0 ** 127))
+    cotangent = jnp.asarray([0.0, 2.0], jnp.float32).reshape(1, 2, 1, 1)
+    grads = jax.grad(lambda w: jnp.sum(attend(w) * cotangent))(weights)
+    np.testing.assert_array_equal(np.asarray(grads).reshape(2, 2), [[0.0, 0.0], [np.inf, 2.0]])
+
+
 @pytest.mark.parametrize("read", ["overflowing", "overflowing at a level of zero weight", "a NaN"])
 def test_a_live_span_that_underflows_reads_as_the_recurrence(read):
     """Three tokens of one document within a block under log decays `[0, -80, -80]`, each live, its first

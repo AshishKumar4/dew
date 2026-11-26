@@ -14,6 +14,7 @@ from reference_error import assert_as_exact, with_gradients
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.kernels.templates.gemm.hooks import ColumnLocal
+from dew.nn.kernels.templates.hooks import Hook
 
 SEEDS = 8
 ROWS, DEPTH, WIDTH = 128, 128, 128
@@ -48,7 +49,7 @@ def _template(hook, out_dtypes):
     def run(x, w):
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
               tuning.pinned({grouped_matmul.MosaicGmm: TILE})):
-            return tuple(gemm.gemm(x, w, None, epilogue=hook(out_dtypes), out_dtype=out_dtypes[0],
+            return tuple(gemm.gemm(x, w, None, epilogue=Hook(hook(out_dtypes)), out_dtype=out_dtypes[0],
                                    out_dtypes=out_dtypes, interpret_on_cpu=True))
     return run
 
@@ -90,7 +91,8 @@ def test_an_undeclared_prologues_pullback_reads_its_tile_whole():
     width, through the template at a pinned 128-column tile its depth's width: read out whole, its rows'
     gradient as exact as XLA's from float64 (read out 64 columns at a time, it would scale by 64)."""
     def product(x, w):
-        return gemm.gemm(x, w, None, prologue=_width_scaled, applied=_width_scaled(x), out_dtype=jnp.bfloat16,
+        return gemm.gemm(x, w, None, prologue=Hook(_width_scaled), applied=_width_scaled(x),
+                         out_dtype=jnp.bfloat16,
                          interpret_on_cpu=True)
 
     def dew(*arguments):

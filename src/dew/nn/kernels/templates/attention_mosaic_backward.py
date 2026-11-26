@@ -21,7 +21,6 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     Kind,
     PaddedCall,
-    Param,
     anchor_multipliers,
     by_power,
     interpreted_rows,
@@ -43,6 +42,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 )
 from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegisters
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
@@ -92,7 +92,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     steps = key.shape[1] // tiles.block_k
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal",
                        spec.queries)
-    hooks = Hooks(score_mod, tuple(map(Param, score_params, score_kinds)))
+    hooks = Hooks(score=Hook(score_mod, tuple(map(Side, score_params, score_kinds))))
     # The accurate form's exponentials exact: the hardware's ex2.approx flushes a subnormal weight to zero,
     # whose product with a large score cotangent the reference keeps (row 2022, ET-SUBFIX2-h100).
     approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,

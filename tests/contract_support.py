@@ -19,7 +19,7 @@ import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -263,7 +263,7 @@ def running(label: str, name: str):
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
                     taking: tuple[str, ...] | None = None, without: tuple[str, ...] = (), draw=None,
-                    seeds: int | None = None) -> None:
+                    seeds: int | None = None, placement: Literal["both", "local", "mesh"] = "both") -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
@@ -282,10 +282,10 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     head brings its own test). A name of no order (`orders`) in either is refused, and so is a case they leave
     no order (`order_set`).
 
-    And every order runs on training's mesh of two devices (`_on_a_mesh`), as a training step runs it (row
-    7973: a launch whose specs left out two of its operands raised under any mesh, and the suite, run off
-    one, passed it), a check-1 site there over the cell's seeded `draw` where it gives one, of `seeds` where
-    given (a cell sharded across CI's map tasks, its mark's count: `map_judge.marked_seeds`)."""
+    Each order also runs on training's mesh of two devices (`_on_a_mesh`) by default, as a training step
+    runs it (row 7973). A slow case can name the two placements separately: `local` runs only the
+    unpartitioned program, `mesh` requires the two-device program. Both use the same finiteness checks
+    against plain and float64 reference arms, and keep the mesh's Check 1 where `draw` gives one."""
 
     every = set(orders(fn, primals, direction, cotangent))
     named = {*(taking or ()), *without} - every
@@ -311,11 +311,13 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     def runs(f, arguments, context, site):
         return {name: _Run(_mesh_program(f, name), arguments, context, site(name), name) for name in in_order}
 
-    narrow = runs(fn, given, contextlib.nullcontext, lambda _: label)
+    narrow = {} if placement == "mesh" else runs(fn, given, contextlib.nullcontext, lambda _: label)
     plainly = {} if plain_fn is None else runs(plain_fn, given, contextlib.nullcontext,
                                                lambda _: f"{label}, plainly")
     wide_runs = runs(truth_fn or fn, wide_given, _on_float64, lambda _: f"{label} in float64")
-    mesh = _training_mesh()
+    mesh = None if placement == "local" else _training_mesh()
+    if placement == "mesh" and (mesh is None or mesh.size != 2):
+        raise ValueError(f"{label}: the mesh contract needs two training devices")
     meshed = {} if mesh is None else runs(fn, _placed(mesh, given), functools.partial(jax.set_mesh, mesh),
                                          lambda name: f"{label}, {name}, on training's mesh of two")
     _compiled_ahead([*narrow.values(), *plainly.values(), *wide_runs.values(), *meshed.values()])

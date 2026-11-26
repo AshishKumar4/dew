@@ -19,6 +19,7 @@ from test_attention_template import CASES, arguments, geometry as core_geometry
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import assembled, attention as template, attention_mosaic
+from dew.nn.kernels.templates.hooks import Hook
 
 pytestmark = pytest.mark.kernel
 
@@ -471,7 +472,7 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
     q = jnp.ones((1, 128, 1, 64), jnp.float16)
     k = jnp.ones((1, 384, 1, 64), jnp.float16)
     v = jnp.ones((1, 384, 1, 128), jnp.float16)
-    hooks = template.Hooks(output_mod=lambda o: o * 2.0)
+    hooks = template.Hooks(output=Hook(lambda o: o * 2.0))
     pinned = attention_mosaic.Tiles(64, 64, 6, 1, family="wgmma", columns=64)
     with generation.assumed("sm90"), _pinned(pinned):
         op, args = attention_mosaic._forward_call(q, k, v, spans, hooks, scale=None, natural=True)
@@ -604,37 +605,6 @@ def test_the_forward_on_tcgen05s_rows_over_narrow_value_blocks_holds_check_1_int
     _check_forward("causal", jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
                    value_width=64, tiles=dataclasses.replace(ROWS_TILES, columns=16),
                    target=generation.gpu_target("sm100"))
-
-
-@INTERPRETS
-def test_the_forward_on_tcgen05s_rows_holds_check_1_beside_a_parameter_no_score_hook_reads_interpreted():
-    """The forward on a B200's tcgen05 rows (`ROWS_TILES`), causal over 192 tokens, given a key bias and no
-    score hook to read it: the launch takes no stream of it, which no role of the rows would release (its
-    issuer streams the keys and values alone), and it computes the plain call, on par with the reference
-    (check 1)."""
-    shape = (1, 192, 2, 1)
-    spans = template.spans(shape[1], shape[1], shape[0], **CALLS["causal"])
-    draw_operands = _drawn(shape, jnp.bfloat16, width=64)
-    target = generation.gpu_target("sm100")
-
-    def draw(seed):
-        drawn = jax.random.fold_in(jax.random.PRNGKey(5), seed)
-        return *draw_operands(seed), jax.random.normal(drawn, (1, 2, shape[1]), jnp.float32)
-
-    def unread(bias):
-        return template.Hooks(score_params=(template.Param(bias, template.Kind.KEY),))
-
-    def ours(query, key, value, dout, bias):
-        del dout
-        with _device(interpret=True, target=target), _pinned(ROWS_TILES):
-            return attention_mosaic.forward(query, key, value, spans, unread(bias), interpret=True)
-
-    def reference(query, key, value, dout, bias):
-        del dout
-        return template.reference(query, key, value, spans, unread(bias))
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward rows unread key bias",
-                    seeds=SEEDS)
 
 
 KEYS_TILES = {

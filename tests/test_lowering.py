@@ -37,6 +37,7 @@ from dew.nn.kernels.generation import (
 )
 from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.telemetry import instrumentation
 from dew.training import TrainerAdvanced
 from dew.training._lowering import KernelReport, kernel_report
@@ -686,20 +687,31 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, list]:
-    """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
-    an abstract mesh of `devices` that splits the rows, and the program's operations (`_operations`)."""
-    from jax.sharding import AbstractMesh, AxisType
+PER_SHARD_KERNELS = {"selective scan": ("selective_scan",), "packed recurrence": ("recurrence", "short_conv")}
+"""The name prefixes of an op's own kernels, where its step launches others too (a layer's projections, the
+GEMM's)."""
 
-    from dew.telemetry.instrumentation import custom_call_kind
+def _own_launches(lowered: jax.stages.Lowered, prefixes: tuple[str, ...] = ("",)) -> list:
+    """The Pallas launches of `lowered` (`kernel_calls`, each a compile compiles) whose kernel's name starts
+    with one of an op's `prefixes` (`PER_SHARD_KERNELS`): its own, a layer's projections' (the GEMM's)
+    apart."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    return [call for call in kernel_calls(lowered, unrun=True)
+            if call.kind in ("triton", "mosaic_gpu") and call.name.startswith(prefixes)]
+
+
+def _kernel_launches(loss, args, generation: str, devices: int,
+                     prefixes: tuple[str, ...]) -> tuple[list, list]:
+    """An op's own launches (`_own_launches`) of `loss`'s value and gradient lowered for `generation`'s GPU
+    on an abstract mesh of `devices` that splits the rows, and the program's operations (`_operations`)."""
+    from jax.sharding import AbstractMesh, AxisType
 
     mesh = gpu_mesh(AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
             lowering_platforms=("cuda",))
-    calls = [call for call in custom_calls(lowered)
-             if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
-    return calls, _operations(lowered)
+    return _own_launches(lowered, prefixes), _operations(lowered)
 
 
 @pytest.mark.parametrize(("generation", "op"),
@@ -710,14 +722,15 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     there (its device's rows, its replicated parameters whole), never the whole batch; and the program's
     only collective is the reduction of its replicated parameters' gradients over the data axis."""
     loss, args = PER_SHARD_STEPS[op](384)
-    whole, _ = _kernel_launches(loss, args, generation, 1)
-    split, operations = _kernel_launches(loss, args, generation, 2)
+    prefix = PER_SHARD_KERNELS.get(op, ("",))
+    whole, _ = _kernel_launches(loss, args, generation, 1, prefix)
+    split, operations = _kernel_launches(loss, args, generation, 2, prefix)
 
     def elements(call) -> int:
         return sum(math.prod(shape) for shape in call.operands)
 
     pairs = list(zip(split, whole, strict=True)) if len(split) == len(whole) else []
-    assert whole and pairs, (op, [call.target for call in whole], [call.target for call in split])
+    assert whole and pairs, (op, [call.name for call in whole], [call.name for call in split])
     assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
         op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
     assert {_collective(name) for name, *_ in operations if _collective(name)} <= {"all-reduce"}
@@ -735,8 +748,9 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
     rows, depth, width, groups = 384, 128, 256, 4
 
     def biased(x, w, sizes, b):
-        return gemm.gemm(x, w, sizes, epilogue=lambda acc, bias: acc + bias,
-                         epilogue_operands=((b, ("groups", "columns")),), out_dtype=jnp.bfloat16)
+        return gemm.gemm(x, w, sizes,
+                         epilogue=Hook(lambda acc, bias: acc + bias, (Side(b, ("groups", "columns")),)),
+                         out_dtype=jnp.bfloat16)
 
     args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
             jax.ShapeDtypeStruct((groups, depth, width), jnp.bfloat16),
@@ -1042,8 +1056,15 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     cause absent from the program it compiles."""
     (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
     operations = _operations(sharded)
-    calls = _mosaic_calls(operations)
-    assert calls and calls == _mosaic_calls(_operations(local))
+
+    def recurrences(lowered) -> list:
+        # The recurrence's own Mosaic GPU launches, each its operands' and results' shapes and types: its
+        # projections' (the GEMM's) run on XLA's mesh, not a map's.
+        return [call.signature for call in _own_launches(lowered, PER_SHARD_KERNELS["packed recurrence"])
+                if call.kind == "mosaic_gpu"]
+
+    calls = recurrences(sharded)
+    assert calls and calls == recurrences(local)
     scanned = [operands for name, target, operands, _ in operations
                if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
     assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned

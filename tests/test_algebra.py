@@ -51,31 +51,39 @@ def cheaper_spliced(program, *operands) -> bool:
     return traces_cheaper(algebra.rewritten(program), *operands)
 
 
+def count_above(x, a):
+    return jnp.sum((x > a).astype(x.dtype), axis=-1)
+
+
 def two_sums(x, y, a):
-    """Two reductions of one scale's products of bounded values (each a tanh), which linearity joins into one
-    pass over their sum: the range facts bound that new sum, so the rewrite admits it (§6.3)."""
+    """Two exact floating counts of different masks, a legal single-pass reduction."""
+    return count_above(x, a) + count_above(y, a)
+
+
+def rounded_sums(x, y, a):
+    """The rounded sums kept separate by the pass, used to exercise their autodiff computation."""
     x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
     return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
 
 
 def test_a_rewritten_program_computes_what_the_program_computes():
     """A rewritten program is on par with the program it rewrites against the float64 truth (check 1), for
-    a unit norm's backward and for two sums linearity joins."""
+    a unit norm's backward and for two independently rounded sums."""
     def draw_unit(seed):
         return rows(seed, (8, 64), (8, 64))
 
     def draw_sums(seed):
         return rows(seed, (8, 64), (8, 64), (8, 64))
 
-    for fn, draw in ((unit_backward, draw_unit), (two_sums, draw_sums)):
+    for fn, draw in ((unit_backward, draw_unit), (rounded_sums, draw_sums)):
         assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw, fn.__name__, seeds=16)
 
 
 def summed_gradient(x, y, a):
-    """The gradient of two bounded sums' squares (`two_sums`) in each operand, as autodiff writes it: the
+    """The gradient of two rounded sums' squares in each operand, as autodiff writes it: the
     backward's own products and sums over the cotangent, which a rewrite of the forward never shows the
     rules."""
-    return jax.grad(lambda x, y, a: jnp.sum(two_sums(x, y, a) ** 2), argnums=(0, 1, 2))(x, y, a)
+    return jax.grad(lambda x, y, a: jnp.sum(rounded_sums(x, y, a) ** 2), argnums=(0, 1, 2))(x, y, a)
 
 
 def test_a_rewritten_backward_computes_what_the_backward_computes():
@@ -90,9 +98,30 @@ def test_a_rewritten_backward_computes_what_the_backward_computes():
 
 
 def test_linearity_joins_two_reductions_into_one_pass():
-    """Two sums of one scale's products become one sum over the joined products: the pass splices a form it
-    prices cheaper than the program's two reductions."""
+    """Two exact counts become one reduction over both masks without rounding either count."""
     assert cheaper_spliced(two_sums, *rows(0, (8, 64), (8, 64), (8, 64)))
+
+
+def test_bounded_sums_keep_the_small_term_after_cancellation():
+    def sum_separately(x, y):
+        x = jax.lax.clamp(-1.0, x, 1.0)
+        y = jax.lax.clamp(-1.0, y, 1.0)
+        return jnp.sum(x) + jnp.sum(y)
+
+    x = jnp.array([1.0, -1.0], jnp.float32)
+    y = jnp.full_like(x, 2.0 ** -25)
+    np.testing.assert_array_equal(jax.jit(algebra.rewritten(sum_separately))(x, y), 2.0 ** -24)
+
+
+def test_a_contraction_keeps_its_scalar_after_the_normal_product():
+    def scaled(x, y):
+        left = (2.0 ** -126) * jnp.cos(x)
+        right = (2.0 ** 100) * jnp.cos(y)
+        return (left @ right) * (2.0 ** -24)
+
+    x, y = jnp.zeros((1, 1), jnp.float32), jnp.zeros((1, 64), jnp.float32)
+    result = jax.jit(algebra.rewritten(scaled))(x, y)
+    np.testing.assert_array_equal(result, np.full((1, 64), 2.0 ** -50, np.float32))
 
 
 def test_each_rule_holds_its_right_side_to_its_left_side():

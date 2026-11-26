@@ -10,8 +10,7 @@ import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 from dew.nn.kernels import xla_products
-from dew.nn.kernels.templates import axes as side_axes_of
-from dew.nn.kernels.templates.axes import GROUPS
+from dew.nn.kernels.templates.gemm import sides
 from dew.nn.precision import at_least_fp32, effective_precision, precision_names
 from dew.nn.sharding import explicit_spec
 
@@ -116,8 +115,8 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     rows = ((lhs, *(each for each, _ in chained)) if chained else (lhs,) * len(matrices) if joined is None
             else (lhs, joined))
     epilogue = mosaic_gpu.joined_sum if joined is not None else epilogue
-    prologue_arrays = side_rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
-    epilogue_arrays = side_rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
+    prologue_arrays = sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
+    epilogue_arrays = sides.rows(epilogue_arrays, epilogue_axes, group_sizes, lhs.shape[0])
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
@@ -149,13 +148,6 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     # `astype` passes an array already of its strong dtype through; a weak one an epilogue made takes it.
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
-
-
-def side_rows(arrays: tuple, axes_of: tuple, group_sizes: jax.Array, rows: int) -> tuple:
-    """The side operands as XLA's program reads them: a `groups` axis as `rows` rows, each its group's
-    value (`axes.at_rows`), every other operand as it is."""
-    return tuple(side_axes_of.at_rows(array, axes, group_sizes, rows) if GROUPS in axes else array
-                 for array, axes in zip(arrays, axes_of, strict=True))
 
 
 def as_tuple(outs) -> tuple:

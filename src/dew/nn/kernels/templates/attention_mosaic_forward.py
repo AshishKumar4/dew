@@ -53,12 +53,13 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     PaddedCall,
-    Param,
     Split,
     anchor_multipliers,
     by_power,
     head_width,
     kept,
+    kind_of,
+    kinds_of,
     output_hooked,
     output_split,
     padded_call,
@@ -120,6 +121,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 )
 from dew.nn.kernels.templates.attention_mosaic_registers import ForwardRegisters
 from dew.nn.kernels.templates.cost import estimate
+from dew.nn.kernels.templates.hooks import NO_HOOK, Side
 from dew.nn.kernels.templates.rings import Ref
 from dew.nn.precision import power2
 
@@ -345,7 +347,7 @@ def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
                 masked: bool = False, **walk):
     """Return `(spec, launch, finished, in_place)` for an inference forward walk (`_inference_walk`), the one
     owner of the `in_place` rewalk rule shared by `_fwd` and `_main_launch` (row 10677)."""
-    if masked and hooks.output_mod is not None:
+    if masked and hooks.output.fn is not None:
         raise ValueError("a masked walk rewalks in place, which an output hook formed past its launch does "
                          "not take")
     # A family that takes no masked rewalk in place (`Issuer.rewalks`: tcgen05's rows) rewalks in the guard's
@@ -353,7 +355,7 @@ def _plain_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     family = bundle_of(walk["tiles"], query.dtype)
     # A value of the keys' columns rewalks in the guard's branch: its launch reads no value array in place.
     in_place = rewalks_in_place(family, query, value, masked=masked,
-                                has_output_mod=hooks.output_mod is not None,
+                                has_output_mod=hooks.output.fn is not None,
                                 in_key=bool(walk.get("in_key")))
     spec, launch, finished = _inference_walk(query, key, value, spans, hooks, masked=masked, flagged=in_place,
                                              **walk)
@@ -507,7 +509,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     paged, sources, parts = walk.paged, walk.sources, walk.parts
     walks = None if flags is None else flags
     blocks = _column_blocks(v, hooked, at.columns)
-    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output_mod is not None,
+    plan = forward_block_plan(v.shape[-1], at.columns, out_dtype, has_output_mod=hooks.output.fn is not None,
                               training=False)
     split = plan.split
     # A scaled launch's keys' magnitudes the call's (`_largest`) but a cache walk's, which its value slots
@@ -612,7 +614,7 @@ def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, wh
 
 def _unhooked(hooks: Hooks) -> Hooks:
     """`hooks` without the output hook, which a launch of a block of the value columns leaves to XLA."""
-    return dataclasses.replace(hooks, output_mod=None, output_params=())
+    return dataclasses.replace(hooks, output=NO_HOOK)
 
 
 def _output_whole(out: jax.Array, hooks: Hooks, hooked: _Hooked, dtype, hooked_blocks: bool) -> jax.Array:
@@ -637,9 +639,9 @@ def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles
 def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
     """The normalized output `out` `[B, H, Qp, Dv]` fp32 under the output hook in XLA, its parameters as the
     launches read them (`hooked`, padded to the call's blocks; `template.output_hooked`)."""
-    params = tuple(Param(array, param.kind) for array, param in zip(hooked.output, hooks.output_params,
+    params = tuple(Side(array, param.axes) for array, param in zip(hooked.output, hooks.output.sides,
                                                                      strict=True))
-    return output_hooked(out, hooks.output_mod, params)
+    return output_hooked(out, hooks.output.fn, params)
 
 
 def _training_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -711,7 +713,7 @@ def _training_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         out = algebra.output_of(dropped, divisor, guarded=form.guarded or hooks.initial is not None,
                                 held=form.largest)
         stored = dataclasses.replace(form, narrowed=algebra.narrowed_of(q.dtype), registered=False)
-        out = algebra.settled_store(stored, out, dropped, divisor, hooked=hooks.output_mod is not None)
+        out = algebra.settled_store(stored, out, dropped, divisor, hooked=hooks.output.fn is not None)
         out = _output_hooked(out, hooks, hooked)
         return (jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0], None
 
@@ -755,11 +757,11 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     # subtracted fold's (a decode step's, its full call's rows packed too, `attention_decode.packed`) scales
     # its own raw products, its query taken by nothing (row 8981).
     unit = family.column_unit(query.dtype)
-    if hooks.query_mod is not None and query.shape[3] % unit:
+    if hooks.query.fn is not None and query.shape[3] % unit:
         # A query prologue over a width its swizzled rows pad (a norm over the zeros past it is another
         # norm): XLA's program before the launch takes it.
-        query = prologued(query, hooks.query_mod, hooks.query_params)
-        hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
+        query = prologued(query, hooks.query.fn, hooks.query.sides)
+        hooks = dataclasses.replace(hooks, query=NO_HOOK)
     # The padded query stays unscaled until `_rewalked` decides per launch (plain or natural rewalk, which
     # may switch families) whether its consumers take the power in their stage (`powered_in_kernel`) or
     # XLA multiplies before the launch (row 5274).
@@ -769,7 +771,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        widths=head_width)
     weights = query.dtype if scales is not None else value.dtype
     spec, taken = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
-                              width=query.shape[3], scale=scale, natural=natural, score_mod=hooks.score_mod,
+                              width=query.shape[3], scale=scale, natural=natural, score_mod=hooks.score.fn,
                               subtracted=subtracted,
                               # A quantized model's codes and values, each at most 127, sum far within fp32.
                               headroom=scaled and hooks.rounds is None and algebra.headroom(weights),
@@ -819,7 +821,7 @@ def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, ta
     if taken != 1.0 and form.natural != spec.natural:
         form = dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
     if form.prescale == 1.0 or powered_in_kernel(
-            family, query.dtype, has_query_mod=hooks.query_mod is not None, parts=parts):
+            family, query.dtype, has_query_mod=hooks.query.fn is not None, parts=parts):
         return query, form
     return by_power(query, form.prescale), form
 class _Read(NamedTuple):
@@ -1103,9 +1105,9 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
         coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
-    streamed = riding(family, tuple(param.kind for param in hooks.score_params), "keys")
-    laid = zip(hooked.score, hooks.score_params, params_held, strict=True)
-    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first, held=kept,
+    streamed = riding(family, kinds_of(hooks.score.sides), "keys")
+    laid = zip(hooked.score, hooks.score.sides, params_held, strict=True)
+    params = tuple(_param(family, ref, kind_of(param), row, head, first, s, k_first, held=kept,
                           slot=slots[score_stream(index)] if index in streamed else None, at=(share, 0))
                    for index, (ref, param, kept) in enumerate(laid))
     is_masked = jnp.logical_not(whole(index)) if masked is None else masked
@@ -1183,10 +1185,10 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
     family, block_q = program.family, program.tiles.block_q
     if program.parts == 1:
         family.loaded(((q_view, q_smem, q_loaded),))
-        if hooks.query_mod is not None:
-            _prologued(family, hooks.query_mod, hooks, hooked.query, place, first, q_smem, spec.prescale)
+        if hooks.query.fn is not None:
+            _prologued(family, hooks.query.fn, hooks, hooked.query, place, first, q_smem, spec.prescale)
         elif spec.prescale != 1.0 and powered_in_kernel(
-                family, q_smem.dtype, has_query_mod=hooks.query_mod is not None, parts=program.parts):
+                family, q_smem.dtype, has_query_mod=hooks.query.fn is not None, parts=program.parts):
             swizzle = query_swizzle(family)
             if swizzle is not None:
                 across.scale_smem(q_smem, spec.prescale, swizzle=swizzle, interpret=interpret)
@@ -1201,7 +1203,7 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
 
 def _prologued(family: mosaic.Family, mod: Callable, hooks: Hooks, refs: tuple, place: tuple, first, q_smem,
                power: float) -> None:
-    """The query block in its stage under the query prologue (`Hooks.query_mod`), once a tile where the
+    """The query block in its stage under the query prologue (`Hooks.query`), once a tile where the
     consumer loads it: read in its family's tile layout (`Family.tile_of`), taken at its rows' indices
     `[rows, 1]` with its parameters, a head's scalar and a width's and a query's as the tile's entries,
     which the hook reads as it reads the reference's `[1, D]` and `[rows, 1]` (`attention.prologued`) where
@@ -1225,7 +1227,7 @@ def _prologued(family: mosaic.Family, mod: Callable, hooks: Hooks, refs: tuple, 
         return algebra.expand(family.rows_of(ref.at[shared_row, shared_head, pl.ds(first, rows)]), tile)
 
     positions = (first + jnp.arange(rows, dtype=jnp.int32))[:, None]
-    params = (param(ref, value.kind) for ref, value in zip(refs, hooks.query_params, strict=True))
+    params = (param(ref, kind_of(value)) for ref, value in zip(refs, hooks.query.sides, strict=True))
     taken = mod(tile, positions, *params).astype(q_smem.dtype)
     q_smem[...] = taken if power == 1.0 else taken * jnp.asarray(power, q_smem.dtype)
     family.published()
@@ -1278,7 +1280,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
     # The queries' intervals and ids, and the score hook's parameters of the query tile, read once, before
     # the walk (`_query_bounds`, `held_params`).
     held = None if spans is None else program.bounds(first, spans, row)
-    kinds = tuple(param.kind for param in hooks.score_params)
+    kinds = kinds_of(hooks.score.sides)
     params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
@@ -1521,7 +1523,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     exponentials `ex2.approx` where the launch approximates (`approximate`). A call of one block of the value
     columns (`Tiles.columns` None), one slice, no output hook. Its launch states its registers by
     `registered` (`_launch`'s)."""
-    if tiles.columns is not None or hooks.output_mod is not None:
+    if tiles.columns is not None or hooks.output.fn is not None:
         raise ValueError("the certify form walks one block of the value columns, no output hook")
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken, hooks = _prepared(
@@ -1564,8 +1566,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled
         # fp32 walk at 64 x 64, two consumers, spilled 12 bytes).
         out_view = stored().out
-        out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
-                           for ref, param in zip(hooked.output, hooks.output_params, strict=True))
+        out_params = tuple(_param(family, ref, kind_of(param), row, head, first, state.acc)
+                           for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its
             # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio, as
@@ -1584,7 +1586,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (chunk := BlockPlan(split=False, out_dtype=out_view.dtype,
-                                 output_hook=hooks.output_mod is not None).epilogue_chunk(
+                                 output_hook=hooks.output.fn is not None).epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
             # so `state.acc` and `output` fit without spilling (rows 5272, 10864).
             width = state.acc.shape[-1]
@@ -1607,7 +1609,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                       else family.stored((mosaic.StagedWriter(write_chunks),), (out_view,), smem=stage))
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
-                                                          output_mod=hooks.output_mod,
+                                                          output_mod=hooks.output.fn,
                                                           output_params=out_params,
                                                           held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
@@ -1824,7 +1826,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, s
     pl.when(consumer > 0)(turn)
     held = None if spans is None else program.bounds(first, spans, place[0])
     row, head = place[:2]
-    kinds = tuple(param.kind for param in hooks.score_params)
+    kinds = kinds_of(hooks.score.sides)
     params_held = held_params(family, hooked.score, kinds, row, head, first, tiles.block_q)
 
     def step(index, slots, arg, accumulators):
@@ -2189,7 +2191,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
     reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
     # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
-    params = param_types(hooks.score_params)
+    params = param_types(hooks.score.sides)
     kinds = tuple(kind for kind, _ in params)
     scoped, rings, after = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
@@ -2232,7 +2234,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by,
                                 in_key=value_columns is not None, splits=splits, table=read.table)
     grid = (heads, batch, queries // pair * splits)
-    reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output_mod is not None,
+    reduced = reducing(family, consumers, hook_reduces(hooks) or hooks.output.fn is not None,
                        # A decided walk's second, scaled, reads its keys' magnitudes in the kernel too.
                        magnitudes=(spec.headroom or decides) and not peaks and read.hooked.magnitudes is None,
                        joined=joined)

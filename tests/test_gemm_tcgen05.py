@@ -16,6 +16,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, grouped_launch, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
+from dew.nn.kernels.templates.hooks import Hook
 
 TILE = tiling.Tiles(128, 128, 64, 4, 1, family='tcgen05')
 """A legal tcgen05 tile of every product `_on_tcgen05` pins (`tuning.pinned`): a CTA's 128 rows by 128
@@ -441,7 +442,7 @@ def _gated_product(tile):
     the epilogue, bf16 out), pinned at `tile`."""
     def product(x, gate, up):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
-            return gemm.gemm(x, gate, None, paired=up, epilogue=_gated, out_dtype=jnp.bfloat16)
+            return gemm.gemm(x, gate, None, paired=up, epilogue=Hook(_gated), out_dtype=jnp.bfloat16)
 
     shapes = (jax.ShapeDtypeStruct((12288, 2560), jnp.bfloat16),
               *(jax.ShapeDtypeStruct((2560, 9216), jnp.bfloat16) for _ in range(2)))
