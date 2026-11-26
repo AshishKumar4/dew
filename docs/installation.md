@@ -101,7 +101,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post132,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post141,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
@@ -138,6 +138,14 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - JAX takes as its CUDA root only a package that holds `ptxas`: CUDA 13's wheels share `nvidia/cu13`, so one of its other tools installed beside CUDA 12's compiler (`nvdisasm`, which the test suite's environment carries) left JAX's root the string `None`, and XLA linked the system CUDA's libdevice.
 - A mesh of compile-only GPUs (a topology's devices, which state their compute capability) carries that capability into its abstract device, so a step compiled ahead for an A100 on a host with no GPU lowers its Mosaic kernels for sm80; they were lowered for sm90, which an A100 cannot run.
 - A compile-only Mosaic GPU target, one that states its compute capability or, stating none, another GPU's kind (an H100 lowered on an A100's host), is held to its own default shared memory limit, not the attached device's.
+- A checkpoint name behind a reshape names the reshaped value's producer too, through every reshape: XLA makes a reshape a view of its operand's buffer, so a GPU matmul's converted output, named after its reshape, was read unnamed at a step's peak.
+- A scan's stacked residual is named at a step's peak by the row its loop writes into it each step, where the loop provably writes every row (its trip count, its induction variable and a whole row into the stack itself, as XLA states them); a write into part of a buffer names none of it.
+- `Compiled.live_intervals()` states each buffer of a compile's allocations over the positions of its heap simulation it lives in, with the memory it lies in and whether XLA's own count of the peak charges it, so a planner reads where a step's peak moves once a change frees what lived there.
+- Mosaic GPU's layout inference takes `erf` and `atan2` as pointwise, and Pallas Triton lowers `lax.erf` by the device library's `erf` at its exact dtype: an attention output hook taking `erf` lowers on sm90's Mosaic kernels and sm80's Triton ones.
+- A Mosaic GPU warpgroup barrier may be marked collective (`warpgroup_barrier(collective=True)`), as the vector store's automatic barriers and Dew's `synced` are, and a marked barrier that repeats the block's last one with only pure ops between is dropped: a kernel's back-to-back barriers cost one.
+- Mosaic GPU's repeated-barrier pass compares barrier ids structurally, changing no other operation, so a kernel's TMA descriptors' host initialization reads values that are still live.
+- A Pallas Triton kernel serializes without its source locations unless debugged, so one kernel serializes alike across processes and call orders, and a program compiled ahead loads.
+- `pallas.run_scoped`'s body holds none of the values it closes over, so a `lax.cond` branch's scope leaves no branch tracer behind.
 - A transformation keeps a wide dtype its trace already holds, while a Python type asked of a wide value still narrows as a user's request.
 - Pallas's Mosaic GPU interpreter transfers a thread map's constants and inputs to the device once, shared by its threads.
 - Pallas's Mosaic GPU interpreter runs a thread map's role body with every argument it was traced with, so a Blackwell causal forward's role threads compile there.

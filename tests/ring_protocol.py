@@ -244,9 +244,10 @@ class _Interpreter:
         return [None] * len(equation.outvars)
 
     def scoped(self, params, values) -> list:
+        # Its body's leading inputs its operands (`pallas.run_scoped`), the rest the refs it allocates.
         jaxpr = params["jaxpr"]
         allocated = []
-        for var in jaxpr.invars:
+        for var in jaxpr.invars[len(values):]:
             aval = var.aval
             inner = aval.inner_aval
             barrier = hasattr(inner.dtype, "num_arrivals")
@@ -255,7 +256,7 @@ class _Interpreter:
                                  num_arrivals=inner.dtype.num_arrivals if barrier else 0,
                                  shape=tuple(inner.shape)))
         self.allocated += allocated
-        return self.run(jaxpr, values, allocated)
+        return self.run(jaxpr, [], [*values, *allocated])
 
     def emit(self, kind: str, at: tuple = (), argument=None) -> list:
         self.events.append(Event(kind, at, argument))
