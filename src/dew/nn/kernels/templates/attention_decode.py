@@ -240,7 +240,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     longest = math.ceil(spans.keys / config.block_k) // (2 * min(config.stages, 2))
     # No more slices than four programs a multiprocessor take: past them a slice's programs wait a wave.
     most = min(longest, max(2, 4 * processors // programs))
-    counts = [1 << power for power in range(1, most.bit_length()) if 1 << power <= most]
+    counts = _slice_counts(processors, programs, most)
     # Priced over every key a row holds (`spans.keys`): a call's own intervals (a cache's lengths, its
     # documents) its launches count no work of, their extents its data's (a decode step's every launch
     # priced none, its plan the heuristic's alone: M-NA-27-gh200 at fb6a6daa2).
@@ -281,6 +281,16 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     # The sliced launch's own op, at its slices, certified (`_certified_stream`).
     found = None if slices == 1 else streamed(splits=slices)
     return single() if found is None else planned(*found, slices)
+
+
+def _slice_counts(processors: int, programs: int, most: int) -> list[int]:
+    """The slice counts a decode plan prices (`_priced_slices`), from 2 to `most`: the powers of two, and
+    the counts whose `programs`-a-slice launch fills whole waves of `processors` at one to four programs a
+    multiprocessor. An A100's B1 over 32768 keys at width 128 walked 113.7 us on 13 slices of K128, its 108
+    multiprocessors' one wave of 8 key heads' programs, where 16 slices of K64 took 140.3 (M-NA-27c-a100)."""
+    waves = (resident * processors // programs for resident in range(1, 5))
+    powers = (1 << power for power in range(1, most.bit_length()))
+    return sorted({count for count in (*powers, *waves) if 2 <= count <= most})
 
 
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
