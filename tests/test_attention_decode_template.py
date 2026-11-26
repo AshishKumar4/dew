@@ -1021,9 +1021,10 @@ def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
     """A decode step's walk whose launch a compile refused (its kernel spilled, `report.refuse_launch`) plans
     that walk again at a config its own launch pins: each walk's plan is its launched op's (`WALKS`), so the
     refusal of the scaled walk's launch steps it down, never pinning it to the config refused (row 5420)."""
-    query = jnp.zeros((8, 1, 16, 64), dtype)
-    key = value = jnp.zeros((8, KEYS, 8, 64), dtype)
-    spans = template.spans(1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32))
+    # 16 rows of 16 heads, 256 programs, past an H100's 132: one slice whatever its dtype.
+    query = jnp.zeros((16, 1, 16, 64), dtype)
+    key = value = jnp.zeros((16, KEYS, 8, 64), dtype)
+    spans = template.spans(1, KEYS, 16, lengths=jnp.full((16,), KEYS, jnp.int32))
     with generation.assumed("sm90"):
         work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
         walk = "scaled" if "scaled" in work else "plain"
@@ -1328,7 +1329,7 @@ def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
     keys. Counted as parts times programs (2026-11-26 audit), the step filled the device on paper and walked
     its keys in one slice."""
     query = jnp.zeros((1, 1, 96, 128), jnp.float32)
-    key = jax.ShapeDtypeStruct((1, 32768, 8, 128), jnp.float32)
+    key = jnp.zeros((1, 32768, 8, 128), jnp.float32)
     with generation.assumed("sm90"):
         work, *_ = attention_decode.planned(query, key, key, attention_decode.key_spans(1, 32768, 1),
                                             template.Hooks())
