@@ -1330,7 +1330,8 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
                                            for c in range(width // call.block)])
             system = algebra.keyed(product, gate, low, betas, *columns)
             merging = _merging(merges, call)
-            lower = algebra.solved(system, merging, supported=merging.supported)
+            # Its merges of their supports alone where its issuer takes one (mma.sync's), none formed else.
+            lower = algebra.solved(system, merging, supported=merging.supported if merging.supports else None)
             if keeps:
                 held.store(a_ref, lower, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             if not applies:
