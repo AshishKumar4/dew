@@ -642,9 +642,8 @@ class BuildTarget:
                   if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
-        kind = devices[0].device_kind if devices[0].platform == "gpu" else None
         built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices),
-                                  device_kind=kind)
+                                  device_kind=held_kind(devices))
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
@@ -966,23 +965,31 @@ class Compile(Protocol):
                  out_shardings: jax.sharding.Sharding) -> OuterProgram | jax.stages.Wrapped: ...
 
 
-def _gpu_mesh(generation: str, multiprocessors: int | None) -> jax.sharding.Mesh:
-    """One mesh axis over the compile-only GPUs of `generation` (`compile_only_gpus`)."""
-    return jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, multiprocessors=multiprocessors)),
-                             ("devices",))
+def held_kind(devices: Sequence) -> str | None:
+    """The kind every GPU of `devices` states (`device_kind`), None where they are not all GPUs of one kind:
+    what a build that pins a kind is held to on each device it runs on (`BuildTarget.device_kind`), a list
+    of an H100 and an H200, both of 132 multiprocessors, pinning none (row 13276)."""
+    kinds = {device.device_kind for device in devices if device.platform == "gpu"}
+    gpus = all(device.platform == "gpu" for device in devices)
+    return next(iter(kinds)) if gpus and len(kinds) == 1 else None
 
 
 @contextlib.contextmanager
 def lowering_for(generation: str, multiprocessors: int | None = None,
-                 device_kind: str | None = None) -> Iterator[None]:
+                 devices: Sequence | None = None) -> Iterator[None]:
     """Within the block, programs trace and lower as `compile_programs` lowers them for one GPU of the CUDA
-    `generation`: their launches derived for that GPU's facts (`assumed`; the `device_kind`'s where a host's
-    own topology states it, `built_target`, else any GPU of the generation's), on the compile-only GPUs'
-    abstract mesh, certified on the first (`report.certifying`). A program traced in it holds the arrays a
-    compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
-    mesh = _gpu_mesh(generation, multiprocessors)
-    with (assumed(built_target(generation, multiprocessors, device_kind=device_kind), portable=True),
-          jax.sharding.use_abstract_mesh(mesh.abstract_mesh), report.certifying(mesh.devices.flat[0])):
+    `generation`: over `devices` where given, else the generation's compile-only GPUs, on their first's
+    abstract mesh, certified on that device (`report.certifying`), their launches derived for its facts
+    (`assumed`): a host's own topology's (`host_gpus`) its kind's own (`built_target`), its programs for that
+    GPU alone, a cuDNN plan among them (row 13275); a canonical GPU's any of the generation's (`portable`).
+    A program traced in it holds the arrays a compile of it ahead holds (a prepare's,
+    `tests/truths_ahead.py`)."""
+    gpus = compile_only_gpus(generation, multiprocessors=multiprocessors) if devices is None else devices
+    mesh = jax.sharding.Mesh(np.asarray(list(gpus)[:1]), ("devices",))
+    host = set(gpus) <= _HOSTS_GPUS
+    target = built_target(generation, multiprocessors, device_kind=held_kind(gpus) if host else None)
+    with (assumed(target, portable=not host), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
+          report.certifying(mesh.devices.flat[0])):
         yield
 
 
@@ -1015,7 +1022,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
             else host_gpus(generation, topology, 1))
     # A node's own topology states its GPUs' kind, whose facts its launches derive from as its run's do
     # (row 13252); a canonical target's stand for any of the generation.
-    kind = None if topology is None else gpus[0].device_kind
+    kind = None if topology is None else held_kind(gpus)
     target = built_target(generation, multiprocessors, device_kind=kind)
     mesh = jax.sharding.Mesh(np.asarray(gpus[:1]), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -1028,7 +1035,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with lowering_for(generation, multiprocessors, kind):
+                with lowering_for(generation, multiprocessors, None if topology is None else gpus):
                     return compiled(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
@@ -1573,7 +1580,7 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # The GPU XLA compiles for, as its compile-only devices state it.
     # Its kind where the devices are a host's own (`_HOSTS_GPUS`), whose launches derive from that part's
     # facts as its run does (row 13252); a canonical GPU's stands for any of its generation.
-    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else devices[0].device_kind
+    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else held_kind(devices)
     stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity, device_kind=kind)
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
