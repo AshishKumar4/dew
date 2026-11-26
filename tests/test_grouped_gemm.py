@@ -1454,11 +1454,11 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
                                            balanced=True, stored=2)
         assert tail_deep is None
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
-        # A whole A100's 216 programs' deep walk prices no balanced tail (its partials' 14 MiB within the
-        # 64 MiB output's budget, `pricing.within_budget`); on 40 programs (2.6 MiB), a single-wave tail
-        # (64 tiles: waves=1,
-        # rem=24, 0 drift): planner produces one Tail plan passed straight to emitter via `_stated` without
-        # re-pricing.
+        # A whole A100's 216 programs' deep walk takes no balanced tail: none pays for itself there (its
+        # budget, its output's, not what refuses it). A shallow kernel gradient's tail on those programs
+        # is within its fp32 output's budget and balanced; on 20 multiprocessors (40 programs), a
+        # single-wave tail (64 tiles: waves=1, rem=24, 0 drift) the planner states once and passes straight
+        # to the emitter via `_stated`, never priced again.
         x_1w = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
         dy_1w = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16)
         ba_1w = tgmm.bind(x_1w, dy_1w, sizes, out_dtype="float32", interpret=False, dense=True)
