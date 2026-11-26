@@ -24,7 +24,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873]
-- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - The cold 4B start's search cannot read which remat frees its miss. [13304]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
@@ -48,6 +47,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
+- Src/dew/interop/torchax_fallback.py intercepts AttentionInterface and one hardcoded _LOOPED_EXPERTS class (LongcatFlashExperts), leaving general HF…. [13044]
 
 ## Models and interop
 
@@ -91,8 +91,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- A 16x1 FP32 NVFP4 tile containing 2^-130 and 2^-132 and zeros quantizes to an all-zero block and tensor scale one on CPU. [13305]
-- A real two-token derived SSD with static scale 2^-128 applies it to the reader before the prepared chunk, flushing it to zero. [13320]
+- Recognition canonicalizes float32 reduce_precision(8,7) into a BF16 round trip although XLA keeps the former qNaN payload and canonicalizes the latter. [13334]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
