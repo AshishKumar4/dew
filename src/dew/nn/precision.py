@@ -1710,7 +1710,7 @@ def _two_product(left, right, *, bit_split: bool, subtract: bool,
     # compiler that took its multiply into the step reading it (`product - head`, a caller's `n - product`)
     # would read the exact product there and the rounded one elsewhere, the residual then the product's
     # rounding where a caller adds it to the rounded product.
-    (product,) = uncontracted(rounded(left * right))
+    (product,) = uncontracted(rounded(jnp.asarray(left * right)))
     head = rounded(lh * rh)
     lost = rounded(product - head if subtract else head - product)
     cross = ((ll, rh), (lh, rl)) if subtract else ((lh, rl), (ll, rh))
