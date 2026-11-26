@@ -236,8 +236,14 @@ class RouteBias(Protocol):
     """A bias that states both forms a route may take: its band (`band`, a `BandBias` the template reads a
     tile at a time) and its writing out over the call's keys (`dense`), the route taking the form it reads
     (`scaled_dot_product_attention`: the band on the template outside forward mode, written out everywhere
-    else): a route that writes a bias out runs no band (row 13503), whose trace the resolution alone reads
-    and a compiled program drops."""
+    else). The resolution reads its band's `shape` and `dtype` alone, as a `BandBias`'s, so a route that
+    writes the bias out traces no band (row 13503)."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> jnp.dtype: ...
 
     def band(self) -> BandBias: ...
 
@@ -1294,8 +1300,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     masked = with_key_starts(masked, starts, key.shape[-3])
     facts = {"dtype": dtype, "precision": precision, "force_fp32_for_softmax": force_fp32_for_softmax,
              "softcap": softcap, "sinks": sinks, "causal": causal, "sliding_window": sliding_window,
-             "mask": mask, "bias": bias.band() if isinstance(bias, RouteBias) else bias,
-             "segment_ids": segment_ids, "max_segments": max_segments,
+             "mask": mask, "bias": bias, "segment_ids": segment_ids, "max_segments": max_segments,
              "key_value_seq_lengths": lengths, "key_value_seq_starts": starts, "block_groups": block_groups,
              "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
              "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
@@ -1306,8 +1311,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # forward mode's reference and kernel do.
         bias = dense_bias(bias, key.shape[-3])
     elif isinstance(bias, RouteBias):
-        # The band the resolution read, the template's.
-        bias = facts["bias"]
+        # The template's form, formed now it reads it.
+        bias = bias.band()
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, softcap=softcap, max_segments=max_segments,
@@ -1618,7 +1623,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    laid = None if bias is None else bias.shape if isinstance(bias, SeparableBias) else jnp.shape(bias)
+    laid = (None if bias is None else bias.shape if isinstance(bias, SeparableBias | RouteBias)
+            else jnp.shape(bias))
     # Groups a call reads under causality, or past the window of its runs (`scaled_dot_product_attention`).
     grouped = ((bool(causal) or key_runs is not None)
                and (block_groups is not None or image_groups is not None))
@@ -1639,8 +1645,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    and laid[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
         dense_bias=(laid is not None and len(laid) == 4 and laid[-2] > 1
-                    and not isinstance(bias, SeparableBias | BandBias)),
-        separable_bias=isinstance(bias, SeparableBias | BandBias),
+                    and not isinstance(bias, SeparableBias | BandBias | RouteBias)),
+        separable_bias=isinstance(bias, SeparableBias | BandBias | RouteBias),
         sinks=sinks is not None, query_sinks=sinks is not None and np.ndim(sinks) > 1, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),

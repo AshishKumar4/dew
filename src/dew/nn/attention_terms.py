@@ -226,6 +226,19 @@ class RelativeTerms:
     query_slots: jax.Array
     key_slots: jax.Array
 
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Its band's shape, `[B, H, Q, band_width(extent)]`, as the band would hold it (`BandBias.shape`)."""
+        from .kernels.templates import band
+
+        batch, queries, heads, _ = self.states.shape
+        return batch, heads, queries, band.band_width(self.bank.shape[-1])
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        """Its band's dtype: at least fp32 (`relative_band`)."""
+        return at_least_fp32(jnp.result_type(self.states, self.bank))
+
     def band(self):
         """The band about each query (`relative_band`), the keys at their indices."""
         return relative_band(self.states, self.bank, jnp.zeros((), jnp.int32))
