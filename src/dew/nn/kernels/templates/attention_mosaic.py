@@ -2242,15 +2242,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # Whole columns of a key block whose dK and dV sums pass a consumer's registers beside a step's
         # products, dV's parked in shared memory across them (`BackwardTiles.parked`), before smaller tiles
         # at more programs: on a family reading its operands from registers, its consumers each their own key
-        # block (an A100's bf16 at width 128, 2 x 4096 causal: 64 x 64 on one consumer 9.70 ms where it
-        # spilled, the 32 x 32 derived at two programs 12.39, M-NA-45); where the unparked tile holds, it. Its
-        # values wider than 64 columns alone: at 64 dK's and dV's sums held beside a 64 x 64 step unparked.
+        # block (an A100's bf16 at width 128, 2 x 4096 causal: 64 x 64 on one consumer parked 10.50 ms,
+        # spill-free, where it spilled unparked at 9.70, and the 32 x 32 derived at two programs 12.39,
+        # M-NA-45, M-NA-49); where the unparked tile holds, it. Its values wider than 64 columns alone: at 64
+        # dK's and dV's sums held beside a 64 x 64 step unparked.
         wide = ba.arguments["value"].shape[-1] > 64
-        parking = [] if not (wide and dq.operands_in_registers) or split_queries(dq) or dkv else [
-            lambda config: (config.parked and fits(config)
-                            and not fits(dataclasses.replace(config, parked=False)))]
-        for wanted in (*parking, *residing, fits):
-            parked = bool(parking) and wanted is parking[0]
+
+        def first(wanted, *, parked: bool) -> BackwardTiles | None:
             for columns in (1, 2, 4):
                 fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, dq) else ()
                 for rows in (None, *fewer):
@@ -2264,7 +2262,21 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                         if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
                                               overlapped=False, walks=walks, rows=rows):
                             return config
-        return None
+            return None
+
+        plain = next((config for wanted in (*residing, fits) if (config := first(wanted, parked=False))),
+                     None)
+        if not (wide and dq.operands_in_registers) or split_queries(dq) or dkv:
+            return plain
+        # A parked tile only where it is larger than the tile held unparked: parking a tile the unparked
+        # derivation holds a peer of costs its dV sums' round trips for nothing (an A100's d128 derived
+        # 32 x 32 parked and its logits staged, 16.31 ms, against 32 x 32 unparked 12.39, M-NA-49).
+        parked = first(lambda config: (config.parked and fits(config)
+                                       and not fits(dataclasses.replace(config, parked=False))), parked=True)
+        if parked is not None and (plain is None or parked.block_q * parked.block_k
+                                   > plain.block_q * plain.block_k):
+            return parked
+        return plain
 
     def _scopes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                 target: generation.GpuTarget) -> list[tuple[mosaic.Family, int, resources.Scope]]:
