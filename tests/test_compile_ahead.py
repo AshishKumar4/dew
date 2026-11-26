@@ -1642,11 +1642,12 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): XLA compiles the
     step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
     the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
-    refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
-    canonical build's beside it in one record directory. Its runs score no split midway, whose programs a
-    build compiles too (row 4752), so its three builds are their steps' alone (row 3981); the first alone
-    inspects, so compiles a sampled step, which no rung record's key holds. Its GPUs' room is what the step
-    needs at two microbatches, less than one needs (each measured, `need_run`)."""
+    refused; the rung its plan recorded is that GPU's, apart from the canonical build's beside it in one
+    record directory. Its runs score no split midway, whose programs a build compiles too (row 4752), so its
+    three builds are their steps' alone (row 3981); the first alone inspects, so compiles a sampled step
+    and keeps a record of its own, its plan fitting that step beside its step (the rung key states the
+    run's inspection), apart from the second's, uninspected, for the same GPU. Its GPUs' room is what the
+    step needs at two microbatches, less than one needs (each measured, `need_run`)."""
     import dataclasses
 
     from run_kinds import lm
