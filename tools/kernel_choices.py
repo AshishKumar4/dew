@@ -114,7 +114,8 @@ def block(text: str) -> tuple[int, int]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description="The kernel choices dew.kernels.Kernels holds, written from "
+                                                 "what Dew's dispatches serve.")
     parser.add_argument("--write", action="store_true", help="rewrite the block in place")
     args = parser.parse_args(argv)
     text = MODULE.read_text()
