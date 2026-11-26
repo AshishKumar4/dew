@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
+from dew.nn.kernels import gemm, generation, grouped_matmul, grouped_quantized, selection, xla_products
 from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.precision import EXACT_FLOAT32
@@ -33,7 +33,7 @@ products): a 64-column tile's and a bfloat16 step's least (`MosaicConvertedGmm.c
 class Codes:
     """A matrix of FP8 codes as the converting launch binds it (`MosaicConvertedGmm`, `trans_rhs`): `codes`
     K-major, `[groups, width, depth]`, its shape theirs and its dtype the bfloat16 they widen to exactly, the
-    products', as a packed matrix states its decoded one (`grouped_matmul._PackedMatrix`)."""
+    products', as a packed matrix states its decoded one (`grouped_quantized._PackedMatrix`)."""
 
     codes: jax.Array | jax.ShapeDtypeStruct
 

@@ -18,7 +18,7 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
+from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_quantized, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
 from dew.nn.kernels.templates.hooks import Hook, Side
 
@@ -212,7 +212,7 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
     matrix, values = nvfp4(13, 1024, 256, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(14).integers(-3, 4, size=(13, 1024)), jnp.float32)
     swapped = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
-    launch = grouped_matmul.MosaicPackedGmm()
+    launch = grouped_quantized.MosaicPackedGmm()
 
     def product(x, kernel):
         with generation.chosen(nvfp4=kernel):
@@ -223,8 +223,8 @@ def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
             product(rows, "packed")
         assert all(launch.legal(ba, config, generation.gpu_target())
                    for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, grouped_matmul.MosaicPackedGmm)), launches.taken
-        with tuning.pinned({grouped_matmul.MosaicPackedGmm: swapped}):
+                   if isinstance(op, grouped_quantized.MosaicPackedGmm)), launches.taken
+        with tuning.pinned({grouped_quantized.MosaicPackedGmm: swapped}):
             got = product(rows, "packed")
         want = product(rows, "xla")
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

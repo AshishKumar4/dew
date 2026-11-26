@@ -32,6 +32,7 @@ from dew.nn.kernels import (
     gemm,
     generation,
     grouped_matmul,
+    grouped_quantized,
     recurrence,
     tuning,
 )
@@ -1563,7 +1564,7 @@ def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
     with generation.assumed("sm100"), tuning.seen() as seen:
         lowered_for(product, specs, "sm100")
     taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
-             if isinstance(op, grouped_matmul.MosaicMxGmm)]
+             if isinstance(op, grouped_quantized.MosaicMxGmm)]
     assert taken
     wide = tiling.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
     with generation.assumed("sm100"):

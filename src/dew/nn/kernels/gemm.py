@@ -55,7 +55,7 @@ from dew.nn.derivatives import (
     declared_tangent,
     with_gradients_formed,
 )
-from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
+from dew.nn.kernels import generation, grouped_matmul, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import PACKED_FORMATS, MxFp8, NvFp4, NvFp4Block, TernaryWeights, e8m0_exponents
 from dew.nn.kernels.gemm_xla import XlaConfig, as_tuple, direct_dtype, xla_mainloop
 from dew.nn.kernels.templates import product as product_of
@@ -803,7 +803,7 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
     ))
 
 
-def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
+def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
     (`ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
@@ -1048,7 +1048,7 @@ class PackedRows(enum.Enum):
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
-    it on the target (`grouped_matmul.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
+    it on the target (`grouped_quantized.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
     its operands are whole arrays (`whole`: no mesh XLA places splits them, `automatic_axes`), which the
     packed launch reads one device's of whole."""
 
@@ -1130,7 +1130,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         raise ValueError("a stack of banks' layer is a grouped call's")
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
-    launch = grouped_matmul.MosaicPackedGmm()
+    launch = grouped_quantized.MosaicPackedGmm()
     words, scales = (jnp.asarray(field if group_sizes is not None else field[None])
                      for field in (matrix.words, matrix.scales))
     count = rows.shape[0] if gather is None else gather.shape[0]
@@ -1193,7 +1193,7 @@ def _undeferred(words, scales) -> NvFp4:
 
 
 def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, gather, first,
-            launch: grouped_matmul.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
+            launch: grouped_quantized.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
     """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
     their group axis, `sizes` each group's rows, `gather` the rows of `rows` they are where given, `first`
     the matrix of a stack the first group reads where given, `gmm`'s): the
@@ -1201,7 +1201,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
     differentiable at every order as `gemm` is (`generation.linear_tangent`): its tangent the decoded
     product's in XLA, its reverse mode the rows' gradient through the decoded values, summed back into the
     rows a gather read (the frozen words, scales, sizes and table taking none). It runs through `launch`
-    (`grouped_matmul.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
+    (`grouped_quantized.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
 
     def decoded(words, scales, first):
         # The bank's matrices, a dense call's one alone (`gemm`'s dense matrix is `[depth, width]`), a stack's
@@ -1330,7 +1330,7 @@ def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtype
     from .templates.gemm import quantized
 
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
-    launch = grouped_matmul.MosaicStepScaledGmm()
+    launch = grouped_quantized.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
     # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
     out_forms = quantized.forms_of(out_forms, dtypes) or None
@@ -1396,7 +1396,7 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
-    launch = grouped_matmul.MosaicStepScaledTgmm()
+    launch = grouped_quantized.MosaicStepScaledTgmm()
     # Bound as the call it is, its operands' rows first as a kernel gradient states them: abstract shapes
     # alone during planning so transposes and scaled counts run only in the chosen branch.
     lhs_spec = jax.ShapeDtypeStruct((lhs_t.shape[1], lhs_t.shape[0]), lhs_t.dtype)
@@ -1514,7 +1514,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
 
     from .templates.gemm import quantized
 
-    launch = grouped_matmul.MosaicMxGmm()
+    launch = grouped_quantized.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
     out_forms = quantized.forms_of(out_forms, dtypes) or None
     hooks = NO_HOOKS if epilogue is None else Hooks(
