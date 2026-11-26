@@ -5,7 +5,8 @@ Declarations: dew.algebra.component_cases.chunk_carry, dew.algebra.component_cas
   dew.algebra.component_cases.keys_cotangent, dew.algebra.component_cases.online_softmax_step,
   dew.algebra.component_cases.prefix_difference, dew.algebra.component_cases.queries_cotangent,
   dew.algebra.component_cases.rounded, dew.algebra.component_cases.rounded_tangent,
-  dew.algebra.component_cases.scores, dew.algebra.component_cases.split_kv_merge.
+  dew.algebra.component_cases.scores, dew.algebra.component_cases.split_kv_merge,
+  dew.algebra.component_cases.values_gradient.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
 egglog 14.0.0.post1; measured on cpu.
 
@@ -240,6 +241,32 @@ def _split_kv_merge_0(x1, x2, x3, x4, x5, x6):
     return (v21, v9, v16)
 
 
+def _values_gradient_0(x1, x2, x3, x4):
+    v5 = lax.eq_p.bind(x3, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v6 = np.array(float('inf'), dtype=jnp.dtype('float32'))
+    v7 = lax.convert_element_type_p.bind(v6, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
+    v8 = lax.broadcast_in_dim_p.bind(v7, shape=(x1.shape[0],), broadcast_dimensions=(), sharding=None)
+    v9 = lax.select_n_p.bind(v5, x3, v8)
+    v10 = lax.broadcast_in_dim_p.bind(v9, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v11 = lax.broadcast_in_dim_p.bind(
+        v10, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
+    v12 = lax.sub_p.bind(x1, v11)
+    v13 = lax.exp_p.bind(v12, accuracy=None)
+    v14 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v15 = np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32'))
+    v16 = lax.convert_element_type_p.bind(v15, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
+    v17 = lax.broadcast_in_dim_p.bind(v16, shape=(x1.shape[0],), broadcast_dimensions=(), sharding=None)
+    v18 = lax.select_n_p.bind(v14, x4, v17)
+    v19 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v18)
+    v20 = lax.broadcast_in_dim_p.bind(v19, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
+    v21 = lax.mul_p.bind(x2, v20, out_dtype=None)
+    v22 = lax.dot_general_p.bind(
+        v13, v21, dimension_numbers=(((0,), (0,)), ((), ())),
+        precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=jnp.dtype('float32'),
+        out_sharding=None)
+    return (v22,)
+
+
 _chunk_carry_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (
         ((32, 32), 'float32'), ((16, 32), 'float32'), ((16, 32), 'float32'), ((16, 32), 'float32'),
@@ -414,3 +441,18 @@ _split_kv_merge_forms: dict[tuple, Callable[..., tuple]] = {
 def split_kv_merge(*operands, policy: str = 'default', target: str = 'sm90'):
     """split_kv_merge's generated form for `policy` and `target` at its operands' case."""
     return _generated.call(_split_kv_merge_forms, operands, policy, target, single=False)
+
+
+_values_gradient_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (
+        ((32, 64), 'float32'), ((32, 128), 'float32'), ((32,), 'float32'), ((32,), 'float32'))):
+        _values_gradient_0,
+    ('default', 'sm90', (
+        ((64, 128), 'float32'), ((64, 256), 'float32'), ((64,), 'float32'), ((64,), 'float32'))):
+        _values_gradient_0,
+}
+
+
+def values_gradient(*operands, policy: str = 'default', target: str = 'sm90'):
+    """values_gradient's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_values_gradient_forms, operands, policy, target, single=True)
