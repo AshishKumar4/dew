@@ -88,16 +88,16 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     of this expression, whose terms may leave the range at its edges (row 13232). A float64 subnormal is its
     value only where the backend keeps one."""
     exponent = _binade(value)
-    result = over_power(value, exponent)
+    significands = over_power(value, exponent)
     for multiplier in multipliers:
         binade = _binade(multiplier)
         exponent = exponent + binade
-        result = result * over_power(multiplier, binade)
+        significands = significands * over_power(multiplier, binade)
     for divisor in divisors:
         binade = _binade(divisor)
         exponent = exponent - binade
-        result = divided_in(result, over_power(divisor, binade))
-    return _scaled_by(result, exponent)
+        significands = divided_in(significands, over_power(divisor, binade))
+    return _scaled_by(significands, exponent)
 
 
 def over_denominator(tangent: jax.Array, numerator: jax.Array, denominator: jax.Array) -> jax.Array:
@@ -126,10 +126,9 @@ def over_denominator(tangent: jax.Array, numerator: jax.Array, denominator: jax.
         torch = special | clean
         # Each branch's operands where the other is chosen held at one, so neither's derivative meets the
         # other's infinities.
-        kept, other = ((jnp.where(chosen, value, 1) for value in (numerator, denominator))
-                       for chosen in (torch, ~torch))
-        kept_numerator, kept_denominator = kept
-        balanced_numerator, balanced_denominator = other
+        kept_numerator, kept_denominator = (jnp.where(torch, value, 1) for value in (numerator, denominator))
+        balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
+                                                    for value in (numerator, denominator))
         return jnp.where(torch, moving * divided_in(divided_in(kept_numerator, kept_denominator),
                                                     kept_denominator),
                          balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
