@@ -226,3 +226,24 @@ def test_a_float32_dense_served_its_window_computes_as_its_kernel():
     plain = jax.jit(layer.apply)(variables, x)
     served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint32), np.asarray(plain).view(np.uint32))
+
+
+def test_a_dense_of_its_own_promotion_served_its_window_computes_as_its_kernel():
+    """A Dense of no dtype over bfloat16 inputs and kernel and a float32 bias (`1 + 2**-9`, which bfloat16
+    rounds away; flax's promotion computes in float32), and one boxing its kernel with its logical axes
+    (`kernel_axes`, `nn.LogicallyPartitioned`), each served its window: each computes what it computes over
+    its kernel, bit for bit."""
+    rng = np.random.default_rng(5389)
+    kernel = (rng.integers(-64, 64, (128, 64)) / 16.0).astype(jnp.bfloat16)
+    x = jnp.asarray(rng.integers(-4, 4, (4, 128)), jnp.bfloat16)
+    promoted = Dense(64, param_dtype=jnp.bfloat16)
+    bias = jnp.full((64,), 1 + 2.0 ** -9, jnp.float32)
+    variables = {"params": {"kernel": jnp.asarray(kernel), "bias": bias}}
+    boxed = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, kernel_axes=("embed", "mlp"))
+    drawn = boxed.init(jax.random.key(0), x)
+    for layer, held in ((promoted, variables), (boxed, drawn)):
+        plain = jax.jit(layer.apply)(held, x)
+        served = jax.jit(layer.apply)(quantization.bf16_windows(held, sites=[""]), x)
+        assert served.dtype == plain.dtype
+        np.testing.assert_array_equal(np.asarray(served, np.float32).view(np.uint32),
+                                      np.asarray(plain, np.float32).view(np.uint32))

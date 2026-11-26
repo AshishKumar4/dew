@@ -616,8 +616,11 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
     from dew.nn.kernels.formats import Bf16Window
 
     params = flatten_dict(dict(variables.get("params", {})))
-    kernels = {path[:-1]: leaf for path, leaf in params.items()
-               if path[-1] == "kernel" and isinstance(leaf, (jax.Array, np.ndarray)) and jnp.ndim(leaf) == 2
+    # A kernel boxed with its logical axes (`nn.LogicallyPartitioned`, a Dense's `kernel_axes`) read as its
+    # value: its window's planes are `[width, words]`, which no kernel axes place, so they are whole.
+    values = {path: meta.unbox(leaf) for path, leaf in params.items() if path[-1] == "kernel"}
+    kernels = {path[:-1]: leaf for path, leaf in values.items()
+               if isinstance(leaf, (jax.Array, np.ndarray)) and jnp.ndim(leaf) == 2
                and jnp.result_type(leaf) == jnp.bfloat16}
     named = {tuple(part for part in site.split("/") if part) for site in sites}
     if missing := named - set(kernels):

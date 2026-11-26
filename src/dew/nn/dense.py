@@ -481,9 +481,10 @@ class Dense(_LinearEnvelope, nn.Dense):
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
-        if isinstance(kernel, Bf16Window) and _compute_dtype(self, inputs) != jnp.bfloat16:
-            # A window's weights are its kernel's bits again: a layer computing in another dtype multiplies
-            # them as its kernel, promoted as any (`gemm.window_product` multiplies bfloat16 rows).
+        if isinstance(kernel, Bf16Window) and not _windowed(self):
+            # A window's weights are its kernel's bits again: a layer whose product is not the window's
+            # multiplies them as its kernel, promoted as any (its dtype not bfloat16, or its own
+            # `dot_general`'s: a float32 result).
             kernel = kernel.decoded()
         if isinstance(kernel, PACKED_FORMATS):
             return self._packed(inputs, kernel)
@@ -540,10 +541,13 @@ class Dense(_LinearEnvelope, nn.Dense):
         return jnp.reshape(summed.astype(dtype), (*jnp.shape(inputs)[:-1], self.features))
 
 
-def _compute_dtype(layer: nn.Dense, inputs: Array) -> jnp.dtype:
-    """The dtype `layer`'s product multiplies in over a bfloat16 kernel: its own where it states one, else
-    its inputs' promoted with the kernel's (flax's `promote_dtype`)."""
-    return jnp.dtype(layer.dtype if layer.dtype is not None else jnp.result_type(inputs, jnp.bfloat16))
+def _windowed(layer: nn.Dense) -> bool:
+    """Whether `layer`'s product over a bfloat16 window is the window's (`gemm.window_product`: its inputs,
+    kernel and bias promoted to bfloat16, the sums fp32 and the bias added before the one rounding): its
+    dtype bfloat16, so flax's promotion rounds all three there, and its product Dense's own, no
+    `dot_general` or `dot_general_cls` of its own."""
+    return (layer.dtype is not None and jnp.dtype(layer.dtype) == jnp.bfloat16 and layer.dot_general is None
+            and layer.dot_general_cls is None)
 
 
 def _members(init, batched: int, flat_shape):
