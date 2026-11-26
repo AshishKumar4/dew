@@ -511,17 +511,22 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
 
 @pytest.mark.parametrize("flushes", [True, False], ids=["flushing", "gradual"])
 def test_a_sum_of_exact_zeros_is_held_exactly_zero(flushes):
-    """A sum of exact zeros has no rounding below the normal range on any path: a reduction of [+0, +0]
-    is +0 alone, its underflow slack refused (2^-126 a flushing lane's, 2^-149 a gradual one's, row 13544),
-    -0 too; one of [-0, -0] -0 or +0 (an identity +0 started from or not); a sum of nonzero terms keeps its
-    slack."""
+    """A sum of exact zeros (as given, before a flushing lane reads them) has no rounding below the normal
+    range on any path: a reduction of [+0, +0] is +0 alone, its underflow slack refused (2^-126 a flushing
+    lane's, 2^-149 a gradual one's, row 13544), -0 too; one of [-0, -0] -0 or +0 (an identity +0 started
+    from or not); a sum of nonzero terms keeps its slack, and a subnormal a flushing lane hands through."""
     plus, minus = np.zeros((1, 2)), np.full((1, 2), -0.0)
     for native, terms, held in ((0.0, plus, True), (-0.0, plus, False), (2.0 ** -126, plus, False),
                                 (2.0 ** -149, plus, False), (-0.0, minus, True), (0.0, minus, True),
                                 (2.0 ** -149, minus, False)):
-        assert ct._terms_hold(np.float32([native]), terms, oc.FLOAT32, flushes)[0] == held, (native, terms)
+        held_here = ct._terms_hold(np.float32([native]), terms, oc.FLOAT32, flushes, given=terms)[0]
+        assert held_here == held, (native, terms)
     tiny = np.float32([[2.0 ** -126, -2.0 ** -126]])
-    assert ct._terms_hold(np.float32([0.0]), tiny, oc.FLOAT32, flushes)[0]
+    assert ct._terms_hold(np.float32([0.0]), tiny, oc.FLOAT32, flushes, given=tiny)[0]
+    # A subnormal term a flushing lane reads as zero but hands through unread keeps the slack.
+    subnormal = np.float32([[2.0 ** -140]])
+    read = np.zeros((1, 1)) if flushes else subnormal
+    assert ct._terms_hold(np.float32([2.0 ** -140]), read, oc.FLOAT32, flushes, given=subnormal)[0]
 
 
 def test_check2_refuses_a_run_of_no_seeds():

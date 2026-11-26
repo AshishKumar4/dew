@@ -336,7 +336,7 @@ def test_check_1_reads_a_discrete_leaf_in_its_own_representation():
         return as_given(lambda seed: {"count": np.asarray([value], np.int64)})
 
     def draw(seed):
-        return (seed,)
+        return (np.float32(seed),)
 
     assert_as_exact(counted(big), counted(big), draw, "an exact count", seeds=8, truth_fn=counted(big))
     with pytest.raises(GateFailure):
