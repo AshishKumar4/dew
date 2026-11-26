@@ -848,6 +848,10 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
             feed(("lit", str(dtype), ext, value.shape, len(raw), aval_key(atom.aval)))
             hasher.update(raw)
             hasher.update(b"\0")
+        elif in_process:
+            # A binary tag distinct from the literals' leading tuple marker, followed by a fixed
+            # width binder position. No repr or temporary tuple for the dominant atom kind.
+            hasher.update(((position[atom] << 8) | 1).to_bytes(9, "little"))
         else:
             feed(("var", position[atom]))
 

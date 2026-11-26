@@ -222,8 +222,10 @@ def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     beside the regions' own (`report.record_pass`): where both entries run it, a jit's trace at the compile
     point (`rewritten_program`) and a function's own (`rewritten`'s `rewrite`)."""
     began = time.perf_counter()
-    scope = _scope_for(accurate, saturation, kernels)
-    made = _rewritten(closed, accurate, saturation, kernels, _scope=scope)
+    made = closed
+    if closed.eqns:
+        scope = _scope_for(accurate, saturation, kernels)
+        made = _rewritten(closed, accurate, saturation, kernels, _scope=scope)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
