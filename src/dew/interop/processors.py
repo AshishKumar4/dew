@@ -844,10 +844,17 @@ class Processor:
         if blocks.ndim != 4 or blocks.shape[1] != blocks.shape[2] or blocks.shape[1] % merge:
             raise ValueError("Inkling 2's pixel_values are square merged-token blocks [tokens, side, side, "
                              f"channels] tiled by its merge size {merge}")
+        if "image_grid_thw" not in values:
+            raise ValueError("Inkling 2's pixel_values come with their image_grid_thw")
+        grids = np.asarray(values["image_grid_thw"])
+        if (grids.ndim != 2 or grids.shape[-1] != 3 or not np.issubdtype(grids.dtype, np.integer)
+                or np.any(grids < 1)):
+            raise ValueError("Inkling 2's image_grid_thw is a positive integer [images, 3] grid, its images' "
+                             f"frames, rows and columns in merged tokens, not {grids.tolist()}")
         tokens, side, _, channels = blocks.shape
         patch = side // merge
         patches = blocks.reshape(tokens, merge, patch, merge, patch, channels).transpose(0, 1, 3, 5, 2, 4)
-        grid = np.asarray(values["image_grid_thw"]) * np.asarray([1, merge, merge])
+        grid = grids * np.asarray([1, merge, merge])
         return {**values, "pixel_values": patches.reshape(tokens * merge * merge, channels * patch * patch),
                 "image_grid_thw": grid}
 

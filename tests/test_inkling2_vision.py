@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from model_support import attending, float64_twin
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
@@ -132,3 +133,8 @@ def test_the_processor_reads_its_merged_blocks_as_the_tower_takes_them():
                                       err_msg=name)
     np.testing.assert_array_equal(np.asarray(processed.kwargs()['image_indices']),
                                   np.asarray(placed(jnp.asarray(ids))))
+    # A grid not [images, 3] of positive integers is refused before it is scaled: `[[1]]` would broadcast.
+    for grid in ([[1]], [[1, 2, 0], [1, 3, 2]]):
+        with pytest.raises(ValueError):
+            processor.from_hf({'input_ids': ids, 'attention_mask': np.ones_like(ids),
+                               'pixel_values': np.concatenate(blocks), 'image_grid_thw': np.asarray(grid)})
