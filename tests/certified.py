@@ -237,10 +237,12 @@ def _exp2_interval(values, bits):
     exp's (`_exp_interval`), past whose ends every power of two lies between the same two neighbours; at a
     whole value its exact power, on every grid, which no interval of `exp(x log 2)` narrows to."""
     clipped = np.clip(values, *(end / math.log(2) for end in EXP_RANGE))
-    low, high = _interval(lambda iv, x: iv.exp(x * iv.log(2)))(clipped, bits)
     whole = clipped == np.round(clipped)
-    power = np.ldexp(1.0, np.round(clipped).astype(np.int64))
-    return np.where(whole, power, low), np.where(whole, power, high)
+    low = high = np.ldexp(1.0, np.where(whole, np.round(clipped), 0).astype(np.int64))
+    if not whole.all():
+        low, high = low.copy(), high.copy()
+        low[~whole], high[~whole] = _interval(lambda iv, x: iv.exp(x * iv.log(2)))(clipped[~whole], bits)
+    return low, high
 
 
 def _log2_interval(values, bits):
@@ -279,8 +281,10 @@ def _tanh_interval(values, bits):
     """tanh's outward enclosure, (exp(2x) - 1) / (exp(2x) + 1), at each finite value, its precision raised
     near zero as expm1's (`_near_zero_interval`), taken at ±20 beyond them: past them every tanh is within
     exp(-40) of ±1, between ±1 and the value next to it of a format no wider than fp32."""
-    return _near_zero_interval(lambda iv, x: (iv.exp(2 * x) - 1) / (iv.exp(2 * x) + 1))(
-        np.clip(values, -20.0, 20.0), bits)
+    def tanh(iv, x):
+        doubled = iv.exp(2 * x)
+        return (doubled - 1) / (doubled + 1)
+    return _near_zero_interval(tanh)(np.clip(values, -20.0, 20.0), bits)
 
 
 def _erfinv_enclosed(values, bits):
@@ -527,8 +531,9 @@ def _rounding(primitive, integral):
 def _one_minus_square(params, operands, result, fmt):
     """lax.one_minus_square's result, the program JAX lowers it to, (1 + x)(1 - x): its two factors' and
     their product's roundings within γ_3 of the exact 1 - x² relative to it (Higham §3.1), with 2^-50 for
-    its float64 evaluation, and each rounding's underflow; a non-finite value as its program makes it; of
-    integers, wrapped."""
+    its float64 evaluation, and each rounding's underflow; an infinity of the exact value's sign where that
+    allowance reaches past the format's largest finite value (its product overflowing); a non-finite value
+    as its program makes it; of integers, wrapped."""
     (x,) = operands
     if fmt is None:
         x = np.asarray(x)
@@ -540,9 +545,11 @@ def _one_minus_square(params, operands, result, fmt):
         exact = (1 + value) * (1 - value)
     native = np.asarray(result, np.float64)
     slack = (gamma(3, fmt) + 2.0 ** -50) * np.abs(exact) + 3 * underflow(fmt, flushes)
-    with np.errstate(invalid="ignore"):
+    largest = (2 - 2.0 ** (1 - fmt.precision)) * 2.0 ** fmt.emax
+    with np.errstate(invalid="ignore", over="ignore"):
         close = np.abs(native - exact) <= np.nextafter(slack, np.inf)
-    return np.where(np.isfinite(exact), close, _same(native, exact))
+        overflowed = (np.abs(exact) + slack >= largest) & _same(native, np.copysign(np.inf, exact))
+    return np.where(np.isfinite(exact), close | overflowed, _same(native, exact))
 
 
 def _correctly_divided(params, operands, result, fmt):
@@ -1448,16 +1455,24 @@ def _arg_extremum(pick):
 def _scatter_extremum(choose, integral):
     """A scatter-min or scatter-max's result: each operand element folded with every update that lands on it
     (`_scatter_targets`) by the lane's min or max (`choose`, its order of zeros and NaN, which no order of
-    folding changes), values read as the lane's arithmetic reads them; of integers, `integral`."""
+    folding changes), those values read as the lane's arithmetic reads them; an element no update lands on
+    moved, its bits kept; of integers, `integral`."""
     def contract(params, operands, result, fmt):
         operand, indices, updates = (np.asarray(value) for value in operands)
         targets = _scatter_targets(params, operand, indices, updates)
-        fold = integral if fmt is None else choose
-        folded, updates = ((operand.copy(), updates) if fmt is None
-                           else (_read(operand, lane().flushes), _read(updates, lane().flushes)))
+        if fmt is None:
+            folded, fold, read, updates = operand.copy(), integral, operand, updates
+        else:
+            flushes = lane().flushes
+            folded, fold = np.asarray(operand, np.float64).copy(), choose
+            read, updates = _read(operand, flushes), _read(updates, flushes)
+        touched = np.zeros(operand.shape, bool)
+        # A rank-zero operand's targets hold no coordinate, and no update of it is dropped.
         for update, target in zip(updates.ravel(), targets, strict=True):
-            if target[0] >= 0:
-                folded[tuple(target)] = fold(folded[tuple(target)], update)
+            if (target >= 0).all():
+                at = tuple(target)
+                folded[at] = fold(folded[at] if touched[at] else read[at], update)
+                touched[at] = True
         return np.asarray(result) == folded if fmt is None else _same(result, folded)
     return contract
 
@@ -1467,8 +1482,8 @@ def _leading_zeros(params, value):
     zero)."""
     value = np.asarray(value)
     unsigned = value.view(np.dtype(f"u{value.dtype.itemsize}")).astype(np.uint64)
-    lengths = np.frompyfunc(int.bit_length, 1, 1)(unsigned.astype(object)).astype(np.int64)
-    return (np.int64(8 * value.dtype.itemsize) - lengths).astype(value.dtype)
+    lengths = np.asarray(np.frompyfunc(int.bit_length, 1, 1)(unsigned.astype(object)), np.int64)
+    return np.asarray(8 * value.dtype.itemsize - lengths, value.dtype)
 
 
 def _integral_extremum(reduce, extreme: str):

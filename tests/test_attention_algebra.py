@@ -1795,6 +1795,24 @@ def test_taken_back_avoids_double_rounding_and_quotient_preserves_large_total_ta
 
 
 
+
+def test_the_cap_multiplies_fp32_logits_by_its_reciprocal_and_divides_any_other():
+    """Gemma 2's cap (`template.Capped`) multiplies fp32 logits by the cap's fp32 reciprocal, its arithmetic
+    on every backend; bf16 logits, and logits of a cap whose fp32 reciprocal is no finite nonzero number
+    (2^128, past fp32's range, at float64), are divided by the cap in their own dtype."""
+    cap = template.Capped(5.0)
+    logits = jnp.asarray([1.8436161, -0.13113005, 30.0], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(cap(logits, None, None)),
+                                  np.asarray(5.0 * jnp.tanh(logits * np.float32(0.2))))
+    narrow = logits.astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(cap(narrow, None, None)),
+                                  np.asarray(5.0 * jnp.tanh(narrow / 5.0)))
+    wide = template.Capped(2.0 ** 128)
+    assert wide.reciprocal == 0.0
+    with jax.enable_x64(new_val=True):
+        capped = wide(jnp.asarray([2.0 ** 128], jnp.float64), None, None)
+    np.testing.assert_allclose(np.asarray(capped), [2.0 ** 128 * np.tanh(1.0)], rtol=1e-15)
+
 PLAIN_JAX_CERTIFIED = """
 import json, sys
 import jax.numpy as jnp
