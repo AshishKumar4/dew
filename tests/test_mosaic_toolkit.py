@@ -2143,9 +2143,10 @@ def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bun
 
 
 def _branch_first_walk(x, w, *, family, interpret):
-    """`x @ w` through a plain walk of `PERSISTED_STEPS` steps whose step first reads `w`'s slot inside a
-    branch (`pl.when` at its first step), then multiplies by it: the read a branch makes acquires the slot
-    within that branch, which the step's own read then takes."""
+    """`x @ w + w[0]` through a plain walk of `PERSISTED_STEPS` steps whose step first reads `w`'s slot inside
+    a branch (a cond's, at its first step): the branch reads its block's first row into the walk's carry,
+    which the read adds to every row of the sums, and the step then multiplies by the slot past the branch.
+    The read a branch makes acquires the slot within that branch, which the step's own read then takes."""
     rows, columns = family.rows, w.shape[1]
     family = family.specialized(rows, columns)
     shape = (rows, columns)
@@ -2153,21 +2154,21 @@ def _branch_first_walk(x, w, *, family, interpret):
     def body(x_gmem, w_gmem, o_gmem):
         def scope(*, streams):
             def read(carry, sums):
-                del carry
                 for first, (value,) in family.chunks(sums):
-                    o_gmem[:, pl.ds(first, value.shape[1])] = value
+                    added = carry[None, first:first + value.shape[1]]
+                    o_gmem[:, pl.ds(first, value.shape[1])] = value + added
 
             multiplied = _multiplying(family, 'x', 'w', interpret)
 
             def step(index, slots, carry, accumulators):
-                @pl.when(index == 0)
-                def _():
-                    slots['w']
-
-                return multiplied(index, slots, carry, accumulators)
+                first_row = jax.lax.cond(index == 0, lambda: slots['w'][0].astype(jnp.float32),
+                                         lambda: jnp.zeros((columns,), jnp.float32))
+                carry, accumulators = multiplied(index, slots, carry, accumulators)
+                return carry + first_row, accumulators
 
             views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
-            walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read)
+            walk = mosaic.Walk(views, step, steps=PERSISTED_STEPS, sums=(shape,), read=read,
+                               carry=jnp.zeros((columns,), jnp.float32))
             family.run(streams["walked"], walk, interpret)
 
         family.scoped(scope, streams={"walked": family.streams({'x': ((rows, PERSISTED_DEPTH), x.dtype),
@@ -2181,18 +2182,44 @@ def _branch_first_walk(x, w, *, family, interpret):
 
 @pytest.mark.parametrize("bundle", ONCE_BUNDLES[:2])
 def test_a_slot_a_branch_reads_first_is_the_steps_own_past_the_branch(bundle):
-    """Interpreted, on the host's CPU: a walk's step whose first read of a slot is inside a branch (a cond's,
-    `pl.when`) and whose next is its own, past the branch: the branch's acquire, its wait and its slot's
-    index the branch's own, holds for none of the step's reads after it, which acquire the slot again (a wait
-    again for the same turn returns at once), so the walk's product is `x @ w`, exactly. A
-    slot held from the branch's read carried its index past the branch, a value of a trace that had ended:
-    an sm120 attention training step's fused backward raised as it lowered (row 13106)."""
+    """A walk's step whose first read of a slot is inside a branch (a cond's) and whose next is its own, past
+    the branch: the branch's acquire, its wait and its slot's index the branch's own, holds for none of the
+    step's reads after it, which acquire the slot again (a wait again for the same turn returns at once).
+    Interpreted on the host's CPU, the branch's row and the walk's product reach the output, `x @ w + w[0]`
+    exactly; traced for an H100, the branch waits on the slot's load before it reads the slot, and the step
+    waits again past the branch. A slot held from the branch's read carried
+    its index past the branch, a value of a trace that had ended: an sm120 attention training step's fused
+    backward raised as it lowered (row 13106); a branch that formed its slot with no wait of its own read
+    it before its load (row 13113)."""
     family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
     with generation.assumed(target), on_the_host():
         got = np.asarray(_branch_first_walk(x, w, family=family, interpret=interpret))
-    np.testing.assert_array_equal(got, np.asarray(x, np.float32) @ np.asarray(w, np.float32))
+    want = np.asarray(x, np.float32) @ np.asarray(w, np.float32) + np.asarray(w, np.float32)[0]
+    np.testing.assert_array_equal(got, want)
+    with generation.assumed("sm90"):
+        traced = jax.make_jaxpr(lambda x, w: _branch_first_walk(x, w, family=family, interpret=False))(x, w)
+    (branch,) = [equation for equation in equations(traced.jaxpr) if equation.primitive.name == "cond"
+                 and any(inner.primitive.name == "get" for each in equation.params["branches"]
+                         for inner in each.jaxpr.eqns)]
+    (reading,) = [each.jaxpr for each in branch.params["branches"]
+                  if any(inner.primitive.name == "get" for inner in each.jaxpr.eqns)]
+    order = [inner.primitive.name for inner in reading.eqns
+             if inner.primitive.name in ("barrier_wait", "get")]
+    assert order[:2] == ["barrier_wait", "get"], order
+    (around,) = [jaxpr for jaxpr in _jaxprs(traced.jaxpr) if branch in jaxpr.eqns]
+    past = around.eqns[around.eqns.index(branch) + 1:]
+    assert any(equation.primitive.name == "barrier_wait" for equation in past)
+
+
+def _jaxprs(jaxpr):
+    """`jaxpr` and every program within it, at any depth."""
+    yield jaxpr
+    from jax.extend import core as jcore
+
+    for inner in jcore.subjaxprs(jaxpr):
+        yield from _jaxprs(inner)
 
 
 def _once_bundle(bundle: str):
