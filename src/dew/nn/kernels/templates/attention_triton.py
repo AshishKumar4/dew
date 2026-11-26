@@ -65,6 +65,7 @@ from dew.nn.kernels.templates.attention import (
     prologues_taken,
     scored,
     shared_place,
+    walked_initial,
     within,
 )
 from dew.nn.kernels.templates.base import Template
@@ -729,7 +730,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     """`forward`'s launch, its padded operands (`padded_call`) and the call's queries before padding."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
-    initial = hooks.initial
+    initial = walked_initial(hooks.initial)
     m0 = total0 = acc0 = None
     if initial is not None:
         m0, total0 = call.rows(initial.m, algebra.LEAST), call.rows(initial.total)

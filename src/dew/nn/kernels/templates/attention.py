@@ -778,6 +778,21 @@ class Initial:
     total: jax.Array
     acc: jax.Array
     valueless: bool = dataclasses.field(default=False, metadata={"static": True})
+    normalized: bool = dataclasses.field(default=False, metadata={"static": True})
+    """Whether `acc` holds the state's output, its numerator over `total` (a resumed decode step's,
+    `attention_decode.resumable`), where its numerator would pass fp32's range: a merge reads it as it is
+    (`attention_algebra.initial_state`, the decode step's past its stateless walk); a walk, which resumes
+    from a numerator, refuses it (`walked_initial`)."""
+
+
+def walked_initial(initial: "Initial | None") -> "Initial | None":
+    """`initial` as a walk resumes from it, its numerator in `acc`; one holding its output
+    (`Initial.normalized`) refused, as its numerator may pass fp32's range: the decode step merges it past
+    its stateless walk (`attention_decode.attend`)."""
+    if initial is not None and initial.normalized:
+        raise ValueError("a resumed decode state holds its output, which a walk does not resume from: "
+                         "resume it on the template's decode (`attention_decode.attend`), which merges it")
+    return initial
 
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
@@ -1321,6 +1336,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
     starts such a query from `m = -inf`. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
+    walked_initial(hooks.initial)
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
