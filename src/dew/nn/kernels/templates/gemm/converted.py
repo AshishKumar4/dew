@@ -64,16 +64,15 @@ class MosaicConvertedGmm(grouped_matmul.MosaicPackedGmm):
         # Its codes' layout is the caller's, whole steps and tiles (`STEP`): the call is not padded.
         return True
 
-    def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
+    def _streamed_matrix(self, kernel: typing.Any, trans_rhs: bool) -> tuple:
         del trans_rhs
         return kernel.codes, True, {}
 
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family):
         from dew.nn.kernels.templates.gemm import mosaic_gpu
 
-        kernel = typing.cast(Codes, ba.arguments['kernel'])
         return mosaic_gpu.gmm_allocations(
-            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=kernel.codes.dtype,
+            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=ba.arguments['kernel'].codes.dtype,
             transpose_rhs=True, prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
             dtypes=(ba.arguments['out_dtype'],))
 
@@ -146,7 +145,8 @@ def fp8_codes_product(lhs: jax.Array, rhs: jax.Array, *, out_dtype, interpret_on
     if not taken:
         return plain()
     codes = jnp.pad(rhs, ((0, padded_width - width), (0, padded_depth - depth)))[None]
-    widened = jnp.pad(lhs, ((0, 0), (0, padded_depth - depth))).astype(jnp.bfloat16)
+    # Widened before it is padded: no transpose of the pad sums in the codes' 8 bits.
+    widened = jnp.pad(lhs.astype(jnp.bfloat16), ((0, 0), (0, padded_depth - depth)))
     sizes = jnp.asarray([rows], jnp.int32)
     product = contracted("test_an_fp8_codes_product_holds_every_order")(
         generation.linear_tangent(*_rules(launch, codes.dtype, interpret_on_cpu), live_cotangents=True,
