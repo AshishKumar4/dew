@@ -89,6 +89,29 @@ def test_an_empty_gated_projection_keeps_its_value_and_pullback(limit):
         np.testing.assert_array_equal(gradient, np.zeros_like(param))
 
 
+def test_an_empty_projection_adds_bias_without_a_contraction_pullback():
+    from dew.nn.dense import Dense
+
+    layer = Dense(features=3, use_bias=True, dtype=jnp.float32)
+    rows = np.zeros((2, 3, 0), np.float32)
+    kernel = np.zeros((0, 3), np.float32)
+    bias = np.asarray([0.25, -2.0, 4.0], np.float32)
+
+    @jax.jit
+    def evaluate(x, w, b):
+        def apply(x, w, b):
+            return layer.apply({"params": {"kernel": w, "bias": b}}, x)
+
+        found, pull = jax.vjp(apply, x, w, b)
+        return found, pull(jnp.ones_like(found))
+
+    found, (dx, dw, db) = evaluate(rows, kernel, bias)
+    np.testing.assert_array_equal(found, np.broadcast_to(bias, (2, 3, 3)))
+    np.testing.assert_array_equal(dx, rows)
+    np.testing.assert_array_equal(dw, kernel)
+    np.testing.assert_array_equal(db, [6, 6, 6])
+
+
 def test_a_gated_hook_rounds_nowhere_at_fp32_and_wider():
     """The fused MLP's hook (`activations.gated_hook`) computes a float64 or fp32 gated product as the
     portable product does, `activate(gate) * up` in the operands' own dtype with no rounding (only a 16-bit
