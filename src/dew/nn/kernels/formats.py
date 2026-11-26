@@ -13,9 +13,13 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.custom_derivatives import SymbolicZero
 from jax.typing import DTypeLike
 
 from dew.algebra import bits
+from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.float_bits import exact_power2, raw_fields, rounded_binary
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import product as formats_of
 from dew.nn.kernels.templates.gemm import packed
 from dew.nn.precision import at_least_fp32, power2
@@ -260,25 +264,61 @@ class MxFp8:
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
     def decoded(self, dtype=jnp.float32) -> jax.Array:
-        """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
-        its block's E8M0 scale decoded through `bits.E8M0_SCALE_FORM` (OCP MX 5.4.1, row 9040), preserving
-        both `0x00` (`2^-127`) without FTZ flush and `0xFF` NaN."""
+        """Each E4M3 code times its E8M0 scale in `dtype`, with one destination rounding. The least
+        scale byte and subnormal result bits are kept even on FTZ backends; byte 255 is NaN (OCP MX 5.4.1).
+        """
+        exponent, invalid = e8m0_exponents(self.scales)
+        exponent, invalid = (jnp.repeat(x, formats_of.MXFP8.depth, axis=-1) for x in (exponent, invalid))
+        return _decode_mxfp8(jax.dtypes.canonicalize_dtype(dtype), self.codes, exponent, invalid)
+
+
+def _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid):
+    """The floating linear rule; two normal factors even for the least E8M0 scale."""
+    wide = jnp.promote_types(dtype, jnp.float32)
+    values = codes.astype(wide)
+    values = jnp.where(exponents == -127, values * jnp.asarray(0.5, wide), values)
+    powers = exact_power2(jnp.maximum(exponents, -126), jnp.finfo(wide).dtype)
+    return (values * jnp.where(invalid, jnp.asarray(jnp.nan, wide), powers)).astype(dtype)
+
+
+def _mxfp8_decoded(dtype, codes, exponents, invalid):
+    if dtype == jnp.float64:
+        return _mxfp8_scale_arithmetic(dtype, codes, exponents, invalid)
+    # Every nonzero finite E4M3 code first widens to a normal fp32. Only the final exponent
+    # application can enter the subnormals, so round the stored product at its destination.
+    _, sign, biased, fraction = raw_fields(codes.astype(jnp.float32))
+    held = jnp.where(biased != 0, fraction | np.uint32(1 << 23), fraction)
+    power = biased.astype(jnp.int32) - 150 + exponents
+    landing = dtype if dtype in (jnp.float16, jnp.bfloat16, jnp.float32) else jnp.float32
+    place = power + 23 - jnp.finfo(landing).nmant
+    return rounded_binary(sign, held, power, landing, last=place,
+                          nan=invalid | (biased == 0xFF)).astype(dtype)
+
+
+def _mxfp8_decode_tangent(dtype, primals, tangents):
+    codes, exponents, invalid = primals
+    moved, _, _ = tangents
+    value = _decode_mxfp8(dtype, *primals)
+    if isinstance(moved, SymbolicZero) or not jnp.issubdtype(dtype, jnp.inexact):
+        return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
+
+    def applied(scales, direction):
+        return _decode_mxfp8(dtype, direction, *scales)
+
+    def pulled(scales, cotangent):
+        # Keep the established floating transpose, narrowing only to the stored code type.
         wide = jnp.promote_types(dtype, jnp.float32)
-        scales_f32, subnormal = e8m0_scales(self.scales)
-        rep_scale = jnp.repeat(scales_f32.astype(wide), formats_of.MXFP8.depth, axis=-1)
-        rep_sub = jnp.repeat(subnormal, formats_of.MXFP8.depth, axis=-1)
-        codes = self.codes.astype(wide)
-        # For 0x00 (2^-127), split into two normal powers (0.5 * 2^-126) so FTZ hardware never flushes the
-        # scale before multiplying normal codes (`448 * 2^-127 = 1.75 * 2^-119` stays normal).
-        sub_vals = (codes * jnp.asarray(0.5, wide)) * jnp.asarray(2.0 ** -126, wide)
-        return jnp.where(rep_sub, sub_vals, codes * rep_scale).astype(dtype)
+        return _mxfp8_scale_arithmetic(wide, cotangent, *scales).astype(codes.dtype)
+
+    direction = generation.linear_map(applied, pulled, (exponents, invalid), moved,
+                                      out_aval=jax.typeof(value))
+    return value, direction
 
 
-def e8m0_scales(scales: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Decode E8M0 `scales` via `bits.e8m0_decoded` into float32 powers (`2^(e-127)` for `1..254`, NaN
-    for `0xFF`, `2^-127` for `0x00`) plus the boolean mask of `0x00` subnormal blocks (row 9040)."""
-    held = jax.lax.bitcast_convert_type(scales, jnp.uint8).astype(jnp.uint32)
-    return bits.e8m0_decoded(held), (held & jnp.uint32(0xFF)) == 0
+_decode_mxfp8 = contracted("test_a_decoded_mxfp8_operand_preserves_its_linear_rule")(
+    declared_tangent(Protected(), _mxfp8_decoded, _mxfp8_decode_tangent,
+                     nondiff_argnums=(0,), symbolic_zeros=True))
+
 
 def mxfp8_scale_bytes(largest: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A 32-value block's MXFP8 scale from its largest magnitude `largest` (float32's, or a float64 truth's),
