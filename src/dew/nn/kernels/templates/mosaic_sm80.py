@@ -739,6 +739,9 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             return self.for_dtype(lhs.dtype)._supported(acc, lhs, rhs, support)
         depth = self.fragment_depth(int(rhs.shape[0]))
         rows, columns = self.term_tile
+        if not support.divides(rows, columns, depth):
+            # Its instructions do not tile the product: whole.
+            return self.products(acc, lhs, rhs)
         issued = support.tiles(rows, columns, depth)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         for k in range(issued.shape[2]):
@@ -774,7 +777,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
 _MOSAIC_MMA = importlib.import_module("jax.experimental.mosaic.gpu.mma")
 """Mosaic GPU's mma.sync module (the package's `mma` its function): its single-tile product and TF32 rounding,
-which `_tiled_product` issues a tile at a time."""
+which `_tiled_product` issues a tile at a time, the fork's own (private there: a pin renaming them fails
+tests/test_supported_products.py's compile)."""
 
 
 def _tiled_product(ctx, acc, left, *rights, rows: int, columns: int, depth: int, tiles: tuple):

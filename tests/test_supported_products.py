@@ -137,8 +137,8 @@ def _on_mma_sync() -> bool:
 @pytest.mark.skipif(not _on_mma_sync(), reason="a product of a support issues on mma.sync's GPUs alone")
 def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(monkeypatch):
     """On this GPU (an mma.sync part's), Qwen3.5-27B's gated delta net forward with its solve's merges
-    issued of their supports alone is the same forward with every merge whole, bit for bit, over finite
-    draws: each instruction skipped held only zero terms."""
+    issued of their supports alone is the same forward with every merge whole, bit for bit up to a zero's
+    sign, over finite draws: each instruction skipped held only zero terms."""
     from dew import _cache
     from dew.nn.kernels.templates import operands
 
@@ -152,4 +152,5 @@ def test_the_solve_of_its_supports_is_the_whole_solve_bit_for_bit_on_this_gpu(mo
                         lambda self, name, lhs, rhs, support: self(name, lhs, rhs))
     with _cache.uncached():
         whole = np.asarray(jax.jit(run)(*given))
-    np.testing.assert_array_equal(supported.view(np.uint16), whole.view(np.uint16))
+    # Equal values, NaN where NaN, a zero's sign aside (`product.Support`'s contract).
+    np.testing.assert_array_equal(supported.astype(np.float32), whole.astype(np.float32))

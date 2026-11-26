@@ -2167,7 +2167,7 @@ class Transport[Allocated, Opened](abc.ABC):
 
 
 def whole_products(issuer: Issuer, support: Support | None) -> None:
-    """Refuses a product of a `support` (`Issuer.register_products`') on `issuer`, whose instructions take
+    """Refuses a product of a `support` (`Issuer.products`') on `issuer`, whose instructions take
     its products whole (`Issuer.term_tile` None)."""
     if support is not None:
         raise NotImplementedError(f"{type(issuer).__name__} issues its products whole, none of a support")
