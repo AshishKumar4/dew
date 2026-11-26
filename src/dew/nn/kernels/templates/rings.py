@@ -17,7 +17,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import swizzling
+from dew.nn.kernels.templates import axes, swizzling
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
 
@@ -116,18 +116,14 @@ def viewed(view: "Among | tuple", block: tuple, step):
         share = (block[0] // len(ref), *block[1:])
         return Pieces(viewed((each, index_map), share, step) for each in ref)
 
-    def at(indices, block):
-        return ref.at[tuple(pl.ds(index * extent, extent)
-                            for index, extent in zip(indices, block, strict=True))]
-
     if isinstance(indices, Paired):
         pair = tuple(extent * 2 if axis == indices.along else extent for axis, extent in enumerate(block))
-        return Split(at(indices.indices, pair), indices.along)
+        return Split(axes.blocked(ref, pair, indices.indices), indices.along)
     if isinstance(indices, Rows):
         run = (indices.rows, *block[1:])
-        return Pieces(at((indices.table[indices.start + each], *indices.rest), run)
+        return Pieces(axes.blocked(ref, run, (indices.table[indices.start + each], *indices.rest))
                       for each in range(block[0] // indices.rows))
-    return at(indices, block)
+    return axes.blocked(ref, block, indices)
 
 
 def held_together(rings: dict) -> list[dict]:

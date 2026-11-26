@@ -45,6 +45,7 @@ from .grouped_cells import (
     MEASURED,
     REFERENCE,
     SCOREBOARDS,
+    STEP_HELD,
     TEMPLATE,
     TOGETHER,
     Kind,
@@ -55,7 +56,7 @@ from .grouped_cells import (
 from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
-from .templates import base
+from .templates import base, copies
 from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
@@ -285,7 +286,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         """The epilogue's values beyond the mainloop's held set, delegated to `pricing.epilogue_registers`
         (row 11982)."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import pricing
+        from .templates.gemm import pricing, quantized
+        from .templates.gemm.hooks import read_out
 
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
@@ -301,7 +303,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                       if len(held_axes(axes)) > 1)
         out_dtypes = hooks.out_dtypes or stored
         return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
-                                          tiles=tiles, has_hook=True, staging=config.staging)
+                                          tiles=tiles, has_hook=True, staging=config.staging,
+                                          hooked=read_out(
+                                              family, (config.share, columns), out_dtypes,
+                                              quantized.forms_of(hooks.out_forms, out_dtypes), config.staging,
+                                              hooks.after()).columns)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
@@ -436,7 +442,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
         run partial (`_partial_axes`)."""
-        from .templates.gemm import derivation, quantized
+        from .templates.gemm import derivation, hooks, quantized
 
         ba = self._aligned(ba, target, whole_tiles=True)
         rows, depth, width = self._generated_extents(ba)
@@ -457,7 +463,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]), programs=programs,
-                                      outputs=_stored_dtypes(ba))
+                                      outputs=_stored_dtypes(ba),
+                                      hooked=(hooks.column_local(ba.arguments['hooks'].epilogue)
+                                              and not ba.arguments['hooks'].out_forms))
             if tile is not None:
                 return formed(tile)
         return None
@@ -923,8 +931,9 @@ class MosaicGmm(_Mosaic):
         family whose loads past an operand are bounded (`Family.bounded_loads`, TMA's) and whose products
         read its blocks by descriptor (`mosaic_gpu.partial_runs`), compiled, not swapped
         (`_swapped`), each axis at least a swizzled tile long where every operand and output along it lies in
-        rows of whole 16 bytes, as a TMA descriptor's strides must (a 100-wide bf16 matrix's 200-byte rows are
-        padded: "Async copies require all GMEM strides except the last one to be a multiple of 16 bytes"), and
+        rows of whole 16 bytes (`copies.whole_rows`), as a TMA descriptor's strides must (a 100-wide bf16
+        matrix's 200-byte rows are padded: "Async copies require all GMEM strides except the last one to be a
+        multiple of 16 bytes"), and
         no side tile runs along it (a side's copy spans its own dtype's tiles, which the fork's untiled view
         of a partial extent takes one of: a float32 side's 64 columns are two); the depth's where the rows are
         not gathered and the width's where they are not scattered (a gather's and a scatter's piecewise copies
@@ -944,7 +953,7 @@ class MosaicGmm(_Mosaic):
             # A call no narrower than a swizzled tile (`mosaic_gpu.partial_step`), which its last tile
             # spans partial; a narrower one is padded to its tile, as a whole tile's rows are.
             return (extent >= mosaic_gpu.partial_step(tokens.dtype)
-                    and all(extent * jnp.dtype(dtype).itemsize % 16 == 0 for dtype in dtypes))
+                    and all(copies.whole_rows(extent, dtype) for dtype in dtypes))
 
         def tiled(operands: tuple, axes_of: tuple, axis: str) -> bool:
             # A side tile along the axis (a vector's copy is one tile of its own, its load past it zeros).
@@ -2129,18 +2138,27 @@ each its own."""
 
 def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]]:
     """`DECLARED`, from the receipts that hold its cells (`grouped_cells`): each scoreboard's kinds
-    (`SCOREBOARDS`), the A10's and L4's (`M_FS_34`), the A100's grouped forward (`M_EM_2`), products in one
-    launch timed apart (`TOGETHER`), and every product a receipt timed (`grouped_cells.timings`, the one
-    record its recognition reads too) where its winner is not its kind's route, none returning to XLA on a
-    kind a scoreboard put on the template."""
+    (`SCOREBOARDS`), the template's only where every product a receipt timed of that kind is at parity
+    (none lagging, `Timing.winner`, whichever receipt timed it), the A10's and L4's (`M_FS_34`), the A100's
+    grouped forward (`M_EM_2`), products in one launch timed apart (`TOGETHER`), and every product a receipt
+    timed (`grouped_cells.timings`, the one record its recognition reads too) where its winner is not its
+    kind's route."""
     cells: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {}
-    replaced = set()
+    lagging = {}
+    for timing in timings():
+        if timing.winner == REFERENCE:
+            lagging.setdefault((timing.generation, timing.made), timing)
     for board in SCOREBOARDS:
         for made in board.times:
-            if board.winner(made) == TEMPLATE:
-                replaced.add((board.generation, made))
-            else:
+            if board.winner(made) == REFERENCE:
                 cells[board.generation, Kind(dense=True, made=made)] = (XLA, board.why(made))
+            elif (held := STEP_HELD.get((board.generation, made))) is not None:
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, f"{board.why(made)}; but {held}")
+            elif (witness := lagging.get((board.generation, made))) is not None:
+                fewest, most = witness.timed.span
+                cells[board.generation, Kind(dense=True, made=made)] = (XLA, (
+                    f"{board.why(made)}; but its {witness.matrix[0]} x {witness.matrix[1]} product at "
+                    f"{fewest}-{most} rows lags: {witness.evidence}"))
     for name, receipt in M_FS_34.items():
         for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT):
             cells[name, Kind(dense=True, made=made)] = (XLA, receipt)
@@ -2153,12 +2171,10 @@ def _declared() -> dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedC
     routes = {TEMPLATE: MOSAIC, REFERENCE: XLA}
     for timing in timings():
         kind = XLA if (timing.generation, Kind(dense=True, made=timing.made)) in cells else MOSAIC
-        route = routes[timing.winner]
-        if route is not kind and not (timing.winner == REFERENCE
-                                      and (timing.generation, timing.made) in replaced):
+        if routes[timing.winner] is not kind:
             cells[timing.generation, Kind(dense=True, made=timing.made, matrix=timing.matrix,
                                           formed=timing.formed, span=timing.timed.span)] = (
-                route, timing.evidence)
+                routes[timing.winner], timing.evidence)
     return cells
 
 
@@ -2167,12 +2183,11 @@ DECLARED = _declared()
 template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
 best/fastest remains the route until our templates catch up", ops 361caffc; bible §6 2026-11-24: "templates
 should replace ref routes on parity"): (device generation, kind of call) to (that route's kernel, the
-receipt). A kind takes the template once every product its receipt timed is at parity, whole
+receipt). A kind takes the template once every product any receipt timed of it is at parity, whole
 (`grouped_cells.Scoreboard`: the template matching or beating the best kernel at every shape it serves,
 kernel-templates.md §1), and a generation no receipt timed takes the template; on a kind XLA keeps, a product
 of a matrix a receipt timed (`MEASURED`) at parity over its rows is the template's, a cell of its own, and
-any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs: no product returns to
-XLA on a kind the template took.
+any other its kind's (`GroupedCase.cell`). The list shrinks as the template climbs.
 A cell's route holds no more of a step's memory than the template's: each product's reverse mode returns
 its rows' cotangent only with its kernel gradient formed (`derivatives.with_gradients_formed`, row 6027),
 whichever route forms it (tests/test_declared_cells_memory.py). Nothing is ranked at runtime. A

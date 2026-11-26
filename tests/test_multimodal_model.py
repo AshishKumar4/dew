@@ -150,34 +150,42 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     trainer = Trainer(objective, optax.sgd(LEARNING_RATE), key=jax.random.key(3),
                       mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     state = trainer.fit(data, steps=1, log_every=1)
-    output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
+    logits = _logits(loaded.model)
+    output = logits(state.variables, inputs)
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    assert_trainer_takes_the_plain_step(loaded, inputs, trainer, state)
+    assert_trainer_takes_the_plain_step(loaded, inputs, trainer, state, logits)
     # The step moved Dew's own logits: an update is a structural change, exact inequality says enough.
-    untrained = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
+    untrained = logits(loaded.variables, inputs)
     assert not np.array_equal(np.asarray(output)[valid], np.asarray(untrained)[valid])
     loaded.save(tmp_path, variables=state.variables)
     reloaded = Pretrained.load(tmp_path, dtype="float32")
     for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.variables),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
-    restored = reloaded.model.apply(reloaded.variables, inputs.tokens, **inputs.kwargs())
+    restored = _logits(reloaded.model)(reloaded.variables, inputs)
     np.testing.assert_array_equal(np.asarray(restored)[valid], np.asarray(output)[valid])
     assert reloaded.processor is not None
     assert loaded.processor is not None
     assert reloaded.processor.decode(inputs.tokens) == loaded.processor.decode(inputs.tokens)
 
 
+def _logits(model):
+    """`model`'s logits over a `ModelInputs` from its variables, compiled whole: applied op by op, each of a
+    multimodal forward's operations compiled on its own, about 1,400 of them (row 8943)."""
+    return jax.jit(lambda variables, given: model.apply(variables, given.tokens, **given.kwargs()))
+
+
 TRAINER_STEP_SEEDS = 8
 """The trainer's step against the plain step's declared draws (check 1), sized by `seeds_for` on armada."""
 
 
-def assert_trainer_takes_the_plain_step(loaded, inputs, trainer, fitted) -> None:
+def assert_trainer_takes_the_plain_step(loaded, inputs, trainer, fitted, logits) -> None:
     """`fitted`, the state `trainer.fit` returned after one step over `inputs`' rows, is its compiled step's
     (`Trainer.compile`) from its first state, to the bit; and that step is on par with the plain SGD step
     (`_stepped`, `_trained`) by check 1 over drawn pixels near the source draw's: the logits after each step
-    at every valid slot, the plain step in float64 the truth. The trainer takes `inputs`' rows each repeated
-    to its batch, which leaves the step's mean loss and so its gradient the same."""
+    at every valid slot (`logits`, `_logits`), the plain step in float64 the truth. The trainer takes
+    `inputs`' rows each repeated to its batch, which leaves the step's mean loss and so its gradient the
+    same."""
     rows = 2 * jax.device_count()
     valid = jnp.asarray(inputs.token_fields["attention_mask"], bool)[..., None]
     first = trainer.initial_state()
@@ -197,7 +205,7 @@ def assert_trainer_takes_the_plain_step(loaded, inputs, trainer, fitted) -> None
         # A fresh copy of the first state a draw: a step takes its state's buffers.
         given = with_pixels(jnp.asarray(pixels))
         state, *_ = step(jax.tree.map(jnp.copy, first), {"text": given.take_rows(jnp.arange(rows) % 2)})
-        return jnp.where(valid, loaded.model.apply(state.variables, given.tokens, **given.kwargs()), 0)
+        return jnp.where(valid, logits(state.variables, given), 0)
 
     def plain(model, variables):
         @jax.jit

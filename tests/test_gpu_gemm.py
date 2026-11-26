@@ -72,6 +72,7 @@ from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
 
 from dew.nn.kernels import fused_gemm, generation
+from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.norms import rms_normalized
 
 pytestmark = pytest.mark.gpu(reason="the GEMM template's and the Mosaic toolkit's kernels, compiled")
@@ -137,23 +138,20 @@ def a_fused_projection_trains_its_producer_and_epilogue():
 
 def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
-    against XLA dot_general from float64 truth (row 10151), at a 128 x 128 tile whose partials' workspace
-    the reference's holds on the GPU's whole wave (`GpuTarget.reference_workspace`; a 128 x 256 tile's over
-    a GH200's 132 multiprocessors, 33 MiB, is past it, row 12850): 2048 x 8192 by 1280, 80 super-tiles a
-    wave and a part."""
+    against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151), its tail's
+    first partials a slot a tail tile (`tail.slots`, NG29)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
-    from dew.nn.kernels.templates.gemm import tiling
-    tile = tiling.Tiles(128, 128, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 1280)), jax.ShapeDtypeStruct((1,), jnp.int32),
+    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 2560)), jax.ShapeDtypeStruct((1,), jnp.int32),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
     assert launch.legal(ba, tile, target) and launch._tail(ba, tile, target)[1] is not None
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
         return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),
-                (rng.normal(size=(8192, 1280)) / np.sqrt(8192)).astype(jnp.bfloat16))
+                (rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16))
 
     def dew_fn(x, w):
         with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
@@ -162,8 +160,38 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x1280",
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
                     seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
+def native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1():
+    """The Qwen3.5-4B q outlier's kernel gradient (8192 rows, 2560 by 2048: 80 tiles over a GH200's 66
+    pairs, 14 of them a balanced tail) into bf16, as a bf16 model's weights take it, at a pinned 128 x 256
+    cluster tile, its tail tiles' first partials a slot a tile (`tail.slots`, NG29): check 1 against XLA's
+    from float64 truth. An fp32 output is summed exactly under the suite's precision, whose cluster tile's
+    tail the launch refuses (`BALANCED_TAILS`)."""
+    from dew.nn.kernels import gemm, grouped_matmul, tuning
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    launch, bf16 = grouped_matmul.MosaicTgmm(), functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = launch.bind(bf16((8192, 2560)), bf16((8192, 2048)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                     out_dtype="bfloat16", interpret=False, dense=True, exact_sums=False)
+    target = generation.gpu_target()
+    assert launch.legal(ba, tile, target) and launch.balanced(ba, tile, target)
+
+    def draw(seed):
+        rng = np.random.default_rng(29 + seed)
+        return ((rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16),
+                rng.normal(size=(8192, 2048)).astype(jnp.bfloat16))
+
+    def dew_fn(x, dy):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicTgmm: tile}):
+            return gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16)[0]
+
+    def plain(x, dy, *, wide=jnp.float32, out=jnp.bfloat16):
+        return jnp.dot(x.T.astype(wide), dy.astype(wide)).astype(out)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail dW 2560x8192x2048",
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+
 
 def _syrk_and_tail_cells():
     return [
@@ -175,6 +203,9 @@ def _syrk_and_tail_cells():
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),
+        Cell("native Hopper cluster=2 balanced tail's kernel gradient holds check 1",
+             native_hopper_cluster2_balanced_tail_kernel_gradient_holds_check_1, "sm90", fault=BALANCED_TAIL,
+             native={"launch": "cluster2 tail", "pass": "kernel gradient"}),
     ]
 
 
@@ -192,6 +223,11 @@ CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads 
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
+
+A100_BALANCED_TAILS = ((320, 192, 1408, (64, 128, 64, 3, 2)), (320, 384, 704, (128, 64, 64, 3, 4)))
+"""Dense bf16 kernel gradients' rows, depth and width, each at a one-consumer mma.sync tile (its rows,
+columns, step, stages and band; two programs a multiprocessor) whose tail an A100 of 8 multiprocessors
+balances: a 128 x 128 tile holds no merge (280 registers a thread, `MosaicTgmm.balanced`)."""
 
 
 def _toolkit_cells() -> list[Cell]:
@@ -259,7 +295,13 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                f"{jnp.dtype(dtype).name}",
                functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
                                  depth, width, dtype), "sm90", fault=BALANCED_TAIL)
-          for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
+          for rows, depth, width, dtype in gemm_template.BALANCED_TAILS),
+        *(Cell(f"an A100's dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width}",
+               functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
+                                 depth, width, jnp.bfloat16, "sm80",
+                                 tiling.Tiles(*tile, warpgroups=1, cluster=1, family="mma.sync", programs=2)),
+               "sm80", fault=BALANCED_TAIL)
+          for rows, depth, width, tile in A100_BALANCED_TAILS),
         *(Cell(f"a chained input gradient holds check 1: {case}",
                functools.partial(gemm_paired.a_chained_input_gradient_holds_check_1, case), name,
                native={"launch": "chained", "generation": name, "case": case})

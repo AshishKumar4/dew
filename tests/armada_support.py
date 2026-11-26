@@ -109,11 +109,12 @@ def commit(root: Path, message: str) -> str:
 
 
 def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0,
-                census: bool = False, timings: dict | None = None) -> list[dict]:
+                census: bool = False, timings: dict | None = None, ended: bool = False) -> list[dict]:
     """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, from
     armada's `timings` (none by default), the census's with `census` (`plan --census`), each run as armada
     starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which the
-    plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+    plan's DEW_TEST_CACHE is not part of; with `ended`, to its process's end (`ci.entry`), not `ci.main`'s
+    return alone. Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     # Run in an environment holding every pin its checkout names, as one built at that checkout does: a
     # scratch checkout's pins name payloads no store holds, and fetching them is no part of what these show.
@@ -127,7 +128,7 @@ def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 
         filled = [re.sub(r"\{(\w+)\}", lambda field, values=values: str(values[field[1]]), word)
                   for word in command]
         monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
-        code = ci.main()
+        code = (ci.entry if ended else ci.main)()
         written = json.loads(out.read_text())["rows"]
         # Its exit says whether a row it wrote is red (.armada.json's task.redExit), and nothing else.
         red_exit = json.loads((ROOT / ".armada.json").read_text())["task"]["redExit"]
@@ -200,3 +201,17 @@ def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
     for name in names:
         (root / name).write_text(LANE_TEST)
     return names
+
+
+def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
+    """The checkout's one 3.12 task, run green on one CPU class against the shared test cache as armada
+    starts it (`armada_task`) under the cache's policy (`cached_checkout`): each call, how many times its
+    test has run, which it counts in `runs`."""
+    verdict = cached_checkout(ci, root, monkeypatch, cache_worker)
+
+    def run(policy: str = "on") -> int:
+        rows = armada_task(ci, monkeypatch, verdict, policy)
+        assert [row["exitCode"] for row in rows] == [0]
+        return len((root / "runs").read_text())
+
+    return run

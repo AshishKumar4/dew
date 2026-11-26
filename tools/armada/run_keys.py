@@ -431,6 +431,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                     else [f"its task wrote its input {path}" for path in wrote[:6]])
             ran = {**ran, "depends": None if inputs_ is None or wrote else inputs_}
         judged = site_inputs(python, row_["name"], ran["depends"])
+        # A check-1 site's map task is never reused (ci.py's `unrun`): its inputs are its judge's, kept among
+        # its artifacts (`site_inputs`), and a record of it is read by none (2026-11-25: ~196,000 a day).
+        if site is not None and site["start"] is not None:
+            continue
         if ran["depends"] is not None and judged is None:
             why.append("its check-1 site's judge ran over map tasks not drawn whole")
         ran = {**ran, "depends": judged}

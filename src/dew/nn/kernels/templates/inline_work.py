@@ -566,7 +566,8 @@ def _instruction(words: list[str], issued: float, moving: float) -> Work:
     if mnemonic.startswith(_PTX_SPECIAL):
         return Work(exponentials=elements * issued)
     if mnemonic.startswith("cvt."):
-        return Work(conversions=elements * issued)
+        # One conversion an instruction, a packed pair's too: `cvt.rn.satfinite.bf16x2.f32` is one F2FP.
+        return Work(conversions=issued)
     if mnemonic.startswith(_PTX_MULTIPLY):
         return Work(integer_multiply_adds=elements * issued)
     if mnemonic.startswith(_PTX_INTEGER):

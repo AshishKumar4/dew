@@ -864,9 +864,14 @@ def test_two_mamba_layers_lower_the_template_scans_launches_once():
     """Two Mamba layers of one shape, forward and backward, lowered for an H100: each of the selective
     template's launches is one Mosaic GPU call in the lowered program, which both layers call
     (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
-    launches were each traced and lowered again (row 2969)."""
+    launches were each traced and lowered again (row 2969). The selective template's alone: the second
+    layer's input projection takes its input's gradient, which the first's has none of, its own launch."""
+    from dew.nn.kernels.lowered import kernel_calls
+
     def launches(layers: int) -> int:
-        return len(_mosaic_calls(_operations(_mamba1_lowered("sm90", layers))))
+        # Every lowered call, a function no run reaches too (`unrun`): the code lowered, each once.
+        return len([call for call in kernel_calls(_mamba1_lowered("sm90", layers), unrun=True)
+                    if call.kind == "mosaic_gpu" and call.name.startswith("selective_scan")])
 
     one = launches(1)
     assert one > 0 and launches(2) == one

@@ -74,7 +74,7 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
         column = c * call.block
         query = read(call.given, q_ref, h // call.group * width + column)
         decays = tuple(read(call.gates, ref, h * width + column) for ref in prefix_refs)
-        operands.staged(family, algebra.key_gated(query, decays, scale), tile)
+        operands.staged(call, algebra.key_gated(query, decays, scale), tile)
 
 
 def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
@@ -252,7 +252,7 @@ def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, ti
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
                         Issuer(call), laid=laid, column_scale=gated, apart=call.apart)
-                    operands.staged(family, scored, staged)
+                    operands.staged(call, scored, staged)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            Parts(staged, held.dtype), value, scale, Issuer(call))

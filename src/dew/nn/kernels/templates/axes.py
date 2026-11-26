@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 WHOLE = slice(None)
 """An axis taken whole (a view's slice along an axis it does not cut)."""
@@ -21,6 +22,13 @@ def named[T](axes: Sequence[str], by_axis: Mapping[str, T]) -> tuple[T, ...]:
     """`by_axis[axis]` for each of `axes`, in their order: an operand's block extents or origins, every axis
     stated."""
     return tuple(by_axis[axis] for axis in axes)
+
+
+def blocked(ref, block: Sequence[int], indices: Sequence):
+    """`ref`'s block of extents `block` at block indices `indices`, axis by axis (`pl.ds(index * extent,
+    extent)`): a step's tile of a stream's view, as a `BlockSpec`'s index map reads it (a GPU ring's
+    `rings.viewed`, a TPU core's copy, `mosaic_tpu.Streams.copy`)."""
+    return ref.at[tuple(pl.ds(index * extent, extent) for index, extent in zip(indices, block, strict=True))]
 
 
 def placed[T](axes: Sequence[str], by_axis: Mapping[str, T],

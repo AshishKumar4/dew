@@ -473,7 +473,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         # An epilogue chunk's columns of the vector held at once (`chunk_columns`), in the epilogue's layout.
         return super().column_registers(self.chunk_columns(columns), dtype)
 
-    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+    def chunks(self, accumulators: tuple, columns: int | None = None) -> Iterator[tuple[int, tuple]]:
+        del columns  # read out a chunk at a time whatever its hook takes (`hook_columns`, its read-out's)
         # Each chunk's columns read from each accumulator's tensor memory (`read`) as its consumer asks for
         # it, after the chunk before it is stored: read all at once, every load was in flight together and a
         # thread held the tile's whole row, ptxas's least spill-free cap 144 at 128 columns and 208 at 192

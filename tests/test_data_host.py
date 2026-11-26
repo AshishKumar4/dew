@@ -165,6 +165,49 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     assert free.resolved(rows, reads=1, batches=1).workers == 3
 
 
+
+class _Slowed:
+    """A step that takes `seconds` on every batch but the one at `slow`, which takes `slowest`."""
+
+    def __init__(self, seconds: float, slow: int = -1, slowest: float = 0.0):
+        self.seconds, self.slow, self.slowest = seconds, slow, slowest
+
+    def __call__(self, index: int, row):
+        time.sleep(self.slowest if index == self.slow else self.seconds)
+        return row
+
+
+def test_automatic_workers_hold_as_many_batches_ready_as_their_slowest_takes_mean_ones():
+    """Each automatic worker holds as many batches ready (`worker_buffer`) as the slowest of the batches
+    automatic loading samples takes mean ones to make, within the memory its share of the budget leaves
+    after its process and its reads: Grain's workers hand on their batches in turn, so a worker that met a
+    batch slower than its buffer covers stalls the training process. Of eight sampled batches after the
+    first, one of 160 ms among seven that take no time is eight mean ones, and a worker holds eight; where
+    its memory has room for three, three; batches of 20 ms each hold one, Grain's own. A buffer asked for
+    stands (row 1563)."""
+    from dew.data.dataset import WORKER_PROCESS_BYTES, Host
+
+    batch = 2**19  # Eight 64 KiB rows.
+    rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 16)
+    # Two workers of 16 reads each, room for three and a half batches beside each.
+    budget = 2 * (WORKER_PROCESS_BYTES + 16 * batch + 7 * batch // 2)
+
+    def ahead(step: _Slowed, memory: int = 2**40, **fields) -> int:
+        # Read in turn, as automatic loading reads its sample (`_Build.tuned`): no thread reading ahead.
+        sampled = rows.map_with_index(step).to_iter_dataset(grain.ReadOptions(num_threads=0,
+                                                                                prefetch_buffer_size=0))
+        loading = Loading(workers="auto", host=Host(2, memory, worker_start=0.0), **fields)
+        resolved = loading.resolved(sampled, reads=1, batches=10**6)
+        assert resolved.workers == 2
+        return resolved.worker_buffer
+
+    spiked = _Slowed(0.0, slow=4, slowest=0.16)
+    assert ahead(spiked) == 8
+    assert ahead(spiked, memory=2 * budget) == 3
+    assert ahead(_Slowed(0.02)) == 1
+    assert ahead(spiked, worker_buffer=2) == 2
+
+
 def nonzero(row) -> bool:
     """Whether a record's id is past the first."""
     return int(row["id"]) != 0

@@ -13,6 +13,7 @@ model's cast sites.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -1289,6 +1290,33 @@ def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
     norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
     with generation.chosen(rms_norm='pallas'), pytest.raises(selection.KernelRefused):
         norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
+
+
+def test_a_swiglu_past_two_to_the_31_elements_compiles_for_an_h100():
+    """The apart SwiGLU's forward and reverse launches over 168 x 4096 rows of 9216 (6.3e9 elements an
+    operand, past int32's 2^31), traced, lowered and compiled for a compile-only H100, both launches in its
+    program: a program a tile of rows and columns (`norm_swiglu._tile_of`), where a flat launch's int32 index
+    overflowed at its trace (row 12971)."""
+    from jax.sharding import NamedSharding
+    from kernel_compile import stated_outputs
+
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    devices = Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operand = jax.ShapeDtypeStruct((168, 4096, 9216), jnp.bfloat16,
+                                   sharding=NamedSharding(devices, PartitionSpec()))
+    assert math.prod(operand.shape) > 2**31
+
+    def step(gate, up):
+        y, pull = jax.vjp(gated_product("swiglu", implementation="pallas"), gate, up)
+        return y, pull(jnp.ones_like(y))
+
+    with (generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        lowered = jax.jit(step).trace(operand, operand).lower()
+        lowered.compile()
+    # Its forward's launch and its reverse's, each returning its outputs.
+    assert sum(1 for count, _ in stated_outputs(lowered) if count) >= 2
 
 
 def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():

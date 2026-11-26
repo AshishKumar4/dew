@@ -52,7 +52,8 @@ environment it runs under. XLA reads a process's flags once, so tests that must 
 conftest runs the marked GPU tests and skips the others, as without it it skips the marked ones, so both
 processes select and cut a file alike and each test runs in one."""
 
-RECIPE = ("tools/armada/prepares.py", "tests/tier_wire.py", "tests/generation_support.py")
+RECIPE = ("tools/armada/prepares.py", "tests/tier_wire.py", "tests/generation_support.py",
+          "tools/armada/recycle.py")
 """What a dry prepare runs beside the tests it records (the topology's writer runs in a process of its own),
 which keys its rows besides every row's shared inputs (ci.py's `prepare_shared`)."""
 
@@ -186,15 +187,24 @@ def process(ci, python: str, file: str, group: str, verdict: Path, left: float, 
     # Of memory, a share of each limit binding it (`held_caps`), its end's the rest.
     cap = {wire.PREPARE_BY: repr(time.monotonic() + max(mine - CAP_MARGIN, mine / 2)) if capped else "",
            wire.PREPARE_HOLDS: held_caps(ci) if capped else ""}
+    # A dry prepare's tests run in as many processes as keep each under `RECYCLE_AT` (recycle.py).
     return ci.tested(python, [file], group, verdict, mine, cache, ci.session.GRACE, common,
                      {"JAX_PLATFORMS": "cpu", wire.PREPARE: "1", "OMP_NUM_THREADS": threads,
                       **(VARIANTS["users"][1] if users else {}), wire.UNIT: unit, **cap, **(environ or {})},
-                     recorded=recorded, variant=variant, kept=kept, judged=judged)
+                     recorded=recorded, variant=variant, kept=kept, judged=judged,
+                     recycle_at=RECYCLE_AT if capped else None)
 
 
 CAP_MARGIN = 240.0
 """What a dry prepare keeps of its time past its cap (`process`) for its process's end: the test or cell
 running at its cap, its programs' upload to the shared cache, its report."""
+
+
+RECYCLE_AT = 3 << 30
+"""The resident bytes past which a dry prepare's pytest ends between two tests, its task running the tests
+left in a fresh process (`process`, recycle.py): a process keeps what its tests compiled until it ends (a
+recurrence family 1-3.6 GB past every release), so a group of heavy families grew to its container's whole
+memory. Under `PREPARE_HOLDS`' 75% of a 10 GiB container, with room for one family's growth past it."""
 
 
 HELD_SHARE = 0.75
@@ -443,23 +453,17 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     checkout's `mainline`, ci.py's `baseline_key`, listed under the file's place once; a green run's alone,
     never written over by a red one), whole or a group of any cut: one cut of main's whole, every group of
     it read, so a row this run cut otherwise is held to main's all the same. `BOOTSTRAP` where main has no
-    run of it at all (no baseline, nor a run named), or where this checkout is main's commit itself and
-    reads none whole; `UNREAD` where none is read whole: no token or main, a
-    Worker that failed or answered late, a baseline that is no list, a run named with no baseline, or no cut
-    whole. Every request, each page of the listing among them, is bounded by `until` (a `time.monotonic`
-    instant), and a read past it is none."""
+    run of it at all (no baseline, nor a run named) or none it kept whole (a cut part-written, a run named
+    with no baseline); `UNREAD` where its baselines could not be read: no token or main, a Worker that failed
+    or answered late, a baseline that is no list. Every request, each page of the listing among them, is
+    bounded by `until` (a `time.monotonic` instant), and a read past it is none."""
     found = _before(ci, python, name, group, until)
-    commit = ci.mainline()
-    if found == PARTIAL and commit is not None and commit == ci.run_keys.head_commit():
-        # A run of main's own commit (a train's base, main's CI) that reads no whole baseline of it: what it
-        # leaves unprepared is main's, the baseline it writes once green (`run_keys.baselined`). Said stale,
-        # a cut main's earlier run left part-written (a group red, so unwritten) would never be green to be
-        # written whole: every run of main red on it, every train's base with them (train 1275's
-        # test_gpu_compile_ahead.py users prepare). One that reads a whole baseline is held to it as its
-        # heads are: a base let pass on a cell its heads were red for returned them all (train 1282), and
-        # one that failed to read them (`UNREAD`) is no run that read none whole.
-        return BOOTSTRAP
-    return UNREAD if found == PARTIAL else found
+    # Main keeping no baseline of it whole holds no run to one, a train's base (main's own commit, whose green
+    # run writes it) and its heads alike: graded apart, the base green on BOOTSTRAP and every head stale on
+    # the same main, the heads were returned for the base's grade (train 1291: main 2b1b88c39 kept 2 of its
+    # 5 attention prepare groups, its other 3 stale in its CI, and three heads were returned on 9 groups). A
+    # whole baseline holds both alike (train 1282), and one that could not be read (`UNREAD`) neither.
+    return BOOTSTRAP if found == PARTIAL else found
 
 
 def _before(ci, python: str, name: str, group: str, until: float) -> set[str] | str:

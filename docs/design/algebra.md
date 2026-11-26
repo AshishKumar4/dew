@@ -334,14 +334,15 @@ fitted to them, and a rule set ships only with measured receipts.
   out costs a trace, never a stale program; and the compiles' refused launches), and written into each later lowering holding the region, reporting the
   kernels' routes and launches its trace reported: a step's relowerings and its planner's candidates traced
   every region again, 1,724 traces and 144 seconds of a Qwen3.5-4B decision step's start on a GH200.
-- **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
-  attention, RMSNorm, stream and gated norms, SwiGLU) only where the region is proven to compute that call, by
-  its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
-  (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account
-  of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
-  (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
-  its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
-  kernels take as the program holds it), each choice the call takes tried, within the search's bounds
+- **Recognition (compile time, rows 3450, 4783):** a region of a program is written as one of Dew's calls (its
+  attention, chunked linear recurrence, RMSNorm, stream and gated norms, SwiGLU) only where the region is
+  proven to compute that call, by its normal form's identity or in the e-graph (`dew.algebra.recognize`). Each
+  call's math is declared once, as the call itself on its portable path (`implementation='xla'`, attention's
+  `'reference'`, a recurrence's `step_reference`), the arithmetic its kernels are held to; no account of a
+  spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
+  (`exp`, `scan`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and
+  make, its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill,
+  which the kernels take as the program holds it), each choice the call takes tried, within the search's bounds
   (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first region one of whose
   candidates is proven equal taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
   answered at once, before any key of it is built (row 5556). The region's equations and each

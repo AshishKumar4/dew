@@ -13,6 +13,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -266,11 +267,27 @@ def _own_span(row_words, staged, bands_ref, short, long, p, columns, leader, one
                 total = arith.addf(total, term)
             for distance in (1, 2):
                 total = arith.addf(total, utils.shfl_bfly(total, distance))
-            with utils.when(leader):
-                # The pair's column in its sub-chunk's diagonal block: its earlier token's place there.
-                place = at(o, row, arith.subi(arith.remui(row, const(sub)), e))
-                memref.store(arith.addf(memref.load(bands_ref, place), total), bands_ref, place)
+            # The pair's column in its sub-chunk's diagonal block: its earlier token's place there.
+            _leader_added(bands_ref, (o, row, arith.subi(arith.remui(row, const(sub)), e)), total, leader)
         scf.yield_(after + ahead)
+
+
+def _leader_added(bands_ref, place: tuple, total, leader) -> None:
+    """`total` added to the bands' word at `place` `(output, row, column)` by the quad's `leader` alone, its
+    shared-memory load and store predicated on it, no branch: in a branch, 165k of an H100's intra_own's
+    2.39M issue slots a program were its divergence's (BSSY/BSYNC/BRA, M-JS-272's SASS); the quad's four
+    threads each adding it, a thread's store could precede another's load (independent thread scheduling),
+    the total counted twice. `bands_ref` a plain fp32 tile, its rows contiguous."""
+    i32, i64 = ir.IntegerType.get_signless(32), ir.IntegerType.get_signless(64)
+    _, rows, columns = ir.MemRefType(bands_ref.type).shape
+    output, row, column = (value if isinstance(value, ir.Value) else arith.constant(i32, value)
+                           for value in place)
+    word = arith.addi(arith.muli(arith.addi(arith.muli(output, arith.constant(i32, rows)), row),
+                                 arith.constant(i32, columns)), column)
+    address = llvm.ptrtoint(i64, utils.getelementptr(utils.memref_ptr(bands_ref), [word], ir.F32Type.get()))
+    ptx = "{ .reg .f32 w; @$0 ld.shared.f32 w, [$1]; add.f32 w, w, $2; @$0 st.shared.f32 [$1], w; }"
+    llvm.inline_asm(ir.Type.parse("!llvm.void"), [leader, address, total], ptx, "b,l,f,~{memory}",
+                    has_side_effects=True)
 
 
 def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
@@ -362,7 +379,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 if threaded and form.parts == 1:
                     # A one-part form copied from the summed blocks straight, scaled and rounded as each
                     # word is copied: no landing.
-                    copied_by_thread(threaded[-1].at[o], views[0], scale=scale)
+                    copied_by_thread((threaded[-1].at[o],), (views[0],), scale=scale)
                     continue
                 block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
                 masked = algebra.block_masked(block, strict=False, scale=scale)

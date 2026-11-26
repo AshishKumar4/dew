@@ -225,7 +225,7 @@ def dry_checkout(root: Path) -> None:
     """A checkout at `root` holding a dry prepare's recipe (prepares.py's `RECIPE`), its topology's writer
     (which writes the generation's name), the suite's side (`UNPREPARING`) and a GPU tier file
     (`VAE_FILE`)."""
-    for name in ("tools/armada/prepares.py", "tests/tier_wire.py"):
+    for name in ("tools/armada/prepares.py", "tests/tier_wire.py", "tools/armada/recycle.py"):
         (root / name).parent.mkdir(parents=True, exist_ok=True)
         (root / name).write_text("")
     (root / "tests/generation_support.py").write_text(
@@ -578,10 +578,11 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
 def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monkeypatch):
     """A dry prepare's baseline (prepares.py's `before`) is every cell main's runs of its file's prepare for
     its generation and process left unprepared, in one cut main's commit names whole (listed once), so a
-    row this run cut otherwise is held to main's all the same. Main with no run of it at all is
-    `BOOTSTRAP`, as is a run of main's own commit (a train's base) that reads none whole, whose baseline it
-    is; else a cut read in part, a Worker that fails, a listing or a read that stalls past its time, a run
-    main named with no baseline, or a time already past, `UNREAD`."""
+    row this run cut otherwise is held to main's all the same. Main with no run of it at all, or none it kept
+    whole (a cut written in part, a run named with no baseline), is `BOOTSTRAP` for any run, a train's base
+    and its heads alike, so neither is graded against what the other is not (train 1291); a Worker that
+    fails, a listing or a read that stalls past its time, a malformed baseline or a time already past is
+    `UNREAD`."""
     kept = {"3.12:tests/test_gpu_a.py#1/2@prepare-sm90": ["tests/test_gpu_a.py::test_a @ cell"],
             "3.12:tests/test_gpu_a.py#2/2@prepare-sm90": ["tests/test_gpu_a.py::test_b @ cell"],
             "3.12:tests/test_gpu_a.py#1/3@prepare-sm90": ["tests/test_gpu_a.py::test_c @ cell"],
@@ -651,9 +652,10 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
         "tests/test_gpu_a.py::test_a @ cell", "tests/test_gpu_a.py::test_b @ cell"}
     assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.BOOTSTRAP
     assert before("tests/test_gpu_b.py", "@prepare-sm90") == ci.prepares.BOOTSTRAP
-    # A run main named whose baseline is not kept (its write lost) is no first run.
+    # A run main named whose baseline is not kept (its write lost) holds a head to nothing, as it holds
+    # the base.
     named.add("3.12:tests/test_gpu_a.py#1/3@prepare-sm90-users")
-    assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.UNREAD
+    assert before("tests/test_gpu_a.py", "1/3@prepare-sm90-users") == ci.prepares.BOOTSTRAP
     named.clear()
     assert before("tests/test_gpu_a.py", "@prepare-sm90", seconds=-1) == ci.prepares.UNREAD
     failing.add("keys")
@@ -673,9 +675,12 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
         shapes[kind] = shape
         assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD, (kind, shape)
         shapes.clear()
-    # A cut one of whose groups is unread is none (1/3 alone of three); 2/2 unread, the 1/2 cut is none too.
+    # A cut one of whose groups is unwritten is none (1/3 alone of three; 2/2 gone, the 1/2 cut too):
+    # main kept none whole, so a head is held to nothing, as main's own run is (train 1291).
     del kept["3.12:tests/test_gpu_a.py#2/2@prepare-sm90"]
-    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.UNREAD
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.BOOTSTRAP
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
+    assert before("tests/test_gpu_a.py", "@prepare-sm90") == ci.prepares.BOOTSTRAP
 
 
 def test_a_task_takes_mains_commit_from_its_plan_its_checkout_holding_no_origin_main(ci, monkeypatch,

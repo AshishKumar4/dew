@@ -100,7 +100,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, DataRestarted, FitStarted, Record, StepCompiled
-from dew.training import streaming
+from dew.training import faults, streaming
 from dew.training._candidates import RunShape, Stepping, StepSettings, as_placed, prepared_for
 from dew.training._fit import (
     Emptied,
@@ -774,6 +774,11 @@ class Trainer(Generic[Loss, Effects]):
         ahead runs the programs compiled with it as compiled (`AheadOfTime.taking`), compiling none."""
         return contextlib.nullcontext() if self._compiler.ahead is None else self._compiler.ahead.taking()
 
+    def _run_directory(self) -> str | None:
+        """The run's directory, where its checkpoints are and its fault record goes (`faults`); None for a run
+        that keeps none."""
+        return None if self.checkpoints is None else self.checkpoints.directory
+
     def _handed_ahead(self) -> None:
         """Take the step compiled ahead this trainer was handed, once the process is readied
         (`ready_process`, the backend opened at the run's share): the compiler runs it where it is tuned or
@@ -1213,7 +1218,9 @@ class Trainer(Generic[Loss, Effects]):
         """
         # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
         # from the plan's first read of the data on.
-        with signal_wake():
+        # A fatal signal's stacks go to the run's directory for the fit's whole length, its teardown's
+        # included (`faults.recording`).
+        with faults.recording(self._run_directory()), signal_wake():
             self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
             run = FitRun(time.perf_counter(), plan.startup)
