@@ -2020,6 +2020,10 @@ class DecoderFamily:
     which the release's code loads beside the model (MiMo-V2.6's `audio_tokenizer`): a load reads each
     folder's config into the source's under `<folder>/config.json` and its tensors as `<folder>/<name>`
     (`folder_config`, `folder_name`), and a save writes them back into the folder."""
+    writes_messages: bool = False
+    """Whether the family's format holds a loop's cross-pass messages, which its routes write (Inkling 2's
+    controllers): its export writes a decoder passing them, which another family's refuses
+    (`layouts.unwritten_extension`, row 13561)."""
     sidecars: Callable[[Mapping[str, object]], Mapping[str, str]] = lambda config: {}
     """The files beside a source's weights that hold more of the family's tensors, which its config states
     (Inkling 2's `mtp.safetensors` under its `mtp_config`), each by the prefix its tensors are read under:

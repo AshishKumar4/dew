@@ -189,6 +189,27 @@ def test_a_release_writes_each_sidecars_tensors_to_its_own_file(tmp_path):
     np.testing.assert_array_equal(shards['model.weight'], trunk)
 
 
+def test_a_saved_release_writes_its_draft_as_the_release_holds_it(source, tmp_path):
+    """`Pretrained.save` writes the draft as the release does (row 13538): its tensors in their own
+    `mtp.safetensors` beside the decoder's shards, none of them in the shards, each under its own name,
+    the Markov head's `rnn_proj` packed back whole (its step's and its context's columns, its bias), bit
+    for bit the fixture's; and the saved release loads its drafter's parameters as the fixture's do. Its
+    loop's cross-pass messages are the format's own (`DecoderFamily.writes_messages`, row 13561)."""
+    from safetensors.numpy import load_file
+
+    source.save(tmp_path)
+    written, given = load_file(tmp_path / 'mtp.safetensors'), load_file(TINY / 'mtp.safetensors')
+    assert sorted(written) == sorted(given)
+    for name, tensor in given.items():
+        np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+    shards = [load_file(path) for path in tmp_path.glob('model*.safetensors')]
+    assert shards and not any(name.startswith('mtp.') for shard in shards for name in shard)
+    reloaded = Pretrained.load(tmp_path, dtype='float32')
+    for got, held in zip(jax.tree.leaves(reloaded.variables['params']['block_drafter']),
+                         jax.tree.leaves(source.variables['params']['block_drafter']), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(held))
+
+
 def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):
     """At zero temperature every rejected draft is replaced by the target's own token, so Speculative
     decoding with the draft's blocks emits the greedy walk, a left-padded row included."""
