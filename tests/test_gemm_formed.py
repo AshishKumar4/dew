@@ -14,10 +14,10 @@ from flax import linen as nn
 from generation_support import COMPILES_ON_CPU, generations
 from reference_error import assert_as_exact, with_gradients
 
+from dew.nn.dense import Dense
 from dew.nn.gated_mlp import fused_products
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates.hooks import Hook, Side
-from dew.nn.dense import Dense
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
 
