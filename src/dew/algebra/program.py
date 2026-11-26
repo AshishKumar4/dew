@@ -21,8 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from jax._src import ad_util
-from jax._src import api_util, config as jax_config
+from jax._src import ad_util, api_util, config as jax_config
 from jax._src.interpreters import partial_eval
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore

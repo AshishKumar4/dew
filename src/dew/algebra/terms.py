@@ -1197,10 +1197,11 @@ def _prove_equation(equation: jcore.JaxprEqn, magnitude_of: Callable[..., Magnit
 def _in_language(equation: jcore.JaxprEqn) -> Operation | None:
     """Read a declared operation only where the equation has its arity, result and supported values."""
     operation = OPERATIONS.get(equation.primitive)
-    if operation is None or len(equation.outvars) != 1 or len(equation.invars) != WRITTEN[operation.kind].arity:
+    if (operation is None or len(equation.outvars) != 1
+            or len(equation.invars) != WRITTEN[operation.kind].arity):
         return None
     if equation.primitive is ad_util.add_jaxvals_p:
-        left, right = (operand.aval for operand in equation.invars)
+        left, right = equation.invars[0].aval, equation.invars[1].aval
         made = equation.outvars[0].aval
         if not (isinstance(left, ShapedArray) and isinstance(right, ShapedArray)
                 and isinstance(made, ShapedArray)):

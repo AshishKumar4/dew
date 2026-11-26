@@ -153,7 +153,8 @@ def work(graph: EGraph, node, region: Region, held: dict | None = None,
     XLA fusion's accounting beside it: an operand's (a leaf's) bytes, at its dtype's element size, read
     from device memory once however many values read it (extraction prices a shared node once), and
     nothing else of device memory, as XLA's fusion reads a program's inputs once (a sibling reduction's too)
-    intermediates on chip; the bytes a product's operands are staged in (the tile walk's, at their dtypes'
+    and keeps its fused intermediates on chip; the bytes a product's operands are staged in (the tile walk's,
+    at their dtypes'
     sizes); a reduction and a product each a kernel of XLA's fusion, its root (elementwise work fuses into
     it); a contracted multiply nothing, its reader's fused multiply-add computing it (`rules._contracted`);
     a declaration's own rescale an exponential an element. What XLA's fusion keeps on chip
