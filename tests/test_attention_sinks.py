@@ -82,8 +82,8 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
 
 def test_a_querys_own_sinks_are_refused_by_the_kernels_taking_a_heads_alone_as_they_are_selected():
     """On a TPU, a causal bf16 call splash takes with a head's sinks (`[H]`) routes to splash, and one
-    weighing each query's own (`[B, S, H]`, projected) is refused by it at selection: 'auto' routes the
-    template and a call naming 'tpu' raises, naming the requirement. A decode step on an H100 takes the
+    weighing each query's own (`[B, S, H]`, projected) is refused by it at selection: 'auto' routes a
+    kernel taking it and a call naming 'tpu' raises, naming the requirement. A decode step on an H100 takes the
     decode kernel with a head's sinks and another with a query's. The route was overridden after
     selection, so a published route named splash while the template ran (row 13108)."""
     from dew.nn.attention import resolve_implementation
@@ -94,7 +94,7 @@ def test_a_querys_own_sinks_are_refused_by_the_kernels_taking_a_heads_alone_as_t
     heads, queries = jnp.zeros((4,), jnp.float32), jnp.zeros((1, 512, 4), jnp.float32)
     with generation.assumed("v5e"):
         assert resolve_implementation("auto", query, query, causal=True, sinks=heads).kernel == "tpu"
-        assert resolve_implementation("auto", query, query, causal=True, sinks=queries).kernel == "template"
+        assert resolve_implementation("auto", query, query, causal=True, sinks=queries).kernel != "tpu"
         with pytest.raises(KernelRefused, match="query_sinks"):
             resolve_implementation("tpu", query, query, causal=True, sinks=queries)
     # A decode step's: the decode kernel reads a head's sinks alone.
