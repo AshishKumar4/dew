@@ -34,9 +34,10 @@ COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
 questions stream through a filter, whose count no read states before it ends, so its epoch is a pass
 over its source examples, which it counts ahead (`Loader.pass_examples`)."""
 
-EXAMPLES = {"lm": 2, "decision": 16, "diffusion": 16, "jepa": 16}
+EXAMPLES = {"lm": 2, "decision": 8, "diffusion": 16, "jepa": 16}
 """Examples a run of each kind reads in a few steps: an LM's example is a document, many windows long;
-the other kinds' are a batch's rows."""
+the other kinds' are a batch's rows, a decision run's one batch, each of its steps seconds on a CPU (row
+13576: two and four steps beside its two epochs' runs took 124 s)."""
 
 GLOBAL_ORDER = {"lm", "diffusion", "jepa"}
 """The kinds whose training data is compiled to one global record order, which a batch ramp cuts
