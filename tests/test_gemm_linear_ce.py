@@ -258,3 +258,22 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
                 x, head, targets, chunks=1, tile=(64, 64), predict=False)
         np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
         np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))
+
+
+def test_a_capped_linear_cross_entropy_launch_caps_as_its_reference_does():
+    """The fused linear cross entropy's launch at a softcap of 20, interpreted as an H100's, gives each row's
+    loss of the logits its reference caps (`precision.capped_logits`: the quotient correctly rounded on every
+    backend, row 13353) within fp32's sum-order rounding: dyadic inputs, each logit exact before its cap."""
+    from dew.nn.precision import capped_logits
+
+    rng = np.random.default_rng(13353)
+    x = jnp.asarray(rng.integers(-4, 5, size=(64, 64)) / 4, jnp.bfloat16)
+    w = jnp.asarray(rng.integers(-4, 5, size=(256, 64)) / 4, jnp.bfloat16)
+    t = jnp.asarray(rng.integers(0, 256, size=(64,)), jnp.int32)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        tile = linear_ce.derive_linear_ce((64, 256, 64), jnp.bfloat16, target, interpret=True)
+        loss, *_ = linear_ce.linear_ce(x, w, t, tiles=tile, softcap=20.0, multiprocessors=1, interpret=True)
+    capped = capped_logits(jnp.dot(x.astype(jnp.float32), w.astype(jnp.float32).T), 20.0)
+    want = jax.nn.logsumexp(capped, axis=1) - capped[jnp.arange(64), t]
+    np.testing.assert_allclose(np.asarray(loss), np.asarray(want), rtol=2e-6, atol=2e-6)

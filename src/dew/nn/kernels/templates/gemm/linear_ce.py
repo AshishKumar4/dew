@@ -12,11 +12,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import categorical
+from dew.nn.precision import capped_logits
 from dew.nn.kernels import generation, grouped_launch, selection, tuning, xla_products
 from dew.nn.kernels.templates import (
     bundles,
@@ -143,8 +143,7 @@ def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smem
                                         ("columns",)).astype(jnp.float32)
             z = z + jax.lax.broadcast_in_dim(bias_col, z.shape, (1,))
         if softcap is not None:
-            # The cap's reciprocal rounded once, as `precision.capped_logits` states it (row 13353).
-            z = jnp.float32(softcap) * jnp.tanh(z * float(np.float32(1) / np.float32(softcap)))
+            z = capped_logits(z, softcap)  # the reference's cap, its division correctly rounded (row 13353)
         col_global = col_tile + start + family.iota(z.shape, 1)
         in_vocab = col_global < vocab
         z_masked = jnp.where(in_vocab, z, jnp.float32(-jnp.inf))

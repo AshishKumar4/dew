@@ -2117,12 +2117,12 @@ def scaled_logits(logits: jax.Array, scale: jax.Array | None, bias: jax.Array | 
 
 def capped_logits(logits: jax.Array, softcap, temperature: float = 1.0) -> jax.Array:
     """Softcapped logits over a sampling temperature, which an engine applies
-    to what the model's head returns: `cap * tanh(logits * RN(1 / cap))`, the cap's reciprocal rounded once,
-    as every kernel's cap states it (attention's `Capped.reciprocal`, the fused cross entropy's), where a
-    division by a literal cap is a multiplication by its reciprocal on XLA's CPU alone (row 13353)."""
+    to what the model's head returns: `cap * tanh(logits / cap)`, the quotient correctly rounded on every
+    backend (`division.divided`), where XLA takes a division by a constant cap as a product with its
+    rounded reciprocal (row 13353); the fused cross entropy's kernel caps its logits by this function."""
     if softcap is not None:
         cap = jnp.asarray(softcap, logits.dtype)
-        logits = cap * jnp.tanh(logits * jnp.reciprocal(cap))
+        logits = cap * jnp.tanh(divided(logits, cap))
     return logits / temperature
 
 
