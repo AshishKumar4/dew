@@ -207,14 +207,13 @@ class Refusal(NamedTuple):
     spills: frozenset[str] = frozenset()
 
 
-FAST_BACKWARD_REFUSED: dict[tuple[str, str, bool], Refusal] = {
-    ("qwen3.5-27b-gdn", "sm120", True): Refusal(13064, frozenset({"recurrence_keys_back"}))}
+FAST_BACKWARD_REFUSED: dict[tuple[str, str, bool], Refusal] = {}
 """The production geometries' 16-bit training refused on a target, over packed documents or one row
 (`bool`), its gradient the port's or the portable math's there, each as declared (`Refusal`). The gate fails
 a refusal not declared here, one past its declaration (a backward's model where it declares spills, a spill
 of a launch it does not name), and a declared one that holds again, so a declaration retires with its row
-(`production_refusals`). Qwen3.5-27B's packed training on an sm120: its keys' backward at 255 registers
-spills 8 bytes where one row's fits (row 13064)."""
+(`production_refusals`). Qwen3.5-27B's packed training on an sm120, whose keys' backward spilled 8 bytes at
+255 registers, retired with its key block narrowed (`template.Mosaic._narrowed`, row 13064)."""
 
 
 def production_refusals(target, group: tuple, refused: list[str], spilled: set[str]) -> list[str]:

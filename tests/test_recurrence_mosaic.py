@@ -2271,7 +2271,7 @@ def test_a_rung_the_assembler_rejects_is_refused_never_taken_as_holding():
     class PastItsTop(type(template.MOSAIC)):
         def rungs(self, ba, config):
             yield template._limited(config, producers=resources.Producers((('recurrence_reverse', 232),)),
-                                    residents=config.residents)
+                                    residents=config.residents, keys=config.keys)
             yield from super().rungs(ba, config)
 
     certified, refused = _reverse_walk_certified(PastItsTop())
@@ -2358,7 +2358,7 @@ def _walked(bound, tiles, kind: str, launch: str, facts) -> list:
     rungs, rung = [], tiles
     while len(rungs) < LADDER_RUNGS and (
             up := template.MOSAIC._raised(bound, rung, frozenset({launch}), facts)) is not None:
-        rung = template._limited(rung, producers=up, residents=rung.residents)
+        rung = template._limited(rung, producers=up, residents=rung.residents, keys=rung.keys)
         rungs.append(rung if kind == 'launch' else dataclasses.replace(
             tiles, forward=dataclasses.replace(tiles.forward, producers=rung.producers)))
     return [tiles, *rungs]

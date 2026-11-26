@@ -633,12 +633,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                    *, training: bool) -> bool:
-        """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
+        """Whether a compile refused `tiles` past what its derivation's rungs answer: a kernel spilled
         (`report.refused_at`), of the product `training` names (`_refused`), whose launch's producer can rise
-        no further, or would leave its tiles unheld (`_raised`)."""
+        no further, or would leave its tiles unheld (`_raised`), and whose launch walks no key block of its
+        own it can narrow (`_narrowed`)."""
         spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles, target)
                             if _of(kernel, training))
-        return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
+        return (bool(spilled) and self._raised(ba, tiles, spilled, target) is None
+                and self._narrowed(ba, tiles, spilled, target) is None)
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                ) -> dict[str, frozenset[tuple[bool, mainloop.Launch]]]:
@@ -811,11 +813,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """`joined`'s next rung for its `spilled` launches: their producers a rung down their ladders
         (`_raised`), or, past a ladder's foot or where every rung left gives their consumers less
         (`_consumers_spilled`), those launches a program fewer a multiprocessor with their producers at the
-        least again (`_fewer`), whose ladders then run at that residency; None past one program."""
+        least again (`_fewer`), whose ladders then run at that residency; past one program, or on a launch
+        that moves no registers, one that walks a key block of its own at half of it (`_narrowed`); None
+        past those."""
         if not self._consumers_spilled(ba, joined, spilled, target) and (
                 raised := self._raised(ba, joined, spilled, target)) is not None:
-            return _limited(joined, producers=raised, residents=joined.residents)
-        return self._fewer(ba, joined, spilled, target)
+            return _limited(joined, producers=raised, residents=joined.residents, keys=joined.keys)
+        return self._fewer(ba, joined, spilled, target) or self._narrowed(ba, joined, spilled, target)
 
     def _consumers_spilled(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                            target: generation.GpuTarget) -> bool:
@@ -849,7 +853,29 @@ class Mosaic(base.Template[mainloop.Tiles]):
         residents = joined.residents.fewer(planned) if planned else None
         if residents is None:
             return None
-        return _limited(joined, producers=joined.producers.without(planned), residents=residents)
+        return _limited(joined, producers=joined.producers.without(planned), residents=residents,
+                        keys=joined.keys)
+
+    def _narrowed(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
+                  target: generation.GpuTarget) -> mainloop.Tiles | None:
+        """`joined` with its `spilled` launches that walk a key block of their own (`mainloop.KEYED`, each
+        kernel's own launch, `_owners`) at half the key block each walks now (`mainloop.Keys.halved`), their
+        producers and residents as they are; None where none does, or one walks the narrowest a staged
+        operand block takes already (`Family.narrowest_columns`). The gated delta net's keys' backward at
+        Qwen3.5-27B's packed training on an sm120 spilled 8 bytes at 255 registers, its family's products
+        reading their operands from registers and moving none, so no producer or residency rung answered it
+        and the whole training refused (row 13064)."""
+        family = bundle(target, _dtype(ba))
+        assert family is not None
+        keyed = _owners(spilled, self.launches(ba, joined, target, backward=True)) & mainloop.KEYED
+        if not keyed:
+            return None
+        block = mainloop.block_of(family)
+        keys = joined.keys.halved({name: joined.keys.of(name) or block for name in keyed},
+                                  family.narrowest_columns(jnp.bfloat16))
+        if keys is None:
+            return None
+        return _limited(joined, producers=joined.producers, residents=joined.residents, keys=keys)
 
     def _raised(self, ba: tokamax.BoundArguments, joined: mainloop.Tiles, spilled: frozenset[str],
                 target: generation.GpuTarget) -> resources.Producers | None:
@@ -1089,8 +1115,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         other = dataclasses.replace(config, stages=config.stages - 1 if config.stages > 1 else 2)
         # Each at the derived config's producers and residents, stepped past its own compiles' spills
         # (`_settled`).
-        return [self._settled(ba, _limited(tiles, producers=config.producers, residents=config.residents),
-                              target)
+        return [self._settled(ba, _limited(tiles, producers=config.producers, residents=config.residents,
+                                           keys=config.keys), target)
                 for tiles in (*beside, other) if tiles is not None]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: mainloop.Tiles,
@@ -1165,8 +1191,9 @@ def _owner(kernel: str, names: Iterable[str]) -> str | None:
 
 def _base(config: mainloop.Tiles) -> mainloop.Tiles:
     """`config` before any rung of its launches' ladders (`rungs`): no producer raised, no program held
-    fewer, its forward's neither."""
-    return _limited(config, producers=resources.Producers(), residents=resources.Residents())
+    fewer, no key block narrowed, its forward's neither."""
+    return _limited(config, producers=resources.Producers(), residents=resources.Residents(),
+                    keys=mainloop.Keys())
 
 
 def _ungridded(launch: mainloop.Launch) -> mainloop.Launch:
@@ -1194,12 +1221,12 @@ def _stated_caps(launches: Sequence[mainloop.Launch], family: mosaic.Family) -> 
     return {name: cap for name, cap in caps.items() if cap is not None}
 
 
-def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers,
-             residents: resources.Residents) -> mainloop.Tiles:
-    """`tiles`, its forward's too, its launches' producers lowered to `producers` and held to `residents`'
-    programs a multiprocessor."""
+def _limited(tiles: mainloop.Tiles, *, producers: resources.Producers, residents: resources.Residents,
+             keys: mainloop.Keys) -> mainloop.Tiles:
+    """`tiles`, its forward's too, its launches' producers lowered to `producers`, held to `residents`'
+    programs a multiprocessor and walking `keys`' key blocks."""
     def held(each: mainloop.Tiles) -> mainloop.Tiles:
-        return dataclasses.replace(each, producers=producers, residents=residents)
+        return dataclasses.replace(each, producers=producers, residents=residents, keys=keys)
 
     return dataclasses.replace(held(tiles), forward=None if tiles.forward is None else held(tiles.forward))
 
