@@ -373,13 +373,15 @@ class BlockSparseSelfAttention(CausalSelfAttention):
     template's indexed form (`selected_attention`): a selection a query head's, over its group's keys. A
     cached call selects over its cache's keys, a document a row."""
 
-    selection: Literal["moba", "infllm"] = "moba"
+    selection: Literal["moba", "infllm", "msa"] = "moba"
     block: int = 512
     top_k: int = 3
+    index_width: int = 64
+    """MSA's index heads' width (`MsaIndexer.width`, the paper's d_idx)."""
 
     reads: ClassVar[frozenset[str]] = frozenset()
 
-    def _attended(self, masking, positions, append, sinks, train: bool, *, bias=None):
+    def _attended(self, masking, positions, append, sinks, train: bool, *, bias=None, hidden=None):
         """The attention over each query's selected chunks (`selected_attention`), its selection MoBA's over
         the call's keys in each document's chunks (`moba_chunks`): an uncached call's its own tokens, by
         their documents and validity; a cached call's its cache's filled slots (`cached_validity`), its
@@ -401,6 +403,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                              "attention forms none of")
         if self.selection == "infllm":
             return checkpoint_name(self._infllm(query, key, value, masking, append), Residual.CONTEXT)
+        if self.selection == "msa":
+            return checkpoint_name(self._msa(query, key, value, masking, append, hidden), Residual.CONTEXT)
         if append is None:
             documents = masking.documents
             if isinstance(documents, CrossDocuments):
@@ -439,6 +443,27 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                                 wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
 
 
+    def _msa(self, query, key, value, masking, append, hidden):
+        """MSA's attention (arXiv 2606.13392 §3): its index branch over the layer's input (`MsaIndexer`, an
+        index query head a key head's group beside one shared index key head, the input detached), each
+        group's `top_k` blocks of `block` its own forced (`msa_selection`), through the template's indexed
+        form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`) for its
+        indexer loss (`msa_indexer_kl`), which trains the index branch alone. Over the call's own tokens,
+        a row one document of every token real."""
+        if append is not None or masking.documents is not None or masking.valid is not None:
+            raise ValueError(f"{self.name}: MSA's selection reads a row of one document's real tokens, its "
+                             "own: no cache, packed documents or hidden token")
+        scores = MsaIndexer(groups=key.shape[2], width=self.index_width, dtype=self.ctx.dtype,
+                            precision=self.ctx.precision, name="msa_indexer")(hidden)
+        selected = msa_selection(scores, block=self.block, top_k=self.top_k)
+        if not self.is_initializing():
+            self.sow(SELECTIONS, "msa", {"index_scores": scores, "selected": selected})
+        return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
+                                  dtype=self.ctx.dtype, precision=self.ctx.precision,
+                                  force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
+                                  wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap)
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockSparseAttentionMixer(AttentionMixer):
     """Block-selected attention (`BlockSparseSelfAttention`): each query reads its own block and the earlier
@@ -447,7 +472,7 @@ class BlockSparseAttentionMixer(AttentionMixer):
     own queries and keys, no parameter of its own, and a cached call's its cache's keys again, so it keeps no
     state beside them."""
 
-    selection: Literal["moba", "infllm"] = "moba"
+    selection: Literal["moba", "infllm", "msa"] = "moba"
     block: int = 512
     top_k: int = 3
 
@@ -464,6 +489,9 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if not ctx.causal:
             raise ValueError("block_sparse_attention requires causal=True: a query selects the blocks before "
                              "its own")
+        if self.selection == "msa" and self.top_k < 2:
+            raise ValueError(f"MSA's selection counts its own block among its top_k, so takes 2 or more, got "
+                             f"{self.top_k}")
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")

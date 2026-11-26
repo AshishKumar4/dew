@@ -22,6 +22,7 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.mla import SELECTIONS
 from dew.registry import mixers
 
 SEEDS = 8
@@ -447,6 +448,28 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     params = dense.init(jax.random.key(1), tokens)
     np.testing.assert_array_equal(np.asarray(infllm.apply(params, tokens)),
                                   np.asarray(dense.apply(params, tokens)))
+
+
+def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():
+    """A decoder of block-selected attention by MSA's selection (`block_sparse_attention`,
+    `selection="msa"`): its index branch's parameters are the model's (`msa_indexer`), it sows its index
+    scores and its selection (`SELECTIONS`, for the indexer's loss, `msa_indexer_kl`), and the main loss's
+    gradient leaves the index branch untouched: its input is read detached, the selection taking none."""
+    model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2,
+                                    index_width=8), dtype="float32")
+    tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
+    params = model.init(jax.random.key(1), tokens)
+
+    def named(tree, part):
+        return [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+                if part in "/".join(str(key) for key in path)]
+
+    assert named(params, "msa_indexer")
+    _, sown = model.apply(params, tokens, mutable=[SELECTIONS])
+    assert named(sown, "index_scores") and named(sown, "selected")
+    grads = jax.grad(lambda p: jnp.sum(model.apply(p, tokens)))(params)
+    for leaf in named(grads, "msa_indexer"):
+        np.testing.assert_array_equal(np.asarray(leaf), 0.0)
 
 
 def test_a_cached_generation_selects_the_blocks_its_full_forward_selects():
