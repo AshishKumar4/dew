@@ -205,7 +205,7 @@ def test_a_relative_band_holds_a_groups_products_at_a_time():
     states = jax.ShapeDtypeStruct((1, BAND_QUERIES, 2, 3), jnp.float32)
     bank = jax.ShapeDtypeStruct((3, extent), jnp.float32)
     traced = jax.make_jaxpr(lambda s, b: relative_band(s, b, jnp.int32(0)).values)(states, bank).jaxpr
-    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, skip=programs.opaque)
+    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, prune=programs.opaque)
              for var in equation.outvars]
     assert any(shape[-2:] == (template.BAND_GROUP, extent) for shape in found), found
     assert not any(shape[-2:] == (BAND_QUERIES, extent) for shape in found)
