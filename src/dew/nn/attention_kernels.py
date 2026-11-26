@@ -222,6 +222,10 @@ class AttentionCase:
     """Whether the call's bias is a query's term plus a key's (`attention.SeparableBias`, FoX's), which the
     template reads as its two terms in O(S) and every other route writes out, `[B, H, S, S]`: not a dense
     bias (`dense_bias`), the selector keeping it on the template (`_attention_preferred`)."""
+    query_sinks: bool = False
+    """Whether the call's sinks are each query's own (`[B, S, H]`, projected from its input), not a head's
+    (`[H]`): the template's initial state (`template.sinks`) and the portable softmax's column read them,
+    and a kernel taking a head's sinks alone refuses the call (`_HEAD_SINKS`)."""
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
@@ -295,6 +299,10 @@ _WHOLE_PRODUCTS = _Need('quantized', lambda case: case.quantized is None,
                         "a quantized model's rule owns the call's products, which this kernel forms whole "
                         "inside its launch, past the rule (`AttentionCase.quantized`)", row=INHERENT)
 _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
+_HEAD_SINKS = _Need('query_sinks', lambda case: not case.query_sinks,
+                    "it takes a head's sinks, not a query's own", row=INHERENT)
+"""A kernel reading one sink a head (splash's, the decode kernel's), which refuses a call whose every query
+weighs its own (`AttentionCase.query_sinks`), however named."""
 _FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
 _FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
                       kind='handoff')
@@ -479,6 +487,7 @@ TPU_SUPPORTS = (
     TPU_BACKEND,
     NATIVE_FLOAT16,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
+    _HEAD_SINKS,
     _Need('spans_only', lambda case: not case.spans_only,
           "splash's descriptor describes no mask of the call's own data, which block groups, key validity "
           "and counted places are; a named tpu call takes them as their mask on its pallas flash kernel "
@@ -847,11 +856,14 @@ def _attention_preferred(case: AttentionCase) -> str:
     whose products a quantized model's rule owns runs the kernel that computes the rule's arithmetic
     (`AttentionCase.quantized`), which every kernel forming its products whole refuses, a declared cell's
     included. A separable bias (`AttentionCase.separable_bias`, FoX's) runs the template on every backend,
-    which alone holds its two terms, not the `[B, H, S, S]` bias every other route writes out."""
+    which alone holds its two terms, not the `[B, H, S, S]` bias every other route writes out; a call of
+    each query's own sinks (`AttentionCase.query_sinks`) runs it on a GPU and a TPU, whose initial state
+    holds them as it streams, where splash and the decode kernel take a head's alone and the reference path
+    forms the scores whole (row 13108)."""
     backend = generation.backend()
     if case.quantized is not None:
         return case.quantized
-    if case.separable_bias or (case.spans_only and backend in ('gpu', 'tpu')):
+    if case.separable_bias or ((case.spans_only or case.query_sinks) and backend in ('gpu', 'tpu')):
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
@@ -932,10 +944,14 @@ def _decode_preferred(case: AttentionCase) -> str:
     template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
     next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere; the
     kernel computing a quantized model's rule where the rule owns the call's products, as attention's
-    (`AttentionCase.quantized`)."""
+    (`AttentionCase.quantized`); the template for a call of each query's own sinks."""
     if case.quantized is not None:
         return case.quantized
-    return 'decode' if generation.backend() == 'gpu' else 'xla'
+    if generation.backend() != 'gpu':
+        return 'xla'
+    # Each query's own sinks, which the decode kernel takes a head's of alone: the template's initial state
+    # (`_attention_preferred`'s, row 13108).
+    return 'template' if case.query_sinks else 'decode'
 
 
 _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel and the attention template's "
@@ -963,7 +979,7 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
-    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, *decode_attention.SUPPORTS)),
+    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, _HEAD_SINKS, *decode_attention.SUPPORTS)),
     Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),

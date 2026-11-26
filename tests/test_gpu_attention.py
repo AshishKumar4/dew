@@ -351,9 +351,10 @@ def test_a_split_steps_merge_and_its_state_are_on_par_on_this_gpu(form):
 
 
 def _scheduled(merge, block: int | None, pad: bool):
-    """`merge` (`test_merged._merges`') at the channel block `block` (its derivation's where None), its
-    slices' columns padded by 32 of NaN where `pad`: each schedule a program of its own."""
-    from dew.nn.kernels import tuning
+    """`merge` (`test_merged._merges`') on Mosaic GPU's launch at the channel block `block` (on the
+    generation's own merge at its derivation's where None), its slices' columns padded by 32 of NaN where
+    `pad`: each schedule a program of its own."""
+    from dew.nn.kernels import generation, tuning
     from dew.nn.kernels.templates import merged
 
     def run(padded, stacked):
@@ -361,7 +362,8 @@ def _scheduled(merge, block: int | None, pad: bool):
             padded = jnp.concatenate([padded, jnp.full((*padded.shape[:-1], 32), jnp.nan, padded.dtype)], -1)
         if block is None:
             return merge(padded, stacked)
-        with tuning.pinned({merged.MergedPadded: merged.MergeConfig(block)}):
+        pinned = tuning.pinned({merged.MergedPadded: merged.MergeConfig(block)})
+        with generation.chosen(merge="mosaic"), pinned:
             return merge(padded, stacked)
     return run
 
