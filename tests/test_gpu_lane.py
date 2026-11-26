@@ -1610,6 +1610,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         assert json.loads(stored[key])["need"] == need
         holds = load("gpu_holds", "tools/armada")
         monkeypatch.setattr(sys, "argv", ["gpu_holds.py", "--tests=tests/test_flow.py tests/test_old.py"])
+        capsys.readouterr()  # The lane's own output.
         assert holds.main() == 0
         assert json.loads(capsys.readouterr().out) == {"tests/test_flow.py": need}
     # A need filed past NEED_DAYS sizes nothing: its file may have been cut otherwise since.
