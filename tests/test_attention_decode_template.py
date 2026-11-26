@@ -426,8 +426,8 @@ def test_a_decode_steps_state_near_fp32s_largest_resumes_each_rows_own_output_in
     """A decode step's state (`attend`'s `finished=False`) of two rows whose keys weigh alike, each row's
     values all of one magnitude near fp32's largest (2^127 and 1.5 x 2^127, bf16), over four keys of
     eight, resumed over the other four: each row's output is its values', finite and its own. Its sums at
-    its maximum, the output times a total of four, pass fp32's largest; held so (`algebra.resumable`) both
-    rows resumed as +inf and the step's outputs were NaN."""
+    its maximum, the output times a total of four, pass fp32's largest; held so
+    (`attention_decode.resumable`) both rows resumed as +inf and the step's outputs were NaN."""
     magnitudes = jnp.asarray([2.0**127, 1.5 * 2.0**127], jnp.float32)
     query = jnp.zeros((2, 1, 8, 64), jnp.bfloat16)
     key = jnp.zeros((2, KEYS, 2, 64), jnp.bfloat16)

@@ -633,26 +633,6 @@ def merged_state(spec: Forward | windows.Units, out: jax.Array, maximum: jax.Arr
     return finished_merged(spec, state, axis=1)
 
 
-def resumable(spec: Forward, state: Partial) -> Partial:
-    """A finished state (`finished_merged`'s: its output normalized, its maximum in `spec`'s units) as a
-    call's initial state takes it (`initial_state`'s inverse): its sums unnormalized at its natural maximum,
-    a state of no mass the walk's start, which adds nothing to a merge. A row whose sums pass fp32's largest
-    (an output near it over a total past one: 2^127 over two keys) holds its total and sums a power of two
-    down, the total's binade (`frexp`), and its maximum as far up: the same softmax, its output
-    `initial_state` gives back as it was, where its sums at the maximum were infinite and two finite outputs
-    resumed as one (2^127 and 1.5 x 2^127 each +inf)."""
-    held = means.holding(state.total)
-    acc = means.resumed(state.acc, state.total)
-    whole = jnp.all(jnp.isfinite(state.acc), axis=-1) & jnp.isfinite(state.total)
-    over = held & whole & ~jnp.all(jnp.isfinite(acc), axis=-1)
-    shift = jnp.where(over, jnp.frexp(state.total)[1], 0)
-    total = jnp.where(over, power2(state.total, -shift), state.total)
-    acc = jnp.where(over[..., None], means.resumed(state.acc, total), acc)
-    maximum = spec.naturalized(state.m)
-    maximum = jnp.where(over, maximum + shift.astype(maximum.dtype) * np.float32(math.log(2.0)), maximum)
-    return Partial(acc, jnp.where(held, maximum, LEAST), total)
-
-
 def units_of(spec: Forward | windows.Units) -> windows.Units:
     """The units a finished form's states merge in (`windows.Units`), its factor `carried`'s: the accurate
     form's exponential of the anchors' difference taken exactly, at its raw products' scale where it keeps

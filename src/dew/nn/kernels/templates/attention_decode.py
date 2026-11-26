@@ -34,6 +34,7 @@ import jax.numpy as jnp
 from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
 
+from dew.algebra import means
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
@@ -51,6 +52,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME, folded_form
 from dew.nn.kernels.templates.cost import Work
+from dew.nn.precision import power2
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -532,7 +534,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         if finished:
             return ungrouped_rows(algebra.finish(spec, state, initial=True, normalized=True)[0],
                                   heads).astype(query.dtype)
-        return _unpacked_state(algebra.resumable(spec, state), heads)
+        return _unpacked_state(resumable(spec, state), heads)
 
     def common() -> jax.Array | Initial:
         return walked("plain" if "plain" in work else "bounded")
@@ -646,15 +648,35 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     them under their prologue, taken as they were cached). A caller whose dense keys already hold their
     prologue passes none. Not `finished`, the step's rows' state in place of their output, the softmax over
     its keys and its initial state left unnormalized (`Initial`, `[B, H, T]` and `[B, H, T, Dv]` fp32, its
-    maximum natural, `algebra.resumable`): another call over other keys that takes it as its initial state
+    maximum natural, `resumable`): another call over other keys that takes it as its initial state
     (`Hooks.initial`) merges the two (kernel-templates.md §A rows 19 and 63: a window's walk merged with a
     sparse part's)."""
     return _planned_step(query, key, value, spans, hooks, scale=scale, interpret=interpret, table=table,
                          sources=sources, scales=scales, bounds=bounds, finished=finished, in_key=in_key)[0]()
 
 
+def resumable(spec: algebra.Forward, state: algebra.Partial) -> algebra.Partial:
+    """A finished state (`algebra.finished_merged`'s: its output normalized, its maximum in `spec`'s units)
+    as a call's initial state takes it (`algebra.initial_state`'s inverse): its sums unnormalized at its
+    natural maximum, a state of no mass the walk's start, which adds nothing to a merge. A row whose sums
+    pass fp32's largest (an output near it over a total past one: 2^127 over two keys) holds its total and
+    sums a power of two down, the total's binade (`frexp`), and its maximum as far up: the same softmax,
+    its output `algebra.initial_state` gives back as it was, where its sums at the maximum were infinite and
+    two finite outputs resumed as one (2^127 and 1.5 x 2^127 each +inf)."""
+    held = means.holding(state.total)
+    acc = means.resumed(state.acc, state.total)
+    whole = jnp.all(jnp.isfinite(state.acc), axis=-1) & jnp.isfinite(state.total)
+    over = held & whole & ~jnp.all(jnp.isfinite(acc), axis=-1)
+    shift = jnp.where(over, jnp.frexp(state.total)[1], 0)
+    total = jnp.where(over, power2(state.total, -shift), state.total)
+    acc = jnp.where(over[..., None], means.resumed(state.acc, total), acc)
+    maximum = spec.naturalized(state.m)
+    maximum = jnp.where(over, maximum + shift.astype(maximum.dtype) * jnp.float32(math.log(2.0)), maximum)
+    return algebra.Partial(acc, jnp.where(held, maximum, algebra.LEAST), total)
+
+
 def _unpacked_state(state: algebra.Partial, heads: int) -> Initial:
-    """A packed step's rows' state (`algebra.resumable`'s, rows `[B, T·G, KV]`) as its queries' `Initial`,
+    """A packed step's rows' state (`resumable`'s, rows `[B, T·G, KV]`) as its queries' `Initial`,
     `[B, H, T]` and `[B, H, T, Dv]` (`ungrouped_rows`)."""
     acc = jnp.swapaxes(ungrouped_rows(state.acc, heads), 1, 2)
     m, total = (jnp.swapaxes(ungrouped_rows(rows[..., None], heads)[..., 0], 1, 2)
