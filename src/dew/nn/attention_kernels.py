@@ -750,8 +750,10 @@ MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     ('sm80', CallKind.of(jnp.bfloat16)): Timed(
         1024, 32768, (64, 128), (4,), windows=False, documents=False, heads=((32, 8),), dtypes=("bfloat16",),
         pairs=((4, 1024), (2, 2048), (2, 4096), (1, 8192), (1, 16384), (1, 32768))),
-    # Interim on an H100, until M-NA-44's GH200 rows land: up to 32768 tokens, cited from M-ET-51.
-    ('sm90', CallKind.of(jnp.bfloat16)): Timed(0, 32768),
+    # M-NA-44's GH200 sweep, exactly: the A100's pairs, widths 64 and 128, 32/8, causal and full.
+    ('sm90', CallKind.of(jnp.bfloat16)): Timed(
+        1024, 32768, (64, 128), (4,), windows=False, documents=False, heads=((32, 8),), dtypes=("bfloat16",),
+        pairs=((4, 1024), (2, 2048), (2, 4096), (1, 8192), (1, 16384), (1, 32768))),
     **{(where, CallKind.of(jnp.float32)): Timed(0, 1024) for where in ('sm80', 'sm90')},
     ('sm100', CallKind.of(jnp.bfloat16)): Timed(
         256, 32768, (64, 128, 256), (4,), causal=True, windows=False,
@@ -774,10 +776,10 @@ On an A100 a bf16 call's: 1024 to 32768 tokens (4 x 1024, 2 x 2048, 2 x 4096, 1 
 holds check 1 at every one and runs 1.007 to 1.70 times faster than the template's, and its training fails
 it at every one (dK 1.73 to 1.79 times the reference's error, dV to 1.65 where causal, against 1.5), so
 the cell's kernel infers on FlashAttention-2 and trains on the template ('flash_inference').
-On an H100 a 16-bit call's: up to 32768 tokens, causal and full, its forward and training step, an interim
-placeholder no receipt holds: its receipts timed 2 x 4096 at width 128, 32 query heads over 8
-(DERIVED-benchx-h100, BWDSTAGES-h100, CELLS-h100), and M-ET-51 holds no sums; M-NA-44's GH200 rows time
-that sweep, and their receipt replaces this placeholder.
+On an H100 a bf16 call's: the A100's six pairs, widths 64 and 128, 32 query heads over 8, causal and full,
+unwindowed and of no documents (M-NA-44-gh200 at c0a4b1ce7, check 1 over 40 draws and five interleaved
+rounds): FlashAttention-3's forward and training step hold check 1 at every one and run 1.17 to 1.96 times
+faster than the template's (1.17 to 1.68 the forward, 1.31 to 1.78 the step).
 On an H100 and an A100 an fp32 call's: up to 1024 tokens, a training step's attention at Qwen3-8B's widths,
 1 x 1024 (CELLS-h100, CELLS-a100).
 On an RTX PRO 6000 a bf16 call's: 1 x 4096 at width 64, 32 query heads over 8, causal, its forward and its
