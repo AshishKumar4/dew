@@ -141,7 +141,7 @@ def walked(forms: derive.Derived, tiles: list[dict], product=None, stepped=None)
 def stepping(kind: type, own):
     """A mainloop's own step (`Derived.step`'s `stepped`) taking each state whose parts are of `kind` by
     `own(state, part)`, every other the forms'."""
-    def stepped(states, parts):
+    def stepped(states, parts, _advanced):
         return tuple(own(state, part) if isinstance(part, kind) else None
                      for state, part in zip(states, parts, strict=True))
 

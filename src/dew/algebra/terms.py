@@ -329,16 +329,6 @@ def reduce_of(term: Term | Skeleton) -> tuple[str, Hashable] | None:
     return text(args[1]), key(args[0])
 
 
-def binary_of(term: Term | Skeleton) -> tuple[str, Hashable, Hashable] | None:
-    """A binary term's operation name and its operands' keys (`key`), None where `term` is no binary: an
-    egglog term's or a skeleton's alike."""
-    if isinstance(term, Skeleton):
-        return (term.form[2], term.form[1], term.form[3]) if term.form[0] == "binary" else None
-    if (args := get_callable_args(term, Term.binary)) is None:
-        return None
-    return text(args[1]), key(args[0]), key(args[2])
-
-
 @dataclasses.dataclass
 class Opaque[Node: (Term, Skeleton)]:
     """An equation outside the language: its inputs' terms (None for a literal, kept in `literals`) and the

@@ -544,7 +544,8 @@ def _window_clusters(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.V
     in program order; those values as `jaxpr` names them; and each internal equation's original output var."""
     active = rules.head_primitives()
     candidates = [(equation, name) for equation in jaxpr.eqns
-                  if (name := terms.spoken_as(equation)) is not None and name in active]
+                  if (name := terms.spoken_as(equation)) is not None
+                  and (name in active or equation.primitive is jax.lax.convert_element_type_p)]
     if not candidates:
         return []
     made = {var: equation for equation in jaxpr.eqns for var in equation.outvars}
@@ -558,8 +559,14 @@ def _window_clusters(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.V
         operand = maker(atom)
         return None if operand is None else terms.spoken_as(operand)
 
-    heads = [equation for equation, name in candidates
-             if rules.heads(name, [made_as(atom) for atom in equation.invars])]
+    def starts(equation, name):
+        if equation.primitive is not jax.lax.convert_element_type_p:
+            return rules.heads(name, [made_as(atom) for atom in equation.invars])
+        wide = maker(equation.invars[0])
+        return (wide is not None and terms.cast_roundtrip_source(equation, wide) is not None
+                and terms.unplaced_equation(wide) and terms.unplaced_equation(equation))
+
+    heads = [equation for equation, name in candidates if starts(equation, name)]
     if not heads:
         return []
     rsqrts, reciprocals, fma_readers = _reuse_siblings(jaxpr, heads)

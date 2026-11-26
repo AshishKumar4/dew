@@ -73,15 +73,15 @@ class Derived(NamedTuple):
     role (`max`, `sum`, `contraction`: the reduction that made it) and shape in the state's order, so a
     template holds each where its mainloop holds that value; its `step(state, tiles, product=, stepped=,
     outputs=)` takes a mainloop's own matrix product (`evaluator`) and its own step (`stepped(states,
-    parts)`, called once a step with each carried state's parts in the slots' order: `Accumulated` for a sum
-    a rule stepped as `state * factor + weights @ values`, `Added` for one stepped as `state * factor +
-    sum(terms)`, None for any other; it returns each new state it takes, None for one it leaves to the
-    forms: a mainloop's accumulator, a compensated walk's running sums, a guard's shifted ones), the factor a
-    row's, the parts the rules state (`derive.rescaled_by`, `summand`), each evaluated once), and with
-    `outputs` (places) returns those of the tile's outputs along the walked axis beside the state, by the
-    same evaluation; its `merge(a, b, operands=None, shapes=, merged=)` (a mainloop's own merge,
-    `merged(firsts, seconds, parts)`, called once with each state's `Merged` factors or None, as `stepped`)
-    and `finish(state, operands=None, shapes=)` read the state (and the unwalked operands given) by the forms
+    parts, advanced)`). The callback receives each carried state's parts in slot order: `Accumulated`
+    for `state * factor + weights @ values`, `Added` for `state * factor + sum(terms)`, and None for
+    a slot already advanced by the forms. `advanced` holds those computed slots (e.g. a running max)
+    and None for any slot with parts. The callback returns each new state it takes, None for one it
+    leaves to the forms. With `outputs` (places), it also returns the named outputs along the walked
+    axis beside the state, by the same evaluation. Its `merge(a, b, operands=None, shapes=, merged=)`
+    can take the mainloop's own merge (`merged(firsts, seconds, parts)`, called once with each state's
+    `Merged` factors or None, as `stepped`). The merge and `finish(state, operands=None, shapes=)`
+    read the state and any unwalked operands by the forms
     of the walk whose tiles were of `shapes` (`init`'s), named, as a state's values alone name no walk (a
     bfloat16 walk's float32 sums are a float32 walk's too)."""
 

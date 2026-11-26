@@ -415,6 +415,31 @@ def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_diviso
     assert graph.check_bool(eq(quotient).to(product)) == admitted
 
 
+@pytest.mark.parametrize("largest", [False, True], ids=["min", "max"])
+@pytest.mark.parametrize("edge", [False, True], ids=["normal-rounding", "overflow"])
+def test_a_scaled_extremum_keeps_the_written_tie_cotangents(largest, edge):
+    extrema = jnp.max if largest else jnp.min
+    sign = np.float32(1 if largest else -1)
+    if edge:
+        pair = np.asarray([2.0 ** 127, 1.125 * 2.0 ** 127], np.float32)
+        scale = np.float32(2)
+    else:
+        pair = np.asarray([0x3FC00002, 0x3FC00003], np.uint32).view(np.float32)
+        scale = np.float32(1.5)
+    values = np.full(1024, sign * 0.5, np.float32)
+    values[:2] = sign * pair
+
+    def reduced(x):
+        return extrema(x * scale)
+
+    chosen = algebra.rewritten(reduced)
+    output, cotangents = jax.jit(jax.value_and_grad(chosen))(values)
+    expected = np.zeros_like(values)
+    expected[:2] = scale / np.float32(2)
+    assert float(output) == (sign * np.inf if edge else float(sign * (pair[0] * scale)))
+    np.testing.assert_array_equal(cotangents, expected)
+
+
 @pytest.mark.parametrize("dtype, folds", [(jnp.float32, True), (jnp.bfloat16, False)])
 def test_two_negations_are_an_identity_in_the_float32_window(dtype, folds):
     from egglog import eq, i64
@@ -486,17 +511,11 @@ def test_a_clamped_divider_reuses_its_held_negative_power_only_in_range(broadcas
                             "clamped dividend with a held reciprocal", seeds=8)
 
 
-@pytest.mark.parametrize("fn", [
-    lambda x, y, s: jnp.max(jnp.tanh(x) * 0.5, axis=1),
-    lambda x, y, s: jnp.min(0.5 * jnp.tanh(x), axis=1),
-    lambda x, y, s: jnp.dot(jnp.tanh(x) * jnp.tanh(s)[:, None], jnp.tanh(y)),
-], ids=["max of a positive scale", "min of a positive scale", "contraction of a scaled operand"])
-def test_a_rule_whose_left_side_heads_at_a_reduction_or_a_contraction_rewrites_it(fn):
-    """A maximum or minimum of a positively scaled operand (`linear`'s positive scale out of an extremum) and
-    a contraction of a scaled operand (its matrix scale, a dequant's): each is rewritten into a form the
-    model prices cheaper, where no head read a reduction of an extremum over a product or a contraction over
-    one, so neither rule ever ran (row 3580)."""
-    assert cheaper_spliced(fn, *rows(1, (64, 32), (32, 16), (64,)))
+def test_a_scaled_matrix_contraction_starts_its_rewrite_window():
+    def contraction(x, y, s):
+        return jnp.dot(jnp.tanh(x) * jnp.tanh(s)[:, None], jnp.tanh(y))
+
+    assert cheaper_spliced(contraction, *rows(1, (64, 32), (32, 16), (64,)))
 
 
 def test_derived_forms_trace_under_each_manual_mesh_they_meet():
