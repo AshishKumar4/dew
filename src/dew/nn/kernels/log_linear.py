@@ -21,6 +21,7 @@ in fp32); a level within, as a recurrence, laid each of its blocks as a chunk of
 
 from __future__ import annotations
 
+import functools
 import math
 
 import jax
@@ -80,15 +81,16 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
 
 
 def _levels(count: int) -> np.ndarray:
-    """`[L, WITHIN, WITHIN]` fp32: each pair of a block's slots at its level (`_within`'s), one-hot over the
+    """`[L, WITHIN, WITHIN]` bool: each pair of a block's slots at its level (`_within`'s), one-hot over the
     `L` levels its pairs reach, of a sequence's `count` (`levels`). A query's weights taken at its pairs'
-    levels by a product with them (exact: one weight times one, the others times zero), whose gradient is a
-    product too: gathered by the levels' indices, the gradient a scatter, which XLA formed as a select and
-    reduce over every pair and level, 3.0 ms of a G4's 9.1 ms log-linear Mamba-2 training step against fla's
-    2.3 ms whole (M-JS-275)."""
+    levels a level's selection at a time, no arithmetic: a weight's infinity or NaN its own level's pairs'
+    alone, and its gradient each level's pairs' selected and summed, another level's infinite cotangent no
+    term of it (as a product with the masks' zeros was, head review of fd3af8c41). Gathered by the levels'
+    indices, the gradient was a scatter: XLA's select and reduce over every pair and level, 3.0 ms of a G4's
+    9.1 ms log-linear Mamba-2 training step against fla's 2.3 ms whole (M-JS-275)."""
     offsets = np.arange(WITHIN)
     level = np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], count - 1)
-    return (level[None] == np.arange(level.max() + 1)[:, None, None]).astype(np.float32)
+    return level[None] == np.arange(level.max() + 1)[:, None, None]
 
 
 def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, packed: bool):
@@ -134,11 +136,12 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, pac
     v, g, weights = (grouped(blocked(x)) for x in (v, g, weights))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR (the exponent
     # `frexp` gives, 1 for 1, 0 for 0); past the sequence's levels, a pair of slots no token takes. Each
-    # pair's weight its query's at its level, a product with the levels' one-hot masks (`_levels`).
+    # pair's weight its query's at its level, selected level by level (`_levels`).
     masks = _levels(weights.shape[-1])
 
     def head(query, key, value, decay, weight):
-        pairs = jnp.einsum('il,lij->ij', weight[:, :len(masks)], masks, precision=jax.lax.Precision.HIGHEST)
+        pairs = functools.reduce(lambda taken, level: jnp.where(masks[level], weight[:, level, None], taken),
+                                 range(1, len(masks)), jnp.broadcast_to(weight[:, :1], masks.shape[1:]))
         return scan.spread(query, key, value, scan.between(decay[:, None]), weights=pairs)
 
     # A key head's value heads, its queries and keys unmapped among them, so their scores are formed once a
