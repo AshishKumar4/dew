@@ -1256,17 +1256,19 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
     check 1 over the family's draws, merging no ties the reference keeps apart (`assert_merges_no_ties`,
     row 6302); a row that sees nothing, zero."""
-    seeds, family = SEEDS[family], FAMILIES[family]
-    draw = _cast(family, family.draw)
-    ref_key = _reference_key(family)
+    seeds, spec = SEEDS[family], FAMILIES[family]
+    draw = _cast(spec, spec.draw)
+    ref_key = _reference_key(spec)
     reference = _jitted_reference(*ref_key, anchored=False)
     truth = _cached_reference_fn(*ref_key, anchored=True)
     rounded = _cached_reference_fn(*ref_key, anchored=True, round_logits=jnp.float32)
-    label = f"{name} accurate {family.dtype}"
-    differentiated = _mainloops(family, ACCURATE)[name]
+    # Each family a site of its own (row 13030: every float32 family one label, so a GPU part holding two
+    # prepared one and read its programs for the other).
+    label = f"{family}: {name} accurate {spec.dtype}"
+    differentiated = _mainloops(spec, ACCURATE)[name]
     # Each result check 1 draws (its second stage's too) held empty at the family's empty rows (row 9041).
-    held = (None if family.empty is None
-            else lambda outputs, inputs: _held_empty(family.empty, outputs, label))
+    held = (None if spec.empty is None
+            else lambda outputs, inputs: _held_empty(spec.empty, outputs, label))
     evaluated = assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth,
                                 held=held, returns=True)
     assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds, rounded_fn=rounded,
@@ -1281,7 +1283,7 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
     truth = _cached_reference_fn(*_reference_key(family), anchored=True)
-    label = f"{mainloop_name} default {family.dtype}"
+    label = f"{family_name}: {mainloop_name} default {family.dtype}"
     differentiated = _mainloops(family, {})[mainloop_name]
     assert_finite(differentiated, truth, draw, label, seeds=seeds, empty=family.empty)
 
@@ -1297,7 +1299,7 @@ def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_ed
     draw = _cast(family_spec, family_spec.draw)
     truth = _cached_dropping_truth(_spans_key(family_spec.spans))
     for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
-        assert_finite(mainloop, truth, draw, f"{name} dropping {family_spec.dtype}", seeds=seeds,
+        assert_finite(mainloop, truth, draw, f"{family}: {name} dropping {family_spec.dtype}", seeds=seeds,
                       empty=family_spec.empty)
 
 
@@ -1807,10 +1809,10 @@ DECODED_ON_CPU = [case for case in DECODED if case not in GPU_ONLY["decode"]]
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
     """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its launch and merge),
     each row's keys the first `K` of its cache, check 1 over the family's draws."""
-    seeds, family = SEEDS[family], FAMILIES[family]
+    seeds, name, family = SEEDS[family], family, FAMILIES[family]
     decoded, forward = _decoded(family, FORMS[form])
     assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
-                    f"decode {form} {family.dtype}", seeds=seeds,
+                    f"{name}: decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
 
@@ -1830,7 +1832,7 @@ def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_ed
     """The template's decode (`attention_decode.attend`: packed rows, sliced keys, merged), interpreted on a
     CPU as an H100 runs it and compiled on an H100, each row's keys its first `K`: check 1 over the family's
     draws, as the decode kernel it replaces is held (testing.md: decode holds the default's claims)."""
-    seeds, family = SEEDS[family], FAMILIES[family]
+    seeds, name, family = SEEDS[family], family, FAMILIES[family]
     lengths = family.spans.get("lengths")
 
     def decoded(query, key, value, sinks):
@@ -1846,7 +1848,7 @@ def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_ed
         return _cast(family, family.draw)(seed)[:4]
 
     assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
-                    f"template decode {family.dtype}", seeds=seeds,
+                    f"{name}: template decode {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
 def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
@@ -1890,10 +1892,10 @@ def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     """The decode kernel's default form, interpreted on a CPU and compiled on a GPU, finite wherever the
     rounded truth is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
     scales its rows' sums in either form (`algebra.SCALED_WALK`)."""
-    seeds, family = SEEDS[family], FAMILIES[family]
+    seeds, name, family = SEEDS[family], family, FAMILIES[family]
     decoded, forward = _decoded(family, None)
     assert_finite(jax.jit(decoded), _reference(family, anchored=True), forward,
-                  f"decode default {family.dtype}", seeds=seeds)
+                  f"{name}: decode default {family.dtype}", seeds=seeds)
 
 
 SUBNORMAL_SHARE_SEEDS = {"float32": 8, "bfloat16": 16}

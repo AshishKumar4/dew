@@ -1068,6 +1068,26 @@ def test_a_decode_step_of_no_split_is_priced_at_its_keys_reads():
     assert fallback.device_bytes >= 2 * keys * kv_heads * width * jnp.dtype(jnp.bfloat16).itemsize
 
 
+def test_a_walk_on_a_gpu_of_no_issue_interval_has_no_issued_price():
+    """A one-row decode walk over 32768 keys, 32 heads over 8 key heads 64 wide in bf16, on an RTX PRO 6000,
+    whose multiprocessor states no issue interval: its issued price (`MosaicForward.price_config`'s
+    `issued`, the decode planner's) is unknown, where priced at its bytes alone it was level over every slice
+    count and the planner took two of them, 16 programs on 188 multiprocessors (M-NA-35-decodec-g4: 281 of
+    a step's 288 us); its unissued price still its own."""
+    target = generation.gpu_target("NVIDIA RTX PRO 6000 Blackwell Server Edition")
+    query = jax.ShapeDtypeStruct((1, 1, 32, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 32768, 8, 64), jnp.bfloat16)
+    spans = attention_decode.key_spans(1, 32768, 1)
+    op, ba = attention_decode._bound(query, key, key, spans, None, scale=None, table=None, sources=None,
+                                     scales=None, splits=4, chosen=attention_decode.WALKS["plain"],
+                                     in_key=False)
+    with generation.assumed(target):
+        tiles = op.derived(ba, target)
+        assert tiles is not None
+        assert op.price_config(ba, tiles, target, issued=True) is None
+        assert op.price_config(ba, tiles, target) is not None
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])

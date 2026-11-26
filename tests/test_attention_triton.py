@@ -1352,8 +1352,9 @@ def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
             compiler_params=pltriton.CompilerParams())(a, b)
 
     def draw(_seed: int):
-        return (jnp.full((16, 16), np.float32(3.40e38), dtype=jnp.float32),
-                jnp.eye(16, dtype=jnp.float32) * np.float32(0.5))
+        # Host values (a GPU tier part's prepare computes nothing on its compile-only device, row 12511).
+        return (np.full((16, 16), np.float32(3.40e38), np.float32),
+                np.eye(16, dtype=np.float32) * np.float32(0.5))
 
     # The one draw at check 1's fewest seeds: a draw that reads no seed is judged at them alike, where one
     # seed was refused as inconclusive (row 12670).

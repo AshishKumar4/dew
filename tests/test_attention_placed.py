@@ -12,16 +12,8 @@ import numpy as np
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
-from test_attention_mosaic import (
-    CALLS,
-    SEEDS,
-    _check_forward,
-    _check_spans,
-    _counted,
-    _device,
-    _drawn,
-    _pinned,
-)
+from test_attention_mosaic import CALLS, SEEDS, _check_forward, _check_spans, _device, _drawn, _pinned
+from test_attention_mosaic_flops import _counted
 from test_attention_template import CASES, arguments, geometry as core_geometry
 
 from dew.nn import programs
