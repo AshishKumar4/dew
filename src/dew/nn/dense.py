@@ -490,9 +490,9 @@ class Dense(_LinearEnvelope, nn.Dense):
 
     @property
     def reads_formed(self) -> bool:
-        """Whether its call takes `formed` (`protocols.ReadsFormed`): a Dense whose arithmetic is this
-        class's own (`_linear`), not one a subclass computes otherwise."""
-        return type(self)._linear is Dense._linear
+        """Whether its call takes `formed` (`protocols.ReadsFormed`): a Dense whose call and arithmetic are
+        this class's own (`__call__`, `_linear`), not ones a subclass computes otherwise."""
+        return type(self)._linear is Dense._linear and type(self).__call__ is Dense.__call__
 
     def product_owned(self) -> bool:
         """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
@@ -511,7 +511,7 @@ class Dense(_LinearEnvelope, nn.Dense):
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
         stored = bias
-        given = inputs.dtype
+        given = None if formed is None else inputs.dtype
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
         # Under a delayed-scaling NVFP4 recipe that takes the product, its rows' scale its amax history's.

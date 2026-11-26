@@ -708,7 +708,7 @@ def dot_general(xla, path: tuple | None = None):
         # A formed input's hook reads its rows and sides as `lhs` is read: of its shape, its dtype; a dot
         # algorithm the call or the run states is the layer's own product's (`xla`'s) to run.
         formed = (formed if formed is not None and formed.operand is lhs and plain
-                  and not _algorithm(precision)
+                  and not _algorithm(precision, lhs.dtype)
                   and all((each.shape, each.dtype) == (lhs.shape, lhs.dtype)
                           for each in (formed.rows, *formed.sides)) else None)
         if plain and path is not None and (shards := mapped_shards(lhs, (rhs,), (path,), out_dtype,
@@ -749,15 +749,28 @@ def dot_general(xla, path: tuple | None = None):
     return product
 
 
-def _algorithm(precision: PrecisionLike) -> bool:
+SAME_PRODUCTS = {
+    jnp.dtype(jnp.bfloat16): frozenset({"DEFAULT", "BF16_BF16_F32", "TF32_TF32_F32", "F32_F32_F32"}),
+    jnp.dtype(jnp.float16): frozenset({"DEFAULT", "F16_F16_F32", "F32_F32_F32"})}
+"""The dot algorithms (`jax.lax.DotAlgorithmPreset`'s names) whose products of 16-bit operands of a dtype are
+the operands' exact products summed in fp32, as `gemm`'s are: a formed product (`FormedInput`) takes a call
+under any of them; another (a narrower input type, fp32 operands' split products) is the layer's own."""
+
+
+def _algorithm(precision: PrecisionLike, dtype) -> bool:
     """Whether a product's precision, the call's or else the run's (`jax_default_matmul_precision`), names a
-    dot algorithm (`jax.lax.DotAlgorithm`, `DotAlgorithmPreset`, or a preset's name), which the layer's own
-    product runs as stated (`float32_dot_general`'s BF16_BF16_F32) and no formed product takes."""
+    dot algorithm (`jax.lax.DotAlgorithm`, `DotAlgorithmPreset`, or a preset's name) whose products of
+    `dtype`'s operands are not `gemm`'s (`SAME_PRODUCTS`), which the layer's own product runs as stated
+    (`float32_dot_general`'s BF16_BF16_F32 of fp32 operands) and no formed product takes."""
     stated = precision if precision is not None else jax.config.jax_default_matmul_precision
     if isinstance(stated, (tuple, list)):
-        return any(_algorithm(each) for each in stated)
-    return (isinstance(stated, (jax.lax.DotAlgorithm, jax.lax.DotAlgorithmPreset))
-            or (isinstance(stated, str) and stated in jax.lax.DotAlgorithmPreset.__members__))
+        return any(_algorithm(each, dtype) for each in stated)
+    if isinstance(stated, jax.lax.DotAlgorithm):
+        return True
+    name = (stated.name if isinstance(stated, jax.lax.DotAlgorithmPreset)
+            else stated if isinstance(stated, str) and stated in jax.lax.DotAlgorithmPreset.__members__
+            else None)
+    return name is not None and name not in SAME_PRODUCTS.get(jnp.dtype(dtype), frozenset())
 
 
 def _whole(*operands: jax.Array) -> bool:

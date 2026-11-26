@@ -389,6 +389,21 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     return lambda gate_up: product(placed_gate_up(gate_up))
 
 
+def portable_derivative(activation: GatedActivation, *operands: jax.Array, axes=None) -> bool:
+    """Whether `gated_product` of `operands` (the gate and up projections, or `packed_gated_product`'s one
+    packed pair) differentiates as its portable product, the law `gated_hook` traces: a named activation's,
+    but SwiGLU's where its Pallas kernel runs, whose backward is the kernel's own (`norm_swiglu`)."""
+    from .kernels import norm_swiglu
+
+    if not isinstance(activation, str):
+        return False
+    if activation != "swiglu":
+        return True
+    choice = (norm_swiglu.packed_swiglu_kernel("auto", *operands, axes=axes) if len(operands) == 1
+              else norm_swiglu.swiglu_kernel("auto", *operands, axes=axes))
+    return choice != "pallas"
+
+
 def placed_gate_up(gate_up: jax.Array) -> jax.Array:
     """A packed projection's `[..., 2, H]` gate and up placed as their gated product reads them: the pair
     whole on each device (`whole_along`, row 12224), its mesh axis moved onto the hidden width where it
