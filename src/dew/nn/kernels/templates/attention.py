@@ -1200,7 +1200,7 @@ def shared_place(shape: tuple[int, ...], row, head) -> tuple:
     return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
 
 
-def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int,
+def _per_head(param: Side, row: jax.Array, head: jax.Array, keys: int | None = None,
               origins: Side | None = None) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and `keys`
     keys: a band's written out over them from its `origins` (`band_dense`)."""
