@@ -282,15 +282,28 @@ def vit_block(layout: ViTLayout, index: int, *, dtype: Dtype | None,
                       precision=precision, name=f"blocks_{index}")
 
 
-def _joined_special_tokens(layout: ViTLayout, segment: jax.Array) -> jax.Array:
-    """A packed row's full-layer `segment` ids `[B, patches]` with its special tokens' (a class token,
-    registers) beside them, in its first frame: a row one image, as a tower holding them packs it."""
-    if set(layout.attention) != {"full"} or set(layout.order) != {"patches"} or any(layout.sinks):
-        raise ValueError("a packed image's special tokens join its patches in full layers alone, in their own "
-                         "order and with no sinks")
+def _segments(layout: ViTLayout, valid, frame, windows, *, images: bool) -> dict:
+    """Each attention kind's segment ids `[B, tokens]` (`ViTLayout.attention`), None where it attends
+    unmasked: an NCHW image is one frame with no padding, its full layers unmasked. A packed row's special
+    tokens (a class token, registers) join its first frame in its full layers: a row one image, as a tower
+    holding them packs it."""
+    segments = {
+        "full": None if images else jnp.where(valid, frame + 1, 0),
+        "band": jnp.where(valid, frame + 1, 0),
+        "conv": jnp.where(valid, frame + 1, 0),
+        "item": jnp.where(valid, 1, 0),
+        "window": None if windows is None else jnp.where(valid, windows + 1, 0),
+    }
     tokens = layout.special_tokens
-    joined = jnp.ones((segment.shape[0], tokens.count), segment.dtype)
-    return jnp.concatenate([joined, segment] if tokens.cls == "first" else [segment, joined], axis=1)
+    if tokens.count and not images:
+        if set(layout.attention) != {"full"} or set(layout.order) != {"patches"} or any(layout.sinks):
+            raise ValueError("a packed image's special tokens join its patches in full layers alone, in "
+                             "their own order and with no sinks")
+        full = segments["full"]
+        joined = jnp.ones((full.shape[0], tokens.count), full.dtype)
+        segments["full"] = jnp.concatenate([joined, full] if tokens.cls == "first" else [full, joined],
+                                           axis=1)
+    return segments
 
 
 def _gather(x, index):
@@ -416,16 +429,7 @@ class VisionTransformer(nn.Module):
                   else jnp.argsort(jnp.where(valid, key, last), axis=1, stable=True)
                   for name, key in keys.items() if key is not None}
 
-        segments = {
-            # An NCHW image is one frame with no padding: its full layers attend unmasked.
-            "full": None if images else jnp.where(valid, frame + 1, 0),
-            "band": jnp.where(valid, frame + 1, 0),
-            "conv": jnp.where(valid, frame + 1, 0),
-            "item": jnp.where(valid, 1, 0),
-            "window": None if windows is None else jnp.where(valid, windows + 1, 0),
-        }
-        if tokens.count and not images:
-            segments["full"] = _joined_special_tokens(lay, segments["full"])
+        segments = _segments(lay, valid, frame, windows, images=images)
         current = "patches"
         for index in range(lay.depth):
             wanted = lay.order[index]
