@@ -339,6 +339,36 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
+class _Counted:
+    """A record step counting the records this process made (`made`)."""
+
+    identity = "counted@1"
+    made = 0
+
+    def __call__(self, record):
+        _Counted.made += 1
+        return record
+
+
+def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
+    """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`); where it
+    would read in the process whatever the sample measured (`Loading.selects_none`: a run whose length
+    nothing states, one CPU, `max_workers` 0) its first batch, read with no thread reading ahead, is the
+    only one it made, no sample made beside it (row 13540: up to nine batches decoded at startup and made
+    again)."""
+    chain = Pipeline(Memory(_Indexed(30))).map(_Counted()).batch(4)
+    for host, steps, most in ((TWO_CPUS, None, None), (Host(1, 2**34, worker_start=1.0), 10**6, None),
+                              (TWO_CPUS, 10**6, 0)):
+        _Counted.made = 0
+        loading = Loading(workers="auto", threads=0, read_buffer=0, host=host, max_workers=most)
+        reader = compile(chain, seed=5, steps=steps, loading=loading).train(DataPartition())
+        try:
+            listed(reader, 1)
+            assert _Counted.made == 4, (host, steps, most, _Counted.made)
+        finally:
+            reader.close()
+
+
 def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
     """However a run states its length (its epochs, its steps), a chain that sets its threads alone, and
     a validation pass beside a training read, automatic workers read the records a read in no workers

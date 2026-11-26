@@ -543,13 +543,11 @@ class Loading:
         # Their mean, which a step making several batches at once is paid in, as the run pays it.
         python = statistics.fmean(seconds[1:] or seconds)
         slowest = max(seconds[1:] or seconds)
-        host = Host.current() if self.host is None else self.host
+        host = self._host()
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
-        cpus = host.cpus if host.cpus > 1 else 0
-        if self.max_workers is not None:
-            cpus = min(cpus, self.max_workers)
+        cpus = self._worker_cpus(host)
         read_buffer = min(self.read_buffer, budget // read)
         ahead = WORKER_BUFFER if self.worker_buffer is None else self.worker_buffer
         held = WORKER_PROCESS_BYTES + ahead * batch + read_buffer * read
@@ -573,6 +571,22 @@ class Loading:
                       budget=budget, batches=batches)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer, worker_buffer=ahead,
                                    sized=sized)
+
+    def selects_none(self, batches: int | None) -> bool:
+        """Whether automatic loading would read in the process whatever its sample of batches measured
+        (`resolved`): over a run whose length nothing states (`batches` None), or on a host with no CPU a
+        worker may take (one CPU, or `max_workers` 0). Its read then opens no sample, whose batches (up to
+        `SAMPLED_BATCHES`, decoded and held together) the run's own read makes again."""
+        return batches is None or self._worker_cpus(self._host()) == 0
+
+    def _host(self) -> Host:
+        return Host.current() if self.host is None else self.host
+
+    def _worker_cpus(self, host: Host) -> int:
+        """The CPUs workers may take of `host`: none of one CPU, where a worker adds a process and no
+        parallelism, at most `max_workers`."""
+        cpus = host.cpus if host.cpus > 1 else 0
+        return cpus if self.max_workers is None else min(cpus, self.max_workers)
 
     def unsized(self) -> Loading:
         """This loading for a read automatic loading sizes nothing for, a pass that is no run's training
