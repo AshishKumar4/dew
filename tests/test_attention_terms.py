@@ -424,7 +424,6 @@ def test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_
     # no band, only the bias written out (row 13503).
     from dew.nn.kernels.templates import band
 
-    params, x = draw(0)
     spec = TERMS["relative_bias"]
     assert isinstance(spec, RelativeBias)
     banded = (1, HEADS, BANDED, band.band_width(spec.extent))
