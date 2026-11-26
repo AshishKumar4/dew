@@ -270,11 +270,13 @@ def _whole_logits(states, matrix, precision: jax.lax.PrecisionLike) -> jax.Array
 
         states, matrix, placed = contracted_alike(states.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16),
                                                   numbers)
-        # Behind a barrier, as `bf16_logits` holds its rounding: XLA's excess precision would otherwise widen
-        # a bf16 result its readers widen, skipping the rounding a tiled head's logits take.
-        return jax.lax.optimization_barrier(jax.lax.dot_general(
-            states, matrix, numbers, precision=jax.lax.Precision.DEFAULT, preferred_element_type=jnp.bfloat16,
-            out_sharding=placed))
+        product = jax.lax.dot_general(states, matrix, numbers, precision=jax.lax.Precision.DEFAULT,
+                                      preferred_element_type=jnp.float32, out_sharding=placed)
+        # Rounded once its sums are whole: a contraction split over devices sums its shards' fp32 partials
+        # before it rounds (XLA's partitioner makes each local product and its sum in the product's type);
+        # unsplit, the GEMM writes the rounding as its epilogue. Behind a barrier, as `bf16_logits` holds its
+        # rounding: XLA's excess precision would otherwise widen a bf16 value its readers widen.
+        return jax.lax.optimization_barrier(product.astype(jnp.bfloat16))
 
     return jax.lax.platform_dependent(
         states, matrix, cuda=written,
