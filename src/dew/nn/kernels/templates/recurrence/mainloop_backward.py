@@ -1426,7 +1426,10 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
                                rhs_transposed=True, rhs_staged=True),
              product_fragments(call, (held, chunk, call.value_block), (held, call.value_block, chunk),
                                rhs_transposed=True, rhs_staged=True))],
-        [f32(chunk, chunk)] * 4 + masks(chunk, chunk)
+        # The adjoint's (`_wy_inverse_adjoint`): each product's fp32 sum beside the narrow one it read, then
+        # its result beside the pairs' decays. Four fp32 squares counted here, an sm120's gated delta net
+        # training claimed 260 registers, refused at every value block, where ptxas took 175 (row 13064).
+        [f32(chunk, chunk)] * 2 + held_tile(held, chunk, chunk) + masks(chunk, chunk)
         + largest_live_set(
             product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
                               lhs_staged=True),
@@ -1509,8 +1512,9 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
     held each block's operand fragments across the walk, 64 to 200 bytes a thread past an A100's 255
     registers. Under reads of their own (`reads` `[R, H * Dk]`, `recurrence.Hooks.erase` 'read'), `(dk,
     dreads, dbeta, after, decay)`: the keys' gradient through the system's columns alone, the reads' through
-    `w` and its rows (`algebra.keys_gradient`'s `reads`), their key block streamed beside the keys'."""
-    chunk = call.chunk
+    `w` and its rows (`algebra.keys_gradient`'s `reads`), their key block streamed beside the keys'. Its key
+    block the call's, or narrower where a compile found it spilling (`Call.key_block`, `Tiles.keys`)."""
+    chunk, block = call.chunk, call.key_block("recurrence_keys_back")
     width, family = call.width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     reading = reads is not None
@@ -1524,26 +1528,26 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
         # The weighted system's tile and, where a chunk is wider than a key block, a block's apart: the
         # products' operands in registers (the rest are streamed).
         square, *rest = staging
-        blocked, summing = (rest[0], rest[1:]) if chunk != call.block else (square, rest)
-        column = c * call.block
+        blocked, summing = (rest[0], rest[1:]) if chunk != block else (square, rest)
+        column = c * block
         keyed = h // call.group * width + column
         views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
-                             keys=given.views(k_ref, row, chunk, keyed, call.block),
-                             w_grads=held.views(dw_ref, row, chunk, h * width + column, call.block),
+                             keys=given.views(k_ref, row, chunk, keyed, block),
+                             w_grads=held.views(dw_ref, row, chunk, h * width + column, block),
                              system=held.views(dl_ref, row, chunk, h * chunk, chunk),
-                             **({"reads": given.views(reads_ref, row, chunk, keyed, call.block)}
+                             **({"reads": given.views(reads_ref, row, chunk, keyed, block)}
                                 if reading else {}))
 
         def step(index, slots, carry, accumulators):
             del index
 
-            def whole(name, operand, block):
-                del block
+            def whole(name, operand, columns):
+                del columns
                 return stream_tile(slots, name, operand)
 
             gate, low = family.rows_of(hi_ref.at[h, span]), family.rows_of(lo_ref.at[h, span])
             beta = family.rows_of(beta_ref.at[h, span])
-            stores = {name: block_stored(call, ref, row, h * width + column, landing["block"])
+            stores = {name: block_stored(call, ref, row, h * width + column, landing["block"], block)
                       for name, ref in (("keys", dk_ref), ("reads", dreads_ref)) if ref is not None}
 
             def stored(kind: str, index: int, grad) -> None:
@@ -1562,27 +1566,27 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
 
         return mosaic.Walk(views, step)
 
-    tiles = stream_blocks(lower=((chunk, chunk), held), keys=((chunk, call.block), given),
-                          w_grads=((chunk, call.block), held), system=((chunk, chunk), held),
-                          **({"reads": ((chunk, call.block), given)} if reading else {}))
-    blocks = width // call.block
+    tiles = stream_blocks(lower=((chunk, chunk), held), keys=((chunk, block), given),
+                          w_grads=((chunk, block), held), system=((chunk, chunk), held),
+                          **({"reads": ((chunk, block), given)} if reading else {}))
+    blocks = width // block
     terms = jax.ShapeDtypeStruct((blocks, call.heads, call.rows), jnp.float32)
     out_type = (*(held.shape(call.heads * width),) * (1 + reading), terms, terms, terms)
     # The key block's products through `w` and the system, and its keys' own pairs: the model's.
-    model = 2 * chunk * chunk * (4 * call.block)
+    model = 2 * chunk * chunk * (4 * block)
     # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
     # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
     # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
     # In turn (`algebra.keys_gradient`): the inverse read transposed against the weights' gradient
     # ('inverse_t'), the system's gradient and its transpose against the keys ('keys_dl', 'keys_dlt').
     keyed = largest_live_set(
-        product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
-        product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
+        product_fragments(call, (held, chunk, chunk), (held, chunk, block)),
+        product_fragments(call, (held, chunk, chunk), (given, chunk, block)))
     # Under reads of their own a block's reads in fp32 beside its keys; the reads' gradient and the keys' are
     # stored in turn through one landing (`algebra.keys_gradient`), neither beside the other.
-    apart = [f32(chunk, call.block)] * reading
+    apart = [f32(chunk, block)] * reading
     held_tiles = Held(phases=(
-        held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + apart
+        held_tile(held, chunk, chunk) * 2 + [f32(chunk, block)] * 4 + apart
         + keyed,
         held_tile(held, chunk, chunk) + [f32(chunk, chunk)] * 4 + masks(chunk, chunk)))
     if held.parts > 1 and product_results(call) == "registers":
@@ -1591,7 +1595,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
         # triangle and their partial sums.
         rows = f32(chunk, 4)
         held_tiles = Held(phases=(
-            held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + apart + [rows] * 4
+            held_tile(held, chunk, chunk) * 2 + [f32(chunk, block)] * 4 + apart + [rows] * 4
             + keyed,
             held_tile(Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk)
             + held_tile(Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk)
@@ -1600,7 +1604,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
                          grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1,
                          live=chunk_liveness(7),
                          steps=1, model=model, held=held_tiles,
-                         staging=(staging_tiles(held, *dict.fromkeys(((chunk, chunk), (chunk, call.block))))
+                         staging=(staging_tiles(held, *dict.fromkeys(((chunk, chunk), (chunk, block))))
                                   + summing_staging(call)),
-                         landing={"block": held.landing(chunk, call.block)})(
+                         landing={"block": held.landing(chunk, block)})(
         a, k, dw, dl, hi, lo, beta, taken, *(() if reads is None else (reads,)))

@@ -50,7 +50,7 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -143,6 +143,28 @@ def block_of(family: mosaic.Family) -> int:
     return family.depths(jnp.bfloat16)[0]
 
 
+KEYED = frozenset({"recurrence_keys_back"})
+"""The launches that walk a key block of their own (`Keys`): each program one key block of a chunk and value
+head, its terms each key block's apart, which their caller sums (`mainloop_backward._keys_back`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Keys(resources.ByLaunch):
+    """The key block a config's launches of their own key block (`KEYED`) walk, where a compile found one
+    spilling with its producers' and residents' ladders run out (`template.Mosaic._narrowed`), every other
+    launch the call's (`Call.block`): a launch whose need sits at a thread's registers on a family whose
+    products read registers spills at some calls and holds at others with the same code (the gated delta
+    net's keys' backward at Qwen3.5-27B's packed training on an sm120, 8 bytes at 255 registers where one
+    row's held, row 13064), and half its key block halves its fp32 tiles."""
+
+    def halved(self, blocks: Mapping[str, int], narrowest: int) -> "Keys | None":
+        """These with each of `blocks`' launches at half the key block it walks now; None where one walks
+        `narrowest` already."""
+        if any(block // 2 < narrowest for block in blocks.values()):
+            return None
+        return self.held({name: block // 2 for name, block in blocks.items()})
+
+
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
@@ -169,6 +191,10 @@ class Tiles:
     """The most programs a multiprocessor holds of its launches where a compile found them spilling with
     their producers' ladders run out (`template.Mosaic._fewer`), every other launch's as many as its plan
     holds."""
+    keys: Keys = dataclasses.field(default_factory=Keys, kw_only=True)
+    """The key block its launches of their own key block walk where a compile found them spilling with
+    their producers' and residents' ladders run out (`template.Mosaic._narrowed`), every other one the
+    call's."""
 
     @property
     def output_block(self) -> int:
@@ -180,7 +206,7 @@ class Tiles:
         producer's raise or a launch's program fewer leaves every other launch given what it was
         (`template.Mosaic.emitted`, `tuning.lowered_once`)."""
         return dataclasses.replace(self, producers=self.producers.only(kernels),
-                                   residents=self.residents.only(kernels),
+                                   residents=self.residents.only(kernels), keys=self.keys.only(kernels),
                                    forward=None if self.forward is None else self.forward.at(kernels))
 
 
@@ -390,6 +416,8 @@ class Call:
     """Its tiles' (`Tiles.producers`)."""
     residents: resources.Residents = dataclasses.field(default_factory=resources.Residents)
     """Its tiles' (`Tiles.residents`)."""
+    keys: Keys = dataclasses.field(default_factory=Keys)
+    """Its tiles' (`Tiles.keys`)."""
     alone: bool = False
     """Whether it is a forward no gradient follows, keeping nothing (`chunk_forward.kept_forward`'s `keeps`):
     its launches named apart (`named`), so a compile's refusal of one is the forward's alone and not a
@@ -404,7 +432,12 @@ class Call:
         """What a launch building `kernels` is given of it: all of it but the other launches' producers and
         residents (`Tiles.at`)."""
         return dataclasses.replace(self, producers=self.producers.only(kernels),
-                                   residents=self.residents.only(kernels))
+                                   residents=self.residents.only(kernels), keys=self.keys.only(kernels))
+
+    def key_block(self, name: str) -> int:
+        """The key block the launch `name` walks (`Tiles.keys`), the call's (`block`) where none narrowed
+        it."""
+        return self.keys.of(name) or self.block
 
     @property
     def gated_keys(self) -> bool:
