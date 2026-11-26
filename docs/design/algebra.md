@@ -1367,16 +1367,14 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 ### 6.11 The generator
 
 The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). The generated components cover the online-softmax step and pairwise
-split-KV merge on the unscaled fast path, attention backward's masked query-first cotangents, its
-key-first weight consumer and value-gradient tile, recurrence scores, compensated prefix differences,
-chunk carries and reverse carries with gated keys and queries, the strict-lower solver's shared doubling
-stage, weighted value application, and whole-tile inverse adjoint. Recurrence cases include padded tokens
-and top-binade values; the checked stages compose a complete solve and a strict-lower pullback.
-Attention's forward cases include a wholly masked tile, empty slices, and a large shared maximum
-with separate masses. The same writer checks rounded-operand
-forward and tangent bodies and holds every generated case against its own reference.
-Production still uses the trace-time derivations and original surrogates (row 3272).
+(`ComponentForm`, rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV
+merge, the backward's overlapped weight and dropped anchored cotangent phases in both tile orientations,
+the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
+pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
+solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
+the selective scan's packed and unpacked decay. The same writer checks rounded-operand forward and
+tangent bodies. Every case holds its own independent reference. The backward weight, dropout and decay
+pilots also exercise each primitive on the CPU. Production still uses the written bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)

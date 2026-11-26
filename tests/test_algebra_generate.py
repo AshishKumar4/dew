@@ -64,6 +64,22 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                         seeds=form.cases.seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("name", ["query_weights", "key_weights", "query_dropped_cotangents",
+                                  "key_dropped_cotangents", "selective_decay", "key_memory_decay"])
+@pytest.mark.parametrize("arm", ["written", "generated"])
+def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
+    from certified import assert_certified
+
+    qualified = f"{component_cases.__name__}.{name}"
+    declaration = generate.DECLARATIONS[qualified]
+    for policy in declaration.cases.policies:
+        function = (declaration.function if arm == "written" else
+                    functools.partial(_derived(qualified), policy=policy))
+        for index, operands in enumerate(declaration.cases.operands):
+            assert_certified(function, functools.partial(declaration.cases.draw, operands=operands),
+                             f"{name} ({arm}, {policy}, {index})", seeds=declaration.cases.seeds)
+
+
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
     (example,) = component_cases.ROUNDED.cases.operands[0]

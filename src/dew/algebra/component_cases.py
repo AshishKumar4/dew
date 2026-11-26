@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ from dew.nn.kernels.templates import attention_algebra
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
     derived_from_weights,
+    derived_weights,
     softmax_gradients,
 )
 from dew.nn.kernels.templates.operands import Parts
@@ -342,6 +344,119 @@ def _chunk_weighted_draw(seed, operands):
     return lower, values, weights
 
 
+def _per_query(values, keys_first):
+    return values[None, :] if keys_first else values[:, None]
+
+
+def _backward_weights(logits, peak, total, *, keys_first):
+    return derived_weights(keys_first=keys_first).mapped({"logits": logits, "peak": peak, "total": total})
+
+
+def _backward_weights_truth(logits, peak, total, *, keys_first):
+    maximum = _per_query(jnp.where(peak == -jnp.inf, jnp.inf, peak), keys_first)
+    exponential = jnp.exp(jnp.minimum(logits - maximum, 0.0))
+    mass = _per_query(jnp.where(total == 0, 1.0, total), keys_first)
+    return exponential, exponential / mass
+
+
+def _dropped_cotangents(logits, products, peak, total, anchor, delta, keep, seen, at_anchor, *, keys_first):
+    return derived_cotangents(keys_first=keys_first, dropped=True, masked=True, anchored=True).mapped(
+        {"logits": logits, "products": products, "peak": peak, "total": total, "anchor": anchor, "delta": delta,
+         "keep": keep, "seen": seen, "at_anchor": at_anchor})
+
+
+def _dropped_cotangents_truth(logits, products, peak, total, anchor, delta, keep, seen, at_anchor, *, keys_first):
+    exponential, weights = _backward_weights_truth(logits, peak, total, keys_first=keys_first)
+    centered = jnp.where(at_anchor, 0.0, products * keep - _per_query(anchor, keys_first))
+    return exponential, weights, jnp.where(seen, weights * (centered - _per_query(delta, keys_first)), 0.0)
+
+
+def _attention_recompute_cases(*, keys_first, dropped):
+    def draw(seed, operands):
+        rng = np.random.default_rng(seed)
+        shape = operands[0].shape
+        if keys_first:
+            shape = shape[::-1]
+        logits = rng.standard_normal(shape).astype(np.float32)
+        peak = rng.standard_normal((shape[0],)).astype(np.float32)
+        total = rng.uniform(2, 4, (shape[0],)).astype(np.float32)
+        # Neither an empty row's mass nor a score rounded above the forward maximum creates a weight > 1.
+        logits[0], peak[0], total[0] = -np.inf, -np.inf, 0
+        logits[1, 0], peak[1] = 1, 0
+
+        def tiles(value):
+            return value.T.copy() if keys_first else value
+
+        if not dropped:
+            return tiles(logits), peak, total
+        products = rng.uniform(-1, 1, logits.shape).astype(np.float32)
+        anchor = rng.uniform(-1, 1, peak.shape).astype(np.float32)
+        delta = rng.uniform(-1, 1, peak.shape).astype(np.float32)
+        keep = np.where(rng.random(logits.shape) < 0.25, 0, 1.25).astype(np.float32)
+        seen = np.ones(logits.shape, dtype=np.bool_)
+        seen[0], seen[:, -1] = False, False
+        at_anchor = np.zeros(logits.shape, dtype=np.bool_)
+        at_anchor[:, 0] = True
+        if seed in (1, 3):
+            # The unscaled centering overflows while the cotangent is finite. The same tile holds a
+            # dropped key, an explicit anchor and a masked key, each read by a different branch.
+            extreme = np.float32(2.0 ** 127)
+            anchor[2], delta[2], total[2] = -extreme, 0, 4
+            products[2, 1], keep[2, 1], logits[2, 1], peak[2] = extreme, 1, 0, 0
+        return (tiles(logits), tiles(products), peak, total, anchor, delta, tiles(keep),
+                tiles(seen), tiles(at_anchor))
+
+    def of(rows, keys):
+        tile = jax.ShapeDtypeStruct((keys, rows) if keys_first else (rows, keys), jnp.float32)
+        query = jax.ShapeDtypeStruct((rows,), jnp.float32)
+        mask = jax.ShapeDtypeStruct(tile.shape, jnp.bool_)
+        return ((tile, tile, query, query, query, query, tile, mask, mask) if dropped else (tile, query, query))
+
+    return Cases(tuple(of(rows, keys) for rows, keys in ((32, 64), (64, 128))), draw, seeds=8,
+                 policies=("default",))
+
+
+def _selective_decay_truth(step, rate, kept=None):
+    decay = jnp.exp(step * rate)
+    return decay if kept is None else jnp.where(kept != 0, decay, 0)
+
+
+def _selective_decay_draw(seed, operands):
+    rng = np.random.default_rng(seed)
+    step = rng.uniform(0, 2, operands[0].shape).astype(np.float32)
+    rate = -rng.uniform(0, 2, operands[1].shape).astype(np.float32)
+    if seed == 1:
+        step[:] = 0
+        rate[...] = -np.float32(3 * 2.0 ** 126)
+    elif seed == 2:
+        step[:] = np.float32(3 * 2.0 ** 126)
+        rate[...] = -np.float32(2.0 ** -126)
+    elif seed == 3:
+        rate[...] = 0
+    kept = () if len(operands) == 2 else ((rng.random(operands[2].shape) > 0.25).astype(np.float32),)
+    return step, rate, *kept
+
+
+def _key_memory_decay_truth(entered, leaving):
+    return jnp.einsum("kv,kv->k", entered, leaving)
+
+
+def _key_memory_decay_draw(seed, operands):
+    entered, leaving = _arrays(seed, operands)
+    if seed == 1:
+        # A large carry and its reciprocal-scale cotangent produce ordinary finite terms.
+        entered[0, :4], leaving[0, :4] = [2.0 ** 60, -2.0 ** 60, 2.0 ** 60, 0], 2.0 ** -60
+    elif seed == 2:
+        entering_mask = np.arange(entered.shape[0]) % 2 == 0
+        entered[entering_mask] = 0
+    return entered, leaving
+
+
+def _recompute_form(function, truth, *, keys_first, dropped):
+    return ComponentForm(functools.partial(function, keys_first=keys_first),
+                         functools.partial(truth, keys_first=keys_first),
+                         _attention_recompute_cases(keys_first=keys_first, dropped=dropped))
+
 SCORES = declare(__name__, "scores", ComponentForm(
     _scores, _scores_truth, _cases(*[((n, n), (n, n), (n,)) for n in (16, 32, 64)])))
 ROUNDED = declare(__name__, "rounded", ComponentForm(
@@ -389,3 +504,20 @@ VALUES_GRADIENT = declare(__name__, "values_gradient", ComponentForm(
 CHUNK_INVERSE_PULLBACK = declare(__name__, "chunk_inverse_pullback", ComponentForm(
     _inverse_pullback, _inverse_pullback_truth,
     dataclasses.replace(_cases(*[((c, c), (c, c)) for c in (16, 32, 64)]), draw=_inverse_pullback_draw)))
+
+QUERY_WEIGHTS = declare(__name__, "query_weights", _recompute_form(
+    _backward_weights, _backward_weights_truth, keys_first=False, dropped=False))
+KEY_WEIGHTS = declare(__name__, "key_weights", _recompute_form(
+    _backward_weights, _backward_weights_truth, keys_first=True, dropped=False))
+QUERY_DROPPED_COTANGENTS = declare(__name__, "query_dropped_cotangents", _recompute_form(
+    _dropped_cotangents, _dropped_cotangents_truth, keys_first=False, dropped=True))
+KEY_DROPPED_COTANGENTS = declare(__name__, "key_dropped_cotangents", _recompute_form(
+    _dropped_cotangents, _dropped_cotangents_truth, keys_first=True, dropped=True))
+SELECTIVE_DECAY = declare(__name__, "selective_decay", ComponentForm(
+    recurrence_algebra.selective_decay, _selective_decay_truth, dataclasses.replace(
+        _cases(((128,), (128,)), ((128,), (128,), ()), ((256,), (), (256,))), draw=_selective_decay_draw)))
+KEY_MEMORY_DECAY = declare(__name__, "key_memory_decay", ComponentForm(
+    recurrence_algebra.key_memory_decay, _key_memory_decay_truth, Cases(
+        tuple((jax.ShapeDtypeStruct(shape, dtype), jax.ShapeDtypeStruct(shape, jnp.float32))
+              for shape, dtype in (((64, 64), jnp.float32), ((128, 64), jnp.bfloat16))),
+        _key_memory_decay_draw, seeds=8, policies=("default",))))

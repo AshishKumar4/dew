@@ -352,9 +352,8 @@ class Rules:
     (`register`); a derivation's own set (`derive.DECOUPLED`, `carry.CARRIED`), whose rules read its readings
     and never run among the registry's, is qualified by its derivation's tests."""
     dev: bool = False
-    """Whether it runs at dev time alone, where each candidate's error is measured before it is taken
-    (`dew.algebra.error.choose`): a set whose forms are chosen for their accuracy, at a cost the program pass
-    would never pay."""
+    """Whether the set is available only to dev-time generation: this keeps candidate error
+    measurement (`dew.algebra.error.choose`) out of compile-time rewriting."""
     aid: bool = False
     """Whether the set only aids the others' saturation and changes no program on its own (commutativity,
     whose operand orders XLA's HloCSE reads alike): a pass whose admitted sets are all aids does not run
