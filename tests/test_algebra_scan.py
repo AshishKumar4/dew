@@ -935,17 +935,21 @@ def test_a_prepared_chunk_keeps_a_subnormal_read_scale_until_the_state_contracti
         state = (jnp.asarray(0, q.dtype), h)
         prepared = forms.prepare(chunk)
         _, held = forms.step(state, prepared)
-        return forms.mapped(prepared, state, held)
+        mapped = forms.mapped(prepared, state, held)
+        replayed, _ = forms.replay(chunk, h)
+        return mapped, replayed
 
     @jax.jit
     def orders(q, h, ct):
-        out, pull = jax.vjp(run, q, h)
-        return out, pull(ct)
+        outputs, pull = jax.vjp(run, q, h)
+        zero = jnp.zeros_like(ct)
+        return outputs, (pull((ct, zero)), pull((zero, ct)))
 
-    out, (dq, dh) = orders(reader, memory, cotangent)
-    np.testing.assert_array_equal(out, np.full_like(reader, 0.5))
-    np.testing.assert_array_equal(dq, np.broadcast_to(memory * 0.25, reader.shape))
-    np.testing.assert_array_equal(dh, reader[:1] * 0.5)
+    outputs, pullbacks = orders(reader, memory, cotangent)
+    for output, (dq, dh) in zip(outputs, pullbacks, strict=True):
+        np.testing.assert_array_equal(output, np.full_like(reader, 0.5))
+        np.testing.assert_array_equal(dq, np.broadcast_to(memory * 0.25, reader.shape))
+        np.testing.assert_array_equal(dh, reader[:1] * 0.5)
 
 
 def ones_chunk(g, dtype=jnp.float32):
