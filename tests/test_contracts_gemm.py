@@ -233,6 +233,29 @@ def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
         np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
     np.testing.assert_array_equal(gradient, np.broadcast_to([[0.25], [0.5]], codes.shape))
 
+def test_decoded_ternary_preserves_its_linear_scale_rule():
+    values = np.tile(np.asarray([[-1, 1], [0, 0], [1, -1], [0, 0]], np.float32), (64, 1))
+    weights = formats.TernaryWeights.of(values, scale=np.ones(2, np.float32))
+    small = np.asarray([2.0 ** -127, -(2.0 ** -127)], np.float32)
+    scale = np.ones_like(small)
+    incoming = np.zeros_like(values)
+    incoming[[0, 2]] = [[1, 2], [4, 8]]
+
+    @jax.jit
+    def orders(scale, direction, incoming):
+        def decoded(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.float32)
+
+        found, moved = jax.jvp(decoded, (scale,), (direction,))
+        _, pull = jax.vjp(decoded, scale)
+        return found, moved, pull(incoming)[0]
+
+    found, tangent, gradient = orders(scale, small, incoming)
+    np.testing.assert_array_equal(found, values)
+    np.testing.assert_array_equal(np.asarray(tangent).view(np.uint32), (values * small).view(np.uint32))
+    np.testing.assert_array_equal(gradient, [3, -6])
+
+
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):

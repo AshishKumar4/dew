@@ -549,7 +549,57 @@ class TernaryWeights:
         return decoded.reshape(*batches, depth, width).astype(dtype)
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
+        """Decode the packed values in `dtype`, including a representable subnormal stored scale."""
         scale_checked(jnp.shape(self.scale), self.shape)
-        wide = jnp.promote_types(dtype, jnp.float32)
-        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
+        return _decode_ternary(jax.dtypes.canonicalize_dtype(dtype), self.unscaled(jnp.float32),
+                               jnp.asarray(self.scale))
+
+
+def _ternary_arithmetic(dtype, codes, scale):
+    wide = jnp.promote_types(dtype, jnp.float32)
+    return (codes.astype(wide) * scale.astype(wide)).astype(dtype)
+
+
+def _ternary_decoded(dtype, codes, scale):
+    ordinary = _ternary_arithmetic(dtype, codes, scale)
+    if scale.dtype != jnp.float32 or dtype not in (jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64):
+        return ordinary
+    _, sign, biased, fraction = raw_fields(scale)
+    power = jnp.full(fraction.shape, -149, jnp.int32)
+    if dtype == jnp.float64:
+        widened = fraction.astype(dtype) * exact_power2(power, dtype)
+    else:
+        widened = rounded_binary(jnp.zeros_like(sign), fraction, power, dtype)
+    width = jnp.finfo(dtype).bits
+    word = jnp.dtype(f"uint{width}")
+    bits = jax.lax.bitcast_convert_type(widened, word)
+    # Stored zero codes have positive sign; multiplying by a negative scale gives them negative zero.
+    negative = ((sign != 0) ^ (codes < 0)).astype(word) << word.type(width - 1)
+    magnitude = jnp.where(codes != 0, bits, word.type(0))
+    exact = jax.lax.bitcast_convert_type(magnitude | negative, dtype)
+    return jnp.where((biased == 0) & (fraction != 0), exact, ordinary)
+
+
+def _ternary_decode_tangent(dtype, primals, tangents):
+    codes, scale = primals
+    _, moving = tangents
+    value = _decode_ternary(dtype, codes, scale)
+    if isinstance(moving, SymbolicZero):
+        return value, SymbolicZero(jax.typeof(value).to_tangent_aval())
+
+    def applied(held, direction):
+        return _decode_ternary(dtype, held[0], direction)
+
+    def pulled(held, cotangent):
+        # Let the floating linear rule reduce broadcasts in the scale's original layout.
+        codes, scale = held
+        _, pull = jax.vjp(lambda weights: _ternary_arithmetic(dtype, codes, weights), scale)
+        return pull(cotangent)[0]
+
+    direction = generation.linear_map(applied, pulled, primals, moving, out_aval=jax.typeof(value))
+    return value, direction
+
+
+_decode_ternary = contracted("test_decoded_ternary_preserves_its_linear_scale_rule")(
+    declared_tangent(Protected(), _ternary_decoded, _ternary_decode_tangent,
+                     nondiff_argnums=(0,), symbolic_zeros=True))
