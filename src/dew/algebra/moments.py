@@ -111,8 +111,8 @@ def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.A
         if jnp.broadcast_shapes(value.shape, w.shape) == paired.shape:
             return _mean(paired, kept, denominator)
         live = _present(w, value)
-        data, weights = _observed(live, value, w)
-        return _mean(data, weights, _denominator(w, weights, live))
+        observed, weights = _observed(live, value, w)
+        return _mean(observed, weights, _denominator(w, weights, live))
 
     mean_x, mean_y = marginal(x, paired_x), marginal(y, paired_y)
     return mean_x, mean_y, _covariance(paired_x, paired_y, kept, mean_x, mean_y, denominator)
