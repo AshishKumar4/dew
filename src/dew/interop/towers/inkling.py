@@ -15,7 +15,15 @@ from dew.interop.weights import placed
 from dew.nn.vision.inkling import InklingProjector, InklingVision
 from dew.registry import Record, towers
 
-from .common import ProjectorLayout, TowerLayout, _vision_section, block_routes, rope_base
+from .common import (
+    ProjectorLayout,
+    TowerLayout,
+    _vision_section,
+    block_routes,
+    integer_field,
+    number_field,
+    rope_base,
+)
 
 _TENSORS = MappingProxyType({
     "embeddings.patch_embedding.weight": ("patch_embed", "kernel"),
@@ -92,17 +100,12 @@ def _write_rope(tower: InklingVision) -> Mapping[str, object]:
     return {"rope_parameters": {"rope_type": "axial", "rope_theta": tower.rope_theta}}
 
 
-def _integer(key: str, field: str | None = None) -> ConfigField:
-    """A key the release states, the tower's default where it does not."""
-    return ConfigField(key, field or key, getattr(InklingVision, field or key), parse=_records.integer)
-
-
 def _mlp_width(vision: Mapping[str, object], used: set[str],
                record: NativeFields[InklingVision]) -> NativeFields[InklingVision]:
     """The feed-forward width: `intermediate_size`, else `mlp_ratio` times the width (the config class's
     rule)."""
     used.update(("intermediate_size", "mlp_ratio"))
-    width = _records.integer(vision.get("hidden_size", InklingVision.hidden_size), "hidden_size")
+    width = _records.integer(vision.get("hidden_size", 1024), "hidden_size")
     stated = vision.get("intermediate_size")
     ratio = _records.number(vision.get("mlp_ratio", 4.0), "mlp_ratio")
     record["intermediate_size"] = (_records.integer(stated, "intermediate_size") if stated is not None
@@ -111,17 +114,18 @@ def _mlp_width(vision: Mapping[str, object], used: set[str],
 
 
 _CONFIG = ConfigLayout(
-    _integer("hidden_size"), _integer("num_hidden_layers", "depth"),
-    _integer("num_attention_heads", "num_heads"),
-    _integer("num_channels", "in_channels"), _integer("native_patch_size", "patch_size"),
-    _integer("adapter_merge_size", "spatial_merge_size"), _integer("posemb_grid_size"),
-    ConfigField("layer_norm_eps", "layer_norm_eps", InklingVision.layer_norm_eps, parse=_records.number),
-    ConfigField("layer_scale_init_value", "layer_scale_init_value", InklingVision.layer_scale_init_value,
-                parse=_records.number),
+    integer_field("hidden_size", default=1024), integer_field("num_hidden_layers", "depth", 23),
+    integer_field("num_attention_heads", "num_heads", 16), integer_field("num_channels", "in_channels", 3),
+    ConfigField("native_patch_size", "patch_size", 20, parse=_records.integer, aliases=("patch_size",)),
+    ConfigField("adapter_merge_size", "spatial_merge_size", 2, parse=_records.integer,
+                aliases=("spatial_merge_size",)),
+    integer_field("posemb_grid_size", default=32), number_field("layer_norm_eps", default=1e-5),
+    number_field("layer_scale_init_value", default=0.1),
     ConfigPart(_mlp_width, lambda tower: {"intermediate_size": tower.intermediate_size}),
     ConfigPart(_read_rope, _write_rope))
-"""An Inkling2VisionConfig's fields as the release spells them (`native_patch_size`, `adapter_merge_size`,
-the config class's aliases of `patch_size` and `spatial_merge_size`)."""
+"""An Inkling2VisionConfig's fields and its defaults (configuration_inkling2.py), as the release spells
+them (`native_patch_size`, `adapter_merge_size`), or as transformers writes them (`patch_size`,
+`spatial_merge_size`, the config class's names for those)."""
 
 _INERT = frozenset({"model_type", "temporal_patch_size", "hidden_act", "projection_hidden_dim",
                     "projector_bias", "text_hidden_size", "initializer_range", "attention_dropout"})
@@ -156,8 +160,8 @@ def translate_inkling_projector_config(hf_config: Mapping[str, object], text_wid
     stated = _records.integer(vision.get("text_hidden_size", text_width), "text_hidden_size")
     if stated != int(text_width):
         raise ValueError(f"text_hidden_size ({stated}) is not the decoder width ({text_width})")
-    width = _records.integer(vision.get("hidden_size", InklingVision.hidden_size), "hidden_size")
-    merge = _records.integer(vision.get("adapter_merge_size", InklingVision.spatial_merge_size),
+    width = _records.integer(vision.get("hidden_size", 1024), "hidden_size")
+    merge = _records.integer(vision.get("adapter_merge_size", vision.get("spatial_merge_size", 2)),
                              "adapter_merge_size")
     return {"class": "inkling2", "fields": {
         "hidden_size": width, "spatial_merge_size": merge,
