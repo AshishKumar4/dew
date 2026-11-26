@@ -34,13 +34,16 @@ def cgroup_root() -> Path:
 
 def limit(name: str) -> str:
     """The execution limit `name` names that binds this process ("limit:cpu", its CPU quota in vCPUs;
-    "limit:memory", its configured memory limit in bytes): the least over its own cgroup and each ancestor up
-    to the root (`cgroup_root`), read by Dew's own reader (`cgroups`), or "max" where none binds. CI keys
-    the limit as configured; Dew's `Host.current` bounds loading by what the memory limit leaves."""
-    reader = cgroups()
-    read = {"limit:cpu": reader.cpus, "limit:memory": reader.memory}[name]
-    root = cgroup_root()
-    found = [value for level in reader.levels(reader.own(root), root) if (value := read(level)) is not None]
+    "limit:memory", its configured memory limit in bytes, v2's or v1's): the least over its own cgroup and
+    each ancestor up to the root (`cgroup_root`), read by Dew's own reader (`cgroups`), or "max" where none
+    binds. CI keys the limit as configured; Dew's `Host.current` bounds loading by what the memory limit
+    leaves."""
+    reader, root = cgroups(), cgroup_root()
+    if name == "limit:memory":
+        found = [stated for _, stated in reader.memory_limits(root)]
+    else:
+        levels = reader.levels(reader.own(root), root)
+        found = [cpus for level in levels if (cpus := reader.cpus(level)) is not None]
     return str(min(found)) if found else "max"
 
 

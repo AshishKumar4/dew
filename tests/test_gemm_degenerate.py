@@ -14,6 +14,7 @@ import pytest
 from generation_support import runnable
 
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 EDGES = {
     "no rows": (0, 64, 64),
@@ -85,8 +86,8 @@ def _call(form: str, sizes, dense: bool):
         if form == "paired":
             return tuple(gemm.gemm(rows, held[0], sizes, paired=held[1], out_dtypes=(jnp.float32,) * 2,
                                    **options))
-        return (gemm.gemm(rows, held[0], sizes, prologue=_scaled, prologue_operands=((scale, ("depth",)),),
-                          epilogue=_biased, epilogue_operands=((bias, ("columns",)), (row_scale, ("rows",))),
+        return (gemm.gemm(rows, held[0], sizes, prologue=Hook(_scaled, (Side(scale, ("depth",)),)),
+                          epilogue=Hook(_biased, (Side(bias, ("columns",)), Side(row_scale, ("rows",)))),
                           **options),)
 
     return call

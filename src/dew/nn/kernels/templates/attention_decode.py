@@ -44,7 +44,6 @@ from dew.nn.kernels.templates.attention import (
     Kept,
     KeySpans,
     Kind,
-    Param,
     grouped_rows,
     prologues_taken,
     spans as key_spans,
@@ -52,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME, folded_form
 from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.hooks import NO_HOOK, Side
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -61,26 +61,26 @@ def packable(hooks: Hooks | None) -> bool:
     `merged.output_hook_refusal` pack (row 5385)."""
     if hooks is None:
         return True
-    if hooks.score_params or hooks.drop is not None:
+    if hooks.score.sides or hooks.drop is not None:
         return False
-    if merged.output_hook_refusal(hooks.output_mod, hooks.output_params) is not None:
+    if merged.output_hook_refusal(hooks.output) is not None:
         return False
-    return hooks.score_mod is None or not _reads_places(hooks.score_mod)
+    return hooks.score.fn is None or not _reads_places(hooks.score.fn)
 
 
-def _packed_output_params(params: tuple[Param, ...], *, heads: int, kv_heads: int) -> tuple[Param, ...]:
+def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int) -> tuple[Side, ...]:
     """Pack `output_params` (`Kind.OUTPUT`, or ungrouped `Kind.HEAD`) onto grouped decode rows
     `[B, T·G, KV, ...]` for in-kernel single-slice forward fusion (`Kind.QUERY` and grouped `Kind.HEAD` defer
     to `merged_finished` to preserve `[Q_tile, 1]` and scalar `()` shapes, row 5385)."""
     group = heads // kv_heads
-    packed_list: list[Param] = []
+    packed_list: list[Side] = []
     for param in params:
-        if param.kind is Kind.HEAD:
+        if param.axes == Kind.HEAD:
             assert group == 1, "grouped single-slice calls defer Kind.HEAD hooks to preserve scalar shape"
             packed_list.append(param)
         else:
-            assert param.kind is Kind.OUTPUT, "single-slice forward packs Kind.OUTPUT and ungrouped Kind.HEAD"
-            packed_list.append(Param(grouped_rows(param.value, kv_heads), Kind.OUTPUT))
+            assert param.axes == Kind.OUTPUT, "single-slice forward packs Kind.OUTPUT and ungrouped Kind.HEAD"
+            packed_list.append(Side(grouped_rows(param.value, kv_heads), Kind.OUTPUT))
     return tuple(packed_list)
 
 
@@ -200,7 +200,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     the step merges with the initial state (`merged.merged_split`), at a config derived for them."""
     chosen = WALKS[walk]
     single_hooks = (None if hooks is None else dataclasses.replace(
-        hooks, initial=None, output_mod=None, output_params=())) if defer_output else hooks
+        hooks, initial=None, output=NO_HOOK)) if defer_output else hooks
     op, ba = _stream_op(query, key, value, spans, single_hooks, scale=scale, table=table, sources=sources,
                         out_dtype=jnp.float32 if defer_output else None, scales=scales, chosen=chosen,
                         in_key=in_key)
@@ -235,7 +235,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         return single()
 
     walked = None if hooks is None else dataclasses.replace(
-        hooks, initial=None, output_mod=None, output_params=())
+        hooks, initial=None, output=NO_HOOK)
     streamed = functools.partial(_streamed, query, key, value, spans, walked, scale=scale, target=target,
                                  table=table, sources=sources, out_dtype=jnp.float32, scales=scales,
                                  chosen=chosen, in_key=in_key)
@@ -387,7 +387,7 @@ def _stream_op(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale
     """The op a packed call's launch of the walk `chosen` names runs, writing `out_dtype` (the query's where
     None) over `splits` slices (`in_key` its values' stream or the key's slot), and its bound arguments,
     deriving none."""
-    masked = hooks is None or hooks.output_mod is None
+    masked = hooks is None or hooks.output.fn is None
     op, args = attention_mosaic._forward_call(query, key, value, spans, hooks, scale=scale, natural=False,
                                               out_dtype=out_dtype, masked=masked, splits=splits, table=table,
                                               sources=sources, subtracted=True, scales=scales,
@@ -422,7 +422,7 @@ def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | Non
     of raw products (`algebra.Forward.subtracted`): the units its finished rows' maxima are in
     (`algebra.finished_form`), which its merge takes."""
     spec, _ = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,
-                          width=query.shape[3], scale=scale, natural=False, score_mod=hooks.score_mod,
+                          width=query.shape[3], scale=scale, natural=False, score_mod=hooks.score.fn,
                           subtracted=True, initial=hooks.initial is not None)
     return algebra.finished_form(spec)
 
@@ -441,14 +441,15 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     group = query.shape[2] // kv_heads
     # A resumed state (`Initial.normalized`) the merge past a stateless walk takes as it is, its finish
     # the hook's, as a hook the walk's packed rows cannot read is.
-    defer_merge = (initial is not None and initial.normalized) or (hooks.output_mod is not None and any(
-        (param.kind is Kind.HEAD and group > 1) or param.kind is Kind.QUERY
-        for param in hooks.output_params))
+    defer_merge = (initial is not None and initial.normalized) or (hooks.output.fn is not None and any(
+        (param.axes == Kind.HEAD and group > 1) or param.axes == Kind.QUERY
+        for param in hooks.output.sides))
     if defer_merge:
-        whole = dataclasses.replace(hooks, initial=initial, output_mod=None, output_params=())
+        whole = dataclasses.replace(hooks, initial=initial, output=NO_HOOK)
     else:
-        packed_out = _packed_output_params(hooks.output_params, heads=query.shape[2], kv_heads=kv_heads)
-        whole = dataclasses.replace(hooks, initial=initial, output_params=packed_out)
+        packed_out = _packed_output_params(hooks.output.sides, heads=query.shape[2], kv_heads=kv_heads)
+        whole = dataclasses.replace(hooks, initial=initial,
+                                    output=dataclasses.replace(hooks.output, sides=packed_out))
     target = generation.gpu_target()
     planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
                                      table=table, sources=sources, scales=scales, in_key=in_key,
@@ -476,12 +477,12 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     """`attend`'s step planned once (`planned`): `(run, common)`, where `run` executes the full step and
     `common` executes its unscaled/bounded common arm for pricing (`priced_step`)."""
     hooks = Hooks() if hooks is None else hooks
-    if hooks.key_mod is not None and (table is not None or scales is not None):
+    if hooks.key.fn is not None and (table is not None or scales is not None):
         raise ValueError("a paged or quantized cache holds its keys under their prologue, taken as they were "
                          "cached: a call over its pages or codes takes no key prologue")
     in_key = attention_mosaic.reads_in_key(in_key, key, value, hooks, table=table, scales=scales)
     query, key, hooks = prologues_taken(query, key, hooks)
-    if not finished and hooks.output_mod is not None:
+    if not finished and hooks.output.fn is not None:
         raise ValueError("an unfinished decode step returns a partial state and takes no output hook")
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed score hook, score parameter, "
@@ -502,16 +503,16 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         # Its finish the merge's past the walk (`planned`'s deferral: a hook the packed rows cannot read, or a
         # resumed state's output, `Initial.normalized`).
         defer_merge = (initial is not None and initial.normalized) or (
-            hooks.output_mod is not None and whole.output_mod is None)
+            hooks.output.fn is not None and whole.output.fn is None)
         if at.slices == 1 and finished and not defer_merge:
             # A row's walk from the initial state, finished in the query's dtype with any output hook fused
             # in-kernel, no merge past it (its fp32 rows and their merge took 45 of B128's 820 us at 4096
             # keys, ET-DECODE6-h100; row 5385).
             with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
                 out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
-                             bounded=chosen.bounded, masked=hooks.output_mod is None)
+                             bounded=chosen.bounded, masked=hooks.output.fn is None)
             return ungrouped_rows(out, heads)
-        stateless = dataclasses.replace(hooks, initial=None, output_mod=None, output_params=())
+        stateless = dataclasses.replace(hooks, initial=None, output=NO_HOOK)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
             walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
                                 out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,
@@ -526,18 +527,16 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
             if finished and defer_merge:
                 return merged.merged_finished(
                     spec, out, jnp.stack([maximum, total]), queries=queries, width=width,
-                    out_dtype=query.dtype, out_heads=heads, initial=initial,
-                    output_mod=hooks.output_mod, output_params=hooks.output_params)
+                    out_dtype=query.dtype, out_heads=heads, initial=initial, output=hooks.output)
             state = algebra.merged_state(spec, out, maximum, total, initial)
         else:
             # The slices merged where the launch wrote them (`merged_finished` / `merged_split`), fusing any
-            # `output_mod` directly into the native merge store (row 5385).
+            # output hook directly into the native merge store (row 5385).
             assert isinstance(walked_out, attention_mosaic.SplitOutput)
             if finished:
                 return merged.merged_finished(spec, walked_out.padded, walked_out.stacked, queries=queries,
                                               width=width, out_dtype=query.dtype, out_heads=heads,
-                                              initial=initial, output_mod=hooks.output_mod,
-                                              output_params=hooks.output_params)
+                                              initial=initial, output=hooks.output)
             state = merged.merged_split(spec, walked_out.padded, walked_out.stacked, queries=queries,
                                         width=width, initial=initial)
         if finished:

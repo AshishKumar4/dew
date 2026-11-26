@@ -41,7 +41,7 @@ from dew import _cache
 from dew._builds import generation_builds
 from dew._devices import cuda_builds, nvidia_gpus
 from dew.nn.kernels import grouped_matmul
-from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
+from dew.nn.kernels.generation import TARGETS, assumed, capability, compile_only_gpus, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels, unsynced_commits
 from dew.nn.kernels.templates import assembled, report, resources
 
@@ -1026,9 +1026,10 @@ def _report(kernel: dict) -> Report:
     return Report(**{**stated, "unread": tuple(kernel["unread"])})
 
 
-TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
-"""The compile-only topology of each TPU generation the gate compiles for: libtpu describes a host's
-chips (2x2), of which a case takes one."""
+TPU_TOPOLOGIES = {name: target.compile_topology for name, target in TARGETS.items()
+                  if target.compile_topology is not None}
+"""The compile-only topology of each TPU generation the gate compiles for (`GpuTarget.compile_topology`):
+libtpu describes a host's chips, of which a case takes one device."""
 
 
 @functools.cache

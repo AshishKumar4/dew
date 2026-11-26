@@ -36,19 +36,18 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
-    TRACED_TILE,
     AttentionLaunch,
     Gradients,
     Hooks,
     Kept,
     KeySpans,
     Kind,
-    Param,
     Split,
     gradients,
     head_width,
     kept_dtype,
     key_prologue_taken,
+    kinds_of,
     logit_scale,
     prologued,
     prologues_taken,
@@ -134,6 +133,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegisters, ForwardRegisters
 from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.hooks import NO_HOOK, TRACED_TILE, Hook, Side
 
 
 @dataclasses.dataclass(frozen=True)
@@ -361,7 +361,7 @@ class MosaicForward(_Mainloop[Tiles]):
     output_dtypes: tuple[str, ...] = ()
     output_width: int = TRACED_TILE
     query_mod: Callable | None = None
-    """The query prologue (`Hooks.query_mod`), which each consumer takes on its query tile where it loads it,
+    """The query prologue (`Hooks.query`), which each consumer takes on its query tile where it loads it,
     once a tile (`attention_mosaic_forward._query_of`); None where the call has none or its caller took it
     (`_forward_call`)."""
     query_kinds: tuple[Kind, ...] = ()
@@ -473,9 +473,11 @@ class MosaicForward(_Mainloop[Tiles]):
                                    initial, drop, start, priced=False, target=target)[0]
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
-        return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
-                     self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop, self.rounds,
-                     self.query_mod, tuple(map(Param, query_params, self.query_kinds)))
+        return Hooks(score=Hook(self.score_mod, tuple(map(Side, score_params, self.score_kinds))),
+                     initial=initial,
+                     output=Hook(self.output_mod, tuple(map(Side, output_params, self.output_kinds))),
+                     drop=drop, rounds=self.rounds,
+                     query=Hook(self.query_mod, tuple(map(Side, query_params, self.query_kinds))))
 
     def _walk_setup(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params,
                     initial, drop, table, sources, scales, query_params, *, residuals: Kept, interpret: bool,
@@ -1304,7 +1306,7 @@ class MosaicForward(_Mainloop[Tiles]):
         arguments = ba.arguments
         query, value = arguments["query"], arguments["value"]
         given = (arguments.get("initial"), hooks.drop, arguments.get("table"), arguments.get("sources"),
-                 arguments.get("scales"), hooks.score_mod, hooks.output_mod, self.query_mod)
+                 arguments.get("scales"), hooks.score.fn, hooks.output.fn, self.query_mod)
         walked = (self.scaled or self.bounded or self.masked or self.subtracted or self.splits > 1
                   or self.rounds is not None or arguments.get("residuals") is Kept.SPLIT)
         if any(each is not None for each in given) or walked or self.parts > 1:
@@ -1456,7 +1458,7 @@ def reads_in_key(in_key: bool, key: jax.Array, value: jax.Array, hooks: Hooks | 
     without `in_key`: `in_key` states the operands, never another call. A plain forward keeping its rows
     (`Kept.OUTPUT`, a split decode step's slices) reads the key's slot as one keeping none."""
     group = swizzling.swizzle_columns(key.dtype, swizzling.SWIZZLE_BYTES)
-    return (in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key_mod is None)
+    return (in_key and residuals is not Kept.SPLIT and (hooks is None or hooks.key.fn is None)
             and value.shape[-1] <= key.shape[-1] and value.shape[-1] % group == 0
             and jnp.dtype(key.dtype).itemsize == 2 and table is None and scales is None)
 
@@ -1485,10 +1487,10 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     arguments = ba.arguments
     registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
                                drop=arguments.get("drop"), start=arguments.get("start"))
-    if hooks.query_mod is not None and op.query_mod is None:
+    if hooks.query.fn is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
-        query = prologued(query, hooks.query_mod, hooks.query_params)
-        hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
+        query = prologued(query, hooks.query.fn, hooks.query.sides)
+        hooks = dataclasses.replace(hooks, query=NO_HOOK)
     return config, certified_walk(query, key, value, spans, hooks, scale=op.scale, natural=op.natural,
                                   tiles=config, interpret=interpret, registered=registered,
                                   tmem_columns=target.tmem_columns)
@@ -1505,20 +1507,19 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
     refusals (`attention_decode.plan`). A query prologue its consumers take where they load the query
     (`MosaicForward.query_mod`) where the launch keeping `residuals` holds it at its own config
-    (`_holds_prologue`), else XLA's program before the launch takes it. Score parameters no score hook reads
-    are none of the launch's: no operand, stream or load of them (an unread key bias's stream on tcgen05's
-    rows, whose issuer streams the keys and values alone, was never released and hung the launch)."""
+    (`_holds_prologue`), else XLA's program before the launch takes it. A hook's side operands are its
+    function's (`hooks.Hook`): no score side operand reaches a launch without a score hook to read it (an
+    unread key bias's stream on tcgen05's rows, whose issuer streams the keys and values alone, was never
+    released and hung the launch)."""
     hooks = Hooks() if hooks is None else hooks
     walked_initial(hooks.initial)
-    if hooks.score_mod is None and hooks.score_params:
-        hooks = dataclasses.replace(hooks, score_params=())
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.bf16_part_count(accurate=True) if fp32 else 1
-    if hooks.query_mod is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
+    if hooks.query.fn is not None and (parts > 1 or head_width(query.shape[3]) != query.shape[3]):
         # A query prologue its consumers cannot take where they load the query: an fp32 call's query enters as
         # program before the launch takes it.
-        query = prologued(query, hooks.query_mod, hooks.query_params)
-        hooks = dataclasses.replace(hooks, query_mod=None, query_params=())
+        query = prologued(query, hooks.query.fn, hooks.query.sides)
+        hooks = dataclasses.replace(hooks, query=NO_HOOK)
     if parts > 1:
         # fp32 operands as their bf16 parts, stacked along the batch axis (`MosaicForward.parts`); the
         # output fp32, the call's. Its fold's logits a difference of raw products scaled after it
@@ -1527,28 +1528,28 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
         query, key, value = (product.stacked(x, parts) for x in (query, key, value))
         out_dtype = jnp.float32 if out_dtype is None else out_dtype
         subtracted = True
-    op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
-                       score_kinds=tuple(param.kind for param in hooks.score_params),
-                       output_kinds=tuple(param.kind for param in hooks.output_params),
-                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
-                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
+    op = MosaicForward(score_mod=hooks.score.fn, output_mod=hooks.output.fn,
+                       score_kinds=kinds_of(hooks.score.sides),
+                       output_kinds=kinds_of(hooks.output.sides),
+                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
+                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
                        score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
                        parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded, in_key=in_key,
-                       query_mod=hooks.query_mod,
-                       query_kinds=tuple(param.kind for param in hooks.query_params),
-                       query_dtypes=tuple(jnp.dtype(param.value.dtype).name for param in hooks.query_params),
+                       query_mod=hooks.query.fn,
+                       query_kinds=kinds_of(hooks.query.sides),
+                       query_dtypes=tuple(jnp.dtype(param.value.dtype).name for param in hooks.query.sides),
                        query_width=query.shape[3], query_dtype=jnp.dtype(query.dtype).name)
     args = (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
-            tuple(param.value for param in hooks.score_params),
-            tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,
-            table, sources, scales, tuple(param.value for param in hooks.query_params))
+            tuple(param.value for param in hooks.score.sides),
+            tuple(param.value for param in hooks.output.sides), hooks.initial, hooks.drop,
+            table, sources, scales, tuple(param.value for param in hooks.query.sides))
     if op.query_mod is not None and not _holds_prologue(op, args, residuals):
-        taken = dataclasses.replace(hooks, query_mod=None, query_params=())
-        return _forward_call(prologued(query, hooks.query_mod, hooks.query_params), key, value, spans, taken,
+        taken = dataclasses.replace(hooks, query=NO_HOOK)
+        return _forward_call(prologued(query, hooks.query.fn, hooks.query.sides), key, value, spans, taken,
                              scale=scale, natural=natural, out_dtype=out_dtype, masked=masked, splits=splits,
                              table=table, sources=sources, subtracted=subtracted, scales=scales,
                              scaled=scaled, bounded=bounded, residuals=residuals, in_key=in_key)
@@ -1621,7 +1622,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
              drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
         family = bundle_of(config, query.dtype)
         spans = self.spans(start, end, query_ids, key_ids)
-        hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial, drop=drop)
+        hooks = Hooks(score=Hook(self.score_mod, tuple(map(Side, score_params, self.score_kinds))),
+                      initial=initial, drop=drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
                              family=family):
             raise NotImplementedError(reason)
@@ -2318,8 +2320,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
-        hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
-                      ba.arguments["initial"], drop=ba.arguments["drop"])
+        hooks = Hooks(score=Hook(self.score_mod,
+                                 tuple(map(Side, ba.arguments["score_params"], self.score_kinds))),
+                      initial=ba.arguments["initial"], drop=ba.arguments["drop"])
         if split_queries(family) and not fuses(self.accurate, bool(self.score_kinds)):
             # A device whose backward bundle's consumers feed their own rings (a B200's, consumer
             # Blackwell's) runs the one launch alone, which this form does not take (`fuses`).
@@ -2370,12 +2373,12 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`), its spans an
     interval a query (`KeySpans.per_query`)."""
     hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
-    op = MosaicBackward(score_mod=hooks.score_mod,
-                        score_kinds=tuple(param.kind for param in hooks.score_params),
-                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
+    op = MosaicBackward(score_mod=hooks.score.fn,
+                        score_kinds=kinds_of(hooks.score.sides),
+                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                         score_reduces=hook_reduces(hooks), form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,
                         accurate=accurate, rounded=rounded, score_reads=score_places(hooks),
                         score_slopes=(varying_slopes(hooks, DQ_GRADS), varying_slopes(hooks, DKV_GRADS)))
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
-                tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)
+                tuple(param.value for param in hooks.score.sides), hooks.initial, residuals, hooks.drop)
