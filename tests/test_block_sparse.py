@@ -236,6 +236,34 @@ def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
             assert {int(b) for b in selected[0, group, index] if b >= 0} == _top(scores, top_k, {0, own})
 
 
+def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_past_it():
+    """InfLLM-V2's attention (`infllm_attention`): a call of fewer keys than its dense cut is the plain causal
+    call's output, bit for bit; one of more, each query reading its selected blocks alone
+    (`infllm_selection`'s), has its output and every gradient on par with the reference attention over that
+    selection's dense mask (check 1)."""
+    rows, queries, heads, groups, width = 1, 256, 8, 2, 32
+    shape = {"block": 16, "top_k": 3, "kernel": 8, "stride": 4}
+    draw = _drawn(rows, queries, heads, groups, width)
+    query, key, value, _ = draw(0)
+    short = block_sparse.infllm_attention(query, key, value, **shape)
+    np.testing.assert_array_equal(np.asarray(short),
+                                  np.asarray(scaled_dot_product_attention(query, key, value, causal=True)))
+
+    def ours(query, key, value):
+        return block_sparse.infllm_attention(query, key, value, dense_below=queries, **shape)
+
+    def reference(query, key, value):
+        # Each query's selected blocks' keys up to its own, a group's mask its query heads'.
+        selected = jax.lax.stop_gradient(block_sparse.infllm_selection(query, key, **shape))
+        place = jnp.arange(queries)
+        chosen = jnp.any(selected[..., None] == (place // shape["block"]), axis=-2)
+        dense = jnp.repeat(chosen & (place[None, :] <= place[:, None]), heads // groups, axis=1)
+        return scaled_dot_product_attention(query, key, value, mask=dense, implementation="xla")
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), draw,
+                    "InfLLM-V2's attention past its dense cut", seeds=SEEDS)
+
+
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
     """NSA's attention (`nsa_attention`): the compressed branch (each compressed key `length` keys every
     `stride`, read once a query reaches its last), the selected blocks its weights pick (through the

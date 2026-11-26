@@ -5,7 +5,8 @@ A selection is each query's key blocks `[B, R, Q, S]` (-1 where it selects none;
 query head's), from a scoring pass the model runs in XLA, selecting through
 `dew.nn.sparse_selection.top_k_selection`: MoBA's gate over chunk-mean keys (`moba_selection`), NSA's
 compressed branch's weights (`nsa_selection`), MiniMax's learned indexer max-pooled to blocks
-(`pooled_selection`), InfLLM-V2's two-window pooling (`infllm_selection`) or a caller's block mask
+(`pooled_selection`), InfLLM-V2's two-window pooling (`infllm_selection`; its attention, dense below 8192
+keys, `infllm_attention`) or a caller's block mask
 (`masked_selection`). `dew.nn.sparse_selection.selected_attention` runs it, each selected block one of the
 key runs `scaled_dot_product_attention` takes (`key_runs`), which the template's mainloops walk as the
 selected tiles alone (`attention_mosaic_program.indexed_walk`): work a query block's selected blocks, not
@@ -242,6 +243,31 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     scores = jax.lax.reduce_window(padded, -jnp.inf, jax.lax.max, (1, 1, 1, span), (1, 1, 1, step),
                                    "VALID")[..., :blocks]
     return top_k_selection(scores, earlier, top_k, forced=forced)
+
+
+INFLLM_DENSE_BELOW = 8192
+"""The keys below which InfLLM-V2 attends densely (kernel-templates.md §A row 60), the plain causal call: its
+short calls' path, a selection of 64 blocks of 64 near every key of them anyway."""
+
+
+def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, block: int = 64, top_k: int = 64,
+                     kernel: int = 32, stride: int = 16, initial: int = 1, local: int = 1,
+                     dense_below: int = INFLLM_DENSE_BELOW, implementation: AttentionImpl = "auto",
+                     **options) -> jax.Array:
+    """InfLLM-V2's attention (kernel-templates.md §A row 60): a call over fewer than `dense_below` keys the
+    plain causal call; a longer one each query's selected blocks (`infllm_selection`: the `top_k` of its
+    earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the `local`
+    ending at its own forced) through the template's indexed form (`selected_attention`), reading those
+    blocks' keys alone. `query` `[B, Q, G * h, D]`, `key` and `value` `[B, K, G, D]`, a causal call whose
+    queries are its keys; `options` the call's other arguments. The selection takes no gradient."""
+    keys = key.shape[1]
+    if keys < dense_below:
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation,
+                                            **options)
+    selected = infllm_selection(query, key, block=block, top_k=top_k, kernel=kernel, stride=stride,
+                                initial=initial, local=local)
+    return selected_attention(query, key, value, selected, block_runs(keys, block),
+                              implementation=implementation, **options)
 
 
 def masked_selection(mask: jax.Array, block_q: int, *, queries: int, most: int) -> jax.Array:
