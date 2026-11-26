@@ -892,7 +892,7 @@ class Trainer(Generic[Loss, Effects]):
         _refuse_lost_waiting(state, checkpoints, resume)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
-        self._compiler.resume_rung(checkpoints.rung(resume))
+        self._compiler.resume_rung(checkpoints._rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
         differs = computation_differs(self, checkpoints, resume)
         if differs:

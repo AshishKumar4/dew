@@ -1598,7 +1598,7 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
             # resume's.
             from dew.training.compiler import resumed_stepping
 
-            trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+            trainer._compiler.resume_rung(trainer.checkpoints._rung(start.resume))
             resumed = resumed_stepping(
                 trainer._stepping(), trainer.checkpoints.window_size(start.resume),
                 held=start.abstract.window is not None, pools=start.abstract.window is not None,
