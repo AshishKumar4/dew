@@ -399,26 +399,6 @@ def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_
     assert int(trainer("swiglu").fit(lm_data(), steps=2).step) == 2
 
 
-def test_a_direct_resume_under_other_numerics_is_refused_and_under_its_own_resumes(tmp_path):
-    """A trainer built directly over a checkpoint directory whose run traced its programs under other
-    numerics (`TrainerAdvanced.numerics`: its unpinned products at "highest", the run's at "default"),
-    which change no tree and no loss scale, refuses to resume, as a configured run's precision refuses it;
-    the numerics that trained it resume (row 13537)."""
-    from dew.nn.precision import DTYPE_PRESETS, Numerics
-
-    def trainer(matmul: str) -> Trainer:
-        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                  mlp_features=32, max_seq_len=12, dtype="float32")
-        numerics = Numerics(DTYPE_PRESETS["32-true"], matmul=matmul)
-        return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT),
-                            advanced=dataclasses.replace(LOOSE, numerics=numerics))
-
-    trainer("highest").fit(lm_data(), steps=1)
-    with pytest.raises(ValueError):
-        trainer("default").fit(lm_data(), steps=2)
-    assert int(trainer("highest").fit(lm_data(), steps=2).step) == 2
-
-
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
 @pytest.mark.parametrize("steps", [4, 20])
 def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, steps):

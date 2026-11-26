@@ -356,7 +356,7 @@ def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
     nothing states, one CPU, `max_workers` 0) its first batch, read with no thread reading ahead, is the
     only one it made, no sample made beside it (row 13540: up to nine batches decoded at startup and made
     again)."""
-    chain = Pipeline(Memory(_Indexed(30))).map(_Counted()).batch(4)
+    chain = Pipeline(Memory(_Indexed(30))).map(_Counted()).repeat().batch(4)
     for host, steps, most in ((TWO_CPUS, None, None), (Host(1, 2**34, worker_start=1.0), 10**6, None),
                               (TWO_CPUS, 10**6, 0)):
         _Counted.made = 0
@@ -1552,15 +1552,19 @@ def test_a_validation_split_needs_no_training_records():
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     """Token ids of varying length are the usual cause, and grain's own
     message names the batch structure rather than what to change. Automatic
-    loading samples a batch to size its buffers, so compiling refuses them;
-    with loading set by hand, the first batch does."""
+    loading sizing workers samples batches to size them by, so compiling a
+    run of a stated length on a host of CPUs refuses them; where it sizes none
+    (a run of no stated length, `Loading.selects_none`) and with loading set by
+    hand, the first batch does."""
     rows = [{"text": np.arange(length, dtype=np.int32)} for length in (3, 5, 4, 6)]
     with pytest.raises(ValueError):
-        _records(rows, 2, loading=Loading(workers="auto"))
-    stream = _records(rows, 2).train(DataPartition())
-    with pytest.raises(ValueError):
-        next(stream)
-    stream.close()
+        compile(Pipeline(Memory(rows)).map(Formatting()).repeat().batch(2), seed=0, steps=10**6,
+                loading=Loading(workers="auto", host=TWO_CPUS))
+    for loading in (Loading(workers="auto"), None):
+        stream = _records(rows, 2, loading=loading).train(DataPartition())
+        with pytest.raises(ValueError):
+            next(stream)
+        stream.close()
 
 
 def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
