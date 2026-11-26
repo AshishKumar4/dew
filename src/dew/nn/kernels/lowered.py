@@ -48,6 +48,9 @@ class KernelCall:
     operands: tuple[tuple[int, ...], ...] = ()
     """The shapes of the arrays the call reads, as its program reads them: a device's shard's where the
     call runs per shard (within a `shard_map`), the whole array's otherwise."""
+    signature: tuple[tuple[tuple[int, ...], str], ...] = ()
+    """Each array the call reads, then each it returns, as its shape and element type: what a device's call
+    is, operand for operand and result for result (a per-shard launch's against one device's)."""
     caller: str | None = None
     """The launch that traced a Mosaic GPU kernel, as its call's caller states it (`report.launch_metadata`),
     beside its name; None where its call states none."""
@@ -337,7 +340,10 @@ def kernel_call(target: str, operation: ir.Operation) -> KernelCall | None:
     kind = custom_call_kind(target)
     if kind == "no_matmul":
         return None
-    return dataclasses.replace(_kernel_call(kind, target, operation), operands=_shapes(operation.operands))
+    signature = tuple((tuple(each.shape), str(each.element_type))
+                      for each in _ranked([*operation.operands, *operation.results]))
+    return dataclasses.replace(_kernel_call(kind, target, operation), operands=_shapes(operation.operands),
+                               signature=signature)
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:

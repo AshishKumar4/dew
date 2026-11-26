@@ -690,22 +690,27 @@ PER_SHARD_KERNELS = {"selective scan": ("selective_scan",), "packed recurrence":
 """The name prefixes of an op's own kernels, where its step launches others too (a layer's projections, the
 GEMM's)."""
 
-def _kernel_launches(loss, args, generation: str, devices: int,
-                     prefix: tuple[str, ...] = ("",)) -> tuple[list, list]:
-    """The Pallas launches (`kernel_calls`, each a compile compiles) of `loss`'s value and gradient lowered
-    for `generation`'s GPU on an abstract mesh of `devices` that splits the rows, those whose kernel's name
-    starts with one of `prefix`, and the program's operations (`_operations`)."""
-    from jax.sharding import AbstractMesh, AxisType
-
+def _own_launches(lowered: jax.stages.Lowered, prefixes: tuple[str, ...] = ("",)) -> list:
+    """The Pallas launches of `lowered` (`kernel_calls`, each a compile compiles) whose kernel's name starts
+    with one of an op's `prefixes` (`PER_SHARD_KERNELS`): its own, a layer's projections' (the GEMM's)
+    apart."""
     from dew.nn.kernels.lowered import kernel_calls
+
+    return [call for call in kernel_calls(lowered, unrun=True)
+            if call.kind in ("triton", "mosaic_gpu") and call.name.startswith(prefixes)]
+
+
+def _kernel_launches(loss, args, generation: str, devices: int,
+                     prefixes: tuple[str, ...]) -> tuple[list, list]:
+    """An op's own launches (`_own_launches`) of `loss`'s value and gradient lowered for `generation`'s GPU
+    on an abstract mesh of `devices` that splits the rows, and the program's operations (`_operations`)."""
+    from jax.sharding import AbstractMesh, AxisType
 
     mesh = gpu_mesh(AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss, argnums=tuple(range(len(args))))).trace(*args).lower(
             lowering_platforms=("cuda",))
-    calls = [call for call in kernel_calls(lowered, unrun=True)
-             if call.kind in ("triton", "mosaic_gpu") and call.name.startswith(prefix)]
-    return calls, _operations(lowered)
+    return _own_launches(lowered, prefixes), _operations(lowered)
 
 
 @pytest.mark.parametrize(("generation", "op"),
@@ -1047,15 +1052,14 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     template on the global rows, and each layer's offsets took 97 loops of a token an iteration (row 1897,
     bible 7's multi-device lowering). The final executable's loops need a GPU's compile; this proves their
     cause absent from the program it compiles."""
-    from dew.nn.kernels.lowered import kernel_calls
-
     (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
     operations = _operations(sharded)
 
     def recurrences(lowered) -> list:
-        # The recurrence's own launches: its projections' (the GEMM's) run on XLA's mesh, not a map's.
-        return [call.operands for call in kernel_calls(lowered, unrun=True)
-                if call.kind == "mosaic_gpu" and call.name.startswith(PER_SHARD_KERNELS["packed recurrence"])]
+        # The recurrence's own Mosaic GPU launches, each its operands' and results' shapes and types: its
+        # projections' (the GEMM's) run on XLA's mesh, not a map's.
+        return [call.signature for call in _own_launches(lowered, PER_SHARD_KERNELS["packed recurrence"])
+                if call.kind == "mosaic_gpu"]
 
     calls = recurrences(sharded)
     assert calls and calls == recurrences(local)
