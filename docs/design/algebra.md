@@ -1677,9 +1677,10 @@ about it is an estimate.
   store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-
   order form is checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8
   steps: no cheaper program within the windows (none found within the search's budgets: windows of at most
-  three inputs, bounded rounds and solver timeouts; not a proof that none exists). `formats.MxFp8`'s
-  scale decoding uses `bits.e8m0_decoded` and its E8M0 form. A free-layout FP8 weight decoder is not
-  served by sm80's W8A8 GEMM yet (row 8548); the sm80 attention-cache path is separate (row 8549).
+  three inputs, bounded rounds and solver timeouts; not a proof that none exists). The exact portable
+  `formats.MxFp8` decode applies that stored exponent to each code's significand before rounding to
+  the destination format. A free-layout FP8 weight decoder is not served by sm80's W8A8 GEMM yet
+  (row 8548); the sm80 attention-cache path is separate (row 8549).
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
   must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
   byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the

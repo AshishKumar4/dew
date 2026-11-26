@@ -213,6 +213,27 @@ def test_a_biased_sum_holds_every_order(edge):
     assert_contract(precision.biased, primals, direction, cotangent, f"a biased sum {edge}", plain_fn=plain)
 
 
+def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
+    codes = np.ones((2, 32), jnp.float8_e4m3fn)
+    stored = np.asarray([[0], [127]], np.uint8).view(jnp.float8_e8m0fnu)
+    incoming = np.broadcast_to(np.asarray([[2.0 ** 125], [0.5]], np.float32), codes.shape)
+
+    @jax.jit
+    def orders(values, scales, incoming):
+        def decode(codes):
+            return formats.MxFp8(codes, scales).decoded()
+
+        value, tangent = jax.jvp(decode, (values,), (jnp.ones_like(values),))
+        _, pull = jax.vjp(decode, values)
+        return value, tangent, pull(incoming)[0]
+
+    value, tangent, gradient = orders(codes, stored, incoming)
+    expected = np.broadcast_to(np.asarray([[2.0 ** -127], [1]], np.float32), codes.shape)
+    for found in (value, tangent):
+        np.testing.assert_array_equal(np.asarray(found).view(np.uint32), expected.view(np.uint32))
+    np.testing.assert_array_equal(gradient, np.broadcast_to([[0.25], [0.5]], codes.shape))
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):
     """`projections.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared
