@@ -101,11 +101,12 @@ def _giant_jvp(threshold: float, eps: float, primals, tangents):
     part kept apart so epsilon's share survives where `|y| / (|y| + eps s)` rounds to 1, and `g` applied
     whole where it is normal, else as `v threshold / (|y| + eps s) s` over the operands' significands
     (`binades.balanced`). The scale is constant (no
-    tangent). Its contract: the first derivative exact across the format's range for a seed whose
-    projection on the head, `u . dx`, is finite, but for a component or a product of terms below its normal
-    range relative to the head (`2^-126` of its largest in fp32), which flushes as any norm of a scaled head
-    does (row 13152); a seed whose projection overflows (seeds near the format's largest along the head),
-    and higher orders, which are JAX's derivatives of this expression, are row 13232's."""
+    tangent). Its contract: the first derivative exact across the format's range, the head's at any size,
+    for a seed whose entries are each below `2^(maxexp - 1) / D` (D the head's width: `2^123` for 8 in fp32),
+    so its projection `u . dx` and its parts `dx - u (u . dx)` stay finite, but for a component or a product
+    of terms below the normal range relative to the head (`2^-126` of its largest in fp32), which flushes as
+    any norm of a scaled head does (row 13152); a larger seed, whose own parts overflow before the gain
+    brings them back, and higher orders, which are JAX's derivatives of this expression, are row 13232's."""
     from .kernels.generation import linear_map
 
     (x, factor), (tangent, _) = primals, tangents
