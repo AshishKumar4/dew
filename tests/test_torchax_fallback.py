@@ -1727,10 +1727,8 @@ MIXTRAL = {**TINY, "num_key_value_heads": 2, "num_local_experts": 4, "num_expert
 @attending("reference")
 def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_path):
     """A Mixtral taken to tier 3, its routed experts asked of transformers' experts interface (`EXPERTS`):
-    Dew's grouped dispatch computes every layer's (`_dew_experts`, a program attested token by token), and
-    its logits over drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
-    from dew.interop.sequence_causality import TOKENWISE, attestation
-
+    Dew's grouped dispatch computes every layer's (`_dew_experts`, its ragged products), and its logits over
+    drawn ids hold check 1 against transformers' eager experts, its float64 twin the truth."""
     torch.manual_seed(0)
     model = transformers.MixtralForCausalLM(transformers.MixtralConfig(**MIXTRAL)).eval()
     model.save_pretrained(tmp_path)
@@ -1738,10 +1736,11 @@ def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_
     assert isinstance(loaded, PretrainedFallback)
     forward = jax.jit(loaded.model.apply)
     tokens = token_draw(0x13044, MIXTRAL["vocab_size"], (2, 12))
-    # Each layer's experts a program Dew's dispatch attests token by token (`_dew_experts`).
+    # Each layer's experts Dew's grouped products over the rows sorted by expert (`_dew_experts`), which
+    # lower to ragged products where transformers' batched products are dense ones.
     program = jax.make_jaxpr(loaded.model.apply)(loaded.variables, *tokens(0))
-    dispatched = [eqn for eqn in equations(program) if attestation(eqn) == TOKENWISE]
-    assert len(dispatched) == MIXTRAL["num_hidden_layers"], len(dispatched)
+    ragged = [eqn for eqn in equations(program) if eqn.primitive.name.startswith("ragged_dot")]
+    assert len(ragged) >= MIXTRAL["num_hidden_layers"], len(ragged)
 
     def built(dtype):
         built = transformers.AutoModelForCausalLM.from_config(
