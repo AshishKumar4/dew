@@ -1438,13 +1438,12 @@
 "tests/test_decoder_export.py::test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors"
 ],
 "tests/test_decoder_remat.py": [
-"tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[False-minimal_offloaded]",
-"tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[False-save_dot_except_mlp]",
-"tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[True-all_but_delta_memory]",
+"tests/test_decoder_remat.py::test_checkpoint_resumes_with_remat_switched[full]",
+"tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[False-minimal_with_scan_and_conv]",
+"tests/test_decoder_remat.py::test_named_policies_train_the_same_model_as_full[False-save_qkv_proj]",
 "tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[altup-False]",
 "tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[dense-False]",
-"tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[mla-False]",
-"tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[mla-True]",
+"tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[dense-True]",
 "tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[shared-False]",
 "tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[shared-True]",
 "tests/test_decoder_remat.py::test_recomputed_blocks_train_the_same_model[sparse-False]",
@@ -1452,8 +1451,9 @@
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[False-dense]",
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[False-sparse]",
 "tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-dense]",
-"tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-altup]",
-"tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-altup]"
+"tests/test_decoder_remat.py::test_recomputed_pipeline_preserves_updates_and_sown_values[True-sparse]",
+"tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[False-dense]",
+"tests/test_decoder_remat.py::test_remat_prefills_and_appends_the_same_cache[True-dense]"
 ],
 "tests/test_decoding_strategies.py": [
 "tests/test_decoding_strategies.py::test_an_undefined_distribution_raises_instead_of_returning_a_token"
