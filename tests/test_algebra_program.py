@@ -415,23 +415,23 @@ def test_a_program_the_pass_rewrites_is_traced_once_at_the_compile_point():
                                   jax.jit(algebra.rewritten(two_sums))(*operands))
 
 
-def test_floating_counts_stay_separate_when_the_combined_count_could_round():
+@pytest.mark.parametrize(("length", "reductions"), [(128, 1), (129, 2)])
+def test_floating_count_join_respects_the_accumulators_exact_integer_range(length, reductions):
     def counted(x, y):
-        return jnp.sum((x > 0).astype(x.dtype)) + jnp.sum((y > 0).astype(y.dtype))
+        return jax.lax.reduce_sum((x > 0).astype(x.dtype), (0,)) + jax.lax.reduce_sum((y > 0).astype(y.dtype), (0,))
 
-    x = jnp.ones((129,), jnp.bfloat16)
+    x = jnp.ones((length,), jnp.bfloat16)
     y = x.at[0].set(0)
     run = algebra.rewritten(counted)
     traced = jax.make_jaxpr(run)(x, y)
-    assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in equations(traced.jaxpr)) == 2
+    assert sum(eq.primitive is jax.lax.reduce_sum_p for eq in equations(traced.jaxpr)) == reductions
     np.testing.assert_array_equal(jax.jit(run)(x, y), jax.jit(counted)(x, y))
 
 
 def _clamped_products(x, a, b, lower, upper, operand=jnp.tanh):
-    """A clamped value (of `operand(x)`) read by two products of bounded values, which the pass joins into
-    one product of their sum."""
+    """A clamped value read by both products of an elementwise sum, eligible for distributivity."""
     clamped = jax.lax.clamp(lower, operand(x), upper)
-    return jnp.sum(clamped * jnp.tanh(a), axis=-1) + jnp.sum(clamped * jnp.tanh(b), axis=-1)
+    return jnp.sum(clamped * jnp.tanh(a) + clamped * jnp.tanh(b), axis=-1)
 
 
 CLAMP_EDGES = np.asarray([np.inf, -np.inf, 0.0, -0.0, 0.3, 1.0, -2.0, 5.0, 2.0 ** -140], np.float32)
@@ -805,27 +805,20 @@ def test_a_program_thousands_of_equations_deep_is_rewritten_around_what_the_rule
     assert_as_exact(jax.jit(algebra.rewritten(deep)), jax.jit(deep), draw, "two sums after a deep chain",
                     seeds=8)
 
-def test_a_scale_after_a_contraction_moves_onto_its_smaller_operand():
-    """A contraction's result scaled by a power of two (a derived walk's `ds k * scale`, docs/design/
-    algebra.md §1.4) scales its smaller operand instead, the product being linear in each and the scale
-    rounding nothing: the rewritten program takes that cheaper form (4 x 4 values multiplied where 4 x 16
-    were), on par with the program as written against the float64 truth (check 1). A scale of another value
-    is rewritten into nothing, as moving it reorders rounding."""
+@pytest.mark.parametrize("factor", [0.25, 0.3])
+def test_a_scale_after_a_contraction_stays_after_the_product(factor):
+    """A bounded contraction has no lower-range proof for its operands or their products."""
     def scaled(g, i):
-        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.25
-
-    def other(g, i):
-        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * 0.3
+        return jnp.dot(jnp.tanh(g), jnp.tanh(i)) * factor
 
     g, i = rows(6, (4, 4), (4, 16))
-    assert not cheaper_spliced(other, g, i)
-    assert cheaper_spliced(scaled, g, i)
+    assert not cheaper_spliced(scaled, g, i)
 
     def draw(seed):
         return rows(seed, (4, 4), (4, 16))
 
     assert_as_exact(jax.jit(algebra.rewritten(scaled)), jax.jit(scaled), draw,
-                    "a scale through a contraction", seeds=16)
+                    "a scalar kept after its contraction", seeds=16)
 
 
 @pytest.mark.parametrize("scaled", ["left", "right"])
