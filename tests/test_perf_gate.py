@@ -53,20 +53,18 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     assert gate.main() == 1
     standing_in(gate, monkeypatch, passed=True)
     stood_in = gate.subprocess.run
+    probe = next(probe for probe in gate.PROBES if probe.tool == "benchmark_step.py")
 
     def failing(command, **kwargs):
-        if Path(command[1]).name == "benchmark_forward.py":
+        if Path(command[1]).name == probe.tool:
             return subprocess.CompletedProcess(command, 3, "", "out of memory")
         return stood_in(command, **kwargs)
 
     monkeypatch.setattr(gate.subprocess, "run", failing)
-    args = SimpleNamespace(only=["forward"], claim=False, model="unused", flowers="unused",
+    args = SimpleNamespace(only=[probe.rows[0].name], claim=False, model="unused", flowers="unused",
                            torch_python="torch", out=tmp_path / "run.json")
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False)
-    forwards = [row.name for probe in gate.PROBES
-                if probe.tool == "benchmark_forward.py" and gate.chosen(probe, args.only) for row in probe.rows]
-    assert forwards
-    assert all(sample[name].startswith("failed: benchmark_forward.py exited 3") for name in forwards)
+    assert all(sample[row.name].startswith(f"failed: {probe.tool} exited 3") for row in probe.rows)
 
 
 def test_a_selection_of_no_row_is_refused_before_setup_and_an_empty_receipt_fails(
