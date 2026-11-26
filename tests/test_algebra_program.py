@@ -2095,6 +2095,8 @@ def test_process_digest_keeps_repeated_descriptors_in_equation_order():
 
 def test_equal_string_parameters_with_distinct_encodings_stay_distinct():
     class Mode(str):
+        direction: int
+
         def __new__(cls, direction):
             value = super().__new__(cls, "fold")
             value.direction = direction
@@ -2105,7 +2107,7 @@ def test_equal_string_parameters_with_distinct_encodings_stay_distinct():
 
     first, second = Mode(1), Mode(-1)
     shape = jax.ShapeDtypeStruct((4,), jnp.float32)
-    traced = jax.make_jaxpr(lambda x: -(-x))(shape)
+    traced = jax.make_jaxpr(lambda x: jax.lax.neg(jax.lax.neg(x)))(shape)
     head, tail = traced.eqns
     head = head.replace(params={"mode": first})
     same = traced.replace(jaxpr=traced.jaxpr.replace(eqns=[head, tail.replace(params={"mode": first})]))
