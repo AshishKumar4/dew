@@ -145,6 +145,32 @@ def test_a_masked_call_with_a_heads_sinks_picks_its_kernel():
         assert mask_kernel("auto", query, key, as_bias=True, sinks=True) != "cudnn"
 
 
+def test_a_decode_step_under_accurate_numerics_streams_on_the_template():
+    """A bf16 decode step with a head's sinks on an H100 under a run's accurate numerics (`Numerics(forms=
+    "accurate")`): the decode kernel and cuDNN, which compute the fast form alone, refuse it when named, and
+    the call left to its selector forms no whole score array (`_scores_whole`), the template's decode
+    streaming it ahead of the reference path; the decode kernel ran it in its fast form (the 2026-11-26
+    audit's decode finding)."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import KernelRefused
+    from dew.nn.precision import Numerics
+
+    def attend(**options):
+        sinks = jnp.zeros((4,), jnp.float32)
+        return lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, sinks=sinks, key_value_seq_lengths=lengths, **options)
+
+    step, cache = jnp.zeros((2, 1, 4, 128), jnp.bfloat16), jnp.zeros((2, 4096, 4, 128), jnp.bfloat16)
+    lengths = jnp.asarray([3000, 2000], jnp.int32)
+    with generation.assumed("sm90"), generation.run_precision(Numerics(forms="accurate")):
+        for named in ("decode", "cudnn"):
+            with generation.chosen(decode=named), pytest.raises(KernelRefused) as refused:
+                jax.eval_shape(attend(), step, cache, cache)
+            assert "form" in {refusal.code for refusal in refused.value.refusals}
+        assert not _scores_whole(attend(), step, cache, cache)
+
+
 @pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
 def test_a_masked_key_weighs_nothing_beside_a_sink_however_low_its_logit(heads, kv_heads, dtype):

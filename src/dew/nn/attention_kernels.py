@@ -958,8 +958,9 @@ _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel a
                 "decode at every fp32 decode shape timed, its products IEEE fp32 as theirs (`highest`; wall "
                 "a step over 50 steps in one loop, interleaved rounds, 1 to 128 rows over 4096 and 32768 "
                 "keys, 32 or 16 query heads over 8, 128 or 64 wide): {}")
-DECODE_XLA = Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True)
-"""A decode step's xla attention (the folded attention, `folded_attention`)."""
+DECODE_XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
+"""A decode step's xla attention (the folded attention, `folded_attention`), the fast form's alone, as
+attention's xla kernel (`XLA`)."""
 
 DECODE_DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
     ('sm80', CallKind.of(jnp.float32, decode=True)): (DECODE_XLA, _FP32_DECODE.format(
@@ -979,18 +980,20 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
-    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, _HEAD_SINKS, *decode_attention.SUPPORTS)),
-    Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
+    Kernel[AttentionCase]('decode', (_FAST, _WHOLE_PRODUCTS, _HEAD_SINKS, *decode_attention.SUPPORTS)),
+    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
-    Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
+    Kernel[AttentionCase]('reference', (), generic=True),
 ), _decode_preferred, _unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
 kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the run's declared products
-(`decode_attention.PRODUCTS`); the attention template's decode (`attention_decode.attend`, through
+(`decode_attention.PRODUCTS`), the fast form's alone (`_FAST`: a run's accurate numerics, the 2026-11-26
+audit found, ran them anyway); the attention template's decode (`attention_decode.attend`, through
 `attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
-until it measures faster than the decode kernel (rows 4042 to 4045, 4075)."""
+until it measures faster than the decode kernel (rows 4042 to 4045, 4075), and ahead of the reference path,
+whose scores are whole, where every kernel before it refuses the call."""
 
 
 def reverse_only(kernel: str) -> bool:
