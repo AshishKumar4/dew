@@ -40,6 +40,8 @@ class _Fragment:
             if all(name not in self.bound for name in _reads(value)):
                 return self.input(value)
             return Layout(tuple(n if isinstance(n, int) else self.dimension(n) for n in value.dimensions))
+        if isinstance(value, tuple) and all(type(n) is int for n in value):
+            return self.input(value)
         if isinstance(value, Literal) and value.integer is not None:
             original = value.integer
             integer = self.operand(original) if isinstance(original, Ref) else self.input(original)
