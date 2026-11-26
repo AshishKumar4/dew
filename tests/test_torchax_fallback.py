@@ -2087,7 +2087,8 @@ def test_a_looped_tier_3_source_trains_at_a_count_each_microbatch_draws(tmp_path
     transformers.LlamaForCausalLM(transformers.LlamaConfig(**LLAMA)).save_pretrained(tmp_path)
     loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     looped = loaded.model.with_loop(Loop(steps=3, layers=(0, 1), step_norm=False))
-    (ids,) = token_draw(0x13144, LLAMA["vocab_size"], (2, 12))(0)
+    # A row a device of the trainer's data axis (a CPU run's eight).
+    (ids,) = token_draw(0x13144, LLAMA["vocab_size"], (8, 12))(0)
     counted = jax.jit(lambda variables, ids, passes: looped.apply(variables, ids, method="logits",
                                                                   loop_passes=passes))
     for count in (1, 2, 3):
