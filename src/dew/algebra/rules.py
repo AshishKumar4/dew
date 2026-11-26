@@ -1030,11 +1030,9 @@ register(Rules.declared("linear", "reorders", _linear(),
 register(Rules.declared("reuse", "reorders", _reuse(),
                         "docs/design/algebra.md §1.4; the reuse probe of 2026-11-05 (benchmark_step and the "
                         "parallelism matrix: 42 to 452 of 423 to 794 divisions a suite share a divisor), "
-                        "each reciprocal guarded by its divisor's floor and bound (row 9035). Dev time "
-                        "until its receipt is measured (row 9777): of the nine perf-gate steps compiled "
-                        "ahead for an H100, it changes finetune-4b's program alone (the survey of "
-                        "2026-11-20, every set against it left out, A/A digests equal), whose timing with "
-                        "and without it is M-DC-14's",
+                        "each reciprocal guarded by its divisor's floor and bound (row 9035). Dev-only "
+                        "pending the default-route SimpleDiT-B native receipt (row 9777; M-AL-2). "
+                        "Compile-only optimized HLO changes, but do not establish accuracy or speed",
                         dev=True))
 register(Rules.declared("joined", "reorders", _joined(),
                         "docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it "
