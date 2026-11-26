@@ -1538,6 +1538,8 @@ chunks and reduces the signed products before dividing and landing. This preserv
 stationary coefficient cancels without materializing a grid of sample pairs (row 13063).
 Weighted moments exclude nonfinite observations of exactly zero weight, including their weight
 directions. A finite observation at zero weight retains its one-sided weight derivative.
+Direct covariance returns each variable's own marginal mean, independent of the other marginal's shape
+or missing observations. Its covariance term centers and differentiates only pairs that are present.
 
 **The proof of the emitted arithmetic.** With `u = 2^-24` and `gamma_n = n u / (1 - n u)`: each term is within
 `gamma_(K+5)` of its real value (a mass's three products, the total's `K - 1` sums, the correctly rounded

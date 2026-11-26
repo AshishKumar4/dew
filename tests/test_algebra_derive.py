@@ -1077,6 +1077,37 @@ def test_direct_weighted_broadcast_keeps_marginal_shapes_and_counts_each_weight_
     np.testing.assert_array_equal(moved, [8, 0])
 
 
+@pytest.mark.parametrize("singleton", [False, True], ids=["flat", "broadcast"])
+def test_direct_covariance_keeps_each_marginals_own_zero_weight_direction(singleton):
+    from dew.algebra import moments
+
+    x = np.asarray([1, 3], np.float32)
+    y = np.asarray([2, np.inf], np.float32)
+    if singleton:
+        y = y[None]
+    weights = np.asarray([1, 0], np.float32)
+    direction = np.asarray([0, 1], np.float32)
+
+    @jax.jit
+    def evaluate(x, y, w, dw):
+        def covariance(w):
+            return moments.weighted_covariance(x, y, w)
+
+        primal, tangent = jax.jvp(covariance, (w,), (dw,))
+        gradient = jax.grad(lambda w: covariance(w)[2].sum())
+        _, second = jax.jvp(gradient, (w,), (dw,))
+        return primal, tangent, second
+
+    (mean_x, mean_y, cov), (dx, dy, dc), second = evaluate(x, y, weights, direction)
+    shape = y.shape[:-1]
+    np.testing.assert_array_equal(mean_x, np.asarray(1, np.float32))
+    np.testing.assert_array_equal(dx, np.asarray(2, np.float32))
+    np.testing.assert_array_equal(mean_y, np.full(shape, 2, np.float32))
+    for part in (cov, dy, dc):
+        np.testing.assert_array_equal(part, np.zeros(shape, np.float32))
+    np.testing.assert_array_equal(second, np.zeros_like(weights))
+
+
 @pytest.mark.parametrize("mode", ["direct", "walk", "merge"])
 def test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions(mode):
     from dew.algebra import moments
