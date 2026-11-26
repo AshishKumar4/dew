@@ -84,9 +84,11 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     `2^-12 * 2^-149` flushes). Each step a product or a division by a significand or an exact power, held
     constant: kept in the result's range as a map of `value`, rounded once a step (a product, two quotients
     and the rescale: as many roundings as PyTorch's order, so a result within those ulps of the largest
-    finite value may round past it); its derivatives in the other operands are JAX's
-    of this expression, whose terms may leave the range at its edges (row 13232). A float64 subnormal is its
-    value only where the backend keeps one."""
+    finite value may round past it); the other operands held constant, no derivative taken in them (row
+    13232). A float64 subnormal is its value only where the backend keeps one."""
+    # The other operands held constant: a derivative in them would stage this expression again at every
+    # order, and the callers' are taken by PyTorch's order where it is clean (row 13232).
+    multipliers, divisors = jax.lax.stop_gradient((tuple(multipliers), tuple(divisors)))
     exponent = _binade(value)
     significands = over_power(value, exponent)
     for multiplier in multipliers:
@@ -100,38 +102,37 @@ def balanced(value: jax.Array, multipliers: Sequence[jax.Array],
     return _scaled_by(significands, exponent)
 
 
-def over_denominator(tangent: jax.Array, numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
+                     denominator: jax.Array) -> jax.Array:
     """The size of `n / d`'s tangent in its denominator, `t n / d^2`, a linear map of `t` that is its own
-    transpose (`generation.linear_map`, so reverse mode evaluates it alike): `t ((n / d) / d)` as PyTorch's
-    backward divides, each quotient rounded once, where both quotients and the product are normal or `t` is
-    zero, or an operand is special (a zero, an infinity, a NaN: IEEE's result); else `balanced(t, (n,), (d,
-    d))` (2^20 / 2^-60 under 2^-60 is 2^80; 4 / 2^-128 under 2^-149 is 2^109; 2^-149 / 2^-140 under 2^-12
-    is 2^119 and pulls 2^-145 back to 2^-14; 2^-100 / 2^30 under 2^100 is 2^-60, where `n / d` underflows;
-    a zero seed is zero beside an infinite `(n / d) / d`: the 2026-11-26 audit and its review). Each branch
-    is plain arithmetic. Its contract: every first derivative (the tangent and its pullback) exact across
-    fp32's full range; higher orders are JAX's derivatives of the balanced expression, which may overflow or
-    flush a term at the range's edges (row 13232)."""
+    transpose (`generation.linear_map`, so reverse mode evaluates it alike): `t (q / d)` of the division's
+    quotient `q` as PyTorch's backward divides, each quotient rounded once, where `q`, `q / d` and the
+    product are normal or `t` is zero, or an operand is special (a zero, an infinity, a NaN: IEEE's result);
+    else `balanced(t, (n,), (d, d))` (2^20 / 2^-60 under 2^-60 is 2^80; 4 / 2^-128 under 2^-149 is 2^109;
+    2^-149 / 2^-140 under 2^-12 is 2^119 and pulls 2^-145 back to 2^-14; 2^-100 / 2^30 under 2^100 is
+    2^-60, where `n / d` underflows; a zero seed is zero beside an infinite `q / d`: the 2026-11-26 audit
+    and its review). Its contract: every first derivative (the tangent and its pullback) exact across
+    fp32's full range; higher orders are JAX's derivatives of PyTorch's order where it is taken, and none
+    where the balanced one is (`balanced` holds its operands constant), row 13232's."""
     from .kernels.generation import linear_map
 
     def apply(residuals, moving):
-        numerator, denominator = residuals
-        held = jax.lax.stop_gradient((numerator, denominator, moving))
-        held_numerator, held_denominator, held_moving = held
-        once = divided_in(held_numerator, held_denominator)
-        twice = divided_in(once, held_denominator)
+        quotient, numerator, denominator = residuals
+        held_quotient, held_numerator, held_denominator, held_moving = jax.lax.stop_gradient(
+            (quotient, numerator, denominator, moving))
+        twice = divided_in(held_quotient, held_denominator)
         product = held_moving * twice
         special = ~(finite_nonzero(held_numerator) & finite_nonzero(held_denominator)) | ~jnp.isfinite(
             held_moving)
-        clean = normal(once) & normal(twice) & (normal(product) | ~finite_nonzero(held_moving))
+        clean = normal(held_quotient) & normal(twice) & (normal(product) | ~finite_nonzero(held_moving))
         torch = special | clean
         # Each branch's operands where the other is chosen held at one, so neither's derivative meets the
         # other's infinities.
-        kept_numerator, kept_denominator = (jnp.where(torch, value, 1) for value in (numerator, denominator))
+        kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))
         balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
                                                     for value in (numerator, denominator))
-        return jnp.where(torch, moving * divided_in(divided_in(kept_numerator, kept_denominator),
-                                                    kept_denominator),
+        return jnp.where(torch, moving * divided_in(kept_quotient, kept_denominator),
                          balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
                                   (balanced_denominator, balanced_denominator)))
 
-    return linear_map(apply, apply, (numerator, denominator), tangent)
+    return linear_map(apply, apply, (quotient, numerator, denominator), tangent)

@@ -1905,7 +1905,7 @@ def _divide_transpose(cotangent, numerator, denominator):
 ad.defjvp2(correctly_rounded_divide_p,
            lambda tangent, quotient, numerator, denominator: correctly_rounded_divide(tangent, denominator),
            lambda tangent, quotient, numerator, denominator: -over_denominator(
-               tangent, numerator, denominator))
+               tangent, quotient, numerator, denominator))
 ad.primitive_transposes[correctly_rounded_divide_p] = _divide_transpose
 
 
