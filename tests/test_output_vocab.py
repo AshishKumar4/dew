@@ -88,3 +88,38 @@ def test_an_unscored_row_enters_no_product_of_the_head():
     (gradient,) = pull(jnp.ones_like(logits))
     assert logits.shape[-1] == SCORED
     assert bool(jnp.all(jnp.isfinite(logits))) and bool(jnp.all(jnp.isfinite(gradient)))
+
+
+@pytest.mark.parametrize("tied", [True, False], ids=["tied", "untied"])
+def test_an_unscored_column_enters_no_product_of_a_bf16_models_head(tied):
+    """A bf16 model's head scoring 48 of its 64 stored rows (`logits_from_hidden`, the logits every call
+    and the unchunked loss read), an unscored row holding fp32's largest values, which round to bf16's
+    infinity in the head's bf16 product: its logits and their pullback to the states are, bit for bit,
+    those of the same head with that row zero, the row entering neither (row 13135), where the untied
+    head's product over every stored column multiplied the discarded columns' zero cotangents by it."""
+    decoder = dataclasses.replace(_decoder(tied=tied, output_vocab=SCORED), dtype="bfloat16")
+    rng = np.random.default_rng(0x0B3)
+    ids = jnp.asarray(rng.integers(1, SCORED, (2, 5)), jnp.int32)
+    variables = nn.unbox(decoder.init(jax.random.key(0), ids))
+    hidden = jnp.asarray(rng.normal(size=(2, 5, TINY_DECODER["emb_features"])), jnp.bfloat16)
+
+    def with_row(value):
+        params = dict(variables["params"])
+        if tied:
+            table = params["embed_tokens"]["embedding"]
+            params["embed_tokens"] = {**params["embed_tokens"], "embedding": table.at[SCORED + 3].set(value)}
+        else:
+            kernel = params["lm_head"]["kernel"]
+            params["lm_head"] = {**params["lm_head"], "kernel": kernel.at[:, SCORED + 3].set(value)}
+        return {**variables, "params": params}
+
+    def pulled(variables):
+        logits, pull = jax.vjp(lambda states: decoder.apply(variables, states, method="logits_from_hidden"),
+                               hidden)
+        return logits, pull(jnp.ones_like(logits))[0]
+
+    logits, gradient = jax.jit(pulled)(with_row(float(np.finfo(np.float32).max)))
+    zero_logits, zero_gradient = jax.jit(pulled)(with_row(0.0))
+    assert logits.shape[-1] == SCORED and bool(jnp.all(jnp.isfinite(gradient)))
+    np.testing.assert_array_equal(np.asarray(logits, np.float32), np.asarray(zero_logits, np.float32))
+    np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.asarray(zero_gradient, np.float32))

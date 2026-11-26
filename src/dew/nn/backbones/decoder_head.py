@@ -12,7 +12,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.continuum import HeadTerms, HeadTransform, _head_growth, _squared_norm, continuum_modules
-from dew.nn.dense import Dense
+from dew.nn.dense import QUANTIZATION, Dense
+from dew.quantization import quantized_products
 
 from ..activations import _SLOPES, UNGATED, ungated_activation
 from ..blocks import normal_kernel
@@ -110,9 +111,17 @@ def head_logits(decoder: CausalTransformer, x):
     width = decoder.logits_width
     if decoder.tie_embeddings:
         logits = head_product('...d,vd->...v', x, decoder.embed_tokens.embedding[:width], decoder.precision)
-    else:
-        # Every row the head stores, its first `width` scored (`output_vocab`).
+    elif decoder.lm_head.features == width or not _scored_alone(decoder):
+        # Every column the head stores, its first `width` scored (`output_vocab`).
         logits = decoder.lm_head(x)[..., :width]
+    else:
+        # Its first `width` columns alone contracted (`OutputTable.logits`): a stored column past them,
+        # finite in fp32 and inf in the bf16 product's operands, would meet its zero cotangent in the
+        # states' pullback as inf times zero (row 13135).
+        rounding = quantizer(decoder, decoder.lm_head)
+        logits = head_product('...d,dv->...v', x if rounding is None else rounding.qdq(x),
+                              decoder.applied_kernel("lm_head")[:, :width], decoder.precision,
+                              compute=decoder.dtype)
     # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
     computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
     # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
@@ -121,6 +130,17 @@ def head_logits(decoder: CausalTransformer, x):
                                                width)),
                          decoder.final_logit_softcap).astype(
         output_dtype(computed if decoder.dtype is None else decoder.dtype))
+
+
+def _scored_alone(decoder: CausalTransformer) -> bool:
+    """Whether the untied head's product is the linear map of its input, a checkpoint's input quantizer's
+    QDQ at most, by the kernel it multiplies by (`applied_kernel`), which `head_logits` contracts over the
+    scored columns alone: not at init, which creates the kernel, and not where another computes the product
+    whole: a packed kernel's NVFP4 product, a frozen FP8 site's, an adapter's dropout, Qwix's rounded
+    operands (`nonlinear_input`, `quantized_products`)."""
+    return not (decoder.is_initializing() or decoder.lm_head.has_variable(QUANTIZATION, "kernel")
+                or decoder.nonlinear_input("lm_head", input_scales=False)
+                or quantized_products(decoder, "lm_head").weights)
 
 
 def output_table(decoder: CausalTransformer) -> OutputTable | None:
