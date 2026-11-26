@@ -1322,6 +1322,19 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
 
 
+def test_an_fp32_decode_step_short_of_the_devices_programs_splits_its_keys():
+    """An fp32 decode step of 96 heads over 32768 keys on an H100 (132 multiprocessors) launches 96 programs,
+    its parts stacked within their rows (`MosaicForward.parts`), short of the device: its plan splits the
+    keys. Counted as parts times programs (2026-11-26 audit), the step filled the device on paper and walked
+    its keys in one slice."""
+    query = jnp.zeros((1, 1, 96, 128), jnp.float32)
+    key = jax.ShapeDtypeStruct((1, 32768, 8, 128), jnp.float32)
+    with generation.assumed("sm90"):
+        work, *_ = attention_decode.planned(query, key, key, attention_decode.key_spans(1, 32768, 1),
+                                            template.Hooks())
+    assert work and all(plan.slices > 1 for plan in work.values()), work
+
+
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
     """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
     (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at

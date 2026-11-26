@@ -228,9 +228,10 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
 
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
-    # Its launch's programs: a float32 call's operands as their parts stack along the rows
-    # (`MosaicForward.parts`), as many programs again each (a merging launch's every one resident).
-    programs = op.parts * query.shape[0] * query.shape[2] * tiles
+    # Its launch's programs, a row's heads' query tiles: a float32 call's parts stack within its programs'
+    # rows (`MosaicForward.parts`, `_extents`' batch its rows less their parts), no program of their own
+    # (counted as one each, a GH200's fp32 step of 64 heads walked its 32768 keys whole, 2026-11-26 audit).
+    programs = query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
         return single()
 
