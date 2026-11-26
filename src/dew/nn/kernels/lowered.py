@@ -23,7 +23,6 @@ from jax.extend.mlir.dialects import stablehlo
 from dew.nn.kernels.templates import assembled
 from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
-
 Typed = tuple[tuple[int, ...], str]
 """An array as a kernel call reads or returns it: its shape and its element type."""
 
