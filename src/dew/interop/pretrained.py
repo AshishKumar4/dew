@@ -2450,6 +2450,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    tensors = sources.with_sidecars(tensors, decoders.sidecars(config), configured, root, weights=weights)
     if language is None and (isinstance(route, WrapperRoute) or decoders.bundles(config)):
         # A bundle's folders' tensors, read whole or, its language model alone, retained by name.
         tensors = _with_folder_tensors(tensors, config, configured, root, weights=weights)

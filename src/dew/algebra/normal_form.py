@@ -245,13 +245,8 @@ VALUE_IDENTITIES = (primitives.name_p,)
 they change is a schedule, never the value compared. A gradient's stop is no identity (`BARRIERS`)."""
 
 
-NARROW = {jnp.dtype(jnp.bfloat16): (8, 7), jnp.dtype(jnp.float16): (5, 10)}
-"""The narrow floats, by the exponent and mantissa bits `reduce_precision` rounds a float32 to them by."""
-
-
-FULL_RANGE = frozenset({jnp.dtype(jnp.bfloat16)})
-"""The narrow floats holding float32's exponent range, whose `reduce_precision` is a round trip through them:
-a float16's underflows to zero where the cast keeps a subnormal (StableHLO's reduce_precision)."""
+NARROW = frozenset(map(jnp.dtype, (jnp.bfloat16, jnp.float16)))
+"""The narrow formats whose elementwise arithmetic is formed in float32."""
 
 
 ROUNDED_ONCE = frozenset({jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p,
@@ -264,21 +259,15 @@ backend computes a narrow one its own way (XLA:GPU's logistic in the operand's d
 
 def _normal_arith(equation: jcore.JaxprEqn, operands: list, widened: _Made,
                   laid: _Made, entrywise_of: _Made) -> list | None:
-    """Arithmetic normalizations for `_normal`: casts, squares, narrow `reduce_precision`, uniform-constant
-    operands, products' stated precision, and narrow-float rounded-once ops; None to bind as written."""
+    """Arithmetic normalizations for `_normal`: casts, squares, uniform constants, products' stated
+    precision and narrow-float rounded-once ops. Reduce-precision stays distinct from conversions
+    because even at the same precision and range they can hold different NaN payload bits."""
     primitive = equation.primitive
     if primitive is jax.lax.convert_element_type_p:
         return [_converted(operands[0], equation.params["new_dtype"], widened)]
     if primitive is jax.lax.square_p or (
             primitive is jax.lax.integer_pow_p and equation.params.get("y") == 2):
         return [jax.lax.mul(operands[0], operands[0])]
-    if primitive is jax.lax.reduce_precision_p:
-        bits = (equation.params["exponent_bits"], equation.params["mantissa_bits"])
-        narrow = next((dtype for dtype, held in NARROW.items() if held == bits and dtype in FULL_RANGE), None)
-        # A round trip through the narrow float from float32 alone, whose exponent range it holds: a wider
-        # float's reduce_precision flushes what the narrow float keeps as a subnormal.
-        if narrow is not None and jnp.result_type(operands[0]) == jnp.float32:
-            return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
     if primitive in ROUNDED_ONCE and len(equation.outvars) == 1 and any(map(_uniform, operands)):
         shape = aval(equation.outvars[0]).shape
         if all(_uniform(value) or jnp.shape(value) == shape for value in operands):
@@ -301,12 +290,11 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
             laid: _Made, entrywise_of: _Made) -> list:
     """`equation` bound over `operands` in the form recognition compares (`canonical`): a square a value
     times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
-    rounded once to the narrow dtype; a gradient's stop or a checkpoint's name its operand
-    (`VALUE_IDENTITIES`); a float32 rounded to a narrow float's digits in place
-    (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
-    own dtype that value itself (`widened`, each exact widening's result by its source); a value less a
-    constant zero that value; a reshape that only adds unit axes the broadcast it is; a transpose pushed into
-    broadcasts where each source keeps its own axis order; and an elementwise equation over values one layout
+    rounded once to the narrow dtype; a checkpoint's name its operand (`VALUE_IDENTITIES`); a value widened
+    exactly and rounded back to its own dtype that value itself (`widened`, each exact widening's result by
+    its source); a value less a constant zero that value; a reshape that only adds unit axes the broadcast
+    it is; a transpose pushed into broadcasts where each source keeps its own axis order; and an
+    elementwise equation over values one layout
     made from equal shapes, beside scalars, that equation before the layout (`laid`). Every other equation as
     it is."""
     primitive = equation.primitive

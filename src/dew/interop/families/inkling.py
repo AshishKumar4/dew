@@ -35,7 +35,7 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
-from dew.interop.config_records import HF_METADATA, native_fields
+from dew.interop.config_records import HF_METADATA, NativeFields, native_fields
 from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     IGNORED_FIELDS,
@@ -53,7 +53,7 @@ from dew.interop.decoder_parts import (
     refuse,
     spelled,
 )
-from dew.interop.layouts import Renames, Route, Slot, Table
+from dew.interop.layouts import Config, Renames, Route, Slot, Table
 from dew.interop.towers.inkling import translate_inkling_projector_config, translate_inkling_vision_config
 from dew.interop.unread import Stored
 from dew.nn.activations import Situ
@@ -62,6 +62,7 @@ from dew.nn.attention_terms import QKClip, RelativeBias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.block_draft import MarkovBlockDraft
 from dew.nn.cross_pass import CrossPass
 from dew.nn.short_conv_site import ShortConvs
 
@@ -231,15 +232,62 @@ def _text_config(text: Mapping[str, object]) -> DecoderFields:
 
 def _inkling2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read Inkling 2's config, the release's wrapper (`inkling2_loop`) or its text decoder's alone
-    (`inkling2_loop_text`), into its text decoder's fields. The wrapper's vision tower and its
-    multi-token-prediction draft (`vision_config`, `mtp_config`) fill no field: a load reads the decoder."""
+    (`inkling2_loop_text`), into its text decoder's fields, the wrapper's multi-token-prediction draft
+    (`mtp_config`) its block drafter (`_draft`). The wrapper's vision tower fills no field of the decoder."""
     if hf_config.get('model_type') != 'inkling2_loop':
         used.update(hf_config)
         return _text_config(hf_config)
     if hf_config.get('tie_word_embeddings'):
         refuse('tie_word_embeddings', "the release's head is its own, untied from the embedding")
     used.update(('text_config', 'vision_config', 'mtp_config', 'tie_word_embeddings'))
-    return _text_config(_records.record(hf_config.get('text_config'), 'text_config'))
+    text = _records.record(hf_config.get('text_config'), 'text_config')
+    config = _text_config(text)
+    if hf_config.get('mtp_config'):
+        config['block_draft'] = _draft(_records.record(hf_config['mtp_config'], 'mtp_config'), text)
+    return config
+
+
+_DRAFT_FIELDS = frozenset({
+    'hidden_size', 'num_hidden_layers', 'num_attention_heads', 'num_key_value_heads', 'head_dim',
+    'intermediate_size', 'max_position_embeddings', 'q_bias', 'o_bias', 'rms_norm_eps', 'rope_theta',
+    'local_layer_ids', 'sliding_window_size', 'block_size', 'markov_rank', 'markov_head_type',
+    'target_layer_ids',
+    # The tensors' dtype and the classes vLLM's config strips (configs.py `Inkling2DSparkConfig.from_target`).
+    'torch_dtype', 'dtype', 'architectures'})
+"""`mtp_config`'s fields, as the release states them (thinkingmachines/Inkling-2-Mini at c9d0283)."""
+
+
+def _draft(mtp: Mapping[str, object], text: Mapping[str, object]) -> NativeFields[MarkovBlockDraft]:
+    """The release's multi-token-prediction draft (`mtp_config`, its tensors the release's `mtp.safetensors`)
+    as a Markov block drafter (`dew.nn.block_draft`), as vLLM reads it (configs.py
+    `Inkling2DSparkConfig.from_target`): its layers at the decoder's width, its taps `target_layer_ids`, a
+    recurrent Markov head (`rnn_hidden`) and no attention biases, refusing anything else."""
+    extra = sorted(str(key) for key in set(mtp) - _DRAFT_FIELDS)
+    if extra:
+        refuse(f'mtp_config fields {extra}', "the release's draft states none of them to compute")
+    if record_int(mtp, 'hidden_size') != record_int(text, 'hidden_size'):
+        refuse('mtp_config.hidden_size', "the draft runs at its decoder's width, reading its taps and head")
+    if mtp.get('markov_head_type') != 'rnn_hidden':
+        refuse(f"mtp_config.markov_head_type {mtp.get('markov_head_type')!r}",
+               "the release's draft corrects its logits by a recurrent head (rnn_hidden)")
+    for field in ('q_bias', 'o_bias'):
+        if mtp.get(field):
+            refuse(f'mtp_config.{field}', "the release's draft projects its attention without biases")
+    reach, _ = context_lengths({'max_position_embeddings': mtp.get('max_position_embeddings')})
+    decoder, _ = context_lengths({'max_position_embeddings': text.get('model_max_length')})
+    if reach < decoder:
+        refuse('mtp_config.max_position_embeddings', f"the draft places up to {reach} positions, short of "
+               f"its decoder's {decoder}")
+    window = record_int(mtp, 'sliding_window_size', 0)
+    local = _records.integers(mtp.get('local_layer_ids', ()), 'local_layer_ids')
+    return native_fields(MarkovBlockDraft)(
+        layers=record_int(mtp, 'num_hidden_layers'), num_heads=record_int(mtp, 'num_attention_heads'),
+        num_kv_heads=record_int(mtp, 'num_key_value_heads'), head_dim=record_int(mtp, 'head_dim'),
+        mlp_features=record_int(mtp, 'intermediate_size'), block_size=record_int(mtp, 'block_size'),
+        taps=_records.integers(mtp.get('target_layer_ids', ()), 'target_layer_ids'),
+        markov_rank=record_int(mtp, 'markov_rank'), rope_theta=record_float(mtp, 'rope_theta'),
+        norm_eps=record_float(mtp, 'rms_norm_eps', 1e-6), local_layers=local,
+        window=window if local else None)
 
 
 _SITES = {'q': 'attn', 'k': 'k', 'v': 'v', 'mlp': 'mlp'}
@@ -286,11 +334,58 @@ _LAYER_LEAVES: Leaves = {
 queries, convolutions, attention terms and cross-pass controllers, those the release stores otherwise as
 `_inkling2_prepare` reads them."""
 
+DRAFT = 'mtp.'
+"""The prefix the draft's tensors (the release's `mtp.safetensors`) are read under
+(`DecoderFamily.sidecars`)."""
+
+_DRAFT_LEAVES: Leaves = {
+    'fuse_weight': ('fuse_weight',), 'mask_embed': ('mask_embed',), 'norm.weight': ('norm', 'scale'),
+    'markov_head.markov_w1.weight': ('markov_head', 'markov_w1'),
+    'markov_head.dflare_norm.weight': ('markov_head', 'dflare_norm', 'scale'),
+    'markov_head.hidden_out.weight': ('markov_head', 'hidden_out', 'kernel'),
+    'markov_head.hidden_out.bias': ('markov_head', 'hidden_out', 'bias'),
+    'markov_head.rnn_step.weight': ('markov_head', 'rnn_step', 'kernel'),
+    'markov_head.rnn_context.weight': ('markov_head', 'rnn_context', 'kernel'),
+    'markov_head.rnn_context.bias': ('markov_head', 'rnn_context', 'bias'),
+}
+"""The draft's tensors outside its layers, as `_inkling2_prepare` reads them (its `rnn_proj` split), onto
+the block drafter's leaves (`dew.nn.block_draft.BlockDrafter`)."""
+
+_DRAFT_LAYER_LEAVES: Leaves = {
+    **{f'{norm}.weight': (norm, 'scale')
+       for norm in ('input_layernorm', 'post_attention_layernorm', 'dflare_norm')},
+    **{f'self_attn.{proj}.weight': ('self_attn', proj, 'kernel')
+       for proj in ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'k_proj_ctx', 'v_proj_ctx')},
+    **{f'self_attn.{norm}.weight': ('self_attn', norm, 'scale')
+       for norm in ('q_norm', 'k_norm', 'k_norm_ctx')},
+    **{f'mlp.{proj}.weight': ('mlp', proj, 'kernel') for proj in ('gate_proj', 'up_proj', 'down_proj')},
+}
+"""A draft layer's tensors, below `layers.{layer}.`."""
+
+
+def _draft_kept(config: Mapping[str, object], kept: int) -> dict:
+    """The release's config as a checkpoint of its first `kept` prediction depths
+    (`DecoderFamily.whole_drafter`): its draft, one drafter, kept at any count and none at 0, where neither
+    it nor its `mtp.safetensors` is read."""
+    return {'mtp_config': None} if kept == 0 and config.get('mtp_config') else {}
+
+
+def _drafting(config: Config, slots: Mapping[str, str]) -> bool:
+    """Whether the record carries the block drafter the draft's tensors fill."""
+    return isinstance(config.get('block_draft'), Mapping)
+
+
 _ROUTES = Table(
     # The vision tower has no counterpart here: its tensors fill no leaf.
     Route('{media}', None, MappingProxyType({'media': Slot(r'model\.visual\..+')})),
+    *(Route(DRAFT + name, 'params/block_drafter/' + '/'.join(path), when=_drafting)
+      for name, path in _DRAFT_LEAVES.items()),
+    *(Route(DRAFT + 'layers.{layer}.' + name, 'params/block_drafter/layers_{layer}/' + '/'.join(path),
+            when=_drafting)
+      for name, path in _DRAFT_LAYER_LEAVES.items()),
     spelled(_NAMES, leaves={'model.output_query': ('output_res', 'kernel')}, layer_leaves=_LAYER_LEAVES))
-"""Inkling 2's names, its text decoder's through `_NAMES`, nothing for its vision tower."""
+"""Inkling 2's names, its text decoder's through `_NAMES`, its draft's under `DRAFT`, nothing for its vision
+tower."""
 
 
 def _query(value: Stored, name: str, width: int) -> Stored:
@@ -358,6 +453,14 @@ def _inkling2_prepare(tensors: Mapping[str, Stored],
             for expert in range(value.shape[0]):
                 prepared[f'{stem}.{expert}.gate_proj.weight'] = value[expert, 0::2]
                 prepared[f'{stem}.{expert}.up_proj.weight'] = value[expert, 1::2]
+        elif name == f'{DRAFT}markov_head.rnn_proj.weight':
+            # `[3r, 2r + 2D]`: the step's columns (the state and the token before's embedding), then the
+            # context's (a place's states and the carried taps), as vLLM's head splits them.
+            rank = value.shape[0] // 3
+            prepared[f'{DRAFT}markov_head.rnn_step.weight'] = value[:, :2 * rank]
+            prepared[f'{DRAFT}markov_head.rnn_context.weight'] = value[:, 2 * rank:]
+        elif name == f'{DRAFT}markov_head.rnn_proj.bias':
+            prepared[f'{DRAFT}markov_head.rnn_context.bias'] = value
         elif name.endswith('.mlp.experts.w2_weight'):
             for expert in range(value.shape[0]):
                 prepared[f'{stem}.{expert}.down_proj.weight'] = value[expert]
@@ -397,8 +500,8 @@ def _inkling2_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrappe
     3a96649): its text decoder (`model.llm.`), its vision trunk (`model.visual.backbone.`) and merger
     (`model.visual.proj_in`, `proj_out`). Each image's merged patches fill its `image_token_id`
     placeholders in order, each token one position on (Inkling2LoopModel.forward, its positions a plain
-    count). The multi-token-prediction draft (`mtp_config`, the release's `mtp.safetensors`) is no model of
-    this bundle's."""
+    count). The multi-token-prediction draft (`mtp_config`, the release's `mtp.safetensors`) is the text
+    decoder's block drafter (`_draft`), which a bundle's media do not draft through."""
     text = _inkling2_config(hf_config, used)
     width = record_int(text, 'emb_features')
     vision = bool(hf_config.get('vision_config'))
@@ -424,6 +527,8 @@ INKLING2 = DecoderFamily(
     'Inkling2LoopForConditionalGeneration',
     routes=_ROUTES,
     prepare=_inkling2_prepare,
+    sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
+    whole_drafter=_draft_kept,
     preserve_source_layout=True,
     wrapper=_inkling2_wrapper,
 )

@@ -1576,3 +1576,42 @@ def test_a_run_saved_before_its_surface_named_its_settings_loads_as_the_run_it_w
     path = tmp_path / "run.json"
     path.write_text(json.dumps(record))
     assert LMRunConfig.load(str(path)) == expected
+
+
+@dataclasses.dataclass
+class _Left:
+    x: int = 0
+
+
+@dataclasses.dataclass
+class _Right:
+    y: int = 0
+
+
+@dataclasses.dataclass
+class _Sections:
+    """A record whose section `one` declares one dataclass beside None, `either` two, and `table` a
+    mapping."""
+
+    one: _Left | None = None
+    either: _Left | _Right | None = None
+    table: dict[str, int] = dataclasses.field(default_factory=lambda: {"a": 1})
+
+
+def test_an_override_path_through_a_section_its_point_sets_is_placed_by_its_one_declared_class():
+    """An override's path under a section the run holds unset that a shallower path of its point sets
+    (`_placed`'s `record`) is placed by the one dataclass the section's field declares beside None, the run
+    building none (row 12908: one walker, no fallback); a field that class lacks, and a section declaring
+    two dataclasses, which no record names apart, are refused rather than guessed."""
+    from dew.config import _placed
+
+    record = {"one": {}, "either": {}}
+    assert _placed(_Sections(), "one.x", record) == (["one", "x"], {})
+    with pytest.raises(KeyError):
+        _placed(_Sections(), "one.y", record)
+    with pytest.raises(KeyError):
+        _placed(_Sections(), "either.x", record)
+    # A mapping field (a run's `TrainerConfig.links`) holds no record section a path steps into: refused as a
+    # path naming none, not read as a dataclass's record.
+    with pytest.raises(KeyError):
+        _placed(_Sections(), "table.a.value", record)

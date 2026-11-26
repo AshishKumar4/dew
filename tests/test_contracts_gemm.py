@@ -245,6 +245,40 @@ def test_a_decoded_mxfp8_operand_preserves_its_linear_rule():
     assert no_tangent.dtype == jax.dtypes.float0
 
 
+def test_decoded_ternary_preserves_its_linear_scale_rule():
+    values = np.tile(np.asarray([[-1, 1], [0, 0], [1, -1], [0, 0]], np.float32), (64, 1))
+    weights = formats.TernaryWeights.of(values, scale=np.ones(2, np.float32))
+    small = np.asarray([2.0 ** -127, -(2.0 ** -127)], np.float32)
+    scale = np.ones_like(small)
+    incoming = np.zeros_like(values)
+    incoming[[0, 2]] = [[1, 2], [4, 8]]
+
+    @jax.jit
+    def orders(scale, direction, incoming):
+        def decoded(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.float32)
+
+        found, moved = jax.jvp(decoded, (scale,), (direction,))
+        _, pull = jax.vjp(decoded, scale)
+        return found, moved, pull(incoming)[0]
+
+    found, tangent, gradient = orders(scale, small, incoming)
+    np.testing.assert_array_equal(found, values)
+    np.testing.assert_array_equal(np.asarray(tangent).view(np.uint32), (values * small).view(np.uint32))
+    np.testing.assert_array_equal(gradient, [3, -6])
+
+    @jax.jit
+    def exact_output(s):
+        def convert(scale):
+            return formats.TernaryWeights(weights.words, scale, weights.form).decoded(jnp.int32)
+
+        return jax.jvp(convert, (s,), (jnp.ones_like(s),))
+
+    integer, no_tangent = exact_output(scale)
+    np.testing.assert_array_equal(integer, values.astype(np.int32))
+    assert no_tangent.dtype == jax.dtypes.float0
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):
     """`projections.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared

@@ -817,6 +817,27 @@ def test_masked_variance_ignores_nonfinite_samples_before_the_square(dtype):
 
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_a_zero_leading_extent_masked_moment_retains_its_shapes_and_pullback(mode):
+    from dew.algebra import moments
+
+    x = np.zeros((0, 4), np.float32)
+    mask = np.ones((1, 4), np.bool_)
+
+    @jax.jit
+    def evaluate(x, mask):
+        def tiled(value):
+            return moments.chunked_moments(value, mask, tile=2, mode=mode)
+
+        (mean, variance), pull = jax.vjp(tiled, x)
+        return mean, variance, pull((jnp.ones_like(mean), jnp.ones_like(variance)))[0]
+
+    mean, variance, gradient = evaluate(x, mask)
+    np.testing.assert_array_equal(mean, np.zeros((0,), x.dtype))
+    np.testing.assert_array_equal(variance, np.zeros((0,), x.dtype))
+    np.testing.assert_array_equal(gradient, x)
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
     """Masked unweighted variance (`moments.chunked_moments` with boolean mask) with wholly-masked tiles
     (first tile empty, middle tile empty) and an all-masked row stays finite and matches the declared
@@ -1097,6 +1118,37 @@ def test_direct_weighted_broadcast_keeps_marginal_shapes_and_counts_each_weight_
     np.testing.assert_array_equal(mean_y, [2, 3])
     np.testing.assert_array_equal(covariance, [0, 0])
     np.testing.assert_array_equal(moved, [8, 0])
+
+
+@pytest.mark.parametrize("singleton", [False, True], ids=["flat", "broadcast"])
+def test_direct_covariance_keeps_each_marginals_own_zero_weight_direction(singleton):
+    from dew.algebra import moments
+
+    x = np.asarray([1, 3], np.float32)
+    y = np.asarray([2, np.inf], np.float32)
+    if singleton:
+        y = y[None]
+    weights = np.asarray([1, 0], np.float32)
+    direction = np.asarray([0, 1], np.float32)
+
+    @jax.jit
+    def evaluate(x, y, w, dw):
+        def covariance(w):
+            return moments.weighted_covariance(x, y, w)
+
+        primal, tangent = jax.jvp(covariance, (w,), (dw,))
+        gradient = jax.grad(lambda w: covariance(w)[2].sum())
+        _, second = jax.jvp(gradient, (w,), (dw,))
+        return primal, tangent, second
+
+    (mean_x, mean_y, cov), (dx, dy, dc), second = evaluate(x, y, weights, direction)
+    shape = y.shape[:-1]
+    np.testing.assert_array_equal(mean_x, np.asarray(1, np.float32))
+    np.testing.assert_array_equal(dx, np.asarray(2, np.float32))
+    np.testing.assert_array_equal(mean_y, np.full(shape, 2, np.float32))
+    for part in (cov, dy, dc):
+        np.testing.assert_array_equal(part, np.zeros(shape, np.float32))
+    np.testing.assert_array_equal(second, np.zeros_like(weights))
 
 
 @pytest.mark.parametrize("mode", ["direct", "walk", "merge"])

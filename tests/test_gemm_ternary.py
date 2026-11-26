@@ -69,6 +69,18 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     assert d_empty.shape == (16, 0)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16, jnp.float64])
+def test_decoded_ternary_keeps_the_sign_and_bits_of_a_subnormal_scale(dtype):
+    values = np.tile(np.asarray([[-1, -1], [0, 0], [1, 1], [0, 0]], np.float32), (64, 1))
+    scale = np.asarray([2.0 ** -127, -2.0 ** -127], np.float32)
+    packed = formats.TernaryWeights.of(values, scale=scale)
+    with jax.enable_x64(dtype == jnp.float64):
+        decoded = np.asarray(jax.jit(lambda stored: stored.decoded(dtype))(packed))
+    expected = (values.astype(np.float64) * scale.astype(np.float64)).astype(dtype)
+    bits = np.dtype(f"uint{expected.dtype.itemsize * 8}")
+    np.testing.assert_array_equal(decoded.view(bits), expected.view(bits))
+
+
 def test_ternary_weight_product_holds_check_1_on_both_routes():
     """`gemm.ternary_weight_product` holds check 1 on both the default XLA and the interpreted Mosaic route
     at a per-column scale (row 1464)."""

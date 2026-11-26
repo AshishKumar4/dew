@@ -91,7 +91,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- Recognition canonicalizes float32 reduce_precision(8,7) into a BF16 round trip although XLA keeps the former qNaN payload and canonicalizes the latter. [13334]
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
