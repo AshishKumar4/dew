@@ -235,7 +235,9 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
         if unlanded:
             split = _unlanded_split(extents, corrected=corrected, base2=affine.base2,
                                     scale=affine.reader_scale)
-            given, entering = (tokens, decays, entering), None
+            live, cut = vanished(exponent, affine.base2)
+            steps = _factors(affine.base2, live, ~cut)
+            given, entering = (tokens, decays, entering, steps), None
         else:
             form = _form(extents, corrected, saturation)
             # The largest values that read no state: operands of the function the carry reads.
@@ -754,11 +756,11 @@ def _unlanded_split(extents: linear_scan.Extents, *, corrected: bool, base2: boo
                     scale: float | np.floating) -> carry.Split:
     """Keep a subnormal reader scale in each read, not in the prepared query vector."""
     def run(prepared, prepared_state):
-        tokens, decays, entering = prepared
+        tokens, decays, entering, steps = prepared
         across = _exp(base2, tokens["E"]) if extents.across else None
         out, h = _looped(tokens, decays, prepared_state, tokens["U"], corrected=corrected,
                          values_read=extents.values_read, apart=extents.apart, across=across,
-                         before=extents.before, erased=extents.erased, reader_scale=scale)
+                         before=extents.before, erased=extents.erased, reader_scale=scale, token_decays=steps)
         if entering is not None:
             out = _entered(out, entering, extents.values_read, prepared_state, scale=scale)
         return out, h
@@ -986,7 +988,7 @@ def _elementwise(node, of: Callable):
 
 def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False,
             apart: int = 0, across=None, before: bool = False, erased: bool = False,
-            reader_scale: float | np.floating | None = None):
+            reader_scale: float | np.floating | None = None, token_decays: _Split | None = None):
     """The token loop over the chunk, a scan of one token's step (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs, a row a token, and the state
     it leaves, each token's read apart from its group's writes where `apart` (`Scan.group`), its corrections
@@ -996,12 +998,16 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
     A = tokens["A"] if erased else B
     count = B.shape[0]
-    between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
-    stepped = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering)), between])
-    # A decay along the values too (`across`, each token's own gates `[C, V]`).
-    valued = jnp.ones((count, values.shape[-1]), stepped.dtype) if across is None else across
-    # The state carried in the type its update's parts widen it to (`_carry_type`, the replay's).
-    h = h.astype(_carry_type(h, stepped, B, values, s, C, valued, A))
+    if token_decays is None:
+        between = decays.between[jnp.arange(1, count), jnp.arange(count - 1)]
+        first = _scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering))
+        stepped = jnp.concatenate([first, between])
+    else:
+        stepped = token_decays
+    leading = stepped.first if isinstance(stepped, _Split) else stepped
+    # A decay along the values too (each token's gates [C, V]).
+    valued = jnp.ones((count, values.shape[-1]), leading.dtype) if across is None else across
+    h = h.astype(_carry_type(h, leading, B, values, s, C, valued, A))
     # The decays a token back, cut where a document starts alone (`_decays_value`): what a correction reading
     # the state a token enters reads it through.
     back = jnp.concatenate([_scaled(1.0, jax.tree.map(lambda x: x[:1], decays.entering_before)),
@@ -1016,10 +1022,15 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
                    if corrected and before else None)
         # A cut key's state selected out before its decay, so a memory past the largest before a document's
         # start is no 0 times inf.
-        h = jnp.where(_crossed(decay)[:, None], 0.0, h)
-        # Apart from its group's writes: the state its group entered, decayed by every token since it.
-        held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
-        h = decay[:, None] * h * along[None, :]
+        if isinstance(decay, _Split):
+            h = jnp.where(_crossed(decay.first)[:, None], 0.0, h)
+            factors = jax.tree.map(lambda part: part[:, None], decay)
+            held = _scaled(jnp.where(index % apart == 0, h, held) if apart else h, factors)
+            h = _scaled(h, factors) * along[None, :]
+        else:
+            h = jnp.where(_crossed(decay)[:, None], 0.0, h)
+            held = decay[:, None] * (jnp.where(index % apart == 0, h, held) if apart else h)
+            h = decay[:, None] * h * along[None, :]
         if corrected:
             h = h - strength * a[:, None] * (_portable(c[None, :], h) if entered is None else entered)
         h = h + b[:, None] * value[None, :]

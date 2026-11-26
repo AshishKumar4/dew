@@ -952,6 +952,30 @@ def test_a_prepared_chunk_keeps_a_subnormal_read_scale_until_the_state_contracti
         np.testing.assert_array_equal(dh, reader[:1] * 0.5)
 
 
+def test_a_tiny_prepared_reader_leaves_a_steep_decays_factors_on_the_state():
+    def step(h, q, b, v, g):
+        return jnp.exp2(g) * h + b[:, None] * v[None, :]
+
+    def read(h, q, b, v, g):
+        return np.float32(2.0 ** -128) * (q @ h)
+
+    declaration = scan.Scan(step, read, SCALAR_SSD, walked="time", state=((1, 1), jnp.float32))
+    forms = scan.derive_scan(declaration, saturation=SATURATION)
+
+    @jax.jit
+    def run(q, h, g):
+        chunk = {"q": q, "b": jnp.zeros_like(q), "v": jnp.zeros_like(q), "g": g}
+        state = (jnp.zeros((), q.dtype), h)
+        prepared = forms.prepare(chunk)
+        leaving, kept = forms.step(state, prepared)
+        return forms.mapped(prepared, state, kept), leaving[1]
+
+    giant = np.float32(2.0 ** 127)
+    output, leaving = run(np.full((2, 1), giant), np.full((1, 1), giant), np.asarray([-149.5, 0], np.float32))
+    np.testing.assert_array_equal(output, np.full((2, 1), np.float32(2.0 ** -23.5)))
+    np.testing.assert_array_equal(leaving, np.full((1, 1), np.float32(2.0 ** -22.5)))
+
+
 def ones_chunk(g, dtype=jnp.float32):
     """A chunk of unit readers, keys and writes at log decays `g`."""
     tokens = g.shape[0]
