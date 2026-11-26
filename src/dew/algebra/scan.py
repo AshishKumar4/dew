@@ -56,6 +56,7 @@ from dew.algebra import carry, cost, derive, linear_scan, program, ratios, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn import float_bits
 from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.nn.kernels.templates.axes import laid
 from dew.nn.nested import nested
 from dew.nn.precision import (
     accurate_exp,
@@ -1116,12 +1117,8 @@ def _subnormal_contract(axes: Sequence[str], output: str, operands: tuple, scale
     """Contract operands and a subnormal scale as unlanded factors, not as an underflowed input."""
     reduced = tuple(dict.fromkeys(tag for used in axes for tag in used if tag not in output))
     layout = (*output, *reduced)
-    factors = []
-    for used, operand in zip(axes, operands, strict=True):
-        permutation = tuple(used.index(tag) for tag in layout if tag in used)
-        placed = jnp.transpose(operand.astype(dtype), permutation)
-        shape = tuple(operand.shape[used.index(tag)] if tag in used else 1 for tag in layout)
-        factors.append(placed.reshape(shape))
+    factors = [laid(operand.astype(dtype), used, layout)
+               for used, operand in zip(axes, operands, strict=True)]
     factors.append(jnp.asarray(np.asarray(scale, dtype)))
     over = tuple(range(len(output), len(layout)))
     terms = ((1.0, tuple(("v", i) for i in range(len(factors)))),)
