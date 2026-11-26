@@ -362,7 +362,8 @@ def test_generate_runs_an_exchange_wherever_the_decoder_routes_it(rng, site):
         np.testing.assert_array_equal(exchanged.host().tokens, np.asarray(alone.tokens))
 
         def undefined_after_the_first(state: decoding.StepState, scores):
-            return jnp.where(state.step >= 1, -jnp.inf, scores)
+            # Each row's step, its scores' rows beside it.
+            return jnp.where(jnp.reshape(state.step >= 1, (-1, 1)), -jnp.inf, scores)
 
         refusing = Sampling(temperature=0, logits=(jax.tree_util.Partial(undefined_after_the_first),))
         with pytest.raises(checkify.JaxRuntimeError):
