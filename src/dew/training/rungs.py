@@ -53,7 +53,7 @@ def rung_records() -> Path | None:
     return _cache.kept_beside('dew-rungs', variable='DEW_RUNG_RECORDS', configured=True)
 
 
-RECORD_VERSION = 3
+RECORD_VERSION = 4
 """The identity a record names (`rung_key`); a record of another version is another run's."""
 
 
@@ -75,10 +75,16 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     a class made inside a function, or an array this process holds only part of): such a run keeps no
     record and decides its rung as it compiles."""
     leaves, structure = jax.tree.flatten(arguments)
+    configured = _configured(settings)
+    if configured is None:
+        _log.info("the step keeps no rung record, its rung decided as it compiles: its objective states no "
+                  "trace key")
+        return None
     try:
         traced = stated([list(modules), step, structure,
                          [[jax.typeof(leaf), leaf.sharding if isinstance(leaf, jax.Array) else None]
-                          for leaf in leaves], trace_context()], "the step a rung record names")
+                          for leaf in leaves], trace_context(), configured],
+                        "the step a rung record names")
     except Unestablished as unstated:
         _log.info("the step keeps no rung record, its rung decided as it compiles: %s", unstated)
         return None
@@ -100,6 +106,29 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
                           jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(flags)}
+
+
+def _configured(settings: StepSettings) -> Mapping[str, object] | None:
+    """What a run's `settings` state of its step by value, beside the code `_code` states: each setting that
+    is no function, mesh or module (its loss scale, whether it skips a step not finite, its inspection, its
+    microbatches, its Newton-Schulz group...), its objective's trace key (`stated_trace`: every setting its
+    loss reads, its head's chunks and tile among them, its untraced attributes left out by name) and the
+    optimizer config it was built from. None where the objective's key states none (a class of a user's
+    that states no key of its own): such a run keeps no record. Two runs of one shape and code whose steps
+    compute otherwise by a setting name two records (the 2026-11-26 audit: a run skipping a step not
+    finite, or scoring its head in other chunks, took another's rung). A raw optimizer's settings are
+    functions, which only its code states."""
+    from dew.objectives.base import stated_trace
+    from dew.optim import OptimConfig
+
+    trace = stated_trace(settings.objective)
+    if trace is None:
+        return None
+    apart = ("objective", "built_optimizer", "device_mesh", "state_mesh", "step", "optimizer_source")
+    held = {field.name: getattr(settings, field.name) for field in dataclasses.fields(settings)
+            if field.name not in apart}
+    source = settings.optimizer_source
+    return {**held, "objective": trace, "optimizer": source if isinstance(source, OptimConfig) else None}
 
 
 def _code(settings: StepSettings, modules: Sequence[object], step: Callable[..., StepFn] | None) -> list[str]:
