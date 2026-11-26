@@ -1129,14 +1129,24 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     return GpuTarget(identifier, identifier, host_links={})
 
 
-def built_target(generation: str, multiprocessors: int | None = None, memory: int | None = None) -> GpuTarget:
-    """The GPU a program compiled ahead is built for: the CUDA `generation`'s target (`gpu_target`) with the
-    `multiprocessors` its build states, where it states them (an H100 PCIe's 114 against the canonical H100's
-    132), else the generation's own, and the `memory` a device holds where it states it (an A100 of 40 GB's
-    bytes, a call's footprint held to them by `device_memory`), else the least of the target's parts
-    (`GpuTarget.memory`). What a build's XLA target (`target_config`), its launches
-    (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
+def built_target(generation: str, multiprocessors: int | None = None, memory: int | None = None,
+                 device_kind: str | None = None) -> GpuTarget:
+    """The GPU a program compiled ahead is built for: the CUDA `generation`'s target (`gpu_target`), or where
+    the build states the `device_kind` it runs on, that part's within the generation (a GH200's measured
+    rates, latencies and peaks against the canonical H100's; a kind the table names no part of keeps the
+    generation's canonical target, as a GPU of an unnamed kind does), with the `multiprocessors` its build
+    states, where it states them (an H100 PCIe's 114 against the canonical H100's 132), else the target's
+    own, and the `memory` a device holds where it states it (an A100 of 40 GB's bytes, a call's footprint
+    held to them by `device_memory`), else the least of the target's parts (`GpuTarget.memory`). What a
+    build's XLA target (`target_config`), its launches (`assumed`) and the target its loader holds it to
+    (`dew.training.ahead.BuildTarget`) all read. Refused where the kind is a part of another generation's."""
     target = gpu_target(generation)
+    if device_kind is not None:
+        part = gpu_target(device_kind)
+        if part.generation not in (target.generation, part.device_kind):
+            raise ValueError(f"a {device_kind} is an {part.generation} GPU, not one of {generation}")
+        if part.generation == target.generation:
+            target = part
     if multiprocessors is not None and multiprocessors <= 0:
         raise ValueError(f"a GPU states a positive count of multiprocessors, not {multiprocessors}")
     if memory is not None and memory <= 0:

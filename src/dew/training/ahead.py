@@ -604,10 +604,16 @@ class BuildTarget:
     serialization differs call to call (two calls on one A100 differ from byte 207 on, probe UB-TOPO,
     2026-11-11), so its digest names nothing. It names the compile, which no loader holds
     (`differences`)."""
+    device_kind: str | None = None
+    """The kind of GPU the programs were compiled for where a build states one (a host's own topology's, a
+    GH200's against the canonical H100's), whose own facts its launches derived from (`built_target`): a
+    device of another kind is refused (`differences`). None for a generation's canonical GPUs, which stand
+    for any of its parts, and for any other platform's (row 13252)."""
 
     @staticmethod
     def built(target: GpuTarget, devices: int, memory: int | None = None, *,
-              topology: bytes | None = None, chips: str | None = None) -> BuildTarget:
+              topology: bytes | None = None, chips: str | None = None,
+              device_kind: str | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
         holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
         was given one, under this process's JAX, jaxlib, computing XLA flags and host, and for a CUDA GPU
@@ -618,7 +624,8 @@ class BuildTarget:
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
                            computation_flags(), platform.machine(), memory,
                            plugin=plugin_builds() if cuda else "", libraries=cuda_libraries() if cuda else (),
-                           topology=None if topology is None else topology_digest(topology), chips=chips)
+                           topology=None if topology is None else topology_digest(topology), chips=chips,
+                           device_kind=device_kind)
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
@@ -635,7 +642,9 @@ class BuildTarget:
                   if (limit := device_memory(device).get("bytes_limit")) is not None]
         own = device_target(devices[0])
         # No topology: the attached GPUs' serialization differs call to call (`topology`).
-        built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices))
+        kind = devices[0].device_kind if devices[0].platform == "gpu" else None
+        built = BuildTarget.built(own, len(devices), min(limits, default=None), chips=tpu_chips(devices),
+                                  device_kind=kind)
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
@@ -645,7 +654,7 @@ class BuildTarget:
         where this build loaded it and other's version is another (a build that loaded none wrote none of
         its state), and never the topology, which names the compile and binds no loader."""
         named = [field.name for field in dataclasses.fields(self)
-                 if field.name not in ("memory", "topology", "libraries", "chips")]
+                 if field.name not in ("memory", "topology", "libraries", "chips", "device_kind")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
         theirs = dict(other.libraries)
@@ -655,6 +664,9 @@ class BuildTarget:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         if self.chips is not None and other.chips != self.chips:
             found.append(f"TPU chips {self.chips}, not {other.chips}")
+        # A kind where the build states one (a host's own GPUs'), which a canonical build never does.
+        if self.device_kind is not None and other.device_kind != self.device_kind:
+            found.append(f"device kind {self.device_kind}, not {other.device_kind}")
         return found
 
     def own_devices(self) -> list:
@@ -1552,7 +1564,10 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # The allocator's limit the plan is made against, from the memory the GPUs' devices carry.
     capacity = stated_limit(devices)
     # The GPU XLA compiles for, as its compile-only devices state it.
-    stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
+    # Its kind where the devices are a host's own (`_HOSTS_GPUS`), whose launches derive from that part's
+    # facts as its run does (row 13252); a canonical GPU's stands for any of its generation.
+    kind = None if on_tpus or not set(devices) <= _HOSTS_GPUS else devices[0].device_kind
+    stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity, device_kind=kind)
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(devices) <= _HOSTS_GPUS
@@ -1631,7 +1646,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         temp_bytes=memory.temp, code_bytes=memory.generated_code, live_bytes=memory.live, plan=trainer.plan,
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
+        built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices),
+                                device_kind=None if topology is None else devices[0].device_kind),
         refusals=report.refused_launches(), sampled=sampled,
         at_run=any(report.left_at_run(executable) for executable, _, _ in programs),
         starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
