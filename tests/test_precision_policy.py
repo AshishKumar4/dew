@@ -858,18 +858,21 @@ def test_a_correctly_rounded_divisions_denominator_derivative_keeps_its_derivati
     balanced order, holding its operands constant, gave 0 (row 13247)."""
     from dew.nn.precision import divided
 
-    seed, denominator = np.float32(2.0 ** 40), np.float32(16)
+    fixed, denominator = np.float32(2.0 ** 40), np.float32(16)
 
     def tangent(n):
-        return jax.jvp(lambda d: divided(n, d), (denominator,), (seed,))[1]
+        return jax.jvp(lambda d: divided(n, d), (denominator,), (fixed,))[1]
 
     # Jitted, as a CPU that flushes subnormal operands lowers them; a numerator seed of 2^90 and a
     # cotangent of 2^-110 too, whose derivatives PyTorch's order keeps normal (row 13247's review).
     numerator = np.float32(2.0 ** -126)
     assert float(jax.jit(tangent)(numerator)) == -(2.0 ** -94)
-    for seed, expected in ((1.0, -(2.0 ** 32)), (2.0 ** 90, -(2.0 ** 122))):
-        moved = jax.jit(lambda n, seed=seed: jax.jvp(tangent, (n,), (np.float32(seed),))[1])(numerator)
-        assert float(moved) == expected, seed
+    for moving, expected in ((1.0, -(2.0 ** 32)), (2.0 ** 90, -(2.0 ** 122))):
+        moved = jax.jit(lambda n, m=moving: jax.jvp(tangent, (n,), (np.float32(m),))[1])(numerator)
+        assert float(moved) == expected, moving
+    # A zero seed's tangent keeps its sign: `-0` in, the negated `+0` out, as the plain product gives.
+    zero = jax.jit(lambda: jax.jvp(lambda d: divided(numerator, d), (denominator,), (np.float32(-0.0),))[1])()
+    assert float(zero) == 0.0 and not np.signbit(np.asarray(zero))
     for cotangent, expected in ((1.0, -(2.0 ** 32)), (2.0 ** -110, -(2.0 ** -78))):
         pulled = jax.jit(lambda n, c=cotangent: jax.vjp(tangent, n)[1](np.float32(c))[0])(numerator)
         assert float(pulled) == expected, cotangent

@@ -117,6 +117,24 @@ def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
                                                                                          raised.dtype))
 
 
+def _pytorch_product(seed: jax.Array, coefficient: jax.Array, special: jax.Array) -> jax.Array:
+    """`seed * coefficient` valued as where subnormals are kept (`_flush_safe`; a special lane the plain
+    product, IEEE's), its sign and zeros its own, and differentiated as the plain product is
+    (`derivatives.surrogate`: `dseed * coefficient + seed * dcoefficient`), so no rescale enters a
+    derivative at any order."""
+    from .derivatives import surrogate
+
+    def forward(seed, coefficient, special):
+        return jnp.where(special, seed * coefficient, _flush_safe(seed, coefficient))
+
+    def derivative(primals, tangents, value):
+        # The lane mask, boolean, takes no tangent.
+        (seed, coefficient, _), (moved_seed, moved_coefficient, _) = primals, tangents
+        return moved_seed * coefficient + seed * moved_coefficient
+
+    return surrogate(forward, derivative)(seed, coefficient, special)
+
+
 def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Array,
                      denominator: jax.Array) -> jax.Array:
     """The size of `n / d`'s tangent in its denominator, `t n / d^2`, a linear map of `t` that is its own
@@ -151,12 +169,10 @@ def over_denominator(tangent: jax.Array, quotient: jax.Array, numerator: jax.Arr
         kept_quotient, kept_denominator = (jnp.where(torch, value, 1) for value in (quotient, denominator))
         balanced_numerator, balanced_denominator = (jnp.where(torch, 1, value)
                                                     for value in (numerator, denominator))
-        # PyTorch's order as its value is where subnormals are kept (`_flush_safe`), its derivatives that
-        # order's own (`plain`'s, JAX's at every order, as before row 13163): a flushing CPU's product
-        # carries no subnormal into the value, and no rescale into a derivative.
-        plain = moving * divided_in(kept_quotient, kept_denominator)
-        kept = jnp.where(special, plain, plain + jax.lax.stop_gradient(
-            jnp.where(special, 0, _flush_safe(moving, divided_in(kept_quotient, kept_denominator)) - plain)))
+        # PyTorch's order as its value is where subnormals are kept, its derivatives that order's own
+        # (`_pytorch_product`, as before row 13163): no subnormal flushed into the value, no rescale into a
+        # derivative.
+        kept = _pytorch_product(moving, divided_in(kept_quotient, kept_denominator), special)
         return jnp.where(torch, kept, balanced(jnp.where(torch, 0, moving), (balanced_numerator,),
                                                (balanced_denominator, balanced_denominator)))
 
