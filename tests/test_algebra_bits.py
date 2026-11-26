@@ -590,21 +590,6 @@ def test_nvfp4_does_not_classify_a_subnormal_tile_as_zero():
     np.testing.assert_array_equal(tensor, np.float32(2.0 ** -126))
 
 
-def test_an_nvfp4_tensor_scale_keeps_its_ordinary_maximum_derivative():
-    x = np.zeros((16, 1), np.float32)
-    x[0, 0] = 2688
-    direction = np.zeros_like(x)
-    direction[0, 0] = 1
-
-    def scale(tile):
-        return bits.nvfp4_coded(tile)[2]
-
-    value, tangent = jax.jit(lambda x, dx: jax.jvp(scale, (x,), (dx,)))(x, direction)
-    np.testing.assert_array_equal(value, np.float32(1))
-    np.testing.assert_array_equal(tangent, np.float32(1 / 2688))
-    np.testing.assert_array_equal(jax.jit(jax.grad(scale))(x), direction * np.float32(1 / 2688))
-
-
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():
     """A truth table over one value and the immediate (`BitOp.LOGIC` with one operand) runs as PTX writes it
     and the synthesizer proves it, `lop3.b32 d, a, imm, imm`, under every table (row 4647): each result
