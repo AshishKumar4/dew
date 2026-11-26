@@ -41,8 +41,8 @@ from .kernels.generation import Choice
 from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
-from .protocols import ProjectionGroup
-from .sharding import MLP_HIDDEN, LogicalAxes, constrain
+from .protocols import ProjectionGroup, fixed_remat, internal_remat
+from .sharding import MLP_HIDDEN, LogicalAxes, constrain, whole_along
 
 PACKED_HIDDEN = (*MLP_HIDDEN[:-1], None, MLP_HIDDEN[-1])
 """The gate and up projections' `[..., 2, H]` output: the pair whole, the hidden width as `MLP_HIDDEN`'s."""
@@ -276,7 +276,10 @@ class GatedMLP(nn.Module):
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
                 gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
-                return self._gated_down(packed_gated_product(activation, axes=axes), (gate_up,), train)
+                # The pair placed whole before the checkpoint (`whole_along`, the product's own placement),
+                # so its reverse mode recomputes the product from the placed pair, moving none again.
+                placed = whole_along(gate_up, -2, onto=-1)
+                return self._gated_down(packed_gated_product(activation, axes=axes), (placed,), train)
         if self._packed():
             group = self._group()
             halves = dict(zip(group.members, group.split(self.gate_up_proj(x)), strict=True))
@@ -378,8 +381,11 @@ class GatedMLP(nn.Module):
         def run(module, *held):
             return module._down(product(*held), train)
 
-        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads.
-        return nn.remat(run, policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
+        if not internal_remat():  # traced for its forward alone (`protocols.forward_only`)
+            return run(self, *halves)
+        # Nothing inside held: its inputs (the halves, the down kernel) are all its reverse mode reads; its
+        # body a checkpoint no remat rung sets (`fixed_remat`).
+        return nn.remat(fixed_remat(run), policy=jax.checkpoint_policies.nothing_saveable)(self, *halves)
 
     def _down(self, hidden, train: bool):
         if self.dropout_rate:

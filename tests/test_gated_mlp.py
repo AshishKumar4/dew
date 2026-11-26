@@ -3,12 +3,12 @@ interpreted as a GPU on a CPU (its training step compiled within resources and u
 tests/test_gemm_formed.py), and its selector's call site in `GatedMLP`."""
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from generation_support import generations
 from reference_error import assert_as_exact, with_gradients
 from test_gemm_formed import FEATURES, HIDDEN, _draw
@@ -617,34 +617,48 @@ class _HoldingItsHidden(GatedMLP):
         return self._down(product(*halves), train)
 
 
+@pytest.mark.parametrize("dropout", [0.0, 0.25], ids=["plain", "dropout"])
 @pytest.mark.parametrize("packed", [False, True], ids=["apart", "packed"])
-def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed):
-    """A gated MLP of bf16 projections, its gate and up apart or packed (`[..., 2, H]`), unrematerialized:
-    its value and every gradient bitwise the path that held its hidden product, and its reverse mode holds
-    no `[tokens, hidden]` value but the gate's and the up projection's (`GatedMLP._gated_down`: 18 GiB at
-    Qwen3.5-4B's 8 x 4096 tokens), the product formed again from them."""
+def test_a_gated_mlp_holds_no_hidden_product_and_differentiates_as_before(packed, dropout):
+    """A gated MLP of bf16 projections, its gate and up apart or packed (`[..., 2, H]`), unrematerialized,
+    in training (its dropout's key fixed): its output and its pullback under one cotangent, every
+    parameter's and the input's, bitwise the path that held its hidden product, and its reverse mode holds
+    the gate's and the up projection's outputs (or their packed one) and never the down projection's input
+    (`GatedMLP._gated_down`: 18 GiB at Qwen3.5-4B's 8 x 4096 tokens), formed again from them."""
     tokens, hidden, features = 24, 48, 16
-    x = jnp.asarray(np.random.default_rng(13460).normal(size=(tokens, features)), jnp.bfloat16)
-    layer, before = (cls(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, packed=packed)
-                     for cls in (GatedMLP, _HoldingItsHidden))
+    rng = np.random.default_rng(13460)
+    x = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(tokens, features)), jnp.bfloat16)
+    layer, before = (cls(hidden_features=hidden, out_features=features, dtype=jnp.bfloat16, packed=packed,
+                         dropout_rate=dropout) for cls in (GatedMLP, _HoldingItsHidden))
     params = layer.init(jax.random.key(0), x)
+    rngs = {"dropout": jax.random.key(7)}
 
-    def run(module):
-        def loss(variables, rows):
-            return jnp.sum(module.apply(variables, rows).astype(jnp.float32) ** 2)
-        return jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(params, x)
+    def apply_of(module):
+        return lambda variables, rows: module.apply(variables, rows, train=True, rngs=rngs)
 
-    (got, (d_params, d_x)), (want, (want_params, want_x)) = run(layer), run(before)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    np.testing.assert_array_equal(np.asarray(d_x), np.asarray(want_x))
-    for leaf, wanted in zip(jax.tree.leaves(d_params), jax.tree.leaves(want_params), strict=True):
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(wanted))
+    got, want = (jax.jit(with_gradients(apply_of(module)))(params, x, cotangent)
+                 for module in (layer, before))
+    jax.tree.map(np.testing.assert_array_equal, got, want)
 
-    def held(module):
-        # The values its pullback holds (`jax.vjp`'s function a pytree of its residuals) of the hidden's size.
-        _, pull = jax.vjp(lambda v, r: module.apply(v, r), params, x)
-        return [leaf.shape for leaf in jax.tree.leaves(pull) if math.prod(leaf.shape) == tokens * hidden]
+    # The down projection's input, read where the layer makes it, and its projections' outputs.
+    seen = {}
 
-    # Apart, the gate's and the up projection's outputs; packed, their one `[tokens, 2, hidden]` output.
-    assert len(held(layer)) == (0 if packed else 2), held(layer)
-    assert len(held(before)) == len(held(layer)) + 1, held(before)
+    def read(next_fun, args, kwargs, context):
+        out = next_fun(*args, **kwargs)
+        if context.method_name == "__call__" and context.module.name in ("gate_proj", "up_proj",
+                                                                       "gate_up_proj", "down_proj"):
+            seen[context.module.name] = args[0] if context.module.name == "down_proj" else out
+        return out
+
+    with nn.intercept_methods(read):
+        _, pull = jax.vjp(apply_of(layer), params, x)
+    held = [np.asarray(leaf) for leaf in jax.tree.leaves(pull)]
+
+    def holds(value) -> bool:
+        value = np.asarray(value)
+        return any(leaf.shape == value.shape and np.array_equal(leaf, value) for leaf in held)
+
+    assert not holds(seen["down_proj"]), "the down projection's input is held"
+    for name in ("gate_up_proj",) if packed else ("gate_proj", "up_proj"):
+        assert holds(seen[name]), name
