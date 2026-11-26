@@ -17,18 +17,18 @@
 "tests/test_algebra_bounds.py::test_every_stated_bound_holds_every_output_its_operands_reach[reduce_max-uint16-(0,)]"
 ],
 "tests/test_algebra_derive.py": [
-"tests/test_algebra_derive.py::test_a_walked_maximum_is_its_monoids[peaks]",
-"tests/test_algebra_derive.py::test_chunked_moments_balanced_quotient_direction_jvp_and_vjp",
-"tests/test_algebra_derive.py::test_chunked_moments_balances_unequal_scales_value_gradients_and_explicit_sharding",
-"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[merge-bfloat16]",
-"tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors",
-"tests/test_algebra_derive.py::test_covariance_means_keep_distinct_value_directions_with_shared_weights",
-"tests/test_algebra_derive.py::test_weighted_moments_keep_the_direction_when_dividing_first_would_flush[walk]"
+"tests/test_algebra_derive.py::test_central_moment_derivation_checks_the_weight_domain_and_handles_extreme_ranges",
+"tests/test_algebra_derive.py::test_chunked_mean_balances_higher_weight_derivatives[2-merge]",
+"tests/test_algebra_derive.py::test_chunked_moment_value_gradient_keeps_its_mixed_zero_weight_direction[one-zero-variance-walk]",
+"tests/test_algebra_derive.py::test_chunked_moments_handles_narrow_float16_and_bfloat16_inputs[walk-bfloat16]",
+"tests/test_algebra_derive.py::test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors[merge]",
+"tests/test_algebra_derive.py::test_direct_weighted_variance_pullback_is_zero_at_equal_large_values[left-zero-merge]",
+"tests/test_algebra_derive.py::test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_finite_directions[walk]"
 ],
 "tests/test_algebra_fusion.py": [
-"tests/test_algebra_fusion.py::test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit[jax.nn causal, grouped]",
-"tests/test_algebra_fusion.py::test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes[a causal window]",
-"tests/test_algebra_fusion.py::test_a_plain_programs_product_runs_the_template_its_call_names[grouped-fast]"
+"tests/test_algebra_fusion.py::test_a_layer_under_the_pass_computes_what_it_does_as_written[sm80-named-biased]",
+"tests/test_algebra_fusion.py::test_a_mapped_products_written_casts_are_replayed_as_written",
+"tests/test_algebra_fusion.py::test_a_parts_prepare_holds_a_prologues_custom_derivative_by_its_name"
 ],
 "tests/test_algebra_laws.py": [
 "tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-False]"
@@ -166,6 +166,12 @@
 "tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_under_every_hook[softcap-float32-fold]",
 "tests/test_attention_algebra.py::test_the_plain_jax_forward_is_on_par_where_no_residuals_are_kept[documents]"
 ],
+"tests/test_attention_band.py": [
+"tests/test_attention_band.py::test_a_band_bias_on_the_template_is_on_par_with_its_dense_bias_on_the_reference_path[full]",
+"tests/test_attention_band.py::test_a_band_bias_on_the_template_is_on_par_with_its_dense_bias_on_the_reference_path[global]",
+"tests/test_attention_band.py::test_a_band_bias_on_the_template_is_on_par_with_its_dense_bias_on_the_reference_path[rows-apart]",
+"tests/test_attention_band.py::test_a_band_bias_on_the_template_is_on_par_with_its_dense_bias_on_the_reference_path[sliding]"
+],
 "tests/test_attention_blackwell.py": [
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_compiles_for_a_b200_within_its_resources[64-full]",
 "tests/test_attention_blackwell.py::test_the_blackwell_forward_holds_check_1_interpreted[causal-64-natural]",
@@ -179,7 +185,7 @@
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-output]",
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-query]",
 "tests/test_attention_decode_template.py::test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted[split-stateless]",
-"tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[ordinary-dense]",
+"tests/test_attention_decode_template.py::test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted[near-bf16s-largest-sources]",
 "tests/test_attention_decode_template.py::test_a_decode_step_launches_only_kernels_its_certification_held",
 "tests/test_attention_decode_template.py::test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted[sm80-dense-int8]",
 "tests/test_attention_decode_template.py::test_a_decode_step_prepared_for_devices_no_run_tuned_is_certified",
@@ -203,8 +209,8 @@
 "tests/test_attention_decode_template.py::test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span",
 "tests/test_attention_decode_template.py::test_a_split_walk_its_compile_refused_plans_and_traces_another_config[full]",
 "tests/test_attention_decode_template.py::test_a_verify_blocks_drafts_read_their_prefix_causally_interpreted[16]",
-"tests/test_attention_decode_template.py::test_an_absorbed_mla_decode_step_of_576_wide_keys_and_512_wide_values_is_on_par_interpreted",
-"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm120-128]",
+"tests/test_attention_decode_template.py::test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par_interpreted",
+"tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm100-128]",
 "tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm80-128]",
 "tests/test_attention_decode_template.py::test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides[sm90-256]",
 "tests/test_attention_decode_template.py::test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth",
@@ -287,7 +293,7 @@
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm80-causal-window-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm80-cross-causal-lengths-starts-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm80-full-default]",
-"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm80-widest-window-accurate]",
+"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm80-widest-window-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-block-causal-fused-keys-first]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-causal-chunk-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-causal-documents-window-default]",
@@ -319,8 +325,8 @@
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-valid-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-valid-fused-shared-keys]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-widest-window-accurate]",
-"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-widest-window-fused-shared-keys]",
-"tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[custom-vjp-sm80-accurate]",
+"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-widest-window-fused]",
+"tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[band-bias-sm90-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[key-bias-sm80-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[key-bias-sm90-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[none-sm90-accurate]",
@@ -340,10 +346,10 @@
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-causal-documents-window]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-cross-causal-lengths-starts]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_over_every_call_form_interpreted[sm90-documents-window-valid-places]",
-"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[alibi-float16-natural-sm80]",
-"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[all-float16-sm90]",
-"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[gate-bfloat16-sm90]",
-"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[none-bfloat16-natural-sm80]",
+"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[alibi-float16-natural-sm90]",
+"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[band-bias-bfloat16-sm80]",
+"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[gate-bfloat16-natural-sm90]",
+"tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[key-bias-float16-natural-sm80]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[row-indexed-bfloat16-natural-sm80]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[sinks-float16-sm80]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_under_every_hook_interpreted[softcap-sinks-alibi-bfloat16-sm80]",
@@ -606,6 +612,9 @@
 "tests/test_attention_route.py::test_partly_split_key_heads_keep_the_kernel_contract_on_a_tensor_and_expert_mesh[eight-key-heads]",
 "tests/test_attention_route.py::test_the_accurate_form_is_one_option_away"
 ],
+"tests/test_attention_sinks.py": [
+"tests/test_attention_sinks.py::test_a_querys_own_sinks_stream_where_the_kernels_taking_a_heads_alone_refuse_them"
+],
 "tests/test_attention_splash.py": [
 "tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[cross]",
 "tests/test_attention_splash.py::test_splash_agrees_with_the_reference_the_oracle_holds[mask]",
@@ -700,6 +709,10 @@
 "tests/test_attention_template.py::test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys[causal-window-sinks-float32-sliced-at-a-tile-edge]",
 "tests/test_attention_template.py::test_a_wider_initial_state_is_read_in_its_own_dtype",
 "tests/test_attention_template.py::test_the_scores_hide_exactly_the_keys_their_spans_hide[cross-causal-lengths-starts]"
+],
+"tests/test_attention_terms.py": [
+"tests/test_attention_terms.py::test_a_layer_scored_at_its_indices_biases_through_a_band_as_it_does_written_out",
+"tests/test_attention_terms.py::test_a_layers_sinks_are_a_heads_or_each_querys_own"
 ],
 "tests/test_attention_triton.py": [
 "tests/test_attention_triton.py::test_a_float32_call_compiles_spill_free_for_an_h100[512 a row]",
@@ -1246,7 +1259,7 @@
 "tests/test_decision_context.py": [
 "tests/test_decision_context.py::test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone",
 "tests/test_decision_context.py::test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights",
-"tests/test_decision_context.py::test_a_request_with_images_reads_its_context_beside_them",
+"tests/test_decision_context.py::test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it",
 "tests/test_decision_context.py::test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_trained",
 "tests/test_decision_context.py::test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text"
 ],
@@ -1603,6 +1616,9 @@
 "tests/test_diffusion_run_sources.py::test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid",
 "tests/test_diffusion_run_sources.py::test_flow_grpo_trains_from_the_run_config_on_a_registered_reward"
+],
+"tests/test_discrete.py": [
+"tests/test_discrete.py::test_masked_diffusion_lm_memorises_the_toy_corpus"
 ],
 "tests/test_disk_banks.py": [
 "tests/test_disk_banks.py::test_disk_moe_logits_and_cached_decode_equal_resident[True-1]"
@@ -2414,9 +2430,9 @@
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm80-64-gqa-8-4-documents-softcap-two-float32-accurate-combination5]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm90-128-gqa-8-2-causal-key-bias-two-float32-fast-combination12]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm90-64-gqa-8-4-causal-key-bias-two-bfloat16-fast-combination16]",
-"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention_kernels-a kernels training step is on par: sm90-template-64-mha-causal-float16-combination39]",
-"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[narrow_copies-a narrow copy training run is on par: sm90-float16-plain-split-combination138]",
-"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[short_conv-a short convs training step is on par: sm90-0.8b-bfloat16-one-combination201]",
+"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention_kernels-a kernels training step is on par: sm90-triton-128-gqa-8-2-full-float32-combination21]",
+"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[narrow_copies-a narrow copy training run is on par: sm90-float16-plain-split-combination139]",
+"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[short_conv-a short convs training step is on par: sm90-0.8b-bfloat16-one-combination202]",
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers[attention]",
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers[attention_kernels]",
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers[narrow_copies]",
@@ -3016,6 +3032,9 @@
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[bfloat16-repeated]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float32-distinct]",
 "tests/test_norm_swiglu.py::test_seam_and_product_run_per_shard_as_on_one_device[fsdp]"
+],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-flat_map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
@@ -3762,9 +3781,9 @@
 ],
 "tests/test_saved_sources.py": [
 "tests/test_saved_sources.py::test_a_decision_run_saved_with_its_budgets_and_context_flat_loads_them_whole",
+"tests/test_saved_sources.py::test_a_decision_run_started_from_a_native_release_trains_records_it_and_answers",
 "tests/test_saved_sources.py::test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export",
 "tests/test_saved_sources.py::test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task",
-"tests/test_saved_sources.py::test_a_lettered_run_over_a_qwen35_backbone_exports_a_release_a_run_starts_from",
 "tests/test_saved_sources.py::test_a_multimodal_run_passing_messages_reloads_from_its_native_release_as_its_run",
 "tests/test_saved_sources.py::test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time[scanned]",
 "tests/test_saved_sources.py::test_a_pool_reads_a_saved_runs_release_through_one_publisher",
