@@ -75,11 +75,19 @@ def _mimo_processor(tokenizer: PreTrainedTokenizerBase, config: Mapping[str, obj
     return MiMoProcessor(tokenizer, config)
 
 
+def _inkling_processor(tokenizer: PreTrainedTokenizerBase, config: Mapping[str, object]) -> HostProcessor:
+    from dew.interop.inkling_media import InklingProcessor
+
+    return InklingProcessor(tokenizer, config)
+
+
 OWN_PROCESSORS: Mapping[str, Callable[[PreTrainedTokenizerBase, Mapping[str, object]], HostProcessor]] = {
-    "mimo_v2": _mimo_processor}
-"""The processor Dew runs, by a source's model type, for a release that ships none and states its
-processing in its config.json: MiMo-V2.6's (`processor_config`), as vLLM's MiMo processor runs it
-(`dew.interop.mimo_media`)."""
+    "mimo_v2": _mimo_processor, "inkling2_loop": _inkling_processor, "inkling2_loop_text": _inkling_processor}
+"""The processor Dew runs, by a source's model type, whatever processor files its release ships: one whose
+release ships none and states its processing in its config.json, MiMo-V2.6's (`processor_config`, as
+vLLM's MiMo processor runs it: `dew.interop.mimo_media`), and one whose release names a processor no
+transformers Dew supports ships, Inkling 2's (`Inkling2Processor`, absent from transformers 5.17, where
+AutoProcessor falls back to the tokenizer: `dew.interop.inkling_media`, row 13251)."""
 
 
 def chat_images(messages: Sequence[Mapping[str, object]], reader: str) -> list[Media | str | bytes]:
@@ -347,13 +355,13 @@ class Processor:
     def _media_reference(self) -> HostProcessor:
         if self.directory is None:
             raise ValueError("this source ships no media processor")
+        from transformers import PreTrainedTokenizerBase
+
+        own = OWN_PROCESSORS.get(_records.text(self.config.get("model_type", ""), "model_type"))
+        if own is not None and isinstance(self.reference, PreTrainedTokenizerBase):
+            return own(self.reference, self.config)
         if not any((self.directory / name).exists() for name in ("processor_config.json",
                                                                  "preprocessor_config.json")):
-            from transformers import PreTrainedTokenizerBase
-
-            own = OWN_PROCESSORS.get(_records.text(self.config.get("model_type", ""), "model_type"))
-            if own is not None and isinstance(self.reference, PreTrainedTokenizerBase):
-                return own(self.reference, self.config)
             raise ValueError(f"{self.config.get('model_type')} ships no processor of its own: hand the model "
                              "its processed fields (`from_hf`)")
         from transformers import AutoProcessor

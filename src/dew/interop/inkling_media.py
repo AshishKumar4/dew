@@ -1,0 +1,161 @@
+"""Inkling 2's host processing of raw images, which its release names (processor_config.json's
+`Inkling2Processor`) but no transformers Dew supports ships.
+
+The reference is transformers' own (models/inkling2/image_processing_inkling2.py and processing_inkling2.py at
+huggingface/transformers 3a96649): an image is never resized; an RGBA one is laid over an 8-pixel
+checkerboard of 204 and 153 in integer arithmetic, any other read as RGB; it is padded at its bottom and
+right to whole merged tokens (`native_patch_size * adapter_merge_size` pixels a side) with -1 on the 0-255
+scale, standardized as `(x - 127.5) / 127.5` in float32, and cut into one `[side, side, 3]` block a merged
+token in raster order, its grid `[1, rows, columns]` counted in merged tokens; each image placeholder of the
+prompt becomes as many placeholders as the image's merged tokens, the prompt then tokenized whole.
+tools/inkling2_fixture.py --processor records the reference's fields this module is held to.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Unpack
+
+import numpy as np
+
+from dew import _records
+from dew._records import JSON
+from dew.nn.inputs import Media, pad_token_rows
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
+    from dew.interop.processors import ProcessorCall
+
+CHECKER = 8
+"""The side of the checkerboard an RGBA image is laid over, in pixels."""
+CHECKER_SHADES = (204, 153)
+"""The checkerboard's shades on the 0-255 scale, its first square's first."""
+PAD = -1.0
+"""The value an image is padded with to whole merged tokens, on the 0-255 scale, before its standardizing."""
+CENTER = np.float32(127.5)
+"""The standardizing's center and scale on the 0-255 scale: the release's mean and deviation, 0.5, over its
+rescale factor 1 / 255, fused as the reference fuses them."""
+
+
+def rgb(image: object) -> np.ndarray:
+    """An image as `[height, width, 3]` uint8, as the reference reads one: a PIL image converted to RGBA where
+    it holds transparency and else to RGB; an RGBA array laid over the checkerboard (`composited`); an RGB
+    array as it is."""
+    from PIL import Image
+
+    if isinstance(image, Image.Image):
+        image = np.asarray(image.convert("RGBA" if image.has_transparency_data else "RGB"))
+    held = np.asarray(image)
+    if held.ndim != 3 or held.shape[-1] not in (3, 4) or held.dtype != np.uint8:
+        raise ValueError(f"an image is [height, width, 3 or 4] uint8 or a PIL image, got {held.dtype} "
+                         f"{held.shape}")
+    return composited(held) if held.shape[-1] == 4 else held
+
+
+def composited(rgba: np.ndarray) -> np.ndarray:
+    """An `[height, width, 4]` uint8 image laid over the checkerboard, each channel `(c a + b (255 - a) +
+    127) // 255` in integers, its background shade `b` alternating every `CHECKER` pixels."""
+    height, width, _ = rgba.shape
+    squares = (np.arange(height)[:, None] // CHECKER + np.arange(width)[None, :] // CHECKER) % 2
+    background = np.where(squares == 0, *CHECKER_SHADES)[..., None]
+    held = rgba.astype(np.int32)
+    alpha = held[..., 3:]
+    return ((held[..., :3] * alpha + background * (255 - alpha) + 127) // 255).astype(np.uint8)
+
+
+def merged_blocks(image: np.ndarray, side: int) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """`image` `[height, width, 3]` uint8 as its merged tokens' pixel blocks `[rows * columns, side, side,
+    3]` float32 in raster order and its grid `(1, rows, columns)`: padded at its bottom and right to whole
+    blocks with `PAD` and standardized about `CENTER`."""
+    height, width, channels = image.shape
+    rows, columns = math.ceil(height / side), math.ceil(width / side)
+    padded = np.full((rows * side, columns * side, channels), PAD, np.float32)
+    padded[:height, :width] = image
+    standardized = (padded - CENTER) / CENTER
+    blocks = standardized.reshape(rows, side, columns, side, channels).transpose(0, 2, 1, 3, 4)
+    return blocks.reshape(rows * columns, side, side, channels), (1, rows, columns)
+
+
+class InklingProcessor:
+    """Inkling 2's processor of text and raw images (`dew.interop.processors.HostProcessor`), from its
+    tokenizer and its config's `vision_config` (a merged token's side, `native_patch_size *
+    adapter_merge_size`) and `image_token_id`, its placeholder. Its fields are the reference's: the model
+    reads its merged blocks as packed patches (`Processor._unmerged`)."""
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, config: Mapping[str, object]) -> None:
+        self.tokenizer = tokenizer
+        vision = _records.record(config.get("vision_config") or {}, "vision_config")
+        patch = _records.integer(vision.get("native_patch_size", vision.get("patch_size", 20)), "patch_size")
+        merge = _records.integer(vision.get("adapter_merge_size", vision.get("spatial_merge_size", 2)),
+                                 "adapter_merge_size")
+        self.side = patch * merge
+        self.image_token_id = _records.integer(config.get("image_token_id", 200054), "image_token_id")
+        held = tokenizer.convert_ids_to_tokens(self.image_token_id)
+        if not isinstance(held, str):
+            raise TypeError(f"the tokenizer reads image_token_id {self.image_token_id} as {held!r}, not one "
+                            "token")
+        self.image_token = held
+
+    def __call__(self, *, images: Media | None = None,
+                 **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
+        """The fields of the call's `text` rows and `images`, each row's placeholders taking the next images
+        in order, each placeholder made as many as its image's merged tokens: `input_ids` and
+        `attention_mask` padded as the tokenizer pads (`pad_token_rows`), `pixel_values` and
+        `image_grid_thw` where any image is given. Videos and audio are refused."""
+        text = kwargs.get("text")
+        if text is None or {"audio", "videos", "video_metadata"} & kwargs.keys() \
+                or kwargs.get("return_tensors", "np") != "np":
+            raise ValueError("Inkling 2's processor here reads text and raw images into NumPy fields")
+        given = [rgb(image) for image in ([] if images is None else
+                                         images if isinstance(images, Sequence) else [images])]
+        processed = [merged_blocks(image, self.side) for image in given]
+        remaining = iter(processed)
+        rows = []
+        for row in [text] if isinstance(text, str) else list(text):
+            parts = row.split(self.image_token)
+            expanded = parts[0]
+            for part in parts[1:]:
+                held = next(remaining, None)
+                if held is None:
+                    raise ValueError("the prompts hold more image placeholders than images")
+                expanded += self.image_token * math.prod(held[1]) + part
+            rows.append(list(self.tokenizer.encode(expanded)))
+        if next(remaining, None) is not None:
+            raise ValueError(f"the prompts hold fewer image placeholders than their {len(given)} images")
+        side = "left" if self.tokenizer.padding_side == "left" else "right"
+        pad = _records.integer(self.tokenizer.pad_token_id or 0, "pad_token_id")
+        padded, valid = pad_token_rows(rows, pad_id=pad, padding_side=side)
+        fields = {"input_ids": padded, **valid}
+        if processed:
+            fields.update(pixel_values=np.concatenate([blocks for blocks, _ in processed]),
+                          image_grid_thw=np.asarray([grid for _, grid in processed], np.int64))
+        return fields
+
+    def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
+                            **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]:
+        """The tokenizer's template over `conversation`; asked for its tokens as named fields (`tokenize`,
+        `return_dict`), the template's text and its image parts' images through this processor's own call
+        (`dew.interop.processors.chat_images`)."""
+        from dew.interop.processors import chat_images, hosts
+
+        tokenizer = self.tokenizer
+        if not hosts(tokenizer):
+            raise TypeError("Inkling 2's tokenizer lacks a host processor operation")
+        if not (kwargs.get("tokenize") and kwargs.get("return_dict")):
+            return tokenizer.apply_chat_template(conversation, **kwargs)
+        options = {name: value for name, value in kwargs.items()
+                   if name not in ("tokenize", "return_dict", "return_tensors")}
+        text = tokenizer.apply_chat_template(conversation, tokenize=False, **options)
+        if not isinstance(text, str):
+            raise TypeError("Inkling 2's chat template must render text")
+        return self(text=text, images=chat_images(conversation, type(self).__name__),
+                    return_tensors=_records.text(kwargs.get("return_tensors", "np"), "return_tensors"))
+
+    def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]:
+        return self.tokenizer.batch_decode(sequences, skip_special_tokens=skip_special_tokens)
+
+    def save_pretrained(self, save_directory: str) -> None:
+        # The release's processor files beside the tokenizer's are its own; the tokenizer's here.
+        self.tokenizer.save_pretrained(save_directory)

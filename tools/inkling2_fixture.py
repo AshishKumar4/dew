@@ -348,6 +348,41 @@ def write_vision_recording() -> None:
          reference=reference, license='Apache-2.0')
 
 
+def processor_draws() -> dict[str, np.ndarray]:
+    """The raw images the processor recording reads, `[height, width, channels]` uint8: an RGB image
+    whose sides are no whole merged tokens, an RGBA one laid over the checkerboard, and an RGB one of
+    whole merged tokens."""
+    rng = np.random.default_rng(0x13251)
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    return {'rgb': rng.integers(0, 256, (13, 21, 3), np.uint8),
+            'rgba': rng.integers(0, 256, (17, 9, 4), np.uint8),
+            'whole': rng.integers(0, 256, (2 * side, 3 * side, 3), np.uint8)}
+
+
+def write_processor_recording() -> None:
+    """transformers' Inkling2ImageProcessor at the tiny bundle's merged-token side, over each of
+    `processor_draws`' images: its `pixel_values` and `image_grid_thw`, as recorded_processor.npz in
+    inkling2-vision-tiny (row 13251)."""
+    import transformers
+    from recorded_references import provenance, save
+    from transformers.models.inkling2.image_processing_inkling2 import Inkling2ImageProcessor
+
+    side = VISION['native_patch_size'] * VISION['adapter_merge_size']
+    processor = Inkling2ImageProcessor(size={'height': side, 'width': side})
+    fields = {}
+    for name, image in processor_draws().items():
+        out = processor(images=[image], return_tensors='np')
+        fields[f'{name}.pixel_values'] = np.asarray(out['pixel_values'])
+        fields[f'{name}.image_grid_thw'] = np.asarray(out['image_grid_thw'])
+    reference = 'Inkling2ImageProcessor (transformers)'
+    command = ('PYTHONPATH=.inkling2:src:tools:tests .venv-3.12/bin/python tools/inkling2_fixture.py '
+               '--vision --processor')
+    record = provenance(reference, f'huggingface/transformers@{REVISION}', 'cpu', command,
+                        transformers=transformers.__version__)
+    save(VISION_TINY / 'recorded_processor.npz', {**fields, 'processor.provenance': record},
+         reference=reference, license='Apache-2.0')
+
+
 def draw(seed: int) -> dict[str, np.ndarray]:
     """Check 1's ids, uniform over the embedding's rows."""
     return {'input_ids': np.random.default_rng(seed).integers(0, TEXT['vocab_size'], SHAPE).astype(np.int32)}
@@ -387,8 +422,12 @@ if __name__ == '__main__':
                         help="the bundle of the tiny decoder beside a tiny vision tower and merger")
     parser.add_argument('--recording', action='store_true',
                         help="record the tiny model's logits over the seeds")
+    parser.add_argument('--processor', action='store_true',
+                        help="record transformers' image processor's fields over drawn raw images")
     arguments = parser.parse_args()
-    if arguments.vision:
+    if arguments.vision and arguments.processor:
+        write_processor_recording()
+    elif arguments.vision:
         write_vision_recording() if arguments.recording else write_vision()
     elif arguments.recording:
         write_recording(QUANTIZED if arguments.quantized else TINY)
