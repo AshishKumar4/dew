@@ -399,7 +399,8 @@ class LinearProducts(nn.Module):
         from dew.nn.kernels.formats import TernaryWeights
 
         module = getattr(self, name)
-        if isinstance(packed_matrix(module, "kernel", lambda: None), TernaryWeights):
+        if module.has_variable(QUANTIZATION, "kernel") and isinstance(
+                module.get_variable(QUANTIZATION, "kernel"), TernaryWeights):
             return True
         return qwix and quantized_products(self, name).inputs
 

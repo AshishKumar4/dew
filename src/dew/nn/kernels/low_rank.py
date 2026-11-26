@@ -166,7 +166,8 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
             terms = _bf16_terms(scaled)
             blocks = factor(lhs, jnp.concatenate(terms, axis=-1), work, precision, a)
             width = scaled.shape[-1]
-            d_a = sum(blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3))
+            parts = [blocks[..., index * width:(index + 1) * width].astype(wide) for index in range(3)]
+            d_a = parts[0] + parts[1] + parts[2]
         else:
             d_a = factor(lhs, scaled, wide, kept, a)
     if wants_b:
