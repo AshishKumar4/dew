@@ -1279,15 +1279,15 @@ class MosaicGmm(_Mosaic):
         if ba.arguments.get('chained') and not self._takes_chained(ba, config, target):
             return False
         # A split is a decode step's (a dense call's, swapped or not, or a grouped one's), each run some
-        # steps, its partials within the reference's workspace (`pricing.within_workspace`, a pinned or
-        # cached tile's as a derived one's, row 12850), of no exact sums or pair products
+        # steps, its partials within its scratch budget (`pricing.within_split_budget`, a pinned or cached
+        # tile's as a derived one's, row 12850), of no exact sums or pair products
         # (`mosaic_gpu._pair_refused`): their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input
         # gradient split four ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its
         # register model held 187 (the GEMM compile gate, EM-G1), its runs' traced steps beside the running
         # sum.
         depth = ba.arguments['tokens'].shape[1]
         if config.splits > 1 and (
-                not pricing.within_workspace(target, config.splits * self._slice_bytes(ba, config, target))
+                not pricing.within_split_budget(target, config.splits * self._slice_bytes(ba, config, target))
                 or ba.arguments['exact_sums'] or self._scaled or ba.arguments.get('paired') is not None
                 or ba.arguments['hooks'].prologue is not None or ba.arguments['hooks'].epilogue is not None
                 or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
@@ -1804,15 +1804,15 @@ class MosaicTgmm(_Mosaic):
         if config.splits > 1 and (
                 self.K_MAJOR
                 or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
-                or not pricing.within_workspace(target,
-                                                config.splits * self._slice_bytes(ba, config, target))):
+                or not pricing.within_split_budget(target,
+                                                   config.splits * self._slice_bytes(ba, config, target))):
             return False
         return super()._legal(ba, config, target)
 
     def _slice_bytes(self, ba, config: tiling.Tiles, target) -> int:
         """One depth slice's fp32 partials as a split launch declares them (`_partials`: each group's `[depth,
         width]` at the call's whole extents, `_whole_extents`, as `_aligned` pads them; none padded here),
-        the bound a pinned or cached split holds as a derived one does (`pricing.within_workspace`, row
+        the bound a pinned or cached split holds as a derived one does (`pricing.within_split_budget`, row
         12850)."""
         del config
         depth, _, width = self._generated_extents(ba)
