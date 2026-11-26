@@ -154,54 +154,9 @@ def _chunk_weighted_0(x1, x2, x3):
 
 
 def _key_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v10 = lax.eq_p.bind(x3, np.array(float('-inf'), dtype=jnp.dtype('float32')))
-    v11 = lax.broadcast_in_dim_p.bind(
-        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],), broadcast_dimensions=(),
-        sharding=None)
-    v12 = lax.select_n_p.bind(v10, x3, v11)
-    v13 = lax.broadcast_in_dim_p.bind(
-        v12, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v14 = lax.sub_p.bind(x1, v13)
-    v15 = lax.exp_p.bind(v14, accuracy=None)
-    v16 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v17 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],),
-        broadcast_dimensions=(), sharding=None)
-    v18 = lax.select_n_p.bind(v16, x4, v17)
-    v19 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v18)
-    v20 = lax.broadcast_in_dim_p.bind(v19, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v21 = lax.mul_p.bind(v15, v20, out_dtype=None)
-    v22 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
-        broadcast_dimensions=(), sharding=None)
-    v23 = lax.mul_p.bind(x2, x7, out_dtype=None)
-    v24, = lax.optimization_barrier_p.bind(v23)
-    v25 = lax.broadcast_in_dim_p.bind(x5, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v26 = lax.sub_p.bind(v24, v25)
-    v27 = lax.select_n_p.bind(x9, v26, v22)
-    v28 = lax.broadcast_in_dim_p.bind(x6, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v29 = lax.sub_p.bind(v27, v28)
-    v30 = lax.mul_p.bind(v29, v20, out_dtype=None)
-    v31 = lax.mul_p.bind(v15, v30, out_dtype=None)
-    v32 = lax.abs_p.bind(v31)
-    v33 = lax.lt_p.bind(v32, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v34 = lax.mul_p.bind(
-        v24, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v35 = lax.mul_p.bind(
-        x5, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v36 = lax.broadcast_in_dim_p.bind(v35, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v37 = lax.sub_p.bind(v34, v36)
-    v38 = lax.select_n_p.bind(x9, v37, v22)
-    v39 = lax.mul_p.bind(
-        x6, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v40 = lax.broadcast_in_dim_p.bind(v39, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v41 = lax.sub_p.bind(v38, v40)
-    v42 = lax.mul_p.bind(v41, v20, out_dtype=None)
-    v43 = lax.mul_p.bind(v15, v42, out_dtype=None)
-    v44 = lax.mul_p.bind(
-        v43, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v45 = lax.select_n_p.bind(v33, v44, v31)
-    v46 = lax.select_n_p.bind(x8, v22, v45)
+    v15, v21, v46 = _shared_component_0(
+        x3, (x1.shape[1],), (), (x1.shape[0], x1.shape[1]), (1,), x1, x4, (1, x1.shape[1]), x2, x7, x5, x9,
+        x6, x8)
     return (v15, v21, v46)
 
 
@@ -219,23 +174,8 @@ def _key_memory_decay_1(x1, x2):
 
 
 def _key_weights_0(x1, x2, x3):
-    v4 = lax.eq_p.bind(x2, np.array(float('-inf'), dtype=jnp.dtype('float32')))
-    v5 = lax.broadcast_in_dim_p.bind(
-        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],), broadcast_dimensions=(),
-        sharding=None)
-    v6 = lax.select_n_p.bind(v4, x2, v5)
-    v7 = lax.broadcast_in_dim_p.bind(
-        v6, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v8 = lax.sub_p.bind(x1, v7)
-    v9 = lax.exp_p.bind(v8, accuracy=None)
-    v10 = lax.eq_p.bind(x3, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v11 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[1],),
-        broadcast_dimensions=(), sharding=None)
-    v12 = lax.select_n_p.bind(v10, x3, v11)
-    v13 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v12)
-    v14 = lax.broadcast_in_dim_p.bind(v13, shape=(1, x1.shape[1]), broadcast_dimensions=(1,), sharding=None)
-    v15 = lax.mul_p.bind(v9, v14, out_dtype=None)
+    v9, _, v15 = _shared_component_1(
+        x2, (x1.shape[1],), (), (x1.shape[0], x1.shape[1]), (1,), x1, x3, (1, x1.shape[1]))
     return (v9, v15)
 
 
@@ -290,99 +230,25 @@ def _queries_cotangent_0(x1, x2, x3, x4, x5, x6, x7, x8):
         x3, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
     v10 = lax.sub_p.bind(x1, v9)
     v11 = lax.min_p.bind(v10, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v12 = lax.exp_p.bind(v11, accuracy=None)
-    v13 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v14 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],),
-        broadcast_dimensions=(), sharding=None)
-    v15 = lax.select_n_p.bind(v13, x4, v14)
-    v16 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v15)
-    v17 = lax.broadcast_in_dim_p.bind(v16, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v18 = lax.mul_p.bind(v12, v17, out_dtype=None)
+    v12, v17, v18 = _shared_component_2(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
     v19 = lax.broadcast_in_dim_p.bind(
         np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
         broadcast_dimensions=(), sharding=None)
-    v20 = lax.broadcast_in_dim_p.bind(x5, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v21 = lax.sub_p.bind(x2, v20)
-    v22 = lax.select_n_p.bind(x8, v21, v19)
-    v23 = lax.broadcast_in_dim_p.bind(x6, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v24 = lax.sub_p.bind(v22, v23)
-    v25 = lax.mul_p.bind(v24, v17, out_dtype=None)
-    v26 = lax.mul_p.bind(v12, v25, out_dtype=None)
+    v26, = _shared_component_3(x5, (x1.shape[0], 1), (0,), x2, x8, v19, x6, v17, v12)
     v27 = lax.select_n_p.bind(x7, v19, v26)
     return (v12, v18, v27)
 
 
 def _query_dropped_cotangents_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v10 = lax.eq_p.bind(x3, np.array(float('-inf'), dtype=jnp.dtype('float32')))
-    v11 = lax.broadcast_in_dim_p.bind(
-        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],), broadcast_dimensions=(),
-        sharding=None)
-    v12 = lax.select_n_p.bind(v10, x3, v11)
-    v13 = lax.broadcast_in_dim_p.bind(
-        v12, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
-    v14 = lax.sub_p.bind(x1, v13)
-    v15 = lax.exp_p.bind(v14, accuracy=None)
-    v16 = lax.eq_p.bind(x4, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v17 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],),
-        broadcast_dimensions=(), sharding=None)
-    v18 = lax.select_n_p.bind(v16, x4, v17)
-    v19 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v18)
-    v20 = lax.broadcast_in_dim_p.bind(v19, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v21 = lax.mul_p.bind(v15, v20, out_dtype=None)
-    v22 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
-        broadcast_dimensions=(), sharding=None)
-    v23 = lax.mul_p.bind(x2, x7, out_dtype=None)
-    v24, = lax.optimization_barrier_p.bind(v23)
-    v25 = lax.broadcast_in_dim_p.bind(x5, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v26 = lax.sub_p.bind(v24, v25)
-    v27 = lax.select_n_p.bind(x9, v26, v22)
-    v28 = lax.broadcast_in_dim_p.bind(x6, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v29 = lax.sub_p.bind(v27, v28)
-    v30 = lax.mul_p.bind(v29, v20, out_dtype=None)
-    v31 = lax.mul_p.bind(v15, v30, out_dtype=None)
-    v32 = lax.abs_p.bind(v31)
-    v33 = lax.lt_p.bind(v32, np.array(float('inf'), dtype=jnp.dtype('float32')))
-    v34 = lax.mul_p.bind(
-        v24, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v35 = lax.mul_p.bind(
-        x5, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v36 = lax.broadcast_in_dim_p.bind(v35, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v37 = lax.sub_p.bind(v34, v36)
-    v38 = lax.select_n_p.bind(x9, v37, v22)
-    v39 = lax.mul_p.bind(
-        x6, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v40 = lax.broadcast_in_dim_p.bind(v39, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v41 = lax.sub_p.bind(v38, v40)
-    v42 = lax.mul_p.bind(v41, v20, out_dtype=None)
-    v43 = lax.mul_p.bind(v15, v42, out_dtype=None)
-    v44 = lax.mul_p.bind(
-        v43, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v45 = lax.select_n_p.bind(v33, v44, v31)
-    v46 = lax.select_n_p.bind(x8, v22, v45)
+    v15, v21, v46 = _shared_component_0(
+        x3, (x1.shape[0],), (), (x1.shape[0], x1.shape[1]), (0,), x1, x4, (x1.shape[0], 1), x2, x7, x5, x9,
+        x6, x8)
     return (v15, v21, v46)
 
 
 def _query_weights_0(x1, x2, x3):
-    v4 = lax.eq_p.bind(x2, np.array(float('-inf'), dtype=jnp.dtype('float32')))
-    v5 = lax.broadcast_in_dim_p.bind(
-        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],), broadcast_dimensions=(),
-        sharding=None)
-    v6 = lax.select_n_p.bind(v4, x2, v5)
-    v7 = lax.broadcast_in_dim_p.bind(
-        v6, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
-    v8 = lax.sub_p.bind(x1, v7)
-    v9 = lax.exp_p.bind(v8, accuracy=None)
-    v10 = lax.eq_p.bind(x3, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v11 = lax.broadcast_in_dim_p.bind(
-        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0],),
-        broadcast_dimensions=(), sharding=None)
-    v12 = lax.select_n_p.bind(v10, x3, v11)
-    v13 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v12)
-    v14 = lax.broadcast_in_dim_p.bind(v13, shape=(x1.shape[0], 1), broadcast_dimensions=(0,), sharding=None)
-    v15 = lax.mul_p.bind(v9, v14, out_dtype=None)
+    v9, _, v15 = _shared_component_1(
+        x2, (x1.shape[0],), (), (x1.shape[0], x1.shape[1]), (0,), x1, x3, (x1.shape[0], 1))
     return (v9, v15)
 
 
@@ -476,6 +342,71 @@ def _values_gradient_0(x1, x2, x3, x4):
         precision=(lax.Precision.HIGHEST, lax.Precision.HIGHEST), preferred_element_type=jnp.dtype('float32'),
         out_sharding=None)
     return (v22,)
+
+
+def _shared_component_0(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13):
+    v5, v10, v11 = _shared_component_1(p0, p1, p2, p3, p4, p5, p6, p7)
+    v12 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=p3, broadcast_dimensions=p2,
+        sharding=None)
+    v13 = lax.mul_p.bind(p8, p9, out_dtype=None)
+    (v14,) = lax.optimization_barrier_p.bind(v13)
+    v21, = _shared_component_3(p10, p7, p4, v14, p11, v12, p12, v10, v5)
+    v22 = lax.abs_p.bind(v21)
+    v23 = lax.lt_p.bind(v22, np.array(float('inf'), dtype=jnp.dtype('float32')))
+    v24 = lax.mul_p.bind(
+        v14, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v25 = lax.mul_p.bind(
+        p10, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v26 = lax.broadcast_in_dim_p.bind(v25, shape=p7, broadcast_dimensions=p4, sharding=None)
+    v27 = lax.sub_p.bind(v24, v26)
+    v28 = lax.select_n_p.bind(p11, v27, v12)
+    v29 = lax.mul_p.bind(
+        p12, np.array(float.fromhex('0x1.0000000000000p-2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v30 = lax.broadcast_in_dim_p.bind(v29, shape=p7, broadcast_dimensions=p4, sharding=None)
+    v31 = lax.sub_p.bind(v28, v30)
+    v32 = lax.mul_p.bind(v31, v10, out_dtype=None)
+    v33 = lax.mul_p.bind(v5, v32, out_dtype=None)
+    v34 = lax.mul_p.bind(
+        v33, np.array(float.fromhex('0x1.0000000000000p+2'), dtype=jnp.dtype('float32')), out_dtype=None)
+    v35 = lax.select_n_p.bind(v23, v34, v21)
+    v36 = lax.select_n_p.bind(p13, v12, v35)
+    return (v5, v11, v36)
+
+
+def _shared_component_1(p0, p1, p2, p3, p4, p5, p6, p7):
+    v0 = lax.eq_p.bind(p0, np.array(float('-inf'), dtype=jnp.dtype('float32')))
+    v1 = lax.broadcast_in_dim_p.bind(
+        np.array(float('inf'), dtype=jnp.dtype('float32')), shape=p1, broadcast_dimensions=p2, sharding=None)
+    v2 = lax.select_n_p.bind(v0, p0, v1)
+    v3 = lax.broadcast_in_dim_p.bind(v2, shape=p3, broadcast_dimensions=p4, sharding=None)
+    v4 = lax.sub_p.bind(p5, v3)
+    v5, v10, v11 = _shared_component_2(v4, p6, p1, p2, p7, p4)
+    return (v5, v10, v11)
+
+
+def _shared_component_2(p0, p1, p2, p3, p4, p5):
+    v0 = lax.exp_p.bind(p0, accuracy=None)
+    v1 = lax.eq_p.bind(p1, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
+    v2 = lax.broadcast_in_dim_p.bind(
+        np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), shape=p2,
+        broadcast_dimensions=p3, sharding=None)
+    v3 = lax.select_n_p.bind(v1, p1, v2)
+    v4 = lax.div_p.bind(np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32')), v3)
+    v5 = lax.broadcast_in_dim_p.bind(v4, shape=p4, broadcast_dimensions=p5, sharding=None)
+    v6 = lax.mul_p.bind(v0, v5, out_dtype=None)
+    return (v0, v5, v6)
+
+
+def _shared_component_3(p0, p1, p2, p3, p4, p5, p6, p7, p8):
+    v0 = lax.broadcast_in_dim_p.bind(p0, shape=p1, broadcast_dimensions=p2, sharding=None)
+    v1 = lax.sub_p.bind(p3, v0)
+    v2 = lax.select_n_p.bind(p4, v1, p5)
+    v3 = lax.broadcast_in_dim_p.bind(p6, shape=p1, broadcast_dimensions=p2, sharding=None)
+    v4 = lax.sub_p.bind(v2, v3)
+    v5 = lax.mul_p.bind(v4, p7, out_dtype=None)
+    v6 = lax.mul_p.bind(p8, v5, out_dtype=None)
+    return (v6,)
 
 
 _chunk_carry_forms: dict[tuple, Callable[..., tuple]] = {
