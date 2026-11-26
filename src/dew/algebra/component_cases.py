@@ -530,16 +530,18 @@ KEY_MEMORY_DECAY = declare(__name__, "key_memory_decay", ComponentForm(
         _key_memory_decay_draw, seeds=8, policies=("default",))))
 
 
-def _softcap_tile(logits, seen, *, cap=50.0):
-    capped, slopes = attention_gradient.tile_logits(attention.Capped(cap), logits, seen, None, None, (),
+def _softcap_tile(logits, seen):
+    capped, slopes = attention_gradient.tile_logits(attention.Capped(50.0), logits, seen, None, None, (),
                                                      scale=0.125, slopes=True)
-    return capped, slopes[0]
+    # Split out the negative-infinity sentinel for the finite error gate without losing any output.
+    unseen = capped == -jnp.inf
+    return jnp.where(unseen, 0.0, capped), slopes[0], unseen
 
 
 def _softcap_tile_truth(logits, seen):
     z = logits / 400
     t = jnp.tanh(z)
-    return jnp.where(seen, 50 * t, -jnp.inf), 1 - t * t
+    return jnp.where(seen, 50 * t, 0.0), 1 - t * t, ~seen
 
 
 def _softcap_draw(seed, operands):
@@ -548,6 +550,7 @@ def _softcap_draw(seed, operands):
     seen = rng.random(logits.shape) > 0.3
     logits[0, :5] = [0.0, -0.0, 1, -1, 1000]
     seen[0, :] = False
+    logits[1, :3], seen[1, :3] = [0.0, -1.0, 1000], True
     return logits, seen
 
 
@@ -562,7 +565,8 @@ def _sink_state_truth(values):
 
 
 def _sliding_visibility(key, start, stop, queries, documents):
-    return attention.within(key[None, :], start[:, None], stop[:, None], (queries[:, None], documents[None, :]))
+    return attention.within(key[None, :], start[:, None], stop[:, None],
+                            (queries[:, None], documents[None, :]))
 
 
 def _sliding_visibility_truth(key, start, stop, queries, documents):
