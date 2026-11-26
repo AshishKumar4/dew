@@ -84,12 +84,15 @@ def test_a_window_product_decoded_in_its_stages_is_its_weights_product(grouped):
     the largest finite, infinities and NaNs) times the rows of the identity, each output entry one weight
     times one: its product on the template's route, each stage decoded in place (interpreted), and on XLA's,
     the decoded matrix's, each XLA's plain product of the weights themselves, bit for bit (a NaN where it
-    is NaN), dense and grouped
-    (two groups of 128 rows, the second's weights reversed in its columns); the route each took reported."""
+    is NaN), dense and grouped (two groups of 128 rows of finite weights, the second's reversed in its
+    columns); the route each took reported."""
     weights = _drawn((256, 64))
     rows = np.eye(256, dtype=jnp.bfloat16)
     sizes = np.asarray([128, 128], np.int32)
     if grouped:
+        # Finite: XLA's ragged dot reads every group's matrix for every row, so one group's infinity is NaN
+        # in the others' rows (row 13565); the dense case holds the non-finite edges.
+        weights = np.where(np.isfinite(weights.astype(np.float32)), weights, np.asarray(0.0, jnp.bfloat16))
         stacked = np.stack([weights, weights[:, ::-1]])
         window = Bf16Window.of(stacked)
         want = np.concatenate([
