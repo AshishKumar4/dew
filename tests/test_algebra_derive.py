@@ -817,6 +817,27 @@ def test_masked_variance_ignores_nonfinite_samples_before_the_square(dtype):
 
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])
+def test_a_zero_leading_extent_masked_moment_retains_its_shapes_and_pullback(mode):
+    from dew.algebra import moments
+
+    x = np.zeros((0, 4), np.float32)
+    mask = np.ones((1, 4), np.bool_)
+
+    @jax.jit
+    def evaluate(x, mask):
+        def tiled(value):
+            return moments.chunked_moments(value, mask, tile=2, mode=mode)
+
+        (mean, variance), pull = jax.vjp(tiled, x)
+        return mean, variance, pull((jnp.ones_like(mean), jnp.ones_like(variance)))[0]
+
+    mean, variance, gradient = evaluate(x, mask)
+    np.testing.assert_array_equal(mean, np.zeros((0,), x.dtype))
+    np.testing.assert_array_equal(variance, np.zeros((0,), x.dtype))
+    np.testing.assert_array_equal(gradient, x)
+
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
     """Masked unweighted variance (`moments.chunked_moments` with boolean mask) with wholly-masked tiles
     (first tile empty, middle tile empty) and an all-masked row stays finite and matches the declared
