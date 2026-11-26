@@ -148,7 +148,7 @@ def pairs(*operands, policy: str = 'default', target: str = 'sm90'):
     return forms[(policy, target, case)](*operands)[0]
 
 
-def queries_cotangent(*operands, policy: str = 'default', target: str = 'sm90'):
+def queries_cotangent(*operands, policy: str = 'accurate', target: str = 'sm90'):
     """queries_cotangent's generated form for `policy` and `target` at its operands' case."""
     case = tuple((tuple(value.shape), jnp.dtype(value.dtype).name) for value in operands)
     forms: dict[tuple, Callable[..., tuple]] = {
