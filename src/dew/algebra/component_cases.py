@@ -236,7 +236,9 @@ def _value_gradient(logits, dout, peak, total):
     q = jnp.zeros((rows, 1), logits.dtype)
     k = jnp.zeros((keys, 1), logits.dtype)
     v = jnp.zeros((keys, dout.shape[-1]), dout.dtype)
-    return softmax_gradients(logits, q, k, v, dout, peak, total, zeros, zeros, scale=1.0)[2]
+    # This component models the device's float32 sum, not the suite's wider CPU-only reference.
+    with jax.default_matmul_precision(precision.FP32_SUMS):
+        return softmax_gradients(logits, q, k, v, dout, peak, total, zeros, zeros, scale=1.0)[2]
 
 
 def _value_gradient_truth(logits, dout, peak, total):
