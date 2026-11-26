@@ -80,19 +80,33 @@ def _assigns(node: ast.stmt, fragments: set[str]) -> bool:
                 or (call.attr == "array" and isinstance(call.value, ast.Name) and call.value.id == "np")))
 
 
-def _copy(name: str, first: int, nodes: list[ast.stmt], scope: set[str]) -> _Copy:
-    normal = _Fragment(scope)
-    statements = []
-    for node in nodes:
-        # Visit the operands before allocating the SSA result names.
-        assert isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-        call = normal.visit(copy.deepcopy(node.value))
-        assert isinstance(call, ast.Call)
-        (target,) = node.targets
-        target = ast.unparse(normal.visit(copy.deepcopy(target)))
-        args = tuple(ast.unparse(arg) for arg in (*call.args, *call.keywords))
-        statements.append(_Assignment(target, ast.unparse(call.func), args))
-    return _Copy(name, first, tuple(statements), tuple(normal.inputs), tuple(normal.bound))
+@dataclasses.dataclass
+class _Span:
+    name: str
+    first: int
+    available: int
+    normal: _Fragment
+    statements: list[_Assignment] = dataclasses.field(default_factory=list)
+
+    def extend(self, nodes: list[ast.stmt], width: int) -> tuple[_Assignment, ...]:
+        for index in range(self.first + len(self.statements), self.first + width):
+            self.statements.append(_assignment(nodes[index], self.normal))
+        return tuple(self.statements)
+
+    def snapshot(self) -> _Copy:
+        return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.inputs),
+                     tuple(self.normal.bound))
+
+
+def _assignment(node: ast.stmt, normal: _Fragment) -> _Assignment:
+    # Visit the operands before allocating the SSA result names.
+    assert isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+    call = normal.visit(copy.deepcopy(node.value))
+    assert isinstance(call, ast.Call)
+    (target,) = node.targets
+    target = ast.unparse(normal.visit(copy.deepcopy(target)))
+    args = tuple(ast.unparse(arg) for arg in (*call.args, *call.keywords))
+    return _Assignment(target, ast.unparse(call.func), args)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,26 +136,25 @@ def _largest(bodies: dict[str, _Body], fragments: set[str]) -> tuple[_Copy, ...]
         for accepted, group in runs:
             if accepted:
                 indices = [index for index, _ in group]
-                candidates.extend((name, first, indices[-1] + 1 - first)
+                candidates.extend(_Span(name, first, indices[-1] + 1 - first, _Fragment(body.scope))
                                   for first in indices[:len(indices) - _MIN_SHARED + 1])
     best: tuple[_Copy, ...] = ()
     saved = 0
     for width in itertools.count(_MIN_SHARED):
-        by_body: dict[tuple[_Assignment, ...], list[tuple[_Copy, int]]] = defaultdict(list)
-        for name, first, available in candidates:
-            if available >= width:
-                body = bodies[name]
-                duplicate = _copy(name, first, body.statements[first:first + width], body.scope)
-                by_body[duplicate.statements].append((duplicate, available))
+        by_body: dict[tuple[_Assignment, ...], list[_Span]] = defaultdict(list)
+        for span in candidates:
+            if span.available >= width:
+                signature = span.extend(bodies[span.name].statements, width)
+                by_body[signature].append(span)
         candidates = []
         for entries in by_body.values():
-            copies = {found.name: found for found, _ in reversed(entries)}
+            copies = {span.name: span for span in reversed(entries)}
             if len(copies) < 2:
                 continue
-            candidates.extend((found.name, found.first, available) for found, available in entries)
+            candidates.extend(entries)
             avoided = width * (len(copies) - 1)
             if avoided > saved:
-                best, saved = tuple(reversed(tuple(copies.values()))), avoided
+                best, saved = tuple(span.snapshot() for span in reversed(tuple(copies.values()))), avoided
         if not candidates:
             return best
     return best
