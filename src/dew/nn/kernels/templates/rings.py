@@ -12,6 +12,7 @@ from typing import Any
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src import core as jax_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
@@ -675,7 +676,13 @@ class Slots:
     sooner (a slot its last product has read). A stream the walk reads a step `ahead` the step reads through
     the next step's slot (`following`, where `more` steps follow in its range): its own slot was acquired by
     the step before it, or by itself where it is its range's `first` (`opened`), and it gives that slot
-    back as any other."""
+    back as any other.
+
+    A slot is held from a read in the step's own trace, which every read after it is within. One read first
+    in a trace inside it (a branch's, a loop body's) is acquired there and not held: its wait passes none of
+    the step's reads outside it, and its slot's index is a value of that trace alone, which a read past it
+    would carry out of its trace (an sm120 attention backward's branch did, and its kernel failed to lower,
+    row 13106). A read after it acquires again, and a wait again for the same turn returns at once."""
 
     def __init__(self, rings: dict[str, Ring], turn: Turn, ahead: tuple[str, ...] = (), *, more=False,
                  first=True):
@@ -685,16 +692,20 @@ class Slots:
         # Each stream's barrier pair's streams (`held_together`): one wait and one release a step for them.
         self._together = {name: tuple(group) for group in held_together(rings) for name in group}
         self._ahead, self.more, self.first = ahead, more, first
+        self._trace = jax_core.find_top_trace(())
 
     def __getitem__(self, name: str):
         if name in self._ahead:
             raise ValueError(f"{name}'s slot is read a step ahead: the step before read it (`following`), or "
                              "the range's first step reads its own (`opened`)")
-        if name not in self._held:
-            ring = self._rings[name]
-            awaited = any(other in self._held for other in self._together[name])
-            self._held[name] = ring.slot(self._turn) if awaited else ring.acquire(self._turn)
-        return self._held[name]
+        if name in self._held:
+            return self._held[name]
+        ring = self._rings[name]
+        awaited = any(other in self._held for other in self._together[name])
+        slot = ring.slot(self._turn) if awaited else ring.acquire(self._turn)
+        if jax_core.find_top_trace(()) is self._trace:
+            self._held[name] = slot
+        return slot
 
     def opened(self, name: str):
         """Stream `name`'s own slot where the walk reads it ahead and no step before this one did: the range's
