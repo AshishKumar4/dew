@@ -352,8 +352,8 @@ class Rules:
     (`register`); a derivation's own set (`derive.DECOUPLED`, `carry.CARRIED`), whose rules read its readings
     and never run among the registry's, is qualified by its derivation's tests."""
     dev: bool = False
-    """Whether the set is available only to dev-time generation: this keeps candidate error
-    measurement (`dew.algebra.error.choose`) out of compile-time rewriting."""
+    """Whether default compile-time rewriting excludes the set. `enabling_dev` can opt into
+    cost-qualified sets; bounded sets require dev-time candidate error measurement."""
     aid: bool = False
     """Whether the set only aids the others' saturation and changes no program on its own (commutativity,
     whose operand orders XLA's HloCSE reads alike): a pass whose admitted sets are all aids does not run
