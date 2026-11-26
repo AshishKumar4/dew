@@ -1715,15 +1715,19 @@ QWEN3_NEXT_GPU = {**QWEN3_NEXT, "hidden_size": 256, "head_dim": 64, "intermediat
                   "linear_key_head_dim": 128, "linear_value_head_dim": 128}
 """`QWEN3_NEXT` at widths the GPU's kernels take (the delta net's heads of 128, its port's), bf16."""
 
+DELTA_LAUNCHES = ("recurrence", "fla_")
+"""The delta rule's kernels' launch names: the recurrence template's (`templates.recurrence`) and fla's port's
+(`fla_gdn`)."""
+
 
 def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
-    """On a GPU, a bf16 Qwen3-Next taken to tier 3 (`kernel_parts`, row 13044) steps through Dew's native
+    """On a Hopper, a bf16 Qwen3-Next taken to tier 3 (`kernel_parts`, row 13044) steps through Dew's native
     kernels where a native model's would: its RMSNorms' fused norm (`rms_norm_forward`, its backward), its
     gated MLPs' fused SiLU product (`swiglu_forward`, its backward) and its delta net's chunked rule's
-    kernels (fla's port, `fla_*`), each launched in its step's program; and its LM loss and every
-    parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1, row
-    13280), where the CPU's float32 witness reaches XLA's arithmetic alone."""
-    from dew.nn.kernels import generation
+    kernels (the recurrence template's or fla's port's, `DELTA_LAUNCHES`) forward and backward, over the
+    projections' bf16 operands as a native layer hands them over (row 13280); and its LM loss and every
+    parameter's gradient are as exact as transformers' own bf16 step from its float64 twin (check 1), where
+    the CPU's float32 witness reaches XLA's arithmetic alone."""
     from dew.nn.programs import equations
 
     torch.manual_seed(0)
@@ -1734,17 +1738,25 @@ def a_bf16_tier_three_qwen3_next_steps_through_dews_native_kernels(tmp_path):
     tokens = np.random.default_rng(0x13280).integers(0, QWEN3_NEXT["vocab_size"], (ROWS, SEQ + 1)).astype(
         np.int32)
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    with generation.routes() as taken:
-        program = jax.make_jaxpr(jax.grad(lambda params: objective_loss(
-            objective, {**loaded.variables, "params": params}, tokens, scalar=True)))(params)
-    names = {str(eqn.params["name"]) for eqn in equations(program.jaxpr)
-             if eqn.primitive.name == "pallas_call"}
+
+    def loss(params):
+        return objective_loss(objective, {**loaded.variables, "params": params}, tokens, scalar=True)
+
+    def launches(function) -> list:
+        return [eqn for eqn in equations(jax.make_jaxpr(function)(params).jaxpr)
+                if eqn.primitive.name == "pallas_call"]
+
+    stepped = launches(jax.grad(loss))
+    names = sorted({str(eqn.params["name"]) for eqn in stepped})
     for kernel in ("rms_norm_forward", "rms_norm_backward", "swiglu_forward", "swiglu_backward"):
-        assert kernel in names, (kernel, sorted(names))
-    # The delta rule's selector gives its call a kernel (the recurrence template's or fla's port), as a
-    # native Qwen3-Next's under its declared write gates (`GatedDeltaNet.declared`).
-    delta = {route.kernel for route in taken if route.choice == generation.Choice.GATED_DELTA_RULE}
-    assert delta - {"xla"}, (delta, sorted(names))
+        assert kernel in names, (kernel, names)
+    # The delta rule's launches: the step's beyond its forward's are its backward's, each over the bf16
+    # queries, keys and values a native layer's port takes, where float32 ones took the portable math.
+    delta = [eqn for eqn in stepped if str(eqn.params["name"]).startswith(DELTA_LAUNCHES)]
+    forward = [eqn for eqn in launches(loss) if str(eqn.params["name"]).startswith(DELTA_LAUNCHES)]
+    assert forward and len(delta) > len(forward), (len(forward), len(delta), names)
+    assert any(var.aval.dtype == jnp.bfloat16 for eqn in forward for var in eqn.invars), [
+        [var.aval.dtype for var in eqn.invars] for eqn in forward]
     reference = copy.deepcopy(model).to(torch.bfloat16)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
