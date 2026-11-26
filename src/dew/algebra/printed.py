@@ -15,7 +15,6 @@ import functools
 import math
 import re
 from collections.abc import Callable, Mapping
-from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -321,10 +320,14 @@ def _body(printer: _Printer, jaxpr: jcore.Jaxpr) -> None:
 
 def _layout(printer: _Printer, value) -> Operand:
     """Identical emitted bodies may share extents read from their declared input shapes."""
-    if not printer.dimensions or not isinstance(value, tuple) or not all(isinstance(n, int) for n in value):
+    if not printer.dimensions or not isinstance(value, tuple):
         return _parameter(value)
-    extents = cast(tuple[int, ...], value)
-    return Layout(tuple(printer.dimensions.get(n, n) for n in extents))
+    extents: list[int | Extent] = []
+    for size in value:
+        if not isinstance(size, int):
+            return _parameter(value)
+        extents.append(printer.dimensions.get(size, size))
+    return Layout(tuple(extents))
 
 
 def _parameter(value) -> Operand:
