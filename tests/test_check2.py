@@ -61,7 +61,8 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
     (jax.lax.rsqrt_p, jax.lax.rsqrt, 1), (jax.lax.log_p, jnp.log, 1), (jax.lax.exp_p, jnp.exp, 1),
     (jax.lax.logistic_p, jax.lax.logistic, 1), (jax.lax.log1p_p, jnp.log1p, 1),
     (jax.lax.expm1_p, jnp.expm1, 1), (jax.lax.sin_p, jnp.sin, 1), (jax.lax.cos_p, jnp.cos, 1),
-    (jax.lax.exp2_p, jax.lax.exp2, 1), (jax.lax.log2_p, jax.lax.log2, 1)], ids=_named)
+    (jax.lax.exp2_p, jax.lax.exp2, 1), (jax.lax.log2_p, jax.lax.log2, 1), (jax.lax.tanh_p, jnp.tanh, 1)],
+    ids=_named)
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(primitive, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
@@ -755,12 +756,14 @@ def _off_by_one_element(result):
     (jax.lax.clz_p, jax.lax.clz, [np.int32([0, 1, -1, 2 ** 30, 255])]),
     (jax.lax.argmax_p, lambda a: jnp.argmax(a, axis=1),
      [np.float32([[1, 3, 3, 2], [-0.0, 0.0, -1, -2], [-np.inf, -np.inf, -np.inf, -np.inf]])]),
+    (jax.lax.dynamic_update_slice_p, lambda a, u, i: jax.lax.dynamic_update_slice(a, u, (i, 1)),
+     [np.float32(np.arange(12).reshape(4, 3)), np.float32(-np.ones((2, 2))), np.int32(3)]),
 ], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
         "gather bf16", "stack", "barrier", "rev", "split", "name", "dynamic slice clamped", "sort",
         "sort keyed", "sort keyed zeros and nans", "top_k", "unstack",
         "tile", "stop_gradient", "xor", "shift", "rem", "rem float", "sign", "sign int", "round even",
         "round away", "reduce to bf16", "reduce to e4m3", "scatter", "scatter bool", "ceil", "clz",
-        "argmax"])
+        "argmax", "dynamic update slice clamped"])
 def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
     interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
@@ -783,6 +786,21 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive
                     else given)
         assert np.all(contract(params, operands, native, None)), primitive
         assert not np.all(contract(params, operands, _off_by_one_element(native), None)), primitive
+
+
+def test_one_minus_square_is_held_as_its_lowered_product_and_a_value_past_its_roundings_breaks_it():
+    """lax.one_minus_square (tanh's derivative) certifies as the program JAX lowers it to, (1 + x)(1 - x):
+    the lane's own result within its three roundings of the exact 1 - x², its NaN and its infinities as
+    that program makes them; a result four steps off is refused."""
+    values = np.float32([0.0, 0.5, -0.999, 1.0, 3.0, 1e-20, 2.0 ** -70, np.inf, np.nan])
+    assert ct.certified(jax.lax.one_minus_square, values)[1] == []
+    native = np.asarray(jax.lax.one_minus_square(values))
+    contract = ct.CONTRACTS[jax.lax.one_minus_square_p]
+    assert np.all(contract({}, [values], native, oc.FLOAT32))
+    stepped = native.copy()
+    for _ in range(4):
+        stepped[1] = np.nextafter(stepped[1], np.float32(np.inf))
+    assert list(np.flatnonzero(~contract({}, [values], stepped, oc.FLOAT32))) == [1]
 
 
 def test_an_arg_extremum_takes_a_nan_where_its_row_holds_one_and_its_first_extreme_elsewhere():
