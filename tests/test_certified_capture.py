@@ -2,6 +2,7 @@
 once, into the jaxpr certification replays and compiles beside it, and the program it lowers is the one it
 lowers with no certification pending (row 8720)."""
 
+import numpy as np
 from process_support import fresh, keeping_picks
 
 CAPTURED_STEP = """
@@ -87,7 +88,18 @@ with report.certifying(compile_only_gpus("sm90")[0]):
             lowered = step.trace(*shapes).lower()
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
-print(json.dumps({"program": program_of(lowered), "certified": found,
+    # The lowered program run here on nonzero operands, its hook's held value 2 either way (`t` sums to 2).
+    operands = (np.arange(1, 129, dtype=np.float32).reshape(8, 16) / 64,
+                np.linspace(-1, 1, 128, dtype=np.float32).reshape(8, 16), np.float32([1.5, 0.5]))
+    ran = lowered.compile()(*operands)
+
+
+def listed(values):
+    return [np.asarray(value).tolist() for value in jax.tree.leaves(values)]
+
+
+print(json.dumps({"program": program_of(lowered), "certified": found, "ran": listed(ran),
+                  "plain": listed(step(*operands)),
                   "uncertified": [str(why) for why in report.uncertified().values()]}))
 """
 """A launch of a custom derivative in a step's gradient traced and lowered with each launch certified on a
@@ -95,7 +107,8 @@ compile-only H100: aside, in a block a compile's lowering certifies in (`report.
 `captured`, and `closed`, its hook closing over an operand of the step's trace, not a constant), or in turn
 (`certified`); whole, or a shard's inside a
 shard_map of four devices (`sharded`). The program as its typed lowering states it (its signature and its
-kernel calls) and what was certified."""
+kernel calls), its loss and gradients run on nonzero operands beside the step's own uncertified call's, and
+what was certified."""
 
 
 def stepped(tmp_path, placed: str, mode: str) -> dict:
@@ -109,13 +122,22 @@ def test_a_launch_certified_aside_lowers_the_program_it_lowers_unpending_and_is_
     """A step's launch certified aside (`report.capture`), its program's trace's call replayed for
     certification: its program, its gradient taken through the launch's custom derivative, is the one it
     lowers with no certification pending (its signature and kernel calls, typed), whole and as a shard
-    inside a shard_map; and it is certified either way. A hook closing over an operand of the step's own
-    trace, which no launch traced alone could read, is certified aside, its operand replayed as an
-    argument."""
+    inside a shard_map, and its loss and both gradients run as the step's own uncertified call's, the
+    multiplier its derivative takes and the hook's held value in them; and it is certified either way. A
+    hook closing over an operand of the step's own trace, which no launch traced alone could read, is
+    certified aside, its operand replayed as an argument, and runs as with a constant of its value."""
     for placed in ("whole", "sharded"):
         captured, certified, closed = (stepped(tmp_path, placed, mode)
                                        for mode in ("captured", "certified", "closed"))
         assert captured["program"] == certified["program"], placed
+        loss, *gradients = captured["ran"]
+        assert loss != 0 and all(np.any(np.asarray(gradient)) for gradient in gradients), placed
+        for found in (captured, certified, closed):
+            np.testing.assert_allclose(np.concatenate([np.ravel(value) for value in found["ran"]]),
+                                       np.concatenate([np.ravel(value) for value in found["plain"]]),
+                                       rtol=0, atol=0, err_msg=placed)
+        for found in (certified, closed):
+            assert found["ran"] == captured["ran"], placed
         for found in (captured, certified, closed):
             assert found["certified"] == [["Scaled", False]] and not found["uncertified"], (placed, found)
 
