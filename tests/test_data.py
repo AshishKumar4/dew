@@ -339,7 +339,7 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
-def test_automatic_loading_samples_no_batch_where_it_could_choose_no_worker():
+def test_automatic_loading_samples_one_batch_where_it_could_choose_no_worker():
     """Automatic loading reads a sample of batches to size its workers by (`Loading.resolved`), which its
     read's explanation states it was sized from; where it would read in the process whatever the sample
     measured (`Loading.selects_none`: a run whose length nothing states, one CPU, `max_workers` 0) it
