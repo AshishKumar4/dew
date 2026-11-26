@@ -304,6 +304,54 @@ def _activation(equation: jcore.JaxprEqn, shape: tuple[int, ...]) -> bool:
             and all(_shape(var) == shape for var in (*equation.invars, *equation.outvars)))
 
 
+def decode_regions(jaxpr: jcore.Jaxpr, *, rows: int) -> tuple[Region, ...]:
+    """Report two projections, their gated activation, and the down projection at decode rows.
+
+    These regions are evidence for a launch-control experiment, not splices. The writer keeps the
+    original dots, their rounding, and the cache and routing boundaries.
+    """
+    index = Index(jaxpr)
+    return tuple(region for place, equation in enumerate(jaxpr.eqns)
+                 if len(equation.outvars) == 1 and _activation(equation, _shape(equation.outvars[0]))
+                 if (region := _decode_gated(index, place, rows)) is not None)
+
+
+def _decode_gated(index: Index, joined: int, rows: int) -> Region | None:
+    equations = index.jaxpr.eqns
+    gate, up = equations[joined].invars
+    hidden, = equations[joined].outvars
+    if len(shape := _shape(hidden)) != 2 or shape[0] != rows:
+        return None
+    if not isinstance(gate, jcore.Var) or not isinstance(up, jcore.Var) or gate is up:
+        return None
+    first, second = index.producer.get(gate), index.producer.get(up)
+    if first is None or second is None or first == second:
+        return None
+    if index.readers[gate] != {joined} or index.readers[up] != {joined} or len(index.readers[hidden]) != 1:
+        return None
+    if any(var in index.escaping for var in (gate, up, hidden)):
+        return None
+    down, = index.readers[hidden]
+    if any(not _decode_product(equations[place]) for place in (first, second, down)):
+        return None
+    if equations[first].invars[0] is not equations[second].invars[0] or equations[down].invars[0] is not hidden:
+        return None
+    places = (*sorted((first, second)), joined, down)
+    ctx = equations[down].ctx
+    if any(equations[place].ctx != ctx for place in places):
+        return None
+    if any(equations[place].effects for place in range(places[0], down + 1)):
+        return None
+    outputs = tuple(equations[down].outvars)
+    at = min((reader for out in outputs for reader in index.readers[out]), default=len(equations))
+    return Region(places, region_inputs(index.jaxpr, places), outputs, at)
+
+
+def _decode_product(equation: jcore.JaxprEqn) -> bool:
+    form = _form(equation)
+    return form is not None and not (form.grouped or form.transpose_lhs)
+
+
 def _captured(index: Index, scanned: Sequence[int], members: set[int], claimed: set[int]) -> set[int]:
     """The layout equations of the captured operands of the equations at `scanned` that only `members` read
     (`CAPTURED`: a bias's broadcast, a row statistic's over the depth), no other region holds (`claimed`)

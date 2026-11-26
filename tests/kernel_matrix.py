@@ -295,6 +295,7 @@ FLOWS: tuple[str, ...] = (
     "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_generated_recurrence_score_tile_holds_on_the_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
 )
 """GPU tier matrix flows by node id: seeded native cases, plus the gated MLP native route matrix."""

@@ -463,6 +463,27 @@ def test_the_recurrence_matrix_holds_on_this_gpu():
     run_cells(kernel_matrix.seeded_cells("recurrence"))
 
 
+@pytest.mark.gpu(reason="the generated score tile has to hold on the native compiler, not only the CPU")
+@pytest.mark.generations("sm90")
+def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
+    from dew.algebra import component_cases, component_cases_derived
+
+    form = component_cases.SCORES
+
+    def call(component):
+        def scores(q, k, decays, scales):
+            return component(q @ k.T, decays, scales)
+        return jax.jit(scores)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(rng.uniform(-0.5, 0.5, shape).astype(np.float32)
+                     for shape in ((32, 32), (32, 32), (32, 32), (32,)))
+
+    assert_as_exact(call(component_cases_derived.scores), call(form.function), draw,
+                    "native recurrence scores, generated or traced", seeds=8, truth_fn=call(form.truth))
+
+
 def test_the_short_conv_matrix_holds_on_this_gpu():
     """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
     XLA's conv, at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`); its other pairs are the

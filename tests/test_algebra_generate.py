@@ -64,6 +64,26 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                         seeds=form.cases.seeds, truth_fn=truth)
 
 
+def test_generated_rounded_bodies_keep_the_written_surrogate_law():
+    from dew.algebra import component_cases_derived as emitted
+    from dew.nn import derivatives, precision
+
+    def tangent(primals, tangents, value):
+        return emitted.rounded_tangent(primals[0], tangents[0], value)
+
+    rounded = derivatives.surrogate(emitted.rounded, tangent)
+    x = np.full((16, 32), 1.003, np.float32)
+    dx = np.full_like(x, 1.007)
+    primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
+    np.testing.assert_array_equal(primal, precision.rounded_operand(x, jnp.bfloat16))
+    np.testing.assert_array_equal(direction, dx)
+    _, pullback = jax.vjp(rounded, jnp.asarray(x))
+    np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
+    gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+    _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
+    np.testing.assert_array_equal(higher, 2 * dx)
+
+
 def nested(x, y):
     """A jit within the program and a constant it closes over."""
     table = jnp.asarray(np.arange(16.0, dtype=np.float32).reshape(4, 4))
