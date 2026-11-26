@@ -599,7 +599,7 @@ def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstanc
     return None if stated else kinds[0]()
 
 
-def _placed(config: "RunConfig", path: str, record: Mapping[str, JSON] | None = None
+def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[str, JSON] | None = None
             ) -> tuple[list[str], dict[str, JSON]]:
     """The keys of `path`'s value in `config`'s record, and the record of the default each unset optional
     record along it takes (`_unset_default`), by its key: each group stepped through the run where it holds
