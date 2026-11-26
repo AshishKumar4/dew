@@ -973,13 +973,15 @@ def _gpu_mesh(generation: str, multiprocessors: int | None) -> jax.sharding.Mesh
 
 
 @contextlib.contextmanager
-def lowering_for(generation: str, multiprocessors: int | None = None) -> Iterator[None]:
+def lowering_for(generation: str, multiprocessors: int | None = None,
+                 device_kind: str | None = None) -> Iterator[None]:
     """Within the block, programs trace and lower as `compile_programs` lowers them for one GPU of the CUDA
-    `generation`: their launches derived for that GPU's facts (`assumed`, any GPU of the generation), on the
-    compile-only GPUs' abstract mesh, certified on the first (`report.certifying`). A program traced in it
-    holds the arrays a compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
+    `generation`: their launches derived for that GPU's facts (`assumed`; the `device_kind`'s where a host's
+    own topology states it, `built_target`, else any GPU of the generation's), on the compile-only GPUs'
+    abstract mesh, certified on the first (`report.certifying`). A program traced in it holds the arrays a
+    compile of it ahead holds (a prepare's, `tests/truths_ahead.py`)."""
     mesh = _gpu_mesh(generation, multiprocessors)
-    with (assumed(built_target(generation, multiprocessors), portable=True),
+    with (assumed(built_target(generation, multiprocessors, device_kind=device_kind), portable=True),
           jax.sharding.use_abstract_mesh(mesh.abstract_mesh), report.certifying(mesh.devices.flat[0])):
         yield
 
@@ -1009,9 +1011,12 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     With `memory_only` every program compiles read offline (`report.read_offline`), refused for none, for
     its memory alone (`Executable.memory`, a convolution's workspace XLA's default where its device's
     compile may pick another): programs no process loads, which a prepare sizes a run by."""
-    target = built_target(generation, multiprocessors)
     gpus = (compile_only_gpus(generation, multiprocessors=multiprocessors) if topology is None
             else host_gpus(generation, topology, 1))
+    # A node's own topology states its GPUs' kind, whose facts its launches derive from as its run's do
+    # (row 13252); a canonical target's stand for any of the generation.
+    kind = None if topology is None else gpus[0].device_kind
+    target = built_target(generation, multiprocessors, device_kind=kind)
     mesh = jax.sharding.Mesh(np.asarray(gpus[:1]), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
     lowerings = []
@@ -1023,7 +1028,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
             try:
-                with lowering_for(generation, multiprocessors):
+                with lowering_for(generation, multiprocessors, kind):
                     return compiled(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
                 raise refused.refusing(name) from refused
@@ -1052,8 +1057,10 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                              "constant of its program, which no executable serializes: pass it as an "
                              f"argument): {refused}") from refused
     need = programs_need(gpus[0], [(executable.memory, 0, 0) for executable in built.values()])
-    return AheadPrograms(BuildTarget.built(target, 1, need), built, tuned=tuned, at_run=tuple(
-        name for name, compiled in zip(programs, executables, strict=True) if report.left_at_run(compiled)))
+    left = tuple(name for name, compiled in zip(programs, executables, strict=True)
+                 if report.left_at_run(compiled))
+    return AheadPrograms(BuildTarget.built(target, 1, need, device_kind=kind), built, tuned=tuned,
+                         at_run=left)
 
 
 def dumps(directory: Path, environment: Mapping[str, str]) -> dict[str, str]:

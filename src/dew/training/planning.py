@@ -1550,7 +1550,10 @@ class FitSearch[LossT, EffectsT]:
                 continue
             measured = [(asked, short) for asked, name in zip(self.asked, named, strict=True)
                         if (short := self.least_short(name)) is not None]
-            if (predicted := predicted_short(rung, measured, start)) is not None and predicted > 0:
+            predicted = predicted_short(rung, measured, start)
+            # Deferred where any process predicts it short (its least room the place's judge), every process
+            # agreeing before it asks, as each compiles the place's program with the rest (`gather`).
+            if any(self.gather(predicted is not None and predicted > 0)):
                 deferred.append(rung)
             elif (split := tried(rung)) is not None:
                 return split

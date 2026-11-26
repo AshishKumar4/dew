@@ -254,7 +254,7 @@ class CompiledTruths:
             return
         from dew.training.ahead import lowering_for
 
-        with lowering_for(self.target.generation, self.target.multiprocessors):
+        with lowering_for(self.target.generation, self.target.multiprocessors, self.target.device_kind):
             yield
 
     def compile_site(self, label: str, programs: Mapping[str, tuple[Callable, Sequence]],

@@ -2190,6 +2190,7 @@ def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_o
     assert gh200 == gpu_target("NVIDIA GH200 480GB") and gh200 != canonical
     assert built_target("sm90", 114, device_kind="NVIDIA GH200 480GB").multiprocessors == 114
     assert built_target("sm90", device_kind="NVIDIA H999 unknown") == canonical
+    assert built_target("sm90", device_kind=canonical.device_kind) == canonical
     with pytest.raises(ValueError):
         built_target("sm80", device_kind="NVIDIA GH200 480GB")
     stated = BuildTarget.built(gh200, 1, device_kind="NVIDIA GH200 480GB")
@@ -2197,4 +2198,17 @@ def test_a_build_stating_its_gpus_kind_derives_from_that_parts_facts_and_loads_o
     h100 = dataclasses.replace(stated, device_kind=gpu_target("sm90").device_kind)
     assert stated.differences(stated) == [] and stated.differences(h100) != []
     assert anywhere.differences(h100) == [] and anywhere.differences(stated) == []
+
+
+def test_a_programs_lowering_for_a_stated_kind_derives_its_launches_from_that_part():
+    """Within `lowering_for` of a stated kind (a node's own topology's, as `compile_programs` and a prepare's
+    trace read it) the GPU in effect is that part's target, and the generation's canonical one without it
+    (row 13252: a GH200 prepare's launches priced as the canonical H100's)."""
+    from dew.nn.kernels.generation import built_target, gpu_target
+    from dew.training.ahead import lowering_for
+
+    with lowering_for("sm90", device_kind="NVIDIA GH200 480GB"):
+        assert gpu_target() == built_target("sm90", device_kind="NVIDIA GH200 480GB")
+    with lowering_for("sm90"):
+        assert gpu_target() == built_target("sm90")
 
