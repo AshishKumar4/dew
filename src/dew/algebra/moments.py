@@ -384,6 +384,8 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
         out_dtype = _floating_dtype(x_arr)
         work = _working_dtype(out_dtype)
         tiled = _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile)
+        if not tiled["x"].size:
+            return _cast_back(masked_moments(tiled["x"][0], tiled["mask"][0]), work, out_dtype)
         finished = _eval_derived(derived("masked", tiled["x"].ndim - 1), tiled, mode)
         return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)
