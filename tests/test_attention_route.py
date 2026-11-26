@@ -1121,7 +1121,8 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
-    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 512, 128, False), ("sm80", 4096, 256, False),
+    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 512, 128, False),
+    ("sm80", 4096, 256, False),
     ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm120", 4096, 64, True),
     ("sm120", 4096, 128, False), ("sm86", 4096, 128, False), ("sm100", 4096, 256, True),
     ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
@@ -1133,7 +1134,8 @@ def test_a_16_bit_calls_declared_cell_holds_only_within_its_generations_receipts
         generation_name, tokens, width, declared):
     """A bf16 causal call over 8 key heads: on an A100, whose declared cell names FlashAttention's forward
     (`attention_kernels.DECLARED`), M-NA-44's sweep exactly (1024 to 32768 tokens, widths 64 and 128); on an
-    H100 up to 32768 tokens (`MEASURED`'s interim placeholder until M-NA-44's GH200 rows); on a G4 at 4096 tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
+    H100 up to 32768 tokens (`MEASURED`'s interim placeholder until M-NA-44's GH200 rows); on a G4 at 4096
+    tokens and width 64 alone (M-NA-35); on an A10, an mma.sync GPU no receipt
     timed, in none (an A100's receipt declared its FlashAttention-2 for every mma.sync GPU, 2026-11-26
     audit); on a B200, whose cell names cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64,
     128 and 256, four query heads a key head. A call none declares takes the template (row 5285)."""
