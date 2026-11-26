@@ -161,8 +161,7 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
         bits.scales_decoded(codes), bits.decoded(codes, bits.E4M3))), "a block scale's decodes")(
         np.arange(256, dtype=np.uint32)))
     finite = (np.arange(256) & 0x7F) != 0x7F
-    np.testing.assert_array_equal(declared[finite].view(np.uint32), integer[finite].view(np.uint32))
-    np.testing.assert_array_equal(np.isnan(declared), ~finite)
+    np.testing.assert_array_equal(declared.view(np.uint32), integer.view(np.uint32))
     # Every reader of a block scale reads it so (row 8675): an NVFP4 operand's block values
     # (`formats.NvFp4Block.decoded`), each of whose blocks codes 1 under one scale, are ml_dtypes' FP8 values,
     # which they were read as before, on every code: a block of a NaN scale NaN (the review of 3580, F1: read
@@ -187,9 +186,7 @@ def test_decoded_matches_xla_on_every_fp8_code(dtype, minifloat):
         bits.decoded(c.astype(jnp.uint32), minifloat),
         jax.lax.bitcast_convert_type(c, dtype).astype(jnp.float32))), f"{minifloat} decoded beside XLA's")(
         np.arange(256, dtype=np.uint8)))
-    nans = np.isnan(xla)
-    np.testing.assert_array_equal(np.isnan(ours), nans)
-    np.testing.assert_array_equal(ours[~nans].view(np.uint32), xla[~nans].view(np.uint32))
+    np.testing.assert_array_equal(ours.view(np.uint32), xla.view(np.uint32))
 
 
 def test_a_forms_version_is_its_stored_layouts():
@@ -576,6 +573,18 @@ def test_a_small_nonzero_tile_keeps_its_nvfp4_codes():
     for codes, tensor in found:
         values = np.asarray(codes, np.float64) * bits.NVFP4_OWED * np.float64(np.asarray(tensor))
         assert np.all(np.sign(values) == np.sign(x))
+
+
+def test_nvfp4_does_not_classify_a_subnormal_tile_as_zero():
+    x = np.zeros((16, 2), np.float32)
+    x[:2, 0] = [2.0 ** -130, -(2.0 ** -132)]
+    codes, scales, tensor = jax.jit(bits.nvfp4_coded)(x)
+    # 2^-130 / 2^-126 / 6 = 1/96, whose e4m3 ceiling is 6/512; the other block is empty.
+    expected = np.zeros_like(x, dtype=np.uint32)
+    expected[:2, 0] = [7, 11]  # e2m1's +6 and -1.5
+    np.testing.assert_array_equal(codes, expected)
+    np.testing.assert_array_equal(np.asarray(scales).view(np.uint8), [[6, 0]])
+    np.testing.assert_array_equal(tensor, np.float32(2.0 ** -126))
 
 
 def test_a_one_operand_lop3_reads_its_immediate_as_both_other_operands():

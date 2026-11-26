@@ -55,14 +55,13 @@ from dew.nn.derivatives import (
     with_tangents_formed,
 )
 
-# The division's names, which its callers read here as before it had a module of its own.
+# The division's public names, which its callers read here as before it had a module of its own; its
+# lowerings and software form its own module's (`dew.nn.division`).
 from dew.nn.division import (
-    _correctly_rounded_divide as _correctly_rounded_divide,
     correctly_rounded_divide as correctly_rounded_divide,
     correctly_rounded_divide_p as correctly_rounded_divide_p,
     divided as divided,
     lowered_divide as lowered_divide,
-    triton_lowerings as triton_lowerings,
 )
 from dew.nn.float_bits import exact_power2, split_bits, two_factor_reach, whole_power2, widened_exactly
 from dew.nn.nested import nested
@@ -142,6 +141,7 @@ __all__ = [
     "running_total",
     "scaled",
     "scaled_logits",
+    "scaled_partial",
     "span_means",
     "spread",
     "sqrt_or_zero",
@@ -1329,6 +1329,15 @@ class Numerics:
             return jnp.dtype(self.dtypes.compute if compute is None else compute) == jnp.float16
         return self.loss_scaling == "dynamic"
 
+    def drawn_dtype(self, drawn: Sequence[DTypeLike] = ()) -> str | None:
+        """The dtype the run stores the parameters it draws fresh in (`dew.state.drawn_in`): its
+        `dtypes.params`, or None where each module it trains draws its own in that already (`drawn`, the
+        modules' `param_dtype`s, Flax's float32 where none is stated), which leaves a parameter a module
+        keeps in a dtype of its own as it is."""
+        held = jnp.dtype(self.dtypes.params)
+        drawn_alike = all(jnp.dtype(dtype) == held for dtype in drawn or (jnp.float32,))
+        return None if drawn_alike else self.dtypes.params
+
 
 ACCURATE = Numerics(DTYPE_PRESETS["32-true"], matmul="highest", forms="accurate")
 """Accurate, scientific work at its cost: float32 throughout, every product that states no precision in
@@ -1746,6 +1755,32 @@ def twice_scaled(product: jax.Array, first: jax.Array, second: jax.Array) -> jax
     # Not `jnp.isfinite`: Mosaic GPU lowers no is_finite, and the fused NVFP4 epilogue runs this in a kernel.
     kept = (magnitude < np.inf) & ((magnitude >= tiny) | (product == 0))
     return jnp.where(kept, once, product * second) * jnp.where(kept, second, first)  # no cotangent unchosen
+
+
+def scaled_partial(partial: jax.Array, row: jax.Array, column: jax.Array) -> jax.Array:
+    """A block-scaled step's `partial` times its `row` and `column` scales, each entry in `twice_scaled`'s
+    order (the row scale first where that intermediate is normal or the partial zero, else the column's),
+    or the scales' own product first where neither intermediate is normal and it is: a subnormal row scale
+    beside a column scale near the largest (2**-128 and 2**127 of a 2.25 partial: 1.125, row 13274), which
+    a recipe's block scales may be, as no NVFP4 tensor scale is. The one rule a blockwise product's every
+    arm scales its own partials by, a kernel's step and XLA's (`mosaic_gpu._step_scaling`,
+    `xla_products.step_scaled`), whatever its codes' format (row 13291): the same partial and scales give
+    the same value in each, though a step's partial itself is each arm's (Hopper's tensor cores align
+    within a step where XLA's fp32 sum does not, docs/design/testing.md). Each order's operands are chosen
+    before they multiply, so no cotangent reaches an unchosen product; its tests are comparisons alone."""
+    tiny = jnp.finfo(partial.dtype).tiny
+
+    def normal(value):  # Not `jnp.isfinite`, which Mosaic GPU lowers none of.
+        magnitude = jnp.abs(value)
+        return (magnitude < np.inf) & (magnitude >= tiny)
+
+    kept = normal(partial * row) | (partial == 0)
+    # The first two orders' first product one multiplication by the scale `kept` chose: a kernel holds one
+    # tile of it, and where `kept` fails, the column-first intermediate whose failure joins the scales.
+    once = partial * jnp.where(kept, row, column)
+    scales = row * column
+    joined = ~normal(once) & (partial != 0) & normal(scales)
+    return jnp.where(joined, partial, once) * jnp.where(joined, scales, jnp.where(kept, column, row))
 
 
 @_protected

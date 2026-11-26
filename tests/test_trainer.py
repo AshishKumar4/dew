@@ -419,7 +419,7 @@ def test_an_update_of_tokens_pools_its_loaders_token_batches_once_one_states_the
     trainer = budget_lm_trainer(update_tokens=4 * LM_ROWS * LM_CONTEXT)
     with pytest.raises(ValueError):
         trainer.initial_state()
-    trainer.reading(Loader(train=lambda partition: iter(()), val=None, records=None, batch=LM_ROWS,
+    trainer._reading(Loader(train=lambda partition: iter(()), val=None, records=None, batch=LM_ROWS,
                            batch_tokens=LM_ROWS * LM_CONTEXT))
     assert trainer.accumulation == 4 and int(trainer.initial_state().window_size) == 4
 

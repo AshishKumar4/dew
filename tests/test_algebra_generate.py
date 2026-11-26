@@ -142,6 +142,105 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
                         seeds=8, truth_fn=whole)
 
 
+def _generated_inverse(system):
+    from dew.algebra.component_cases_derived import chunk_solve_level
+
+    size = system.shape[0]
+    place = jnp.arange(size)
+    identity = jnp.eye(size, dtype=system.dtype)
+    paired = (place[:, None] % 2 == 1) & (place[None, :] == place[:, None] - 1)
+    inverse = identity - jnp.where(paired, system, 0)
+    for level in range(1, size.bit_length() - 1):
+        inverse = chunk_solve_level(system, inverse, jnp.asarray(level, jnp.int32))
+    return inverse - identity
+
+
+@pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
+def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
+    from dew.algebra.component_cases_derived import chunk_weighted
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, values, strengths):
+        return chunk_weighted(_generated_inverse(system), values, strengths)
+
+    def written(system, values, strengths):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
+
+    def truth(system, values, strengths):
+        rhs = values * strengths[:, None]
+        return jax.lax.linalg.triangular_solve(system, rhs, left_side=True, lower=True, unit_diagonal=True)
+
+    def draw(seed):
+        system = component_cases._chunk_system(seed, size)
+        rng = np.random.default_rng(seed)
+        rhs = rng.uniform(-0.25, 0.25, (size, columns)).astype(np.float32)
+        strength = rng.uniform(0.125, 0.5, size).astype(np.float32)
+        strength[1] = 0
+        return system, rhs, strength
+
+    assert_as_exact(generated, written, draw, "generated recurrence solve and value application",
+                    seeds=8, truth_fn=truth)
+
+
+@pytest.mark.parametrize("size", [16, 32, 64])
+def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
+    from dew.algebra.component_cases_derived import chunk_inverse_pullback
+    from dew.nn.kernels import recurrence_algebra
+
+    def generated(system, cotangent):
+        return chunk_inverse_pullback(_generated_inverse(system), cotangent)
+
+    def written(system, cotangent):
+        lower = recurrence_algebra.solved(system, component_cases._carry_product)
+        return component_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
+
+    def truth(system, cotangent):
+        identity = jnp.eye(size, dtype=system.dtype)
+
+        def solve(a):
+            return jax.lax.linalg.triangular_solve(
+                a, identity, left_side=True, lower=True, unit_diagonal=True)
+
+        _, pull = jax.vjp(solve, system)
+        return pull(jnp.tril(cotangent, -1))[0]
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        # Same-shape adversarial draws can also use the system as the cotangent. Keep the closed
+        # solve and its transpose representable together; the component gate covers the isolated edge.
+        system = np.tril(rng.uniform(-0.125 / size, 0.125 / size, (size, size)).astype(np.float32), -1)
+        cotangent = rng.normal(size=system.shape).astype(np.float32)
+        return system, cotangent
+
+    assert_as_exact(generated, written, draw, "generated inverse VJP of a triangular solve",
+                    seeds=8, truth_fn=truth)
+
+
+def test_generated_value_gradient_accumulates_two_query_tiles():
+    from dew.algebra.component_cases_derived import values_gradient
+
+    def generated(scores, cotangent, peak, total):
+        return (values_gradient(scores[:32], cotangent[:32], peak[:32], total[:32])
+                + values_gradient(scores[32:], cotangent[32:], peak[32:], total[32:]))
+
+    def written(scores, cotangent, peak, total):
+        return component_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
+
+    def truth(scores, cotangent, peak, total):
+        keep = jnp.isfinite(peak)
+        weights = jnp.exp(jnp.where(keep[:, None], scores - peak[:, None], -jnp.inf))
+        return weights.T @ (cotangent / jnp.where(total > 0, total, 1)[:, None])
+
+    def draw(seed):
+        case = component_cases.VALUES_GRADIENT.cases
+        left = case.draw(seed, case.operands[0])
+        right = case.draw(seed + 19, case.operands[0])
+        return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
+
+    assert_as_exact(generated, written, draw, "generated dV across query tiles", seeds=8, truth_fn=truth)
+
+
 def test_generated_rounded_bodies_keep_the_written_surrogate_law():
     from dew.algebra import component_cases_derived as emitted
     from dew.nn import derivatives, precision

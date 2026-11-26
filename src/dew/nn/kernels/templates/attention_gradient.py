@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import rewritten
-from dew.nn.kernels.templates.attention import Kind, differentiable, floating_params
+from dew.nn.kernels.templates.attention import TILED, Kind, differentiable, floating_params
 from dew.nn.kernels.templates.attention_algebra import (
     PLAIN,
     WEIGHT_SHIFT,
@@ -113,7 +113,7 @@ def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...],
     pieces = []
     for slope, kind in zip(slopes[1:], kinds, strict=True):
         entries = where_seen(seen, cotangents * slope, 0.0)
-        pieces.append(entries if kind == Kind.TILE else sums[kind](entries) if kind in sums else None)
+        pieces.append(entries if kind in TILED else sums[kind](entries) if kind in sums else None)
     return logits, tuple(pieces)
 
 

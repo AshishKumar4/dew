@@ -273,6 +273,7 @@ class CompiledTruths:
         (`report.CompiledOnDevice`: a choice its GPU makes at run time) is left unbegun, its refusal raised
         for its caller to place it otherwise."""
         from dew._cache import uncached
+        from dew.nn.kernels.selection import Unlowerable
         from dew.nn.kernels.templates import report
 
         if label in self.begun:
@@ -294,8 +295,15 @@ class CompiledTruths:
             # (`compiled_memory`).
             memory = {}
             if not calls_the_host:
-                with uncached():
-                    read = self._compiled(programs, compiled, host, memory_only=True)
+                try:
+                    with uncached():
+                        read = self._compiled(programs, compiled, host, memory_only=True)
+                except Unlowerable:
+                    # A program refused as it lowers (`attention.unlowered_launch`): the site undone, so
+                    # its compile of the arms it holds is the label's (`arm_store._compile_arms`).
+                    self.begun.discard(label)
+                    shutil.rmtree(site)
+                    raise
                 memory = {name: executable.memory._asdict() for name, executable in read.programs.items()
                           if executable.memory is not None}
             (site / SITE).write_text(json.dumps({"stamp": self.stamp, "label": label, "memory": memory,
@@ -306,7 +314,9 @@ class CompiledTruths:
         try:
             with uncached():
                 built = self._compiled(programs, compiled, host)
-        except report.CompiledOnDevice:
+        except (report.CompiledOnDevice, Unlowerable):
+            # The site undone, its label free for the compile its caller retries (the site's arms at run,
+            # or its others ahead, `arm_store._compile_arms`).
             self.begun.discard(label)
             shutil.rmtree(site)
             raise

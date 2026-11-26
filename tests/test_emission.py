@@ -1160,7 +1160,7 @@ def test_a_correctly_rounded_division_prices_as_its_backend_lowers_it():
     it (row 12886): in a Pallas Triton kernel, read from the launch's own compiler parameters (a
     `CompilerParams` instance, as `pallas_call` binds it), its native `div.rn.f32`, one MUFU beside five FFMAs
     and an FCHK an element on its common path (FS-DIV-SASS5); in a Mosaic GPU kernel and in XLA's program its
-    software division (`precision._correctly_rounded_divide`), counted through its protected and marked
+    software division (`division.software_divide`), counted through its protected and marked
     calls: its significands' division beside the plain quotient, two of a Mosaic GPU kernel's divisions an
     element and more, and nothing of it unpriced, where a flat count reached the plain quotient alone."""
     from jax.experimental import pallas as pl

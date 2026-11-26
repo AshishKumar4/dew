@@ -377,6 +377,10 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     if passes is not None and (decode or loop.shared_cache or loop.exit_threshold is not None):
         raise ValueError("a loop runs a count of passes given per call in training alone: not in decode, "
                          "under a shared cache or an exit threshold, which choose their passes themselves")
+    if (passes is not None and model.block_draft is not None
+            and model.is_mutable_collection('prediction_inputs')):
+        raise ValueError("a count of passes given per call skips visits a block drafter's taps name in the "
+                         "loop's order (`CausalTransformer.visits`): record its context over every pass")
     if passes is not None and captures_any_method(model):
         raise ValueError("a count of passes given per call runs every pass under one scan, which stacks no "
                          "method's non-array return: capture the modules' calls (capture_intermediates=True)")

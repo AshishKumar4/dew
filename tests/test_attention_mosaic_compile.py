@@ -1133,6 +1133,12 @@ def test_the_fullest_fitting_tiles_lower_within_a_hoppers_block(launch):
 def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate):
     """The backward under each score hook lowers for an H100 on any host, as the GPU gate runs it: each hook
     parameter and the initial state read per tile by the dQ and dK/dV programs."""
+    _hooked_backward_lowers(hooks, accurate=accurate)
+
+
+def _hooked_backward_lowers(hooks: str, *, accurate: bool = False, pin=None) -> None:
+    """The backward under the score hook `SCORE_HOOKS[hooks]`, through the route, lowered for an H100 on
+    any host (its config `pin`'s where given), as the GPU gate runs it."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
@@ -1151,9 +1157,19 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
         return attention_route.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+    pins = {} if pin is None else {attention_mosaic.MosaicBackward: pin}
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), tuning.pinned(pins):
         jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
             lowering_platforms=("cuda",))
+
+
+@lowers("sm90")
+def test_a_band_bias_backward_of_two_launches_lowers_for_an_h100():
+    """A band bias's (`Kind.BAND`) backward on an H100 pinned to two launches (`fused=False`), its dK/dV
+    walk along the queries reading the band where each step reads it, the dQ launch's riding its key stream:
+    lowers. A band rode the dK/dV walk's query stream too, whose views it holds none of (head review)."""
+    _hooked_backward_lowers("band-bias", pin=attention_mosaic.BackwardTiles(64, 64, 2, 1, family="wgmma",
+                                                                            fused=False))
 
 
 @lowers("sm90")

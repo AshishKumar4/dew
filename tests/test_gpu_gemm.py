@@ -58,6 +58,7 @@ import test_contracts_gemm as contracts_gemm
 import test_declared_cells_memory as declared_cells_memory
 import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
+import test_gemm_converted as gemm_converted
 import test_gemm_gather as gemm_gather
 import test_gemm_nvfp4_chain as gemm_nvfp4_chain
 import test_gemm_paired as gemm_paired
@@ -220,6 +221,38 @@ def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
                     truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+def _converted_cells() -> tuple[Cell, ...]:
+    """The converting FP8 codes product's check 1 on an A100, each format's (row 8548): its first native
+    run qualifies the accuracy its receipt's timing rests on."""
+    on_par = gemm_converted.an_fp8_codes_product_through_the_converting_template_is_on_par
+    return tuple(Cell(f"an fp8 codes product through the converting template is on par ({name})",
+                      functools.partial(on_par, name), "sm80", mosaic=True,
+                      native={"launch": "converted fp8 gmm", "format": name})
+                 for name in gemm_converted.FORMATS)
+
+
+def _scale_edge_cells() -> tuple[Cell, ...]:
+    """The blockwise FP8 template's exact witnesses at its scales' ends (rows 13257, 13274, 13291), each an
+    exact value its run reads through the template's route."""
+    return (
+        Cell("a blockwise FP8 product at far-apart scales is exact",
+             gemm_blockwise.a_blockwise_fp8_product_at_far_apart_scales_is_exact, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "subnormal scale"}),
+        Cell("a blockwise FP8 product at large finite scales is finite",
+             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *(Cell(f"an E5M2 blockwise {name} at fp32's largest is finite ({edge})",
+               functools.partial(witness, edge), "sm90", at_run=EXACT_OVERFLOW,
+               native={"launch": launch, "pass": f"e5m2 step scaling, {edge}"})
+          for name, witness, launch in (
+              ("product", gemm_blockwise.an_e5m2_blockwise_product_at_fp32s_largest_is_finite,
+               "blockwise fp8 gmm"),
+              ("kernel gradient", gemm_blockwise.an_e5m2_blockwise_kernel_gradient_at_fp32s_largest_is_finite,
+               "blockwise fp8 tgmm"))
+          for edge in gemm_blockwise.E5M2_EDGES),
+    )
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -364,9 +397,8 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
-        Cell("a blockwise FP8 product at large finite scales is finite",
-             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
-             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *_scale_edge_cells(),
+        *_converted_cells(),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",

@@ -76,6 +76,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
@@ -599,18 +600,44 @@ def _unset_default(owner: "RunConfig | DataclassInstance | type[DataclassInstanc
     return None if stated else kinds[0]()
 
 
-def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]:
+def _placed(config: "RunConfig | DataclassInstance", path: str, record: Mapping[str, JSON] | None = None
+            ) -> tuple[list[str], dict[str, JSON]]:
     """The keys of `path`'s value in `config`'s record, and the record of the default each unset optional
-    record along it takes (`_unset_default`), by its key."""
+    record along it takes (`_unset_default`), by its key: each group stepped through the run where it holds
+    it; where it holds a section unset that `record` (the record an override writes) sets, a shallower path
+    of the same point, that section read off `record` by the one dataclass its field declares beside None,
+    building no run (row 12908); KeyError for a path naming no field, or a section of no one such class."""
     *groups, field = path.split(".")
     held: object = config
+    kind: type = type(config)
+    node: object = record
     unset: dict[str, JSON] = {}
     for group in groups:
-        if not (dataclasses.is_dataclass(held) and group in _names(held)):
-            raise KeyError(f"{path} names no group of the run record")
-        owner, held = held, getattr(held, group)
-        if held is None and (default := _unset_default(owner, group)) is not None:
+        # A record section read off `record` steps by its declared dataclass; any other mapping (a run's
+        # `TrainerConfig.links`) holds no group a path names.
+        owner: DataclassInstance | type[DataclassInstance]
+        if isinstance(held, Mapping):
+            if not (dataclasses.is_dataclass(kind) and group in _names(kind)):
+                raise KeyError(f"{path} names no group of the run record")
+            owner, value = kind, held.get(group)
+        else:
+            if not (dataclasses.is_dataclass(held) and group in _names(held)):
+                raise KeyError(f"{path} names no group of the run record")
+            owner, value = held, getattr(held, group)
+        stated = node.get(group) if isinstance(node, Mapping) else None
+        if value is None and isinstance(stated, Mapping):
+            declared = registry.declared_type(kind, group)
+            kinds = [member for member in (declared, *typing.get_args(declared))
+                     if isinstance(member, type) and dataclasses.is_dataclass(member)]
+            if len(kinds) != 1:
+                raise KeyError(f"{path} names no group of the run record")
+            held, kind = stated, kinds[0]
+        elif value is None and (default := _unset_default(owner, group)) is not None:
             held, unset[group] = default, registry.to_record(default, type(default))
+            kind = type(default)
+        else:
+            held, kind = value, type(value)
+        node = stated
     if isinstance(held, Registered):
         # A command line's subcommand (`registry.record_flags`) is the record it makes: its plain flags are
         # that record's `fields` entries.
@@ -619,31 +646,8 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]
         if field not in parameters(held.member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], unset
-    if not (dataclasses.is_dataclass(held) and field in _names(held)):
-        raise KeyError(f"{path} names no field of the run record")
-    return [*groups, field], unset
-
-
-def _declared_path(kind: type, record: Mapping[str, JSON], path: str) -> tuple[list[str], dict[str, JSON]]:
-    """`_placed` read off a record of the run class `kind` (`record`, a section of which a shallower path of
-    an override's point set) and the classes its fields declare, building no run: the keys of `path`'s
-    value, each section by the one dataclass its field declares beside None, and the record of the default
-    each section the record holds unset takes (`_unset_default`), by its key; KeyError for any other."""
-    *groups, field = path.split(".")
-    node: object = record
-    unset: dict[str, JSON] = {}
-    for group in groups:
-        declared = registry.declared_type(kind, group)
-        kinds = [member for member in (declared, *typing.get_args(declared))
-                 if isinstance(member, type) and dataclasses.is_dataclass(member)]
-        held = node.get(group) if isinstance(node, Mapping) else None
-        if held is None and (default := _unset_default(kind, group)) is not None:
-            held = unset[group] = registry.to_record(default, type(default))
-            kinds = [type(default)]
-        if len(kinds) != 1 or not isinstance(held, Mapping):
-            raise KeyError(f"{path} names no group of the run record")
-        kind, node = kinds[0], held
-    if not (dataclasses.is_dataclass(kind) and field in _names(kind)):
+    named = kind if isinstance(held, Mapping) else held
+    if not (dataclasses.is_dataclass(named) and field in _names(named)):
         raise KeyError(f"{path} names no field of the run record")
     return [*groups, field], unset
 
@@ -844,12 +848,9 @@ class RunConfig:
             value = point[path]
             if path in chained:
                 continue
-            try:
-                keys, unset = _placed(self, path)
-            except KeyError:
-                # A section the run holds unset that a shallower path of the point set: placed by its
-                # declared class, the run built once, from the completed record.
-                keys, unset = _declared_path(type(self), record, path)
+            # A section the run holds unset that a shallower path of the point set is placed by its declared
+            # class, the run built once, from the completed record (`_placed`'s `record`).
+            keys, unset = _placed(self, path, record)
             *groups, field = keys
             node = record
             for group in groups:
@@ -1675,15 +1676,17 @@ class RunConfig:
         ahead, so a config read alone reads none of it."""
         trainer = self.trainer
         checkpoints, tracker = resources.pop("checkpoints", None), resources.pop("tracker", None)
+        numerics = self.trained_numerics(objective)
+        scaled, drawn = (False, None) if numerics is not None else self.trained_knobs()
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, accumulation=trainer.accumulation,
             update_tokens=trainer.update_tokens, split=trainer.split, remat=trainer.remat,
             microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
             advanced=training.TrainerAdvanced(
                 layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
-                skip_nonfinite=trainer.skip_nonfinite,
-                dynamic_scale=trainer.precision.scales_loss(self.compute_dtype()),
-                tune_kernels=self.diagnostics.tune_kernels, param_dtype=self.drawn_dtype(),
+                skip_nonfinite=trainer.skip_nonfinite, numerics=numerics, dynamic_scale=scaled,
+                param_dtype=drawn,
+                tune_kernels=self.diagnostics.tune_kernels,
                 inspection=trainer.inspection, diloco=trainer.diloco,
                 **{"links": self.diagnostics.links, **resources}))
 
@@ -1693,13 +1696,33 @@ class RunConfig:
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
-    def drawn_dtype(self) -> str | None:
-        """The dtype the run stores the parameters it draws fresh in (`Trainer`'s `param_dtype`): its
-        numerics' `dtypes.params` where that is not Flax's own float32 and its model's record states
-        none; None leaves each module's own."""
-        params = self.trainer.precision.dtypes.params
-        return None if "param_dtype" in self.model.fields or jax.numpy.dtype(params) == jax.numpy.float32 \
-            else params
+    def trained_numerics[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> Numerics | None:
+        """The run's numerics as its trainer reads them over `objective` (`TrainerAdvanced.numerics`): its
+        precision, with the compute dtype its modules state as their own in place of its own
+        (`stated_compute`: the record's where the run built them, `numerics_fields`, a handed model's own),
+        and the parameters' dtype its model's record states, which the model then draws them in itself. None
+        where its modules state no one compute dtype (Flax's None, a wrapper's, several among a multipart
+        objective's), which no trainer establishes: the run then hands its trainer the loss scale and drawn
+        dtype its record names (`trained_knobs`), as before numerics reached the trainer, its programs traced
+        under its numerics all the same (`traced`)."""
+        from dew.training.transaction import stated_compute
+
+        computes = stated_compute(objective)
+        if computes is None:
+            return None
+        precision = self.trainer.precision
+        stated = self.model.fields.get("param_dtype")
+        params = precision.dtypes.params if stated is None else str(stated)
+        return dataclasses.replace(precision, dtypes=dataclasses.replace(
+            precision.dtypes, compute=computes, params=params))
+
+    def trained_knobs(self) -> tuple[bool, str | None]:
+        """The loss scale and drawn dtype a trainer takes for a run whose numerics it cannot hold
+        (`trained_numerics`): its numerics' loss scaling at its record's compute dtype (`compute_dtype`), and
+        its parameters' dtype where that is not Flax's float32 and its model's record states none."""
+        precision = self.trainer.precision
+        drawn = None if "param_dtype" in self.model.fields else precision.drawn_dtype()
+        return precision.scales_loss(self.compute_dtype()), drawn
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,

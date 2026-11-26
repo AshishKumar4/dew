@@ -393,7 +393,7 @@ def test_a_relative_band_holds_the_relative_bias_it_writes_out(extent, offset):
     `extent - 1` before a query's place through its place lies in the query's band."""
     from dew.nn.attention import BandBias
     from dew.nn.attention_terms import relative_band, relative_logits
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     rng = np.random.default_rng([0x13138, extent])
     rows, heads, rank = 2, 2, 3
@@ -420,13 +420,13 @@ def test_a_relative_band_holds_a_groups_products_at_a_time():
 
     from dew.nn import programs
     from dew.nn.attention_terms import relative_band
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     extent = 64
     states = jax.ShapeDtypeStruct((1, BAND_QUERIES, 2, 3), jnp.float32)
     bank = jax.ShapeDtypeStruct((3, extent), jnp.float32)
     traced = jax.make_jaxpr(lambda s, b: relative_band(s, b, jnp.int32(0)).values)(states, bank).jaxpr
-    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, skip=programs.opaque)
+    found = [getattr(var.aval, "shape", ()) for equation in equations(traced, prune=programs.opaque)
              for var in equation.outvars]
     assert any(shape[-2:] == (template.BAND_GROUP, extent) for shape in found), found
     assert not any(shape[-2:] == (BAND_QUERIES, extent) for shape in found)
@@ -437,7 +437,7 @@ def test_a_relative_band_of_no_queries_or_rows_is_empty():
     (`BandBias.dense`), are empty as `relative_logits`' bias over them is, its other axes theirs."""
     from dew.nn.attention import BandBias
     from dew.nn.attention_terms import relative_band, relative_logits
-    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kernels.templates import band as template
 
     extent, keys = 5, 16
     states = jnp.zeros((2, 0, 3, 4), jnp.float32)

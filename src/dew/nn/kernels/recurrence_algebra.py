@@ -40,8 +40,11 @@ from dew.nn.precision import (
     float32_einsum,
     float32_matmul,
     power2,
+    renormalized_add,
+    rounding_alone,
     two_product,
     two_sum,
+    uncontracted,
 )
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
@@ -111,14 +114,15 @@ def prefix(g):
     """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
-    (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
-    variadic reduce-window over each position's chunk so far, which XLA fuses into the launches' layout of the
-    pair: as an associative scan its log-depth levels were XLA launches of their own, fourteen of the gated
-    delta net's 364 us forward on a GH200, 45 us of it (LF-GDN-NCU-gh200; four fusions in all compiled for an
-    sm90 with the window, jsf-prefix-rw), the pair as precise either way (1.2e-14 to 1.5e-14 relative from
-    float64 over decays of 1e-3 to 30 a token). One program JAX traces once for `g`'s type: its exact sums
-    traced afresh, each layer's forward, its kept forward in the backward and its gradient's preparation each
-    paid them, 226 s of Qwen3.5-4B's 1208 s ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
+    (`precision.renormalized_add` over the terms fenced once), so a difference of two positions is as precise
+    as its own range. One variadic reduce-window over each position's chunk so far, which XLA fuses into the
+    launches' layout of the pair: as an associative scan its log-depth levels were XLA launches of their own,
+    fourteen of the gated delta net's 364 us forward on a GH200, 45 us of it (LF-GDN-NCU-gh200; four fusions
+    in all compiled for an sm90 with the window, jsf-prefix-rw), the pair as precise either way (1.2e-14 to
+    1.5e-14 relative from float64 over decays of 1e-3 to 30 a token). One program JAX traces once for `g`'s
+    type: its exact sums traced afresh, each layer's forward, its kept forward in the backward and its
+    gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s ahead-of-time compile (row 3142,
+    FS2440-4B-STACKS)."""
     scale = np.float32(LOG2_E)
     scaled, error = two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
@@ -126,8 +130,14 @@ def prefix(g):
     window = tuple(size if dim == axis else 1 for dim in range(g.ndim))
     padding = tuple((size - 1, 0) if dim == axis else (0, 0) for dim in range(g.ndim))
     zero = jnp.zeros((), g.dtype)
-    return jax.lax.reduce_window((scaled, error), (zero, zero), compensated_add, window, (1,) * g.ndim,
-                                 padding)
+    # As the one compensated pair reduction sums (`precision.summed_pairs`): each term's hi read as one value
+    # where it is made (`uncontracted`), the window's additions marked to round alone, and the pairs combined
+    # by `renormalized_add`, where a combine fencing its operands at every step (`compensated_add`) was a
+    # second way of the same sum (row 10722).
+    with rounding_alone():
+        (scaled,) = uncontracted(scaled)
+        return jax.lax.reduce_window((scaled, error), (zero, zero), renormalized_add, window,
+                                     (1,) * g.ndim, padding)
 
 
 def prefix_terms(g) -> tuple:
@@ -451,12 +461,12 @@ def apart(rows, rows_lo, columns, columns_lo):
 def _lags(shape) -> jax.Array:
     """A tile's row index less its column index `[R, C]`, how far each column's token lags its row's (its
     column 0 the row index): the one int tile a mask comparing a row with its column holds (`lag > 0` strictly
-    lower), where `_grid`'s two stay live."""
-    rows, cols = _grid(shape)
+    lower), where `tile_indices`'s two stay live."""
+    rows, cols = tile_indices(shape)
     return rows - cols
 
 
-def _grid(shape) -> tuple[jax.Array, jax.Array]:
+def tile_indices(shape) -> tuple[jax.Array, jax.Array]:
     """A tile's row and column indices `[R, C]` each, two iotas, so a mainloop lays each as its tile (a vector
     broadcast both ways is one value Mosaic GPU's layout inference cannot lay twice)."""
     return jax.lax.broadcasted_iota(jnp.int32, shape, 0), jax.lax.broadcasted_iota(jnp.int32, shape, 1)
@@ -534,7 +544,7 @@ def _later_groups(shape, group: int, *, columns_later: bool = False) -> jax.Arra
     shift = group.bit_length() - 1
     if group != 1 << shift:
         raise ValueError(f"a group of {group} tokens is no power of two")
-    rows, cols = (index >> shift for index in _grid(shape))
+    rows, cols = (index >> shift for index in tile_indices(shape))
     return cols > rows if columns_later else rows > cols
 
 
@@ -562,30 +572,33 @@ Supported = Callable[[str, "Operand", "Operand", Support], jax.Array]
 in its blocks."""
 
 
+def doubled_level(a, inverse, rows, cols, level, issue: Issue, *, supported: Supported | None = None):
+    """Join the width-`s` blocks of `X_s` at `s = 2**level`: `X_2s = X_s + (M_s * (X_s A)) X_s`.
+
+    `M_s` takes each odd block's rows over the preceding block's columns: `factor`'s `X2 A21 X1` there,
+    zero elsewhere. The two `"merge"` products use the cached supports when `supported`: `X_s` block
+    diagonal, `A` strictly lower, and joins inside their blocks.
+    """
+    row_block, col_block = rows >> level, cols >> level
+    lower = ((row_block & 1) == 1) & (col_block == row_block - 1)
+    if supported is None:
+        return inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
+    joining, joined = _merges_support(a.shape[-1], 1 << level)
+    joins = jnp.where(lower, supported("merge", inverse, a, joining), 0.0)
+    return inverse + supported("merge", joins, inverse, joined)
+
+
 def doubled(a, issue: Issue, *, supported: Supported | None = None):
-    """`factor`'s doubling on one tile: `(I - A)^-1` `[C, C]` of a strictly lower `a`, every level's blocks
-    held in place in the tile, for a mainloop whose products take whole tiles (Mosaic GPU's, a warpgroup's 64
-    rows, which hold no block of their own, and whose element-wise steps take 32 of a tile's entries a
-    thread, so a forward substitution's 16 steps over its 16-row blocks cost a 64-row tile more than the
-    three levels of products they replace). From the two-wide blocks `[[1, 0], [a, 1]]`, each level joins
-    pairs of `s`-blocks as `X_2s = X_s + (M_s * (X_s A)) X_s` ('merge' twice), `M_s` each pair's lower block:
-    the block-diagonal `X_s` against the whole tile, masked there, is its odd blocks' rows of `A` over the
-    even ones', so the join is `factor`'s `X2 A21 X1` there and zero elsewhere, the same terms, and a
-    mainloop stages `A` once. Given `supported`, each merge is issued of its terms alone (`_merges_support`):
-    the inverse block-diagonal, `A` strictly lower, the joins in their blocks."""
-    size = a.shape[-1]
-    rows, cols = _grid(a.shape)
+    """`factor`'s whole-tile inverse `(I - A)^-1` of a strictly lower `A`, starting at two-wide blocks and
+    calling `doubled_level` until they span the tile. A mainloop stages `A` once. A Mosaic warpgroup's 64
+    rows hold no block of their own; elementwise steps take 32 entries a thread, so the 16 steps of
+    forward substitution within each 16-row block cost more than the three product levels that replace
+    those steps. Each level uses `factor`'s same terms.
+    """
+    rows, cols = tile_indices(a.shape)
     inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
-    width = 2
-    while width < size:
-        lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
-        if supported is None:
-            inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
-        else:
-            joining, joined = _merges_support(size, width)
-            joins = jnp.where(lower, supported("merge", inverse, a, joining), 0.0)
-            inverse = inverse + supported("merge", joins, inverse, joined)
-        width *= 2
+    for level in range(1, (a.shape[-1] - 1).bit_length()):
+        inverse = doubled_level(a, inverse, rows, cols, level, issue, supported=supported)
     return inverse
 
 
@@ -610,7 +623,7 @@ def solved(system, issue: Issue, *, supported: Supported | None = None):
     """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
     diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
     product), its merges of their supports alone where `supported` (`doubled`'s)."""
-    rows, cols = _grid(system.shape)
+    rows, cols = tile_indices(system.shape)
     return doubled(-system, issue, supported=supported) - jnp.where(rows == cols, 1.0, 0.0)
 
 
@@ -670,7 +683,7 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple |
     if last is None:
         return [part * decay[i] + issue("write", keys(i).T, values) for i, part in enumerate(state)]
     key_rows, value_row, row = last
-    rows, _ = _grid(values.shape)
+    rows, _ = tile_indices(values.shape)
     earlier = jnp.where(rows != row, values, jnp.zeros((), values.dtype))
     return [part * decay[i] + (issue("write", keys(i).T, earlier) + key_rows(i)[:, None] * value_row[None, :])
             for i, part in enumerate(state)]
@@ -771,7 +784,7 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
     launch on an A100 (1508 us against 356, M-JS-144-a100). A sub-chunk's own pairs factored too, taken on
     the tensor cores, put a packed document's first token's output, a row of 2.5e-5 where `q . k` cancels,
     at 0.83 of its size from float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w)."""
-    index, _ = _grid(prefix[0].shape)
+    index, _ = tile_indices(prefix[0].shape)
     # Every row gated down to its own sub-chunk's first token.
     down = decay(prefix, _laid_references(lambda s: at(s * sub), index, chunk, sub))
     # Scaled once gated down, so a large row its decay attenuates stays finite.
@@ -810,7 +823,7 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     the row times the key first, which loses no term in range to the decay (row 7299; a decayed row lost
     2^-100 against a key of 2^60, base review 6ce025bc7 F1; a decayed key 2^-160 against a row of 2^100,
     #3703 review)."""
-    index, _ = _grid(rows[0].shape)
+    index, _ = tile_indices(rows[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
 
@@ -849,10 +862,106 @@ def token_decays(prefix: tuple, earlier: tuple, *, sub: int = SUB) -> jax.Array:
     (`separated`) and `earlier`, each row `i` holding token `i - 1`'s: a sub-chunk's own pairs' factors
     (`key_diagonal_bands`, `key_diagonal_pairs_back`), its exponent at most zero (`decay`). A sub-chunk's
     first token's is one, no pair of its own sub-chunk spanning it, whatever `earlier` holds there."""
-    index, _ = _grid(prefix[0].shape)
+    index, _ = tile_indices(prefix[0].shape)
     first = index % sub == 0
     return decay(prefix, tuple(jnp.where(first, half, before) for half, before in zip(prefix, earlier,
                                                                                        strict=True)))
+
+
+OWN_REACH = 112
+"""The most whole powers of two an anchored factor's exponent spans (`own_anchored`): within it `between` is
+exact, past 120 it holds its scale and below -124 it may flush."""
+
+OWN_BAND = 100
+"""The magnitudes, as powers of two, every anchored operand's elements keep within or are zero as given
+(`own_out_of_band`): both of an element's two bf16 parts normal, its narrowing losing no more of it than its
+parts' 16 bits."""
+
+OWN_PRODUCT = 116
+"""The largest power of two the backward's anchored products' terms reach before their outer factors
+(`anchored.back`): its largest gradient block's element times its largest anchored operand's, so a sum of
+sixteen terms of three part products, two such sums added, stays within fp32's range (2^121)."""
+
+FIRST, MIDDLE, LAST = 0, SUB // 2, SUB - 1
+"""A sub-chunk's tokens its own pairs' anchors are taken at (`own_anchors`): the forward's middle, both
+factors before its product and within half a sub-chunk; the backward's rows' gradients' first and its keys'
+last, each outer factor (applied after its product) at most one."""
+
+
+def own_anchors(at: Callable[[int], tuple], shape: tuple[int, ...], token: int = MIDDLE, sub: int = SUB
+                ) -> tuple:
+    """Each row's sub-chunk's anchor, the separated prefix at its `token` (`at(token)`, a column's vectors;
+    `MIDDLE`, `FIRST` or `LAST`), laid over its rows, each half `shape` `[C, BK]` (`_laid_references`): the
+    point both factors of a sub-chunk's own pair are taken against (`own_anchored`), fla_kda's safe gate's
+    shifted first token."""
+    index, _ = tile_indices(shape)
+    return _laid_references(lambda s: at(s * sub + token), index, shape[0], sub)
+
+
+def own_anchored(prefix: tuple, anchors: tuple) -> tuple[jax.Array, jax.Array]:
+    """A key block's anchored factors `(exp2(g_i - A), exp2(A - g_i))` `[C, BK]` of its separated prefix
+    `prefix` against its rows' anchors (`own_anchors`): a sub-chunk's own pair `(i, j)` decays by the first's
+    on row `i` times the second's on key `j`, `exp2(g_i - g_j)` (`between`, its exponent either sign), so the
+    own pairs are one product of rows and keys each scaled once (fla_kda's safe-gate diagonal, chunk_intra.py
+    at 413ad2c), where `key_diagonal_bands` forms each pair's decay apart. Against a sub-chunk's first token
+    the first is at most one, against its last the second (a prefix falls along its tokens). The pairs past
+    a token (`j > i`) take factors past one, which every caller masks."""
+    return between(prefix, anchors), between(anchors, prefix)
+
+
+def own_reach_exceeded(prefix: tuple, anchors: tuple) -> jax.Array:
+    """Where a key block's anchored factors pass `OWN_REACH` (`own_anchored`), bool `[C, BK]`: a token's
+    prefix more whole powers of two from its anchor than the reach, or a prefix not finite."""
+    (whole, fraction), (other, its_fraction) = prefix, anchors
+    return (jnp.abs(whole - other) > OWN_REACH) | ~jnp.isfinite(fraction + its_fraction)
+
+
+def own_out_of_band(given: jax.Array, scaled: jax.Array) -> jax.Array:
+    """Where an anchored operand's elements leave its band, bool, each its `scaled` value of its `given` one:
+    not finite, or given nonzero and its magnitude past `2^OWN_BAND` or below `2^-OWN_BAND` (a value its two
+    bf16 parts take less exactly, or a fast-math flush to zero, of a term whose pair may keep it)."""
+    size = jnp.abs(scaled)
+    return ~jnp.isfinite(scaled) | ((given != 0) & ((size < 2.0 ** -OWN_BAND) | (size > 2.0 ** OWN_BAND)))
+
+
+def own_rows_failed(reached: jax.Array | None, operands: Sequence[tuple[jax.Array, jax.Array]] = ()
+                    ) -> jax.Array:
+    """The rows whose anchored products leave their guard, a row's vector `[C]` fp32, one where they do: an
+    element of `reached` (`own_reach_exceeded`, `[C, BK]`; None: none) or of an operand `(given, scaled)` of
+    `operands` out of its band (`own_out_of_band`), reduced along its row (a warp's own); a caller takes
+    their largest across the warps once (a row's vector's share of scratch, where the whole tile's took a
+    tile's)."""
+    flags = ([] if reached is None else [reached]) + [own_out_of_band(*operand) for operand in operands]
+    return jnp.max(jnp.where(functools.reduce(jnp.logical_or, flags), 1.0, 0.0), axis=1)
+
+
+def own_columns(pairs: jax.Array, *, chunk: int, transposed: bool = False, sub: int = SUB) -> jax.Array:
+    """A call's pairs `[R, H * chunk]` (each chunk's square of a head's pairs) as each token's own pairs
+    strictly before it, its sub-chunk's earlier tokens a column each `[R, H * sub]`: row `i`'s column `c` the
+    pair `(i, f + c)`, `f` its sub-chunk's first token, zero at and past `i`; `transposed`, each chunk's
+    square transposed first: row `j`'s column `r` the pair `(f + r, j)`, zero at and before `j`. The own
+    pairs' backward's operands (`anchored.back`), a sub-chunk's block of rows against its keys' rows."""
+    rows, heads = pairs.shape[0], pairs.shape[1] // chunk
+    squares = pairs.reshape(rows // chunk, chunk, heads, chunk)
+    if transposed:
+        squares = squares.transpose(0, 3, 2, 1)
+    token = jnp.arange(chunk)[:, None]
+    column = jnp.arange(sub)[None, :]
+    found = jnp.take_along_axis(squares, (token // sub * sub + column)[None, :, None, :], axis=3)
+    before = (column > token % sub) if transposed else (column < token % sub)
+    return jnp.where(before[None, :, None, :], found, jnp.zeros((), pairs.dtype)).reshape(rows, heads * sub)
+
+
+def own_compact(square: jax.Array, *, sub: int = SUB) -> jax.Array:
+    """A chunk's `[C, C]` product's own sub-chunks' blocks compact `[C, sub]` (`key_diagonal_bands`' form, a
+    row's column its earlier token's place in its sub-chunk's block): each row's pairs at or before it in its
+    own block, zero past it (selected: an anchored pair past its row may be any value, `own_anchored`), the
+    rest of the product unread."""
+    rows, lanes = tile_indices((square.shape[0], sub))
+    found = jnp.zeros(rows.shape, jnp.float32)
+    for s in range(square.shape[1] // sub):
+        found = jnp.where((rows // sub == s) & (lanes <= rows % sub), square[:, s * sub:(s + 1) * sub], found)
+    return found
 
 
 def own_bands(pairs: jax.Array, *, chunk: int, sub: int = SUB) -> jax.Array:
@@ -903,7 +1012,7 @@ def columns_before(found: jax.Array, start: int) -> jax.Array:
     on) strictly below the chunk's diagonal across sub-chunks: its columns before `start`, zero from it on.
     `key_block_pairs`' are zero there as formed, but for a row whose write gate overflows, a NaN where it
     meets a zero factor."""
-    return jnp.where(_grid(found.shape)[1] < start, found, 0.0)
+    return jnp.where(tile_indices(found.shape)[1] < start, found, 0.0)
 
 
 def block_masked(block: jax.Array, *, strict: bool, scale: float, sub: int = SUB) -> jax.Array:
@@ -1117,7 +1226,7 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tu
     # token's.
     keyed = keys * d_key
     at_last = jnp.sum(keyed, axis=0) if columns is None else columns(keyed)
-    rows, _ = _grid(d_key.shape)
+    rows, _ = tile_indices(d_key.shape)
     d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
     d_weight = weight_sum()
     # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`: cast `dw` once before both the diagonal and off-diagonal
@@ -1185,7 +1294,7 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
     (`key_block_pairs`); each sub-chunk's own pairs' gradients are `key_diagonal_pairs_back`'s."""
     for c in range(columns):
         prefix = separated(*gates(c))
-        index, _ = _grid(prefix[0].shape)
+        index, _ = tile_indices(prefix[0].shape)
         down = decay(prefix, _laid_references(lambda s, c=c: separated(*reference(s, c)), index, chunk, sub))
         gated_rows = [staged(row(c) * down) for row in rows]
 
@@ -1238,7 +1347,7 @@ def key_diagonal_pairs_back(strips: list, own: list, behind: Callable[[jax.Array
     reads not its keys: no projection, which bounds the tied update's cotangents), the pairs' terms summed
     before their decay where their sum is finite, else each decayed first: cotangents about `2^127` summed
     to `2^128` where their decay takes them to `2^67` (head review of a84db53d5)."""
-    index, _ = _grid(d_keys.shape)
+    index, _ = tile_indices(d_keys.shape)
 
     def offset(e, carried):
         d_rows, d_keys, pair, following = carried

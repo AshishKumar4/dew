@@ -12,7 +12,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.continuum import HeadTerms, HeadTransform, _head_growth, _squared_norm, continuum_modules
-from dew.nn.dense import Dense, watched_or_owned
+from dew.nn.dense import Dense, packed_ternary, watched_or_owned
 
 from ..activations import _SLOPES, UNGATED, ungated_activation
 from ..blocks import normal_kernel
@@ -99,7 +99,23 @@ def bounds(decoder: CausalTransformer, states) -> HeadTerms:
 
 
 def head_logits(decoder: CausalTransformer, x):
-    """The fp32 head over states past the continuum levels (`continuum_states`), or final states."""
+    """The fp32 head over states past the continuum levels (`continuum_states`), or final states: its
+    scores (`head_scores`) under the final logit cap, in the run's output dtype."""
+    logits, computed = _scored_logits(decoder, x)
+    # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
+    return capped_logits(logits, decoder.final_logit_softcap).astype(
+        output_dtype(computed if decoder.dtype is None else decoder.dtype))
+
+
+def head_scores(decoder: CausalTransformer, x) -> jax.Array:
+    """The head's scores of `x` before the final logit cap, in at least fp32: what a drafter sums its own
+    scores with before it caps them (`dew.nn.block_draft.draft`)."""
+    return _scored_logits(decoder, x)[0]
+
+
+def _scored_logits(decoder: CausalTransformer, x) -> tuple[jax.Array, jnp.dtype]:
+    """The head's scores of `x` with its gains and bias, before the cap, and the dtype its product
+    computed in."""
     # A stream-width transform reads the final states before `project_out` takes them to the table's.
     if decoder.head_transform is not None:
         x = decoder.head_norm(ungated_activation(decoder.head_transform, decoder.head_dense(x)))
@@ -124,12 +140,8 @@ def head_logits(decoder: CausalTransformer, x):
                                   precision=head.precision)
     # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
     computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
-    # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
-    return capped_logits(scaled_logits(logits, _scored(token_gains(decoder), width),
-                                       _scored(decoder.head_bias_value if decoder.head_bias else None,
-                                               width)),
-                         decoder.final_logit_softcap).astype(
-        output_dtype(computed if decoder.dtype is None else decoder.dtype))
+    return scaled_logits(logits, _scored(token_gains(decoder), width),
+                         _scored(decoder.head_bias_value if decoder.head_bias else None, width)), computed
 
 
 def _scored_alone(decoder: CausalTransformer) -> bool:
@@ -150,11 +162,13 @@ def output_table(decoder: CausalTransformer) -> OutputTable | None:
     """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables
     (`head_table`). None where no matrix alone is the head: past a `head_transform` or a continuum
     level, or where `lm_head`'s or `project_out`'s parameters are not its kernel alone: `dew.lora`'s
-    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's."""
+    factors beside it, which its interceptor adds, or no kernel, a frozen FP8 layer's; or where it serves a
+    packed ternary kernel (`dense.packed_ternary`)."""
     layers = [*([] if decoder.tie_embeddings else [decoder.lm_head]),
               *([] if decoder.embedding_features is None else [decoder.project_out])]
     if (decoder.head_transform is not None or decoder.continuum is not None
-            or any(set(layer.variables.get("params", {})) != {"kernel"} for layer in layers)):
+            or any(set(layer.variables.get("params", {})) != {"kernel"} or packed_ternary(layer)
+                   for layer in layers)):
         return None
     return head_table(decoder)
 

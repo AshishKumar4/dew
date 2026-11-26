@@ -8,35 +8,87 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
+from jax.custom_batching import custom_vmap
 from jax.custom_derivatives import SymbolicZero
 
 from dew.algebra import derive, program, ratios, windows
-from dew.algebra.forms import Derived
-from dew.nn.derivatives import Protected, contracted, declared_tangent
+from dew.algebra.forms import Derived, WalkLaw
+from dew.nn.derivatives import Protected, contracted, declared_tangent, marked
+from dew.nn.float_bits import raw_fields, stored_zero, widened_exactly
+from dew.nn.kernels import generation
 from dew.nn.programs import holes
 
 SATURATION = program.Saturation(growth=64, depth=4)
 """Derivation limits for central-moment walks."""
 
 
+def _present(w: jax.Array, *values: jax.Array) -> jax.Array:
+    """Keep a finite observation even at zero weight, for its one-sided derivative."""
+    zero = stored_zero(w) if jnp.issubdtype(w.dtype, jnp.floating) else w == 0
+    nonfinite = functools.reduce(jnp.logical_or, (~jnp.isfinite(value) for value in values))
+    return ~(zero & nonfinite)
+
+
+def _observed(present: jax.Array, *values: jax.Array) -> tuple[jax.Array, ...]:
+    return tuple(jnp.where(present, value, jnp.zeros_like(value)) for value in values)
+
+
+def _denominator(w: jax.Array, kept: jax.Array, present: jax.Array) -> jax.Array:
+    # Broadcasting one weight across the reduction still counts it only once in a direct call.
+    if w.shape[-1] != kept.shape[-1]:
+        kept, = _observed(jnp.any(present, axis=-1, keepdims=True), w)
+    count = jnp.sum(kept, axis=-1)
+    return jnp.where(count > 0, count, jnp.ones_like(count))
+
+
+def _mean(x, w, denominator):
+    return jnp.sum(w * x, axis=-1) / denominator
+
+
+def _variance(x, w, mean, denominator):
+    diff = x - mean[..., None]
+    return jnp.sum(w * diff * diff, axis=-1) / denominator
+
+
 def _weighted_moments_with_total(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Weighted `(mean, variance, total_weight)` of `x` along its last axis under nonnegative `w`."""
     n = jnp.sum(w, axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
-    mean = jnp.sum(w * x, axis=-1) / safe_n
-    diff = x - mean[..., None]
-    m2 = jnp.sum(w * diff * diff, axis=-1)
-    return mean, m2 / safe_n, n
+    mean = _mean(x, w, safe_n)
+    return mean, _variance(x, w, mean, safe_n), n
+
+
+def _weighted_moments_written(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
+    present = _present(w, x)
+    x, kept = _observed(present, x, w)
+    denominator = _denominator(w, kept, present)
+    mean = _mean(x, kept, denominator)
+    return mean, _variance(x, kept, mean, denominator)
+
+
+def _weighted_runtime(x, w):
+    if not w.ndim or not x.size or not w.size:
+        return _weighted_moments_written(x, w)
+    x = jnp.atleast_1d(x)
+    singleton = w.shape[-1] == 1 and x.shape[-1] != 1
+    return _with_tiny_weights(x, w, _weighted_moments_written, dtype=_floating_dtype(x, w),
+                              singleton=singleton)
+
+
+_weighted = marked(WalkLaw(law=_weighted_moments_written, weight=1), _weighted_runtime)
 
 
 def weighted_moments(x: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Weighted `(mean, variance)` of `x` along its last axis under nonnegative weights `w`, zero where
-    total weight is zero."""
-    return _weighted_moments_with_total(x, w)[:2]
+    """Weighted (mean, variance) along the last axis, zero for a row with no weight.
+
+    Stored subnormal weights on finite rows participate in the same ratio and its derivatives.
+    """
+    return _weighted(jnp.asarray(x), jnp.asarray(w))
 
 
 def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -45,9 +97,16 @@ def masked_moments(x: jax.Array, mask: jax.Array) -> tuple[jax.Array, jax.Array]
     n = jnp.sum(mask.astype(x.dtype), axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
     mean = jnp.sum(jnp.where(mask, x, jnp.zeros_like(x)), axis=-1) / safe_n
-    diff = x - mean[..., None]
-    m2 = jnp.sum(jnp.where(mask, diff * diff, jnp.zeros_like(x)), axis=-1)
+    # Mask before any nonlinear operation can make its pullback multiply an inactive infinity.
+    diff = jnp.where(mask, x - mean[..., None], jnp.zeros_like(x))
+    m2 = jnp.sum(jax.lax.square(diff), axis=-1)
     return mean, m2 / safe_n
+
+
+def _covariance(x, y, w, mean_x, mean_y, denominator):
+    dx = x - mean_x[..., None]
+    dy = y - mean_y[..., None]
+    return jnp.sum(w * dx * dy, axis=-1) / denominator
 
 
 def _weighted_cov_with_total(
@@ -56,17 +115,35 @@ def _weighted_cov_with_total(
     """Weighted `(mean_x, mean_y, covariance, total_weight)` of `(x, y)` along their last axis."""
     n = jnp.sum(w, axis=-1)
     safe_n = jnp.where(n > 0, n, jnp.ones_like(n))
-    mean_x = jnp.sum(w * x, axis=-1) / safe_n
-    mean_y = jnp.sum(w * y, axis=-1) / safe_n
-    dx = x - mean_x[..., None]
-    dy = y - mean_y[..., None]
-    cov = jnp.sum(w * dx * dy, axis=-1) / safe_n
-    return mean_x, mean_y, cov, n
+    mean_x, mean_y = _mean(x, w, safe_n), _mean(y, w, safe_n)
+    return mean_x, mean_y, _covariance(x, y, w, mean_x, mean_y, safe_n), n
 
 
 def weighted_covariance(x: jax.Array, y: jax.Array, w: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`."""
-    return _weighted_cov_with_total(x, y, w)[:3]
+    """Weighted `(mean_x, mean_y, covariance)` of `(x, y)` along their last axis under nonnegative `w`.
+
+    Each returned mean has its own marginal mask and shape. The covariance's centers and weight
+    derivatives exclude a missing pair.
+    """
+    present = _present(w, x, y)
+    paired_x, paired_y, kept = _observed(present, x, y, w)
+    denominator = _denominator(w, kept, present)
+
+    def marginal(value):
+        live = _present(w, value)
+        observed, weights = _observed(live, value, w)
+        return _mean(observed, weights, _denominator(w, weights, live))
+
+    def paired_center(value, observed):
+        if jnp.broadcast_shapes(value.shape, w.shape)[-1] == observed.shape[-1]:
+            return _mean(observed, kept, denominator)
+        # A singleton walked extent keeps its original normalization even when its partner
+        # broadcasts it to more cells. Only a pair that is present can contribute its weight.
+        observed_slot, weights = _observed(jnp.any(present, axis=-1, keepdims=True), value, w)
+        return _mean(observed_slot, weights, denominator)
+
+    center_x, center_y = paired_center(x, paired_x), paired_center(y, paired_y)
+    return marginal(x), marginal(y), _covariance(paired_x, paired_y, kept, center_x, center_y, denominator)
 
 
 def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
@@ -75,7 +152,7 @@ def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
     exposing total weight `n` as the final declared output (reusing the same reduction contract)."""
     axes = (*(f"d{i}" for i in range(rank - 1)), "walked")
     if kind == "weighted":
-        fn = _weighted_moments_with_total if with_total else weighted_moments
+        fn = _weighted_moments_with_total if with_total else _weighted_moments_written
         return derive.Reduction(fn, {"x": axes, "w": axes}, walked="walked", ranges={"w": (0.0, math.inf)})
     if kind == "masked":
         return derive.Reduction(masked_moments, {"x": axes, "mask": axes}, walked="walked")
@@ -88,7 +165,10 @@ def _reduction(kind: Literal["weighted", "masked", "covariance"], rank: int, *,
 
 @functools.cache
 def declaration(kind: Literal["weighted", "masked", "covariance"], rank: int = 2) -> derive.Reduction:
-    """`derive.Reduction` for `kind` over `rank`-D arrays walked along their last axis."""
+    """A `derive.Reduction` over the last axis; weighted monoids expect zero or normal weights.
+
+    The runtime `weighted_moments` and `chunked_moments` also accept subnormal weights.
+    """
     return _reduction(kind, rank, with_total=False)
 
 
@@ -180,6 +260,88 @@ def _covariance_form(second: int, weight: int) -> ratios.Ratio:
 
 _COV_FORM = _covariance_form(1, 2)
 _VAR_FORM = _covariance_form(0, 1)
+_STORED_MEAN = replace(_MEAN_FORM, store_subnormal=True)
+_STORED_VARIANCE = replace(_VAR_FORM, store_subnormal=True)
+
+
+def _subnormal_rows(x, w):
+    _, _, biased, field = raw_fields(w)
+    valid_x, valid_w = _observed(_present(w, x), x, w)
+    finite = jnp.isfinite(valid_x) & jnp.isfinite(valid_w)
+    tiny = jnp.broadcast_to((biased == 0) & (field != 0), finite.shape)
+    return jnp.any(tiny, axis=-1) & jnp.all(finite, axis=-1)
+
+
+@custom_vmap
+def _any_subnormal(rows):
+    return jnp.any(rows)
+
+
+@_any_subnormal.def_vmap
+def _batch_any_subnormal(size, batched, rows):
+    del size, batched
+    # There is one rare-path choice for the whole batch, not one select per vmap element.
+    return _any_subnormal(rows), False
+
+
+def _partition_rows(rows, values):
+    def split(rare, value):
+        return jnp.where(rare, value, 0), jnp.where(rare, 0, value)
+
+    def joined(rare, cotangents):
+        # The two supports do not overlap. Select rather than add: FTZ can erase x + 0.
+        return jnp.where(rare, *cotangents)
+
+    return generation.linear_map(split, joined, rows, values)
+
+
+def _with_tiny_weights(x, w, ordinary, *, dtype, singleton: bool):
+    if ((not x.ndim and not w.ndim) or not jnp.issubdtype(w.dtype, jnp.floating)
+            or not jnp.issubdtype(dtype, jnp.floating)):
+        return ordinary(x, w)
+    x, w = jnp.atleast_1d(x), jnp.atleast_1d(w)
+    rare = _subnormal_rows(x, w)
+
+    def choose(x, w, rare):
+        row = rare[..., None]
+        x, w = (jnp.broadcast_to(value, (*rare.shape, value.shape[-1])) for value in (x, w))
+        exact_x, ordinary_x = _partition_rows(row, x)
+        exact_w, ordinary_w = _partition_rows(row, w)
+        exact = _exact_weighted(exact_x, exact_w, rare, dtype, singleton=singleton)
+        kept = ordinary(ordinary_x, ordinary_w)
+
+        def selected(special, normal):
+            from dew.nn.sharding import explicit_placement
+
+            # A singleton row can carry an explicit partition in the written walk even when
+            # the ratio's shape-only broadcast would leave it replicated.
+            placement = explicit_placement(jax.typeof(normal))
+            choice = rare
+            if placement is not None:
+                if jax.typeof(special).sharding != placement:
+                    special = jax.sharding.reshard(special, placement)
+                if jax.typeof(rare).sharding != placement:
+                    choice = jax.sharding.reshard(rare, placement)
+            return jnp.where(choice, special, normal)
+
+        return jax.tree.map(selected, exact, kept)
+
+    return jax.lax.cond(_any_subnormal(rare), choose, lambda x, w, _: ordinary(x, w), x, w, rare)
+
+
+def _exact_weighted(x, w, rare, dtype, *, singleton: bool):
+    """Unlanded weighted mean and variance for the live rows; a safe unit mass elsewhere."""
+    x, w = _observed(_present(w, x), x, w)
+    work = _working_dtype(dtype)
+    x, w = (jnp.moveaxis(widened_exactly(value, work), -1, 0) for value in (x, w))
+    count = max(x.shape[0], w.shape[0])
+    first = (jnp.arange(count) == 0).reshape((count,) + (1,) * rare.ndim)
+    present = (rare & first if singleton else rare[None]).astype(work)
+    unit = (~rare & first).astype(work)
+    sign = jnp.where(present != 0, jnp.ones_like(present), -jnp.ones_like(present))
+    mean = ratios.ratio([x, w, present, unit], _STORED_MEAN)
+    variance = ratios.ratio([x, w, present, unit, sign], _STORED_VARIANCE)
+    return _cast_back((mean, variance), work, dtype)
 
 
 def _ratio_jvp_only(primals: Sequence[jax.Array], tangents: Sequence,
@@ -334,12 +496,18 @@ def chunked_moments(x: jax.Array, w: jax.Array, *, tile: int,
         out_dtype = _floating_dtype(x_arr)
         work = _working_dtype(out_dtype)
         tiled = _tiled({"x": x_arr.astype(work), "mask": w_arr}, tile)
+        if not tiled["x"].size:
+            return _cast_back(masked_moments(tiled["x"][0], tiled["mask"][0]), work, out_dtype)
         finished = _eval_derived(derived("masked", tiled["x"].ndim - 1), tiled, mode)
         return _cast_back(finished, work, out_dtype)
     out_dtype = _floating_dtype(x_arr, w_arr)
     work = _working_dtype(out_dtype)
-    return _cast_back(_run_chunked_weighted(x_arr.astype(work), w_arr.astype(work), tile, mode)[:2],
-                      work, out_dtype)
+    def ordinary(x, w):
+        x, w = _observed(_present(w, x), x, w)
+        walked = _run_chunked_weighted(x.astype(work), w.astype(work), tile, mode)[:2]
+        return _cast_back(walked, work, out_dtype)
+
+    return _with_tiny_weights(x_arr, w_arr, ordinary, dtype=out_dtype, singleton=False)
 
 
 def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
@@ -351,5 +519,6 @@ def chunked_covariance(x: jax.Array, y: jax.Array, w: jax.Array, *, tile: int,
     x_arr, y_arr, w_arr = jnp.asarray(x), jnp.asarray(y), jnp.asarray(w)
     out_dtype = _floating_dtype(x_arr, y_arr, w_arr)
     work = _working_dtype(out_dtype)
+    x_arr, y_arr, w_arr = _observed(_present(w_arr, x_arr, y_arr), x_arr, y_arr, w_arr)
     return _cast_back(_run_chunked_cov(x_arr.astype(work), y_arr.astype(work), w_arr.astype(work), tile,
                                        mode)[:3], work, out_dtype)

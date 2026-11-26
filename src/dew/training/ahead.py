@@ -1260,7 +1260,7 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
                                       examples: int | None = None, resume: Resume = "auto") -> Batch:
     """The batch `trainer`'s first step takes from `loader`, as `fit` would start the run: an input its
     objective names alone declared first (`Trainer._declare_input`), the loader read through its device
-    steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer.reading`), the
+    steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer._reading`), the
     run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
     (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
     checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,
@@ -1275,7 +1275,7 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     from dew.training.startup import resumed_step
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
-    trainer.reading(loader, examples=examples, steps=steps)
+    trainer._reading(loader, examples=examples, steps=steps)
     trainer.validate(steps=steps)
     checkpoints = trainer.checkpoints
     resumed = resumed_step(trainer, resume)
@@ -1611,8 +1611,12 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     # before, in a build that sees no GPU, its initializer's launches took the CPU's routes and certified
     # nothing, so the run certified them on its GPU (rows 7322, 8299: five init-shape launches).
     # A host step's start runs on its CPU companion (`Trainer._started`), traced as that run traces it.
-    start = trainer._started() if trainer.host_master else None
-    with assumed(on, portable=portable), certifying:
+    # The trainer's numerics hold over all of it, its start's draw among it, as over a run's (`numbered`).
+    from dew.training.distributed import under_numerics
+
+    with under_numerics(trainer.numerics):
+        start = trainer._started() if trainer.host_master else None
+    with under_numerics(trainer.numerics), assumed(on, portable=portable), certifying:
         start = trainer._started() if start is None else start
         if start.resume is not None and trainer.checkpoints is not None:
             # A resumed run's step compiles at the rung its checkpoint records and the split its state was
@@ -1621,7 +1625,7 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
             # resume's.
             from dew.training.compiler import resumed_stepping
 
-            trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+            trainer._compiler.resume_rung(trainer.checkpoints._rung(start.resume))
             resumed = resumed_stepping(
                 trainer._stepping(), trainer.checkpoints.window_size(start.resume),
                 held=start.abstract.window is not None, pools=start.abstract.window is not None,

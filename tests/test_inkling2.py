@@ -70,17 +70,23 @@ def test_its_logits_are_on_par_with_transformers(fixture, leaf):
                     seeds=seeds, truth_fn=truth)
 
 
-@pytest.mark.parametrize('change', [
-    {'local_layer_ids': [0, 1, 2, 3, 4, 5]}, {'rope_theta': 10000.0},
-    {'loop_config': {**RELEASE['text_config']['loop_config'], 'core_step': 1}}, {'scoring_func': 'softmax'},
-], ids=['kinds-disagreeing', 'unknown-field', 'unknown-loop-field', 'softmax-router'])
-def test_a_config_it_cannot_compute_is_refused(change):
+@pytest.mark.parametrize(('section', 'change'), [
+    ('text_config', {'local_layer_ids': [0, 1, 2, 3, 4, 5]}), ('text_config', {'rope_theta': 10000.0}),
+    ('text_config', {'loop_config': {**RELEASE['text_config']['loop_config'], 'core_step': 1}}),
+    ('text_config', {'scoring_func': 'softmax'}), ('mtp_config', {'markov_head_type': 'bigram'}),
+    ('mtp_config', {'q_bias': True}), ('mtp_config', {'hidden_size': 32}),
+    ('mtp_config', {'dflare_mode': 'mean'}), ('mtp_config', {'max_position_embeddings': 64}),
+], ids=['kinds-disagreeing', 'unknown-field', 'unknown-loop-field', 'softmax-router', 'draft-bigram-head',
+        'draft-query-bias', 'draft-narrower', 'draft-unknown-field', 'draft-short-reach'])
+def test_a_config_it_cannot_compute_is_refused(section, change):
     """A text config whose layers' kinds transformers and the release's own fields state apart, stating a
-    field the release states none of, or scoring its router otherwise, is refused rather than read as some
-    other model; the fixture's own config, which each changes one field of, reads (the logits' test)."""
+    field the release states none of, or scoring its router otherwise, or a draft (`mtp_config`, row 12945)
+    whose head, biases, width or reach the release's states otherwise, or stating a field it states none
+    of, is refused rather than read as some other model; the fixture's own config, which each changes one
+    field of, reads (the logits' test)."""
     translate_config(RELEASE)
     with pytest.raises(ValueError):
-        translate_config({**RELEASE, 'text_config': {**RELEASE['text_config'], **change}})
+        translate_config({**RELEASE, section: {**RELEASE[section], **change}})
 
 
 @attending("reference")

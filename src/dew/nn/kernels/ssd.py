@@ -20,9 +20,10 @@ heads go ahead of the time inside it, the one layout Mosaic blocks.
 The backward is the hand-written reverse recurrence, `dS_n = exp(acs_C-1)
 dS_n+1 + dy^T (C exp(acs))`, since autodiff would keep every chunk's
 intermediates. The XLA path is the oracle and the scan for CPU and refused
-geometries; a GPU whose target row names it runs mamba_ssm's own kernels
-(`dew.nn.kernels.mamba_ssd`), else the XLA path. tests/test_ssd_kernel.py
-holds the kernel to `chunk_ssd` and its `jax.grad`.
+geometries; a GPU runs what the scan's selector routes it to
+(`recurrence_chunk.SCAN`: the recurrence template, or the port of mamba_ssm's
+kernels where a cell declares it). tests/test_ssd_kernel.py holds the kernel to
+`chunk_ssd` and its `jax.grad`.
 """
 
 from __future__ import annotations
@@ -46,14 +47,18 @@ MIN_WIDTH = 8
 Below it a tile is mostly padding: 8 is Mosaic's sublane count."""
 
 MIN_CHUNK = 64
-"""The shortest chunk worth a program. The intra-chunk term is `C` times the
-work of the carry, so under 64 a program spends more on its own state
-recurrence than on the matmul it exists for and XLA's batched einsum wins."""
+"""The shortest chunk the kernel is chosen for: an admission heuristic, not a
+measured crossover (no TPU timing below 64 is on record). The intra-chunk term
+is `C` times the carry's work, so a short chunk's program spends more of itself
+on its own state recurrence than on the products it exists for. Re-time on a
+v5e and a v6e before changing it."""
 
 TPU_PROGRAM_WORDS = 1 << 20
-"""The fp32 words one Mosaic program may hold, 4 MiB. Its operands live in VMEM,
-128 MiB of it per core, so what bounds the window here is the double buffering
-the pipeline runs around it rather than the window itself."""
+"""The most fp32 words of one program's logical blocks the kernel is chosen for,
+4 MiB (`_program_words`, one set of its blocks): an admission heuristic, not the
+scoped VMEM limit Mosaic enforces nor a peak-allocation or buffering bound, which
+each target's limits model apart. Re-time on a v5e and a v6e before changing
+it."""
 
 
 def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
@@ -68,12 +73,13 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     """Return whether the SSD kernel is chosen for this geometry and the scan's `dtype`.
 
     The kernel needs a tpu backend, a float32 scan (a wider scan takes the
-    XLA path in its own dtype), a chunk long enough to pay for a program,
-    three power-of-two widths so that Mosaic's tiling wastes no lanes, and a
-    tile inside the per-program budget. This kernel's one-program form ran 6x
-    to 12x slower than XLA as Triton on an RTX 4080 and overflowed shared
-    memory at chunks of 128 and 256 (docs/performance.md); a GPU runs
-    mamba_ssm's decomposition into fourteen kernels (`dew.nn.kernels.mamba_ssd`).
+    XLA path in its own dtype), a chunk of at least `MIN_CHUNK`, three
+    power-of-two widths so that Mosaic's tiling wastes no lanes, and its blocks
+    within `TPU_PROGRAM_WORDS`: both admission heuristics. A GPU's route is the
+    selector's (`recurrence_chunk.SCAN`). (Historical, for this kernel's
+    one-program form only: as Triton on an RTX 4080 it ran 6x to 12x slower
+    than XLA and overflowed shared memory at chunks of 128 and 256,
+    docs/performance.md.)
     """
     if backend != 'tpu' or jnp.dtype(dtype) != jnp.float32:
         return False
