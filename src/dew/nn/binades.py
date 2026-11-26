@@ -118,30 +118,31 @@ def _flush_safe(seed: jax.Array, coefficient: jax.Array) -> jax.Array:
                                                                                          raised.dtype))
 
 
-def exactly(plain: Callable[..., jax.Array], exact: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+def exactly(plain: Callable[..., jax.Array], exact: Callable[..., jax.Array], contract: str
+            ) -> Callable[..., jax.Array]:
     """A function valued as `exact` computes it and differentiated as `plain` is, at every order
-    (`derivatives.surrogate`): `exact` a range-safe value of the arithmetic `plain` writes (a balanced
-    product, a flush-safe one), `plain` that arithmetic itself, whose derivatives JAX takes where its own
-    intermediates are normal, as before the range-safe value replaced it (rows 13260, 13261). An operand no
-    derivative moves adds no term, so a constant beside an infinite factor meets no `0 * inf`."""
+    (`derivatives.surrogate`), held by the test `contract` names (`derivatives.contracted`): `exact` a
+    range-safe value of the arithmetic `plain` writes (a balanced product, a flush-safe one), `plain` that
+    arithmetic itself, whose derivatives JAX takes where its own intermediates are normal, as before the
+    range-safe value replaced it (rows 13260, 13261). An operand no derivative moves adds no term, so a
+    constant beside an infinite factor meets no `0 * inf`."""
     from jax.custom_derivatives import SymbolicZero
 
     from .derivatives import surrogate
 
     def derivative(primals, tangents, value):
-        moved = [index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero)]
-        if not moved:
+        live = [not isinstance(tangent, SymbolicZero) for tangent in tangents]
+        if not any(live):
             return jnp.zeros_like(value)
 
-        def at(*values):
-            operands = list(primals)
-            for index, given in zip(moved, values, strict=True):
-                operands[index] = given
-            return plain(*operands)
-        return jax.jvp(at, tuple(primals[index] for index in moved),
-                       tuple(tangents[index] for index in moved))[1]
+        def at(*moving):
+            given = iter(moving)
+            return plain(*(next(given) if moves else primal
+                           for primal, moves in zip(primals, live, strict=True)))
+        return jax.jvp(at, tuple(p for p, moves in zip(primals, live, strict=True) if moves),
+                       tuple(t for t, moves in zip(tangents, live, strict=True) if moves))[1]
 
-    return surrogate(exact, derivative, symbolic_zeros=True)
+    return contracted(contract)(surrogate(exact, derivative, symbolic_zeros=True))
 
 
 def _over_plain(quotient, numerator, denominator, moving):
@@ -164,7 +165,7 @@ def _over_exact(quotient, numerator, denominator, moving):
                               (kept_denominator, kept_denominator)))
 
 
-_over_valued = contracted("test_the_precision_seams_hold_every_order")(exactly(_over_plain, _over_exact))
+_over_valued = exactly(_over_plain, _over_exact, "test_the_precision_seams_hold_every_order")
 """`over_denominator`'s map, valued range-safe and differentiated as PyTorch's order at every order
 (`exactly`), held by the division's contract; built once."""
 

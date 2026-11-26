@@ -104,7 +104,7 @@ def _exact_share(eps: jax.Array, factor: jax.Array, denominator: jax.Array) -> j
     return jnp.where(normal(eps * factor) & normal(plain), plain, balanced(eps, (factor,), (denominator,)))
 
 
-_epsilon_share = contracted("test_a_giant_heads_clip_holds_every_order")(exactly(_plain_share, _exact_share))
+_epsilon_share = exactly(_plain_share, _exact_share, "test_a_giant_heads_clip_holds_every_order")
 """A giant head's epsilon share `eps s / (|y| + eps s)` (`_giant_jvp`): valued range-safe, differentiated
 as its plain quotient (`binades.exactly`)."""
 
