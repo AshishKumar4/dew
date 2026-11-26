@@ -832,6 +832,25 @@ def test_a_correctly_rounded_divisions_denominator_derivative_is_finite_where_it
     assert float(pull(np.float32(cotangent))[0]) == pulled
 
 
+def test_a_balanced_denominator_derivative_keeps_its_mixed_derivatives():
+    """`2^-100 / d` at `d = 2^30` under a denominator seed `2^100`, whose tangent `-2^-60` the balanced order
+    computes (PyTorch's coefficient `2^-160` flushes): its derivative in the numerator is `-2^40`, bit for
+    bit, forward over forward and reverse over forward, jitted, as PyTorch's order differentiates it through
+    its normal `2^-30` and `2^-60`, where the balanced order held its operands constant and gave 0 (row
+    13261)."""
+    from dew.nn.precision import divided
+
+    fixed, denominator = np.float32(2.0 ** 100), np.float32(2.0 ** 30)
+
+    def tangent(n):
+        return jax.jvp(lambda d: divided(n, d), (denominator,), (fixed,))[1]
+
+    numerator = np.float32(2.0 ** -100)
+    assert float(jax.jit(tangent)(numerator)) == -(2.0 ** -60)
+    assert float(jax.jit(lambda n: jax.jvp(tangent, (n,), (np.float32(1),))[1])(numerator)) == -(2.0 ** 40)
+    assert float(jax.jit(jax.grad(tangent))(numerator)) == -(2.0 ** 40)
+
+
 def test_a_correctly_rounded_divisions_denominator_derivative_of_a_special_is_ieees():
     """`0 / 0`'s tangent in its denominator is IEEE's NaN, both ways, not a finite value of the operands' bits
     (row 13163's review)."""
