@@ -481,7 +481,8 @@ def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
             for source, tile in ((products, product_tile), (decays, decay_tile), (scales, column)):
                 plgpu.copy_gmem_to_smem(source, tile, ready)
             plgpu.barrier_wait(ready)
-            values = component(family.tile_of(product_tile), family.tile_of(decay_tile), family.columns_of(column))
+            values = component(family.tile_of(product_tile), family.tile_of(decay_tile),
+                               family.columns_of(column))
             plgpu.store(staged, values, optimized=False)
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(staged, out)

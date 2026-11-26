@@ -24,9 +24,9 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 from jax.core import ShapedArray
 from jax.extend import core as jcore
-import jax.numpy as jnp
 
 from dew import parity
 from dew.algebra import error, printed, rules
