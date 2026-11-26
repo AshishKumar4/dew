@@ -163,10 +163,14 @@ def test_a_placed_steps_compile_limit_gives_back_the_state_it_reuses():
         batch = shard_batch(trainer.device_mesh, rows)
         room = step_room(device)
         assert room is not None and room > target, (room, target)
-        filler = [jnp.zeros((1 << 24,), jnp.float32, device=device) for _ in range((room - target) >> 26)]
-        # Within a 64 MiB chunk of the target, the allocator's own reservations aside: still room for the
-        # temporaries beside what the step places, short of the state with them.
-        filled = step_room(device)
+        # Filled a 64 MiB chunk at a time, the room read after each: the allocator takes more than a chunk's
+        # bytes for some of them (its own reservations, a program's), which a count made from the room before
+        # any read as none, so the GPU stopped 200 MiB past the target (rows 12913, 12950).
+        filler = []
+        while (filled := step_room(device)) is not None and filled >= target + (1 << 26):
+            filler.append(jnp.zeros((1 << 24,), jnp.float32, device=device))
+        # Within a 64 MiB chunk of the target: still room for the temporaries beside what the step places,
+        # short of the state with them.
         assert filled is not None and target - (1 << 26) < filled < target + (1 << 26), (target, filled)
         assert beside + ahead.temp_bytes < filled < argument + beside + ahead.temp_bytes, (filled, ahead)
         step = trainer.compile(state, batch)
