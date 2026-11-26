@@ -77,7 +77,10 @@ def top_k_selection(scores, keep, top_k: int, *, forced=None):
     keep = jnp.broadcast_to(keep, scores.shape)
     if forced is not None:
         keep = keep & ~jnp.any(jnp.arange(total)[:, None] == forced[..., None, :], axis=-1)
-    ranked = jnp.where(keep, scores, jnp.finfo(at_least_fp32(scores.dtype)).min)
+    # Every allowed key ranks above every forbidden one, its score however low (fp32's least, -inf):
+    # allowed at fp32's least at the lowest, forbidden at -inf (row 13536).
+    wide = at_least_fp32(scores.dtype)
+    ranked = jnp.where(keep, jnp.maximum(scores.astype(wide), jnp.finfo(wide).min), -jnp.inf)
     chosen = jax.lax.top_k(ranked, min(top_k, total), is_stable=True)[1]
     chosen = jnp.where(jnp.take_along_axis(keep, chosen, axis=-1), chosen, -1)
     return chosen if forced is None else jnp.concatenate([chosen, forced.astype(chosen.dtype)], axis=-1)

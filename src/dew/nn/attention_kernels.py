@@ -343,9 +343,6 @@ FLASH_SUPPORTS = (
                 row='roadmap: flash attention ALiBi'),
     _Need('softcap', lambda case: case.softcap is None, "the call has a logit softcap",
                 row='roadmap: flash attention softcap'),
-    _Need('deterministic', lambda case: not deterministic_ops_requested(),
-                "--xla_gpu_deterministic_ops is set, which its backward's atomic sum of the query gradient "
-                "does not keep", row=INHERENT),
     _Need('dropout', lambda case: not case.dropout,
           "the call drops attention weights, which FlashAttention's path here does not take",
           row='roadmap: attention dropout in FlashAttention'),
@@ -790,7 +787,15 @@ width 256 measured faster on FlashAttention-2 (G4-ET-ATT-SCOREBOARD, 2.72 agains
 of its call and declares none."""
 
 
-FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS, reverse_only=True)
+FLASH_BACKWARD = (
+    _Need('deterministic', lambda case: not deterministic_ops_requested(),
+          "--xla_gpu_deterministic_ops is set, which its backward's atomic sum of the query gradient does "
+          "not keep", row=INHERENT),
+)
+"""What FlashAttention's backward refuses beyond its forward (`FLASH_SUPPORTS`): a call whose derivative
+another kernel takes (`FLASH_INFERENCE`'s, the template's) takes none of these."""
+
+FLASH = Kernel[AttentionCase]('flash', (*FLASH_SUPPORTS, *FLASH_BACKWARD), reverse_only=True)
 CUDNN = Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS), reverse_only=True)
 XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
 INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
@@ -802,7 +807,8 @@ INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need
 FLASH_INFERENCE = Kernel[AttentionCase]('flash_inference', (*FLASH_SUPPORTS, *TEMPLATE_SUPPORTS))
 """FlashAttention for a call no derivative is taken of and the template for one differentiated, its forward
 and derivatives the template's: where FlashAttention's forward holds check 1 and its backward does not (an
-A100's, M-NA-44)."""
+A100's, M-NA-44). Its backward's refusals (`FLASH_BACKWARD`: deterministic ops) are not its own, the
+template taking every derivative (row 13535)."""
 
 
 def primal_alone(kernel: str, dtype, width: int, causal: bool) -> tuple[str, str] | None:

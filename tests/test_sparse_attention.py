@@ -342,6 +342,17 @@ def test_memory_follows_the_selection_not_the_sequence():
     assert selected < logits
 
 
+def test_a_selection_ranks_every_allowed_key_above_every_forbidden_one():
+    """`top_k_selection` takes an allowed key at fp32's least or -inf ahead of every forbidden key, the stable
+    top-k's lower index notwithstanding (row 13536): over scores [least, least, least, 5] with the first two
+    forbidden, its top two are the last key and the third, not the last and an empty slot."""
+    least = np.finfo(np.float32).min
+    for low in (least, -np.inf):
+        scores = jnp.asarray([[[least, least, low, 5.0]]], jnp.float32)
+        keep = jnp.asarray([[[False, False, True, True]]])
+        np.testing.assert_array_equal(np.asarray(top_k_selection(scores, keep, 2))[0, 0], [3, 2])
+
+
 def test_a_querys_empty_selection_slots_leave_the_next_querys_keys_alone():
     """A selection's -1 slots (`top_k_selection` leaves them where fewer keys are allowed than the top
     k) mark no key in `selection_mask`, so packed documents keep their own keys: the second query, the

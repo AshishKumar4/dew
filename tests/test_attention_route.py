@@ -13,6 +13,7 @@ rows' arguments name.
 
 import functools
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -1201,6 +1202,31 @@ def test_flash_inference_infers_on_flashattention_and_trains_on_the_template():
         trained = _launches(jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2)),
                             query, key, key)
     assert inferred == {"flash"} and trained == {"template"}, (inferred, trained)
+
+
+def test_flash_inference_takes_a_call_under_deterministic_ops_that_flash_refuses(monkeypatch):
+    """Under --xla_gpu_deterministic_ops, which FlashAttention's backward's atomic dQ sum does not keep
+    (`attention_kernels.FLASH_BACKWARD`), a bf16 causal call named onto 'flash' on an A100 is refused, and
+    one named onto 'flash_inference', whose derivatives are the template's, is taken: differentiated, its
+    template's kernels alone (row 13535)."""
+    from dew._devices import deterministic_ops_requested
+    from dew.nn.kernels.selection import KernelRefused
+
+    monkeypatch.setenv("XLA_FLAGS", " ".join(filter(None, (os.environ.get("XLA_FLAGS"),
+                                                             "--xla_gpu_deterministic_ops=true"))))
+    assert deterministic_ops_requested()
+    query = jax.ShapeDtypeStruct((2, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 4096, 8, 128), jnp.bfloat16)
+
+    def named(implementation):
+        def call(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, implementation=implementation)
+        return jax.grad(lambda *x: jnp.sum(call(*x).astype(jnp.float32)), argnums=(0, 1, 2))
+
+    with generation.assumed("sm80"):
+        assert _launches(named("flash_inference"), query, key, key) == {"template"}
+        with pytest.raises(KernelRefused):
+            _launches(named("flash"), query, key, key)
 
 
 def test_flash_inference_where_flash_lowers_not_trains_a_rematerialized_block_and_refuses_its_inference():
