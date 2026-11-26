@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_route,
     attention_triton,
 )
+from dew.nn.kernels.templates.hooks import Hook, Side
 
 
 @contextlib.contextmanager
@@ -114,15 +115,15 @@ def _edges(dtype) -> dict:
     pair = (_rows([[0.0], [0.0]], dtype), _rows([[0.0]], dtype), _rows([[big]], dtype),
             _rows([[0.0], [4.0]], dtype))
     return {
-        "a query a hook empties": (*pair, spans_two, template.Hooks(score_mod=_emptied)),
+        "a query a hook empties": (*pair, spans_two, template.Hooks(score=Hook(_emptied))),
         "a query no span reaches": (*pair, empty, None),
         "keys past a whole tile": (_rows(drawn[0][:12], dtype), _rows(drawn[1][:12], dtype),
                                    _rows(drawn[2][:12], dtype), _rows(drawn[3][:12], dtype),
                                    template.spans(12, 12, 1), None),
         "an infinite hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                          template.Hooks(score_mod=_poisoned(jnp.inf))),
+                                          template.Hooks(score=Hook(_poisoned(jnp.inf)))),
         "a NaN hook where masked": (*(_rows(x, dtype) for x in drawn), causal,
-                                    template.Hooks(score_mod=_poisoned(jnp.nan))),
+                                    template.Hooks(score=Hook(_poisoned(jnp.nan)))),
         "values at the largest": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),
                                   _rows([[largest]] * 16, dtype), _rows(drawn[3], dtype), causal, None),
         "values at the least": (_rows(drawn[0], dtype), _rows(drawn[1], dtype),
@@ -249,13 +250,13 @@ def _witness(keys: list[float], values: list[list[float]], douts: list[list[floa
     query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
     key = jnp.broadcast_to(_channel([keys]), (batch, count, 1, WIDTH))
     table = jnp.asarray(bias, jnp.float32)[None, None]
-    hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
-        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),))
+    hooks = template.Hooks(score=Hook(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (Side(
+        table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),)))
     # An unchecked entry's every channel unchecked: an inf cotangent's NaN reaches them all.
     expected = {name: np.where(np.isnan(first), np.nan, np.pad(first, ((0, 0),) * 3 + ((0, WIDTH - 1),)))
                 for name, rows in gradients.items() if name != "bias"
                 for first in (_held(rows)[:, :, None, None],)}
-    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score_params[0].value.shape)
+    expected["bias"] = _held(gradients["bias"]).reshape(hooks.score.sides[0].value.shape)
     spans = template.spans(queries, count, batch, **{name: jnp.asarray(bound, jnp.int32)
                                                       for name, bound in (bounds or {}).items()})
     return (query, key, _channel(values), _channel(douts), hooks, spans), expected

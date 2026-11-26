@@ -50,6 +50,7 @@ from dew.mesh import (
 )
 from dew.nn.dense import Dense, amax_history, noted_amax, packed_matrix
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import Residual
 
 from .activations import (
@@ -708,8 +709,7 @@ def _streamed(x: jax.Array | Gathered, compute, *, hooked: bool = True
         return x.tokens, x.rows, {}
     if x.tokens.dtype != compute or not hooked:
         return gathered(x), None, {}
-    return x.tokens, x.rows, {'prologue': _scaled,
-                              'prologue_operands': ((x.scales.astype(x.tokens.dtype), ('rows',)),)}
+    return x.tokens, x.rows, {'prologue': Hook(_scaled, (Side(x.scales.astype(x.tokens.dtype), ('rows',)),))}
 
 
 def _scaled(rows: jax.Array, scales: jax.Array) -> jax.Array:
@@ -790,7 +790,7 @@ def _biased(bias: jax.Array | None, compute) -> dict:
         return {}
     work = jnp.result_type(bias.dtype, compute, jnp.float32)
     held = jnp.asarray(rounded_operand(bias, compute)).astype(work)
-    return {'epilogue': _plus_bias, 'epilogue_operands': ((held, ('groups', 'columns')),)}
+    return {'epilogue': Hook(_plus_bias, (Side(held, ('groups', 'columns')),))}
 
 
 def _plus_bias(acc: jax.Array, bias: jax.Array) -> jax.Array:
@@ -890,8 +890,8 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
                           checkpoint_name(up_rows, Residual.UP_PROJ))
     with _named(implementation):
         out = gemm.gemm(gate_rows, down_stack, group_sizes, compute=compute, out_dtype=compute,
-                        precision=precision, layer=down_layer, scatter=scatter, prologue=hook,
-                        prologue_operands=((up_rows, ('rows', 'depth')),), applied=hidden)
+                        precision=precision, layer=down_layer, scatter=scatter,
+                        prologue=Hook(hook, (Side(up_rows, ('rows', 'depth')),)), applied=hidden)
     return _computed(out, compute)
 
 
@@ -912,7 +912,7 @@ def _paired_call(paired: tuple, group_sizes: jax.Array, compute: Dtype, implemen
     or what `epilogue` makes of their accumulators, `named` naming them (`gemm.gemm`'s)."""
     tokens, rows, prologue, first_stack, second_stack, layer = paired
     count = len(named) if named else 2
-    hooks = {} if epilogue is None else {"epilogue": epilogue, "named": named}
+    hooks = {} if epilogue is None else {"epilogue": Hook(epilogue), "named": named}
     with _named(implementation):
         outputs = gemm.gemm(tokens, first_stack, group_sizes, compute=compute, out_dtype=compute,
                             out_dtypes=(compute,) * count, precision=precision, paired=second_stack,

@@ -19,6 +19,7 @@ from . import tuning
 from .templates import base
 from .templates.axes import held as held_axes
 from .templates.gemm.hooks import NO_HOOKS, Hooks
+from .templates.hooks import TRACED_TILE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,11 +66,6 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     sizes = np.floor(shares / shares.sum() * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
     return jnp.asarray(sizes)
-
-
-TRACED_TILE = 16
-"""The square tile a launch's hooks are traced at to key its picks (`_GroupedLaunch.traced`), widened for an
-epilogue that narrows whole runs of columns to the least tile holding one (`quantized.Form.unit`)."""
 
 
 class _GroupedLaunch[Config: Hashable](base.Template[Config]):
