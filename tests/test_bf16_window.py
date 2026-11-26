@@ -247,3 +247,21 @@ def test_a_dense_of_its_own_promotion_served_its_window_computes_as_its_kernel()
         assert served.dtype == plain.dtype
         np.testing.assert_array_equal(np.asarray(served, np.float32).view(np.uint32),
                                       np.asarray(plain, np.float32).view(np.uint32))
+
+
+def test_a_window_products_rows_cotangent_keeps_a_cancellation():
+    """A window of `+1` and `-1` columns, its product's cotangent `[1 + 2**-12, 1]` pulled back on the
+    template's route and XLA's at the highest precision: the rows' cotangent is `2**-12` at each depth, the
+    cotangent's difference read whole (a product rounding it to TF32's 10 bits cancels it to zero)."""
+    weights = np.zeros((256, 64), jnp.bfloat16)
+    weights[:, 0], weights[:, 1] = 1.0, -1.0
+    window = Bf16Window.of(weights)
+    rows = jnp.ones((2, 256), jnp.bfloat16)
+    cotangent = jnp.zeros((2, 64), jnp.float32).at[:, 0].set(1 + 2.0 ** -12).at[:, 1].set(1.0)
+    for kernel in ("mosaic", "xla"):
+        with (jax.default_matmul_precision("highest"), generation.assumed("sm90"),
+              generation.chosen(grouped_matmul=kernel)):
+            [got] = jax.vjp(lambda rows: gemm.window_product(rows, window, out_dtype=jnp.float32,
+                                                             interpret_on_cpu=True), rows)[1](cotangent)
+        np.testing.assert_array_equal(np.asarray(got, np.float32), np.full((2, 256), 2.0 ** -12, np.float32),
+                                      err_msg=kernel)

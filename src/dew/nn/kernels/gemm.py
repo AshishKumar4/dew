@@ -831,8 +831,9 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
     (`ternary_weight_product`, `window_product`) of operands `(rows, words, sizes, *rest)`, its bank
     `make_bank(words, *rest)` (a window's meta among `rest`); callers wrap `linear_tangent` with
     `contracted(...)`. Its rows' cotangent is the decoded matrix's products of the cotangent's bfloat16
-    parts where its weights are `finite` (a ternary code's), else the decoded product's own pullback (a
-    window's infinity times a part's zero would be NaN where the one transpose reads it whole)."""
+    parts where its weights are `finite` (a ternary code's), else its portable product's own transpose (XLA's,
+    the cotangent whole at the configured precision: a window's infinity times a part's zero would be NaN
+    where the one transpose reads it whole)."""
     def decoded(*bank) -> jax.Array:
         [matrices, _] = decoded_operands(make_bank(*bank), None)
         return matrices[0] if dense else matrices
@@ -861,8 +862,7 @@ def _packed_weight_rules(launch: grouped_quantized.MosaicWordPackedGmm, make_ban
                     gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
             else:
-                [d_rows] = jax.vjp(lambda rows: decoded_product(rows, matrices, None if dense else s,
-                                                                interpret_on_cpu=interpret), r)[1](cotangent)
+                [d_rows] = jax.vjp(lambda rows: portable(rows, w, s, *rest), r)[1](cotangent)
         leaves = (d_rows.astype(r.dtype), *(zero_from_primal(each) for each in (w, s, *rest)))
         return tuple(leaves[index] for index in live)
     return forward, backward, portable
