@@ -465,9 +465,10 @@ def _tpu_capture(directory, ops, runs):
 def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path):
     """A TPU call's device time (`benchmark.tpu_ops`, the kernel tuner's on a TPU core) is the ops of its
     program's one run on its devices, each its device milliseconds: another program's ops and run, a host
-    transfer and another device's left out. A capture where the call's program did not run on its devices
-    is refused, though another program ran there (`NoKernels`), and one where it ran twice on a device is
-    refused as ambiguous (`AmbiguousCapture`)."""
+    transfer and another device's left out; a call on two devices, each one's. A capture where the call's
+    program did not run on one of its devices, or ran there without an op, is refused, though another
+    program ran there (`NoKernels`), and one where it ran twice on a device is refused as ambiguous
+    (`AmbiguousCapture`)."""
     from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
 
     ops = [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7), (0, "transfer", 1.0, 1.5, None),
@@ -477,10 +478,21 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     _tpu_capture(one, ops, runs)
     assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run")] == [("fusion.1", 0.25),
                                                                                    ("custom-call.2", 0.75)]
+    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run")] == ["fusion.1", "custom-call.2", "fusion.9"]
     with pytest.raises(NoKernels):
         tpu_ops(one, {2}, "jit_run")
     with pytest.raises(NoKernels):
         tpu_ops(one, {0}, "jit_idle")
+    # A call on TPUs 0 and 1 whose capture holds its run on TPU 0 alone, another program's on TPU 1; or its
+    # run on TPU 1 with no op of its own: part of the call, refused.
+    half = tmp_path / "half"
+    _tpu_capture(half, ops, [runs[0], (1, "jit_other(9)", 0.0, 4.0, 9)])
+    with pytest.raises(NoKernels):
+        tpu_ops(half, {0, 1}, "jit_run")
+    idle = tmp_path / "idle"
+    _tpu_capture(idle, ops[:4], runs)
+    with pytest.raises(NoKernels):
+        tpu_ops(idle, {0, 1}, "jit_run")
     twice = tmp_path / "twice"
     _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
     with pytest.raises(AmbiguousCapture):

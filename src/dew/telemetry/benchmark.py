@@ -410,31 +410,33 @@ def tpu_ops(directory: str | Path, devices: Iterable[int], module: str) -> tuple
     it (`XLA Ops`, its program_id), each its device milliseconds; another program's ops, a host transfer and
     another device's left out. A call of one program always runs its module (`_module_of`), so a run of
     another executable of the same name beside it is a second run, refused with the rest of a capture where
-    it ran twice on one device or states no program (`AmbiguousCapture`); one where it ran on none of
-    `devices` is refused (`NoKernels`)."""
+    it ran twice on one device or states no program (`AmbiguousCapture`). The call ran on every one of
+    `devices`, so a capture holding no run of it, or no op of its run, on any one of them holds part of the
+    call and is refused (`NoKernels`), never read as the whole."""
     from dew.telemetry import trace
 
-    named = {f"/device:TPU:{device}" for device in devices}
     modules, _ = trace.device_events(directory, tpu_line="XLA Modules")
     own = re.compile(re.escape(module) + r"(\.\d+)?(\(\d+\))?")
-    runs = {plane: [run for run in events if own.fullmatch(run.name)]
-            for plane, events in modules.items() if plane in named}
-    if not any(runs.values()):
-        raise NoKernels(f"the capture under {directory} holds no run of {module} on TPU {sorted(devices)}")
+    runs = {device: [run for run in modules.get(f"/device:TPU:{device}", []) if own.fullmatch(run.name)]
+            for device in sorted(set(devices))}
+    if missing := [device for device, each in runs.items() if not each]:
+        raise NoKernels(f"the capture under {directory} holds no run of {module} on TPU {missing} of the "
+                        f"call's {sorted(runs)}")
     if any(len(each) > 1 for each in runs.values()):
         raise AmbiguousCapture(f"the capture under {directory} holds {module} run more than once on a device "
-                               f"of TPU {sorted(devices)}, which no one call's own are told apart from")
+                               f"of TPU {sorted(runs)}, which no one call's own are told apart from")
     planes, _ = trace.device_events(directory)
     timed = []
-    for plane, (run,) in ((plane, each) for plane, each in runs.items() if each):
+    for device, (run,) in runs.items():
         if (program := trace.program_of(run)) is None:
             raise AmbiguousCapture(f"{module}'s run under {directory} states no program, so its ops are not "
                                    "told apart from another program's beside it")
-        timed += [KernelTime(op.name, op.duration_ns / 1e6) for op in planes.get(plane, [])
-                  if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns
-                  and trace.program_of(op) == program]
-    if not timed:
-        raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {sorted(devices)}")
+        ran = [KernelTime(op.name, op.duration_ns / 1e6) for op in planes.get(f"/device:TPU:{device}", [])
+               if run.start_ns <= op.start_ns and op.end_ns <= run.end_ns and trace.program_of(op) == program]
+        if not ran:
+            raise NoKernels(f"{module}'s run under {directory} holds no op on TPU {device} of the call's "
+                            f"{sorted(runs)}")
+        timed += ran
     return tuple(timed)
 
 
