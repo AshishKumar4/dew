@@ -24,6 +24,12 @@ def named[T](axes: Sequence[str], by_axis: Mapping[str, T]) -> tuple[T, ...]:
     return tuple(by_axis[axis] for axis in axes)
 
 
+def whole(count: int, block: int) -> int:
+    """`count` rounded up to whole `block`s: the extent a launch's tiles of `block` cover, or an extent
+    aligned to a unit of `block` (an allocation's, a step's depth)."""
+    return -(-count // block) * block
+
+
 def blocked(ref, block: Sequence[int], indices: Sequence):
     """`ref`'s block of extents `block` at block indices `indices`, axis by axis (`pl.ds(index * extent,
     extent)`): a step's tile of a stream's view, as a `BlockSpec`'s index map reads it (a GPU ring's

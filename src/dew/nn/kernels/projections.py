@@ -39,6 +39,7 @@ from dew.nn.kernels.gemm import (
     nvfp4_block_finished,
     nvfp4_block_product,
 )
+from dew.nn.kernels.templates import axes
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.kernels.templates.product import MXFP8 as MX_BLOCKS, NVFP4 as NVFP4_BLOCKS, SCALE_DEPTH, declared
 from dew.nn.precision import EXACT_FLOAT32, biased, biased_value
@@ -138,7 +139,7 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     ends = jnp.cumsum(sizes)
     group = jnp.searchsorted(ends, jnp.arange(count), side="right")
     blocks = -(-sizes // edge)
-    padded = -(-(count + groups * (edge - 1)) // edge) * edge
+    padded = axes.whole(count + groups * (edge - 1), edge)
     held_group = jnp.minimum(group, groups - 1)
     place = jnp.where(group < groups, (jnp.cumsum(blocks) - blocks)[held_group] * edge
                       + jnp.arange(count) - (ends - sizes)[held_group], padded)

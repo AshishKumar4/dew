@@ -651,7 +651,7 @@ def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundA
     reservation its own (`resources.shared_programs`)."""
     held = target.multiprocessor
     step = held.register_step
-    allocated = -(-(launch.registers(ba, config) or step) // step) * step * _warps(config) * held.warp_threads
+    allocated = axes.whole(launch.registers(ba, config) or step, step) * _warps(config) * held.warp_threads
     most = min(held.registers // allocated, held.resident_blocks)
     return resources.shared_programs(most, launch.staged_bytes(ba, config, target),
                                      generation.shared_budget(target))

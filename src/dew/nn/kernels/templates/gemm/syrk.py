@@ -37,6 +37,7 @@ from dew.nn.kernels.templates import (
     stores,
     swizzling,
 )
+from dew.nn.kernels.templates.axes import whole
 from dew.nn.kernels.templates.gemm import derivation
 from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     APPROX_MATH,
@@ -421,11 +422,11 @@ def syrk(x: jax.Array, *, tiles: Tiles, transpose: bool = False, out_dtype, mult
     g = x.shape[0]
     m, k = (x.shape[2], x.shape[1]) if transpose else (x.shape[1], x.shape[2])
     tile_side = tile_rows(tiles, family)
-    m_pad = -(-m // tile_side) * tile_side
+    m_pad = whole(m, tile_side)
     # Polynomial shares `x` with the epilogue side load `[part_row:part_row+share, col_tile:col_tile+cols]`,
     # so its column axis must cover the padded square output grid `m_pad` as well as whole `block_k` steps.
     k_target = max(k, m_pad) if poly_coeffs is not None else k
-    k_pad = -(-k_target // tiles.block_k) * tiles.block_k
+    k_pad = whole(k_target, tiles.block_k)
     if m_pad != m or k_pad != k:
         pad = (((0, 0), (0, k_pad - k), (0, m_pad - m)) if transpose
                else ((0, 0), (0, m_pad - m), (0, k_pad - k)))
@@ -554,7 +555,7 @@ def syrk_launch_of(tiles: Tiles, shape: tuple[int, int, int], dtype, out_dtype, 
     _, m, k = shape
     family = family_of(tiles, dtype, target)
     tile_side = tile_rows(tiles, family)
-    m_pad = -(-m // tile_side) * tile_side
+    m_pad = whole(m, tile_side)
     k_target = max(k, m_pad) if polynomial else k
     steps = -(-k_target // tiles.block_k)
 
@@ -592,10 +593,10 @@ def derive_syrk(shape: tuple[int, int, int], dtype, out_dtype, target, *, transp
         super_unit = family0.role_rows * min(family0.consumers, CONSUMERS) * family0.cluster
         base_unit = math.lcm(family0.role_rows, family0.column_unit(dtype))
         align = min(super_unit, max(base_unit, 1 << max(0, m - 1).bit_length()))
-        align = -(-align // base_unit) * base_unit
-        aligned_m = -(-m // align) * align
+        align = whole(align, base_unit)
+        aligned_m = whole(m, align)
         step_unit = family0.depths(dtype)[-1]
-        aligned_k = -(-(max(k, aligned_m) if polynomial else k) // step_unit) * step_unit
+        aligned_k = whole(max(k, aligned_m) if polynomial else k, step_unit)
 
         def candidate(tile: Tiles) -> bool:
             if refused is not None and refused(tile):
