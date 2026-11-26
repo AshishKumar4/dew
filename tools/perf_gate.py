@@ -68,6 +68,12 @@ ALONE = "~aa"
 UNQUALIFIED = ("incomplete", "partial", "unjudged")
 """The states that judge nothing and fail the gate: the gate's own (Platform's), never a head's."""
 
+
+class ProbeFailed(RuntimeError):
+    """A probe that ran in a tree and exited other than 0: its rows `failed:`, which a base's comparison owes
+    (`verdict`'s "base failed"), where a row a tree cannot run (`not run:`, one older than its lock) has none
+    to owe."""
+
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
 # rotary, the joint attention and the modulated feed-forwards of the hot path.
 FLUX2 = {"num_layers": 2, "num_single_layers": 4, "heads": 12, "head_dim": 128,
@@ -432,7 +438,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 # (its step's compile is in its evidence, `compile_seconds`): where a GPU's minutes went.
                 sample.update({f"seconds {name}": round(time.perf_counter() - began, 3) for name in names})
                 if done.returncode != 0 and not external:
-                    raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
+                    raise ProbeFailed(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
                 # A peak the tree's tool did not measure (`peak`) is unmeasured, its row's sample None,
                 # beside the rows it did measure.
@@ -443,9 +449,10 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                 if probe.rows[0].name.startswith("step ") and out.is_file() and (stall := stalled(out)):
                     sample.update({f"stalled {row.name}": stall for row in probe.rows})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
+                said = "failed" if isinstance(error, ProbeFailed) else "not run"
                 failure = ({"error": str(error)[-400:],
                             "exit_code": None if done is None else done.returncode}
-                           if external else f"not run: {str(error)[-400:]}")
+                           if external else f"{said}: {str(error)[-400:]}")
                 sample.update(dict.fromkeys(names, failure))
             if out.is_file():
                 evidence = Path(args.out).resolve().with_suffix("")
@@ -460,6 +467,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
 def run(args: argparse.Namespace) -> int:
     """Every row of the battery (`--only`'s) in the three arms (`arms`), `--rounds` rounds of them (`rounds`);
     the machine's lock recorded (`lock`), which the run's compile ahead installs (`compile`)."""
+    unmatched(args.only, [row.name for row in BATTERY])
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     settings = dict(setting.split("=", 1) for setting in getattr(args, "head_env", None) or [])
@@ -619,6 +627,13 @@ def compile_samples(name: str, seconds: float, parts: Mapping[str, float] | None
             **{f"{name} {part}": float(parts.get(part, 0.0)) for part in SHOWN_PARTS}}
 
 
+def unmatched(only: list[str] | None, names: list[str]) -> None:
+    """Refused (SystemExit) before any setup where a word of `only` names none of `names`: a selection that
+    measures nothing writes an empty receipt a runner would read as a gate passed."""
+    if missing := [word for word in only or () if not any(word in name for name in names)]:
+        raise SystemExit(f"--only {' '.join(missing)}: no row's name holds it")
+
+
 def chosen(probe: "Probe", only: list[str] | None) -> bool:
     """Whether `--only`'s words (`only`, none: every probe) choose `probe`: any of them in any of its rows'
     names, as `run` and `ahead_battery` both select it."""
@@ -686,6 +701,7 @@ def compile_battery(args: argparse.Namespace) -> int:
         raise SystemExit("compile: XLA_FLAGS sets the autotuning level, which planning ahead keeps off; a "
                          "gate compiles as a run does with no GPU attached, so unset it")
     generation, gib, device = COMPILE_TARGETS[args.kind]
+    unmatched(args.only, list(STEP_CASES))
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     pythons, unbuilt = environments(((base, base_path), (head, head_path)), args.lock, args.environments)
@@ -719,7 +735,7 @@ def compile_battery(args: argparse.Namespace) -> int:
                     done = _run(path, pythons[tree], "", argv, head_path / "tools", 3600,
                                 Path(cache) / "compiles")
                 if done.returncode != 0:
-                    taken |= {row.name: f"not run: {done.stderr[-400:]}" for row in compile_rows(name)}
+                    taken |= {row.name: f"failed: {done.stderr[-400:]}" for row in compile_rows(name)}
                     continue
                 seconds, plans[name], parts[name] = compiled_sample(done.stdout)
                 taken |= compile_samples(name, seconds, parts[name])
@@ -788,7 +804,9 @@ def verdict(row: Row, base: list, head: list, alone: list) -> tuple[str, dict]:
     if not any(measured(x) for x in base) and not any(measured(x) for x in head):
         return "incomplete", {}
     if not any(measured(x) for x in base):
-        return "not compared", {}
+        # A base whose probe ran and failed is no tree that predates the row: the comparison is owed.
+        return ("base failed" if any(isinstance(x, str) and x.startswith("failed:") for x in base)
+                else "not compared"), {}
     if not any(measured(x) for x in head):
         return "broken", {}
     missing = {name: sum(not measured(x) for x in samples)
@@ -826,6 +844,8 @@ def report(args: argparse.Namespace) -> int:
     lines = [f"| row | unit | {base} | {head} | ratio | interval | A/A interval | verdict |",
              "|---|---|---:|---:|---:|---|---|---|"]
     failed, verdicts = [], {}
+    if not results["rows"]:
+        failed.append("no rows: the run measured nothing (its selection matched none)")
     claiming = getattr(args, "claim", False) or results.get("claim", False)
     if claiming:
         included = {row["name"] for row in results["rows"]}
@@ -844,7 +864,7 @@ def report(args: argparse.Namespace) -> int:
         verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated, **numbers,
                               **({"plans": selected} if any(selected.values()) else {}),
                               **({"parts": spent} if any(spent.values()) else {})}
-        if (state in (*UNQUALIFIED, "broken", "failed") or (state == "regressed" and row.gated)
+        if (state in (*UNQUALIFIED, "broken", "failed", "base failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
             failed.append(f"{row.name} ({state})")
