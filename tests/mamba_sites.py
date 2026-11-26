@@ -7,10 +7,17 @@ on a GPU and records (`RECORDED`), and Dew's leaves of it (`ruled`).
 - `stability/rated/<regime>/forward`: the forward's draws (`stressed`), its output and final memory.
 - `stability/rated/<regime>/gradient`: the gradient's (`cotangents`, its documents restarted where the
   regime resets them), its output, final memory and every operand's gradient under the drawn cotangents.
+
+A recorded site draws the same inputs on every host (testing.md, `input_digest`): every normal of a site's
+draw, its transform's and its cotangents' are `recorded_inputs.normals`' (`_normals`, keyed by the regime's
+name, the product and the seed), its uniforms NumPy's
+integer-derived ones, its arithmetic float64 on the host rounded once (`hosted`).
 """
 
 import dataclasses
 import functools
+import itertools
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -78,6 +85,15 @@ def ruled(rule: Callable[[Chunk], tuple], arrays: dict, leaves: tuple[str, ...] 
     return {name: found[name] for name in leaves}
 
 
+def _normals(*tags) -> Callable[[tuple], np.ndarray]:
+    """A draw's normals in turn, float64, each `recorded_inputs.normals`' of `tags` and its place in the
+    draw: the same bits on every host."""
+    from recorded_inputs import normals
+
+    places = itertools.count()
+    return lambda shape: normals([6781, *tags, next(places)], shape, np.float64)
+
+
 def sites() -> dict[str, Site]:
     """Every recorded site by name: each regime's forward and gradient of the rated scan."""
     import test_recurrence_stability as stability
@@ -87,12 +103,17 @@ def sites() -> dict[str, Site]:
     hooks = stability.SITES["rated"]
     found = {}
     for regime in stability.REGIMES:
-        def forward(seed, regime=regime):
-            operands = bf16(stability.stressed(hooks, regime, seed)[0], hooks)
-            return operands, drawn_cotangents(operands, seed)
+        # A regime's streams keyed by its name, so another regime added or moved leaves its draws' digests.
+        tag = zlib.crc32(regime.encode())
 
-        def gradient(seed, regime=regime):
-            operands, (out, final) = stability.cotangents(hooks, regime, seed)
+        def forward(seed, tag=tag, regime=regime):
+            normal = _normals(tag, 0, seed)
+            operands = bf16(stability.stressed(hooks, regime, seed, normal=normal)[0], hooks)
+            return operands, drawn_cotangents(operands, seed, normal=normal)
+
+        def gradient(seed, tag=tag, regime=regime):
+            normal = _normals(tag, 1, seed)
+            operands, (out, final) = stability.cotangents(hooks, regime, seed, normal=normal)
             restored = stability.restarting(lambda given: given, regime)(operands)
             return bf16(restored, hooks), (out.astype(jnp.bfloat16), final)
 

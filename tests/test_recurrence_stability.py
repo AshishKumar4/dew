@@ -26,6 +26,7 @@ interpretation of a kernel judges its host's arithmetic, not the kernel's."""
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -105,8 +106,10 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
     """`operands` with every token's log decay `target` `[B, T, H]`, formed through whichever operand the
     hooks read it from (`_decayed`)."""
     if hooks.rated:
-        # The log decay is `rate * dt`: dt the target over each head's rate.
-        return dataclasses.replace(operands, beta=target / operands.rate)
+        # The log decay is `rate * dt`: dt the target over each head's rate, in float64 on the host and
+        # rounded once (`hosted`), the same on every host and backend.
+        dt = np.asarray(target, np.float64) / np.asarray(operands.rate, np.float64)
+        return dataclasses.replace(operands, beta=hosted(dt))
     if hooks.gates is not None:
         # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero. Each branch takes
         # the inputs it selects alone, so an unselected one's derivative (expm1 past fp32's range, a log near
@@ -123,11 +126,11 @@ def _formed(operands: Chunk, hooks, target) -> Chunk:
     return dataclasses.replace(operands, log_decay=target)
 
 
-def _aligned(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
+def _aligned(operands: Chunk, hooks, normal: Callable) -> Chunk:
     """Every token's key within 1e-3 of one unit vector a row and head, the write gate near one: 0.999,
     or its logit where the gates form it through a sigmoid; a write the hooks take as one stays so."""
     base = np.asarray(operands.key, np.float64)[:, :1]
-    keys = hosted(unit(base + 1e-3 * rng.standard_normal(operands.key.shape)))
+    keys = hosted(unit(base + 1e-3 * normal(operands.key.shape)))
     near_one = np.log(0.999 / 0.001) if hooks.gates is not None else 0.999
     beta = None if operands.beta is None else jnp.full_like(operands.beta, near_one)
     return dataclasses.replace(operands, key=keys, beta=beta)
@@ -186,18 +189,19 @@ def _spread(operands: Chunk, hooks, rng: np.random.Generator) -> Chunk:
 
 
 REGIMES = {
-    'decays near one': (lambda operands, hooks, rng: _decayed(operands, hooks, -1e-4, 5e-5, rng), None),
-    'decays near zero': (lambda operands, hooks, rng: _decayed(operands, hooks, -30.0, 5.0, rng), NEAR_ZERO),
-    'the decay bound': (lambda operands, hooks, rng: _decayed(operands, hooks, -5.0, 0.0, rng), None),
-    'aligned keys': (lambda operands, hooks, rng: _aligned(operands, hooks, rng), None),
-    'resets on chunk edges': (lambda operands, hooks, rng: _reset(operands), None),
-    'saturated gates': (lambda operands, hooks, rng: _saturated(operands, hooks, rng), None),
-    'spread gates': (lambda operands, hooks, rng: _spread(operands, hooks, rng), None),
-    'a long sequence': (lambda operands, hooks, rng: _decayed(operands, hooks, -1e-3, 5e-4, rng), LONG),
-    'a fading memory': (lambda operands, hooks, rng: _decayed(operands, hooks, -0.1, 0.05, rng), LONG),
-    'steep then mild': (lambda operands, hooks, rng: _steep(operands, hooks, rng), None),
+    'decays near one': (lambda o, h, rng, normal: _decayed(o, h, -1e-4, 5e-5, rng), None),
+    'decays near zero': (lambda o, h, rng, normal: _decayed(o, h, -30.0, 5.0, rng), NEAR_ZERO),
+    'the decay bound': (lambda o, h, rng, normal: _decayed(o, h, -5.0, 0.0, rng), None),
+    'aligned keys': (lambda o, h, rng, normal: _aligned(o, h, normal), None),
+    'resets on chunk edges': (lambda o, h, rng, normal: _reset(o), None),
+    'saturated gates': (lambda o, h, rng, normal: _saturated(o, h, rng), None),
+    'spread gates': (lambda o, h, rng, normal: _spread(o, h, rng), None),
+    'a long sequence': (lambda o, h, rng, normal: _decayed(o, h, -1e-3, 5e-4, rng), LONG),
+    'a fading memory': (lambda o, h, rng, normal: _decayed(o, h, -0.1, 0.05, rng), LONG),
+    'steep then mild': (lambda o, h, rng, normal: _steep(o, h, rng), None),
 }
-"""Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
+"""Each regime's transform of a draw's operands (`(operands, hooks, rng, normal)`: its uniforms the NumPy
+generator's, its normals `normal(shape)`'s) and its tokens (the draw's own where None)."""
 
 GRADIENT_SEEDS = {
     ('scalar delta', 'decays near one'): 8,
@@ -375,25 +379,30 @@ def floor(regime: str) -> float:
     return FLOORS.get(regime, -5.0)
 
 
-def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
+def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS,
+             normal: Callable | None = None) -> tuple[Chunk]:
     """Draw `seed`'s operands for `hooks` under `regime` over `value_heads` value heads, a decay per key
-    dimension no steeper than the regime's floor (`FLOORS`)."""
+    dimension no steeper than the regime's floor (`FLOORS`): its normals `normal(shape)`'s where given (a
+    recorded site's, the same on every host, `recorded_inputs.normals`), else NumPy's."""
     transform, length = REGIMES[regime]
-    (operands,) = draw(hooks, packed=False, seed=seed, value_heads=value_heads,
+    (operands,) = draw(hooks, packed=False, seed=seed, value_heads=value_heads, normal=normal,
                        **({} if length is None else {'length': length}))
-    operands = transform(operands, hooks, np.random.default_rng([seed, 99]))
+    rng = np.random.default_rng([seed, 99])
+    operands = transform(operands, hooks, rng, normal or rng.standard_normal)
     if hooks.decay == 'vector':
         operands = dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, floor(regime)))
     return (operands,)
 
 
-def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
+def cotangents(hooks, regime: str, seed: int, *, normal: Callable | None = None
+               ) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """Draw `seed`'s operands under `regime` (`stressed`), their documents' starts taken out (`restarting`
     puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
     and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
-    are."""
-    (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS)
-    return dataclasses.replace(operands, starts=None), drawn_cotangents(operands, seed)
+    are; every normal `normal(shape)`'s where given (`stressed`)."""
+    (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS,
+                           normal=normal)
+    return dataclasses.replace(operands, starts=None), drawn_cotangents(operands, seed, normal=normal)
 
 
 GRADIENT_HEADS = 16

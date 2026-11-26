@@ -226,10 +226,11 @@ def unit(x):
     return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
 
 
-def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
+def cotangents(operands: Chunk, seed: int, *, normal: Callable | None = None) -> tuple[jax.Array, jax.Array]:
     """Cotangents of `operands`' output `[B, S, Hv, Dv]`, in their values' dtype, and of their final memory
-    `[B, Hv, Dk, Dv]`, fp32: normals of the seed's own stream (`hosted`)."""
-    normal = np.random.default_rng([seed, 101]).standard_normal
+    `[B, Hv, Dk, Dv]`, fp32: normals of the seed's own stream (`hosted`), or `normal(shape)`'s where given (a
+    recorded site's, the same on every host, `recorded_inputs.normals`)."""
+    normal = normal or np.random.default_rng([seed, 101]).standard_normal
     batch, length, heads, width = operands.value.shape
     return (hosted(normal((batch, length, heads, width)), operands.value.dtype),
             hosted(normal((batch, heads, operands.key.shape[-1], width))))
@@ -237,16 +238,16 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
          value_heads: int = VALUE_HEADS, value_width: int | None = None, key_heads: int = KEY_HEADS,
-         key_width: int = KEY_WIDTH) -> tuple[Chunk]:
+         key_width: int = KEY_WIDTH, normal: Callable | None = None) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries (of unit
     norm where the hooks declare them), keys and values (`NORMED_WIDTH` wide under the norm), a log decay a
     head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory entering, `length` tokens over
     `value_heads` value heads and `key_heads` key heads `key_width` wide, the values `value_width` wide where
     given, and with `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the
-    second, 48 a chunk's first token."""
+    second, 48 a chunk's first token; its normals `normal(shape)`'s where given (`cotangents`), or NumPy's."""
     rng = np.random.default_rng(seed)
-    normal = np.random.default_rng([seed, 1]).standard_normal
+    normal = normal or np.random.default_rng([seed, 1]).standard_normal
     width = value_width or (VALUE_WIDTH if hooks.output is None else NORMED_WIDTH)
     key_order, value_order = rng.permutation(key_width), rng.permutation(width)
     turned = {}
