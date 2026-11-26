@@ -368,6 +368,18 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
                     seeds=CAPACITY_SEEDS, truth_fn=as_given(truth))
 
 
+def test_the_exchanges_route_bound_refuses_a_route_two_ulps_off():
+    """The two-process check's bound on the input's bfloat16 cotangent (`routes_rounded_bound`: a rounding a
+    route on the wire and each side's one rounding of the sum) holds a route's one rounding and refuses its
+    cotangent moved two of its ulps: one route of 1 + 2**-7 beside a zero one."""
+    from moe_exchange_worker import routes_rounded_bound
+
+    route = 1.0 + 2.0 ** -7
+    bound = routes_rounded_bound(np.asarray([[route], [0.0]]), 2.0 ** -8)
+    assert 2.0 ** -8 * route <= bound[0]
+    assert 2 * 2.0 ** -7 > bound[0]
+
+
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
     assert_exchange_across_processes(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 1.0)
 
