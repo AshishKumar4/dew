@@ -192,7 +192,8 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
   - **decoupled reductions** (declared forms and dev-time rules): dependent nonlinear reductions broken
     with correction terms. Stateful softmax and log-sum-exp merges use their own rescale; weighted or
     masked variance and bilinear covariance use the declared Chan–Golub–LeVeque merge in `moments.py`
-    (row 9036), with independently ranged directional sums carried as described in §6.12;
+    (row 9036), with independently ranged directional sums carried as described in §6.12. A Boolean
+    mask excludes a sample before the centered square, including in its derivative;
   - **stable forms** (`stable`, dev time; §1.5; row 9037): `log1p` and `expm1`, a sum's logarithm taken out
     of its exponent (the log-sum-exp fold), logarithms of exponentials in log space (`log(exp(a) / exp(b))`
     as `a - b`, a KL's divergence of two softmaxes; `log(exp(a) exp(b))`, `log(exp(a))`), differences of

@@ -794,6 +794,28 @@ def test_weighted_central_moments_derive_and_match_float64_at_high_mean(mode):
         draw_shifted, f"weighted central moments ({mode})", seeds=16)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+def test_masked_variance_ignores_nonfinite_samples_before_the_square(dtype):
+    from dew.algebra import moments
+
+    x = np.asarray([[1, 3, np.inf, -np.inf], [np.nan, np.inf, -np.inf, 1]], dtype)
+    mask = np.asarray([[True, True, False, False], [False, False, False, False]])
+    direction = np.asarray([[1, 0, np.inf, np.inf], [np.inf, np.inf, np.inf, np.inf]], dtype)
+
+    def orders(x, mask, direction):
+        def sum_var(value):
+            return moments.masked_moments(value, mask)[1].sum()
+
+        gradient, mixed = jax.jvp(jax.grad(sum_var), (x,), (direction,))
+        return moments.masked_moments(x, mask), gradient, mixed
+
+    (mean, variance), gradient, mixed = jax.jit(orders)(x, mask, direction)
+    np.testing.assert_array_equal(mean, [2, 0])
+    np.testing.assert_array_equal(variance, [1, 0])
+    np.testing.assert_array_equal(gradient, [[-1, 1, 0, 0], [0, 0, 0, 0]])
+    np.testing.assert_array_equal(mixed, [[0.5, -0.5, 0, 0], [0, 0, 0, 0]])
+
+
 @pytest.mark.parametrize("mode", ["walk", "merge"])
 def test_masked_central_moments_handle_empty_tiles_and_empty_rows(mode):
     """Masked unweighted variance (`moments.chunked_moments` with boolean mask) with wholly-masked tiles
