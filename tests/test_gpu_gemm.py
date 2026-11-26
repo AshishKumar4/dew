@@ -220,6 +220,19 @@ def an_xla_fallbacks_dense_bf16_product_holds_check_1_against_xlas_own_dot():
                     truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
+def _scale_edge_cells() -> tuple[Cell, ...]:
+    """The blockwise FP8 template's exact witnesses at its scales' ends (rows 13257, 13274), each an exact
+    value its run reads."""
+    return (
+        Cell("a blockwise FP8 product at far-apart scales is exact",
+             gemm_blockwise.a_blockwise_fp8_product_at_far_apart_scales_is_exact, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "subnormal scale"}),
+        Cell("a blockwise FP8 product at large finite scales is finite",
+             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
+             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+    )
+
+
 def _syrk_and_tail_cells():
     return [
         # The family's cells as its own grid states them, each pinned to its GPU (`gpu_flow.cells_of`).
@@ -364,12 +377,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                gemm_paired.a_chained_input_gradient_is_as_finite_as_its_products_sum, name,
                native={"launch": "chained", "generation": name, "case": "overflow"})
           for name in ("sm90", "sm100")),
-        Cell("a blockwise FP8 product at far-apart scales is exact",
-             gemm_blockwise.a_blockwise_fp8_product_at_far_apart_scales_is_exact, "sm90",
-             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "subnormal scale"}),
-        Cell("a blockwise FP8 product at large finite scales is finite",
-             gemm_blockwise.a_blockwise_fp8_product_at_large_finite_scales_is_finite, "sm90",
-             at_run=EXACT_OVERFLOW, native={"launch": "blockwise fp8 gmm", "pass": "step scaling"}),
+        *_scale_edge_cells(),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
