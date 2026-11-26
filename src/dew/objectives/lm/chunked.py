@@ -282,13 +282,13 @@ def _whole_logits(states, matrix, precision: jax.lax.PrecisionLike) -> jax.Array
 
 
 def _contracted_whole() -> bool:
-    """Whether no device splits a product's contraction as it traces: every axis of the mesh in context
-    that is not manual is one device (a step on one GPU, a `shard_map`'s body over every axis), or, with no
-    mesh in context, the process holds one device."""
+    """Whether no device splits a product's contraction as it traces, proved by the mesh in context: every
+    axis of it that is not manual is one device (a step on one GPU, which the trainer traces under its mesh,
+    a `shard_map`'s body over every axis). With none in context nothing proves it: a program's devices are
+    its arguments' shardings', which no trace reads."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty:
-        return jax.device_count() == 1
-    return all(size == 1 for name, size in mesh.shape.items() if name not in mesh.manual_axes)
+    return not mesh.empty and all(size == 1 for name, size in mesh.shape.items()
+                                  if name not in mesh.manual_axes)
 
 
 def _widened(raw: jax.Array) -> jax.Array:
