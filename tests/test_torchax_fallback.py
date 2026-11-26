@@ -1737,10 +1737,16 @@ def test_experts_the_interface_dispatches_run_through_dews_grouped_dispatch(tmp_
     forward = jax.jit(loaded.model.apply)
     tokens = token_draw(0x13044, MIXTRAL["vocab_size"], (2, 12))
     # Each layer's experts Dew's grouped products over the rows sorted by expert (`_dew_experts`), which
-    # lower to ragged products where transformers' batched products are dense ones.
-    program = jax.make_jaxpr(loaded.model.apply)(loaded.variables, *tokens(0))
-    ragged = [eqn for eqn in equations(program) if eqn.primitive.name.startswith("ragged_dot")]
-    assert len(ragged) >= MIXTRAL["num_hidden_layers"], len(ragged)
+    # lower to ragged products where transformers' batched products are dense ones: as many a layer as one
+    # layer's own Mixtral holds.
+    def ragged(directory) -> int:
+        held = Pretrained.load(directory, dtype="float32", fallback="torchax")
+        program = jax.make_jaxpr(held.model.apply)(held.variables, *tokens(0))
+        return sum(eqn.primitive.name.startswith("ragged_dot") for eqn in equations(program))
+    single = transformers.MixtralConfig(**{**MIXTRAL, "num_hidden_layers": 1})
+    transformers.MixtralForCausalLM(single).save_pretrained(tmp_path / "one")
+    one = ragged(tmp_path / "one")
+    assert one > 0 and ragged(tmp_path) == MIXTRAL["num_hidden_layers"] * one
 
     def built(dtype):
         built = transformers.AutoModelForCausalLM.from_config(
