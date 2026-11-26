@@ -281,3 +281,18 @@ def test_a_bf16_dense_with_a_narrow_bias_served_its_window_rounds_as_its_kernel(
     plain = jax.jit(layer.apply)(variables, x)
     served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
     np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
+
+
+def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_as_its_kernel():
+    """A bfloat16 Dense stating a dot algorithm that narrows its operands (`F16_F16_F32`: a bfloat16 input of
+    `2**-30` is zero in fp16) over a unit kernel computes what it computes over its kernel, served its window
+    too, bit for bit: the window's product multiplies its operands whole, so the layer's own product runs."""
+    kernel = np.zeros((128, 64), jnp.bfloat16)
+    kernel[0, 0] = 1.0
+    layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False,
+                  precision=jax.lax.DotAlgorithmPreset.F16_F16_F32)
+    variables = {"params": {"kernel": jnp.asarray(kernel)}}
+    x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
+    plain = jax.jit(layer.apply)(variables, x)
+    served = jax.jit(layer.apply)(quantization.bf16_windows(variables, sites=[""]), x)
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
