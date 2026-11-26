@@ -168,14 +168,19 @@ def _compile_arms(store: CompiledTruths, arms: Mapping[str, tuple[Callable, bool
         from dew.nn.kernels.templates import report
 
         with summed_as_run():
+            at_run = None
             while programs:
                 try:
-                    store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True)
+                    store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True,
+                                       at_run=at_run)
                 except report.CompiledOnDevice as refused:
                     # Check 1 measures the arms as their GPU compiles them, a choice no compile without it
-                    # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`).
-                    store.compile_site(armed(label, written), programs, held, compiled=compiled, arms=True,
-                                       at_run=str(refused))
+                    # holds: every arm of the site compiles in its run, as the prepare states (`_stored_arm`),
+                    # their memory read offline as they lower, a refused one's dropped as below.
+                    if at_run is not None:
+                        raise
+                    at_run = str(refused)
+                    continue
                 except Unlowerable as refused:
                     # A kernel staged for its run alone (`attention.unlowered_launch`: an arm whose trace
                     # holds it, refused as it lowers): that arm compiles in its run, the others ahead.
