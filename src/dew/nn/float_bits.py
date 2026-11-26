@@ -209,9 +209,26 @@ def rounded_binary(sign: jax.Array, significand: jax.Array, exponent: jax.Array,
     if limits.bits != 32:
         sign = sign >> np.uint32(32 - limits.bits)
     bits = sign | jnp.where(significand == 0, np.uint32(0), magnitude)
-    quiet = infinity | np.uint32(1 << (mantissa - 1))
-    bits = jnp.where(nan, quiet, jnp.where(infinite, sign | infinity, bits))
+    bits = jnp.where(nan, np.uint32(quiet_nan_bits(dtype)), jnp.where(infinite, sign | infinity, bits))
     return jax.lax.bitcast_convert_type(bits.astype(f"uint{limits.bits}"), dtype)
+
+
+def quiet_nan_bits(dtype: DTypeLike) -> int:
+    """The bits of `dtype`'s positive quiet NaN, an IEEE binary format: its exponent all ones and its
+    mantissa's leading bit alone (`0x7FC00000` for float32), the NaN a cast of one gives."""
+    limits = jnp.finfo(dtype)
+    return (((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1))
+
+
+def quiet_nan(negative: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`dtype`'s quiet NaN (`quiet_nan_bits`) signed where `negative` holds, for each of its entries: the one
+    constructor of a signed NaN a stored decoder lands (a minifloat's NaN codes, a scale's, an MXFP8
+    block's); which NaN carries a sign is its caller's policy."""
+    limits = jnp.finfo(dtype)
+    word = jnp.dtype(f"uint{limits.bits}")
+    signs = jnp.asarray(negative).astype(word) << word.type(limits.bits - 1)
+    bits = word.type(quiet_nan_bits(dtype)) | signs
+    return jax.lax.bitcast_convert_type(bits, dtype)
 
 
 EXPONENT_REACH = 1 << 16

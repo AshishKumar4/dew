@@ -444,11 +444,9 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     budget, so a row that stops or spends its budget goes inactive while the
     rest keep drawing; an inactive row's cache is not written. A grammar
     guides the draws as `strategies.Sample` does. The step runs the model
-    before it draws, so no device check comes before the model call: jax's
-    checkify cannot carry a check into a shard_map (jax-ml/jax#40907), and a
-    model on a mesh runs its expert dispatch in one. A token is therefore fed
-    in the step after the one that drew it, and a row that feeds nothing,
-    one seated this step, keeps the logits its prompt left. A server drawing
+    before it draws: a token is fed in the step after the one that drew it,
+    and a row that feeds nothing, one seated this step, keeps the logits its
+    prompt left. A server drawing
     speculative blocks runs `_speculated` instead.
     """
     if placement.plan is not None:
@@ -620,11 +618,9 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     iteration), and the host throws the error when it reads them, one call
     later. The state comes back split as it went in.
 
-    Each iteration checks its own draws. jax's checkify cannot carry a check
-    into a shard_map (jax-ml/jax#40907), and every iteration after the first
-    calls the model, which may run one, after the checks of the iteration
-    before it; so the iterations' errors come out of the loop as values and
-    meet in one after it, the first iteration's ahead of the rest.
+    Each iteration checks its own draws; the iterations' errors come out of
+    the loop as values and meet in one after it, the first iteration's ahead
+    of the rest, so the host reads the earliest failure.
     """
 
     def advanced(state: Slots, admission: Admission | None) -> tuple[checkify.Error, tuple[Slots, Draws]]:

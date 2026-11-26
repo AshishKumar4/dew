@@ -86,7 +86,7 @@ DPO keeps the starting policy in the existing EMA slot at unit decay; GRPO and F
 - The EMA clock advances on completed optimizer updates, not micro-steps or rejected updates.
 - The fix is one select per leaf: return the average unchanged where `decay >= 1.0` (`training/transaction.py::ema_update`). It must remain bit-identical even if a live parameter is non-finite; multiplying that parameter by zero would not preserve it. Its test forces a non-finite parameter and asserts the reference is bit-identical afterwards, with and without `dynamic_scale`.
 
-The reference forward uses the same model and scoring code as the policy with a different variable tree. The EMA slot holds this frozen reference instead of a moving policy average. Reference likelihoods are computed from the current batch, so there is no second cache of scores to invalidate when the data path changes. We revisit this only if a measured run shows reference forwards dominating.
+The reference forward uses the same model and scoring code as the policy with a different variable tree. The EMA slot holds this frozen reference instead of a moving policy average. Reference likelihoods are computed from the current batch (`objectives/rl/preference.py`), so there is no second cache of scores to invalidate when the data path changes. A score depends on more than the frozen weights: the microbatch's loop passes and progress, its window coordinates and which tokens are completions; reusing one is valid only for an identical scoring call. Publishing reference scores for stable repeated inputs belongs at the data and scoring seam that holds those inputs fixed, measured for its wall time, ingestion and peak.
 
 ## 4. The rollout capability
 

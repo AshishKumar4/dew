@@ -206,6 +206,30 @@ def whitened(rewards, values, gamma, lam, dtype):
     return (raw - mean) / np.sqrt(variance * (count / (count - 1)) + dtype(1e-8))
 
 
+@pytest.mark.parametrize("compiled", [False, True], ids=["direct", "compiled"])
+@pytest.mark.parametrize("unmasked", [0, 1])
+def test_whitening_fewer_than_two_entries_is_refused_where_checked(compiled, unmasked):
+    """Unbiased whitening divides by one less than its unmasked count: a checked call of `gae` (eager or
+    compiled) over a mask of fewer than two entries reports it rather than returning a NaN, where two
+    whiten."""
+    from jax.experimental import checkify
+
+    from dew.rl.advantage import gae
+
+    rewards, values = jnp.arange(8.0).reshape(1, 8), jnp.zeros((1, 8))
+
+    def whitened(mask):
+        run = jax.jit(gae, static_argnums=(3, 4)) if compiled else gae
+        return checkify.checkify(run, errors=checkify.user_checks)(rewards, values, mask, 1.0, 1.0)
+
+    error, (advantages, _) = whitened(jnp.zeros((1, 8)).at[0, :2].set(1.0))
+    error.throw()
+    assert np.all(np.isfinite(np.asarray(advantages)))
+    error, _ = whitened(jnp.zeros((1, 8)).at[0, :unmasked].set(1.0))
+    with pytest.raises(checkify.JaxRuntimeError):
+        error.throw()
+
+
 PPO_SHIFT_SEEDS = 16
 """The shifted-reward site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
 (2026-10-21, on armada)."""
