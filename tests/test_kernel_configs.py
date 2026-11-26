@@ -1279,6 +1279,7 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
     unchanged at their pin otherwise. Read from each kernel's own lowered module, as its call lowers it,
     whatever compiled before it in the process."""
     import jax.experimental.mosaic.gpu as mgpu
+    from jax.extend.mlir import ir
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.lowered import kernel_calls
@@ -1295,25 +1296,22 @@ def test_an_amperes_gemm_copies_its_blocks_promised_in_bounds():
                     if call.kind != "mosaic_gpu":
                         continue
                     module = mgpu.deserialized(call.ir)
+                    found: list[bool] = []
+
+                    def visit(operation, found=found):
+                        # Each copy, whether it states its bounds (an operand past its two addresses).
+                        if operation.name == "nvvm.cp.async.shared.global":
+                            found.append(len(operation.operands) > 2)
+                        return ir.WalkResult.ADVANCE
+
                     with module.context:
-                        for operation in _operations(module.operation):
-                            if operation.name == "nvvm.cp.async.shared.global":
-                                copies += 1
-                                if len(operation.operands) > 2:
-                                    bounded.append((each.case.name, call.name))
+                        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+                    copies += len(found)
+                    bounded += [(each.case.name, call.name)] * sum(found)
                 if each.case.required and not copies:
                     uncopied.append(each.case.name)
     assert not uncopied, uncopied[:4]
     assert not bounded, bounded[:4]
-
-
-def _operations(operation):
-    """Every operation nested in `operation`, in program order."""
-    for region in operation.regions:
-        for block in region.blocks:
-            for inner in block.operations:
-                yield inner.operation
-                yield from _operations(inner.operation)
 
 
 @COMPILES_ON_CPU
