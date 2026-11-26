@@ -849,8 +849,11 @@ def numerics_read[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         raise ValueError(f"the run's numerics compute in {compute}, which every module it trains states as "
                          f"its own dtype (dtype={compute}); "
                          + ("they state none, or several" if stated is None else f"they compute in {stated}"))
-    drawn = numerics.drawn_dtype([dtype for entry in objective.program_key() if entry.trained
-                                  and (dtype := _own(entry.module, "param_dtype")) is not None])
+    # Each module's storage as its own field states it, unknown where it states none (a wrapper's, whose
+    # submodules draw as they are written): the numerics' dtype is applied to every fresh leaf then.
+    owned = [_own(entry.module, "param_dtype") for entry in objective.program_key() if entry.trained]
+    drawn = numerics.dtypes.params if None in owned else numerics.drawn_dtype(
+        [dtype for dtype in owned if dtype is not None])
     return numerics.scales_loss(), drawn
 
 

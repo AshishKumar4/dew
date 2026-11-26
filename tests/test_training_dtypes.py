@@ -432,6 +432,41 @@ def test_a_trainer_given_numerics_traces_draws_and_scales_under_them(preset):
     assert 0 < drawn < len(traced) and all(seen == numerics for seen in traced)
 
 
+def test_numerics_store_every_fresh_parameter_where_one_module_states_its_storage_and_another_none():
+    """Under `bf16-true`, two trained modules computing in bf16, one stating its storage as bf16 and one (a
+    wrapper) stating none, its layer drawing float32: every fresh parameter is stored in bf16, the
+    numerics' storage applied where a module's own is unknown (review of row 11935)."""
+    from dew.objectives.base import ProgramModule
+
+    numerics = Numerics(DTYPE_PRESETS["bf16-true"])
+    stated = nn.Dense(1, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)
+    read = numerics_reader([])(jnp.bfloat16)
+
+    class Two(Fitted):
+        def __init__(self):
+            self.model, self.other = stated, read
+
+        def program_key(self):
+            return (ProgramModule(self.model, None, trained=True),
+                    ProgramModule(self.other, None, trained=True))
+
+        def fresh_variables(self, key, held):
+            x = jnp.ones((1, 2), jnp.float32)
+            first, second = jax.random.split(key)
+            return {"params": {"model": nn.unbox(self.model.init(first, x))["params"],
+                               "other": nn.unbox(self.other.init(second, x))["params"]}}
+
+        def loss(self, variables, batch, step):
+            params = variables["params"]
+            prediction = (self.model.apply({"params": params["model"]}, batch["x"])
+                          + self.other.apply({"params": params["other"]}, batch["x"])).astype(jnp.float32)
+            return jnp.mean((prediction - batch["y"]) ** 2), Aux({})
+
+    state = Trainer(Two(), optax.sgd(.1), key=jax.random.key(0),
+                    advanced=TrainerAdvanced(numerics=numerics)).initial_state()
+    assert {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])} == {jnp.dtype(jnp.bfloat16)}
+
+
 def test_a_step_compiled_ahead_traces_under_its_trainers_numerics():
     """A trainer's step compiled ahead from Python (`compile_ahead`) for compile-only GPUs traces its start
     and its step under the trainer's numerics, as its fit does (`under_numerics`)."""
