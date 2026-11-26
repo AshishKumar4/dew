@@ -2,9 +2,10 @@
 its cases, saturated with every rule set dev time runs (`rules.admitted(dev=True)`), its candidates measured
 against its float64 truth on its cases' draws (check 1, `dew.parity.judge`) and the cheapest its policy
 admits chosen (`dew.algebra.error.choose`, §1.5) under each policy, priced for each target; the choices
-written beside the declaring module as ordinary Python (`<module>_derived.py`: plain JAX, no import of
-`dew.algebra`, `printed.source`), headed by the declarations, the sets and their receipts and the egglog
-version. `python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
+written beside the declaring module as ordinary Python (`<module>_derived.py`, `printed.source`). The
+generated module uses only `dew.algebra._generated` for case dispatch, not the registry, rules or
+extractor. Its header names the declarations, rule sets, receipts and egglog version.
+`python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
 where a written module differs, which tests/test_algebra_generate.py runs on every train.
 
 A declaration's choice is the platform's that measures it: the draws are seeded and fixed, so generation is
