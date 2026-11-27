@@ -10,9 +10,6 @@
 "tests/test_aggregation.py::test_a_prefill_flown_a_window_at_a_time_writes_the_replay_one_pass_writes[False]",
 "tests/test_aggregation.py::test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_taken"
 ],
-"tests/test_ahead_certification.py": [
-"tests/test_ahead_certification.py::test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_them"
-],
 "tests/test_algebra_bounds.py": [
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over a logistic and a constant-float16--3-7]",
 "tests/test_algebra_bounds.py::test_every_bound_stated_from_a_floor_holds_every_output_its_operands_reach[over an exponential-bfloat16-0-2]",
@@ -130,7 +127,6 @@
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+mla-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer+moe-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[causal_transformer-1-step-fsdp]",
-"tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[hybrid_dit-1-step-data]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[jepa_encoder-1-step-fsdp]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_dit-1-step-stage]",
 "tests/test_architectures.py::test_architecture_trains_on_every_layout_as_on_one_device[simple_mmdit-1-step-data]",
@@ -770,28 +766,28 @@
 "tests/test_attention_triton.py::test_the_plain_forward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)]"
 ],
 "tests/test_attention_triton_backward.py": [
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[causal-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[cross-causal-lengths-starts-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=128, block_k=64, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[documents-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[full-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=128, block_k=64, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-documents-window]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[chunk]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-chunk]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-window]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-documents]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-block-causal-window]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_every_call_form[two-sided-window-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-chunk]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[causal-window-valid]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-block-causal-window]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal-window-valid]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-causal]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[cross-window]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-causal-chunk-places]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[documents-lengths]",
-"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[lengths]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[lengths-starts]",
+"tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[valid]",
 "tests/test_attention_triton_backward.py::test_the_backward_is_on_par_over_the_core_s_other_call_forms[widest-window]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)-default]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-documents-valid-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
-"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-window-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)-default]"
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-causal-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=64, block_k=32, warps=4, stages=2)-accurate]",
+"tests/test_attention_triton_backward.py::test_the_plain_backward_is_on_par_over_runs[runs-window-places-Tiles(block_q=32, block_k=32, warps=4, stages=2)-accurate]"
 ],
 "tests/test_attention_triton_hooks.py": [
 "tests/test_attention_triton_hooks.py::test_the_backward_is_on_par_under_every_score_hook[alibi-float16-default]",
@@ -3189,8 +3185,8 @@
 "tests/test_plan.py::test_a_second_trainer_of_one_step_reads_its_step_back_from_the_persistent_cache",
 "tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-cpu]",
 "tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[two-microbatches]",
-"tests/test_plan.py::test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_once_warm[16-between0]",
-"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[minimal_with_scan_and_conv]"
+"tests/test_plan.py::test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step_again",
+"tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[minimal_with_context]"
 ],
 "tests/test_ppo.py": [
 "tests/test_ppo.py::test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged[default]",
@@ -4019,9 +4015,6 @@
 ],
 "tests/test_source_schedulers.py": [
 "tests/test_source_schedulers.py::test_source_config_rebuilds_its_scheduler_trajectory_and_gradient[edm.exponential_v_threshold]"
-],
-"tests/test_sparse_attention.py": [
-"tests/test_sparse_attention.py::test_the_layer_runs_the_selection_and_matches_its_masked_kernel"
 ],
 "tests/test_speculative.py": [
 "tests/test_speculative.py::test_a_blocks_tokens_are_drawn_as_the_target_draws_them",
