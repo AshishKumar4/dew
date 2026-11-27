@@ -475,29 +475,29 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
 
 def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_its_record(tmp_path):
     """A configured run launched into a directory that holds a best checkpoint's weights alone (`Best`'s
-    `weights_only`, ranked so its first evaluation wins and no resumable step is kept), which trained under
-    other numerics (JAX's "highest" beneath its
-    "default", relaunched under "high"), is refused before its record is replaced: the directory's guard is
-    taken under the numerics its steps trace under, as `fit` takes it (row 13708)."""
+    `weights_only`, ranked so its first evaluation wins and no resumable step is kept), whose products
+    computed at "highest", declared, is refused when it declares "high" under JAX's own "highest" before its
+    record is replaced: the directory's guard is taken under the numerics its steps trace under, as `fit`
+    takes it, where JAX's own setting alone would read the run as computing alike (row 13708)."""
     from affine_run import dataset, val_batches
 
     from dew.checkpoints import Checkpoints
-    from dew.nn.precision import DTYPE_PRESETS, Numerics
+    from dew.nn.precision import Numerics
     from dew.training import Best
 
-    def run(steps: int) -> RunConfig:
+    def run(steps: int, matmul: str) -> RunConfig:
         return RunConfig(trainer=TrainerConfig(
             steps=steps, checkpoint_dir=str(tmp_path), eval_every=1, checkpoint_every=None,
             checkpoint_final=False, best=Best("val/loss", mode="max", weights_only=True),
-            precision=Numerics(DTYPE_PRESETS["32-true"], matmul="default")))
+            precision=Numerics(matmul=matmul)))
 
     with jax.default_matmul_precision("highest"):
-        run(2).train(Regression(), dataset(val=val_batches()), name="weights")
-    held = Checkpoints(str(tmp_path / "weights"))
-    assert held.best is not None and held.latest is None
-    record = (tmp_path / "weights" / RUN_FILE).read_bytes()
-    with jax.default_matmul_precision("high"), pytest.raises(ValueError):
-        run(3).train(Regression(), dataset(val=val_batches()), name="weights")
+        run(2, "highest").train(Regression(), dataset(val=val_batches()), name="weights")
+        held = Checkpoints(str(tmp_path / "weights"))
+        assert held.best is not None and held.latest is None
+        record = (tmp_path / "weights" / RUN_FILE).read_bytes()
+        with pytest.raises(ValueError):
+            run(3, "high").train(Regression(), dataset(val=val_batches()), name="weights")
     assert (tmp_path / "weights" / RUN_FILE).read_bytes() == record
 
 
