@@ -3,6 +3,8 @@
 built around it."""
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -91,19 +93,15 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     from dew.registry import ModelConfig
 
     config = DiffusionRunConfig(
-        model=ModelConfig(
-            "simple_dit",
-            {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-             "dtype": "float32"},
-        ),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 4),
         preset=presets.MeanFlow(),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("mean_flow",
-                                  {"omega": 2.0, "kappa": 0.5, "solver": Euler(), "steps": 2,
-                                   "ema_decay": None}),
+        objective=ObjectiveConfig(functools.partial(MeanFlowObjective, omega=2.0, kappa=0.5,
+                                                    solver=Euler(), steps=2, ema_decay=None)),
     )
     run = tmp_path / "run"
     task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), run, 1e-2)

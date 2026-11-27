@@ -198,12 +198,12 @@ class ActivityRun(RunConfig):
 '''
 
 TRAIN_RUN = '''
-import dataclasses, sys
+import dataclasses, functools, sys
 from dew.config import TrainerConfig
 from dew.registry import ModelConfig
-from toypackage.models import ActivityRun
+from toypackage.models import ActivityRun, Population
 default = ActivityRun().trainer
-run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 64}),
+run = ActivityRun(model=ModelConfig(functools.partial(Population, neurons=64)),
                   trainer=dataclasses.replace(default, steps=4, eval_every=4, log_every=1,
                                               checkpoint_dir=sys.argv[1], name="activity",
                                               compilation_cache_dir=None, multi_host=False))

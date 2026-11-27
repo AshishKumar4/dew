@@ -1,6 +1,7 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import dataclasses
+import functools
 import importlib
 import json
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ from token_support import write_token_corpus
 from tool_support import load
 
 import dew
+from dew import registry
 from dew.config import ObjectiveConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
@@ -69,11 +71,11 @@ def tiny(default: LMRunConfig, model: str = "{}", objective: str | None = None,
     """`default` with its model's fields `model` (a JSON record) over its own, computing in float32, and its
     objective `objective` (by class, the run's own where None) with `objective_fields` (their records): what
     a run file states of what the run trains."""
-    stated = default.objective if objective is None else ObjectiveConfig(objective)
+    stated = default.objective if objective is None else ObjectiveConfig(functools.partial(
+        registry.objectives[objective]))
     return dataclasses.replace(
-        default, model=dataclasses.replace(default.model, fields={**default.model.fields, "dtype": "float32",
-                                                                  **json.loads(model)}),
-        objective=dataclasses.replace(stated, fields={**stated.fields, **objective_fields}))
+        default, model=default.model.with_fields(**{"dtype": "float32", **json.loads(model)}),
+        objective=stated.with_fields(**objective_fields))
 
 
 def windows(corpus, held: bool = False, **settings):
@@ -940,8 +942,7 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
 
     # The gate trains under the exit objective at its default weight, the run stating none.
     assert objective.exit_entropy == EXIT_ENTROPY
-    untrained = dataclasses.replace(config, objective=dataclasses.replace(
-        config.objective, fields={**config.objective.fields, "exit_entropy": None}))
+    untrained = dataclasses.replace(config, objective=config.objective.with_fields(exit_entropy=None))
     with pytest.raises(ValueError):
         untrained.exit_settings()
     labels = param_labels(groups)(objective.held_variables()["params"])

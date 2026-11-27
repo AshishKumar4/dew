@@ -248,7 +248,7 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     from dew.nn.kernels import generation
     from dew.nn.precision import Numerics
     from dew.objectives.lm import Samples
-    from dew.registry import ModelConfig
+    from dew.registry import ModelConfig, to_record
     from dew.training import Trainer
 
     decoder = blocky()
@@ -264,7 +264,7 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     with generation.run_precision(trained_in):
         trainer.fit(stream, steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
-    model = dataclasses.asdict(ModelConfig.from_model(decoder))
+    model = to_record(ModelConfig.from_model(decoder), ModelConfig)
     record = {"objective": "lm", "data": {"seq_len": SEQ}, "model": model}
     (tmp_path / "run.json").write_text(json.dumps(record))
     native = TextGeneration.from_run(str(tmp_path))

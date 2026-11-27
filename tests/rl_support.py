@@ -3,6 +3,7 @@ causal stack's scoring contract, verl's token-mean reduction of the
 surrogate terms they check `dew.rl` against, and an asynchronous scheduler's
 scripted source and publisher."""
 
+import functools
 from concurrent.futures import Future
 
 import jax
@@ -10,7 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.protocols import OutputTable
+from dew.objectives.rl.grpo import GRPOObjective
 from dew.rl import surrogate
 
 
@@ -122,10 +125,12 @@ def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8, **o
     tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
     rows = [{"prompt": prompt, "data_source": "rule", "ground_truth": "a"}] * 8
     rollout = PromptRollout(reward=completion_length, groups=2, max_new_tokens=4)
-    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                               "dtype": "float32"})
+    model = ModelConfig(functools.partial(CausalTransformer, emb_features=16,
+                                          num_layers=1, num_heads=2, dtype="float32"))
     default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
-                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo", dict(objective_fields)),
+                          tokenizer=tokenizer,
+                          objective=ObjectiveConfig(
+                              functools.partial(GRPOObjective, **dict(objective_fields))),
                           rollout=rollout,
                           model=model, max_new_tokens=0)
     return LMRunConfig.cli(["--trainer.steps", "1", "--trainer.checkpoint-dir", str(tmp_path),

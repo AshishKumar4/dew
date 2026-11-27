@@ -109,7 +109,7 @@ type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAlias
 # the width of what may arrive; `build` narrows each one again against the
 # type its member declared before the member ever sees it.
 type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic | datetime.timedelta
-                   | types.FunctionType | types.BuiltinFunctionType
+                   | types.FunctionType | types.BuiltinFunctionType | functools.partial
                    | DataclassInstance | Mapping[str, object]
                    | Mapping[RecordKey, object] | Sequence[Configured])
 
@@ -439,8 +439,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         members = (annotated[self[name], tyro.conf.subcommand(name.replace("_", "-"))] for name in names)
         return functools.reduce(operator.or_, members)
 
-    def flag_choices(self, record: type[Registered]) -> Callable[[], type]:
-        """The members' records (`record`, this kind's `Registered` class) as a command line chooses them
+    def flag_choices(self, record: type[Bound]) -> Callable[[], type]:
+        """The members' records (`record`, this kind's `Bound` class) as a command line chooses them
         (`record_flags`): a subcommand an alias (`env:flight`), its arguments plain flags, made when a
         command line is parsed (`tyro.conf.arg(constructor_factory=...)`), one class's first alias alone,
         a subclass's before its base's (tyro reads a union's first member a default is an instance of)."""
@@ -584,9 +584,20 @@ def to_record(value, annotation) -> JSON:
 
     from dew._records import recorded_duration
 
-    if isinstance(value, Registered) and "_alias" in vars(type(value)):
-        # A command line's subcommand (`record_flags`) is the record it makes, its base's.
-        value = value.recorded()
+    if isinstance(value, Bound):
+        # A command line's subcommand (`record_flags`) is the record it makes, its base's; a bound member is
+        # recorded as `{"name", "fields", "defaults", ...}`, its other settings beside (`Bound.record`), and
+        # named by its kind's class where the annotation does not name it (a union of kinds).
+        held = value.recorded()
+        record = held.record()
+        if type(held) is nominal_class(_unwrapped(annotation)):
+            return record
+        return {"class": import_path(type(held)), "fields": record}
+    if isinstance(value, functools.partial):
+        # A member bound by keyword (`Bound.bound`), recorded as the class record of what it builds.
+        if value.args:
+            raise Unrecordable(f"{value!r} binds arguments by position, which a record names none of")
+        return {"class": import_path(value.func), "fields": argument_records(value.func, value.keywords)}
     if isinstance(value, datetime.timedelta):
         try:
             return recorded_duration(value)
@@ -832,7 +843,11 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if annotation is JSON:
         # Data a record holds as written, whatever it spells (a chat message's `{"function": ...}`).
         return configured(value)
+    # An alias resolved first, so a bound member's alias (`type Predictor = functools.partial[...]`) reads
+    # as the partial it names.
     annotation = resolve_alias(annotation)
+    if typing.get_origin(annotation) is functools.partial or annotation is functools.partial:
+        return _bound(value, typing.get_args(annotation))
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
@@ -899,7 +914,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
                 return _built(_member(named[0], (nominal,)), named[1], dtypes=dtypes)
             if dataclasses.is_dataclass(nominal):
                 # A record reads as its kind's own class: a command line's subcommands are its parser's
-                # alone (`RunConfig.cli`, `Registered.flagged`), so a run saved and read back is the run.
+                # alone (`RunConfig.cli`, `Bound.flagged`), so a run saved and read back is the run.
                 return _construct(nominal, value, dtypes=dtypes)
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
@@ -1142,18 +1157,20 @@ def component[Base](base: type[Base], record: Mapping[str, object]
     return member, named[1]
 
 
+def _of_kind(member: Callable[..., Configured], held: tuple[type, ...]) -> bool:
+    """Whether `member` is one of `held`, derives from one, or is a function declared to return one."""
+    if isinstance(member, type):
+        return any(_derives(member, base) for base in held)
+    return callable(member) and any(_returns(member, base) for base in held)
+
+
 def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     """The class or function a record's `class` names, by import path or by
     an alias of any kind, that is one of `held`, derives from one, or is a
     function declared to return one."""
-    def fits(member: Callable[..., Configured]) -> bool:
-        if isinstance(member, type):
-            return any(_derives(member, base) for base in held)
-        return callable(member) and any(_returns(member, base) for base in held)
-
     found = ([imported(name)] if ":" in name else
              [imported(kind.paths[name]) for kind in KINDS if name in kind.paths])
-    fitting = [member for member in found if fits(member)]
+    fitting = [member for member in found if _of_kind(member, held)]
     if len(fitting) == 1:
         return fitting[0]
     wanted = " or ".join(base.__name__ for base in held)
@@ -1165,6 +1182,27 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
         raise ValueError(f"{name!r} names a {wanted} outside Dew, which a record builds only from a "
                          f"trusted package (trust=({package!r},), --trust {package})")
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
+
+
+def _bound(value: object, declared: tuple[Annotation, ...]) -> functools.partial:
+    """A member bound by keyword (`Bound.bound`) from its class record, `{"class": ..., "fields": {...}}`,
+    each field read against the member's own annotation; or the partial given, its arguments as they are.
+    A member the partial's annotation names (`functools.partial[JepaPredictor]`) is one of that class,
+    checked before its arguments are read, a partial given among them; `Any` names none, and any other
+    kind is its record's to check (`Bound._member`)."""
+    held = tuple(each for each in declared if isinstance(each, type) and each is not Any)
+    if isinstance(value, functools.partial):
+        if held and not _of_kind(value.func, held):
+            raise ValueError(f"{value!r} binds no {' or '.join(each.__name__ for each in held)}")
+        return value
+    named = class_record(value) if isinstance(value, Mapping) else None
+    if named is None:
+        raise ValueError(f"a bound member is the record that names it, {{'class': ..., 'fields': {{...}}}}, "
+                         f"not {value!r}")
+    member = _member(named[0], held or (object,))
+    # Read here: a partial a caller calls hands its member the arguments it takes (a config's bound member
+    # holds its records until it is built, `Bound.read`).
+    return _Bound(member, **read_arguments(member, named[1]))
 
 
 def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
@@ -1179,7 +1217,9 @@ def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
 
 def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
     """What `member` builds from a record of its fields (`_taken`), checked as
-    a configured value (`configured`)."""
+    a configured value (`configured`); a bound member's record by its own shape (`Bound.read`)."""
+    if isinstance(member, type) and issubclass(member, Bound):
+        return member.read(fields, dtypes=dtypes)
     built = member(**_taken(member, fields, dtypes=dtypes))
     # A plain class of Dew's or a trusted package's is the value its record
     # describes (`to_record` writes it from its constructor's parameters).
@@ -1259,7 +1299,10 @@ def record_class(member: Callable[..., Configured]) -> type | None:
 
 
 def _construct(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Configured:
-    """Build the dataclass `member` from a record of its fields."""
+    """Build the dataclass `member` from a record of its fields; a bound member's record (`Bound`) by its
+    own shape (`Bound.read`)."""
+    if issubclass(member, Bound):
+        return member.read(fields, dtypes=dtypes)
     return configured(member(**_declared(member, fields, dtypes=dtypes)))
 
 
@@ -1939,31 +1982,51 @@ JsonRecords = Annotated[Mapping[str, JSON], _JSON_OBJECT]
 """Records by name, written as a single JSON string on the command line and
 read back as the records they are (`JSON` entries, `_rebuilt`), never as the
 values they describe: a class's defaults as a run recorded them
-(`Registered.defaults`)."""
+(`Bound.defaults`)."""
+
+
+class _Bound(functools.partial):
+    """A member bound by keyword (`Bound.bound`), equal to another of the same member and arguments, as a
+    record of it is: a run read back equals the run written. Its base unsubscripted, as `Bound`'s kinds'
+    are: tyro reads a field's default's class by its original bases, which Python 3.14 refuses a
+    subscripted one of (`types.get_original_bases`)."""
+
+    def __eq__(self, other) -> bool:
+        # Another bound member alone, which hashes as this one does.
+        return (isinstance(other, _Bound) and (self.func, self.args, self.keywords)
+                == (other.func, other.args, other.keywords))
+
+    def __hash__(self) -> int:
+        return hash(self.func)
 
 
 @dataclasses.dataclass(frozen=True)
-class Registered(ABC):
-    """A registered class, named by an alias or an import path and held as the path, and the arguments a
-    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
-    defaults as it defaulted them when the run was first recorded, so the record builds the same
-    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
-    its stated fields are held as their records (`_recorded`)."""
+class Bound(ABC):
+    """A registered member, a class or the function that builds one, bound to the arguments a run states
+    (`bound`: a `functools.partial` of the member by keyword alone, which a type checker reads against
+    the member's own signature), and `defaults`, every other argument the member defaults as it defaulted
+    them when the run was first recorded, so the record builds the same thing after a default changes
+    (`arguments`). What a caller derives from its data (a vocabulary's size, the model an objective is
+    built around) it passes at `build`. Each kind names its registry (`_member`), which the bound member
+    must be one of, and whether its arguments must be ones a record can carry (`_recorded`).
 
-    name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
+    A record writes it as `{"name": <import path>, "fields": {...}, "defaults": {...}}` and its other
+    settings beside, each by its field (`record`, `read`), the shape every record of it has held, so a run,
+    a checkpoint or a release written before reads as written."""
+
+    bound: functools.partial[Any]
     defaults: JsonRecords = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it, read back as that
+    """Each argument the member defaults and `bound` leaves out, as a record holds it, read back as that
     record (a function's `{"function": ...}`), so a run read back holds the defaults it was written with;
-    one a record lacks, as an argument the class has since gained, takes the class's default now."""
+    one a record lacks, as an argument the member has since gained, takes the member's default now."""
 
     _recorded: ClassVar[bool] = True
     _aliases: ClassVar[Aliases | None] = None
+    """The kind's aliases (`envs`), which name its command line's subcommands (`flagged`); None for a kind
+    no command line chooses."""
     _flags: ClassVar[Mapping[str, Annotation]] = {}
     """A command line's subcommand's flags (`record_flags`), each by its flat annotation (`_flat`); none on
     a record of no subcommand."""
-    """The kind's aliases (`envs`), which name its command line's subcommands (`flagged`); None for a kind
-    no command line chooses."""
 
     @staticmethod
     @abstractmethod
@@ -1972,36 +2035,111 @@ class Registered(ABC):
         function or classmethod that builds one (`envs`)."""
 
     def __post_init__(self) -> None:
-        member = self._member(self.name)
-        object.__setattr__(self, "name", import_path(member))
+        if not isinstance(self.bound, functools.partial):
+            raise TypeError(f"{type(self).__name__} binds its member with functools.partial(Member, ...), "
+                            f"not {self.bound!r}")
+        if self.bound.args:
+            raise TypeError(f"{type(self).__name__} binds its member's arguments by name, which its record, "
+                            f"its command line and an override address them by, not {self.bound.args!r}")
+        member = self._member(import_path(self.bound.func))
+        keywords = dict(self.bound.keywords)
         if self._recorded:
-            object.__setattr__(self, "fields", argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", recorded_defaults(member, self.fields, self.defaults))
+            # Held as their records, as a record writes them, and refused here, by name, rather than where
+            # the run is built or saved: an argument the member does not take, or a value no record can
+            # carry (a lambda). Read, a nested class built, only where the member is built (`arguments`),
+            # so a record that names an environment's renderer opens none of its assets until then.
+            keywords = argument_records(member, keywords)
+        # Held as given otherwise (a model's: a world model's views, named until its environment widens
+        # them, `dew.objectives.rl.run.filled`), read where the member is built.
+        object.__setattr__(self, "bound", _Bound(member, **keywords))
+        object.__setattr__(self, "defaults", recorded_defaults(member, keywords, self.defaults))
 
     @property
     def member(self) -> type | Callable[..., Configured]:
-        """The class, or function, `name` names (`_member`)."""
-        return self._member(self.name)
+        """The class, or function, bound (`_member`), as the kind's table holds it."""
+        return self._member(import_path(self.bound.func))
 
     @property
-    def arguments(self) -> JsonDict:
-        """The arguments the class is built from, before those the caller derives (`built_arguments`)."""
+    def name(self) -> str:
+        """The bound member's import path, which a record writes."""
+        return import_path(self.bound.func)
+
+    @property
+    def fields(self) -> Mapping[str, Configured]:
+        # The arguments the run states as held: records for a kind that holds records (`_recorded`).
+        """The arguments the run states, as the member takes them."""
+        return types.MappingProxyType(self.bound.keywords)
+
+    @property
+    def arguments(self) -> Mapping[str, object]:
+        """The arguments the member is built from, before those the caller derives (`built_arguments`)."""
         return built_arguments(self.member, self.fields, self.defaults)
 
-    def recorded(self) -> Registered:
+    @property
+    def field_records(self) -> dict[str, JSON]:
+        """The arguments the run states, each as a record holds it: what a record compares and writes,
+        beside `defaults`. A recorded kind's as held (`argument_records`, at construction); another's each
+        recorded as given, read against nothing until its member is built (a world model's views named
+        alone, which its environment widens)."""
+        with recording():
+            # Each written as held, against no parameter's annotation, as the record held them before
+            # (`JsonDict`): a recorded kind's records again as they are, and a world model's views named
+            # alone, which its environment widens, no value of the parameter they become.
+            return {name: to_record(value, None) for name, value in self.fields.items()}
+
+    def record(self) -> dict[str, JSON]:
+        """This record as a run's record holds it: the member's import path (`name`), the arguments the
+        run states as records (`fields`), its `defaults`, and each other setting by its field."""
+        settings = {field.name: to_record(vars(self)[field.name], declared_type(type(self), field.name))
+                    for field in dataclasses.fields(self) if field.name not in ("bound", "defaults")}
+        return {"name": self.name, "fields": self.field_records, "defaults": dict(self.defaults), **settings}
+
+    @classmethod
+    def read(cls, record: Mapping[str, object], *, dtypes: bool) -> Self:
+        """The record `record` writes (`record`): the member its `name` names, by an alias or an import
+        path, bound by its `fields`, and its `defaults` and other settings. A field the record lacks takes
+        its default; one the kind does not declare raises."""
+        own = {field.name for field in dataclasses.fields(cls)} - {"bound"}
+        unknown = sorted(set(record) - own - {"name", "fields"})
+        if unknown:
+            raise ValueError(f"{cls.__name__} is the record {{'name': ..., 'fields': {{...}}, 'defaults': "
+                             f"{{...}}}}; unknown fields {unknown}")
+        default = next(field for field in dataclasses.fields(cls) if field.name == "bound").default_factory
+        if "name" in record:
+            member = cls._member(text(record["name"], f"{cls.__name__}.name"))
+        elif default is not dataclasses.MISSING:
+            # A record naming no member is the kind's default one's, as a record of an earlier Dew's was.
+            member = default().func
+        else:
+            raise ValueError(f"{cls.__name__}'s record names no member, and the kind has no default one")
+        fields = _records.record(record.get("fields") or {}, f"{cls.__name__}.fields")
+        settings: dict[str, Any] = {name: _rebuilt(declared_type(cls, name), value, dtypes=dtypes, name=name)
+                                    for name, value in record.items() if name in own}
+        return cls(functools.partial(member, **fields), **settings)
+
+    def with_fields(self, **changed: Configured) -> Self:
+        """This record with `changed` among the arguments it states, over those it stated."""
+        return dataclasses.replace(self, bound=functools.partial(self.member, **{**self.fields, **changed}))
+
+    def without_fields(self, *names: str) -> Self:
+        """This record stating none of `names`, each then the member's default or the caller's."""
+        kept = {name: value for name, value in self.fields.items() if name not in names}
+        return dataclasses.replace(self, bound=functools.partial(self.member, **kept))
+
+    def recorded(self) -> Bound:
         """This record as its kind's own class holds it, where it is a command line's subcommand
-        (`record_flags`): its name, fields, defaults and settings, the flags its fields already hold; itself
-        otherwise. What a run's record writes (`to_record`)."""
+        (`record_flags`): its member, its arguments, its defaults and settings, the flags its arguments
+        already hold; itself otherwise. What a run's record writes (`to_record`)."""
         if "_alias" not in vars(type(self)):
             return self
         base = type(self).__mro__[1]
         return base(**{field.name: vars(self)[field.name] for field in dataclasses.fields(base)})
 
     def flagged(self) -> Self:
-        """This record as its command line's subcommand holds it (`record_flags`, `Aliases.flag_choices`): a
-        field a plain flag holds as that flag, the rest, a record's, kept as they are, its other settings as
-        they are; itself where its kind names no aliases or none names its class (a command line chooses
-        none such), or where it is already such a subcommand's."""
+        """This record as its command line's subcommand holds it (`record_flags`, `Aliases.flag_choices`): an
+        argument a plain flag holds as that flag, the rest kept as they are, its other settings as they
+        are; itself where its kind names no aliases or none names its member (a command line chooses none
+        such), or where it is already such a subcommand's."""
         aliases = self._aliases
         named = {} if aliases is None else {aliases.paths[alias]: alias for alias in reversed(list(aliases))}
         if self.name not in named or "_alias" in vars(type(self)):
@@ -2009,30 +2147,39 @@ class Registered(ABC):
         made = record_flags(type(self), self.member, self.name, named[self.name])
         own = {each.name for each in dataclasses.fields(type(self))}
         held = {name: value for name, value in self.fields.items()
-                if name in made._flags and _fits(json_value(value, name), made._flags[name])}
-        settings = {name: vars(self)[name] for name in own if name not in ("name", "fields")}
+                if name in made._flags and _fits(value, made._flags[name])}
+        settings = {name: vars(self)[name] for name in own if name != "bound"}
         rest = {name: value for name, value in self.fields.items() if name not in held}
-        # Its flags and settings stated over the subcommand's defaults, its `fields` the rest (its
+        # Its flags and settings stated over the subcommand's defaults, `bound` the rest (its
         # `__post_init__` adding the flags set apart from their defaults).
-        return dataclasses.replace(made(self.name, fields=rest), **settings, **held)
+        return made(bound=functools.partial(self.member, **rest), **settings, **held)
+
+
+def _simple_dit() -> functools.partial[nn.Module]:
+    """A model record's default member, the registry's own simple DiT (`models`), bound to nothing: the
+    registry imports no model (`tools/lint_layers.py`), so it names its default by its table."""
+    return functools.partial(models["simple_dit"])
 
 
 @dataclasses.dataclass(frozen=True)
-class ModelConfig(Registered):
-    """A model's class and the fields the run gives it.
+class ModelConfig(Bound):
+    """A model's class bound to the fields the run gives it.
 
-    `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes and matmul precision
-    included (its attention kernel is the run's, `Diagnostics.kernels`, since
-    row 11938), which the command line sets one flag each
-    (`RunConfig.cli`); a recipe fills the ones it derives from its data in
-    `build`. `defaults` holds every other field the class defaults, as it
-    defaulted them when the run was first recorded, so the record builds the
-    same model after a default changes (`arguments`). `wrappers` are the
-    classes the model was wrapped in, in the order they were applied.
+    `bound` is the class, of `dew.registry.models` or any model by its import
+    path, by the keywords the run states: its own fields, its compute and
+    storage dtypes and matmul precision included (its attention kernel is the
+    run's, `Diagnostics.kernels`, since row 11938), which the command line
+    sets one flag each (`RunConfig.cli`); a recipe fills the ones it derives
+    from its data in `build`. `defaults` holds every other field the class
+    defaults, as it defaulted them when the run was first recorded, so the
+    record builds the same model after a default changes (`arguments`).
+    `wrappers` are the classes the model was wrapped in, in the order they
+    were applied.
     """
 
-    name: str = "simple_dit"
+    bound: functools.partial[Any] = dataclasses.field(
+        default_factory=_simple_dit)
+    """The model's class, a Flax module, bound to the fields the run states."""
     wrappers: tuple[Wrapper, ...] = ()
     """What wraps the built model, innermost first, which `build` applies in
     order: a checkpoint's input quantization, a bound LoRA (its factors are
@@ -2058,19 +2205,21 @@ class ModelConfig(Registered):
 
     @classmethod
     def from_model(cls, model) -> Self:
-        """Return the module's class and constructor fields, and each wrapper
-        its class was made in, in the order they were applied."""
+        """Return the module's class bound to its constructor fields, and each wrapper its class was made
+        in, in the order they were applied."""
         model_type, layers = wrapper_layers(type(model))
-        return cls(import_path(model_type), record_fields(model, model_type),
+        return cls(functools.partial(model_type, **record_fields(model, model_type)),
                    wrappers=tuple(layer._dew_wrapper() for layer in reversed(layers)))
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`with_dtype`); None keeps it."""
-        return dataclasses.replace(self, fields=with_dtype(self.name, self.fields, dtype))
+        return dataclasses.replace(
+            self, bound=functools.partial(self.member, **with_dtype(self.name, self.fields, dtype)))
 
     def with_declared(self, field: str, value: str | int) -> Self:
         """This model with `value` in its field `field`, or its parts' (`with_declared`)."""
-        return dataclasses.replace(self, fields=with_declared(self.name, self.fields, field, value))
+        return dataclasses.replace(
+            self, bound=functools.partial(self.member, **with_declared(self.name, self.fields, field, value)))
 
     def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""
@@ -2124,14 +2273,14 @@ def _fits(value: Configured, annotation: Annotation) -> bool:
 
 
 @functools.cache
-def record_flags[R: Registered](record: type[R], member: type | Callable[..., Configured], path: str,
-                 alias: str) -> type[R]:
-    """`member`'s record (`record`, a `Registered` kind's) as a command line sets it (api03): a subclass whose
+def record_flags[R: Bound](record: type[R], member: type | Callable[..., Configured], path: str,
+                           alias: str) -> type[R]:
+    """`member`'s record (`record`, a `Bound` kind's) as a command line sets it (api03): a subclass whose
     own fields are the member's arguments a plain flag sets (`_flat`; one the run builds, an object, takes
     none), each defaulting to the member's default (None where it states none a flag holds, which leaves
-    the member's), the record's `name`, `fields` and `defaults` hidden from the command line and its other
-    settings flags as the record declares them; its `fields` the flags set apart from their defaults, over
-    any it was given. Its `_alias` names the subcommand it is (`implied_subcommand`)."""
+    the member's), the record's `bound` and `defaults` hidden from the command line and its other settings
+    flags as the record declares them; its `bound` the member, by the flags set apart from their defaults
+    over any argument it was given. Its `_alias` names the subcommand it is (`implied_subcommand`)."""
     reserved = {field.name for field in dataclasses.fields(record)} | set(dir(record))
     # Each flag's annotation, `make_dataclass`'s field type, and its flat part (`_flat`), which `flagged`
     # reads a value by.
@@ -2146,15 +2295,14 @@ def record_flags[R: Registered](record: type[R], member: type | Callable[..., Co
         default = declared if held else None
         flats[name], stated_defaults[name] = flat, default
         flags.append((name, flat if held else flat | None, dataclasses.field(default=default)))
-    suppressed = [("name", tyro.conf.Suppress[str], dataclasses.field(default=path)),
-                  ("fields", tyro.conf.Suppress[JsonDict], dataclasses.field(default_factory=dict)),
+    suppressed = [("bound", tyro.conf.Suppress[functools.partial],
+                   dataclasses.field(default_factory=lambda: functools.partial(member))),
                   ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
 
     def __post_init__(self) -> None:
         given = {name: vars(self)[name] for name in stated_defaults
                  if vars(self)[name] != stated_defaults[name]}
-        object.__setattr__(self, "name", path)
-        object.__setattr__(self, "fields", {**self.fields, **given})
+        object.__setattr__(self, "bound", functools.partial(member, **{**self.bound.keywords, **given}))
         record.__post_init__(self)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
@@ -2170,7 +2318,7 @@ def record_flags[R: Registered](record: type[R], member: type | Callable[..., Co
 def implied_subcommand(default: Configured) -> str | None:
     """The subcommand a field's `default` is (`record_flags`'s `_alias`: `env:flight`), which a flag of the
     field given without one implies; None for any other default."""
-    return vars(type(default)).get("_alias") if isinstance(default, Registered) else None
+    return vars(type(default)).get("_alias") if isinstance(default, Bound) else None
 
 
 

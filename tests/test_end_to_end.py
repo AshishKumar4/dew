@@ -42,6 +42,7 @@ from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones import SimpleDiT
+from dew.nn.backbones.unet import Unet
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION
@@ -686,17 +687,19 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     for name in ("tiny_diffusers", "rae"):
         extract_fixture(FIXTURES / f"{name}.tar.xz", tmp_path / name)
     config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
-                                         "mlp_ratio": 1, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=1, emb_features=16,
+                                            num_layers=2, num_heads=2, mlp_ratio=1, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
-        objective=ObjectiveConfig("diffusion", {
-            "alignment": Alignment("dit_block_0", source=str(tmp_path / "rae/dinov2_plain"), width=8,
-                                   resolution=112),
-            "end_to_end": EndToEnd(perceptual_weight=0.0, discriminator_width=8), "solver": Euler(),
-            "guidance": None, "steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective,
+                                                    alignment=Alignment(
+                                                        "dit_block_0",
+                                                        source=str(tmp_path / "rae/dinov2_plain"), width=8,
+                                   resolution=112), end_to_end=EndToEnd(
+                                       perceptual_weight=0.0, discriminator_width=8), solver=Euler(),
+                                       guidance=None, steps=2, ema_decay=None)))
     run = tmp_path / "run"
     task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 32), run, 1e-2)
 
@@ -720,9 +723,11 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     # its weights and running statistics (ledger 2791): its own saved task decodes with them, the weights
     # stored as a storage override asks, the statistics as the run kept them.
     started = replace(config, pretrained=str(run), source=SourceOptions(step="latest"), text=None,
-                      model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)), autoencoder=None,
-                      objective=ObjectiveConfig("diffusion", {
-                          "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+                      model=ModelConfig(functools.partial(Unet,
+                                                          **dict(DEFAULT_MODEL_CONFIG))), autoencoder=None,
+                      objective=ObjectiveConfig(
+                          functools.partial(DiffusionObjective, solver=Euler(), guidance=None,
+                                            steps=2, ema_decay=None)))
     saved_after_one_step(started, lambda task: batch_for(task, 32), tmp_path / "started", 1e-2)
     again = TextToImage.from_run(str(tmp_path / "started"))
     assert isinstance(again.autoencoder, TunedAutoEncoder)

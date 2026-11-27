@@ -6,6 +6,7 @@ block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.pa
 
 import csv
 import dataclasses
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ from dew.config import ModelConfig
 from dew.data import Files, Loading, Phase, Steps, phases
 from dew.decision import Decide, decisions
 from dew.decision.config import DecisionRunConfig, RowBudgets
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-native-tiny"
@@ -65,7 +67,8 @@ LOOP = Loop(STEPS[-1], step_norm=False, layers=(1, 3), implicit=True)
 def run(root: Path, steps, data, loop: Loop = LOOP) -> DecisionRunConfig:
     del root
     return DecisionRunConfig(pretrained=str(QWEN35),
-                             model=ModelConfig("causal_transformer", {"dtype": "float32"}),
+                             model=ModelConfig(
+                                 functools.partial(CausalTransformer, dtype="float32")),
                              rows=RowBudgets(max_len=MAX_LEN),
                              data=data, validation=None, loop=loop, passes=steps)
 

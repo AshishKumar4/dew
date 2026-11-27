@@ -24,6 +24,7 @@ writes a few synthetic images as parquet and trains a tiny model for four
 steps on one CPU device, on the same path. It needs no network.
 """
 
+import functools
 import json
 import time
 from dataclasses import dataclass, replace
@@ -41,6 +42,7 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
+from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
@@ -251,8 +253,9 @@ def main(config: Config) -> Path:
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
     run = RunConfig(
         model=ModelConfig.from_model(model), data=train, validation=test,
-        objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
-                                                      "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
+        objective=ObjectiveConfig(functools.partial(BlockDiffusionObjective,
+                                                    prompt_length=config.prompt_tokens, pad_token_id=PAD,
+                                                    eos_token_ids=(EOS,))),
         optim=OptimConfig(optimizer=AdamW(weight_decay=0.05), clip=1.0, schedule=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 20)),

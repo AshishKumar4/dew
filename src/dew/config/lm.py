@@ -18,6 +18,7 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, NamedTuple
 
@@ -29,7 +30,7 @@ from dew._records import integer, text
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.drawn import WHOLE, drawn_once
-from dew.objectives.lm.objective import Samples
+from dew.objectives.lm.objective import LMObjective, Perplexity, Samples
 from dew.objectives.rl.rollout import Reward
 from dew.optim import AdamW, OptimConfig
 from dew.registry import ModelConfig, imported_argument, objectives
@@ -183,7 +184,8 @@ class LMRunConfig(DecoderRunConfig):
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
                                             "sampling")
 
-    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
+    objective: ObjectiveConfig = dataclasses.field(
+        default_factory=lambda: ObjectiveConfig(functools.partial(LMObjective)))
     """The objective and its arguments: lm, masked_diffusion (MDLM),
     block_diffusion (the official DiffusionGemma fine-tuning objective), or
     any objective by its import path that `LMObjective`'s arguments build:
@@ -192,7 +194,8 @@ class LMRunConfig(DecoderRunConfig):
     (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
     objective it is."""
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
-    model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
+    model: ModelConfig = dataclasses.field(
+        default_factory=DecoderRunConfig.transformer_model)
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
@@ -268,13 +271,14 @@ class LMRunConfig(DecoderRunConfig):
             table = max(vocab_size, mask + 1) if isinstance(mask, int) else vocab_size
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
             model = self.model.build(max_seq_len=context, vocab_size=table, **self.numerics_fields())
+            # The run records the model it built, the widths its data derived among its fields.
+            run = dataclasses.replace(run, model=self.model.with_fields(max_seq_len=context,
+                                                                         vocab_size=table))
         else:
             source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
             # Its fields name the mask id a masked objective reads, which a loop leaves as loaded.
             model, fields = source.model, dict(source.model_config)
-        if source is None:
-            run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
         variables = None if source is None else source.variables
         if self.lora is not None:
             if source is None:
@@ -311,7 +315,7 @@ class LMRunConfig(DecoderRunConfig):
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """Perplexity, where the run evaluates a validation split it holds."""
-        return (MetricConfig("perplexity"),) if validates else ()
+        return (MetricConfig(functools.partial(Perplexity)),) if validates else ()
 
     def tokens(self) -> Tokens:
         """The token windows this run trains on, as its chain states them (`Dataset.facts`): their

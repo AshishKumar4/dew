@@ -4,6 +4,7 @@ were applied (`ModelConfig.wrappers`), and its public loader rebuilds the same
 model: the same wrappers, in the same order, computing what the run computed."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import jax
@@ -113,7 +114,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
         fields = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
                   "mlp_features": 32, "max_seq_len": 16}
         config = config or LMRunConfig(
-            model=ModelConfig("causal_transformer", fields),
+            model=ModelConfig(functools.partial(CausalTransformer, **fields)),
             trainer=TrainerConfig(checkpoint_dir=str(directory), steps=steps,
                                   eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                                   quantization=Quantization()))

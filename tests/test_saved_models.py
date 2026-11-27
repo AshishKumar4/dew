@@ -3,6 +3,7 @@ control policy and a DreamerV3 agent, objectives with no inference task of their
 their run's record states and load back as the model and weights the run trained, where their checkpoints
 recorded no declaration and `SavedRun.at` refused them."""
 
+import functools
 from pathlib import Path
 
 import jax
@@ -14,6 +15,7 @@ from recording import bits
 from run_kinds import jepa, trained
 from test_env_runs import TEACHER, student, teacher_run
 
+from dew import registry
 from dew.checkpoints import Checkpoints
 from dew.config.release import Release
 from dew.inference.loading import pipeline
@@ -155,7 +157,8 @@ def test_a_native_release_is_cast_a_leaf_at_a_time_as_it_is_placed(tmp_path):
     from dew.registry import ModelConfig
 
     wide = {"policy_layers": [512] * 6, "value_layers": [512] * 6}
-    run = replace(teacher_run(tmp_path), model=ModelConfig(ACTOR_CRITIC, wide))
+    run = replace(
+        teacher_run(tmp_path), model=ModelConfig(functools.partial(registry.models[ACTOR_CRITIC], **wide)))
     run.prepare().train("teacher")
     export_run(SavedRun.pinned(str(tmp_path / "teacher")), tmp_path / "policy", ema=False)
 

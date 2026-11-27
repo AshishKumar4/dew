@@ -1190,8 +1190,10 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
               "layer_types": ["local"], "kinds": {"local": {"window": window}}}
     chain = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=seq, batch=8, pack=None)
     default = LMRunConfig(data=chain.loading(Loading(workers=0)),
-                          model=ModelConfig("causal_transformer", fields),
-                          objective=ObjectiveConfig("lm", {"prefix": prefix}), max_new_tokens=0)
+                          model=ModelConfig(functools.partial(CausalTransformer,
+                                                              **fields)),
+                          objective=ObjectiveConfig(
+                              functools.partial(LMObjective, prefix=prefix)), max_new_tokens=0)
     LMRunConfig.cli(["--trainer.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
                      str(tmp_path / "runs"), "--trainer.compilation-cache-dir", "None",
                      "--trainer.multi-host", "False", "--trainer.log-every", "1", "--trainer.eval-every",

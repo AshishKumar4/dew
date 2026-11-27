@@ -20,6 +20,7 @@ them on one CPU device:
     JAX_PLATFORMS=cpu python examples/train_flowers_tpu.py --smoke --out /tmp/flowers-smoke
 """
 
+import functools
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -38,8 +39,11 @@ from dew.data import TFDS, Files, Loading, images, presets
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.distributed import collective_host
+from dew.eval.fid import FID
+from dew.eval.images import CLIPScore
 from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
 from dew.sampling import CFG
@@ -113,11 +117,13 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         data=train.shuffle(seed=0).repeat().pipe(presets.images, 16, batch=4).loading(loading),
         validation=held.pipe(presets.images, 16, batch=4).loading(loading),
         preset=EDM(regime="pixel"),
-        objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
-                                                "ema_decay": 0.9}),
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Heun(),
+                                                    guidance=CFG(2.0), steps=2, ema_decay=0.9)),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
-                     MetricConfig("clip_score", {"modelname": config.clip_model})),
+        val_metrics=(MetricConfig(functools.partial(FID,
+                                                    weights=config.inception_weights)),
+                     MetricConfig(functools.partial(CLIPScore,
+                                                    modelname=config.clip_model))),
         optim=OptimConfig(lr=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=3, log_every=1,
                               eval_every=3, checkpoint_every=3, mesh=MeshSpec(fsdp=1), multi_host=False,
@@ -141,11 +147,14 @@ def slice_config(config: Config) -> DiffusionRunConfig:
                                                  augment=True, caption=caption),
         validation=held.pipe(presets.images, config.image_size, batch=config.batch_size, caption=caption),
         preset=EDM(regime="pixel"),
-        objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(config.guidance),
-                                                "steps": config.sampling_steps, "ema_decay": 0.9999}),
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Heun(),
+                                                    guidance=CFG(config.guidance),
+                                                    steps=config.sampling_steps, ema_decay=0.9999)),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
-                     MetricConfig("clip_score", {"modelname": config.clip_model})),
+        val_metrics=(MetricConfig(functools.partial(FID,
+                                                    weights=config.inception_weights)),
+                     MetricConfig(functools.partial(CLIPScore,
+                                                    modelname=config.clip_model))),
         optim=OptimConfig(optimizer=AdamW(weight_decay=0.01), schedule=Cosine(
             peak_value=config.learning_rate, warmup_steps=2000, init_value=config.learning_rate,
             end_value=2e-4)),

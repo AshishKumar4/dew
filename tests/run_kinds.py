@@ -4,6 +4,7 @@ is set from, and the `dew train` step that trains one (`trained_by_cli`)."""
 
 import csv
 import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -32,6 +33,12 @@ from dew.decision.config import CrossContext, DecisionRunConfig, Letters, RowBud
 from dew.decision.layout import Labels, QuestionSegment, built_in, per_question
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
+from dew.nn.backbones.unet import Unet
+from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Layout, LocalTracker, MeshSpec
@@ -96,7 +103,7 @@ def lm(root: Path, drawn: bool, *, rows: str = "windows", reading: str = "memory
         return read(chain.batch(8), reading)
     fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
               **({} if dtype is None else {"dtype": dtype})}
-    return LMRunConfig(model=ModelConfig("causal_transformer", fields),
+    return LMRunConfig(model=ModelConfig(functools.partial(CausalTransformer, **fields)),
                        data=windows(corpus.train, drawn=drawn), validation=windows(corpus.val, drawn=False))
 
 
@@ -116,8 +123,9 @@ def decision(root: Path, drawn: bool) -> RunConfig:
         chain = rows.pipe(decisions, question="team").read("memory")
         kept = chain.random_filter_map(MostlyKept()) if drawn else chain
         return kept.batch(8).loading(Loading(workers=0))
-    return DecisionRunConfig(pretrained=str(TINY_LAYA), model=ModelConfig("causal_transformer",
-                                                                          {"dtype": "float32"}),
+    return DecisionRunConfig(pretrained=str(TINY_LAYA),
+                             model=ModelConfig(
+                                 functools.partial(CausalTransformer, dtype="float32")),
                              data=asked(train, drawn=drawn), validation=asked(held, drawn=False))
 
 
@@ -135,12 +143,13 @@ def diffusion(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                         "num_heads": 2}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2)),
         data=captioned(train, 4, drawn=drawn), validation=captioned(held, 4, drawn=False), preset=Flow(),
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    steps=2)))
 
 
 def published(root: Path, drawn: bool) -> RunConfig:
@@ -154,9 +163,10 @@ def published(root: Path, drawn: bool) -> RunConfig:
     train, held = pictures()
     return DiffusionRunConfig(
         pretrained=str(pipeline), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
+        model=ModelConfig(
+            functools.partial(Unet, **{**DEFAULT_MODEL_CONFIG, "dtype": "float32"})),
         data=captioned(train, 32, drawn=drawn), validation=captioned(held, 32, drawn=False), val_metrics=(),
-        objective=ObjectiveConfig("diffusion", {"steps": 2}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, steps=2)))
 
 
 def jepa(root: Path, drawn: bool) -> RunConfig:
@@ -166,9 +176,9 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
     def patched(rows, *, drawn: bool):
         return read(rows.pipe(presets.images, 16, batch=8, augment=Dimmed() if drawn else False))
     return JepaRunConfig(
-        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32"}),
-        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        model=ModelConfig(functools.partial(JepaEncoder, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, mlp_ratio=2, dtype="float32")),
+        predictor=functools.partial(JepaPredictor, num_layers=1, predictor_features=8), num_target_blocks=2,
         data=patched(train, drawn=drawn), validation=patched(held, drawn=False))
 
 
@@ -208,8 +218,13 @@ def masked(root: Path, drawn: bool) -> RunConfig:
     """`lm`'s run as a masked-diffusion one, its model bidirectional with a mask id, which previews
     nothing."""
     run = lm(root, drawn)
-    model = ModelConfig("causal_transformer", {**run.model.fields, "causal": False, "mask_token_id": 0})
-    return dataclasses.replace(run, objective=ObjectiveConfig("masked_diffusion"), model=model,
+    model = ModelConfig(
+        functools.partial(
+            registry.models["causal_transformer"], **{**run.model.fields, "causal": False,
+                                                      "mask_token_id": 0}))
+    return dataclasses.replace(run,
+                               objective=ObjectiveConfig(functools.partial(
+                                   registry.objectives["masked_diffusion"])), model=model,
                                max_new_tokens=0)
 
 
@@ -224,10 +239,10 @@ def dreamed(root: Path, drawn: bool, release: str = "dream") -> RunConfig:
                                 tokenizer=str(source), vocab_size=128, eos_id=1)
     data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32"})
+    model = ModelConfig(functools.partial(CausalTransformer, dtype="float32"))
     return dataclasses.replace(lm(root, drawn), data=data, validation=None, pretrained=str(source),
                                tokenizer=str(source), model=model, max_new_tokens=0,
-                               objective=ObjectiveConfig("masked_diffusion"))
+                               objective=ObjectiveConfig(functools.partial(MaskedDiffusionObjective)))
 
 
 def prefixed(root: Path, drawn: bool) -> RunConfig:
@@ -240,8 +255,9 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
     run = lm(root, drawn)
     kinds = {"blocks": LayerKind(mixer=AttentionMixer(bidirectional_blocks=True))}
     record = registry.to_record(kinds, typing.get_type_hints(CausalTransformer)["kinds"])
-    return dataclasses.replace(run, model=ModelConfig("causal_transformer", {
-        **run.model.fields, "num_layers": 2, "layer_types": ["blocks", "blocks"], "kinds": record}))
+    return dataclasses.replace(
+        run, model=ModelConfig(functools.partial(CausalTransformer, **{
+        **run.model.fields, "num_layers": 2, "layer_types": ["blocks", "blocks"], "kinds": record})))
 
 
 def state_then_question() -> tuple[QuestionSegment, ...]:
@@ -308,10 +324,11 @@ def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA), toke
                                 tokenizer=release, vocab_size=32, eos_id=1)
     spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32"})
+    model = ModelConfig(functools.partial(CausalTransformer, dtype="float32"))
     return dataclasses.replace(lm(root, drawn), pretrained=release, tokenizer=release, model=model,
                                data=spans, validation=None,
-                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
+                               objective=ObjectiveConfig(functools.partial(
+                                   registry.objectives["block_diffusion"], prompt_length=4)),
                                max_new_tokens=0)
 
 
@@ -346,13 +363,13 @@ def stated[R: RunConfig](run: R, *, model: str | None = None,
     """`run` with its model of the class `model` names (its own where None) and `model_fields` over its
     fields, and its objective alike, each field as its record holds it: what a run file states of what the
     run trains."""
-    held = run.model if model is None else ModelConfig(model)
-    goal = run.objective if objective is None else ObjectiveConfig(objective)
+    held = run.model if model is None else ModelConfig(functools.partial(registry.models[model]))
+    goal = run.objective if objective is None else ObjectiveConfig(functools.partial(
+        registry.objectives[objective]))
     assert goal is not None or not objective_fields, "a run of no objective takes none of its fields"
     return dataclasses.replace(
-        run, model=dataclasses.replace(held, fields={**held.fields, **model_fields}),
-        objective=None if goal is None else dataclasses.replace(goal,
-                                                                fields={**goal.fields, **objective_fields}))
+        run, model=held.with_fields(**model_fields),
+        objective=None if goal is None else goal.with_fields(**objective_fields))
 
 
 def settled(settings: Mapping[str, object]) -> dict[str, object]:

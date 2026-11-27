@@ -16,12 +16,14 @@ from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
 
 CELLS = ['''
+import functools
 import json
 from pathlib import Path
 
 from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Files, presets
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 rows = Path("play.jsonl")
@@ -29,8 +31,8 @@ rows.write_text("".join(json.dumps({"text": "to be or not to be, that is the que
                         for _ in range(40)))
 train, held = Files(str(rows), format="jsonl").holdout(records=4)
 run = LMRunConfig(
-    model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                             "max_seq_len": 48, "dtype": "float32"}),
+    model=ModelConfig(functools.partial(CausalTransformer, emb_features=16, num_layers=1, num_heads=2,
+                                        max_seq_len=48, dtype="float32")),
     data=train.repeat().pipe(presets.lm, "byte", seq_len=32, batch=4, pack=None),
     validation=held.pipe(presets.lm, "byte", seq_len=32, batch=4, pack=None),
     trainer=TrainerConfig(name="notebook", checkpoint_dir=str(Path("checkpoints").resolve()),

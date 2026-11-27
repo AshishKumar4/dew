@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import os
 import typing
@@ -11,10 +12,14 @@ from typing import TYPE_CHECKING
 import pytest
 from flax import linen as nn
 
+from dew import registry
 from dew._records import JSON
 from dew.config import ObjectiveConfig
 from dew.inputs import Field, InputSpec
 from dew.nn import activations
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.jepa import JepaPredictor
+from dew.objectives.supervised import Supervised
 from dew.registry import Aliases, from_record
 
 if TYPE_CHECKING:
@@ -104,7 +109,8 @@ def test_a_dataclass_members_field_rebuilds_through_a_function_member():
 
 
 def supervised(loss: dict) -> ObjectiveConfig:
-    return ObjectiveConfig("supervised", {"loss": loss, "inputs": InputSpec(Field("x", (3,)))})
+    return ObjectiveConfig(functools.partial(Supervised, loss=loss,
+                                             inputs=InputSpec(Field("x", (3,)))))
 
 
 def test_a_model_records_wrappers_round_trip_by_their_class_and_refuse_what_wraps_nothing():
@@ -115,11 +121,11 @@ def test_a_model_records_wrappers_round_trip_by_their_class_and_refuse_what_wrap
     from dew.registry import ModelConfig, to_record
 
     quantized = InputQuantization(format="modelopt", sites=(("lm_head", "fp8"),))
-    wrapped = ModelConfig("simple_dit", wrappers=(quantized,))
+    wrapped = ModelConfig(functools.partial(SimpleDiT), wrappers=(quantized,))
     rebuilt = ModelConfig.from_dict(to_record(wrapped, ModelConfig))
     assert rebuilt == wrapped and type(rebuilt.wrappers[0]) is InputQuantization
     with pytest.raises(TypeError):
-        ModelConfig("simple_dit", wrappers=(Field("image", (4, 4, 3)),))
+        ModelConfig(functools.partial(SimpleDiT), wrappers=(Field("image", (4, 4, 3)),))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -309,12 +315,12 @@ class Defaulted(nn.Module):
 
 
 def test_a_configs_defaults_read_back_as_the_records_it_wrote():
-    """A model config's defaults (`Registered.defaults`) are records, and read back as those records
+    """A model config's defaults (`Bound.defaults`) are records, and read back as those records
     (`JsonRecords`): written and read, or replaced, the config is the one it was, a function's default its
     `{"function": ...}`, never the value it names."""
     from dew.registry import ModelConfig, to_record
 
-    config = ModelConfig(f"{__name__}:Defaulted")
+    config = ModelConfig(functools.partial(registry.models[f"{__name__}:Defaulted"]))
     assert config.defaults["activation"] == {"function": "dew.nn.activations:silu"}
     assert ModelConfig.from_dict(json.loads(json.dumps(to_record(config, ModelConfig)))) == config
     assert dataclasses.replace(config) == config
@@ -524,3 +530,108 @@ def test_an_unnamed_record_of_a_union_naming_a_class_twice_builds_it_once():
     unnamed record of its fields builds it, where two trials of the one class read as two that fit it (the
     review of API02b)."""
     assert from_record(Overlapping, {"either": {"fraction": 0.5}}).either == Halt(0.5)
+
+
+def test_a_bound_member_reads_back_as_its_annotation_admits():
+    """A member bound by keyword (`functools.partial`) reads back from its class record as the partial it
+    was: under `functools.partial[Any]` and the bare partial whatever its class, under a class's partial only
+    as a binding of that class, a built partial and its record alike (row 12896)."""
+    import functools
+    from typing import Any
+
+    from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
+    from dew.registry import from_record, to_record
+
+    bound = functools.partial(JepaPredictor, num_layers=1, predictor_features=8)
+    record = to_record(bound, functools.partial[JepaPredictor])
+    for annotation in (functools.partial[Any], functools.partial, functools.partial[JepaPredictor]):
+        again = from_record(annotation, record)
+        assert isinstance(again, functools.partial)
+        assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 1, "predictor_features": 8})
+    other = functools.partial(JepaEncoder, num_layers=1)
+    for given in (other, to_record(other, functools.partial)):
+        with pytest.raises(ValueError):
+            from_record(functools.partial[JepaPredictor], given)
+    # A factory declared to return the class binds it too, given and as its record alike.
+    from model_support import decoder
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    made = functools.partial(decoder, kind="attention")
+    for given in (made, to_record(made, functools.partial)):
+        read = from_record(functools.partial[CausalTransformer], given)
+        assert isinstance(read, functools.partial) and read.func is decoder
+
+
+USER_ENVS = """
+import dataclasses
+from typing import ClassVar
+
+
+@dataclasses.dataclass(frozen=True)
+class Opened:
+    assets: str = "scene"
+    built: ClassVar[list[str]] = []
+
+    def __post_init__(self):
+        self.built.append(self.assets)
+
+
+@dataclasses.dataclass(frozen=True)
+class Simulated:
+    renderer: Opened
+"""
+
+
+def test_a_bound_record_holds_its_arguments_until_its_member_is_built(tmp_path):
+    """A bound member holds its arguments as given until it is built (row 12896, train 1412's review): a
+    model's views named by their entries alone, which its environment widens, held as named; and a record
+    naming a part of a recorded kind (a trusted package's environment's renderer, one that opens assets)
+    builds none of it, the record saved again as read, until the environment is built."""
+    from dew.objectives.rl.dreamer import WorldModel
+    from dew.registry import ModelConfig
+
+    named = ModelConfig(functools.partial(WorldModel, reads="image")).with_fields(auxiliary=[["state", 256]])
+    assert named.fields["auxiliary"] == [["state", 256]]
+    (tmp_path / "users_envs.py").write_text(USER_ENVS)
+    report = json.loads(_ran(tmp_path, """
+import json
+from dew.config.env import EnvConfig
+from dew.registry import from_record, import_trusted, to_record
+import_trusted(None, ("users_envs",))
+import users_envs
+renderer = {"class": "users_envs:Opened", "fields": {"assets": "track"}}
+record = {"name": "users_envs:Simulated", "fields": {"renderer": renderer}}
+env = from_record(EnvConfig, record)
+read = list(users_envs.Opened.built)
+written = to_record(env, EnvConfig)
+built = env.build()
+print(json.dumps({"read": read, "same": written["fields"] == record["fields"],
+                  "built": built.renderer.assets, "opened": users_envs.Opened.built}))
+"""))
+    assert report == {"read": [], "same": True, "built": "track", "opened": ["track"]}, report
+
+
+def test_a_record_naming_no_member_is_its_kinds_default_ones():
+    """A record of a kind with a default member that names none, as an earlier Dew's could, binds that
+    default (row 12896, train 1412's review): a model's the simple DiT, a rollout's Dreamer's."""
+    from dew.config.env import RolloutConfig
+    from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.registry import ModelConfig
+
+    model = ModelConfig.from_dict({"fields": {"patch_size": 2}})
+    assert (model.member, dict(model.fields)) == (SimpleDiT, {"patch_size": 2})
+    assert from_record(RolloutConfig, {"fields": {"batch": 4}}).member is DreamerRollout
+
+
+type _Predictor = functools.partial[JepaPredictor]
+
+
+def test_a_bound_member_reads_back_through_its_alias():
+    """A partial named by a type alias reads back as the partial it names (train 1412's review)."""
+    from dew.registry import to_record
+
+    bound = functools.partial(JepaPredictor, num_layers=4)
+    again = from_record(_Predictor, to_record(bound, _Predictor))
+    assert isinstance(again, functools.partial)
+    assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 4})

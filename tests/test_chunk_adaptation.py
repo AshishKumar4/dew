@@ -1526,10 +1526,10 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
 
     adaptation = ChunkAdaptation(window=3, rate=0.5, damped=True)
     config = LMRunConfig(
-        model=ModelConfig("causal_transformer", {
-            "vocab_size": VOCAB, "emb_features": FEATURES, "num_layers": 1, "num_heads": 2, "head_dim": 4,
-            "mlp_features": 16, "max_seq_len": 32, "continuum": LEVEL}),
-        objective=ObjectiveConfig("lm", {"adaptation": adaptation}))
+        model=ModelConfig(functools.partial(CausalTransformer, vocab_size=VOCAB,
+                                            emb_features=FEATURES, num_layers=1, num_heads=2, head_dim=4,
+                                            mlp_features=16, max_seq_len=32, continuum=LEVEL)),
+        objective=ObjectiveConfig(functools.partial(LMObjective, adaptation=adaptation)))
     read = RunConfig.read(json.loads(json.dumps(config.record())))
     assert read.record() == config.record()
     objective = read.objective.build(model=read.model.build(), seq_len=LENGTH)

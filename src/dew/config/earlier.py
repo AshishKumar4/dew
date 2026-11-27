@@ -36,11 +36,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
     rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`), and its rows' budgets
     and context layers as the records that hold them (`earlier_decision_rows`, row 11937); an LM run's
-    rollout's reward named by its import path as that path's record (`earlier_reward`); a world model's
-    tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
-    `earlier_dynamics_positions`); a trainer layout recorded at `Layout()`'s defaults as unset
-    (`earlier_trainer_layout`); its data plan version
-    as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
+    rollout's reward named by its import path as that path's record (`earlier_reward`); a JEPA run's
+    predictor's arguments as the `JepaPredictor` they bind (`earlier_jepa_predictor`, row 12896); a world
+    model's tokenizer's and its dynamics model's positions as they learned them
+    (`earlier_tokenizer_positions`, `earlier_dynamics_positions`); a trainer layout recorded at
+    `Layout()`'s defaults as unset (`earlier_trainer_layout`); its data plan version as the one it read by
+    (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`); an encoder or conditioner by the import path it
     has now (`dew._records.moved_paths`, row 5996); a decision layout of a class it was before by the
     segment layout it is now, wherever the record holds it (`dew._records.earlier_layout`, row 6140); a
@@ -65,7 +66,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     # A decision run's budgets and context layers by the records they are held in now, and an LM run's
     # reward by the record of what its import path names (row 11937).
-    earlier = earlier_reward(earlier_decision_rows(earlier))
+    earlier = earlier_jepa_predictor(earlier_reward(earlier_decision_rows(earlier)))
     earlier = earlier_newton_schulz(earlier_retired(earlier_packed_experts(earlier), additive_unset=additive))
     # Its optimizer's and trainer's settings by the names a run's surface gives them now (`earlier_surface`).
     earlier = earlier_surface(earlier)
@@ -1084,3 +1085,26 @@ def earlier_reward(record: Mapping[str, object]) -> Mapping[str, object]:
     restated = {**held, "reward": {"function": held["reward"]}}
     rollout = {**rollout, "fields": restated} if classed else restated
     return {**record, "fields": {**named[1], "rollout": rollout}}
+
+
+def earlier_jepa_predictor(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved JEPA run's record whose `predictor` held its arguments alone, a mapping of them (a
+    `JsonDict` before row 12896): the class record of the `JepaPredictor` they bind, which reads as it
+    (`functools.partial`'s record, `dew.registry.to_record`). Carried to 1.0 (ledger 1552)."""
+    named = registry.class_record(record)
+    predictor = None if named is None else named[1].get("predictor")
+    if (named is None or not isinstance(predictor, Mapping) or "class" in predictor
+            or named[0] not in registry.runs):
+        return record
+    from dew.config.jepa import JepaRunConfig
+
+    run_class = registry.runs[named[0]]
+    if not (isinstance(run_class, type) and issubclass(run_class, JepaRunConfig)):
+        return record
+    # The arguments the run derived over whatever the dict stated (its grid, factorization, scan order and
+    # dtype), which a bound predictor states none of, left out.
+    from dew.config.jepa import DERIVED_PREDICTOR
+
+    stated = {name: value for name, value in predictor.items() if name not in DERIVED_PREDICTOR}
+    bound = {"class": "dew.nn.backbones.jepa:JepaPredictor", "fields": stated}
+    return {**record, "fields": {**named[1], "predictor": bound}}

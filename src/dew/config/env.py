@@ -13,9 +13,10 @@ handed a loader of empty rows (`idle`).
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Callable, Mapping
-from typing import Annotated, ClassVar, Self
+from typing import Annotated, Any, ClassVar, Self
 
 import jax
 import numpy as np
@@ -28,7 +29,7 @@ from dew.data.dataset import Loader, replayed
 from dew.nn.sharding import abstract
 from dew.objectives.base import Shown
 from dew.objectives.rl.control import ControlPPOObjective
-from dew.objectives.rl.dreamer import DreamerV3Objective
+from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.run import (
     Agent,
     Environment,
@@ -44,9 +45,9 @@ from dew.objectives.rl.run import (
     taught,
 )
 from dew.registry import (
+    Bound,
     Configured,
     ModelConfig,
-    Registered,
     declared_type,
     envs,
     models,
@@ -63,19 +64,20 @@ _BUILT = ("objective", "env", "replay", "teacher", "demonstrator")
 
 
 @dataclasses.dataclass(frozen=True)
-class EnvConfig(Registered):
-    """An environment's class and the arguments the run gives it, and how the run wraps it.
+class EnvConfig(Bound):
+    """An environment's class bound to the arguments the run gives it, and how the run wraps it.
 
-    `name` is an alias of `dew.registry.envs` or an import path, held as the path: a JAX `Env` class, a host
-    `Simulator` class, or a function or classmethod that returns one (`Playground.load`). `fields` are its
-    arguments as given, a nested value as its record (a race's `Racing`, a `GateRace`'s renderer as `{"class":
-    ..., "fields": ...}`), set one at a time by `RunConfig.override({"env.<argument>": ...})`; `defaults`
-    holds every other argument the class defaults, as a model's are held. An `Env` of one environment is
+    `bound` is a JAX `Env` class, a host `Simulator` class, or a function or classmethod that returns one
+    (`Playground.load`), of `dew.registry.envs` or by its import path, by the arguments the run states, each
+    as the member takes it (a race's `Racing`, a `GateRace`'s renderer), set one at a time by
+    `RunConfig.override({"env.<argument>": ...})`; `defaults` holds every other argument the class
+    defaults, as a model's are held. An `Env` of one environment is
     wrapped as `dew.rl.playground.playground` wraps one: each episode cut after `episode_length` steps of
     `action_repeat` repeats where that is set (`TimeLimit`), then `count` of them stepped together
     (`Batched`). A `Simulator` is a batch of its own, and takes neither."""
 
-    name: str
+    bound: functools.partial[Any]
+    """The environment's class, or the function that makes it, bound to the arguments the run states."""
     count: int | None = None
     episode_length: int | None = None
     action_repeat: int = 1
@@ -94,16 +96,16 @@ class EnvConfig(Registered):
 
 
 @dataclasses.dataclass(frozen=True)
-class RolloutConfig(Registered):
-    """The rollout that collects the run's batches (`dew.training.rollout.Rollout`): `name` an alias of
-    `dew.registry.rollouts` (`dreamer`, `control`) or an import path, held as the path, and `fields` the
-    settings the run gives it, as records: a `DreamerRollout`'s `batch`, `length`, `train_ratio`,
-    `prefill`, `capacity` and `checkpointed_replay`, a `ControlRollout`'s `unroll_length`, `unrolls`,
-    `epochs` and `minibatches`. `defaults` holds the class's others as recorded. The run builds the rest,
-    the objective, the environment and its teacher (`_BUILT`); a `train_ratio` of `inf` trains on the
-    prefill alone."""
+class RolloutConfig(Bound):
+    """The rollout that collects the run's batches (`dew.training.rollout.Rollout`): `bound` a rollout class
+    of `dew.registry.rollouts` (`dreamer`, `control`) or by its import path, by the settings the run gives
+    it: a `DreamerRollout`'s `batch`, `length`, `train_ratio`, `prefill`, `capacity` and
+    `checkpointed_replay`, a `ControlRollout`'s `unroll_length`, `unrolls`, `epochs` and `minibatches`.
+    `defaults` holds the class's others as recorded. The run builds the rest, the objective, the
+    environment and its teacher (`_BUILT`); a `train_ratio` of `inf` trains on the prefill alone."""
 
-    name: str = "dreamer"
+    bound: functools.partial[Any] = dataclasses.field(
+        default_factory=lambda: functools.partial(DreamerRollout))
 
     _aliases: ClassVar = rollouts
 
@@ -199,15 +201,15 @@ class EnvRunConfig(RunConfig):
     BUILT: ClassVar[tuple[str, ...]] = (*RunConfig.BUILT, "teacher.step")
 
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("dew.objectives.rl.dreamer:WorldModel"))
+        default_factory=lambda: ModelConfig(functools.partial(WorldModel)))
     """The agent's networks. The run derives from its environment each width the class declares: its
     `action_size`, and a world model's `observation_size` and `image` from the view it `reads`; a record
     that states one is refused. A run that starts from a saved run trains that run's model, and names none."""
     objective: ObjectiveConfig = dataclasses.field(
-        default_factory=lambda: ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective"))
-    """The agent's objective and its arguments (`ObjectiveConfig(..., {"imitation": 1, "imitates":
-    "label"})`); a `ControlPPOObjective`'s `observation_size` is derived, the width of the views it
-    `reads`."""
+        default_factory=lambda: ObjectiveConfig(functools.partial(DreamerV3Objective)))
+    """The agent's objective and its arguments (`ObjectiveConfig(functools.partial(DreamerV3Objective,
+    imitation=1, imitates="label"))`); a `ControlPPOObjective`'s `observation_size` is derived, the width of
+    the views it `reads`."""
     trainer: TrainerConfig = dataclasses.field(
         default_factory=lambda: TrainerConfig(eval_every=None, checkpoint_every=None))
     env: EnvChoice | None = None
@@ -257,12 +259,18 @@ class EnvRunConfig(RunConfig):
         Variables that do not fit the agent are refused."""
         model = self.trained_model()
         observation = observed(env)
-        model = dataclasses.replace(model, fields={**model.fields, **filled(observation, model.fields)})
+        entries = filled(observation, model.field_records)
+        changed: dict[str, Configured] = {}
+        if "proprio" in entries:
+            changed["proprio"] = entries["proprio"]
+        if "auxiliary" in entries:
+            changed["auxiliary"] = entries["auxiliary"]
+        model = model.with_fields(**changed)
         declared = {field.name for field in dataclasses.fields(models[model.name])}
         derived: dict[str, Configured] = {"action_size": env.action_size}
         if declared & {"observation_size", "image"}:
             # A world model's encoder reads a vector of `observation_size`, or an image of its shape.
-            shape = seen(observation, reads({**model.defaults, **model.fields}))
+            shape = seen(observation, reads({**model.defaults, **model.field_records}))
             derived |= {"observation_size": shape[0] if len(shape) == 1 else 0,
                         "image": shape if len(shape) == 3 else None}
         derived = {name: value for name, value in derived.items() if name in declared}
@@ -272,7 +280,7 @@ class EnvRunConfig(RunConfig):
         built = dataclasses.replace(self, model=model).numerics_fields()
         widths = {}
         if "observation_size" in parameters(self.objective.member)[0]:
-            read = seen(observation, reads({**self.objective.defaults, **self.objective.fields}))
+            read = seen(observation, reads({**self.objective.defaults, **self.objective.field_records}))
             if len(read) != 1:
                 raise ValueError(f"{self.objective.name} reads a flat observation, and its views are {read}")
             widths["observation_size"] = read[0]

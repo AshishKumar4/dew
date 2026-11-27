@@ -4,6 +4,7 @@ answer read from its own context."""
 
 import copy
 import dataclasses
+import functools
 import itertools
 from collections.abc import Sequence
 from pathlib import Path
@@ -31,6 +32,7 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.inputs import CharTable
 from dew.interop import Pretrained
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
 from dew.training import Trainer, TrainerAdvanced
@@ -891,7 +893,8 @@ def test_a_runs_configured_context_encoder_computes_in_its_dtype_and_reads_text(
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
     context = CrossContext(layers=(0,), length=32, text=text)
     run = dataclasses.replace(decision(tmp_path, drawn=False), context=context, calibrate=False,
-                              model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
+                              model=ModelConfig(
+                                  functools.partial(CausalTransformer, dtype="bfloat16")))
     objective = run.prepare().objective
     assert jnp.dtype(objective.model.context.encoder.dtype) == jnp.dtype("bfloat16")
     state, _ = trained(run, tmp_path, "clip", trainer={"checkpoint_final": True})

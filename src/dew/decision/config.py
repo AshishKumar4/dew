@@ -19,6 +19,7 @@ held-out answers and a bucket's 2000, Laya's floors.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
@@ -59,15 +60,7 @@ from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, SharedCrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import (
-    ModelConfig,
-    class_record,
-    dtype_name,
-    encoders,
-    from_record,
-    import_path,
-    record_argument,
-)
+from dew.registry import ModelConfig, class_record, dtype_name, encoders, from_record, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:
@@ -258,12 +251,14 @@ class DecisionRunConfig(DecoderRunConfig):
     BUILT: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.BUILT, "option_text")
     UNSEEDED: ClassVar[str] = SCHEDULE_MIXTURE
 
-    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
+    objective: ObjectiveConfig = dataclasses.field(
+        default_factory=lambda: ObjectiveConfig(functools.partial(DecisionObjective)))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(lr=2.5e-5))
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
-    model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
+    model: ModelConfig = dataclasses.field(
+        default_factory=DecoderRunConfig.transformer_model)
     pretrained: str = LAYA
     """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
     subfolder: str | None = None
@@ -538,7 +533,7 @@ class DecisionRunConfig(DecoderRunConfig):
             return None
         widest = {"options": max(integer(value, "slots.options") for value in stated)}
         # The objective's arguments as it builds them: those the run states over those it recorded defaulted.
-        fields = {**self.objective.defaults, **self.objective.fields}
+        fields = {**self.objective.defaults, **self.objective.field_records}
         rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
         fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
         return option_width(widest, rate, fewest)
@@ -547,7 +542,7 @@ class DecisionRunConfig(DecoderRunConfig):
         """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
         if not validates:
             return ()
-        return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
+        return tuple(MetricConfig(functools.partial(type(metric))) for metric in default_metrics())
 
 
 type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]

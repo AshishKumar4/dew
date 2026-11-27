@@ -8,6 +8,7 @@ unfit, by training and a server alike; a cut that leaves two options alike is a 
 under its own reason, which a server answers as its release does, the cut in its usage."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import jax
@@ -302,8 +303,8 @@ def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_ke
     assert {name: any(NONE_OF_THE_ABOVE in bytes(option).decode()
                       for _ in range(16) for option in _options(read.random_map(row, rng)))
             for name, row in rows.items()} == {"two": False, "three": True}
-    defaulted = ObjectiveConfig("decision", fields={"none_of_the_above": 1.0})
-    recorded = ObjectiveConfig("decision", fields={"none_of_the_above": 1.0},
+    defaulted = ObjectiveConfig(functools.partial(DecisionObjective, none_of_the_above=1.0))
+    recorded = ObjectiveConfig(functools.partial(DecisionObjective, none_of_the_above=1.0),
                                defaults={**defaulted.defaults, "none_of_the_above_options": 0})
     assert defaulted.defaults["none_of_the_above_options"] == 3
     assert recorded.arguments["none_of_the_above_options"] == 0
@@ -496,8 +497,11 @@ def test_a_runs_readout_holds_the_labels_its_datas_questions_ask(backbone, count
     assert summary["capacities"]["labels"] == {"count": count, "from": "data"}
     assert len(objective.model.head.label_ids) == count
     def noted(**fields):
-        held = dataclasses.replace(_run(backbone, count, stated=True), objective=dataclasses.replace(
-            DecisionRunConfig().objective, fields={"none_of_the_above": 0.25, **fields}))
+        held = dataclasses.replace(_run(backbone, count, stated=True),
+                                   objective=dataclasses.replace(
+                                       DecisionRunConfig().objective,
+                                       bound=functools.partial(DecisionRunConfig().objective.member,
+                                                               **{"none_of_the_above": 0.25, **fields})))
         return held.prepare().train("x")[2]["capacities"]["labels"]
 
     assert noted() == {"count": count + 1, "from": "data"}

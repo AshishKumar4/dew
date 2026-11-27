@@ -16,6 +16,7 @@ the record.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 from typing import Annotated, Self
 
@@ -31,7 +32,7 @@ from dew.checkpoints import Checkpoints
 from dew.config import ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.objectives.base import Objective
-from dew.objectives.world_model import TokenizerObjective, WorldModelObjective
+from dew.objectives.world_model import CausalTokenizer, TokenizerObjective, WorldModelObjective
 from dew.registry import Configured, ModelConfig, models, objectives, parameter_type, parameters
 
 
@@ -59,12 +60,12 @@ class WorldModelRunConfig(RunConfig):
 
 
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("dew.objectives.world_model:CausalTokenizer"))
+        default_factory=lambda: ModelConfig(functools.partial(CausalTokenizer)))
     """The network the stage trains, a `CausalTokenizer` or a `Dynamics`. The run derives each width the class
     declares from what the data and the tokenizer state (`frame`; `latents`, `bottleneck` and `action_size`);
     a record that states one is refused. A `Dynamics.frames` holds the data's windows."""
     objective: ObjectiveConfig = dataclasses.field(
-        default_factory=lambda: ObjectiveConfig("dew.objectives.world_model:TokenizerObjective"))
+        default_factory=lambda: ObjectiveConfig(functools.partial(TokenizerObjective)))
     """The stage's objective: `TokenizerObjective`, or `WorldModelObjective` and its `shortcut`, whose
     tokenizer, and the weights of it, are `tokenizer`'s."""
     tokenizer: Annotated[TokenizerConfig, tyro.conf.subcommand("tokenizer")] | None = None

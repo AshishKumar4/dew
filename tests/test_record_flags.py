@@ -4,12 +4,15 @@ flags make exactly the ones a record states."""
 
 import contextlib
 import dataclasses
+import functools
 import io
 
 import pytest
 import tyro
 
+from dew import registry
 from dew.config.env import EnvChoice, EnvConfig, EnvRunConfig, RolloutChoice, RolloutConfig
+from dew.objectives.rl.control import ControlRollout
 from dew.registry import envs, from_record, implied_subcommand, rollouts, to_record
 
 
@@ -24,11 +27,11 @@ class Chosen:
 @pytest.mark.parametrize(("record", "aliases"), [(RolloutConfig, rollouts), (EnvConfig, envs)],
                          ids=["rollouts", "envs"])
 def test_a_kinds_flagged_records_are_the_records_a_record_states(record, aliases):
-    """Each aliased member's record, flagged (`Registered.flagged`), writes the record its plain record
+    """Each aliased member's record, flagged (`Bound.flagged`), writes the record its plain record
     writes (`to_record`) and reads back as it (`from_record`): a command line's subcommand changes no run's
     record."""
     for alias in aliases:
-        plain = record(aliases.paths[alias])
+        plain = record(functools.partial(aliases[alias]))
         flagged = plain.flagged()
         assert type(flagged) is not record and isinstance(flagged, record)
         assert to_record(flagged, record) == to_record(plain, record)
@@ -36,12 +39,12 @@ def test_a_kinds_flagged_records_are_the_records_a_record_states(record, aliases
 
 
 def test_a_rollout_is_chosen_by_its_subcommand_and_set_by_plain_flags():
-    """`rollout:control --rollout.unroll-length 64` is `RolloutConfig("control", {"unroll_length": 64})`'s
+    """`rollout:control --rollout.unroll-length 64` is the control rollout bound by `unroll_length=64`'s
     record, no flag left at its default stated; none given, the default's subcommand, its record stating
     none; an environment chosen by its own (`env:flight --env.count 4`) holds its settings beside its
     arguments."""
     parsed = tyro.cli(Chosen, args=["rollout:control", "--rollout.unroll-length", "64"])
-    stated = RolloutConfig("control", {"unroll_length": 64})
+    stated = RolloutConfig(functools.partial(ControlRollout, unroll_length=64))
     assert to_record(parsed.rollout, RolloutConfig) == to_record(stated, RolloutConfig)
     assert to_record(tyro.cli(Chosen, args=[]).rollout, RolloutConfig) == to_record(RolloutConfig(),
                                                                                      RolloutConfig)
@@ -59,10 +62,13 @@ def test_an_environment_runs_help_names_its_choices_and_their_flags_and_no_json(
         EnvRunConfig.cli(["--help"])
     text = shown.getvalue()
     assert "rollout:control" in text and "rollout:dreamer" in text
-    assert "--rollout.fields" not in text and "--env.fields" not in text, text
+    hidden = [f"--{kind}.{held}" for kind in ("rollout", "env") for held in ("bound", "defaults")]
+    assert not any(flag in text for flag in hidden), text
 
 
-@pytest.mark.parametrize("run", [EnvRunConfig(), EnvRunConfig(rollout=RolloutConfig("control"))],
+@pytest.mark.parametrize("run", [EnvRunConfig(),
+                                 EnvRunConfig(rollout=RolloutConfig(functools.partial(
+                                     registry.rollouts["control"])))],
                          ids=["declared", "control"])
 def test_an_env_run_saved_and_read_back_is_the_run(run, tmp_path):
     """An environment run, its rollout a kind its command line chooses by subcommands, saved and read back
@@ -76,8 +82,8 @@ def test_an_env_run_saved_and_read_back_is_the_run(run, tmp_path):
 
 def test_an_env_run_parsed_from_its_command_line_holds_its_kinds_own_records():
     """A run parsed from its command line (`EnvRunConfig.cli`) holds each record as its kind's own class,
-    equal to the one a caller builds with the same settings (`Registered.recorded`)."""
+    equal to the one a caller builds with the same settings (`Bound.recorded`)."""
     parsed = EnvRunConfig.cli(["rollout:control", "--rollout.unroll-length", "64"])
     assert type(parsed.rollout) is RolloutConfig
-    assert parsed.rollout == RolloutConfig("control", {"unroll_length": 64})
+    assert parsed.rollout == RolloutConfig(functools.partial(ControlRollout, unroll_length=64))
     assert EnvRunConfig.cli([]) == EnvRunConfig()

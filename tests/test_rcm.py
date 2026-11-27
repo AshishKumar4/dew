@@ -1,6 +1,7 @@
 """rCM's losses against NVlabs/rcm's own methods (`tools/rcm_reference.py`),
 and forward-mode attention for its tangent."""
 
+import functools
 import json
 from pathlib import Path
 from typing import NamedTuple
@@ -15,7 +16,9 @@ from interop_support import extract_fixture
 from model_support import attending
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
+from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.consistency import (
+    ConsistencyDistillationObjective,
     backward_simulation,
     consistency_loss,
     critic_loss,
@@ -24,6 +27,7 @@ from dew.objectives.diffusion.consistency import (
     guided,
     trig_prediction,
 )
+from dew.objectives.diffusion.objective import DiffusionObjective
 
 CASE = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "losses.npz")
 CONFIG = json.loads(str(CASE["config"]))
@@ -199,13 +203,13 @@ def _saved_teacher(root: Path) -> _Teacher:
     from dew.sampling import Euler
 
     teacher_run = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                         "time_scale": 0.002, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, time_scale=0.002, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, ema_decay=None)))
     directory = root / "teacher"
     _, state, batch = saved_after_one_step(teacher_run, lambda task: batch_for(task, 4), directory, 1e-2)
     return _Teacher(teacher_run, directory, state, batch)
@@ -218,7 +222,9 @@ def _distilling(teacher: _Teacher, directory: Path | None = None, **fields):
     from dew.config import ObjectiveConfig
     from dew.sampling import Consistency
 
-    objective = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None, **fields})
+    objective = ObjectiveConfig(
+        functools.partial(ConsistencyDistillationObjective, **{"solver": Consistency(), "steps": 3,
+                                                         "ema_decay": None, **fields}))
     source = str(directory or teacher.directory)
     return dataclasses.replace(teacher.run, teacher_run=source, objective=objective)
 
@@ -242,7 +248,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     teacher, state, batch = saved_teacher.run, saved_teacher.state, saved_teacher.batch
     # The checkpoint's Fourier table is authoritative, whatever scale the model record names.
     for time_scale in (16, 0.001):
-        model = dataclasses.replace(teacher.model, fields={**teacher.model.fields, "time_scale": time_scale})
+        model = teacher.model.with_fields(time_scale=time_scale)
         dataclasses.replace(_distilling(saved_teacher), model=model).build()
 
     task = _distilling(saved_teacher, **ALTERNATING).build()
@@ -395,7 +401,9 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     objective = DiffusionRunConfig(pretrained=pipeline, preset=Flow(), model=precision(),
                                    data=images_of("tfds://oxford_flowers102", 16),
                                        val_metrics=(),
-                                   objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
+                                   objective=ObjectiveConfig(
+                                       functools.partial(ConsistencyDistillationObjective,
+                                                         ema_decay=None))).build()
     source = load_diffusion_source(pipeline, dtype="float32", size=(16, 16))
     direct = ConsistencyDistillationObjective(source, objective.process, None, ema_decay=None)
     assert (to_record(objective.task_settings(), ImageSettings)

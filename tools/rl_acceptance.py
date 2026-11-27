@@ -27,6 +27,7 @@ ArrayRecords (examples/train_flowers_tpu.py).
 from __future__ import annotations
 
 import argparse
+import functools
 import itertools
 import json
 import time
@@ -42,12 +43,14 @@ from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfi
 from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
+from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlRollout
+from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
+from dew.objectives.world_model import CausalTokenizer, Dynamics, WorldModelObjective
 from dew.optim import Adam, LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
+from dew.rl.playground import Playground
 from dew.training import LocalTracker, TrainerAdvanced
 
-CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
-"""The modules of the agents' networks and objectives, which a record names by import path."""
 GREEDY, DRAWN = "greedy", "drawn"
 """The validation splits the acceptance runs score on, which log `greedy/return` and `drawn/return`: the
 policy's mean, and the draws it acts with in training, which a DreamerV3 return is published as."""
@@ -108,18 +111,20 @@ def ppo_run(
     every = rollout["epochs"] * rollout["minibatches"]
     playground = {"name": task}
     return EnvRunConfig(
-        env=EnvConfig("playground", playground, count=envs, episode_length=1000),
-        model=ModelConfig(f"{CONTROL}:ActorCritic"),
-        objective=ObjectiveConfig(
-            f"{CONTROL}:ControlPPOObjective",
-            {"discount": 0.995, "reward_scaling": 10.0, "entropy_cost": 1e-2, "clip": 0.3},
-        ),
-        rollout=RolloutConfig("control", rollout),
+        env=EnvConfig(functools.partial(Playground.load, **playground), count=envs,
+                      episode_length=1000),
+        model=ModelConfig(functools.partial(ActorCritic)),
+        objective=ObjectiveConfig(functools.partial(ControlPPOObjective,
+                                                    discount=0.995, reward_scaling=10.0, entropy_cost=1e-2,
+                                                    clip=0.3)),
+        rollout=RolloutConfig(functools.partial(ControlRollout, **rollout)),
         optim=OptimConfig(optimizer=Adam(), lr=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out), steps=collections * every,
                               log_every=every, eval_every=None, checkpoint_every=None, resume="never"),
         episodes={
-            GREEDY: EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000))
+            GREEDY: EpisodesConfig(
+                1000, EnvConfig(functools.partial(Playground.load, **playground), count=128,
+                                episode_length=1000))
         },
     )
 
@@ -174,10 +179,11 @@ def dreamer_run(
     }
     updates = int(environment_steps * rollout["train_ratio"] / (rollout["batch"] * rollout["length"]))
     return EnvRunConfig(
-        env=EnvConfig("playground", {"name": task}, count=envs, episode_length=1000),
-        model=ModelConfig(f"{DREAMER}:WorldModel"),
-        objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective"),
-        rollout=RolloutConfig("dreamer", rollout),
+        env=EnvConfig(functools.partial(Playground.load, name=task), count=envs,
+                      episode_length=1000),
+        model=ModelConfig(functools.partial(WorldModel)),
+        objective=ObjectiveConfig(functools.partial(DreamerV3Objective)),
+        rollout=RolloutConfig(functools.partial(DreamerRollout, **rollout)),
         optim=OptimConfig(optimizer=LaProp(),
                           schedule=Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)),
         trainer=TrainerConfig(checkpoint_dir=str(out), steps=updates, log_every=1000,
@@ -373,32 +379,28 @@ def dreamer4_stages(
     models of one architecture over the tokenizer's latents at its last step, one trained by shortcut
     forcing ("shortcut") and one by diffusion forcing ("diffusion"), `dynamics_steps` steps each (run key
     1)."""
-    world = "dew.objectives.world_model"
     adam = OptimConfig(optimizer=Adam(), lr=3e-4)
 
     def trainer(steps: int, key: int) -> TrainerConfig:
         return TrainerConfig(checkpoint_dir=str(out), steps=steps, log_every=steps,
                              eval_every=None, checkpoint_every=None, key=key, resume="never")
 
-    tokenizer = ModelConfig(
-        f"{world}:CausalTokenizer",
-        {"patch": 4, "width": 128, "depth": 3, "heads": 4, "latents": 16, "bottleneck": 8},
-    )
+    tokenizer = ModelConfig(functools.partial(CausalTokenizer, patch=4, width=128,
+                                              depth=3, heads=4, latents=16, bottleneck=8))
     stages = {
         "tokenizer": WorldModelRunConfig(
             data=clips, model=tokenizer, optim=adam, trainer=trainer(tokenizer_steps, 0)
         )
     }
-    dynamics = ModelConfig(
-        f"{world}:Dynamics",
-        {"spatial": 16, "width": 256, "depth": 6, "heads": 4, "levels": 7, "frames": frames},
-    )
+    dynamics = ModelConfig(functools.partial(Dynamics, spatial=16, width=256,
+                                             depth=6, heads=4, levels=7, frames=frames))
     saved = TokenizerConfig(str(out / "dreamer4-tokenizer"), tokenizer_steps)
     for name, shortcut in (("shortcut", True), ("diffusion", False)):
         stages[name] = WorldModelRunConfig(
             data=clips,
             model=dynamics,
-            objective=ObjectiveConfig(f"{world}:WorldModelObjective", {"shortcut": shortcut}),
+            objective=ObjectiveConfig(functools.partial(WorldModelObjective,
+                                                        shortcut=shortcut)),
             tokenizer=saved,
             optim=adam,
             trainer=trainer(dynamics_steps, 1),
