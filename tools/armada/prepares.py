@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Set as AbstractSet
+from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
 PREPARE = "prepare-"
@@ -273,40 +273,51 @@ def planned(files: list[tuple[str, bool, int]], took: Callable[[str, str], tuple
     return found
 
 
-def unprepared_in(truths: Path, records: tuple[str, ...],
+def unprepared_in(truths: Path, records: Mapping[str, str],
                   owning: Callable[[str], str]) -> dict[str, list[dict]]:
     """The cells a prepare into store `truths` left unprepared, by test file (`owning` a test's node id): each
-    reason of each of `records` (tests/tier_wire.py's `UNPREPARED`, and its `DEFERRED`, a flow's cell its
-    prepare deferred to its run, which the run names unprepared), each its test, where, why and cell label (a
-    deferred cell's), so the flow's cells deferred at one line are each their own."""
+    reason of each of `records`, by its record's name and the kind of cell it records (tests/tier_wire.py's
+    `UNPREPARED`, a site's, and its `DEFERRED`, a flow's cell its prepare deferred to its run, which the run
+    names unprepared), each its test, where, why, cell label and kind, so the flow's cells deferred at one
+    line are each their own and no site's cell is taken for a flow's of one test and label."""
     found: dict[str, list[dict]] = {}
-    for name in records:
+    for name, kind in records.items():
         for path in sorted(truths.rglob(name)):
             record = json.loads(path.read_text())
             # A record that lists no reasons gives its own where and why, as its first's.
             for reason in record.get("reasons") or [record]:
                 found.setdefault(owning(record["test"]), []).append(
                     {"test": record["test"], "where": reason.get("where", "?"),
-                     "error": reason.get("error", "?"),
+                     "error": reason.get("error", "?"), "kind": kind,
                      **({"cell": reason["cell"]} if reason.get("cell") else {})})
     return found
 
 
-Cell = tuple[str, str, str | None]
-"""An unprepared cell as a row and its baseline keep it (`unprepared_cells`): its test, where in it, and its
-label or None, each a field, so no node id reading like a where or a label (" @ ", " [") is parsed for one."""
+Cell = tuple[str, str, str | None, str | None]
+"""An unprepared cell as a row and its baseline keep it (`unprepared_cells`): its test, where in it, its label
+or None, and the kind of record it is (`unprepared_in`'s: a site's or a flow's; None in a baseline written
+before it was kept), each a field, so no node id reading like a where or a label (" @ ", " [") is parsed for
+one, and no site's cell is taken for a flow's. Strings (`identity`) only say a cell."""
 
 
 def cell_of(record: Mapping) -> Cell:
     """`record`'s cell (`Cell`), its where "?" where it names none, as `identity` names it."""
-    return (record["test"], record.get("where") or "?", record.get("cell"))
+    return (record["test"], record.get("where") or "?", record.get("cell"), record.get("kind"))
 
 
-def record_of(cell: Cell) -> dict:
-    """The record of cell `cell` (`Cell`), as `unprepared_in` gives one, its `identity` beside it."""
-    test, where, label = cell
-    record = {"test": test, "where": where, **({"cell": label} if label else {})}
+def record_of(cell: Sequence) -> dict:
+    """The record of cell `cell` (`Cell`, or an older baseline's three fields, its kind unknown), as
+    `unprepared_in` gives one, its `identity` beside it."""
+    test, where, label, kind = (*cell, None) if len(cell) == 3 else cell
+    record = {"test": test, "where": where, **({"cell": label} if label else {}),
+              **({"kind": kind} if kind else {})}
     return {**record, "identity": identity(record)}
+
+
+def known(cell: Cell, cells: AbstractSet[Cell]) -> bool:
+    """Whether `cells` (a baseline's) holds `cell`: by every field, or, where the baseline kept no kind, by
+    its test, where and label alone."""
+    return cell in cells or (*cell[:3], None) in cells
 
 
 def identity(record: Mapping) -> str:
@@ -330,12 +341,14 @@ def skipped_whole(record: Mapping, untried: set[str]) -> bool:
 
 def capped_alike(record: Mapping, untried: set[tuple[str, str]]) -> bool:
     """Whether a cell `record` is one main's run left at its prepare's cap (`untried`, the (test, cell label)
-    pairs of main's labeled capped cells): the same test's same labeled cell, wherever this run reached it.
-    Its structured test and label, exactly; a reused row's identity alone only where it reads one way, the
-    test, " @ ", a where holding no " @ ", then the label (`identity`), so no sibling cell and no parameter
-    id that shares a start is taken for it."""
+    of main's labeled capped flow cells, and of its labeled caps of no known kind, an older baseline's): the
+    same test's same labeled flow cell, wherever this run reached it. A site's cap (tests/reference_error.py's
+    labeled Check 1 site) excuses its own cell alone, where it lies (`known`), and no flow cell sharing its
+    label: the exemption is a cell's, never a site's. Its structured fields, exactly; a reused row's identity
+    alone only where it reads one way, the test, " @ ", a where holding no " @ ", then the label (`identity`),
+    so no sibling cell and no parameter id that shares a start is taken for it."""
     if "test" in record:
-        return (record["test"], record.get("cell")) in untried
+        return record.get("kind") != "site" and (record["test"], record.get("cell")) in untried
     for test, cell in untried:
         named = record["identity"]
         if (named.startswith(f"{test} @ ") and named.endswith(f" [{cell}]")
@@ -380,9 +393,13 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
                 else [{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
                 else [{**record, "identity": identity(record)} for record in own])
         cells = sorted(record["identity"] for record in held)
-        capped = sorted(found.get("capped", []) if "unprepared" in found
-                        else {identity(record) for record in own if record["where"] == capped_at})
-        judged_ = [record for record in held if record["identity"] not in set(capped)]
+        # Its capped cells by their where, a field, where it keeps them so; an older reused row's by the
+        # strings it kept (`capped`), the one place a string decides. The strings are otherwise said alone.
+        structured = all("test" in record for record in held)
+        capped = sorted({record["identity"] for record in held if record["where"] == capped_at} if structured
+                        else found.get("capped", []))
+        judged_ = [record for record in held
+                   if not (record["where"] == capped_at if structured else record["identity"] in set(capped))]
         # Said once: a reused row's output holds its banner (`capped_banner`) already.
         if capped and (found.get("output") or "").startswith(head := capped_banner(capped)):
             found = {**found, "output": found["output"][len(head):].lstrip("\n")}
@@ -392,11 +409,11 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # cells by their fields gives main's capped ones so; an older one's identities are read back.
             # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
             # older baseline's identities, parsed for its caps as they always were.
-            fields = {cell for cell in before if isinstance(cell, tuple)}
+            fields = {(*cell, None) if len(cell) == 3 else cell for cell in before if isinstance(cell, tuple)}
             legacy = {cell for cell in before if isinstance(cell, str)}
-            untried = {test for test, where, label in fields if where == capped_at and label is None}
-            untried_cells = {(test, label) for test, where, label in fields
-                             if where == capped_at and label is not None}
+            untried = {test for test, where, label, _ in fields if where == capped_at and label is None}
+            untried_cells = {(test, label) for test, where, label, kind in fields
+                             if where == capped_at and label is not None and kind != "site"}
             whole = f" @ {capped_at}"
             untried |= {cell[:-len(whole)] for cell in legacy if cell.endswith(whole)}
             labeled = f" @ {capped_at} ["
@@ -405,7 +422,7 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # A record main left so: by its fields where it has them, else (a reused row's identity) rendered.
             rendered = legacy | {identity(record_of(cell)) for cell in fields}
             new = [record for record in judged_
-                   if not (cell_of(record) in fields or record["identity"] in legacy if "test" in record
+                   if not (known(cell_of(record), fields) or record["identity"] in legacy if "test" in record
                            else record["identity"] in rendered)
                    and not skipped_whole(record, untried) and not capped_alike(record, untried_cells)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
@@ -423,8 +440,8 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             "output", found.get("output") or "")])} if capped else {})
         # Its unprepared cells by their fields too, its baseline's (`cells_of`), where each has them.
         fields = ({"unprepared_cells": sorted((cell_of(record) for record in held),
-                                   key=lambda cell: (cell[0], cell[1], cell[2] or ""))}
-                  if all("test" in record for record in held) else {})
+                                              key=lambda cell: tuple(field or "" for field in cell))}
+                  if structured else {})
         judged.append(as_ran({**found, "unprepared": cells, **fields, **red, **said}, stale))
     return judged
 
@@ -524,12 +541,14 @@ def cells_of(record: dict | None) -> set[Cell] | set[str] | None:
         return None
     if "unprepared_cells" in record:
         kept = record["unprepared_cells"]
+        # Four fields each, an older record's three (its kind unknown, None).
         if not (isinstance(kept, list) and all(
-                isinstance(cell, list) and len(cell) == 3 and isinstance(cell[0], str)
-                and isinstance(cell[1], str) and (cell[2] is None or isinstance(cell[2], str))
+                isinstance(cell, list) and len(cell) in (3, 4) and isinstance(cell[0], str)
+                and isinstance(cell[1], str)
+                and all(field is None or isinstance(field, str) for field in cell[2:])
                 for cell in kept)):
             raise Unread("a baseline's cells are no list of cells")
-        return {(test, where, label) for test, where, label in kept}
+        return {(cell[0], cell[1], cell[2], cell[3] if len(cell) == 4 else None) for cell in kept}
     kept = record.get("unprepared")
     if not (isinstance(kept, list) and all(isinstance(cell, str) for cell in kept)):
         raise Unread("a baseline's unprepared cells are no list of cells")
@@ -684,7 +703,8 @@ def run(ci, python: str, tests: list[str], split: str, out: Path, deadline: floa
                 kept={name: kept[(name, group)]} if (name, group) in kept else None, written=written,
                 ends=began + deadline,
                 judged=lambda found, truths=truths, before_=before_, generation=generation: graded(
-                    found, unprepared_in(truths, (wire.UNPREPARED, wire.DEFERRED), ci.grading.owning),
+                    found, unprepared_in(truths, {wire.UNPREPARED: "site", wire.DEFERRED: "flow"},
+                                         ci.grading.owning),
                     before_, generation, lambda named: ci.grading.owning(ci.parsed_row(named)[1]),
                     ci.grading.STALE, wire.CAPPED))
             rows_ += [nothing_timed(found) for found in json.loads(verdict.read_text())["rows"]]
