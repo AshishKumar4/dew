@@ -199,12 +199,45 @@ def head_commit() -> str | None:
     return (found.stdout.strip() or None) if found.returncode == 0 else None
 
 
+BASELINES = "DEW_BASELINES"
+"""The commit a task's run with its records off (`ci.RECORDS`) writes its green dry prepares' baselines
+of (`baselines`), named only by the land queue's stale-row pass (ops queue/land.sh, suspect.sh
+--baselines), which runs on the very commit CI graded the rows CI left unrun, so a train that publishes
+has its baseline whole: its stale rows wrote none (row 13049). A suspect's comparisons name none, and read
+baselines alone: one written between two of their lookups would grade the same omission two ways.
+Written only where it is this checkout's commit, keyed by it; the rows are graded against the mainline as
+ever (`records.MAINLINE`)."""
+
+
+def baselines_asked() -> bool:
+    """Whether this run is told to write its commit's baselines with its records off (`BASELINES`)."""
+    return (given := os.environ.get(BASELINES)) is not None and given == head_commit()
+
+
+def baselines(python: str, rows: list[dict], held: str, until: float | None = None, *,
+              asked: bool = False) -> set[str]:
+    """Each green dry prepare's row of `rows` on class `held` given its baseline at this commit (`baselined`),
+    within `until` where one is given: the rows whose baseline the store did not take, which stand stale
+    (`ci.unbaselined`). Without the store, none where a run's records are its own (they write no baseline
+    either); every one due where its baselines were `asked` of it (`BASELINES`): a pass told to write them
+    that cannot leaves no row green without its baseline."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return {row_["name"] for row_ in rows if due(row_)} if asked else set()
+    return {row_["name"] for row_ in rows if not baselined(python, row_["name"], held, token, row_, until)}
+
+
+def due(ran: Mapping) -> bool:
+    """Whether a row owes its commit a baseline: a green dry prepare's (`baselined`)."""
+    return ran.get("exitCode") == 0 and "unprepared" in ran
+
+
 def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
               until: float | None = None) -> bool:
     """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
     written now, tried once within `until` where one is given, or none is due; a green row with none stands
     stale (`unbaselined`)."""
-    if (commit := head_commit()) is None or ran.get("exitCode") != 0 or "unprepared" not in ran:
+    if (commit := head_commit()) is None or not due(ran):
         return True
     return written(baseline_key(commit, python, place, held), token,
                    json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1, until=until)
@@ -409,17 +442,16 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
-    unnamed: set[str] = set()
+    # Each green dry prepare's baseline first, whatever of its admission to reuse below (record, key,
+    # epoch): a row is named the commit's own only once its baseline is written (`named_at_commit`).
+    held = device_class(network)
+    unnamed = baselines(python, rows, held, until)
     # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
     executed = followed.recorded(log)
-    held = device_class(network)
     if opened is not None:
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
-        # A green dry prepare's baseline, whatever of its admission to reuse below (record, key, epoch).
-        if not baselined(python, row_["name"], held, token, row_, until):
-            unnamed.add(row_["name"])
         name = parsed_row(row_["name"])[1]
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)

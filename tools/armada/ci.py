@@ -1651,17 +1651,23 @@ def kept_records(python: str, rows: list[dict], ran: list[dict], out: Path, file
     not), `out` written again where a green row's baseline was not taken (`unbaselined`). A row run in more
     than one process (what it opened None, as a blind watch's) keeps no key, what each read being no one
     record's; its red still begins its next epoch and its green still writes its baseline. Its records'
-    reads and writes within `until` where one is given."""
+    reads and writes within `until` where one is given. Not recording, it writes only the baselines the land
+    queue's stale-row pass asks of this commit (`run_keys.BASELINES`)."""
     opened, wrote, written = reads
     carried = wrote.union(*(written or []))
     if written is not None:
         written.append(wrote)
-    if not recording:
-        return
-    log, unrecorded = files
-    unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
-    if unnamed := run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in,
-                                  until):
+    if recording:
+        log, unrecorded = files
+        unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
+        unnamed = run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in,
+                                  until)
+    else:
+        # No record kept (a suspect's run, `RECORDS`), but the baselines the land queue's stale-row pass
+        # asks of the commit it tests (`run_keys.BASELINES`).
+        unnamed = (run_keys.baselines(python, ran, run_keys.device_class(network), until, asked=True)
+                   if run_keys.baselines_asked() else set())
+    if unnamed:
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
 
 
