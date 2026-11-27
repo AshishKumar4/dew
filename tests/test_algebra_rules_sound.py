@@ -101,7 +101,7 @@ def _binary(name: str, x, y):
     if x.shape and y.shape and x.shape != y.shape:
         raise Inadmissible(f"{name} of {x.shape} and {y.shape}")
     # A fused multiply-add's names (`rules.CONTRACTED`) are their primitives' over the reals.
-    real = cost.PRIMITIVES.get(name, name)
+    real = rules.BOUND_AS.get(name, name)
     return {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.divide}[real](x, y)
 
 
@@ -698,7 +698,7 @@ class Traced(Evaluated):
             x, op, y, _ = values
             # A fused multiply-add's names (`rules.CONTRACTED`) are their primitives', which XLA contracts.
             return {"add": jnp.add, "sub": jnp.subtract, "mul": jnp.multiply, "div": jnp.divide,
-                    "max": jnp.maximum, "min": jnp.minimum}[cost.PRIMITIVES.get(op, op)](x, y)
+                    "max": jnp.maximum, "min": jnp.minimum}[rules.BOUND_AS.get(op, op)](x, y)
         if name == "compare":
             x, op, y, _ = values
             return {"lt": jnp.less, "gt": jnp.greater, "eq": jnp.equal}[op](x, y)

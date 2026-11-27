@@ -339,14 +339,10 @@ _WRITTEN = {written.constructor: (kind, written.names) for kind, written in term
 """Each operation's constructor by its name: its kind of operation and the field of it its name is
 (`terms.Written.names`)."""
 
-_BOUND_AS = {contracted: name for name, contracted in rules.CONTRACTED.items()}
-"""A fused multiply-add's names by the operation each binds as (`rules.CONTRACTED`)."""
-
-
 def _operated(name: str, values: list, primitive: Primitive) -> None:
     """That the parameters of `primitive` a term of constructor `name` over `values` reads are of its own
     operation (`terms.OPERATIONS`): its kind, and where the term names it (its second argument) its symbol
-    or monoid, a fused multiply-add's name the one it binds as (`ValueError` otherwise). A derived walk's
+    or monoid, a fused multiply-add's name the one it binds as (`rules.BOUND_AS`; `ValueError` otherwise). A derived walk's
     rescale (`terms.RESCALE`), no program's operation, reads the parameters its declaration's exponent gives
     it."""
     kind, names = _WRITTEN[name]
@@ -355,7 +351,7 @@ def _operated(name: str, values: list, primitive: Primitive) -> None:
         return
     operation = terms.OPERATIONS.get(primitive)
     if operation is None or operation.kind != kind or (
-            names is not None and _BOUND_AS.get(named, named) != (
+            named is not None and rules.BOUND_AS.get(named, named) != (
                 operation.symbol if names == "symbol" else operation.monoid)):
         raise ValueError(f"a {name} {named or ''} reading {primitive}'s parameters")
 
