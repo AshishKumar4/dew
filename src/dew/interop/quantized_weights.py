@@ -29,6 +29,12 @@ class QuantizedWeight:
     decoded: str | None
 
 
+def stored_grid(quantized: Mapping[str, QuantizedWeight]) -> dict[str, unread.Stored]:
+    """The scales and zeros every one of `quantized` encodes against, as the source stored them, each part
+    under its name: a part two weights share (a tied pair's one scale) held once, the same stored tensor."""
+    return {part: held for weight in quantized.values() for part, held in weight.grid.items()}
+
+
 def weight_records(codec: SourceQuantization, tensors: Mapping[str, unread.Stored], names: Iterable[str],
                    decoded: Mapping[str, unread.Stored] | None) -> dict[str, QuantizedWeight]:
     """Each of `names`' record as `codec` stores it in `tensors`: its parts the source holds (an optional
