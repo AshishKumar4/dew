@@ -34,7 +34,6 @@ import pytest
 import recurrence_witness as rw
 import tier_wire
 from attention_witness import (
-    BACKWARD_FORMS,
     FORMS,
     assert_backward_faults_refused,
     assert_backward_witnessed,
@@ -757,11 +756,12 @@ def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_
 
 
 def the_attention_backwards_gradients_certify_natively(generation_name, form):
-    """Every gradient of the attention template's fast backward under `form` lies inside its enclosure from
-    the forward's stored output, maxima and denominators (`attention_witness.assert_backward_witnessed`), at
-    this GPU's `ex2` (PTX's reach)."""
+    """Every gradient of the attention template's fast backward under `form`, and its accurate one's (two
+    launches), lies inside its enclosure from the forward's stored residuals
+    (`attention_witness.assert_backward_witnessed`), at this GPU's `ex2` (PTX's reach)."""
     with generation.assumed(generation_name):
         assert_backward_witnessed(0, form, interpret=False, lane=mosaic_lane())
+        assert_backward_witnessed(0, form, interpret=False, lane=mosaic_lane(), accurate=True)
 
 
 def the_attention_backward_witness_refuses_its_faults_natively(generation_name):
@@ -841,7 +841,7 @@ FLOWS = {
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS),
         *(cell(the_attention_backwards_gradients_certify_natively, g, form)
-          for g in GENERATIONS for form in BACKWARD_FORMS),
+          for g in GENERATIONS for form in FORMS),
         *(cell(the_attention_backward_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS)],
 }
