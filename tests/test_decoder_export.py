@@ -758,7 +758,7 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     for layout in quantized.weight_layouts:
         if layout.name != scaled:
             np.testing.assert_array_equal(float_export[layout.name], layout.export(state.variables))
-    without_provenance = dataclasses.replace(quantized, quantized_tensors=())
+    without_provenance = dataclasses.replace(quantized, quantized={})
     with pytest.raises(ValueError):
         without_provenance.save(tmp_path / "refused", variables=state.variables)
 
@@ -829,7 +829,7 @@ def test_a_quantized_source_of_a_preparing_family_exports_updated_weights_in_its
         assert_same_stored_tensors(load_shards(tmp_path / placement),
                                    load_shards(tmp_path / "export"))
     dense = {stored.removeprefix(bare): tensor for stored, tensor in
-             dataclasses.replace(loaded, config=plain, quantized_tensors=()).export(updated).items()}
+             dataclasses.replace(loaded, config=plain, quantized={}).export(updated).items()}
     expected = encoded_form(quantization, dense, (name,))
     exported = load_shards(tmp_path / "export")
     assert json.loads((tmp_path / "export" / "config.json").read_text()) == config
@@ -882,7 +882,8 @@ def test_a_quantized_export_encodes_each_weight_as_it_is_read_against_its_stored
     for part, spec in stored.items():
         assert (written[part].shape, written[part].dtype) == (spec.shape, spec.dtype), part
     with pytest.raises(ValueError):
-        dataclasses.replace(loaded, quantized_specs={}).export()
+        dataclasses.replace(loaded, quantized={name: dataclasses.replace(weight, stored={})
+                                               for name, weight in loaded.quantized.items()}).export()
 
     dense = {**tensors, name: quantization.decode(written, name)}
     reads, encoded = [], []
@@ -955,7 +956,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     reloaded = Pretrained.load(destination, dtype="float32")
     np.testing.assert_array_equal(tool.logits(plain, plain.variables, ids),
                                   tool.logits(reloaded, reloaded.variables, ids))
-    missing = dataclasses.replace(loaded, quantized_tensors=())
+    missing = dataclasses.replace(loaded, quantized={})
     with pytest.raises(ValueError):
         missing.save(tmp_path / "missing-provenance", variables=state.variables)
 
