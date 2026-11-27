@@ -497,28 +497,51 @@ def test_an_msa_index_branch_trains_by_its_kl_per_query_whatever_targets_the_rol
 
 
 def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
-    """A step split into parts of unequal query counts (one part's rows padded) pools the indexer's KL as one
-    term of its own mass: each part's KL total and query count beside its prediction's, which the step sums
-    leaf by leaf (`dew.training.transaction`), the whole batch's counts the parts' sum, so the pooled KL is
-    the whole's per query and no average of the parts' means (row 13705)."""
-    from dew.objectives.routing import RoutedStatistics
+    """A step split into two parts of unequal query counts (the second part's rows padded) pools the
+    indexer's KL as one term of its own mass: each part's KL total and query count beside its prediction's,
+    which the step sums leaf by leaf (`dew.training.transaction`), so it updates every parameter, the index
+    branch's among them, as the unsplit step does over the same rows, held to the whole update's float64
+    truth by check 1 (row 13705: an average of the parts' means weighs the padded part's queries up)."""
+    from float64_replay import float64_replay
+    from rl_split_support import prepare_split_whole_steps
 
     objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
-    params = nn.unbox(objective.init(jax.random.key(0)))
-    ids = np.random.default_rng(3).integers(1, VOCAB, size=(4, SEQ + 1)).astype(np.int32)
-    real = np.ones(ids.shape, bool)
-    real[2:, 6:] = False
+    rate = 0.5
 
-    def statistics(rows: slice) -> RoutedStatistics:
-        inputs = ModelInputs(jnp.asarray(ids[rows]), {"attention_mask": jnp.asarray(real[rows])})
-        stats, _ = objective.loss(params, {"text": inputs}, step_at())
-        assert isinstance(stats, RoutedStatistics)
-        return stats
+    def rows(seed: int) -> dict:
+        tokens = np.random.default_rng([seed, 13705]).integers(1, VOCAB, size=(4, SEQ + 1))
+        return packed_batch([packed_row(row) for row in tokens[:2]]
+                            + [packed_row(row[:6]) for row in tokens[2:]])
 
-    whole, full, padded = statistics(slice(None)), statistics(slice(0, 2)), statistics(slice(2, None))
-    (indexed,), (first,), (second,) = whole.auxiliary, full.auxiliary, padded.auxiliary
-    assert float(first.mass) > float(second.mass) > 0
-    assert float(indexed.mass) == float(first.mass) + float(second.mass)
+    template = rows(0)
+    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
+        objective, rate, jax.random.key(3), template, template)
+
+    def draw(seed: int):
+        params = jax.jit(objective.init)(jax.random.key(seed))["params"]
+        batch = rows(seed)
+        moved = [step(jax.tree.map(jnp.copy, start.replace(variables={**start.variables, "params": params})),
+                      batch)[0].variables["params"] for step, start in ((split_step, split_start),
+                                                                        (whole_step, whole_start))]
+        return params, batch, *moved
+
+    def whole_update(params, batch, _split, _whole):
+        step = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0), None,
+                    committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                    example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
+        grads = jax.grad(lambda p: objective.scalar_loss({**whole_start.variables, "params": p}, batch,
+                                                         step)[0])(params)
+        return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
+
+    params, _, split_moved, _ = draw(0)
+    # The index branch moves, its KL's gradient reaching it through the split step.
+    assert any(np.any(np.asarray(after) != np.asarray(before))
+               for (path, after), before in zip(jax.tree_util.tree_leaves_with_path(split_moved),
+                                                jax.tree.leaves(params), strict=True)
+               if INDEXER in jax.tree_util.keystr(path))
+    truth = float64_replay(whole_update, compiled=True)
+    assert_as_exact(lambda _p, _b, split, _w: split, lambda _p, _b, _s, whole: whole, draw,
+                    "an indexer's split update", seeds=8, truth_fn=truth)
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

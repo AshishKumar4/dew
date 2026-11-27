@@ -40,7 +40,7 @@ from dew.nn.kernels.options import (
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective, head_tile_of
-from dew.state import Accumulation, TrainState, apart, occupied, together
+from dew.state import Accumulation, TrainState, apart, kept_window, occupied, together
 from dew.telemetry.compiles import Compiles, Ledger, Program, Span, owning
 from dew.telemetry.instrumentation import StepFlops, compiled_memory
 from dew.training._candidates import (
@@ -1603,7 +1603,10 @@ class StepCompiler[L, E]:
         concrete = not isinstance(jax.tree.leaves(state.variables)[0], jax.ShapeDtypeStruct)
         # The window a run's first step builds (`builds_window`), built here, with the step: its first
         # step reads it as built, compiling and tracing nothing (`executable_only`).
-        empty = (None if window == 1 or state.accumulation is not None else stepping.initialize_accumulation(
+        # A resumed window the step does not read (`kept_window`), empty, is built afresh too.
+        kept = state.accumulation is not None and kept_window(state.accumulation, prepared.accumulation,
+                                                              read=concrete)
+        empty = (None if window == 1 or kept else stepping.initialize_accumulation(
             state, microbatch_shapes(cpu_batch, split), shapes, window=window, split=split,
             shape_only=not concrete).accumulation)
         run = HostRun(stepping, bodies, placement, prepared, shapes, split, window, empty,

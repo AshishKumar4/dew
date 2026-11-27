@@ -96,7 +96,7 @@ from dew.optim_schedules import (
 )
 from dew.registry import Unrecordable
 from dew.scores import Summary
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, occupied, together
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, occupied, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
@@ -1009,10 +1009,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
         """Whether a step of `window` microbatches over `state` builds its window first (`_window_of`): a
-        state that holds none, or a ramp's stage whose window replays other shapes."""
-        held, staged = state.window, self._shape.ramp or self._shape.stage_starts
-        return window > 1 and self.step is None and (
-            held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
+        state that holds none, or one whose window the step does not read (`kept_window`: a ramp's stage's
+        of other batch shapes, or a resumed one an earlier Dew pooled other statistics in, row 13705), empty;
+        one part filled is refused."""
+        return window > 1 and self.step is None and not kept_window(
+            state.window, candidate.prepared.window, read=True)
 
     def _windowing(self) -> Windowing:
         """What its runs' empty windows are built by (`empty_window`)."""

@@ -5,10 +5,14 @@ teacher scores the same batch. The loss mixes the student's own loss with
 the KL between the two temperature-softened token distributions and, over
 named layer pairs, with a distance between their hidden states:
 
-    (1 - alpha) * student + alpha * T^2 * KL(teacher_T || student_T) + beta * feature
+    (1 - alpha) * prediction + alpha * T^2 * KL(teacher_T || student_T) + beta * feature + own
 
-Every term is summed over the positions the student counts, with the
-student's weights, and divided by the student's mass. The feature term
+`prediction` is the student's own token loss. Each of those terms is summed over
+the positions the student counts, with the student's weights, and divided by the
+student's mass. `own` is the student's terms of their own mass, which train its
+architecture rather than its predictions (a router's balance, an indexer's KL per
+query: `RoutedStatistics`), each at its own weight and over its own count, whatever
+alpha (row 13705). The feature term
 averages the pairs' per-position cosine distance or mean squared error.
 alpha, T and beta are each a constant or an `optax` schedule of the step the
 trainer passes the objective. MaxText's linear and cosine anneals are
@@ -139,11 +143,8 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
         `alpha` weights the KL against the student's own loss (MaxText's
         `distill_alpha`). `temperature` softens both distributions before the
-        KL and scales the KL by its square (`distill_temperature`). The
-        student's terms of their own mass, which train its architecture
-        rather than its predictions (a router's balance, an indexer's KL,
-        `RoutedStatistics`), keep their own weights beside the mix, whatever
-        `alpha`: only its prediction's loss is mixed with the KL.
+        KL and scales the KL by its square (`distill_temperature`), as the
+        module's formula states.
 
         `features` names `(teacher layer, student layer)` pairs whose output
         states the feature term compares. `beta` weights that term
