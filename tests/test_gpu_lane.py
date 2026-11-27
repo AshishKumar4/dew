@@ -971,7 +971,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     lookalike = ["tests/test_gpu_a.py::test_flow[p] @ " + wire.CAPPED + " [q", "a site", "c"]
     older = f"tests/test_gpu_a.py::test_other @ {wire.CAPPED}"
     kept = {"3.12:tests/test_gpu_a.py#1/2@prepare-sm90": {
-                "unprepared": [ci.prepares.identity(ci.prepares.record_of(tuple(lookalike)))],
+                "unprepared": [ci.prepares.identity(ci.prepares.record_of(ci.prepares.decoded(lookalike)))],
                 "unprepared_cells": [lookalike]},
             "3.12:tests/test_gpu_a.py#2/2@prepare-sm90": {"unprepared": [older]}}
 
