@@ -1477,13 +1477,14 @@ class RunConfig:
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         skipped = self.skipped_preview(objective)
+        eval_every = trainer.eval_interval(dataset)
         # What `fit` is asked for but its resume, which a run compiled ahead compiles its evaluations from.
         fitted = FitArguments(
             # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
             steps=steps, tokens=trainer.tokens, max_tokens=trainer.max_tokens,
             log_every=trainer.log_every,
             examples=dataset.examples if steps is None else None,
-            eval_every=trainer.eval_interval(dataset), checkpoint_every=trainer.checkpoint_interval(dataset),
+            eval_every=eval_every, checkpoint_every=trainer.checkpoint_interval(dataset),
             checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
             metrics=metrics if suites is None else (), preview=trainer.wandb is not None and skipped is None,
             best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
@@ -1494,7 +1495,7 @@ class RunConfig:
         # the data's own `val` where a pass is scheduled or metrics score it.
         held = ([suite.data for suite in suites.values()] if suites is not None
                 else list(validation.values()) if validation is not None
-                else [dataset.val] if dataset.val is not None and (fitted["eval_every"] or metrics) else [])
+                else [dataset.val] if dataset.val is not None and (eval_every or metrics) else [])
         if skipped is not None and lowering is None and any(not episodic(split) for split in held):
             # A run that validates a batch split, where a preview samples (`Evaluation.run`; a split of
             # episodes previews none), records the preview it skips, and why.
