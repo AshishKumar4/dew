@@ -40,7 +40,7 @@ def _recorded(module):
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
-    from dew.algebra import format_cases, format_cases_derived
+    from dew.algebra import format_cases_derived
     from dew.nn import precision
 
     emitted, taken = _recorded(format_cases_derived)
@@ -72,7 +72,7 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
 
 
 def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
-    from dew.algebra import format_cases, format_cases_derived
+    from dew.algebra import format_cases_derived
     from dew.nn import fake_quant
 
     emitted, taken = _recorded(format_cases_derived)
