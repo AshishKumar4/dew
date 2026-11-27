@@ -265,6 +265,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             _STAGED.reset(staged)
         with _publishing(directory):
             held_at = existing()
+            # The group the published tree takes, and its setgid, bound under the lock to what the
+            # destination is now (the tree it replaces, or a parent's setgid where there is none): a
+            # publisher that began before another's commit, or against no tree, chose them from another view
+            # (audit 2026-11-27 P05).
+            _grouped(staging, directory.parent.stat() if held_at is None else held_at, made, held_at is None)
             if held_at is None:
                 staging.chmod(made)
                 os.rename(staging, directory)
@@ -324,6 +329,25 @@ def _removed(tree: Path) -> None:
                                                 path, left)
 
     shutil.rmtree(tree, onexc=retried)
+
+
+def _grouped(staging: Path, source: os.stat_result, made: int, fresh: bool) -> None:
+    """Give every entry of `staging` the group a tree published from it takes beside `source` (the tree it
+    replaces, or, `fresh`, its parent), and every folder the setgid bit that tree's root takes (`made` for
+    a new tree, else the replaced root's): only where the group differs, so a tree written under the group
+    it publishes with is left as it is. A group this process cannot give is refused, as `chown` refuses
+    it, before anything moves."""
+    if fresh and not source.st_mode & stat.S_ISGID:
+        # A new tree outside a setgid parent takes the publisher's own group, which it was written in.
+        return
+    setgid = (made if fresh else stat.S_IMODE(source.st_mode)) & stat.S_ISGID
+    for here, folders, files in os.walk(staging, followlinks=False):
+        for path in (Path(here), *(Path(here) / name for name in (*folders, *files))):
+            held = path.lstat()
+            if held.st_gid != source.st_gid:
+                os.chown(path, -1, source.st_gid, follow_symlinks=False)
+            if stat.S_ISDIR(held.st_mode) and (held.st_mode & stat.S_ISGID) != setgid:
+                path.chmod((stat.S_IMODE(held.st_mode) & ~stat.S_ISGID) | setgid)
 
 
 def _made_mode(parent: Path) -> int:

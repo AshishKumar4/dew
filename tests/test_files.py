@@ -292,3 +292,23 @@ def test_a_read_only_folder_replaced_leaves_no_tree_behind(tmp_path):
     # The release and its publication lock alone: nothing of the earlier tree or the staging.
     left = sorted(path.name for path in tmp_path.iterdir() if not path.name.startswith(".dew-lock-"))
     assert left == ["release"], left
+
+
+def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):
+    """A publisher that began against no tree, which another published while it wrote, publishes in the
+    group of the tree it replaces as its publication lock finds it, every entry of it (audit 2026-11-27
+    P05: the group was chosen from the view at its start)."""
+    groups = sorted({*os.getgroups(), os.getgid()} - {os.getgid()})
+    other = groups[0] if groups else (os.getgid() + 1 if os.geteuid() == 0 else None)
+    if other is None:
+        pytest.skip("this process can give no group but its own")
+    destination = tmp_path / "release"
+    with swapped(destination, _nothing_foreign) as staging:
+        (staging / "nested").mkdir()
+        (staging / "nested" / "model.safetensors").write_text("ours")
+        # Another publisher's tree, in another group, published while this one is written.
+        destination.mkdir()
+        (destination / "model.safetensors").write_text("theirs")
+        os.chown(destination, -1, other)
+    published = [destination, *destination.rglob("*")]
+    assert {path.lstat().st_gid for path in published} == {other}
