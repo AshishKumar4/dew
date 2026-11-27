@@ -846,6 +846,8 @@ CONTRACTED = {"mul": "fmul", "add": "fadd", "sub": "fsub"}
 """A fused multiply-add's names (`_contracted`): its multiply's and the add's or subtract's that reads it,
 each bound as the primitive it names (its params'), the multiply priced nothing beside its reader
 (`cost.work`)."""
+BOUND_AS = {contracted: name for name, contracted in CONTRACTED.items()}
+"""The operation each of a fused multiply-add's names binds as (`CONTRACTED`'s, by its name)."""
 
 
 def _contracted() -> tuple[RuleFamily, ...]:

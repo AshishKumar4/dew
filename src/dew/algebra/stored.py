@@ -49,7 +49,7 @@ from jax.extend.core import Jaxpr, Primitive, primitives
 
 from dew import _code, _files
 from dew._builds import dew_cache_dir
-from dew.algebra import terms
+from dew.algebra import rules, terms
 from dew.algebra.terms import Term
 from dew.nn.kernels.templates import report as kernel_report
 
@@ -131,7 +131,8 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms]) ->
         literals = [_literal(value) for value in _listed(record["literals"])]
         decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
                            literals=len(region.literals) + len(literals),
-                           params=len(region.params) + len(params), states=len(_listed(record["steps"])))
+                           primitives=[primitive for primitive, _ in (*region.params, *params)],
+                           states=len(_listed(record["steps"])))
         made = assembled(record, decoded=decoded, value=_value)
         # Each literal a derivation appends is shaped as it is (`_appended`).
         shapes = [(Term.literal(i64(index)), literal.shape)
@@ -292,11 +293,13 @@ class _Decoded:
         return None if index is None else self(index, sides=sides)
 
 
-def _decoded(table: list, *, leaves: int, literals: int, params: int, states: int) -> _Decoded:
+def _decoded(table: list, *, leaves: int, literals: int, primitives: Sequence[Primitive],
+             states: int) -> _Decoded:
     """An entry's `table` (`_Writer.table`) decoded over a region of `leaves` leaves, `literals` literals and
-    `params` parameters (its own appended ones counted), carrying `states` states, each term checked as it is
-    built: each argument of its kind and a term's one before it, a leaf, a literal, an operation's parameters
-    and a state in range, a state of side 0 or 1, each name a constructor's (`ValueError` otherwise)."""
+    parameters of `primitives` (its own appended ones counted), carrying `states` states, each term checked
+    as it is built: each argument of its kind and a term's one before it, a leaf, a literal, an operation's
+    parameters and a state in range, an operation's parameters its own (`_operated`), a state of side 0 or
+    1, each name a constructor's (`ValueError` otherwise)."""
     made: list[Term] = []
     reads: list[frozenset[int]] = []
     for entry in table:
@@ -322,12 +325,36 @@ def _decoded(table: list, *, leaves: int, literals: int, params: int, states: in
             # A leaf's and a literal's index, its first argument.
             if not 0 <= terms.integer(values[0]) < (leaves if name == "leaf" else literals):
                 raise ValueError(f"a {name} past its region's")
-        elif values and isinstance(values[-1], i64) and not 0 <= terms.integer(values[-1]) < params:
+        elif values and isinstance(values[-1], i64):
             # An operation's parameters by index, its last argument where it is one.
-            raise ValueError(f"a {name}'s parameters past its region's")
+            if not 0 <= (index := terms.integer(values[-1])) < len(primitives):
+                raise ValueError(f"a {name}'s parameters past its region's")
+            _operated(name, values, primitives[index])
         made.append(constructor(*values))
         reads.append(read)
     return _Decoded(tuple(made), tuple(reads))
+
+
+_WRITTEN = {written.constructor: (kind, written.names) for kind, written in terms.WRITTEN.items()}
+"""Each operation's constructor by its name: its kind of operation and the field of it its name is
+(`terms.Written.names`)."""
+
+
+def _operated(name: str, values: list, primitive: Primitive) -> None:
+    """That the parameters of `primitive` a term of constructor `name` over `values` reads are of its own
+    operation (`terms.OPERATIONS`): its kind, and where the term names it (its second argument) its symbol
+    or monoid, a fused multiply-add's name the one it binds as (`rules.BOUND_AS`; `ValueError` otherwise).
+    A derived walk's rescale (`terms.RESCALE`), no program's operation, reads the parameters its
+    declaration's exponent gives it."""
+    kind, names = _WRITTEN[name]
+    named = None if names is None else terms.text(values[1])
+    if name == "binary" and named == terms.RESCALE:
+        return
+    operation = terms.OPERATIONS.get(primitive)
+    if operation is None or operation.kind != kind or (
+            named is not None and rules.BOUND_AS.get(named, named) != (
+                operation.symbol if names == "symbol" else operation.monoid)):
+        raise ValueError(f"a {name} {named or ''} reading {primitive}'s parameters")
 
 
 def _argument(kind: str, value):
