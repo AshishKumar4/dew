@@ -89,6 +89,7 @@ from .precision import (
     at_least_fp32,
     at_precision,
     capped_logits,
+    compensated_sum,
     configurable_precision,
     configured_precision,
     exact_products,
@@ -590,10 +591,33 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
 
     `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU under
     Dew's tests sums an fp32 one in float64 and rounds once (`precision.accumulated`).
+    A CPU's fp32 product over more keys than `VALUE_BLOCK` sums each block of
+    keys apart and joins the blocks' sums once, compensated (`compensated_sum`):
+    one dot over a T5 encoder's 256 keys rounded its long fp32 sum 2.2 times as
+    far from float64 as torch's CPU attention, which sums keys in blocks (row
+    13655); an accelerator's product, and a 16-bit one, is the one dot.
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
-    return float32_einsum(equation, weights.astype(value.dtype), value, precision=precision)
+    weights = weights.astype(value.dtype)
+    keys = value.shape[-3]
+    if value.dtype != jnp.float32 or keys <= VALUE_BLOCK:
+        return float32_einsum(equation, weights, value, precision=precision)
+
+    def whole(weights, value):
+        return float32_einsum(equation, weights, value, precision=precision)
+
+    def blocked(weights, value):
+        sums = [float32_einsum(equation, weights[..., start:start + VALUE_BLOCK],
+                               value[..., start:start + VALUE_BLOCK, :, :], precision=precision)
+                for start in range(0, keys, VALUE_BLOCK)]
+        return compensated_sum(jnp.stack(sums), (0,))
+
+    return jax.lax.platform_dependent(weights, value, cpu=blocked, default=whole)
+
+
+VALUE_BLOCK = 64
+"""The keys a CPU's fp32 probability-value product sums apart before it joins them (`weighted_values`)."""
 
 
 class Products(NamedTuple):
