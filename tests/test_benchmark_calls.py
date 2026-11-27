@@ -510,6 +510,13 @@ def _tpu_capture(directory, ops, runs, read=None, *, deferred: bool = False):
     (run / "host.xplane.pb").write_bytes(space)
 
 
+OPCODES = {"fusion.1": "fusion", "custom-call.2": "custom-call", "fusion.4": "fusion", "fusion.5": "fusion",
+           "fusion.9": "fusion", "copy-start": "copy-start", "copy-done": "copy-done", "fusion": "fusion",
+           "fusion.2": "fusion", "copy.3": "copy"}
+"""The opcodes of the instructions of the module the captures' calls run, by name (`tpu_ops`'
+`instructions`)."""
+
+
 def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path):
     """A TPU call's device time (`benchmark.tpu_ops`, the kernel tuner's on a TPU core) is the ops of its
     program's one run on its devices, each its device milliseconds: another program's ops and run, a host
@@ -525,58 +532,60 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     runs = [(0, "jit_run(7)", 0.0, 1.0, 7), (0, "jit_other(9)", 2.0, 3.0, 9), (1, "jit_run(7)", 0.0, 4.0, 7)]
     one = tmp_path / "one"
     _tpu_capture(one, ops, runs)
-    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run", annotation=READ)] == [
+    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run", annotation=READ,
+                                                         instructions=OPCODES)] == [
         ("fusion.1", 0.25), ("custom-call.2", 0.75)]
-    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", annotation=READ)] == [
+    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", annotation=READ, instructions=OPCODES)] == [
         "fusion.1", "custom-call.2", "fusion.9"]
     # Its enqueue deferred to a queue's thread (a tuple index table's transfer first, M-FS-105), after its
     # execute has ended: read through the flow its execute produces, the other call's issue on the same
     # queue still not the call's.
     deferred = tmp_path / "deferred"
     _tpu_capture(deferred, ops, runs, deferred=True)
-    assert [op.name for op in tpu_ops(deferred, {0, 1}, "jit_run", annotation=READ)] == [
+    assert [op.name for op in tpu_ops(deferred, {0, 1}, "jit_run", annotation=READ,
+                                      instructions=OPCODES)] == [
         "fusion.1", "custom-call.2", "fusion.9"]
     deferred_foreign = tmp_path / "deferred-foreign"
     _tpu_capture(deferred_foreign, ops, runs, read=(3,), deferred=True)
     with pytest.raises(NoKernels):
-        tpu_ops(deferred_foreign, {0}, "jit_run", annotation=READ)
+        tpu_ops(deferred_foreign, {0}, "jit_run", annotation=READ, instructions=OPCODES)
     # A same-named executable's run the read's call did not enqueue (another call's, its linkage on another
     # thread within the read's annotation): no run of the call's, though its name is the call's module's.
     foreign = tmp_path / "foreign"
     _tpu_capture(foreign, ops, runs, read=(3,))
     with pytest.raises(NoKernels):
-        tpu_ops(foreign, {0}, "jit_run", annotation=READ)
+        tpu_ops(foreign, {0}, "jit_run", annotation=READ, instructions=OPCODES)
     for devices in ({2}, set()):
         with pytest.raises(NoKernels):
-            tpu_ops(one, devices, "jit_run", annotation=READ)
+            tpu_ops(one, devices, "jit_run", annotation=READ, instructions=OPCODES)
     with pytest.raises(NoKernels):
-        tpu_ops(one, {0}, "jit_idle", annotation=READ)
+        tpu_ops(one, {0}, "jit_idle", annotation=READ, instructions=OPCODES)
     # A call on TPUs 0 and 1 whose capture holds its run on TPU 0 alone, another program's on TPU 1; or its
     # run on TPU 1 with no op of its own: part of the call, refused.
     half = tmp_path / "half"
     _tpu_capture(half, ops, [runs[0], (1, "jit_other(9)", 0.0, 4.0, 9)])
     with pytest.raises(NoKernels):
-        tpu_ops(half, {0, 1}, "jit_run", annotation=READ)
+        tpu_ops(half, {0, 1}, "jit_run", annotation=READ, instructions=OPCODES)
     idle = tmp_path / "idle"
     _tpu_capture(idle, ops[:4], runs)
     with pytest.raises(NoKernels):
-        tpu_ops(idle, {0, 1}, "jit_run", annotation=READ)
+        tpu_ops(idle, {0, 1}, "jit_run", annotation=READ, instructions=OPCODES)
     twice = tmp_path / "twice"
     _tpu_capture(twice, ops, [*runs, (0, "jit_run(7)", 1.5, 1.8, 7)])
     with pytest.raises(AmbiguousCapture):
-        tpu_ops(twice, {0}, "jit_run", annotation=READ)
+        tpu_ops(twice, {0}, "jit_run", annotation=READ, instructions=OPCODES)
     # Another program's run overlapping the call's on its core: the ops within it not told apart, refused.
     overlapped = tmp_path / "overlapped"
     _tpu_capture(overlapped, ops, [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
     with pytest.raises(AmbiguousCapture):
-        tpu_ops(overlapped, {0}, "jit_run", annotation=READ)
+        tpu_ops(overlapped, {0}, "jit_run", annotation=READ, instructions=OPCODES)
     # An op inside the call's run stating another program, or one where the run states none: refused.
     for listed, ran in (([*ops, (0, "fusion.5", 0.5, 0.75, 9)], runs),
                         (ops, [(0, "jit_run", 0.0, 1.0, None)])):
         stray = tmp_path / f"stray{len(listed)}"
         _tpu_capture(stray, listed, ran)
         with pytest.raises(AmbiguousCapture):
-            tpu_ops(stray, {0}, "jit_run", annotation=READ)
+            tpu_ops(stray, {0}, "jit_run", annotation=READ, instructions=OPCODES)
     # Runs naming two programs on the call's two devices, or a run naming none, its ops stating none (a v5e's
     # layout): not one call's, refused. A host transfer the only op inside a run stating its program by stat:
     # no op of the call's.
@@ -585,11 +594,11 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         unnamed = tmp_path / name
         _tpu_capture(unnamed, [(0, "fusion.1", 0.0, 0.25, None), (1, "fusion.9", 0.0, 4.0, None)], ran)
         with pytest.raises(AmbiguousCapture):
-            tpu_ops(unnamed, {0, 1}, "jit_run", annotation=READ)
+            tpu_ops(unnamed, {0, 1}, "jit_run", annotation=READ, instructions=OPCODES)
     carried = tmp_path / "carried"
     _tpu_capture(carried, [(0, "transfer", 0.25, 0.5, None)], runs[:1])
     with pytest.raises(NoKernels):
-        tpu_ops(carried, {0}, "jit_run", annotation=READ)
+        tpu_ops(carried, {0}, "jit_run", annotation=READ, instructions=OPCODES)
 
 
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
@@ -597,8 +606,10 @@ def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp
     recorded, their HLO text shortened): its run on the `XLA Modules` line names its program in its name,
     `jit_fs90_profiled_gemm(370734272565018276)`, with no program_id stat, and its ops on `XLA Ops` state no
     program at all; the call is the ops inside its run's span on its core (one program running there at a
-    time), another program's run before and after it (synthetic, as are their ops) left out."""
-    from dew.telemetry.benchmark import tpu_ops
+    time), another program's run before and after it (synthetic, as are their ops) left out, each op the
+    instruction of its module its HLO text names; a run of transfers alone, or holding an op naming none of
+    its module's instructions, refused."""
+    from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
 
     started = "%copy-start = (bf16[8192,4096]{1,0:T(8,128)(2,1)S(1)}) copy-start(%x.1)"
     done = "%copy-done = bf16[8192,4096]{1,0:T(8,128)(2,1)S(1)} copy-done(%copy-start)"
@@ -612,17 +623,31 @@ def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp
             (0, gemm, 7.198516, 8.624395, None)]
     v5e = tmp_path / "v5e"
     _tpu_capture(v5e, ops, runs)
-    read = tpu_ops(v5e, {0}, "jit_fs90_profiled_gemm", annotation=READ)
+    read = tpu_ops(v5e, {0}, "jit_fs90_profiled_gemm", annotation=READ, instructions=OPCODES)
     # Each op's milliseconds its own picoseconds, as the capture states them.
     assert [(op.name, round(op.milliseconds * 1e9)) for op in read] == [
         (started, 13000), (done, 2000), (fused, 1425826000)]
+    # Its ops read as the instructions they name (their HLO text's): a run of its copies alone, async or
+    # not, times no kernel of the call's, and one holding an op no instruction of its module names (a label
+    # whose first word does is none) is another's.
+    copied = "%copy.3 = bf16[8192,4096]{1,0} copy(%x.1)"
+    for name, inside, refusal in (("copies", [ops[1], ops[2]], NoKernels),
+                                  ("copy", [(0, copied, 7.198568, 8.624394, None)], NoKernels),
+                                  ("stray", [*ops[1:3], (0, "%fusion.7 = f32[8] fusion(%x.1)", 7.198568,
+                                                         8.624394, None)], AmbiguousCapture),
+                                  ("label", [*ops[1:3], (0, "fusion synchronization", 7.198568, 8.624394,
+                                                         None)], AmbiguousCapture)):
+        refused = tmp_path / name
+        _tpu_capture(refused, inside, runs)
+        with pytest.raises(refusal):
+            tpu_ops(refused, {0}, "jit_fs90_profiled_gemm", annotation=READ, instructions=OPCODES)
 
 
 def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():
     """A TPU call is timed as a compiled program called with its dynamic operands (`benchmark._program_of`),
-    whose module names its runs (`_module_of`); a jitted function, whose call may run no program (with JIT
-    disabled) or take other operands than its compile (static arguments), and a plain function are
-    refused (`AmbiguousCapture`)."""
+    whose module names its runs and whose instructions its ops (`_module_of`); a jitted function, whose call
+    may run no program (with JIT disabled) or take other operands than its compile (static arguments), and a
+    plain function are refused (`AmbiguousCapture`)."""
     from dew.telemetry.benchmark import AmbiguousCapture, _module_of, _program_of
 
     def scaled(x):
@@ -632,7 +657,10 @@ def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_ot
     with jax.default_device(jax.local_devices(backend="cpu")[0]):
         jitted = jax.jit(scaled)
         compiled = jitted.lower(jnp.ones((8,), jnp.float32)).compile()
-    assert _program_of(compiled) is compiled and _module_of(compiled) == "jit_scaled"
+    name, instructions = _module_of(compiled)
+    assert _program_of(compiled) is compiled and name == "jit_scaled"
+    # Its instructions' opcodes by name, which its ops name on a TPU (`tpu_ops`): its product among them.
+    assert "multiply" in instructions.values()
     for refused in (jitted, scaled):
         with pytest.raises(AmbiguousCapture):
             _program_of(refused)
