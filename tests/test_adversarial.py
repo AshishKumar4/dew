@@ -29,7 +29,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
-from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
+from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, DiffusionObjective
 from dew.registry import ModelConfig
 from dew.sampling import Consistency, Euler
 from dew.training import Trainer
@@ -174,19 +174,21 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("ladd")
     teacher = DiffusionRunConfig(
-        model=ModelConfig("simple_dit",
-                          {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
-                           "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=2, num_heads=2, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, ema_decay=None)))
     _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 4), root / "teacher", 1e-2,
                                        key=0)
-    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
-        "ladd", {"feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
-        "kernel_size": [3, 3], "solver": Consistency(), "steps": 2, "ema_decay": None}))
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"),
+                                  objective=ObjectiveConfig(
+                                      functools.partial(AdversarialDistillationObjective,
+                                                        feature_layers=["dit_block_0", "dit_block_1"],
+                                                        cmap_dim=8, kernel_size=[3, 3], solver=Consistency(),
+                                                        steps=2, ema_decay=None)))
     return student, batch
 
 

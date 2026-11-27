@@ -3,6 +3,7 @@ autoencoder's reconstruction and latent, trained by `Supervised` on the
 reconstruction's squared error plus the latent's KL divergence from a unit
 Gaussian. `dew train` imports it as `autoencoder_experiment`."""
 
+import functools
 import json
 import tempfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
+from dew.objectives.supervised import Supervised
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 
@@ -68,7 +70,8 @@ def run() -> RunConfig:
         # Formatting reads each JSON point as an array of numbers.
         data=Files(files["train"]).map(Formatting()).shuffle(seed=0).repeat().batch(32),
         validation=Files(files["validation"]).map(Formatting()).batch(32),
-        objective=ObjectiveConfig("supervised", {"loss": evidence_bound, "metrics": (reconstruction_error,),
-                                                 "inputs": InputSpec(Field("x", (FEATURES,)))}),
+        objective=ObjectiveConfig(functools.partial(Supervised, loss=evidence_bound,
+                                                    metrics=(reconstruction_error,),
+                                                    inputs=InputSpec(Field("x", (FEATURES,))))),
         optim=OptimConfig(lr=1e-2),
         trainer=TrainerConfig(steps=40, log_every=1, eval_every=None, checkpoint_every=40))

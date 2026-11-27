@@ -30,6 +30,7 @@ the Mamba-2 width and expert width follow d, and m_width is d / 128.
 """
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 
 import tyro
@@ -39,6 +40,8 @@ from dew.config.lm import LMRunConfig
 from dew.data import Phase, Steps, mix, phases, presets
 from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.lm.objective import LMObjective
 from dew.optim import AdamW, OptimConfig, ParamGroup, Power, PowerTail
 from dew.registry import ModelConfig
 
@@ -157,12 +160,13 @@ class RigelArgs:
 def run_config(args: RigelArgs) -> LMRunConfig:
     """The LM run config for `args`."""
     return LMRunConfig(
-        model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
+        model=ModelConfig(functools.partial(CausalTransformer,
+                                            **{**model_config(args.width), "dtype": "bfloat16"})),
         data=phased(args.corpora, args.steps, args.seq_len, args.batch_size),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
         trainer=TrainerConfig(steps=args.steps, eval_every=None, checkpoint_every=5_000),
-        objective=ObjectiveConfig("lm", {"balance": {
-            "aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}}),
+        objective=ObjectiveConfig(functools.partial(LMObjective, balance={
+            "aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001})),
         tokenizer=args.tokenizer, max_new_tokens=0)
 
 

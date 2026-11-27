@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import time
@@ -54,13 +55,17 @@ import jax.numpy as jnp
 import numpy as np
 from flax import serialization, traverse_util
 
+from dew import registry
 from dew._files import write_atomically
 from dew._records import JSON, integer, real
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
+from dew.objectives.rl.control import ControlRollout
+from dew.objectives.rl.dreamer import DreamerRollout
 from dew.optim import Adam, LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
+from dew.rl.flight import FlightEnv, GateRace
 
 AUXILIARY = (("state", 512), ("gates", 512), ("airframe", 256), ("physics", 256), ("obstacles", 256))
 """The world model's auxiliary heads: each privileged view and its head's units, its width the race's."""
@@ -126,13 +131,14 @@ def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> En
     rollout = {"unroll_length": round(32 * hz / 30), "epochs": 4, "minibatches": 32}
     every = SCORED_EVERY * rollout["epochs"] * rollout["minibatches"]
     return EnvRunConfig(
-        env=EnvConfig("flight", flight, count=drones),
-        model=ModelConfig(f"{CONTROL}:ActorCritic",
-                          {"policy_layers": [256] * 3, "value_layers": [256] * 4, "spread": 0.2}),
-        objective=ObjectiveConfig(f"{CONTROL}:ControlPPOObjective", {
-            "discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz), "clip": 0.2, "entropy_cost": 1e-4,
-            "reads": ["teacher"]}),
-        rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer=Adam(), lr=3e-4,
+        env=EnvConfig(functools.partial(FlightEnv, **flight), count=drones),
+        model=ModelConfig(functools.partial(registry.models[f"{CONTROL}:ActorCritic"],
+                                            policy_layers=[256] * 3, value_layers=[256] * 4, spread=0.2)),
+        objective=ObjectiveConfig(functools.partial(registry.objectives[f"{CONTROL}:ControlPPOObjective"],
+                                                    discount=0.99 ** (60 / hz), lam=0.95 ** (60 / hz),
+                                                    clip=0.2, entropy_cost=1e-4, reads=["teacher"])),
+        rollout=RolloutConfig(functools.partial(ControlRollout, **rollout)),
+        optim=OptimConfig(optimizer=Adam(), lr=3e-4,
                                                                      clip=1.0),
         trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every,
                               eval_every=None, checkpoint_every=None, keep=Keep(latest=1, every=every)))
@@ -412,9 +418,10 @@ class World:
         # DreamerV3's rate, 4e-5 after a linear warmup over its first 1000 updates.
         rate = Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)
         run = EnvRunConfig(
-            env=EnvConfig("gate_race", race),
-            objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective", objective),
-            rollout=RolloutConfig("dreamer", rollout),
+            env=EnvConfig(functools.partial(GateRace, **race)),
+            objective=ObjectiveConfig(functools.partial(registry.objectives[f"{DREAMER}:DreamerV3Objective"],
+                                                        **objective)),
+            rollout=RolloutConfig(functools.partial(DreamerRollout, **rollout)),
             teacher=TeacherConfig(str(self.teacher), self.teacher_step, demonstrates=True),
             optim=OptimConfig(optimizer=LaProp(), schedule=rate),
             trainer=TrainerConfig(checkpoint_dir=str(self.out), key=STAGES.index(stage), log_every=1000,
@@ -425,7 +432,9 @@ class World:
                     "context": self.length, "dtype": "bfloat16"}
         model = {"conv_depth": 64, "units": 1024, "reads": "image", "dtype": "bfloat16",
                  "auxiliary": [list(head) for head in AUXILIARY], "dynamics": dynamics}
-        return dataclasses.replace(run, model=ModelConfig(f"{DREAMER}:WorldModel", model))
+        return dataclasses.replace(run,
+                                   model=ModelConfig(functools.partial(
+                                       registry.models[f"{DREAMER}:WorldModel"], **model)))
 
 
 def _staged(world: World, stage: str, updates: int, every: int | None, report: dict, judge, races: tuple,

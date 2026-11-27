@@ -8,6 +8,7 @@ batches it draws further, RLOO's reference penalty in the reward, and the global
 over a batch split into data shares."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,7 @@ from dew.config import ObjectiveConfig
 from dew.config.lm import PromptRollout
 from dew.nn.progress import Progress
 from dew.objectives.rl import RolloutScheduler, Synchronous
-from dew.objectives.rl.grpo import _Terms
+from dew.objectives.rl.grpo import GRPOObjective, _Terms
 from dew.objectives.rl.methods import method
 from dew.objectives.rl.scheduler import scored_rows
 from dew.objectives.rl.sessions import (
@@ -87,7 +88,8 @@ def composed(name, model, seq_len, *, max_new_tokens=8, overlong_cache=None, **f
     (`PromptRollout.scheduler_settings`)."""
     rollout = PromptRollout(reward=completion_length, method=name, max_new_tokens=max_new_tokens,
                             overlong_cache=overlong_cache)
-    objective = ObjectiveConfig("grpo", fields).build(model=model, seq_len=seq_len,
+    objective = ObjectiveConfig(
+        functools.partial(GRPOObjective, **fields)).build(model=model, seq_len=seq_len,
                                                        **rollout.objective_settings())
     return objective, rollout.scheduler_settings()
 

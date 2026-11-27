@@ -1042,10 +1042,12 @@ def _assembled(record: Mapping, *, decoded: stored._Decoded, value: Callable, re
                        for mapped, output in zip(record["mapped"], region.outputs, strict=True))):
         raise ValueError("an entry whose forms' counts are not its region's")
     equations, admitted, fired, limits, iterations, nodes, limited, before, after = record["report"]
-    if not (all(stored.integral(number) for number in (equations, iterations, nodes, *limits))
+    if not (all(isinstance(held, list) for held in (admitted, fired, limits))
+            and all(stored.integral(number) for number in (equations, iterations, nodes, *limits))
             and len(limits) == 2 and isinstance(limited, bool)
             and all(isinstance(name, str) for name in admitted)
-            and all(isinstance(name, str) and stored.integral(number) for name, number in fired)):
+            and all(isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str)
+                    and stored.integral(pair[1]) for pair in fired)):
         raise ValueError("an entry whose report is not a derivation's")
     floors = tuple(map(value, record["floors"]))
     before, after = value(before), value(after)

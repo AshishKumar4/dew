@@ -7,6 +7,7 @@ their feature extractors, so nothing downloads: a wav2vec2 that reads
 trains on are muxed here by the ffmpeg the `av` extra bundles.
 """
 
+import functools
 import subprocess
 
 import jax
@@ -27,7 +28,9 @@ from dew.data.dataset import DataPartition
 from dew.data.images import CAPTIONS
 from dew.data.sources.files import Files
 from dew.inputs import AudioCondition, Condition, HFAudio
+from dew.nn.backbones.video_dit import VideoDiT
 from dew.objectives.base import Step
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import ModelConfig, to_record
 from dew.sampling import CFG
 from dew.training import Trainer
@@ -204,10 +207,11 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
         context=1 / 25).read("memory").loading(Loading(workers=0))
     seconds = data.facts()["audio_seconds"]
     config = DiffusionRunConfig(
-        model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
-                                        "num_heads": 2, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(VideoDiT, patch_size=4, emb_features=32,
+                                            num_layers=1, num_heads=2, dtype="float32")),
         data=data, text=None, audio=AudioCondition(checkpoint=str(towers / "wav2vec2")), val_metrics=(),
-        objective=ObjectiveConfig("diffusion", {"steps": 4, "guidance": CFG(2.0), "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, steps=4,
+                                                    guidance=CFG(2.0), ema_decay=None)))
     objective = config.build()
     assert objective.inputs.conditions["textcontext"].encoder.seconds == seconds
     assert DiffusionRunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()

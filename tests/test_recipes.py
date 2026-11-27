@@ -6,6 +6,7 @@ refuse its own command is red: the decision recipe's `--trainer.steps 2000` was 
 cadence ("epoch"), which no test of the recipes ran."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from run_kinds import QWEN_TINY, TINY_LAYA, pictures
 from token_support import write_token_corpus
 from tool_support import load
 
+from dew import registry
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
@@ -33,8 +35,8 @@ IMAGE_MODEL = {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads"
 def with_model(run, name: str | None = None, **fields):
     """`run` with its model's `fields` over its own, of the class `name` names where given: what a user states
     by editing a recipe's run."""
-    model = run.model if name is None else ModelConfig(name)
-    return dataclasses.replace(run, model=dataclasses.replace(model, fields={**model.fields, **fields}))
+    model = run.model if name is None else ModelConfig(functools.partial(registry.models[name]))
+    return dataclasses.replace(run, model=model.with_fields(**fields))
 
 
 def saved(root: Path, state) -> bool:

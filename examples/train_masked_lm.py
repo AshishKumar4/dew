@@ -23,6 +23,7 @@ lines of text as JSON, byte-tokenizes them and trains a tiny model for four
 steps on one CPU device. It needs no network.
 """
 
+import functools
 import json
 import time
 from dataclasses import dataclass, field, replace
@@ -36,6 +37,7 @@ from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import AdamW, Cosine, OptimConfig
@@ -120,13 +122,15 @@ def main(config: Config) -> Path:
                             mesh=MeshSpec(fsdp=1), multi_host=False)
     # The mask is the id past the tokenizer's, so no text can contain it.
     run = LMRunConfig(
-        model=ModelConfig("causal_transformer", {
+        model=ModelConfig(functools.partial(CausalTransformer, **{
             **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
-            "dtype": "float32" if config.smoke else "bfloat16"}),
+            "dtype": "float32" if config.smoke else "bfloat16"})),
         data=data, validation=validation, tokenizer=config.tokenizer,
-        objective=ObjectiveConfig("masked_diffusion", {
-            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999,
-            "eos_token_ids": () if tokenizer.eos_id is None else (tokenizer.eos_id,)}),
+        objective=ObjectiveConfig(functools.partial(MaskedDiffusionObjective,
+                                                    steps=config.sample_steps,
+                                                    ema_decay=0.9 if config.smoke else 0.999,
+                                                    eos_token_ids=() if tokenizer.eos_id is None else (
+                                                        tokenizer.eos_id,))),
         optim=OptimConfig(optimizer=AdamW(weight_decay=0.03), clip=1.0, schedule=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 10)),

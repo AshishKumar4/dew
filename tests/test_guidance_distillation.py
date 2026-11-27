@@ -3,6 +3,7 @@ Flux pipeline's text towers: the loss written out from the paper's equation,
 and a saved student run restored."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
 import jax
@@ -14,6 +15,7 @@ from diffusion_support import images_of, saved_after_one_step, saved_unstepped
 from interop_support import extract_fixture
 from model_support import attending
 
+from dew import registry
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
@@ -21,9 +23,11 @@ from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
 from dew.inference import TextToImage
 from dew.inputs import TextCondition, unit_range
+from dew.nn.backbones.flux import FluxTransformer
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 
@@ -52,16 +56,19 @@ def runs(tmp_path_factory, request):
     root = tmp_path_factory.mktemp("guidance")
     extract_fixture(FIXTURES / "flux_source.tar.xz", root / "flux")
     teacher = DiffusionRunConfig(
-        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32"}),
+        model=ModelConfig(
+            functools.partial(FluxTransformer, **{**FLUX, "dtype": "float32"})),
         data=images_of("tfds://oxford_flowers102", 8), preset=request.param, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, ema_decay=None)))
     _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 8), root / "teacher", 1e-2,
                                        key=0)
-    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
-        "guidance_distillation", {"scales": [1.0, 6.0], "solver": Euler(), "steps": 2, "ema_decay": None}))
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"),
+                                  objective=ObjectiveConfig(functools.partial(
+                                      registry.objectives["guidance_distillation"], scales=[1.0, 6.0],
+                                      solver=Euler(), steps=2, ema_decay=None)))
     return root, student, batch
 
 

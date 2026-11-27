@@ -13,6 +13,7 @@ same run from that record alone, continuing it from its own checkpoints:
 
     PYTHONPATH=examples dew train checkpoints/train_supervised/run.json --trust train_supervised
 """
+import functools
 import json
 import tempfile
 from pathlib import Path
@@ -25,7 +26,7 @@ from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
-from dew.objectives.supervised import Accuracy
+from dew.objectives.supervised import Accuracy, Supervised
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 
@@ -71,7 +72,8 @@ def run() -> RunConfig:
         # Formatting reads each JSON point as an array of numbers.
         data=Files(files["train"]).map(Formatting()).shuffle(seed=0).repeat().batch(64),
         validation=Files(files["validation"]).map(Formatting()).batch(64),
-        objective=ObjectiveConfig("supervised", {
-            "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
+        objective=ObjectiveConfig(functools.partial(Supervised, loss=cross_entropy,
+                                                    metrics=(
+                                                        Accuracy(),), inputs=InputSpec(Field("x", (2,))))),
         optim=OptimConfig(lr=3e-3),
         trainer=TrainerConfig(steps=300, log_every=50, eval_every=100, checkpoint_every=100))

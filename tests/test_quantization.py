@@ -34,6 +34,7 @@ from dew.distributed.batches import shard_batch
 from dew.distributed.placement import Layout, MeshSpec
 from dew.lora import _low_rank as lora_low_rank, _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
+from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import torch_bicubic_resize
 from dew.nn.kv_cache import hadamard, rotated
 from dew.nn.precision import FP32_SUMS
@@ -41,6 +42,7 @@ from dew.nn.quantizers import nearest_codewords
 from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.quantization import UNQUANTIZED, Quantization, entry_methods, quantize_for_serving, quantize_with
@@ -1395,14 +1397,15 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     from dew.registry import ModelConfig
 
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
-                                         "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=4, emb_features=16,
+                                            num_layers=1, num_heads=2, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), steps=1,
                               eval_every=None, checkpoint_every=None, compilation_cache_dir=None, **trainer),
-                              objective=ObjectiveConfig("diffusion",
-                              {"guidance": None, "steps": 2}))
+                              objective=ObjectiveConfig(
+                                  functools.partial(DiffusionObjective, guidance=None,
+                                                    steps=2)))
 
 
 def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):

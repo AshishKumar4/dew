@@ -3,6 +3,7 @@ release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`
 own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
+import functools
 import json
 import shutil
 from pathlib import Path
@@ -26,6 +27,9 @@ from dew.interop.pretrained import load_diffusion_source
 from dew.interop.saved_sources import export_run, released_run
 from dew.kernels import Kernels
 from dew.lora import LoRA
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.unet import Unet
+from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
 
@@ -234,10 +238,10 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     from dew.interop.layouts import source_layout
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    gated = ModelConfig("causal_transformer", {
-        "emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32", "parallel_residual": True,
-        "shared_parallel_norm": True, "head_bias": True, "attention_bias": False, "mlp": "swiglu",
-        "position_embedding": "learned"})
+    gated = ModelConfig(functools.partial(CausalTransformer, emb_features=16,
+                                          num_layers=1, num_heads=2, dtype="float32", parallel_residual=True,
+                                          shared_parallel_norm=True, head_bias=True, attention_bias=False,
+                                          mlp="swiglu", position_embedding="learned"))
     first = dataclasses.replace(lm(tmp_path, drawn=False), model=gated)
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
@@ -267,7 +271,8 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
     leaves_alike(host.variables["params"], state.variables["params"])
     run = dataclasses.replace(first, pretrained=str(source), source=SourceOptions(step="latest"),
-                              model=ModelConfig("causal_transformer", {"dtype": "float32"}))
+                              model=ModelConfig(
+                                  functools.partial(CausalTransformer, dtype="float32")))
     second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
     assert int(second.step) == 1
     assert LMRunConfig.load(str(tmp_path / "runs" / "second")).pretrained == str(source)
@@ -393,9 +398,9 @@ def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_a
     from dew.inference.tasks import SavedRun, TextGeneration, saved_model
     from dew.interop.layouts import source_layout
 
-    routed = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 2, "num_heads": 2,
-                                                "mlp_features": 32, "dtype": "float32",
-                                                "mixture": {"experts": 4, "top_k": 2, "layers": [1]}})
+    routed = ModelConfig(functools.partial(CausalTransformer, emb_features=16,
+                                           num_layers=2, num_heads=2, mlp_features=32, dtype="float32",
+                                           mixture={"experts": 4, "top_k": 2, "layers": [1]}))
     trained(dataclasses.replace(lm(tmp_path, drawn=False), model=routed), tmp_path, "routed",
             trainer={"checkpoint_final": True})
     run, release = tmp_path / "runs" / "routed", tmp_path / "release"
@@ -452,8 +457,10 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
     source = tmp_path / "runs" / "first"
     read = SavedRun.pinned(str(source)).step
     command = dataclasses.replace(first, pretrained=str(source), text=None,
-                                  model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
-                                  objective=ObjectiveConfig("diffusion", {}))
+                                  model=ModelConfig(
+                                      functools.partial(Unet,
+                                                        **dict(DEFAULT_MODEL_CONFIG))),
+                                  objective=ObjectiveConfig(functools.partial(DiffusionObjective)))
     trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
     trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2,
                                                "checkpoint_final": True})
@@ -481,8 +488,10 @@ def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
     saved running a layer at a time resumes scanning them, and back, where its resume refused it as another
     model (row 4104)."""
     first = lm(tmp_path, drawn=False)
-    deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
-                                                          {**first.model.fields, "num_layers": 2}))
+    deeper = dataclasses.replace(first,
+                                 model=ModelConfig(
+                                     functools.partial(CausalTransformer,
+                                                       **{**first.model.fields, "num_layers": 2})))
     with stacked(scanned=False):
         trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
     for scanned, steps in ((True, 2), (False, 3)):
@@ -591,8 +600,9 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     run = dataclasses.replace(first, pretrained=str(source), source=SourceOptions(step="latest"), text=None,
-                              model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
-                              objective=ObjectiveConfig("diffusion", {}))
+                              model=ModelConfig(
+                                  functools.partial(Unet, **dict(DEFAULT_MODEL_CONFIG))),
+                              objective=ObjectiveConfig(functools.partial(DiffusionObjective)))
     task = TextToImage.from_run(str(source))
 
     objective = run.build()
@@ -647,10 +657,12 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     height, width = own.inputs.sample.shape[-3:-1]
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
+        model=ModelConfig(
+            functools.partial(Unet, **{**DEFAULT_MODEL_CONFIG, "dtype": "float32"})),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
-        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, steps=2,
+                                                    ema_decay=None)))
     saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
     # Wider and taller apart: a rectangle's two extents each read where they are.
     size = (2 * height, width + width // 2)
@@ -719,9 +731,11 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height),
         preset=Flow(resolution_shift=ResolutionShift(base_shift=mu, max_shift=mu)),
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
+        model=ModelConfig(
+            functools.partial(Unet, **{**DEFAULT_MODEL_CONFIG, "dtype": "float32"})),
         val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
-        objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, steps=2,
+                                                    ema_decay=None)))
     task, _, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
     # At its own size the run's process is the grid's, value for value.
     assert flow_shift(task) == flow_shift(own)
@@ -742,8 +756,9 @@ def test_a_diffusion_run_starts_from_an_adapted_run_with_its_base_frozen(tmp_pat
                          lora=LoRA(rank=2, modules=("ada_proj",)))
     run = dataclasses.replace(first, pretrained=str(tmp_path / "runs" / "adapted_first"),
                               source=SourceOptions(step="latest"), text=None,
-                              model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
-                              objective=ObjectiveConfig("diffusion", {}))
+                              model=ModelConfig(
+                                  functools.partial(Unet, **dict(DEFAULT_MODEL_CONFIG))),
+                              objective=ObjectiveConfig(functools.partial(DiffusionObjective)))
     from_adapted, _ = trained(run, tmp_path, "from_adapted")
     assert FROZEN in from_adapted.variables
     factors = sum(leaf.size for leaf in jax.tree.leaves(adapter.variables["params"]))
@@ -813,8 +828,10 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     from dew._cli.main import main
     from dew.registry import ModelConfig
 
-    run = dataclasses.replace(lm(tmp_path, drawn=False), model=ModelConfig(
-        "causal_transformer", {"emb_features": 256, "num_layers": 16, "num_heads": 4, "dtype": "float32"}))
+    run = dataclasses.replace(lm(tmp_path, drawn=False),
+                              model=ModelConfig(
+                                  functools.partial(CausalTransformer, emb_features=256,
+                                                    num_layers=16, num_heads=4, dtype="float32")))
     trained(run, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "shared_cache"))
@@ -916,8 +933,9 @@ def test_a_resume_compares_a_model_kind_named_remat(tmp_path):
     run = lm(tmp_path, drawn=False)
 
     def kinded(window: int) -> RunConfig:
-        return dataclasses.replace(run, model=dataclasses.replace(run.model, fields={
-            **run.model.fields, "layer_types": ("remat",), "kinds": {"remat": LayerKind(window=window)}}))
+        return dataclasses.replace(
+            run, model=run.model.with_fields(layer_types=("remat",),
+                                             kinds={"remat": LayerKind(window=window)}))
 
     saved = earlier_run(json.loads(json.dumps(kinded(4).record())))
     kinded(4).check_resume(saved)

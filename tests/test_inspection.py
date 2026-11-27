@@ -4,6 +4,7 @@ holds, and logged one log late; a run that watches nothing compiles its step unc
 import collections
 import contextlib
 import dataclasses
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -20,9 +21,11 @@ from objective_cases import cases
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, set_record, trained_record
 
+from dew import registry
 from dew._cli.main import main
 from dew.data.dataset import Loader
 from dew.nn.inspection import HISTOGRAM_EDGES, statistics
+from dew.objectives.lm.objective import LMObjective
 from dew.optim import Adam
 from dew.telemetry.compiles import Compiles
 from dew.training import Inspection, MeshSpec, Trainer, TrainerAdvanced, inspected
@@ -413,8 +416,12 @@ def watching_alone(kind: str, root: Path):
         globs = ["head/*"] if kind.endswith("path") else ["*Head", "*Readout"]
         return KINDS["decision"](root, drawn=False), globs
     run = KINDS[kind](root, drawn=False)
-    model = ModelConfig("causal_transformer", {**run.model.fields, "num_nextn_predict_layers": 2})
-    depths = dataclasses.replace(run, model=model, objective=ObjectiveConfig("lm", {"mtp_weight": 0.3}))
+    model = ModelConfig(
+        functools.partial(
+            registry.models["causal_transformer"], **{**run.model.fields, "num_nextn_predict_layers": 2}))
+    depths = dataclasses.replace(run, model=model,
+                                 objective=ObjectiveConfig(
+                                     functools.partial(LMObjective, mtp_weight=0.3)))
     return depths, ["mtp_1/*"]
 
 

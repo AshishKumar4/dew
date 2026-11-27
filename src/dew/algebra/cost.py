@@ -19,7 +19,7 @@ from egglog import DagCostModel, EGraph, get_callable_args
 
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
-from dew.algebra.rules import CONTRACTED, dtype as dtype_fact, param_dtype, shape
+from dew.algebra.rules import BOUND_AS, CONTRACTED, dtype as dtype_fact, param_dtype, shape
 from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -419,8 +419,6 @@ def model(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
     return DagCostModel(marginal_cost=marginal, identity=Seconds(Work(), schedule))
 
 
-PRIMITIVES = {contracted: name for name, contracted in CONTRACTED.items()}
-"""The primitive each of a fused multiply-add's names binds (`rules.CONTRACTED`)."""
 
 RISK = {"log": 1.0, "sub": 1e-3}
 """What a node of the stable proposal (`stable`) costs beside its time, in seconds: a logarithm whose value
@@ -438,7 +436,7 @@ def stable(region: Region, schedule: Schedule) -> DagCostModel[Seconds]:
         for constructor in (Term.unary, Term.binary):
             if (args := get_callable_args(node, constructor)) is not None:
                 # Each operation's name follows its first operand; a fused multiply-add's is its primitive's.
-                risk = RISK.get(PRIMITIVES.get(text(args[1]), text(args[1])), 0.0)
+                risk = RISK.get(BOUND_AS.get(text(args[1]), text(args[1])), 0.0)
                 return Seconds(done, schedule, risk)
         return Seconds(done, schedule)
 

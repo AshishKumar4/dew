@@ -6,11 +6,13 @@ class does not declare is refused.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
 import pytest
 
+from dew import registry
 from dew.config import ObjectiveConfig, RunConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.earlier import earlier_run
@@ -18,6 +20,7 @@ from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.decision.config import DecisionRunConfig
 from dew.kernels import Kernels
+from dew.objectives.lm.objective import LMObjective
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,9 +46,11 @@ def test_a_record_keeps_what_it_states_and_defaults_what_it_lacks():
     quantized = dataclasses.replace(run, trainer=dataclasses.replace(
         run.trainer, quantization=Quantization(dtype="fp8", patterns=(".*mlp.*",), weight_only=True)))
     assert DiffusionRunConfig.from_dict(written(quantized)) == quantized
-    stated = LMRunConfig(objective=ObjectiveConfig("lm", {"ema_decay": 0.99}))
+    stated = LMRunConfig(
+        objective=ObjectiveConfig(functools.partial(LMObjective, ema_decay=0.99)))
     assert LMRunConfig.from_dict({"objective": {"name": "lm", "fields": {"ema_decay": 0.99}}}) == stated
-    assert LMRunConfig.from_dict({}).objective == ObjectiveConfig("lm")
+    assert LMRunConfig.from_dict({}).objective == ObjectiveConfig(functools.partial(
+        registry.objectives["lm"]))
 
 
 PUBLISHED = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "run.json"
@@ -82,7 +87,7 @@ def test_the_published_run_reads_back_as_it_was_written(live):
         assert json.loads(published.read_text()) == held
     assert changed(json.loads(json.dumps(RunConfig.read(held).record())), held) == []
     stated = held["fields"]["objective"]["fields"]
-    built = RunConfig.read(held).objective.arguments
+    built = RunConfig.read(held).objective.field_records
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
 
 

@@ -4,7 +4,8 @@
 
 Oxford flowers is the default, its validation split held to score the probes; its data is a chain
 (`dew.data.presets.images`, its size and batch in `default`). The encoder is the run's model, which
-`default` states, the predictor takes the encoder's width and heads plus --predictor, and the probes score
+`default` states, the predictor takes the encoder's width and heads plus what --predictor binds (a
+`JepaPredictor`'s class record, `{"class": ..., "fields": {...}}`), and the probes score
 the frozen encoder at every validation (`dew.config.jepa.JepaRunConfig`).
 """
 
@@ -27,8 +28,7 @@ def default(train, held) -> JepaRunConfig:
     run = JepaRunConfig(data=train.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64),
                         validation=held.pipe(presets.images, 224, batch=64))
     encoder = {"patch_size": 16, "emb_features": 384, "num_layers": 12, "num_heads": 6}
-    return dataclasses.replace(run, model=dataclasses.replace(run.model,
-                                                              fields={**run.model.fields, **encoder}))
+    return dataclasses.replace(run, model=run.model.with_fields(**encoder))
 
 
 def main(argv: list[str] | None = None, images=None):

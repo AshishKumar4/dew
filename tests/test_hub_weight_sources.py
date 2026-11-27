@@ -121,10 +121,12 @@ LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "-
 `HF_ENDPOINT` as it imports the Hub client: the token files and the runs' root."""
 
 TRAIN_DECISION = """
+import functools
 import sys
 from dew.data import Files, Loading
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 table, root = sys.argv[1:3]
@@ -136,7 +138,8 @@ DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
                        "--trainer.checkpoint-every", "1", "--no-calibrate"],
                       default=DecisionRunConfig(
                           data=rows.loading(Loading(workers=0)),
-                          model=ModelConfig("causal_transformer", {"dtype": "float32"}))).run()
+                          model=ModelConfig(functools.partial(CausalTransformer,
+                                                              dtype="float32")))).run()
 """
 """A recorded decision run over a Hub backbone, through the command line, in a process of its own: the
 rows' table and the runs' root."""

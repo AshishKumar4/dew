@@ -1295,21 +1295,21 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
 
 
 GATED_DELTA_AHEAD = """
-import dataclasses, json, sys
+import dataclasses, functools, json, sys
 from pathlib import Path
 from run_kinds import lm
 from dew.config.lm import LMRunConfig
 from dew.nn.kernels.generation import routes
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 from dew.training.ahead import AheadOfTime, CompiledAhead
 from dew.training.targets import AheadTarget
 
 root = Path(sys.argv[1])
-model = ModelConfig("causal_transformer", {
-    "emb_features": 128, "num_layers": 1, "num_heads": 2, "head_dim": 64, "mlp_features": 256,
-    "dtype": "bfloat16", "layer_types": ["linear_attention"], "kinds": {"linear_attention": {"mixer": {
-        "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2, "linear_num_value_heads": 2,
-                                               "linear_key_head_dim": 64, "linear_value_head_dim": 64}}}}})
+model = ModelConfig(functools.partial(CausalTransformer, emb_features=128, num_layers=1, num_heads=2,
+    head_dim=64, mlp_features=256, dtype="bfloat16", layer_types=["linear_attention"], kinds={
+    "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
+    "linear_num_value_heads": 2, "linear_key_head_dim": 64, "linear_value_head_dim": 64}}}}))
 run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
                        "--trainer.steps", "2"],
                       default=dataclasses.replace(lm(root, drawn=False), model=model))

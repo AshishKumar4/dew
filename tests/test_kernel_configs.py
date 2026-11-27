@@ -1441,6 +1441,63 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize(("depth", "width"), [(4096, 4096), (4096, 14336), (14336, 4096)],
+                         ids=["q/o", "up", "down"])
+def test_a_hoppers_nvfp4_decode_tile_bands_its_columns_and_stages_unrestaged(depth, width, rows):
+    """Llama-3-8B's NVFP4 projections at a decode step's rows on an H100, the selector's packed launch
+    (traced, `tuning.seen`): at 64 rows, which no swap takes (a role's rows), its tile's planar snake bands
+    every column tile a wave reaches (its one row tile spanned, `resources.band`: 64 column tiles a band at
+    q/o and down, 128 of up's 224), as the parent of row 5874 did where the balanced band of 8 ran 2x slower
+    (M-FS-89c/d); at 1 and 16 rows, its swapped call's derived tile (`_swapped_tile`: warpgroup MMA's
+    fed ring) keeps its outputs unrestaged, which ran 1.65x slower restaged to four stages at (32, 1)
+    (M-FS-89c/d)."""
+    from dew.nn.kernels import formats
+
+    held = formats.NvFp4(jax.ShapeDtypeStruct((width, depth // 8), jnp.uint32),
+                         jax.ShapeDtypeStruct((width, depth // 16), jnp.float8_e4m3fn),
+                         jax.ShapeDtypeStruct((), jnp.float32))
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        with tuning.seen() as launches:
+            jax.eval_shape(lambda lhs, held: gemm.nvfp4_product(lhs, held, out_dtype=jnp.bfloat16),
+                           jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), held)
+        packed = [(op, config, ba) for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
+                  if isinstance(op, grouped_quantized.MosaicPackedGmm)]
+        assert packed, launches.taken
+        for op, config, ba in packed:
+            assert isinstance(config, tiling.Tiles), config
+            swapped = op._swapped_tile(ba, target)
+            if rows == 64:
+                columns = width // config.block_n
+                assert swapped is None and not config.swapped, config
+                assert config.grid_block_n == 1 << (min(columns, 132).bit_length() - 1), config
+            else:
+                assert swapped is not None and swapped.staging is None, swapped
+
+
+@pytest.mark.parametrize(("generation_name", "family", "cluster", "searched", "walked", "width", "band"), [
+    ("sm100", "tcgen05.pair", 2, 256, 256, 3072, 8), ("sm90", "wgmma", 1, 256, 1, 131072, 128)],
+    ids=["pair's columns", "walked rows"])
+def test_a_bands_columns_are_its_clusters_and_its_rows_the_walked_ones(generation_name, family, cluster,
+                                                                      searched, walked, width, band):
+    """A derived tile's band (`derivation._shaped`, `resources.band`) over one row tile: a B200 pair's
+    128 x 128 CTAs hold 256 columns a tile (`pricing.tile_columns`), so 3072 columns are 12 column tiles and
+    the band 8 (not 16 of 24 counted a CTA's, a walk of one remainder, theme 5874's review); a call whose
+    tiles are searched at rows aligned up (`linear_ce`'s 256 for one row) bands the rows its launch walks,
+    one row tile, every column tile its wave reaches (128, not 32 of four searched row tiles)."""
+    from dew.nn.kernels.templates.gemm import derivation
+
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        layout = pricing.family_of(tiling.Tiles(128, 128, 64, 2, 1, cluster=cluster, family=family),
+                                   jnp.bfloat16, target)
+        side = 128 if cluster > 1 else 64
+        tile = derivation._shaped(layout, side, side, 64, consumers=1, programs=1, rows=searched, width=width,
+                                  multiprocessors=target.multiprocessors, grouped=False, walked=walked)
+    assert tile.grid_block_n == band, tile
+
+
 def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     """An NVFP4 projection at a decode step's 16 rows on a compile-only H100, no kernel named
     (`gemm.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix decoded once a

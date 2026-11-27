@@ -20,6 +20,7 @@ from flax import linen as nn
 from objective_data import IMAGES, SEQ_LEN, first
 from rl_cases import packed
 
+from dew import registry
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
@@ -32,6 +33,7 @@ from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec, TextCondition
 from dew.nn.backbones import CausalTransformer, SimpleDiT
+from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective
 from dew.objectives.base import TEACHER
@@ -65,7 +67,8 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
                                                                       caption=image_steps.caption()),
         preset=Flow() if preset is None else preset, val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
+        objective=ObjectiveConfig(
+            functools.partial(registry.objectives[objective], **{"solver": Euler(), "steps": 2, **fields})))
 
 
 @functools.cache
@@ -85,7 +88,8 @@ def guided() -> DiffusionRunConfig:
 
     return dataclasses.replace(
         diffusion(guidance=None, ema_decay=None),
-        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32"}),
+        model=ModelConfig(
+            functools.partial(FluxTransformer, **{**FLUX, "dtype": "float32"})),
         text=TextCondition(encoder="diffusion_text", checkpoint=flux_pipeline()))
 
 

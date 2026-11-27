@@ -7,6 +7,7 @@ forwards the family tests match against diffusers.
 """
 
 import dataclasses
+import functools
 import json
 import math
 import shutil
@@ -23,6 +24,7 @@ from interop_support import allocated_bytes, extract_fixture, tiny_pipeline
 from model_support import attending
 from reference_error import as_given, assert_as_exact
 
+from dew import registry
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
@@ -30,9 +32,12 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import TextToImage
 from dew.inputs import TextCondition
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.precision import Dtypes, Numerics
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
+from dew.objectives.diffusion.consistency import ConsistencyDistillationObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
 from dew.registry import ModelConfig, to_record
@@ -57,7 +62,7 @@ def pipelines(tmp_path_factory):
 def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
     model = DiffusionRunConfig().model
-    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32"})
+    return model.with_fields(dtype="float32")
 
 
 @attending("xla")
@@ -76,8 +81,9 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
     config = DiffusionRunConfig(
         pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(),
         data=read(train.pipe(presets.images, 16, batch=8, caption=image_steps.caption())), val_metrics=(),
-        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2,
-                                                "unconditional_prob": 0.0, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, unconditional_prob=0.0,
+                                                    ema_decay=None)))
 
     def trained(steps: int):
         # Named in its config, as the command line names it, so its build knows the run it resumes.
@@ -151,9 +157,10 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
                                 data=images_of("tfds://oxford_flowers102", size),
                                     val_metrics=(),
-                                objective=ObjectiveConfig("diffusion",
-                                                          {"solver": Euler(), "guidance": None, "steps": 2,
-                                                           "unconditional_prob": 0.0, "ema_decay": None}))
+                                objective=ObjectiveConfig(
+                                    functools.partial(DiffusionObjective, solver=Euler(),
+                                                      guidance=None, steps=2, unconditional_prob=0.0,
+                                                      ema_decay=None)))
     objective = config.build()
     assert set(objective.inputs.conditions) == {"conditioning"}
     batch = batch_for(objective, size)
@@ -379,9 +386,11 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
     config = DiffusionRunConfig(
         pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(), val_metrics=(),
         data=images_of("tfds://oxford_flowers102", 16),
-        objective=ObjectiveConfig("diffusion", {
-            "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None,
-            "alignment": alignment, "end_to_end": EndToEnd(perceptual_weight=0., discriminator_weight=0.)}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, ema_decay=None,
+                                                    alignment=alignment,
+                                                    end_to_end=EndToEnd(
+                                                        perceptual_weight=0., discriminator_weight=0.))))
     objective = config.build()
     batch = batch_for(objective, 16)
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(3))
@@ -430,8 +439,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
                                     data=images_of("tfds://oxford_flowers102", size),
                                         val_metrics=(),
-                                    objective=ObjectiveConfig("diffusion", {
-                                        "solver": Euler(), "steps": 2, **settings})).build()
+                                    objective=ObjectiveConfig(functools.partial(
+                                        registry.objectives["diffusion"], **{
+                                        "solver": Euler(), "steps": 2, **settings}))).build()
     source = load_diffusion_source(str(directory), dtype="float32", size=(size, size))
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
@@ -478,7 +488,8 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     that convention, and a flow preset is."""
     common = {"pretrained": str(pipelines / "flux" / "pipeline"), "model": precision(),
               "data": images_of("tfds://oxford_flowers102", 16), "val_metrics": (),
-              "objective": ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2})}
+              "objective": ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                             guidance=None, steps=2))}
     with pytest.raises(ValueError):
         DiffusionRunConfig(**common).build()
     assert DiffusionRunConfig(**common, preset=Flow(shift=3.0)).build() is not None
@@ -592,7 +603,8 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
 def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
     """The run's parameter dtype (`trainer.precision.dtypes.params`) is the storage the pipeline's
     denoiser loads and trains in."""
-    objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
+    objective = ObjectiveConfig(functools.partial(DiffusionObjective, guidance=None,
+                                                  ema_decay=None))
     configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
                                     model=precision(),
                                     trainer=TrainerConfig(precision=Numerics(Dtypes(params="bfloat16"))),
@@ -607,7 +619,8 @@ def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pip
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():
     with pytest.raises(ValueError):
-        DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
+        DiffusionRunConfig(pretrained="some/pipeline",
+                           model=ModelConfig(functools.partial(SimpleDiT)),
                            text=TextCondition(encoder="t5"))
 
 
@@ -620,15 +633,14 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     the evaluation's draw need not follow)."""
     directory = pipelines / "flux" / "pipeline"
     config = DiffusionRunConfig(
-        model=ModelConfig("flux_transformer", {
-            "in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1,
-            "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
-            "guidance_embeds": True, "axes_dims_rope": [4, 4, 4],
-            "dtype": "float32"}),
+        model=ModelConfig(functools.partial(FluxTransformer, in_channels=12,
+                                            out_channels=12, num_layers=1, num_single_layers=1, heads=2,
+                                            head_dim=12, joint_attention_dim=16, pooled_projection_dim=10,
+                                            guidance_embeds=True, axes_dims_rope=[4, 4, 4], dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)),
-        objective=ObjectiveConfig("diffusion",
-                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
+        objective=ObjectiveConfig(functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, ema_decay=None)))
     objective = config.build()
     assert set(objective.inputs.conditions) == {"conditioning"}
     batch = batch_for(objective, 8)
@@ -644,13 +656,13 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
 
 def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRunConfig:
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                         "num_heads": 2, "dtype": "float32"}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("flow_grpo", {"clip_range": 0.2, "beta": beta, "solver": Euler(),
-                                                "guidance": None, "steps": 2}),
+        objective=ObjectiveConfig(functools.partial(FlowGRPOObjective, clip_range=0.2,
+                                                    beta=beta, solver=Euler(), guidance=None, steps=2)),
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3))
 
 
@@ -691,7 +703,8 @@ def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
     config = dataclasses.replace(
-        grpo_run(), objective=ObjectiveConfig("diffusion_nft", {"kl": 0.0, "solver": Euler(), "steps": 2}),
+        grpo_run(), objective=ObjectiveConfig(functools.partial(DiffusionNFTObjective, kl=0.0,
+                                                                solver=Euler(), steps=2)),
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2))
     objective = config.build()
     assert isinstance(objective, DiffusionNFTObjective) and config.rollout is not None
@@ -716,15 +729,18 @@ def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
     assert stated.rollout == FlowRolloutConfig()
     assert DiffusionRunConfig.from_dict(stated.to_dict()).rollout == FlowRolloutConfig()
     with pytest.raises(ValueError):
-        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("flow_grpo", {"reward": "psnr"}))
+        dataclasses.replace(grpo_run(),
+                            objective=ObjectiveConfig(
+                                functools.partial(FlowGRPOObjective, reward="psnr")))
     with pytest.raises(ValueError):
-        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
+        dataclasses.replace(grpo_run(),
+                            objective=ObjectiveConfig(functools.partial(DiffusionObjective)))
     with pytest.raises(ValueError):
         FlowRolloutConfig(reward="no_such_metric")
     parsed = DiffusionRunConfig.cli(["preset:flow", "--rollout.reward", "psnr", "--rollout.groups", "2",
                                      "--rollout.train-steps", "3"],
                                     default=dataclasses.replace(DiffusionRunConfig(),
-                                                                objective=ObjectiveConfig("flow_grpo"),
+                                                                objective=ObjectiveConfig(functools.partial(FlowGRPOObjective)),
                                                                 rollout=FlowRolloutConfig()))
     assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
     assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
@@ -772,7 +788,8 @@ def test_a_distillation_from_a_flow_grpo_run_distills_its_policy_and_not_its_kl_
     checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
-    distillation = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None})
+    distillation = ObjectiveConfig(functools.partial(ConsistencyDistillationObjective, solver=Consistency(),
+                                                     steps=3, ema_decay=None))
     student = dataclasses.replace(grpo_run(directory=str(tmp_path)), rollout=None,
                                   teacher_run=str(tmp_path / "run"), objective=distillation)
     distilled = jax.tree.leaves(student.build().init(jax.random.PRNGKey(0))[TEACHER]["params"])
@@ -847,7 +864,9 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
                                 data=images_of("tfds://oxford_flowers102", 16),
                                 val_metrics=(),
                                 trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
-                                objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
+                                objective=ObjectiveConfig(
+                                    functools.partial(FlowGRPOObjective, **settings)),
+                                    rollout=rollout)
     saved = config.build()
     initial = started(saved)
     # The run's step-0 state is the pipeline's weights, leaf for leaf.
@@ -888,9 +907,10 @@ def test_diffusion_run_source_refuses_unsupported_source_transformations_before_
     shutil.copytree(pipelines / "sd3" / "pipeline", metadata, ignore=shutil.ignore_patterns("*.safetensors"))
     base = DiffusionRunConfig(pretrained=str(metadata), preset=None, model=precision(),
                               data=images_of("tfds://oxford_flowers102", 16), val_metrics=(),
-                              objective=ObjectiveConfig("diffusion",
-                                                        {"solver": Euler(), "guidance": None, "steps": 2,
-                                                         "unconditional_prob": 0.0, "ema_decay": None}))
+                              objective=ObjectiveConfig(
+                                  functools.partial(DiffusionObjective, solver=Euler(),
+                                                    guidance=None, steps=2, unconditional_prob=0.0,
+                                                    ema_decay=None)))
     with pytest.raises(TypeError):
         dataclasses.replace(base, source=SourceOptions(dex=DifferentialExtension())).build()
     with pytest.raises(ValueError):
@@ -915,9 +935,8 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
         config = diffusion_run(tmp_path / "runs", 8, log_every=1)
         config = dataclasses.replace(
             config, data=images_of("tfds://oxford_flowers102", 256, batch=8),
-            model=dataclasses.replace(config.model, fields={
-                **config.model.fields, "patch_size": 16, "emb_features": 64, "num_layers": 2, "num_heads": 4,
-                "dtype": "bfloat16"}),
+            model=config.model.with_fields(patch_size=16, emb_features=64, num_layers=2, num_heads=4,
+                                           dtype="bfloat16"),
             trainer=dataclasses.replace(config.trainer, name="large", steps=steps,
                                         checkpoint_every=2, checkpoint_final=True))
         return config.train(config.build(), data, name="large")

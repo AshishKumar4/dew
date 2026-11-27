@@ -1065,6 +1065,15 @@ class MosaicGmm(_Mosaic):
     BLOCKS: ClassVar[dict[str, str]] = {'rows': 'block_m', 'depth': 'block_k', 'columns': 'block_n'}
 
 
+    def _swapped_tile(self, ba, target) -> tiling.Tiles | None:
+        """The tile `ba` runs swapped (`_swapped`), derived as the swapped call's own and priced as its walk
+        is (`_contraction`: the call's own operands, swapped); None where it runs as it is."""
+        swapped = self._swapped(ba, target)
+        tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
+            self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS), operands=lambda tile: (
+                self._operand_bytes(ba, dataclasses.replace(tile, swapped=True))))
+        return None if tile is None else dataclasses.replace(tile, swapped=True)
+
     def _tile(self, ba, target) -> tiling.Tiles | None:
         # A dense product of fewer rows than a role's (a decode step's) may run swapped: its matrix takes the
         # MMA's rows and its rows the columns, whose unit is narrower, so its tile multiplies no padding rows
@@ -1087,13 +1096,8 @@ class MosaicGmm(_Mosaic):
                         alt, dtype, target)).loads_ahead + alt_fam.in_flight
                         and (split := self._decode_split(ba, alt, target)) is not None):
                     candidates.append(split)
-        swapped = self._swapped(ba, target)
-        # Its tiles priced as its walk is (`_contraction`): the call's own operands, swapped.
-        tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
-            self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS), operands=lambda tile: (
-                self._operand_bytes(ba, dataclasses.replace(tile, swapped=True))))
+        tile = self._swapped_tile(ba, target)
         if tile is not None:
-            tile = dataclasses.replace(tile, swapped=True)
             splits = (1 if ba.arguments['exact_sums'] or self._scaled else pricing.split_count(
                 dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target)))
             split = dataclasses.replace(tile, splits=splits)

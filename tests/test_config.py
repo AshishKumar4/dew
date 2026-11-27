@@ -1,6 +1,7 @@
 """RunConfig: the typed record of a run, its round trip, and what it builds."""
 
 import dataclasses
+import functools
 import json
 import os
 from collections.abc import Callable, Mapping
@@ -19,11 +20,14 @@ from model_support import attending
 
 import dew.config
 import dew.nn.backbones
+from dew import registry
 from dew.checkpoints import RUN_FILE
 from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.uvit import UViT
 from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import Adam, AdamW, Cosine, GaussNewton, Lamb, Muon, MuonClip, Optax, OptimConfig, ParamGroup
@@ -53,7 +57,7 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
                                     format="array_record").pipe(presets.images, 64, batch=32),
     }[dataset]
     config = RunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=4, emb_features=64)),
         data=data,
         optim=OptimConfig(optimizer=Lamb(b1=0.8, b2=0.99, weight_decay=0.1), lr=1e-3),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
@@ -235,7 +239,8 @@ def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
 @attending("xla")
 def test_the_model_config_builds_with_its_own_dtype_and_attention():
     fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16"})
+    config = ModelConfig(
+        functools.partial(CausalTransformer, **{**fields, "dtype": "bfloat16"}))
     model = config.build()
     import jax
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
@@ -281,7 +286,7 @@ class Unprecise(nn.Module):
 
 def test_a_model_without_dtype_builds_and_refuses_a_dtype_override():
     unprecise = f"{__name__}:Unprecise"
-    config = ModelConfig(unprecise, {"features": 2})
+    config = ModelConfig(functools.partial(registry.models[unprecise], features=2))
     with pytest.raises(ValueError):
         config.with_dtype("float32")
     assert isinstance(config.build(), Unprecise)
@@ -289,7 +294,7 @@ def test_a_model_without_dtype_builds_and_refuses_a_dtype_override():
 
 def test_an_unknown_model_field_is_refused():
     with pytest.raises(ValueError):
-        ModelConfig("simple_dit", {"depth": 3}).build()
+        ModelConfig(functools.partial(SimpleDiT, depth=3)).build()
 
 
 def test_the_run_length_is_steps_or_epochs():
@@ -318,7 +323,7 @@ def test_a_setting_of_an_unset_layout_sets_it_from_its_defaults():
 
 def test_the_cli_parses_the_mesh_and_the_layout_over_a_runs_model_and_chain():
     default = RunConfig(data=images_of("tfds://oxford_flowers102", 64),
-                        model=ModelConfig("uvit", {"emb_features": 32}))
+                        model=ModelConfig(functools.partial(UViT, emb_features=32)))
     config = RunConfig.cli(["--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
                             "--trainer.steps", "5"], default=default)
     assert config.trainer.mesh == MeshSpec(fsdp=2)
@@ -822,12 +827,11 @@ def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
     mixer = GatedDeltaNetMixer(
         linear_num_key_heads=1, linear_num_value_heads=1,
         linear_key_head_dim=4, linear_value_head_dim=4, linear_conv_kernel_dim=2)
-    run = RunConfig(model=ModelConfig("causal_transformer", {
-        "vocab_size": 8, "emb_features": 4, "num_layers": 1, "num_heads": 1,
-        "max_seq_len": 8, "mlp_features": 8, "mixer": AttentionMixer(),
-        "kinds": {"full_attention": LayerKind(mixer=mixer)},
-        "dtype": "float32",
-    }))
+    run = RunConfig(model=ModelConfig(functools.partial(CausalTransformer, vocab_size=8,
+                                                        emb_features=4, num_layers=1, num_heads=1,
+                                                        max_seq_len=8, mlp_features=8, mixer=AttentionMixer(),
+                                                        kinds={"full_attention": LayerKind(mixer=mixer)},
+                                                        dtype="float32")))
     model = run.model.build()
     tokens = jnp.asarray([[0, 1, 2, 3]], jnp.int32)
     variables = model.init(jax.random.key(1), tokens)
@@ -979,8 +983,9 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits(tm
     assert LMRunConfig().evaluation_suites(stream, splits) is None
     named = DecisionRunConfig.cli(["--val-metrics", '[{"name": "accuracy"}]', "--suites",
                                    '{"test": {"metrics": [{"name": "accuracy"}, {"name": "brier"}]}}'])
-    assert named.val_metrics == (MetricConfig("accuracy"),)
-    assert named.suites == {"test": Suite(metrics=(MetricConfig("accuracy"), MetricConfig("brier")))}
+    assert named.val_metrics == (MetricConfig(functools.partial(Accuracy)),)
+    assert named.suites == {"test": Suite(metrics=(MetricConfig(functools.partial(
+        registry.metrics["accuracy"])), MetricConfig(functools.partial(Brier))))}
     suites = named.evaluation_suites(stream, splits)
     assert {split: (suite.data, kinds(suite.metrics)) for split, suite in suites.items()} == {
         "val": (splits["val"], [Accuracy]), "test": (splits["test"], [Accuracy, Brier])}
@@ -992,14 +997,16 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits(tm
     del saved["suites"]
     (tmp_path / "run.json").write_text(json.dumps({**record, "fields": saved}))
     assert DecisionRunConfig.load(str(tmp_path)) == named
-    only = LMRunConfig(val_metrics=[], suites={"test": Suite(metrics=(MetricConfig("perplexity"),))})
+    only = LMRunConfig(val_metrics=[],
+                       suites={"test": Suite(metrics=(MetricConfig(functools.partial(
+                           registry.metrics["perplexity"])),))})
     scored = only.evaluation_suites(stream, splits)
     assert {split: kinds(suite.metrics) for split, suite in scored.items()} == {
         "val": [], "test": [Perplexity]}
     assert LMRunConfig(val_metrics=[]).evaluation_suites(types.SimpleNamespace(val=None), None) == {}
     # Metrics named where no split is validated would score nothing: refused.
     with pytest.raises(ValueError):
-        LMRunConfig(val_metrics=[MetricConfig("perplexity")]).evaluation_suites(
+        LMRunConfig(val_metrics=[MetricConfig(functools.partial(Perplexity))]).evaluation_suites(
             types.SimpleNamespace(val=None), None)
     with pytest.raises(ValueError):
         LMRunConfig(suites={"holdout": Suite(metrics=())}).evaluation_suites(stream, splits)
@@ -1102,7 +1109,7 @@ def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_a
 
     fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
               "mixer": {"class": "attention", "fields": {}}}
-    run = LMRunConfig(model=ModelConfig("causal_transformer", fields),
+    run = LMRunConfig(model=ModelConfig(functools.partial(CausalTransformer, **fields)),
                       trainer=TrainerConfig(steps=1))
     assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
     assert run.override({"trainer.steps": 3}).model == run.model

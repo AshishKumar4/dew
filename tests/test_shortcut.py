@@ -3,12 +3,15 @@ loss its `update` takes (`tools/shortcut_reference.py`), and the run config
 around them."""
 
 
+import functools
+
 import jax
 import numpy as np
 import optax
 from model_support import attending
 
 from dew.diffusion import presets
+from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.diffusion.few_step import ShortcutObjective
 
 
@@ -25,17 +28,14 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from dew.training import Trainer
 
     config = DiffusionRunConfig(
-        model=ModelConfig(
-            "simple_dit",
-            {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-             "dtype": "float32"},
-        ),
+        model=ModelConfig(functools.partial(SimpleDiT, patch_size=2, emb_features=16,
+                                            num_layers=1, num_heads=2, dtype="float32")),
         data=images_of("tfds://oxford_flowers102", 4),
         preset=presets.Shortcut(),
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("shortcut",
-                                  {"sections": 4, "bootstrap_every": 2, "solver": Euler(), "steps": 3}),
+        objective=ObjectiveConfig(functools.partial(ShortcutObjective, sections=4,
+                                                    bootstrap_every=2, solver=Euler(), steps=3)),
     )
     task = config.build()
     assert isinstance(task, ShortcutObjective) and task.model.interval

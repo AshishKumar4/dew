@@ -5,6 +5,7 @@ they run and none of the scenarios' own file, which a fresh process imported who
 resume claim's four processes, where these take about 6 (row 7006)."""
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Mapping
 from pathlib import Path
@@ -16,6 +17,7 @@ from recording import RecordingTracker
 from run_kinds import settled
 from scenario_contract import CELL, Phase, assert_steps_finite
 
+from dew import registry
 from dew.checkpoints import Checkpoints
 from dew.data import Memory
 from dew.distributed.placement import Layout, MeshSpec
@@ -43,7 +45,9 @@ def diffusion_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, flo
     config = diffusion_run(Path(root) / "runs", RUN_BATCH, **trainer)
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
     config = dataclasses.replace(
-        config, model=dataclasses.replace(config.model, fields={**fields, "remat": cell["memory"]}),
+        config, model=dataclasses.replace(
+            config.model, bound=functools.partial(
+                config.model.member, **{**fields, "remat": cell["memory"]})),
         trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
     config = config.override(settled(phase.settings()))
     images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
@@ -83,8 +87,11 @@ def diffusion_rl_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, 
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
     method = cell["method"]
     config = dataclasses.replace(
-        config, model=dataclasses.replace(config.model, fields=fields), preset=Flow(),
-        objective=ObjectiveConfig(method, {**DIFFUSION_RL[method], "solver": Euler(), "steps": 2}),
+        config, model=dataclasses.replace(
+            config.model, bound=functools.partial(config.model.member, **fields)), preset=Flow(),
+        objective=ObjectiveConfig(
+            functools.partial(registry.objectives[method], **{**DIFFUSION_RL[method], "solver": Euler(),
+                                                              "steps": 2})),
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2),
         trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
     config = config.override(settled(phase.settings()))

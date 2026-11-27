@@ -1,15 +1,17 @@
 """The JEPA run, as one typed record: I-JEPA over images, V-JEPA over video.
 
 The encoder is the run's model. The predictor takes the encoder's width and
-heads, and its own depth and width from `predictor`: a predictor as wide as
-the encoder makes the objective too easy. Optional probes score the frozen
+heads, and its own depth and width from `predictor` (a `JepaPredictor` bound by
+the arguments the run states): a predictor as wide as the encoder makes the
+objective too easy. Optional probes score the frozen
 encoder beside the validation loss.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar
+import functools
+from typing import Annotated, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -18,11 +20,16 @@ from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 from dew.nn.dit import FROM_ENCODER
 from dew.nn.protocols import ReadsClips
 from dew.objectives.jepa.masking import MultiBlockMask
+from dew.objectives.jepa.objective import JepaObjective
 from dew.optim import OptimConfig
-from dew.registry import JsonDict, ModelConfig
+from dew.registry import ModelConfig, record_argument
+
+DERIVED_PREDICTOR = ("grid", "factorized", "scan_order", "dtype")
+"""The predictor's arguments the run derives from its encoder and data, which `predictor` states none of."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,15 +38,21 @@ class JepaRunConfig(RunConfig):
 
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "probe_classes", "knn_k")
 
-    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("jepa"))
+    objective: ObjectiveConfig = dataclasses.field(
+        default_factory=lambda: ObjectiveConfig(functools.partial(JepaObjective)))
     """The JEPA objective and its arguments (its `momentum` field, `[0.996, 1.0]`).
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
     # bf16 compute over float32 parameters, as the LM recipe's (`dew.config.lm`).
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("jepa_encoder", {"precision": "default"}))
+        default_factory=lambda: ModelConfig(functools.partial(JepaEncoder, precision="default")))
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(lr=1e-3))
-    predictor: JsonDict = dataclasses.field(default_factory=dict)
-    """Predictor kwargs, over the encoder's shared ones."""
+    predictor: Annotated[functools.partial[JepaPredictor],
+                         record_argument(functools.partial[JepaPredictor])] = dataclasses.field(
+        default_factory=lambda: functools.partial(JepaPredictor))
+    """The predictor, `JepaPredictor` bound by the arguments the run states. An option its encoder's class
+    marks as its (`FROM_ENCODER`) that it leaves unstated is the encoder's own; its grid, factorization,
+    scan order and dtype the run derives (`DERIVED_PREDICTOR`). On the command line it is one JSON class
+    record, `--predictor '{"class": "dew.nn.backbones.jepa:JepaPredictor", "fields": {"num_layers": 4}}'`."""
     num_target_blocks: int = 4
     target_scale: tuple[float, float] = (0.15, 0.2)
     target_aspect: tuple[float, float] = (0.75, 1.5)
@@ -47,6 +60,18 @@ class JepaRunConfig(RunConfig):
     """Number of classes for optional frozen-encoder probes; without them,
     validation scores the loss alone."""
     knn_k: int = 20
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not isinstance(self.predictor, functools.partial) or self.predictor.func is not JepaPredictor:
+            raise TypeError(f"predictor binds JepaPredictor, functools.partial(JepaPredictor, ...), not "
+                            f"{self.predictor!r}")
+        # Bound by keyword, as a model record binds a model (`ModelConfig`), refused here otherwise; held as
+        # that record holds it, equal to another of the same arguments.
+        object.__setattr__(self, "predictor", ModelConfig(self.predictor).bound)
+        derived = sorted(set(self.predictor.keywords) & set(DERIVED_PREDICTOR))
+        if derived:
+            raise ValueError(f"the run derives the predictor's {derived} from its encoder; leave them out")
 
     def sample(self) -> Field:
         """The batch field the encoder reads, at the resolution the data comes in (`Dataset.facts`): a
@@ -76,10 +101,9 @@ class JepaRunConfig(RunConfig):
         # (`FROM_ENCODER`) unless `predictor` sets them, and always computes as the encoder does, its dtype
         # and attention kernel.
         shared = {option.name: getattr(encoder, option.name) for option in dataclasses.fields(encoder)
-                  if option.metadata.get(FROM_ENCODER) and option.name not in self.predictor}
-        predictor = ModelConfig("jepa_predictor", {
-            **self.predictor, "grid": grid, "factorized": video, "scan_order": encoder.scan_order}).build(
-                **shared, dtype=encoder.dtype)
+                  if option.metadata.get(FROM_ENCODER) and option.name not in self.predictor.keywords}
+        predictor = ModelConfig(self.predictor).build(
+            grid=grid, factorized=video, scan_order=encoder.scan_order, **shared, dtype=encoder.dtype)
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
         ramp = {}
@@ -111,8 +135,11 @@ class JepaRunConfig(RunConfig):
         del validates
         if not self.probe_classes:
             return ()
-        return (MetricConfig("linear_probe", {"num_classes": self.probe_classes}),
-                MetricConfig("knn_probe", {"num_classes": self.probe_classes, "k": self.knn_k}))
+        from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+
+        return (MetricConfig(functools.partial(LinearProbe, num_classes=self.probe_classes)),
+                MetricConfig(functools.partial(KnnProbe, num_classes=self.probe_classes,
+                                               k=self.knn_k)))
 
 
 __all__ = ["JepaRunConfig"]

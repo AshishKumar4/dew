@@ -16,9 +16,12 @@ Whole documents packed into the windows are a run file's chain: the store packed
 (docs/recipes.md).
 """
 
+import functools
+
 from dew.config.lm import LMRunConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import ModelConfig
 
 
@@ -27,7 +30,8 @@ def default(store: str = "data/shakespeare-byte") -> LMRunConfig:
     shuffle and repeat written before them, so a run knows its epoch's length."""
     return LMRunConfig(data=TokenFiles(store).shuffle(seed=0).repeat().pipe(
         presets.token_windows, seq_len=256, batch=32),
-        model=ModelConfig("causal_transformer", {"emb_features": 384, "num_layers": 6, "num_heads": 6}))
+        model=ModelConfig(functools.partial(CausalTransformer, emb_features=384,
+                                            num_layers=6, num_heads=6)))
 
 
 def main(argv: list[str] | None = None):

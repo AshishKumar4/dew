@@ -4,6 +4,7 @@ float64 transcription of the arithmetic, apart from Dew's code."""
 
 import contextlib
 import copy
+import functools
 import itertools
 
 import jax
@@ -15,6 +16,7 @@ from flax import struct
 from recording import bits
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 
+from dew import registry
 from dew.objectives.base import Ratio, Shown
 from dew.objectives.rl.control import (
     ActorCritic,
@@ -24,6 +26,7 @@ from dew.objectives.rl.control import (
     tanh_normal_log_prob,
 )
 from dew.rl.env import Batched, TimeLimit, TimeStep, env_rollout, start
+from dew.rl.flight import FlightEnv
 from dew.rl.replay import ReplayBuffer
 from dew.rl.simulator import STACKED
 from dew.training import TrainerAdvanced
@@ -1145,24 +1148,28 @@ def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_en
     actor_critic = "dew.objectives.rl.control:ActorCritic"
     control_ppo = "dew.objectives.rl.control:ControlPPOObjective"
     phase1 = EnvRunConfig(
-        env=EnvConfig("flight", {"racing": racing_fields, "views": ["state", "teacher"]}, count=8),
-        model=ModelConfig(actor_critic, {"policy_layers": [8], "value_layers": [8]}),
-        objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.05,
-                                                "reads": ["teacher"]}),
-        rollout=RolloutConfig("control", {"unroll_length": 2, "epochs": 1, "minibatches": 1}),
+        env=EnvConfig(
+            functools.partial(FlightEnv, racing=racing_fields, views=["state", "teacher"]),
+            count=8),
+        model=ModelConfig(functools.partial(registry.models[actor_critic], policy_layers=[8],
+                                            value_layers=[8])),
+        objective=ObjectiveConfig(functools.partial(registry.objectives[control_ppo], discount=0.95,
+                                                    entropy_cost=0.05, reads=["teacher"])),
+        rollout=RolloutConfig(functools.partial(ControlRollout, unroll_length=2, epochs=1,
+                                                minibatches=1)),
         optim=OptimConfig(Adam(), lr=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, checkpoint_every=1,
                               log_every=1, eval_every=None, multi_host=False))
     phase1.prepare().train("control_phase")
     phase2 = dataclasses.replace(
-        phase1, objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.0,
-                                                        "reads": ["teacher"]}),
+        phase1, objective=ObjectiveConfig(functools.partial(registry.objectives[control_ppo], discount=0.95,
+                                                            entropy_cost=0.0, reads=["teacher"])),
         trainer=dataclasses.replace(phase1.trainer, steps=2))
     resumed = phase2.prepare().train("control_phase")
     assert int(resumed.updates) == 2
     bad_phase = dataclasses.replace(
-        phase2, objective=ObjectiveConfig(control_ppo, {"discount": 0.8, "entropy_cost": 0.0,
-                                                        "reads": ["teacher"]}),
+        phase2, objective=ObjectiveConfig(functools.partial(registry.objectives[control_ppo], discount=0.8,
+                                                            entropy_cost=0.0, reads=["teacher"])),
         trainer=dataclasses.replace(phase1.trainer, steps=3))
     with pytest.raises(ValueError):
         bad_phase.prepare().train("control_phase")

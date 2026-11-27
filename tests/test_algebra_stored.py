@@ -139,6 +139,15 @@ def _corrupted(record, corrupt):
                 "steps": [len(table), *record["steps"][1:]]}
     if corrupt == "a literal no array":
         return {**record, "literals": [*record["literals"], ["T", [["p", 1], ["T", []]]]]}
+    if corrupt == "a product of another operation's parameters":
+        # A product reading an addition's or a product's parameters by index, in range, of another kind.
+        at = next(at for at, entry in enumerate(table) if entry[0] == "dot")
+        other = next(entry[1][-1] for entry in table
+                     if entry[0] == "binary" and entry[1][1] != ["s", terms.RESCALE])
+        name, arguments = table[at]
+        return {**record, "terms": [*table[:at], [name, [*arguments[:-1], other]], *table[at + 1:]]}
+    if corrupt == "a report's admitted sets a string":
+        return {**record, "report": [record["report"][0], "sets", *record["report"][2:]]}
     if corrupt == "a finish dropped":
         return {**record, "finishes": [None for _ in record["finishes"]]}
     raise AssertionError(corrupt)
@@ -148,7 +157,8 @@ def _corrupted(record, corrupt):
                                      "a merge's side in a step", "a short part", "unreadable",
                                      "an argument of another sort", "a term of its own", "a float past range",
                                      "a dtype of objects", "an untyped empty vector", "a finish dropped",
-                                     "a literal no array",
+                                     "a literal no array", "a product of another operation's parameters",
+                                     "a report's admitted sets a string",
                                      "nested past depth", "a flipped byte", "another entry's"])
 def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
@@ -196,7 +206,8 @@ def test_a_shared_term_is_written_once_and_read_back():
     writer = stored._Writer()
     at = writer.term(form)
     assert len(writer.table) == 65
-    decoded = stored._decoded(json.loads(json.dumps(writer.table)), leaves=1, literals=0, params=1, states=0)
+    decoded = stored._decoded(json.loads(json.dumps(writer.table)), leaves=1, literals=0,
+                              primitives=[jax.lax.add_p], states=0)
     assert terms.key(decoded(at, sides=())) == terms.key(form)
 
 
@@ -310,3 +321,50 @@ def test_a_fresh_process_walks_a_template_by_the_forms_an_earlier_one_stored(tmp
     assert first["stored"].get("miss") and not first["stored"].get("hit")
     assert second["stored"] == {"hit": first["stored"]["miss"]}
     assert second["values"] == first["values"]
+
+
+def test_a_replacements_stored_outcomes_are_the_kept_programs_whether_or_not_it_is_kept():
+    """The store's reading or writing a replacement's trace made (`report._proposing`) is recorded in the
+    kept program's registry and `recording` at once: a replacement discarded keeps them, one kept
+    (`report._commit`) records them once."""
+    with kernel_report.refusals(), kernel_report.recording() as recorded:
+        with kernel_report._proposing([]):
+            kernel_report.record_stored("hit")
+        assert recorded.stored == {"hit": 1} and kernel_report.stored() == {"hit": 1}
+        with kernel_report._proposing([]) as proposal:
+            kernel_report.record_stored("miss")
+        kernel_report._commit(proposal)
+        assert recorded.stored == {"hit": 1, "miss": 1} and kernel_report.stored() == {"hit": 1, "miss": 1}
+
+
+def test_a_proposals_stored_outcomes_reach_the_scopes_opened_within_it():
+    """Within a proposal, a `recording` opened there counts the store's outcomes too, a `refusals` scope
+    opened there counts its own apart from the registry's, and a nested proposal discarded counts its own in
+    the kept program's."""
+    with kernel_report.refusals(), kernel_report.recording() as outer:
+        with kernel_report._proposing([]):
+            with kernel_report.recording() as inner:
+                kernel_report.record_stored("hit")
+            with kernel_report.refusals():
+                kernel_report.record_stored("miss")
+                assert kernel_report.stored() == {"miss": 1}
+            with kernel_report._proposing([]):
+                kernel_report.record_stored("invalid")
+        assert inner.stored == {"hit": 1}
+        assert outer.stored == {"hit": 1, "miss": 1, "invalid": 1}
+        assert kernel_report.stored() == {"hit": 1, "invalid": 1}
+
+
+def test_a_fused_multiply_adds_terms_read_as_the_operations_they_bind():
+    """A fused multiply-add's terms (`rules.CONTRACTED`), named apart from the multiply and add whose
+    parameters they bind, read back over those; over another operation's parameters, refused."""
+    operand = Term.leaf(i64(0))
+    form = operand.binary(String("fmul"), operand, i64(0)).binary(String("fadd"), operand, i64(1))
+    writer = stored._Writer()
+    at = writer.term(form)
+    table = json.loads(json.dumps(writer.table))
+    decoded = stored._decoded(table, leaves=1, literals=0, primitives=[jax.lax.mul_p, jax.lax.add_p],
+                              states=0)
+    assert terms.key(decoded(at, sides=())) == terms.key(form)
+    with pytest.raises(ValueError):
+        stored._decoded(table, leaves=1, literals=0, primitives=[jax.lax.add_p, jax.lax.add_p], states=0)
