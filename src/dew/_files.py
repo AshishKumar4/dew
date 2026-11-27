@@ -334,26 +334,14 @@ def _removed(tree: Path) -> None:
     except OSError as gone:
         log.warning("could not read %s of a save's discarded tree: %s", tree, gone)
         return
-    try:
-        held = os.open(tree, (os.O_RDONLY if _PIN is None else _PIN) | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError as unopened:
-        log.warning("could not read %s of a save's discarded tree: %s", tree, unopened)
+    if (holding := _hold(tree, named, log)) is None:
         return
-    root = held if _PIN is None else None
+    root, readable = holding
     try:
-        if not _same(held, named):
-            log.warning("left %s: another entry took its name as it was opened", tree)
-            return
-        if root is None:
-            try:
-                root = os.open(tree, _FOLDER)
-            except OSError as unopened:
-                # Its root opened by none of this process's rights (a mode an earlier tree's restored on
-                # it): an empty one is removed all the same, while it is held.
-                log.warning("could not read %s of a save's discarded tree: %s", tree, unopened)
-        if root is not None and _same(root, named):
+        if readable:
             _emptied(root, log)
-        # Its name removed while the folder it named is held open, so no other folder takes its inode.
+        # Its name removed while the folder it named is held open, so no other folder takes its inode; one
+        # no right of this process reads (a mode an earlier tree's restored on it) removed where it is empty.
         if not os.path.samestat(os.lstat(tree), named):
             raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", str(tree))
         os.rmdir(tree)
@@ -361,20 +349,20 @@ def _removed(tree: Path) -> None:
         # A save's own leftover, named for whoever clears it; the save's outcome is its own.
         log.warning("could not remove a save's discarded tree %s: %s", tree, left)
     finally:
-        _closed(held, *(() if root is None else (root,)))
+        os.close(root)
 
 
 def _emptied(root: int, log: logging.Logger) -> None:
     """Every entry of the folder the descriptor `root` holds removed through descriptors (`_removed`), a
     link not followed, depth first on a stack of open folders rather than Python's: each folder given its
     owner's read, write and search (`_opened`) before its entries are read; a folder in it held as the
-    entry its name was read as before anything is read of it (`_held`), emptied, and its name removed while
+    entry its name was read as before anything is read of it (`_hold`), emptied, and its name removed while
     it still names that folder, held open until then; one no right opens to read removed so where it is
-    empty, never walked. Every descriptor it opened is closed, a failure logged, not raised."""
+    empty, never walked. Every descriptor it opened is closed, one a folder, a failure logged, not raised."""
     _opened(root, log)
-    # Each open folder: its descriptor, its entries left to remove, and its own name, entry and holding
-    # descriptor in the folder below it on the stack (None for the root, its caller's).
-    stack: list[tuple[int, Iterator[str], tuple[str, os.stat_result, int] | None]] = []
+    # Each open folder: its descriptor, its entries left to remove, and its own name and entry in the folder
+    # below it on the stack (None for the root, its caller's).
+    stack: list[tuple[int, Iterator[str], tuple[str, os.stat_result] | None]] = []
     stack.append((root, _listed(root, log), None))
     try:
         while stack:
@@ -385,9 +373,9 @@ def _emptied(root: int, log: logging.Logger) -> None:
                 if own is not None:
                     # Its name removed while it is held open, so no other folder takes its inode meanwhile.
                     try:
-                        _rmdir_held(stack[-1][0], *own[:2], log)
+                        _rmdir_held(stack[-1][0], *own, log)
                     finally:
-                        _closed(folder, own[2])
+                        os.close(folder)
                 continue
             try:
                 found = os.stat(name, dir_fd=folder, follow_symlinks=False)
@@ -397,46 +385,44 @@ def _emptied(root: int, log: logging.Logger) -> None:
             except OSError as left:
                 log.warning("could not remove %s from a save's discarded tree: %s", name, left)
                 continue
-            if (held := _held(folder, name, found, log)) is None:
+            if (holding := _hold(name, found, log, folder)) is None:
                 continue
-            inner = held if _PIN is None else None
-            if inner is None:
-                try:
-                    inner = os.open(name, _FOLDER, dir_fd=folder)
-                except OSError:
-                    pass
-            if inner is None or not _same(inner, found):
+            inner, readable = holding
+            if not readable:
                 # A folder no right of this process opens to read (a `0000` one): removed where it is empty,
-                # never walked, while held as the entry it was read as (train 1443's review); a read
-                # descriptor of another entry put in its place closed unread.
-                if inner is not None and inner != held:
-                    os.close(inner)
+                # never walked, while held as the entry it was read as (train 1443's review).
                 try:
                     _rmdir_held(folder, name, found, log)
                 finally:
-                    os.close(held)
+                    os.close(inner)
                 continue
             _opened(inner, log)
-            stack.append((inner, _listed(inner, log), (name, found, held)))
+            stack.append((inner, _listed(inner, log), (name, found)))
     finally:
         for folder, _, own in stack:
             if own is not None:
-                _closed(folder, own[2])
+                os.close(folder)
 
 
 _PIN = getattr(os, "O_PATH", None)
 """Linux's descriptor of an entry that reads nothing of it (`O_PATH`), which holds a folder no right opens
-to read (`_held`); None where the system has none, where a folder is held by its read descriptor alone."""
+to read (`_hold`); None where the system has none, where a folder is held by its read descriptor alone."""
 
 
-def _held(folder: int, name: str, found: os.stat_result, log: logging.Logger) -> int | None:
-    """A descriptor holding the folder `name` of the folder the descriptor `folder` holds, checked to be the
-    entry `found` its name was read as, before anything is read of it (`_emptied`): an `O_PATH` one where the
-    system has it (`_PIN`), else one opened to read; None, logged, where none opens or another entry took
-    the name. While it is open no other folder takes the inode, so a check of a name against it holds."""
+def _hold(name: Path | str, found: os.stat_result, log: logging.Logger,
+          folder: int | None = None) -> tuple[int, bool] | None:
+    """One descriptor holding the folder `name` (of the folder the descriptor `folder` holds, else a path),
+    checked to be the entry `found` its name was read as before anything is read of it, and whether it
+    reads (`_removed`, `_emptied`): the folder opened to read, checked against an `O_PATH` descriptor held
+    first where the system has one (`_PIN`), which is closed once the read one is checked, or kept where no
+    right opens it to read; else its read descriptor alone. None, logged, where none opens or another entry
+    took the name. While it is open no other folder takes the inode, so a check of a name against it
+    holds; one a folder keeps a walk's descriptors to one a level."""
+    def opened(flags: int) -> int:
+        return os.open(name, flags | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+
     try:
-        held = os.open(name, (os.O_RDONLY if _PIN is None else _PIN) | os.O_DIRECTORY | os.O_NOFOLLOW,
-                       dir_fd=folder)
+        held = opened(os.O_RDONLY if _PIN is None else _PIN)
     except OSError as left:
         log.warning("could not remove %s from a save's discarded tree: %s", name, left)
         return None
@@ -444,7 +430,17 @@ def _held(folder: int, name: str, found: os.stat_result, log: logging.Logger) ->
         os.close(held)
         log.warning("left %s of a save's discarded tree: another entry took its name", name)
         return None
-    return held
+    if _PIN is None:
+        return held, True
+    try:
+        read = opened(os.O_RDONLY)
+    except OSError:
+        return held, False
+    if not _same(read, found):
+        os.close(read)
+        return held, False
+    os.close(held)
+    return read, True
 
 
 def _same(descriptor: int, found: os.stat_result) -> bool:
@@ -453,12 +449,6 @@ def _same(descriptor: int, found: os.stat_result) -> bool:
         return os.path.samestat(os.fstat(descriptor), found)
     except OSError:
         return False
-
-
-def _closed(*descriptors: int) -> None:
-    """Each of `descriptors` closed once, however many times it is named."""
-    for descriptor in dict.fromkeys(descriptors):
-        os.close(descriptor)
 
 
 def _listed(folder: int, log: logging.Logger) -> Iterator[str]:
