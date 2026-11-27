@@ -1985,9 +1985,11 @@ values they describe: a class's defaults as a run recorded them
 (`Bound.defaults`)."""
 
 
-class _Bound[Member](functools.partial[Member]):
+class _Bound(functools.partial):
     """A member bound by keyword (`Bound.bound`), equal to another of the same member and arguments, as a
-    record of it is: a run read back equals the run written."""
+    record of it is: a run read back equals the run written. Its base unsubscripted, as `Bound`'s kinds'
+    are: tyro reads a field's default's class by its original bases, which Python 3.14 refuses a
+    subscripted one of (`types.get_original_bases`)."""
 
     def __eq__(self, other) -> bool:
         # Another bound member alone, which hashes as this one does.
