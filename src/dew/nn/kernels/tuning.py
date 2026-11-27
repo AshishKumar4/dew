@@ -462,9 +462,12 @@ def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
     them (`_read`): each launch with its derived config (`gaps`) and the configs that ran, in its jax's
     own file (`cache.kernel_picks_path`)."""
-    return json.dumps({"device_kind": device_kind, "data": [
-        {**_launch_json(ba), "derived": encoded(ba.heuristics_config),
-         "timings": _timings_json(timings)} for ba, timings in picks]})
+    return json.dumps({"device_kind": device_kind, "data": [_entry(ba, timings) for ba, timings in picks]})
+
+
+def _entry(ba: tokamax.BoundArguments, timings: Timings) -> dict[str, JSON]:
+    """One launch's stored entry (`dumps_picks`): the launch, its derived config and its timings."""
+    return {**_launch_json(ba), "derived": encoded(ba.heuristics_config), "timings": _timings_json(timings)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -491,7 +494,7 @@ def gaps(device_kind: str) -> list[Gap]:
     (`Gap`), each named once."""
     found = []
     ours, _ = _partitioned(_cache.kernel_picks_path(device_kind))
-    for entry, (ba, timings) in ours:
+    for _, entry, (ba, timings) in ours:
         derived, fastest = _key(decoded(entry["derived"])), timings.fastest_config
         if fastest == derived:
             continue
@@ -1414,9 +1417,14 @@ Launch = tuple[KernelOp, tokamax.BoundArguments]
 
 
 def _keyed(timed) -> Keyed:
-    """Each of the `(launch, timings)` pairs `timed` by its op and cache key, which binds the
-    launch's arguments to this checkout's signature of its kernel (ValueError where they do not)."""
-    return {(ba.op, ba.autotuning_cache_key): (ba, timings) for ba, timings in timed}
+    """Each of the `(launch, timings)` pairs `timed` by its key (`_launch_key`)."""
+    return {_launch_key(ba): (ba, timings) for ba, timings in timed}
+
+
+def _launch_key(ba: tokamax.BoundArguments) -> tuple[tokamax.Op, Hashable]:
+    """A launch's key in the picks store, a stored launch's and a fresh one's alike: its op and cache key,
+    which binds its arguments to this checkout's signature of its kernel (ValueError where they do not)."""
+    return ba.op, ba.autotuning_cache_key
 
 
 def _kernel_launches(launches: Keyed):
@@ -1436,19 +1444,22 @@ def _read(path: str) -> tuple[Keyed, list]:
     checkout cannot read leaves the others readable. A missing file, or one
     that is not JSON, holds nothing."""
     ours, foreign = _partitioned(path)
-    return _keyed([launch for _, launch in ours]), foreign
+    return {key: launch for key, _, launch in ours}, foreign
 
 
-def _partitioned(path: str) -> tuple[list[tuple[dict, tuple[tokamax.BoundArguments, Timings]]], list]:
-    """The entries of the store at `path` this checkout reads, each with its launch and timings, and the
-    entries it does not (`_read`), another checkout's."""
+def _partitioned(path: str) -> tuple[list[tuple[tuple, dict, tuple[tokamax.BoundArguments, Timings]]], list]:
+    """The entries of the store at `path` this checkout reads, each with its key (`_launch_key`), as written
+    and its launch and timings, and the entries it does not (`_read`), another checkout's."""
     ours, foreign = [], []
     for entry in _stored(path):
         if not isinstance(entry, dict):
             foreign.append(entry)
             continue
         try:
-            ours.append((entry, (_launch(entry), _timings(entry.get("timings")))))
+            # Its timings read before its key: an entry of another checkout's timings is another's, whatever
+            # its arguments key as here.
+            launch, timings = _launch(entry), _timings(entry.get("timings"))
+            ours.append((_launch_key(launch), entry, (launch, timings)))
         except Unreadable:
             foreign.append(entry)
     return ours, foreign
@@ -1490,10 +1501,10 @@ def _store(device_kind: str, picks) -> None:
     with filelock.FileLock(path + '.lock'):
         ours, foreign = _partitioned(path)
         fresh = _keyed(picks)
-        kept = {(ba.op, ba.autotuning_cache_key): entry for entry, (ba, _) in ours}
-        written = json.loads(dumps_picks(device_kind, fresh.values()))
-        write_atomically(path, json.dumps({**written, "data": [
-            *(entry for key, entry in kept.items() if key not in fresh), *written["data"], *foreign]}))
+        kept = {key: entry for key, entry, _ in ours}
+        entries = [*(entry for key, entry in kept.items() if key not in fresh),
+                   *(_entry(ba, timings) for ba, timings in fresh.values()), *foreign]
+        write_atomically(path, json.dumps({"device_kind": device_kind, "data": entries}))
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
@@ -1763,9 +1774,10 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
 
     traced = launched()
     for op, ba in found:
-        picks, key = op.get_autotuning_cache(kind), ba.autotuning_cache_key
+        launch = _launch_key(ba)
+        picks, key = op.get_autotuning_cache(kind), launch[1]
         picks.pop(key, None)
-        if (fastest := settled.get((ba.op, key))) is not None:
+        if (fastest := settled.get(launch)) is not None:
             picks[key] = fastest
     changed = launched() != traced
     if any(_coordination.from_every_process(changed)):
