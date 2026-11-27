@@ -462,6 +462,19 @@ def effective_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLi
     return precision if precision_names(precision) else jax.config.jax_default_matmul_precision
 
 
+def stated_algorithm(precision: jax.lax.PrecisionLike
+                     ) -> jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset | None:
+    """The dot algorithm a product is declared with, `effective_precision(precision)`'s: one the call states,
+    else the run's (`jax_default_matmul_precision` naming a preset), as an object a dot takes; None where the
+    declaration is a precision level (an explicit level overriding a run's algorithm)."""
+    effective = effective_precision(precision)
+    if isinstance(effective, jax.lax.DotAlgorithm | jax.lax.DotAlgorithmPreset):
+        return effective
+    if isinstance(effective, str) and effective in jax.lax.DotAlgorithmPreset.__members__:
+        return jax.lax.DotAlgorithmPreset[effective]
+    return None
+
+
 def rounds_products() -> bool:
     """Whether the run's declaration lets a native route round an fp32 product's operands (TF32, or bf16
     parts): its fast forms (`Numerics.forms`) at a configured precision of no more than the default

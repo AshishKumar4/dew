@@ -45,7 +45,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
-from jax.core import Tracer
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
@@ -90,7 +89,14 @@ from dew.nn.kernels.templates.gemm.hooks import (
 )
 from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    stated_algorithm,
+    twice_scaled,
+)
 from dew.nn.programs import read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -168,7 +174,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    rhs = _window_served(lhs, rhs, compute, precision)
+    rhs = _window_served(lhs, rhs, compute, precision, out_dtypes or (out_dtype,))
     if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
@@ -357,23 +363,17 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
-def _window_served(lhs, rhs, compute, precision):
-    """`gemm`'s matrix: a `Bf16Window` whose product the call asks (`_window_takes`), else its decoded matrix
-    (its encoding checked first, as the window's product checks it); any other matrix as it is."""
-    if not isinstance(rhs, Bf16Window) or _window_takes(lhs, compute, precision):
+def _window_served(lhs, rhs, compute, precision, outputs: tuple):
+    """`gemm`'s matrix: a `Bf16Window` whose product (`window_product`: bf16 rows' exact products, fp32 sums
+    none promoted, at the run's precision) is the call's (`templates.product.declared`'s of its `compute`
+    into its `outputs`, its algorithm the run's), else its decoded matrix, `Bf16Window.verified` (13686)."""
+    if not isinstance(rhs, Bf16Window):
         return rhs
-    return (rhs if isinstance(rhs.form, Tracer) else rhs.checked()).decoded()
-
-
-def _window_takes(lhs, compute, precision) -> bool:
-    """Whether a `Bf16Window`'s product (`window_product`: bf16 rows' exact products summed in fp32, none
-    promoted) is the one `gemm` is asked: its products' dtype (`compute`, `lhs`'s where None) bf16's,
-    at the default precision the call and the run each ask (above it an fp32 output's partial sums are
-    promoted, `templates.product.declared`; an algorithm may narrow the operands) (row 13686)."""
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
-    # The run's own precision too: the window's dot reads it where the call's states the default.
-    return computed == jnp.dtype(jnp.bfloat16) and all(
-        asks_default_precision(stated, configured=True) for stated in (precision, None))
+    asked, run = (declared(computed, stated, outputs=outputs) for stated in (precision, None))
+    taken = (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None
+             and run.refusal is None and stated_algorithm(precision) in (None, stated_algorithm(None)))
+    return rhs if taken else rhs.verified(rhs.decoded())
 
 
 def _packed_gemm(lhs, matrix: NvFp4 | TernaryWeights | Bf16Window, group_sizes, *, epilogue: Hook,

@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import Tracer
 from jax.custom_derivatives import SymbolicZero
 from jax.typing import DTypeLike
 
@@ -728,6 +729,18 @@ class Bf16Window:
         """Verify the stored `form` (every addressable shard) is this Dew's encoder's."""
         _checked_form(self.form, window_form_version(), "Bf16Window", "Bf16Window.of", form=form)
         return self
+
+    def verified(self, value: jax.Array) -> jax.Array:
+        """`value`, computed from this window, where its form is this Dew's encoder's: checked at once where
+        the form is concrete (`checked`, which refuses another's), else, the window a traced argument (a
+        jitted step's), NaN wherever it is not, so words another encoder packed, read through this form's
+        decode, give no plausible number (the one boundary every product of a window passes, row 13686)."""
+        if not isinstance(self.form, Tracer):
+            self.checked()
+            return value
+        expected = jnp.asarray(window_form_version())
+        ours = jnp.all(jnp.asarray(self.form).reshape(-1, expected.size) == expected)
+        return jnp.where(ours, value, jnp.asarray(jnp.nan, value.dtype))
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
         """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a
