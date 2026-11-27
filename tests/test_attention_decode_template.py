@@ -1330,8 +1330,9 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
 def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
     heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
-    `merged.launch_work` (rows 8845, 10533): its kernel count, span (`3 * chunks`) and device bytes equal the
-    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
+    `merged.launch_work` (rows 8845, 10533): its kernel count, span (its Pallas Triton merge's, an H100's,
+    `merged.MOSAIC_SLOWER`: a step a slot of its chunks a pass, `merged._triton_span`) and device bytes equal
+    the split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
     from test_merged import _traced_merge_bytes
 
     from dew.algebra import windows
@@ -1358,7 +1359,8 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
                                         out_dtype=out_dtype, out_heads=out_heads)
     slices = padded_s.shape[1]
-    merge_span = float(3 * -(-slices // windows.chunk_width(slices)))
+    chunk = windows.chunk_width(slices)
+    merge_span = float(3 * -(-slices // chunk) * chunk)
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]
