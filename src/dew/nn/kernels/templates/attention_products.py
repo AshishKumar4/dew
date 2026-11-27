@@ -17,8 +17,9 @@ each combine lowered onto one call of the template, its one softmax over one val
 """
 
 import dataclasses
+import functools
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -197,10 +198,6 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
                              "copies of the keys do not")
     original = hooks.score.fn
 
-    def remapped(s, q_pos, k_pos, *params):
-        assert original is not None
-        return original(s, q_pos, k_pos % count, *params)
-
     # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its
     # copies' gradients sum before they round to its own (a 16-bit bias's near and far terms each past its
     # largest, summing to 0).
@@ -211,4 +208,11 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
     if drop is not None:
         keys = jnp.arange(count, dtype=jnp.int32) if drop.keys is None else drop.keys
         drop = dataclasses.replace(drop, keys=jnp.concatenate([keys] * products))
-    return dataclasses.replace(hooks, score=Hook(None if original is None else remapped, sides), drop=drop)
+    score = None if original is None else functools.partial(_own_keys, original, count)
+    return dataclasses.replace(hooks, score=Hook(score, sides), drop=drop)
+
+
+def _own_keys(score: Callable, count: int, s, q_pos, k_pos, *params):
+    """`score` given each key's own index of `count`, a copy's taken back (`_copied_hooks`): one function a
+    hook and count, so a holdable hook's lowering stays held (`tuning.holdable`)."""
+    return score(s, q_pos, k_pos % count, *params)

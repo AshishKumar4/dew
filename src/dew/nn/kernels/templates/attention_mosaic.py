@@ -119,7 +119,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     most_consumers,
     placed_draws,
     placed_scratch,
-    pointwise_tiles,
     reducing,
     refused,
     scaled_drop,
@@ -1121,12 +1120,8 @@ class MosaicForward(_Mainloop[Tiles]):
         steps = padded_k // config.block_k
         training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
-        # The output hook's program at this config's own output tile, as its walk replays it (`sliced_hook`).
-        pointwise = pointwise_tiles(self.output_mod, self.output_kinds, self.output_dtypes,
-                                    (config.block_q, value_width)) is not None
         plan = forward_block_plan(full_v, config.columns, out_dtype,
-                                  has_output_mod=self.output_mod is not None, training=training,
-                                  pointwise=pointwise)
+                                  has_output_mod=self.output_mod is not None, training=training)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config, target=target) if decides is None else decides
