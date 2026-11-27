@@ -288,6 +288,11 @@ def floor_of(literal: Term) -> i64: ...
 """The class of a literal's value among the walk's floors (`_floors`): literals of one value one class."""
 
 
+EXPONENTIALS = {"e": "exp", 2: "exp2"}
+"""The language's exponential of each base a declaration states (`Reduction.exponent`): the exponentials a
+walk's weights scale by (`_exponentials`, `scales`), whose parameters a declaration's own rescale reads."""
+
+
 def _exponentials(scaled: bool = False) -> list:
     """The rules that find what scales as `exp(-k)` of an anchor `k` (`scales`), from its exponential; and
     `scaled`, as `exp(-c k)`, an exponential of a difference times a positive literal `c` (raw logits, the
@@ -302,7 +307,7 @@ def _exponentials(scaled: bool = False) -> list:
     # exponent is held to 0 by a select, `exp(where(x < b, x - b, 0))`, `b` the broadcast of a bound of every
     # `x` (so the two are equal in the reals): attention's accurate form's weights over scaled logits, its
     # largest weighing exactly 1 against a compiler's contraction.
-    for power in ("exp", "exp2"):
+    for power in EXPONENTIALS.values():
         difference = x.binary(String("sub"), base, s)
         held = x.compare(String("lt"), base, d).select(y, difference)
         broadcast = (local(x), eq(base).to(k.shaped(String("broadcast_in_dim"), q)), anchor(k),
@@ -631,10 +636,6 @@ def _plain():
         name="plain walked")
 
 
-EXPONENTIALS = {2: "exp2", "e": "exp"}
-"""The language's exponential of each base a declaration states (`Reduction.exponent`)."""
-
-
 DECOUPLED = rules.Rules("decoupled", "reorders", _decoupled(),
                         receipt="docs/design/algebra.md §6.9; tests/test_algebra_derive.py; measured M-IE-1 "
                                 "(the derived attention forward against the hand forms it replaced, GH200: "
@@ -880,9 +881,13 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         (saturation.growth, saturation.depth), declaration.walked, declaration.exponent,
         tuple(sorted(declaration.ranges.items())), declaration.exact, declaration.rescale is None, context()))
     params_from, literals_from, shapes_from = len(region.params), len(region.literals), len(region.shapes)
+    # A rescale reads an exponential's parameters only where the declaration states its own rescale, whose
+    # walk alone writes one (`DECOUPLED_RESCALED`).
+    rescaled = frozenset() if declaration.rescale is None else frozenset(EXPONENTIALS.values())
     if name is not None and (made := stored.loaded(name, region, functools.partial(
             _assembled, region=region, closed=closed,
-            walked_leaves=_walked_leaves(closed, names, walked_axes), began=began))) is not None:
+            walked_leaves=_walked_leaves(closed, names, walked_axes), began=began),
+            rescaled=rescaled)) is not None:
         return made
     made = _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
     if name is None:
