@@ -928,7 +928,7 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
     none, the factor XLA's after it, as its receipts timed it; interpreted on this CPU (whose float32 flushes
     the subnormals `factored`'s own rounding keeps) no launch takes it either."""
 
-    def epilogues(rows, interpret):
+    def epilogues(rows, *, interpret):
         spec, matrix, sizes = _columned_case(grouped, rows)
         with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), tuning.seen() as launched:
             jax.eval_shape(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
@@ -937,10 +937,10 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
         assert found, rows
         return found
 
-    assert all(epilogue is not None for epilogue in epilogues(256, False))
-    assert all(epilogue is None for epilogue in epilogues(256, True))
+    assert all(epilogue is not None for epilogue in epilogues(256, interpret=False))
+    assert all(epilogue is None for epilogue in epilogues(256, interpret=True))
     # A decode's rows (the receipts' decode cells, `NVFP4_DECODE_ROWS`) keep the factor after the launch.
-    assert all(epilogue is None for epilogue in epilogues(16, False))
+    assert all(epilogue is None for epilogue in epilogues(16, interpret=False))
 
 
 @pytest.mark.parametrize("interpret", [False, True], ids=["native", "interpretation asked on a GPU"])
