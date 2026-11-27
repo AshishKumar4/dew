@@ -67,8 +67,9 @@ def depth_split(args) -> dict:
 
 def one_rank(args) -> dict:
     """A `[256, 256]` bfloat16 kernel placed on process 0's devices alone, its columns split across them:
-    no process waits on another's agreement; process 0, holding it whole, windows it whole, and process 1
-    holds none of its planes."""
+    no process waits on another's agreement, and every process holds the same window, its planes placed on
+    process 0's devices as the kernel's columns are, each of process 0's plane shards its own columns'
+    window and process 1 holding none of them."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -84,10 +85,12 @@ def one_rank(args) -> dict:
                                           lambda index: kernel[index], dtype=kernel.dtype)
     window = quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])[quantization.QUANTIZATION][
         "kernel"]
-    if args.process_id == 0:
-        return {"planes": [bool(np.array_equal(np.asarray(window.words), Bf16Window.of(kernel).words))],
-                "shape": list(window.shape)}
-    return {"planes": [shard.data.size for shard in window.words.addressable_shards],
+    columns = {shard.device: shard.index[1] for shard in placed.addressable_shards}
+    sharding = window.words.sharding
+    return {"planes": [bool(np.array_equal(np.asarray(shard.data),
+                                           Bf16Window.of(kernel[:, columns[shard.device]]).words))
+                       for shard in window.words.addressable_shards],
+            "placed": [str(sharding.spec), sorted(device.id for device in sharding.device_set)],
             "shape": list(window.shape)}
 
 

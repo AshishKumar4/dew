@@ -459,6 +459,7 @@ def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
     # On process 0's devices alone: every process windows it alike, process 1 holding none of its planes.
     reports = run_pool("one_rank", tmp_path / "one", 2, devices=2, script=worker)
     assert reports[0]["planes"] and all(reports[0]["planes"]) and reports[1]["planes"] == [], reports
+    assert reports[0]["placed"] == reports[1]["placed"], reports
     assert all(report["shape"] == [256, 256] for report in reports), reports
     # Each process's own kernel on its own device, an ordinary array of no mesh: windowed whole where it is.
     for report in run_pool("own_device", tmp_path / "own", 2, devices=2, script=worker):

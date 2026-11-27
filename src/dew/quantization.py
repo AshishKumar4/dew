@@ -633,22 +633,20 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
 
 
 def _window(kernel: jax.Array | np.ndarray, site: str):
-    """`kernel`'s lossless window (`Bf16Window.of`): a host array's encoded whole, as is a resident one this
-    process holds on devices of its own alone (its default's, a mesh of its own); one placed by a mesh's
-    names over devices of several processes encoded where it lives (`_resident_window`), every process
-    agreeing where the mesh spans the pool (the device set every process sharing it holds the same deciding,
-    and `agreed` meets every process of the pool); one on another
-    process's devices alone encoded as the planes this process holds of it, none, with no agreement to
-    meet (that process encodes it whole)."""
+    """`kernel`'s lossless window (`Bf16Window.of`): a host array's encoded whole, as is a resident one on a
+    single process or one a process holds on a device of its own (its default's, no mesh's names). Under a
+    pool of processes one placed by a mesh's names is encoded where it lives (`_resident_window`) on every
+    process alike, its planes placed as its columns are, whichever processes hold it; every process agrees
+    on it where the mesh spans the pool (`agreed` meets every process), and none waits on a peer where it
+    does not (a mesh of one process's devices, which that process windows alone)."""
     from jax.sharding import NamedSharding
 
     from dew.nn.kernels.formats import Bf16Window
 
-    if isinstance(kernel, jax.Array) and isinstance(sharding := kernel.sharding, NamedSharding):
+    if (isinstance(kernel, jax.Array) and jax.process_count() > 1
+            and isinstance(sharding := kernel.sharding, NamedSharding)):
         processes = {device.process_index for device in sharding.device_set}
-        if len(processes) > 1 or jax.process_index() not in processes:
-            # Agreed where every process of the pool holds a part, which is every process that meets it.
-            return _resident_window(kernel, sharding, site, agree=len(processes) == jax.process_count())
+        return _resident_window(kernel, sharding, site, agree=len(processes) == jax.process_count())
     return Bf16Window.of(np.asarray(kernel), site=site)
 
 
