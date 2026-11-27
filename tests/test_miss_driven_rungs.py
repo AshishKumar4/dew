@@ -147,15 +147,15 @@ def test_every_process_defers_a_place_any_predicts_short_and_asks_it_after_the_r
 
 
 def scripted_search(gather):
-    """A fit search over a tiny decoder on one device, its rounds `gather`'s, its rung the plain one."""
-    from dew.training.planning import FitSearch, Rung
+    """A fit search over a tiny decoder on one device, its rounds `gather`'s."""
+    from dew.training.planning import FitSearch
 
     model = models.build("causal_transformer", vocab_size=32, emb_features=16, num_layers=1, num_heads=2,
                          mlp_features=32, max_seq_len=8)
     search = FitSearch(lower=None, options=lambda candidate: None, objective=LMObjective(model, seq_len=8),
                        mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False,
                        ns_group=None, base=None, resumed=None, gather=gather)
-    return search, Rung((), None, fused=False, xla_defaults=False, narrow=False)
+    return search
 
 
 def test_a_jumped_rung_fitting_at_a_split_its_walk_passed_over_is_admitted_there():
@@ -201,8 +201,7 @@ def test_a_miss_reads_its_next_split_and_whether_it_fits_as_every_process_does()
     next split is its last-resort one and no process reads it as fitting (train 1387's P1)."""
     from dew.training.memory import MemoryMiss
 
-    search, rung = scripted_search(lambda mine: [mine, [3, False]])
-    search.at(rung)
+    search = scripted_search(lambda mine: [mine, [3, False]])
     search.misses[(search.rung(), 1)] = MemoryMiss(1, scaled=100, shortfall=40, factor=1)
     assert search.forecast([1, 2, 4, 8], 0) == (3, False)
 
