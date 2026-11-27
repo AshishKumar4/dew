@@ -563,9 +563,17 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
 def call_scratch(target: str) -> bool:
     """Whether a custom call of `target` outputs a tuple of its result first and its scratch last (every
     cuBLAS call of the pinned XLA: the gemm rewriter's workspace, the triangular solve's temp bytes), the
-    call carrying the frontend attributes of the instruction it replaced (`_Call.scratched`)."""
-    call = _calls().get(target)
+    call carrying the frontend attributes of the instruction it replaced (`_Call.scratched`). Read off
+    XLA's own targets (`_XLA_CALLS`), which no optional wheel's discovery is needed for."""
+    call = _XLA_CALLS.get(target)
     return call is not None and call.scratched
+
+
+def xla_gemm(target: str) -> bool:
+    """Whether `target` is one of XLA's cuBLAS GEMMs, whose backend config states its dot's dimension
+    numbers (`gemm_backend_config.dot_dimension_numbers`), read off XLA's own targets (`_XLA_CALLS`)."""
+    call = _XLA_CALLS.get(target)
+    return call is not None and call.kind == "gemm"
 
 
 def custom_call_kind(target: str) -> str | None:

@@ -37,7 +37,7 @@ from typing import Any
 import jax
 
 from dew.telemetry import hlo
-from dew.telemetry.instrumentation import call_scratch, custom_call_kind
+from dew.telemetry.instrumentation import call_scratch, xla_gemm
 
 
 @dataclasses.dataclass(frozen=True)
@@ -811,7 +811,7 @@ def _custom(instruction, operands, shape):
                 # Stated unknown (null), or past the outputs stated (a kernel's scratch): unknown.
                 outputs.append(_filled(element, None))
         return outputs if shape.tuple_shapes else outputs[0]
-    if custom_call_kind(instruction.custom_call_target) == "gemm":
+    if xla_gemm(instruction.custom_call_target):
         config = json.loads(instruction.backend_config or "{}")
         numbers = config.get("gemm_backend_config", {}).get("dot_dimension_numbers")
         if numbers is not None:
