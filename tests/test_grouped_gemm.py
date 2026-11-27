@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import lane
-from generation_support import INTERPRETS, here, interpreted_projection, lowers, runs
+from generation_support import INTERPRETS, here, interpreted_projection, lowers, on_the_host, runs
 from jax.sharding import Mesh
 from native_certificates import (
     forward_products,
@@ -257,18 +257,22 @@ def test_a_16_bit_products_stated_dot_algorithm_reaches_xla():
         return jax.lax.dot_general(x, w, (((1,), (0,)), ((), ())), precision=algorithm,
                                    preferred_element_type=out_dtype)
 
-    x, w = jnp.asarray([[2048.0] + [1.0] * 6 + [-2048.0]], jnp.float16), jnp.ones((8, 1), jnp.float16)
-    refusals = []
-    for arm in (xla_own, through_dew):
-        with pytest.raises(jax.errors.JaxRuntimeError) as refused:
-            jax.block_until_ready(jax.jit(arm, static_argnums=(2, 3))(x, w, preset.F16_F16_F16, jnp.float16))
-        refusals.append(str(refused.value).splitlines()[0])
-    assert refusals[0] == refusals[1]
-    rng = np.random.default_rng(0)
-    xb, wb = (jnp.asarray(rng.normal(size=shape), jnp.bfloat16) for shape in ((4, 64), (64, 8)))
-    np.testing.assert_array_equal(
-        np.asarray(jax.jit(through_dew, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)),
-        np.asarray(jax.jit(xla_own, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)))
+    # On this CPU whatever the lane's default device: a GPU's dot has the float16 accumulator XLA:CPU lacks.
+    with on_the_host():
+        x, w = jnp.asarray([[2048.0] + [1.0] * 6 + [-2048.0]], jnp.float16), jnp.ones((8, 1), jnp.float16)
+        refusals = []
+        for arm in (xla_own, through_dew):
+            with pytest.raises(jax.errors.JaxRuntimeError) as refused:
+                jax.block_until_ready(jax.jit(arm, static_argnums=(2, 3))(x, w, preset.F16_F16_F16,
+                                                                          jnp.float16))
+            refusals.append(str(refused.value).splitlines()[0])
+        assert refusals[0] == refusals[1]
+        rng = np.random.default_rng(0)
+        xb, wb = (jnp.asarray(rng.normal(size=shape), jnp.bfloat16) for shape in ((4, 64), (64, 8)))
+        def run(arm):
+            return np.asarray(jax.jit(arm, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32))
+
+        np.testing.assert_array_equal(run(through_dew), run(xla_own))
 
 
 def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path, monkeypatch):
@@ -539,6 +543,9 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
         whole = launch.derived(launch.bind(bf16((32768, 2048)), bf16((32768, 2880)), sizes, (),
                                            out_dtype="float32", interpret=False), target)
         assert whole is not None and 2048 % whole.block_m == 0, whole
+    # The interpreted launches on this CPU whatever the lane's default device, as the interpreter runs them
+    # (an A100's default device ran the H100's barrier copy natively).
+    with generation.assumed("sm90"), on_the_host():
         rng = np.random.default_rng(37)
         tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 320)), jnp.bfloat16)
         cotangent = jnp.asarray(rng.integers(-3, 4, size=(300, 128)), jnp.bfloat16)
@@ -550,7 +557,7 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
                                               multiprocessors=4, interpret=grouped_launch.INTERPRETED))
 
         np.testing.assert_array_equal(gradient(128, 2), gradient(64, 1))
-    with generation.assumed("sm80"):
+    with generation.assumed("sm80"), on_the_host():
         tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 264)), jnp.bfloat16)
         cotangent = jnp.asarray(rng.integers(-3, 4, size=(300, 64)), jnp.bfloat16)
         narrow = tiling.Tiles(192, 64, 32, 2, 1, family="mma.sync")
