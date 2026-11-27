@@ -58,16 +58,25 @@ __all__ = ["ExpertBalance", "RoutedStatistics", "UntrainedRouter", "apply_routed
 
 @struct.dataclass
 class RoutedStatistics:
-    """A prediction's statistics next to the routers' own terms.
+    """A prediction's statistics next to the terms that normalize by counts of their own.
 
     Each router term normalises by its own count, not by the counted tokens,
     so the terms travel as separate statistics until `ExpertBalance.reduce`
-    adds them up.
+    adds them up. `auxiliary` holds the model's own terms of their own mass,
+    each its coefficient already in its total: an indexer's KL over the queries
+    it counts (`dew.objectives.lm.IndexerTraining`), which a role's targets
+    alone would weigh by targets it never reads (row 13705).
     """
     prediction: Ratio
-    sequence: tuple[Ratio, ...]
-    global_routers: tuple[RouterMoments, ...]
+    sequence: tuple[Ratio, ...] = ()
+    global_routers: tuple[RouterMoments, ...] = ()
     router_z: tuple[Ratio, ...] = ()
+    auxiliary: tuple[Ratio, ...] = ()
+
+    @property
+    def routed(self) -> bool:
+        """Whether it holds a router's term, which only a balance reduces (`reduce_routed`)."""
+        return bool(self.sequence or self.global_routers or self.router_z)
 
 
 @dataclass(frozen=True)
@@ -229,10 +238,7 @@ class ExpertBalance:
                 raise ValueError("global router statistics require aux_loss_alpha")
             value = value + global_router_loss(term, self.aux_loss_alpha)
             active = active | (term.positions > 0)
-        for term in stats.router_z:
-            auxiliary, supported = term.mean()
-            value, active = value + auxiliary, active | supported
-        return value, active
+        return _with_terms(value, active, (*stats.router_z, *stats.auxiliary))
 
     def apply(self, variables: Variables, effects: Variables) -> Variables:
         """`variables` with each counted router's bias moved by its counts (`dew.nn.moe.load_balance_update`).
@@ -289,14 +295,25 @@ def reduce_routed(balance: ExpertBalance | None,
                   stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
     """The objective value of a loss's statistics, and whether they have any mass.
 
-    A `Ratio` reduces by its own mean, and routed statistics by `balance` (`ExpertBalance.reduce`), which
-    a routed loss has to name.
+    A `Ratio` reduces by its own mean; statistics holding a router's terms by `balance`
+    (`ExpertBalance.reduce`), which a routed loss has to name; the prediction beside auxiliary terms alone by
+    each term's mean, summed.
     """
     if isinstance(stats, Ratio):
         return stats.mean()
-    if balance is None:
+    if balance is not None:
+        return balance.reduce(stats)
+    if stats.routed:
         raise ValueError("routed statistics require a balance (ExpertBalance)")
-    return balance.reduce(stats)
+    return _with_terms(*stats.prediction.mean(), stats.auxiliary)
+
+
+def _with_terms(value: jax.Array, active: jax.Array, terms: tuple[Ratio, ...]) -> tuple[jax.Array, jax.Array]:
+    """`value` with each term's mean added, and whether it or any term has mass."""
+    for term in terms:
+        auxiliary, supported = term.mean()
+        value, active = value + auxiliary, active | supported
+    return value, active
 
 
 def apply_routed(balance: ExpertBalance | None, variables: Variables, effects: Variables) -> Variables:

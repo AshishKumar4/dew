@@ -461,6 +461,41 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup"))
 
 
+def test_an_msa_index_branch_trains_by_its_kl_per_query_whatever_targets_the_role_counts():
+    """MSA's index branch trains by its KL per counted query (`IndexerTraining.weight` times that ratio),
+    a term of its own mass beside the cross entropy per counted target: a role that counts one target of
+    each row moves the branch exactly as one that counts every target does, the same queries read
+    (row 13705: the KL summed into the cross entropy's numerator was weighed by the targets counted, a
+    hundredfold for one target among a hundred queries)."""
+    from test_mixers import tiny
+
+    from dew.data.chat import ROLES_KEY, Role
+    from dew.registry import mixers
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    objective = LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=1.0),
+                            loss_role=Role.ASSISTANT)
+    params = nn.unbox(objective.init(jax.random.key(0)))
+    tokens = token_batch()["text"]
+    every = np.full(tokens.shape, int(Role.ASSISTANT), np.int32)
+    one = np.full(tokens.shape, int(Role.USER), np.int32)
+    one[:, -1] = int(Role.ASSISTANT)
+
+    def branch(roles) -> tuple[list[np.ndarray], float]:
+        batch = {"text": tokens, ROLES_KEY: jnp.asarray(roles)}
+        (_, aux), grads = jax.value_and_grad(lambda p: objective.scalar_loss(p, batch, step_at()),
+                                             has_aux=True)(params)
+        found = [np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(grads["params"])
+                 if "msa_indexer" in jax.tree_util.keystr(path)]
+        return found, float(aux.metrics["indexer_kl"])
+
+    (all_targets, kl), (one_target, kl_again) = branch(every), branch(one)
+    assert all_targets and kl == kl_again
+    for left, right in zip(all_targets, one_target, strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
 def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
     """One document, then padding whose ids are real tokens. The attention
