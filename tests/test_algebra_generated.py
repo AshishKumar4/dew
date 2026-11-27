@@ -185,3 +185,31 @@ def test_a_grouped_scores_readout_runs_the_written_tile_and_counts_why():
         found = recurrence_algebra.scores_tile(products, decays, scales, 2)
     np.testing.assert_array_equal(found, written)
     assert counts == {("dew.algebra.recurrence_cases.scores", "another static program"): 1}
+
+
+def test_the_interpreted_ssd_backward_takes_its_generated_skip_pullback():
+    """A packed bf16 SSD's skip gradient on the recurrence template interpreted as an sm90 runs it (its walk's
+    `_values_gated_back`), under the generated choice: the skip's pullback and the gated values' reach their
+    declared cases at the call's own tile and run the generated bodies, on par with the written choice from
+    the portable math (check 1)."""
+    from ssd_support import mamba_ssd_draw, mamba_ssd_xla
+    from test_mamba_ssd import SKIPPED
+    from test_recurrence_chunk import formed
+
+    def skip_gradient(kernel):
+        def run(arrays):
+            with generation.assumed("sm90", interpreted=True), generation.chosen(ssd="mosaic_gpu",
+                                                                                 generated=kernel):
+                return mamba_ssd_xla(arrays, 16, jnp.bfloat16)["D"]
+        return formed("fast", run)
+
+    def truth(arrays):
+        with generation.chosen(ssd="xla"):
+            return mamba_ssd_xla(arrays, 16)["D"]
+
+    with generated.taken() as counts:
+        assert_as_exact(jax.jit(skip_gradient("generated")), jax.jit(skip_gradient("written")),
+                        lambda seed: (mamba_ssd_draw(seed, SKIPPED, jnp.bfloat16, documents=True),),
+                        "the packed skip's gradient, generated", seeds=FEWEST_SEEDS, truth_fn=jax.jit(truth))
+    assert counts["dew.algebra.recurrence_cases.skipped_back", generated.GENERATED] >= 1, counts
+    assert counts["dew.algebra.recurrence_cases.gdn_value_pullback", generated.GENERATED] >= 1, counts

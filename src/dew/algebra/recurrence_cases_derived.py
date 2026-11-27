@@ -589,6 +589,8 @@ def chunk_weighted(*operands, policy: str = 'default', target: str = 'sm90'):
 
 
 _gdn_value_pullback_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (*(((64, 16), 'float32'),) * 2, ((64,), 'float32'))):
+        _gdn_value_pullback_0,
     ('default', 'sm90', (*(((32, 64), 'float32'),) * 2, ((32,), 'float32'))):
         _gdn_value_pullback_0,
     ('default', 'sm90', (*(((64, 128), 'float32'),) * 2, ((64,), 'float32'))):
@@ -750,6 +752,8 @@ def selective_token(*operands, policy: str = 'default', target: str = 'sm90'):
 
 
 _skipped_back_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (*(((64, 16), 'float32'),) * 2, ((), 'float32'))):
+        _skipped_back_0,
     ('default', 'sm90', (*(((64, 64), 'float32'),) * 2, ((), 'float32'))):
         _skipped_back_0,
     ('default', 'sm90', (*(((64, 128), 'float32'),) * 2, ((), 'float32'))):

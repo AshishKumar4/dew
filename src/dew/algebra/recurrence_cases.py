@@ -380,7 +380,10 @@ KDA_STRICT_BAND = declare(__name__, "kda_strict_band", ComponentForm(
 
 GDN_VALUE_PULLBACK = declare(__name__, "gdn_value_pullback", ComponentForm(
     recurrence_algebra.gated_values_back, _gdn_values_truth, dataclasses.replace(
-        float32_cases(*[((c, v), (c, v), (c,)) for c, v in ((32, 64), (64, 128))]), draw=_gdn_values_draw)))
+        # A block's rows of the value columns: the SSD's 16-wide heads' (test_mamba_ssd's packed skip case)
+        # and wider ones.
+        float32_cases(*[((c, v), (c, v), (c,)) for c, v in ((64, 16), (32, 64), (64, 128))]),
+        draw=_gdn_values_draw)))
 
 
 SSD_CHUNK_FORWARD = declare(__name__, "ssd_chunk_forward", ComponentForm(
@@ -552,6 +555,6 @@ SKIPPED_BACK = declare(__name__, "skipped_back", ComponentForm(
     recurrence_algebra.skipped_back, _skipped_back_truth, dataclasses.replace(
         # The tiled backward's (a block's rows of the value columns, the head's scalar skip) and the laid
         # backward's (the call's rows of each head's value columns, a skip a head).
-        float32_cases(((64, 64), (64, 64), ()), ((64, 128), (64, 128), ()),
+        float32_cases(((64, 16), (64, 16), ()), ((64, 64), (64, 64), ()), ((64, 128), (64, 128), ()),
                       ((128, 4, 64), (128, 4, 64), (4, 1)), ((256, 8, 64), (256, 8, 64), (8, 1))),
         draw=_skipped_back_draw)))
