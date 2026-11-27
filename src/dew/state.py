@@ -151,11 +151,12 @@ def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) ->
     objective whose statistics gained a term since: an indexer's KL beside its prediction, row 13705)."""
     if held is None:
         return False
-    if (held.mass is None) != (pending.mass is None) or (held.replays(pending) and not held.pools(pending)):
+    replays = held.replays(pending)
+    if (held.mass is None) != (pending.mass is None) or (replays and not held.pools(pending)):
         raise ValueError("the state's accumulation window pools other statistics than the step's, which it "
                          "cannot continue: resume from a step that closed its window, or with the Dew that "
                          "wrote it")
-    if held.replays(pending):
+    if replays:
         return True
     if read and held.fill is not None and (count := occupied(held)):
         raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
