@@ -73,13 +73,15 @@ def test_a_tight_start_compiles_second_a_place_that_fits(tmp_path, monkeypatch, 
 
 
 def test_a_looped_decoder_reading_its_passes_apart_compiles_second_its_unfused_tile(tmp_path, monkeypatch):
-    """A looped decoder whose loss weighs each pass's exit takes its head's tile unfused, a tile of tokens by
-    columns per pass: on an H100 whose allocator holds what its step needs tiled, its second compile is its
-    tiled head and fits, priced by the tile it takes rather than a fused head's chunk over the whole
-    vocabulary (train 1387's P2)."""
+    """A looped decoder whose loss weighs each pass's exit takes its head's tile unfused, a tile of 4096
+    tokens by 8192 columns (128 MiB of logits) where a fused head's chunk scores the whole vocabulary (512
+    MiB): on an H100 whose allocator holds what its step needs tiled and 128 MiB more, its second compile is
+    its head tiled, no layer recomputed, and fits; a quote of the fused chunk, short by 384 MiB, would read
+    the tile alone as not fitting (train 1387's P2)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    room = need(None, tiled=True, looped=True)
+    room = need(None, tiled=True, looped=True) + 2 ** 27
     assert need(None, looped=True) > room
     probes = searched(decoder(room, looped=True))["probes"]
     assert [probe["fits"] for probe in probes] == [False, True], probes
-
+    second = probes[1]
+    assert second["remat"] is None and second["head_tile"] is not None and not second["head_fused"], second

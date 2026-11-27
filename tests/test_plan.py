@@ -131,7 +131,8 @@ def test_every_process_gathers_the_split_asked_after_each_miss():
     assert FitSearch.forecast(search(fitting, [[3, False]]), candidates, 0) == (3, False)
     assert FitSearch.forecast(search({}, []), candidates, 3) == (None, False)
     # A miss whose figures leave no split above it room asks the finest, XLA's compile the judge of it.
-    assert FitSearch.forecast(search({("rung", 1): MemoryMiss(1, 30, 50, 1)}, []), candidates, 0) == (3, False)
+    starved = {("rung", 1): MemoryMiss(1, 30, 50, 1)}
+    assert FitSearch.forecast(search(starved, []), candidates, 0) == (3, False)
 
 
 def test_every_process_keeps_or_drops_the_narrow_copies_together():
