@@ -45,6 +45,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
+from jax.core import Tracer
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
@@ -357,21 +358,18 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
                          f"{expected}, not {applied.shape} {applied.dtype}")
 
 def _window_served(lhs, rhs, compute, precision):
-    """`gemm`'s matrix: a `Bf16Window` the call's math is its product's (`_window_takes`), else its decoded
-    matrix, whose ordinary product computes what the call asks of its weights, its encoding checked first as
-    the window's product checks it (a traced one's at its trace's caller); any other matrix as it is."""
+    """`gemm`'s matrix: a `Bf16Window` whose product the call asks (`_window_takes`), else its decoded matrix
+    (its encoding checked first, as the window's product checks it); any other matrix as it is."""
     if not isinstance(rhs, Bf16Window) or _window_takes(lhs, compute, precision):
         return rhs
-    return (rhs if isinstance(rhs.form, jax.core.Tracer) else rhs.checked()).decoded()
+    return (rhs if isinstance(rhs.form, Tracer) else rhs.checked()).decoded()
 
 
 def _window_takes(lhs, compute, precision) -> bool:
-    """Whether a `Bf16Window`'s product (`window_product`: its rows rounded to bf16, each product exact,
-    summed in fp32 at the default precision, no partial sums promoted) is the product `gemm` is asked for:
-    its products' dtype (`compute`, `lhs`'s where None) bf16's, at the default precision the call and the
-    run each ask (above it, an fp32 output's partial sums are promoted, `templates.product.declared`; a stated
-    algorithm may narrow the operands) (row 13686: an fp32 call's rows of 1 + 2^-9 rounded to 1 where its
-    kernel's product keeps them)."""
+    """Whether a `Bf16Window`'s product (`window_product`: bf16 rows' exact products summed in fp32, no partial
+    sums promoted) is the one `gemm` is asked for: its products' dtype (`compute`, `lhs`'s where None) bf16's,
+    at the default precision the call and the run each ask (above it an fp32 output's partial sums are
+    promoted, `templates.product.declared`; an algorithm may narrow the operands) (row 13686)."""
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
     # The run's own precision too: the window's dot reads it where the call's states the default.
     return computed == jnp.dtype(jnp.bfloat16) and all(
