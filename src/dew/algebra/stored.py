@@ -235,9 +235,9 @@ class _Writer:
         self.table: list[list] = []
         self.at: dict[object, int] = {}
 
-    def term(self, term) -> int:
+    def term(self, term: Term) -> int:
         """`term`'s index in the table, it and each of its terms written where they are not yet."""
-        pending: list[tuple[object, tuple[str, tuple] | None]] = [(term, None)]
+        pending: list[tuple[Term, tuple[str, tuple] | None]] = [(term, None)]
         while pending:
             held, called = pending.pop()
             if terms.key(held) in self.at:
@@ -252,7 +252,7 @@ class _Writer:
             self.at[terms.key(held)] = len(self.table) - 1
         return self.at[terms.key(term)]
 
-    def maybe(self, term) -> int | None:
+    def maybe(self, term: Term | None) -> int | None:
         return None if term is None else self.term(term)
 
     def _argument(self, argument) -> list:
