@@ -238,9 +238,14 @@ def _entry(spec: P, dimension: int):
 
 def tensor_shards(query) -> int:
     """How many ways the mesh's tensor axes split the query heads."""
+    return _splits(query, 2)
+
+
+def _splits(query, dimension: int) -> int:
+    """How many ways the mesh's axes split the query's `dimension` (its rows' 0, its heads' 2)."""
     mesh = jax.sharding.get_abstract_mesh()
     return math.prod(mesh.shape[axis]
-                     for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
+                     for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), dimension)))
 
 
 def shard_heads(query) -> int:
@@ -250,9 +255,7 @@ def shard_heads(query) -> int:
 
 def row_shards(query) -> int:
     """How many ways the mesh's batch axes split the query rows, as `on_attention_shards` splits them."""
-    mesh = jax.sharding.get_abstract_mesh()
-    return math.prod(mesh.shape[axis]
-                     for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 0)))
+    return _splits(query, 0)
 
 
 def launched(query, key) -> tuple[int, int, int]:
