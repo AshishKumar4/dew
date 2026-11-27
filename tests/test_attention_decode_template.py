@@ -83,10 +83,10 @@ def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
 
 def _one_query_draws(rows: int, heads: int, keys: int, kv_heads: int, dtype):
     """A draw of `rows` rows' one query of `heads` heads 64 wide, and their keys and values over `keys`."""
-    return functools.partial(_drawn, (rows, 1, heads, 64), (rows, keys, kv_heads, 64), dtype)
+    return functools.partial(_normals, (rows, 1, heads, 64), (rows, keys, kv_heads, 64), dtype)
 
 
-def _drawn(query_shape: tuple[int, ...], kv_shape: tuple[int, ...], dtype, seed: int) -> tuple:
+def _normals(query_shape: tuple[int, ...], kv_shape: tuple[int, ...], dtype, seed: int) -> tuple:
     """A seed's queries of `query_shape` and keys and values (or their pools) of `kv_shape`
     (`attention_oracle.qkv`)."""
     return qkv(query_shape, dtype, seed, kv_shape)
@@ -95,7 +95,7 @@ def _drawn(query_shape: tuple[int, ...], kv_shape: tuple[int, ...], dtype, seed:
 def _operands(query_shape: tuple[int, ...], keys: int):
     """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
     heads 64 wide."""
-    return functools.partial(_drawn, query_shape, (2, keys, 2, 64), jnp.bfloat16)
+    return functools.partial(_normals, query_shape, (2, keys, 2, 64), jnp.bfloat16)
 
 
 @INTERPRETS
@@ -657,7 +657,7 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
                                                 implementation=implementation)
         return attend
 
-    draw = functools.partial(_drawn, (rows, drafts, 32, 128), (rows, keys, 8, 128), jnp.bfloat16)
+    draw = functools.partial(_normals, (rows, drafts, 32, 128), (rows, keys, 8, 128), jnp.bfloat16)
 
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), draw,
                     f"verify block of {drafts} through the route", seeds=SEEDS)
@@ -685,7 +685,7 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
         rows = pool[:, table]
         return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(2, keys, kv_heads, pool.shape[-1])
 
-    draw = functools.partial(_drawn, (2, 1, 32, 128), (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
+    draw = functools.partial(_normals, (2, 1, 32, 128), (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
 
     def ours(query, key_pool, value_pool):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
