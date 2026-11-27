@@ -305,12 +305,13 @@ def test_a_flows_deferred_cell_is_read_unprepared_and_a_row_left_no_time_is_stal
         for cell in cells:
             truths_ahead.reasoned(store / name / record, test, "tests/test_gpu_vae.py:9",
                                   f"{cell or 'a site'}: lowered", cell)
-    found = ci.prepares.unprepared_in(tmp_path, (ci.tier_wire().UNPREPARED, ci.tier_wire().DEFERRED),
-                                      ci.grading.owning)
-    # The flow's two cells deferred at one line are each their own.
-    assert sorted(ci.prepares.identity(record) for record in found["tests/test_gpu_vae.py"]) == [
-        f"{encodes} @ tests/test_gpu_vae.py:9", f"{flow} @ tests/test_gpu_vae.py:9 [one]",
-        f"{flow} @ tests/test_gpu_vae.py:9 [two]"]
+    found = ci.prepares.unprepared_in(
+        tmp_path, {ci.tier_wire().UNPREPARED: "site", ci.tier_wire().DEFERRED: "flow"}, ci.grading.owning)
+    # The flow's two cells deferred at one line are each their own, each of its record's kind.
+    records = found["tests/test_gpu_vae.py"]
+    assert sorted((ci.prepares.identity(record), record["kind"]) for record in records) == [
+        (f"{encodes} @ tests/test_gpu_vae.py:9", "site"), (f"{flow} @ tests/test_gpu_vae.py:9 [one]", "flow"),
+        (f"{flow} @ tests/test_gpu_vae.py:9 [two]", "flow")]
     out = tmp_path / "verdict.json"
     assert ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", out, 1.0,
                            "off") == 3
@@ -440,36 +441,104 @@ def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_
             [found], {} if "unprepared" in found else {"tests/test_gpu_vae.py": records}, before, "sm90",
             lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
         return row
+
+    def kept(*cells):
+        """Main's baseline keeping `cells` by their fields, as it is read back (`cells_of`)."""
+        return ci.prepares.cells_of({"unprepared_cells": [list(cell) for cell in cells]})
     # A parameter id holding " @ <cap> [": main's cell of it at an ordinary site, labeled.
     lookalike = ("tests/test_gpu_vae.py::test_flow[p] @ " + wire.CAPPED + " [q", "a site", "c")
     # This run's cell that main's lookalike, read as a string, names as one main capped.
     reached = {"test": "tests/test_gpu_vae.py::test_flow[p]", "where": "a site", "error": "e",
                "cell": "q @ a site [c"}
-    assert graded([reached], before={lookalike})["new_unprepared"] == [ci.prepares.identity(reached)]
+    assert graded([reached], before=kept(lookalike))["new_unprepared"] == [ci.prepares.identity(reached)]
     # A cell main capped, by its fields, exempts its same cell wherever this run reached it, fresh or reused.
     capped = ("tests/test_gpu_vae.py::test_flow", wire.CAPPED, "two")
     same = {"test": "tests/test_gpu_vae.py::test_flow", "where": "tests/test_gpu_vae.py", "error": "e",
             "cell": "two"}
-    row = graded([same], before={capped})
+    row = graded([same], before=kept(capped))
     assert row["exitCode"] == 0
     assert json.loads(json.dumps(row))["unprepared_cells"] == [
-        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two"]]
+        ["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None]]
     assert ci.prepares.cells_of(json.loads(json.dumps(row))) == {
-        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two")}
-    assert graded([], before={capped}, found=json.loads(json.dumps(row)))["exitCode"] == 0
+        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two", None)}
+    assert graded([], before=kept(capped), found=json.loads(json.dumps(row)))["exitCode"] == 0
     sibling = {**same, "cell": "three"}
-    assert graded([same, sibling], before={capped})["new_unprepared"] == [ci.prepares.identity(sibling)]
+    assert graded([same, sibling], before=kept(capped))["new_unprepared"] == [ci.prepares.identity(sibling)]
     # A cut kept by fields beside an older one kept by identities: each read as it is, so the lookalike's
     # fields still name no cap, and an older identity at the cap still exempts as before.
     older = f"tests/test_gpu_vae.py::test_other @ {wire.CAPPED}"
-    mixed = graded([reached], before={lookalike, older})
+    mixed = graded([reached], before=kept(lookalike) | {older})
     assert mixed["new_unprepared"] == [ci.prepares.identity(reached)]
     other = {"test": "tests/test_gpu_vae.py::test_other", "where": "x", "error": "e"}
-    assert graded([other], before={lookalike, older})["exitCode"] == 0
+    assert graded([other], before=kept(lookalike) | {older})["exitCode"] == 0
     # Two cells whose fields differ but render alike: compared by field, one is never the other.
     one = {"test": "t @ a", "where": "b", "error": "e"}
-    assert ci.prepares.identity(one) == ci.prepares.identity(ci.prepares.record_of(("t", "a @ b", None)))
-    assert graded([one], before={("t", "a @ b", None)})["new_unprepared"] == [ci.prepares.identity(one)]
+    assert ci.prepares.identity(one) == ci.prepares.identity(
+        ci.prepares.record_of(ci.prepares.decoded(("t", "a @ b", None))))
+    assert graded([one], before=kept(("t", "a @ b", None)))["new_unprepared"] == [ci.prepares.identity(one)]
+
+
+def test_a_site_s_cap_excuses_no_flow_cell_and_a_cap_is_judged_by_its_fields(ci, tmp_path):
+    """A cell keeps the kind of record it came from (prepares.py's `unprepared_in`: a Check 1 site's
+    `UNPREPARED`, a flow's `DEFERRED`) through its row and baseline: main capping a site labeled as a flow's
+    cell excuses no new failure of that cell elsewhere, fresh or reused, where main capping the cell does, and
+    a baseline of the older three fields still does; a reused row of the older three fields is main's
+    same cell, and a site's cell is no flow's at one where and label (PT01). This run's capped cells are
+    told by their where, a field, so a cell merely rendered as a capped one is still judged, fresh or reused
+    (CC06)."""
+    name = "3.12:tests/test_gpu_vae.py#@prepare-sm90"
+    wire = ci.tier_wire()
+    test, line = "tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py:9"
+    kinds = {wire.UNPREPARED: "site", wire.DEFERRED: "flow"}
+    runs = iter(range(100))
+
+    def prepared(*reasons):
+        """The cells a prepare left whose store holds `reasons` (record, where, label), as a dry prepare reads
+        them."""
+        store = tmp_path / str(next(runs))
+        for index, (record, where, label) in enumerate(reasons):
+            truths_ahead.reasoned(store / str(index) / record, test, where, f"{label}: e", label)
+        return ci.prepares.unprepared_in(store, kinds, ci.grading.owning)["tests/test_gpu_vae.py"]
+
+    def graded(records, before, found=None):
+        found = found or {"name": name, "exitCode": 0, "output": "ran"}
+        [row] = ci.prepares.graded(
+            [found], {} if "unprepared" in found else {"tests/test_gpu_vae.py": records}, before, "sm90",
+            lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
+        return json.loads(json.dumps(row))
+
+    def baseline(*reasons):
+        """Main's green prepare's baseline, leaving `reasons`, as it is written and read back."""
+        row = graded(prepared(*reasons), ci.prepares.BOOTSTRAP)
+        assert row["exitCode"] == 0
+        return ci.prepares.cells_of({field: row[field] for field in ("unprepared", "unprepared_cells")})
+
+    site_capped = baseline((wire.UNPREPARED, wire.CAPPED, "two"))
+    flow_capped = baseline((wire.DEFERRED, wire.CAPPED, "two"))
+    failed = prepared((wire.DEFERRED, line, "two"))
+    assert graded(failed, site_capped)["new_unprepared"] == [ci.prepares.identity(failed[0])]
+    row = graded(failed, flow_capped)
+    assert row["exitCode"] == 0
+    assert graded([], site_capped, found=row)["exitCode"] == 1
+    assert graded([], flow_capped, found=row)["exitCode"] == 0
+    older = ci.prepares.cells_of({"unprepared_cells": [[test, wire.CAPPED, "two"]]})
+    assert graded(failed, older)["exitCode"] == 0
+    # An older reused row, its cell's three fields, against main's baseline of that cell with its kind.
+    main_failed = baseline((wire.DEFERRED, line, "two"))
+    reused = {"name": name, "exitCode": 0, "output": "", "unprepared": [ci.prepares.identity(failed[0])],
+              "unprepared_cells": [[test, line, "two"]]}
+    assert graded([], main_failed, found=reused)["exitCode"] == 0
+    assert graded(prepared((wire.UNPREPARED, line, "two")), main_failed)["exitCode"] == 1
+    # This run's cap, and a site's cell whose where reads as the cap rendered: only the cap is left unjudged.
+    records = prepared((wire.DEFERRED, wire.CAPPED, "c"), (wire.UNPREPARED, f"{wire.CAPPED} [c]", None))
+    assert len({ci.prepares.identity(record) for record in records}) == 1
+    said = [ci.prepares.identity(records[0])]
+    row = graded(records, set())
+    assert (row["exitCode"], row["capped"], row["new_unprepared"]) == (1, said, said)
+    saved = graded(records, ci.prepares.BOOTSTRAP)
+    assert saved["exitCode"] == 0
+    again = graded([], set(), found=saved)
+    assert (again["exitCode"], again["capped"], again["new_unprepared"]) == (1, said, said)
 
 
 @pytest.mark.parametrize("capped", [False, True])
@@ -902,7 +971,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     lookalike = ["tests/test_gpu_a.py::test_flow[p] @ " + wire.CAPPED + " [q", "a site", "c"]
     older = f"tests/test_gpu_a.py::test_other @ {wire.CAPPED}"
     kept = {"3.12:tests/test_gpu_a.py#1/2@prepare-sm90": {
-                "unprepared": [ci.prepares.identity(ci.prepares.record_of(tuple(lookalike)))],
+                "unprepared": [ci.prepares.identity(ci.prepares.record_of(ci.prepares.decoded(lookalike)))],
                 "unprepared_cells": [lookalike]},
             "3.12:tests/test_gpu_a.py#2/2@prepare-sm90": {"unprepared": [older]}}
 
@@ -926,7 +995,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "head")
     monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
     found = ci.prepares.before(ci, "3.12", "tests/test_gpu_a.py", "@prepare-sm90", time.monotonic() + 600)
-    assert found == {tuple(lookalike), older}
+    assert found == {(*lookalike, None), older}
     reached = {"test": "tests/test_gpu_a.py::test_flow[p]", "where": "a site", "error": "e",
                "cell": "q @ a site [c"}
     other = {"test": "tests/test_gpu_a.py::test_other", "where": "x", "error": "e"}
@@ -956,7 +1025,12 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     fields = [["tests/test_gpu_a.py::t[p] @ " + ci.tier_wire().CAPPED + " [q", "a site", "c"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(fields[0])}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None)}
+    # Its kind kept too: a row's four fields published and read back whole.
+    kinded = [[*fields[0], "flow"]]
+    assert ci.run_keys.baselined("3.12", place, "cls", "token",
+                                 {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": kinded})
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(kinded[0])}
 
 
 @pytest.mark.parametrize("taken", [True, False])
