@@ -2,6 +2,7 @@
 numpy, the runs a selection gives against the keys it reads, and the attention over a selection on par with
 the reference over its dense mask (check 1)."""
 
+import contextlib
 import itertools
 
 import jax
@@ -22,11 +23,9 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
-from dew.nn.attention import scaled_dot_product_attention, score_precision
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
-from dew.nn.kernels import generation
 from dew.nn.mla import SELECTIONS, indexer_target
-from dew.nn.precision import ACCURATE
 from dew.registry import mixers
 
 SEEDS = 8
@@ -520,49 +519,36 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
     assert int(picks[0, 0, -1, 0]) in (2, 3)
 
 
-def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
-    """MSA's indexer loss (`msa_query_kls`) at the layer's precision, `highest`, under an ambient bf16
-    product preset (`BF16_BF16_F32`, whose operands Dew rounds to bf16 on any backend): its teacher's
-    logits 4096 and 4097 (a query of 1 against keys 4096 and 4097) stay apart, so a uniform student's KL
-    is the float64 run's, where the ambient preset rounded both to 4096 and gave 0 (row 13706); and a
-    layer stating that preset under the run's accurate numerics, whose attention forms IEEE fp32 logits,
-    alike."""
-    query = jnp.ones((1, 2, 1, 1), jnp.float32)
-    key = jnp.asarray([[[[4096.0]], [[4097.0]]]], jnp.float32)
+@pytest.mark.parametrize(("dtype", "precision", "wide_logits", "ambient"), [
+    (jnp.bfloat16, "BF16_BF16_F32", False, None),
+    (jnp.float32, "highest", False, "BF16_BF16_F32"),
+    (jnp.float32, "BF16_BF16_F32", True, None),
+], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "wide-logits"])
+def test_msas_teacher_is_the_weights_its_attention_gives(dtype, precision, wide_logits, ambient):
+    """MSA's teacher (`msa_query_kls` with the mixer's `msa_scores`) over two keys against a uniform student:
+    its KL the float64 KL of the very weights MSA's attention gives (the reference path of
+    `scaled_dot_product_attention` at the layer's dtype, precision and logit width, read out as its output
+    over one-hot values), a query `[1, 0]` and keys `[0, 0]` and `[1, 0]` at width 2, whose scaled query a
+    narrowing preset rounds to bf16 (0.70703125), the attention's and so the teacher's; and keys 4096 and
+    4097 at a layer's `highest` under an ambient bf16 preset (row 13706): the teacher's logits never
+    another order or precision than the attention's (train 1359's F1)."""
+    query = jnp.asarray([[[[1.0, 0.0]]] * 2], dtype)
+    key = jnp.asarray([[[[0.0, 0.0]], [[1.0, 0.0]]]], dtype)
+    if ambient is not None:
+        key = jnp.asarray([[[[4096.0, 0.0]], [[4097.0, 0.0]]]], dtype)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
     uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
-    with jax.default_matmul_precision("BF16_BF16_F32"):
-        found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=1.0,
-                                                      precision="highest"))[0, 1]
-    target = np.exp([4096.0 - 4097.0, 0.0])
-    target /= target.sum()
-    expected = float(np.sum(target * np.log(target)) + np.log(2.0))
-    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
-    # A layer stating the narrowing preset under the run's accurate numerics: the attention forms its logits
-    # in IEEE fp32 (`attention.score_precision`), and the teacher with it.
-    with generation.run_precision(ACCURATE):
-        found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=1.0,
-                                                      precision=score_precision("BF16_BF16_F32")))[0, 1]
-    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
-
-
-def test_msas_teacher_scales_its_logits_after_their_product_as_the_attention_does():
-    """MSA's indexer loss (`msa_query_kls`) at the narrowing bf16 product preset (`BF16_BF16_F32`) and a logit
-    scale of 2^-0.5: its teacher's logits the product of the query and key, then the scale, 0 and
-    0.70710678 for a query of 1 against keys 0 and 1 (the attention's), its KL against a uniform student the
-    float64 run's of those, where a query scaled before its product rounded to bf16's 0.70703125 (train
-    1359's F1)."""
-    query = jnp.ones((1, 2, 1, 1), jnp.float32)
-    key = jnp.asarray([[[[0.0]], [[1.0]]]], jnp.float32)
-    selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
-    uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
-    scale = 2.0**-0.5
-    found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=scale,
-                                                  precision="BF16_BF16_F32"))[0, 1]
-    target = np.exp([0.0, float(np.float32(scale))])
-    target /= target.sum()
-    expected = float(np.sum(target * np.log(target)) + np.log(2.0))
-    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
+    teacher = block_sparse.msa_scores(dtype, precision, wide_logits=wide_logits)
+    one_hot = jnp.eye(2, dtype=dtype)[None, :, None, :]
+    with jax.default_matmul_precision(ambient) if ambient is not None else contextlib.nullcontext():
+        found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2,
+                                                      scale=2 ** -0.5, teacher=teacher))[0, 1]
+        weights = scaled_dot_product_attention(query, key, one_hot, causal=True, implementation="reference",
+                                               dtype=dtype, precision=precision, wide_logits=wide_logits,
+                                               force_fp32_for_softmax=True)
+    attended = np.asarray(weights, np.float64)[0, 1, 0]
+    expected = float(np.sum(attended * np.log(attended)) + np.log(2.0))
+    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0) + 2 * np.finfo(np.float32).eps, 6)
 
 
 def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
@@ -798,6 +784,26 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
         segments=segments, max_segments=1, right_padded=True)))
     np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(by_ids(changed))[:, :-1])
     np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(forward(tokens))[:, :-1])
+
+
+def test_infllm_v2s_cut_counts_the_keys_its_ids_and_validity_both_hold():
+    """An InfLLM-V2 decoder row of 64 slots, 48 of one document (its ids, padding 0) and a validity hiding
+    one of those and none of the padding: its real keys 47, below the cut of 56, so it attends densely, its
+    real queries' logits the dense decoder's, where the validity alone counted 63 and took the selection."""
+    tokens = jax.random.randint(jax.random.key(0), (1, 64), 0, VOCAB)
+    segments = (jnp.arange(64) < 48).astype(jnp.int32)[None]
+    valid = jnp.ones((1, 64), bool).at[0, 10].set(False)
+    rows = coordinates(segments=segments, valid=valid, max_segments=1, right_padded=True)
+
+    def decoder(dense_below):
+        return tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=3,
+                                       dense_below=dense_below), dtype="float32")
+
+    params = decoder(56).init(jax.random.key(1), tokens)
+    real = np.flatnonzero(np.asarray(segments[0]) & np.asarray(valid[0]))
+    cut = np.asarray(decoder(56).apply(params, tokens, coordinates=rows))[0, real]
+    dense = np.asarray(decoder(1 << 20).apply(params, tokens, coordinates=rows))[0, real]
+    np.testing.assert_array_equal(cut, dense)
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():
