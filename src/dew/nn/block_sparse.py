@@ -445,6 +445,10 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     return top_k_selection(scores, earlier, top_k, forced=forced)
 
 
+INFLLM_FORCED = 2
+"""The blocks InfLLM-V2's selection forces a query (`infllm_selection`'s defaults, `initial` and `local` 1
+each): the first and its own."""
+
 INFLLM_DENSE_BELOW = 8192
 """The keys below which InfLLM-V2 attends densely (kernel-templates.md §A row 60), the plain causal call: its
 short calls' path, a selection of 64 blocks of 64 near every key of them anyway."""
@@ -587,7 +591,9 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                              "own: no cache or packed documents")
         valid = (None if masking.valid is None
                  else jnp.broadcast_to(jnp.asarray(masking.valid, bool), key.shape[:2]))
-        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k,
+        # The mixer's `top_k` counts every block a query reads, its own among them, as MoBA's and MSA's
+        # do: InfLLM-V2's first block and its own are forced, its top by score the rest (row 13720).
+        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k - INFLLM_FORCED,
                                 dense_below=self.dense_below, key_valid=valid, sinks=sinks,
                                 dtype=self.ctx.dtype,
                                 precision=self.ctx.precision,
@@ -629,7 +635,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
 @dataclasses.dataclass(frozen=True)
 class BlockSparseAttentionMixer(AttentionMixer):
     """Block-selected attention (`BlockSparseSelfAttention`): each query reads its own block and the earlier
-    blocks its `selection` picks, `top_k` with its own, blocks of `block` places. MoBA's (the default; arXiv
+    blocks its `selection` picks, `top_k` in all with its own (InfLLM-V2's first block forced among them),
+    blocks of `block` places. MoBA's (the default; arXiv
     2502.13189, blocks of 512 and the top 3) reads the layer's own queries and keys, no parameter of its own,
     over each document's blocks and a cached call's cache. InfLLM-V2's (`"infllm"`, blocks of 16s, dense
     below `dense_below` keys) and MSA's (`"msa"`, an index branch of parameters over the layer's input,
@@ -688,6 +695,10 @@ class BlockSparseAttentionMixer(AttentionMixer):
                              "would part from the attention it trains toward")
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
+                             f"{self.top_k}")
+        if self.selection == "infllm" and self.top_k <= INFLLM_FORCED:
+            raise ValueError(f"InfLLM-V2's selection forces each query's first and own blocks, and top_k "
+                             f"counts them: one by score takes a top_k of {INFLLM_FORCED + 1} or more, not "
                              f"{self.top_k}")
         if self.alibi or self.bidirectional_images or self.bidirectional_blocks:
             raise ValueError("block_sparse_attention adds no ALiBi bias and reads no image or block whole")

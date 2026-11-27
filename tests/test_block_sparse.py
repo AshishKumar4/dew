@@ -505,8 +505,9 @@ def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
     """MSA's indexer loss (`msa_query_kls`) at the layer's precision, `highest`, under an ambient bf16
     product preset (`BF16_BF16_F32`, whose operands Dew rounds to bf16 on any backend): its teacher's
     logits 4096 and 4097 (a query of 1 against keys 4096 and 4097) stay apart, so a uniform student's KL
-    is the float64 run's, where the ambient preset rounded both to 4096 and gave 0 (row 13706); and a layer stating that preset under the run's accurate numerics, whose attention forms
-    IEEE fp32 logits, alike."""
+    is the float64 run's, where the ambient preset rounded both to 4096 and gave 0 (row 13706); and a
+    layer stating that preset under the run's accurate numerics, whose attention forms IEEE fp32 logits,
+    alike."""
     query = jnp.ones((1, 2, 1, 1), jnp.float32)
     key = jnp.asarray([[[[4096.0]], [[4097.0]]]], jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
@@ -718,21 +719,25 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses. A
     right-padded row (`training.md`'s) it takes, its real queries' logits bitwise as they were whatever token
     its padding holds (train 1345's F3: it was refused)."""
-    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2),
+    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=4),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, VOCAB)
     params = dense.init(jax.random.key(1), tokens)
     np.testing.assert_array_equal(np.asarray(infllm.apply(params, tokens)),
                                   np.asarray(dense.apply(params, tokens)))
-    # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone: the first, its
-    # own and its top one of those between, not the dense decoder's every key.
-    sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=1,
+    # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone, three in all (its
+    # top_k, row 13720): the first, its own and its top one of those between, not the dense decoder's every
+    # key; a top_k of no block past the forced two it refuses.
+    sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=3,
                                      dense_below=32), dtype="float32")
     selected = np.asarray(sparse.apply(params, tokens))
     assert not np.array_equal(selected, np.asarray(dense.apply(params, tokens)))
     with pytest.raises(ValueError):
         tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
+            jax.random.key(1), tokens)
+    with pytest.raises(ValueError):
+        tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2)).init(
             jax.random.key(1), tokens)
     padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
     forward = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(valid=padded,
