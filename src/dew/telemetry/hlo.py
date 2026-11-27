@@ -10,6 +10,7 @@ default pool does not meet it. A module is decoded once per read; protobuf is im
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.resources
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
@@ -73,9 +74,8 @@ def message_class(name: str) -> type[Message]:
 def module_from_text(text: str) -> HloModule:
     """The HLO module `text` writes (an XLA dump file, a test's module), parsed by XLA's own HLO parser, which
     `instructions` reads as it reads a compiled one."""
-    from jax._src.lib import hlo
-
-    return hlo.hlo_module_from_text(text)
+    # jaxlib's binding of XLA's parser (`jaxlib._hlo`), which no typed module states.
+    return importlib.import_module("jaxlib._hlo").hlo_module_from_text(text)
 
 
 def module_proto(module: HloModule | bytes) -> Message:

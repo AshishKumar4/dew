@@ -190,8 +190,9 @@ class Assignment:
                     spans.append((step.buffer_id, opened.pop(step.buffer_id), position))
                     continue
                 shared = step.share_with_canonical_id
-                storages[step.buffer_id] = (storages.get(shared, shared) if step.kind == kinds["SHARE_WITH"]
-                                            else step.buffer_id)
+                sharing = step.kind == kinds["SHARE_WITH"]
+                storages[step.buffer_id] = (int(storages.get(shared, shared)) if sharing
+                                            else int(step.buffer_id))
                 opened[step.buffer_id] = position
             spans += [(buffer, start, len(simulated.events)) for buffer, start in opened.items()]
             allocation = simulated.buffer_allocation_index
@@ -257,18 +258,18 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
             if assigned[step.buffer_id] > 0:
                 charged.add(step.buffer_id)
         elif step.kind == kinds["SHARE_WITH"]:
-            shared = canonical[step.buffer_id] = step.share_with_canonical_id
+            shared = canonical[step.buffer_id] = int(step.share_with_canonical_id)
             instances[shared] = instances.get(shared, 0) + 1
             if instances[shared] == 1 and assigned[step.buffer_id] > 0:
                 charged.add(step.buffer_id)
         else:
-            freed = canonical.get(step.buffer_id, step.buffer_id)
+            freed = int(canonical.get(step.buffer_id, step.buffer_id))
             instances[freed] = instances.get(freed, 0) - 1
     return charged
 
 
-def _maker(instruction, index: tuple[int, ...], instructions: dict[int, Any],
-           computations: dict[int, Any]) -> tuple[Any, tuple[int, ...]]:
+def _maker(instruction, index: tuple[int, ...], instructions,
+           computations):
     """What makes `instruction`'s output at shape `index`, and where in that maker's own output it is: inside
     a fusion, through its fused computation's tuples and get-tuple-elements to the instruction making it,
     the shape index carried along (XLA:GPU's own fusions carry no op_name of their own, the instruction they
@@ -308,7 +309,7 @@ def _role(maker, index: tuple[int, ...]) -> str:
     return "workspace" if _cublas(maker) and last > 0 and index == (last,) else ""
 
 
-def _aliased_named(locations, instructions: dict[int, Any], computations: dict[int, Any]):
+def _aliased_named(locations, instructions, computations):
     """What a while loop's body writes into a state element a buffer is also at (its aliases' `locations`: a
     while's output element), the first found (`_loop_named`); None where it is at none."""
     for location in locations:
@@ -320,7 +321,7 @@ def _aliased_named(locations, instructions: dict[int, Any], computations: dict[i
     return None
 
 
-def _loop_named(loop, element: int, instructions: dict[int, Any], computations: dict[int, Any]
+def _loop_named(loop, element: int, instructions, computations: dict[int, Any]
                 ):
     """What while `loop`'s body writes into the whole of its state's `element`: the body's element where it
     is named (the state element is that value); else the row a scan writes into its stacked output each step
@@ -335,8 +336,8 @@ def _loop_named(loop, element: int, instructions: dict[int, Any], computations: 
     return _stacked(loop, element, written, instructions, computations)
 
 
-def _stacked(loop, element: int, written, instructions: dict[int, Any],
-             computations: dict[int, Any]):
+def _stacked(loop, element: int, written, instructions,
+             computations):
     """The row a scan writes into its stacked output each step, state `element` of while `loop`, `written`
     the body's value for it: XLA keeps a loop's state in its initial elements' buffers, so a scan's stack is
     the buffer its broadcast fills, which carries no name, while each step's dynamic-update-slice writes the
@@ -360,10 +361,7 @@ def _stacked(loop, element: int, written, instructions: dict[int, Any],
         put = instructions[computation.root_id]
     if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
         return None
-    try:
-        known = json.loads(loop.backend_config or "{}")
-    except ValueError:
-        return None
+    known = json.loads(loop.backend_config or "{}")
     if not isinstance(known, dict) or not {"known_trip_count", "known_init_step",
                                            "known_induction_variable"} <= known.keys():
         return None  # Proto3's JSON leaves a zero out, so a missing field is 0.
@@ -414,7 +412,7 @@ def _stacked(loop, element: int, written, instructions: dict[int, Any],
     return _laid_out(outside(_laid_out(update, instructions)), instructions)
 
 
-def _laid_out(instruction, instructions: dict[int, Any]):
+def _laid_out(instruction, instructions):
     """The value `instruction` lays out again (a bitcast, a reshape, a copy, which keep its elements), through
     each; `instruction` where it is none."""
     while instruction.opcode in ("bitcast", "reshape", "copy"):
@@ -422,7 +420,7 @@ def _laid_out(instruction, instructions: dict[int, Any]):
     return instruction
 
 
-def _spread(value, instructions: dict[int, Any], computations: dict[int, Any]) -> bool:
+def _spread(value, instructions, computations) -> bool:
     """Whether array `value` is one scalar broadcast, or a constant: a fusion's output or a multi-output
     fusion's element so made too."""
     value = _laid_out(value, instructions)
@@ -497,7 +495,7 @@ _GEMMS = frozenset(("__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f
 (`gemm_backend_config.dot_dimension_numbers`)."""
 
 
-def provenance(module, argument: Callable[[int], int | None] | None = None) -> dict[int, Any]:
+def provenance(module, argument: Callable[[int], int | None] | None = None):
     """Each instruction's provenance in `HloModuleProto` `module`, by its id: an array's `Dims`, a tuple's a
     list of its elements'. Read through the dimension maps each op states (a dot's and a cuBLAS call's
     dimension numbers, a reduce's, broadcast's and transpose's dimensions, a reshape's and bitcast's merges, a
@@ -509,7 +507,7 @@ def provenance(module, argument: Callable[[int], int | None] | None = None) -> d
     computations = {computation.id: computation for computation in module.computations}
     found: dict[int, Any] = {}
 
-    def evaluate(computation, parameters: dict[int, Any]):
+    def evaluate(computation, parameters):
         held: dict[int, Any] = {}
         shapes: dict[int, Any] = {}
         for instruction in computation.instructions:
@@ -529,8 +527,8 @@ def provenance(module, argument: Callable[[int], int | None] | None = None) -> d
     return found
 
 
-def _of(instruction, operands: list[Any], operand_shapes: list[Any], parameters: dict[int, Any],
-        called: list[Any], evaluate: Callable[[Any, dict[int, Any]], Any]):
+def _of(instruction, operands, operand_shapes, parameters,
+        called, evaluate: Callable[[Any, dict[int, Any]], Any]):
     """`instruction`'s provenance from its operands'."""
     opcode, shape = instruction.opcode, instruction.shape
     if opcode == "parameter":
@@ -627,7 +625,7 @@ def _joined(left, right):
     raise ValueError(f"provenances of two shapes joined: {left!r}, {right!r}")
 
 
-def _same_positions(shape, operands: list[Any]):
+def _same_positions(shape, operands):
     """Each output dimension its operands' at its position: a tuple output's elements each their tuple
     operands' element, or the array operand at their index (a variadic collective's, reduce-window's)."""
     if shape.tuple_shapes:
@@ -697,7 +695,7 @@ def _dot(lhs: Dims, rhs: Dims, numbers) -> Dims:
             *(rhs[axis] for axis in range(len(rhs)) if axis not in rhs_kept))
 
 
-def _convolution(instruction, operands: list[Any]) -> Dims:
+def _convolution(instruction, operands) -> Dims:
     """A convolution's provenance: its batch dimension the input's, its feature dimension the kernel's output
     feature (with the input's feature or batch dimension where it groups them), each spatial dimension the
     input's and the kernel's at its place."""
@@ -717,7 +715,7 @@ def _convolution(instruction, operands: list[Any]) -> Dims:
     return tuple(dims)
 
 
-def _reduced(instruction, operands: list[Any], shape):
+def _reduced(instruction, operands, shape):
     """A reduce's provenance: each output its input's dimensions but those it reduces, in order."""
     inputs = operands[:len(operands) // 2]
     removed = set(instruction.dimensions)
@@ -726,7 +724,7 @@ def _reduced(instruction, operands: list[Any], shape):
     return outputs if shape.tuple_shapes else outputs[0]
 
 
-def _gathered(instruction, operands: list[Any]) -> Dims:
+def _gathered(instruction, operands) -> Dims:
     """A gather's provenance: its offset dimensions the operand's it keeps, in order; its batch dimensions the
     start indices', in order, with an operand batching dimension's beside its indices' own."""
     numbers, (operand, indices) = instruction.gather_dimension_numbers, operands[:2]
@@ -749,7 +747,7 @@ def _gathered(instruction, operands: list[Any]) -> Dims:
     return tuple(dims)
 
 
-def _loop(initial, called: list[Any], evaluate: Callable[[Any, dict[int, Any]], Any]):
+def _loop(initial, called, evaluate: Callable[[Any, dict[int, Any]], Any]):
     """A while loop's provenance: its state's, its body's output joined into it until the body adds nothing
     (sets only grow, so it ends)."""
     body = called[0]  # XLA's while names its body first, its condition second.
@@ -761,7 +759,7 @@ def _loop(initial, called: list[Any], evaluate: Callable[[Any, dict[int, Any]], 
         state = joined
 
 
-def _custom(instruction, operands: list[Any], shape):
+def _custom(instruction, operands, shape):
     """A custom call's provenance: as its `output_dims` frontend attribute states it (one list an output, one
     entry a dimension, each a list of [operand, axis] pairs, empty for a size descending from none, null for
     one unknown; `dew.nn.kernels.templates.outputs`); a cuBLAS call's from its dot's dimension numbers, its
@@ -788,14 +786,14 @@ def _custom(instruction, operands: list[Any], shape):
         config = json.loads(instruction.backend_config or "{}")
         numbers = config.get("gemm_backend_config", {}).get("dot_dimension_numbers")
         if numbers is not None:
-            result = _dot(operands[0], operands[1], _Numbers(numbers))
+            product = _dot(operands[0], operands[1], _Numbers(numbers))
             if shape.tuple_shapes:
-                return [result, *(_filled(element, frozenset()) for element in shape.tuple_shapes[1:])]
-            return result
+                return [product, *(_filled(element, frozenset()) for element in shape.tuple_shapes[1:])]
+            return product
     return _filled(shape, None)
 
 
-def _from_operands(entry: list[list[int]], operands: list[Any]) -> frozenset[tuple[int, int]] | None:
+def _from_operands(entry: list[list[int]], operands) -> frozenset[tuple[int, int]] | None:
     descended: frozenset[tuple[int, int]] | None = frozenset()
     for operand, axis in entry:
         descended = _union(descended, operands[operand][axis])
