@@ -38,8 +38,6 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     a decoded weight (its stored bits again) exact, summed in fp32 and rounded once to `out_dtype` (`lhs`'s
     where None); decoded a stage at a time in the GEMM mainloop where the selector takes it (`WINDOW`), else
     the decoded matrix's XLA dot (`xla_products.decoded_dot`). Frozen: its gradient is the rows' alone."""
-    if not isinstance(window.form, Tracer):
-        window.checked()
     dense = group_sizes is None
     if (dense and len(window.shape) != 2) or (not dense and len(window.shape) != 3):
         raise ValueError(f"window_product weight rank mismatch for dense={dense}: {window.shape}")
@@ -60,6 +58,10 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
         case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
         mosaic = selection.select(WINDOW, case).kernel == "mosaic"
     if mosaic:
+        # The launch reads the words itself: their form checked here where it is concrete, as the XLA
+        # route's `Bf16Window.decoded` checks it.
+        if not isinstance(window.form, Tracer):
+            window.checked()
         form = jnp.asarray(window.form)
         rules = gemm._packed_weight_rules(launch, lambda w, m: Bf16Window(w, m, form), interpret_on_cpu,
                                           dense=dense, finite=False)

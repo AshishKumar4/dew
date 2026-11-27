@@ -656,7 +656,7 @@ class Bf16Window:
     words: jax.Array | np.ndarray
     meta: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
-
+    fmt: str = dataclasses.field(metadata={"static": True}, default="window")
 
     @classmethod
     def of(cls, weights: jax.Array | np.ndarray, *, site: str = "a matrix") -> "Bf16Window":
