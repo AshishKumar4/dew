@@ -953,8 +953,8 @@ class RunConfig:
             changed.remove("data_plan_version")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
-        if recorded.trainer.precision != self.trainer.precision:
-            changed.append("trainer.precision")
+        # Its precision is held to what the checkpoint computed, its products' effective precision among it,
+        # by the trainer's own admission (`_agree_resume`), not to its declaration (row 13708).
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
@@ -1648,12 +1648,18 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
-            from dew.training.startup import resumed_step
+            from dew.training.startup import refuse_other_computation, resumed_step
 
-            if resumed_step(built, resume) is not None and (
-                    record := self._saved_record(checkpoints.directory, checkpoints)) is not None:
+            step = resumed_step(built, resume)
+            record = None if step is None else self._saved_record(checkpoints.directory, checkpoints)
+            if record is not None:
                 self.check_resume(record)
                 resumed["record"] = record
+            if step is not None:
+                # The trainer's admission, under the numerics its steps trace under, before the record is
+                # replaced: a refusal leaves the run's record as it was (row 13708).
+                with self.traced():
+                    refuse_other_computation(built, checkpoints, step)
 
         def check_data() -> None:
             from dew.training.startup import resume_admitted

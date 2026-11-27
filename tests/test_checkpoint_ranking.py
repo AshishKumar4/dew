@@ -1200,7 +1200,8 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
     in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
     tree and no loss scale, refuses to resume, an
     objective that records nothing for inference (no task) among them, as the run's training record holds
-    them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537)."""
+    them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537), its products'
+    precision as they computed it, declared or JAX's (row 13708)."""
     import dataclasses
 
     from affine_run import Regression, dataset
@@ -1237,9 +1238,11 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
         trainer(ambient, "ambient").fit(dataset(), steps=1)
     with pytest.raises(ValueError), jax.default_matmul_precision("default"):
         trainer(ambient, "ambient").fit(dataset(), steps=2)
-    # Under another spelling of the same precision ('float32' is 'highest'), it resumes.
+    # Under another spelling of the same precision ('float32' is 'highest'), it resumes, and so does a resume
+    # that declares the precision its products computed at, which JAX's own setting gave them (row 13708).
     with jax.default_matmul_precision("float32"):
         assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
+    assert int(trainer(Numerics(full, matmul="highest"), "ambient").fit(dataset(), steps=3).step) == 3
 
 
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):

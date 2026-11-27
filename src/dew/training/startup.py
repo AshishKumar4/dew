@@ -186,6 +186,18 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     return differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
 
 
+def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]",
+                                               checkpoints: "Checkpoints", step: int) -> None:
+    """Refuse `trainer`'s resume of `checkpoints`' `step` where they compute otherwise
+    (`computation_differs`), read under the numerics its steps trace under: the trainer's own admission,
+    which a configured run takes before it replaces its record (`RunConfig.train`, row 13708)."""
+    differs = computation_differs(trainer, checkpoints, step)
+    if differs:
+        raise ValueError(f"the checkpoint at step {step} in {checkpoints.directory} trained another "
+                         f"computation ({', '.join(differs)}); resume it with the objective, its settings "
+                         "and model it recorded, or train in another directory")
+
+
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
     """Where the computation a checkpoint trained and this run's differ: each path of its objective's class
     or its model's record in its inference record (`Objective.inference_record`), the fields that say how

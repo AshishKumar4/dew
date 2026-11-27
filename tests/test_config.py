@@ -441,6 +441,31 @@ def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_
     assert (tmp_path / "kept" / RUN_FILE).read_bytes() == record
 
 
+def test_a_resume_under_another_effective_precision_is_refused_before_its_record_is_replaced(tmp_path):
+    """A configured run resumed under numerics that declare as it did (`trainer.precision`, its products at
+    "default") but compute otherwise (JAX's own precision changed beneath them: "highest" trained, "high"
+    resumed), a resumable setting changed beside them (its step budget), is refused before its record is
+    replaced (row 13708: the declarations compared alike, `run.json` was rewritten, then the trainer
+    refused); under JAX's "highest" again, named otherwise ("float32"), it resumes."""
+    from dew.nn.precision import DTYPE_PRESETS, Numerics
+
+    declared = Numerics(DTYPE_PRESETS["32-true"], matmul="default")
+
+    def run(steps: int) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, checkpoint_dir=str(tmp_path), eval_every=None,
+                                               checkpoint_every=None, precision=declared))
+
+    data = Loader(lambda partition: batches(), None, None, 8)
+    with jax.default_matmul_precision("highest"):
+        assert int(run(1).train(Regression(), data, name="ambient").step) == 1
+    record = (tmp_path / "ambient" / RUN_FILE).read_bytes()
+    with jax.default_matmul_precision("high"), pytest.raises(ValueError):
+        run(2).train(Regression(), data, name="ambient")
+    assert (tmp_path / "ambient" / RUN_FILE).read_bytes() == record
+    with jax.default_matmul_precision("float32"):
+        assert int(run(2).train(Regression(), data, name="ambient").step) == 2
+
+
 def test_publishing_requires_a_final_checkpoint_policy():
     with pytest.raises(ValueError):
         TrainerConfig(wandb=Wandb(project="test", publish=True), checkpoint_final=False)
