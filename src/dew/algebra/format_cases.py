@@ -53,10 +53,10 @@ def _rounding_case(name, dtype):
                          output_tree=(jax.tree.structure(0),))
 
 
-ROUNDED = SurrogateBodies(precision._rounded, precision._rounded_tangent, (1,), symbolic_zeros=False, cases={
-    (jnp.bfloat16,): _rounding_case("rounded", jnp.bfloat16),
-    (jnp.float16,): _rounding_case("rounded_fp16", jnp.float16),
-}).declared(__name__)
+ROUNDED = SurrogateBodies(precision._rounded, precision._rounded_tangent, (1,), symbolic_zeros=False, cases=(
+    ((jnp.bfloat16,), _rounding_case("rounded", jnp.bfloat16)),
+    ((jnp.float16,), _rounding_case("rounded_fp16", jnp.float16)),
+)).declared(__name__)
 
 
 def _gemm_scaled_truth(partial, rows, columns):
@@ -299,12 +299,12 @@ def _e8m0_truth(codes):
 
 
 QUANTIZED_STE = SurrogateBodies(fake_quant._rounded_value, fake_quant.rounded_tangent, (),
-                                symbolic_zeros=False, cases={
-    (): SurrogateCase("quantized_ste", ComponentForm(
+                                symbolic_zeros=False, cases=(
+    ((), SurrogateCase("quantized_ste", ComponentForm(
         fake_quant._rounded_value, _ste_truth, _ste_cases(reverse=False)),
-                      {(): ComponentForm(_ste_flat_tangent, _ste_tangent_truth, _ste_cases(reverse=True))},
-                      output_tree=(jax.tree.structure(0),)),
-}).declared(__name__)
+                       {(): ComponentForm(_ste_flat_tangent, _ste_tangent_truth, _ste_cases(reverse=True))},
+                       output_tree=(jax.tree.structure(0),))),
+)).declared(__name__)
 
 
 ENCODE_E4M3 = _encode_case("encode_e4m3", bits.E4M3)

@@ -17,9 +17,6 @@ import logging
 from collections.abc import Callable, Iterator, Sequence
 from types import ModuleType
 
-import jax
-from jax.core import ShapedArray
-
 from dew import _cache
 from dew.algebra import _generated
 from dew.nn.kernels import generation
@@ -61,19 +58,6 @@ def enabled() -> bool:
     return generation.chosen_kernel(generation.Choice.GENERATED, "written") == GENERATED
 
 
-def _refused(operands: Sequence) -> str | None:
-    """Why `operands` are no generated body's ABI, which is strongly typed, unplaced arrays alone, as the
-    generator admits them (`generate._case_admitted`): a Python number, a weakly typed value or a placed one
-    keys no declared case as the written math reads it. None where they are."""
-    for operand in operands:
-        if not (hasattr(operand, "shape") and hasattr(operand, "dtype")):
-            return f"an operand of type {type(operand).__name__}, not an array"
-        aval = jax.typeof(operand)
-        if not isinstance(aval, ShapedArray) or aval.weak_type or not aval.sharding.mesh.empty:
-            return f"an operand {aval}, not a strongly typed unplaced array"
-    return None
-
-
 def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable | None:
     """The generated body of the component `qualified` (its declaring module and name) for a call over
     `operands` (its flat ABI, as declared), where the "generated" choice is in effect, `when` holds (the
@@ -85,7 +69,7 @@ def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable |
     if not when:
         _counted(qualified, "another static program")
         return None
-    if (refusal := _refused(operands)) is not None:
+    if (refusal := _generated.refused(operands)) is not None:
         _counted(qualified, refusal)
         return None
     module, name = qualified.rsplit(".", 1)

@@ -34,6 +34,7 @@ from jax.extend import core as jcore
 
 from dew import parity
 from dew.algebra import _component_sharing, error, printed, rules
+from dew.algebra import _generated
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -131,11 +132,13 @@ class SurrogateBodies:
     tangent: Callable
     nondiff_argnums: tuple[int, ...]
     symbolic_zeros: bool
-    cases: Mapping[tuple, SurrogateCase]
+    cases: tuple[tuple[tuple, SurrogateCase], ...]
+    """Each case beside its static arguments, as pairs: a mapping would join `0.0` and `-0.0`, or `True` and
+    `1`, before `_exact_key` reads them."""
 
     def declared(self, module: str) -> SurrogateBodies:
         """Register both bodies under the same static-argument and tangent-activity declaration."""
-        for case in self.cases.values():
+        for _, case in self.cases:
             declare(module, case.name, case.forward)
             for inactive, form in case.tangents.items():
                 declare(module, case.tangent_name(inactive), form)
@@ -143,10 +146,16 @@ class SurrogateBodies:
 
     @functools.cached_property
     def _keyed(self) -> dict[Hashable, SurrogateCase]:
-        """Each case by its static arguments' exact key (`_exact_key`)."""
-        keyed = {_exact_key(fixed): case for fixed, case in self.cases.items()}
-        if None in keyed:
-            raise ValueError("a surrogate case's static arguments must be hashable")
+        """Each case by its static arguments' exact key (`_exact_key`); two cases of one key, or one of none
+        (an unhashable argument), refused."""
+        keyed: dict[Hashable, SurrogateCase] = {}
+        for fixed, case in self.cases:
+            key = _exact_key(fixed)
+            if key is None:
+                raise ValueError(f"surrogate case {case.name}: static arguments {fixed!r} are unhashable")
+            if key in keyed:
+                raise ValueError(f"surrogate cases {keyed[key].name} and {case.name}: one key, {fixed!r}")
+            keyed[key] = case
         return keyed
 
     def _case(self, fixed: tuple) -> SurrogateCase | None:
@@ -193,18 +202,26 @@ class SurrogateBodies:
                       symbolic_zeros=self.symbolic_zeros))
 
 
-_BITS = frozenset({float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128})
-"""The number types `_exact_key` reads by their bytes: these exactly, a subclass keeping its own equality."""
+_BITS = (float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128, jnp.bfloat16)
+"""The number types `_exact_key` reads by their bytes: these exactly (by identity, never by a type's hash), a
+subclass keeping its own equality."""
+_PADDED = (np.longdouble, np.clongdouble)
+"""The number types whose bytes hold padding no value sets (x87's 80 bits in 16): read by each part's sign
+and its shortest exact digits instead, a NaN by its sign alone."""
 
 
 def _exact_key(value) -> Hashable | None:
     """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
-    of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), a plain tuple by
-    its parts, any other hashable value by its type and itself (its own equality: a callable by identity, a
-    subclass by its own). None where it is unhashable, which no declared case is."""
+    of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), one of `_PADDED` by
+    its parts' signs and digits, a plain tuple by its parts, any other hashable value by its type and itself
+    (its own equality: a callable by identity, a subclass by its own). None where it is unhashable, which no
+    declared case is."""
     kind = type(value)
-    if kind in _BITS:
+    if any(kind is number for number in _BITS):
         return kind, np.asarray(value).tobytes()
+    if any(kind is number for number in _PADDED):
+        parts = (value.real, value.imag) if kind is np.clongdouble else (value,)
+        return kind, tuple((bool(np.signbit(part)), repr(part)) for part in parts)
     if kind is tuple:
         parts = tuple(_exact_key(part) for part in value)
         return None if None in parts else (kind, parts)
@@ -226,12 +243,8 @@ def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
 def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:
     if policy not in cases.policies or target not in cases.targets:
         return False
-    for value in operands:
-        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
-            return False
-        aval = jax.typeof(value)
-        if not isinstance(aval, ShapedArray) or aval.weak_type or not aval.sharding.mesh.empty:
-            return False
+    if _generated.refused(operands) is not None:
+        return False
     key = case_of(operands)
     return any(case_of(shapes) == key for shapes in cases.operands)
 

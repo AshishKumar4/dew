@@ -100,7 +100,7 @@ def test_generated_guidance_preserves_the_scale_direction_at_both_endpoints():
         return jax.jvp(lambda w: gradient(c, w), (weight,), (jnp.ones_like(weight),))[1]
 
     np.testing.assert_array_equal(higher(composed), jnp.ones_like(c))
-    assert taken and all(name.startswith("guided") for name in taken), taken
+    assert {"guided", "guided_tangent"} <= set(taken), taken
 
 
 def _plain(outputs, totals, anchors):
@@ -232,9 +232,9 @@ def test_a_surrogate_case_keys_its_static_arguments_exactly():
     cyclic = Held()
     cyclic.append(cyclic)
     named = Named((1,))
-    surrogate = SurrogateBodies(written, written_tangent, (1,), symbolic_zeros=False, cases={
-        (0.0,): declared_case("plus"), (frozenset({1}),): declared_case("member"),
-        (named,): declared_case("named")})
+    surrogate = SurrogateBodies(written, written_tangent, (1,), symbolic_zeros=False, cases=(
+        ((0.0,), declared_case("plus")), ((frozenset({1}),), declared_case("member")),
+        ((named,), declared_case("named"))))
 
     def emitted(name):
         def body(*operands, policy, target):
@@ -250,3 +250,38 @@ def test_a_surrogate_case_keys_its_static_arguments_exactly():
         primal, tangent = jax.jvp(lambda arg, shift=shift: composed(arg, shift), (x,), (jnp.ones_like(x),))
         np.testing.assert_array_equal(primal, np.full(4, value, np.float32))
         np.testing.assert_array_equal(tangent, np.full(4, slope, np.float32))
+
+
+def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
+    """`generate._exact_key` keys two static arguments alike only where they are one: each sign of zero, each
+    NaN's sign and payload, each number type (`1`, `1.0`, `True`), NumPy and bfloat16 scalars by type and
+    bits, nested plain tuples by their parts; an unhashable value has none, and a value of a class whose own
+    type is unhashable is keyed by its own hash. Two cases of one key are refused at the first lookup."""
+    from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, _exact_key
+
+    class Unhashable(type):
+        __hash__ = None  # pyright: ignore[reportAssignmentType]
+
+    class Odd(metaclass=Unhashable):
+        pass
+
+    nan = np.float64("nan")
+    payload = np.frombuffer(np.uint64(0x7FF8000000000001).tobytes(), np.float64)[0]
+    distinct = [0.0, -0.0, nan, -nan, payload, 1, 1.0, True, np.float32(1), np.float16(1), np.longdouble(1),
+                np.longdouble(-0.0), np.longdouble(0.0), np.complex64(1), jnp.bfloat16(1), (1, (2.0,)),
+                (1, (-2.0,)), frozenset({1})]
+    keys = [_exact_key(value) for value in distinct]
+    assert None not in keys and len(set(keys)) == len(keys)
+    assert _exact_key(float("nan")) == _exact_key(float("nan")) and _exact_key((0.0,)) == _exact_key((0.0,))
+    assert _exact_key(np.longdouble(1) / 3) == _exact_key(np.longdouble(1) / 3)
+    assert _exact_key([1]) is None and _exact_key(({1},)) is None
+    odd = Odd()
+    assert _exact_key(odd) == _exact_key(odd) != _exact_key(Odd())
+
+    operand = jax.ShapeDtypeStruct((4,), jnp.float32)
+    form = ComponentForm(lambda x: x, lambda x: x, Cases(((operand,),), lambda seed, operands: operands, 1))
+    case = SurrogateCase("twin", form, {}, output_tree=(jax.tree.structure(0),))
+    twice = SurrogateBodies(lambda x, shift: x, lambda *values: values[-2][0], (1,), symbolic_zeros=False,
+                            cases=(((nan,), case), ((np.float64("nan"),), case)))
+    with pytest.raises(ValueError, match="one key"):
+        twice.assembled(lambda name: form.function)(jnp.zeros(4), nan)

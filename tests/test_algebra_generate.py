@@ -166,7 +166,7 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    form = format_cases.ROUNDED.cases[jnp.bfloat16,].forward
+    form = dict(format_cases.ROUNDED.cases)[jnp.bfloat16,].forward
     (example,) = form.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
@@ -405,7 +405,7 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     case = generate.SurrogateCase("partial", forward, {(1,): active},
                                   input_tree=(jax.tree.structure(({"x": tile, "y": tile},)),),
                                   output_tree=(jax.tree.structure({"difference": tile, "sum": tile}),))
-    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases={(): case})
+    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases=(((), case),))
     reachable = {}
     for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
         _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)
