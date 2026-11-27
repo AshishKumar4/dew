@@ -155,7 +155,9 @@ def stage_packed(args) -> dict:
     template = staging.state(_template(own), staging.checkpointed)
     reports = {}
     for step, held in ((1, packed), (2, _foreign(packed))):
-        state = dataclasses.replace(placed, variables={**placed.variables, QUANTIZATION: held})
+        # The state a step left, which the step it is saved under names (`_filled`).
+        state = dataclasses.replace(placed, step=placed.step + step,
+                                    variables={**placed.variables, QUANTIZATION: held})
         directory = Path(args.run_dir) / f"stage-{step}"
         checkpoints = Checkpoints(str(directory))
         checkpoints.save(step, staging.saved(state), _laid=laid)
