@@ -140,12 +140,14 @@ def assert_replay_drafts_as_a_prefill(model, params, draw, label: str, *, seeds:
         with jax.enable_x64(new_val=True):
             return wide(*inputs)
 
-    assert_as_exact(replayed, dew_path(fresh), draw, label, seeds=seeds, truth_fn=truth)
-    # The next token each arm's logits choose, the same one: check 1 holds integers by their distance.
-    for seed in range(seeds):
-        inputs = draw(seed)
-        chosen = [np.asarray(arm(*inputs)["next"]) for arm in (replayed, fresh)]
-        np.testing.assert_array_equal(*chosen, err_msg=f"{label}, seed {seed}")
+    evaluated = assert_as_exact(replayed, dew_path(fresh), draw, label, seeds=seeds, truth_fn=truth,
+                                returns=True)
+    # The next token each arm's logits choose, the same one, read off the draws check 1 evaluated: check 1
+    # holds integers by their distance.
+    for seed, drawn in (evaluated or {}).items():
+        dew = {jax.tree_util.keystr(path): leaf for path, leaf in drawn.dew}
+        reference = dict(zip(sorted(dew), drawn.reference, strict=True))
+        np.testing.assert_array_equal(dew["['next']"], reference["['next']"], err_msg=f"{label}, seed {seed}")
 
 
 def greedy_walk(model, params):

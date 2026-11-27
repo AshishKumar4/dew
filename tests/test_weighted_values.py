@@ -28,14 +28,16 @@ def test_a_sum_across_its_blocks_cancels_exactly_where_the_one_dot_is_one_float6
 
 
 def test_keys_a_mesh_splits_take_the_one_dot():
-    """Keys an Explicit mesh axis splits three ways, 66 of them, which no 64-key block divides: the product
-    traces as the one dot, split as its operands are."""
-    devices = np.asarray(jax.devices()[:3])
-    mesh = jax.sharding.Mesh(devices, ("keys",), axis_types=(AxisType.Explicit,))
-    weights = jax.ShapeDtypeStruct((1, 2, 5, 66), jnp.float32,
-                                   sharding=NamedSharding(mesh, PartitionSpec(None, None, None, "keys")))
+    """Keys an Explicit mesh axis splits three ways, 66 of them, which no 64-key block divides, summed in fp32
+    (`FP32_SUMS`, where a CPU would block them): the product traces as the one dot, split as its value is."""
+    from dew.nn.precision import FP32_SUMS
+
+    devices = jax.devices()
+    assert len(devices) >= 3, "the suite's CPU holds a three-device mesh"
+    mesh = jax.sharding.Mesh(np.asarray(devices[:3]), ("keys",), axis_types=(AxisType.Explicit,))
+    weights = jax.ShapeDtypeStruct((1, 2, 5, 66), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec()))
     value = jax.ShapeDtypeStruct((1, 66, 2, 4), jnp.float32,
                                  sharding=NamedSharding(mesh, PartitionSpec(None, "keys", None, None)))
-    with jax.sharding.use_mesh(mesh):
+    with jax.set_mesh(mesh), jax.default_matmul_precision(FP32_SUMS):
         traced = jax.jit(lambda w, v: weighted_values(EQUATION, w, v)).trace(weights, value)
     assert traced.out_info.shape == (1, 5, 2, 4)
