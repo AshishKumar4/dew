@@ -36,17 +36,29 @@ def family_of(tiles: "Tiles", dtype, target: generation.GpuTarget | None = None)
 
 
 def tile_columns(tiles: "Tiles", family: mosaic.Family) -> int:
-    """The output columns a tile's accumulators hold: its `block_n`, or both CTAs' of a pair whose family's
-    products span it (`mosaic.Transport.pairs_product`, tcgen05's pair: its tile twice a CTA's rows and
-    columns, each CTA's accumulators its own rows by all the pair's columns)."""
-    return tiles.block_n * (tiles.cluster if family.pairs_product else 1)
+    """The output columns a tile's accumulators hold (`cluster_columns` of its shape)."""
+    return cluster_columns(tiles.block_n, tiles.cluster, family)
+
+
+def cluster_columns(block_n: int, cluster: int, family: mosaic.Family) -> int:
+    """The output columns the accumulators of a tile `block_n` wide on a cluster of `cluster` CTAs hold: its
+    `block_n`, or both CTAs' of a pair whose family's products span it (`mosaic.Transport.pairs_product`,
+    tcgen05's pair: its tile twice a CTA's rows and columns, each CTA's accumulators its own rows by all
+    the pair's columns)."""
+    return block_n * (cluster if family.pairs_product else 1)
 
 
 def tile_rows(tiles: "Tiles", family: mosaic.Family) -> int:
-    """The output rows a cluster's tile spans: each CTA's `block_m` its own, side by side, whether a pair's
-    products span them (`tile_columns`) or its CTAs multicast the blocks they read alike."""
+    """The output rows a cluster's tile spans (`cluster_rows` of its shape)."""
     del family
-    return tiles.block_m * tiles.cluster
+    return cluster_rows(tiles.block_m, tiles.cluster)
+
+
+def cluster_rows(block_m: int, cluster: int) -> int:
+    """The output rows a cluster of `cluster` CTAs' tile spans: each CTA's `block_m` its own, side by side,
+    whether a pair's products span them (`cluster_columns`) or its CTAs multicast the blocks they read
+    alike."""
+    return block_m * cluster
 
 
 def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
