@@ -815,8 +815,11 @@ class MosaicForward(_Mainloop[Tiles]):
         if not (found := emission.launched_kernels(traced.jaxpr)):
             return None
         resident = self.resident(ba, config, target)
+        # Its walk's softmax waits on a step's logits' products and its values' product on the softmax
+        # (`cost.launch_seconds`' `serial`).
         return sum(cost.launch_seconds(launched.work, emission.launch_programs(kernel), target,
-                                       resident=resident, warps=launched.warps if issued else 0.0)
+                                       resident=resident, warps=launched.warps if issued else 0.0,
+                                       serial=True)
                    for kernel, launched in found)
 
     def _choose_consumers(self, ba: tokamax.BoundArguments, candidates: list[Tiles], *,

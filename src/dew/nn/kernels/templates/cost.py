@@ -292,6 +292,10 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  fused=rate(vector) if held is None else math.inf)
 
 
+TENSOR_UNIT, ISSUE_UNIT = 0, 7
+"""`units`' tensor cores' and issue slots' places in its seconds."""
+
+
 def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
     FP8 modes in turn), the CUDA cores (their instructions, operations and conversions; the adds fused into
@@ -469,7 +473,7 @@ def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiproc
 
 
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
-                   resident: int = 1, warps: float = 0.0) -> float:
+                   resident: int = 1, warps: float = 0.0, serial: bool = False) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
     multiprocessor, each issuing over `warps` warps (`emission.warps_of`; 0 where unknown): the longer of
     the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs sharing one multiprocessor's
@@ -479,14 +483,24 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     6216, 10809, 10810). Its issue slots take a warp's issue interval (`Multiprocessor.issue_interval`) over
     the warps each scheduler holds, where fewer warps than that interval leave it idle between a warp's
     instructions (`latency_bound`: rows 5274, 4123): every resident program's warps where the multiprocessor's
-    programs hide each other's intervals (`Multiprocessor.programs_hide_issue`), else one program's."""
+    programs hide each other's intervals (`Multiprocessor.programs_hide_issue`), else one program's. A
+    `serial` launch's issued instructions wait on its products and its products on them, a step at a time,
+    so its tensor cores' seconds and its issue slots' add where another launch's take the longer: a GH200's
+    attention forward at B2 S8192 32/8 d128 under ncu ran its tensor-busy and issue-busy times nearly end
+    to end, 2.312 ms against 1.383 + 1.094 at 64 x 64 on three consumers, 2.044 against 1.177 + 0.889 at
+    64 x 64 on two, 1.795 against 1.199 + 0.659 at 64 x 128 on two (M-NA-41, M-NA-41c), the order its
+    longer-of price inverted (NA41)."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
     per_sm = spread(count, target.multiprocessors or 1)
     waves = spread(count, wave(target.multiprocessors, resident))
     at = rates(target, device=False)
-    throughput = max(units(per_program, at)[0])
+    on_units = units(per_program, at)[0]
+    if serial:
+        summed = on_units[TENSOR_UNIT] + on_units[ISSUE_UNIT]
+        on_units = [summed, *on_units[TENSOR_UNIT + 1:ISSUE_UNIT], *on_units[ISSUE_UNIT + 1:]]
+    throughput = max(on_units)
 
     multiprocessor = target.architecture.multiprocessor
     hiding = multiprocessor is None or multiprocessor.programs_hide_issue
