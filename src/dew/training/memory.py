@@ -770,9 +770,9 @@ def resident_on(*trees: TrainState | Batch) -> dict[Hashable, int]:
 def limit_exited(executable: jax.stages.Compiled | None) -> bool:
     """Whether `executable` is a compile XLA stopped past the limit it compiled under (`LIMIT_EXIT`), as it
     states (`CompiledMemory.stopped`): after its buffer assignment, its memory stated as a whole compile's,
-    or before optimizing where its arguments alone are over, those alone stated; it runs nowhere and is no plan's nor any held step's. A whole binary (one held, compiled ahead or read
-    from the persistent cache, which keys no limit) runs whatever limit a later compile asks, and is judged
-    by its memory alone."""
+    or before optimizing where its arguments alone are over, those alone stated; it runs nowhere and is no
+    plan's nor any held step's. A whole binary (one held, compiled ahead or read from the persistent cache,
+    which keys no limit) runs whatever limit a later compile asks, and is judged by its memory alone."""
     memory = None if executable is None else compiled_memory(executable)
     return memory is not None and memory.stopped
 
