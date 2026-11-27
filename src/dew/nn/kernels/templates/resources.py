@@ -393,15 +393,14 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int, *,
     column tile; row 4053's H100 forward's three or six column tiles read its tokens twice in bands of
     two or four, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's the power of two, at most `column_tiles`,
     nearest below the band that reads each operand fewest times, the rows' and the columns' blocks
-    balanced (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)),
-    or wider where a wave already spans every one of the walk's `row_tiles` (programs over them): its
-    row blocks are each read once whatever the band, which then takes the columns a wave reaches (a decode
-    step's one row tile: Llama-3-8B's NVFP4 projections on a GH200 ran 2x slower at the balanced band of
-    8 than at 64 or 128, their row tile alike, M-FS-89c/d, row 5874); a power of two, as its snake's
-    division by another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44
-    bytes spilled at a band of three, NS4053-1), which the register model does not see. A cluster of
-    `cluster` multiprocessors is one program, its tile `cluster` row tiles (`row_tiles` counts clusters'
-    tiles)."""
+    balanced (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)).
+    A wave that already spans every one of the walk's `row_tiles` (programs over them) reads each row
+    block once whatever the band, so its band takes the columns a wave reaches (a decode step's one row
+    tile: Llama-3-8B's NVFP4 projections on a GH200 ran 2x slower at the balanced band of 8 than at 64 or
+    128, their tile alike, M-FS-89c/d, row 5874). The band is a power of two, as its snake's division by
+    another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes spilled
+    at a band of three, NS4053-1), which the register model does not see. A cluster of `cluster`
+    multiprocessors is one program, its tile `cluster` row tiles (`row_tiles` counts clusters' tiles)."""
     if grouped:
         return column_tiles
     programs, rows = multiprocessors // cluster, block_m * cluster
