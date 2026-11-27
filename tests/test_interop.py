@@ -451,6 +451,30 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
                                       seeds=TRAINED_EXPORT_SEEDS)
 
 
+def test_a_release_pinning_a_retired_kernel_choice_loads_and_generates(tmp_path):
+    """A release an earlier Dew exported pinning the retired kernel choice (`generated`) beside its attention
+    kernel in its `dew_release.json` loads (`Pretrained.load`) with the choice left out and generates under
+    the pins it keeps, where its first call refused the choice."""
+    from test_inference import make_lm_run
+
+    from dew.config.release import RELEASE_FILE
+    from dew.interop import Pretrained
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run)
+    destination = tmp_path / "export"
+    Pretrained.from_run(str(run)).save(destination)
+    held = json.loads((destination / RELEASE_FILE).read_text())
+    held["task"]["kernels"] = {"attention": "reference", "generated": "written"}
+    (destination / RELEASE_FILE).write_text(json.dumps(held))
+    reloaded = Pretrained.load(destination, dtype="float32")
+    assert reloaded.kernels == (("attention", "reference"),)
+    task = reloaded.formed(reloaded.pipeline())
+    assert task.kernels == (("attention", "reference"),)
+    task(jnp.asarray([[3, 4, 5]], jnp.int32), 2, key=7)
+
+
 FRESH_TRAINING = """
 import sys
 

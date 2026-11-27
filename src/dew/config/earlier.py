@@ -49,8 +49,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
     11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); a pin of the
     grouped products' kernel written before SYRK took a choice of its own as SYRK's too
-    (`earlier_grouped_pins`, row 12457); a kernel choice Dew retired since left out
-    (`earlier_retired_kernels`, rows 3272, 6109); and every
+    (`earlier_grouped_pins`, row 12457); and every
     field a class lost since, its model's, its source options' and any class record's, left out
     (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
@@ -58,8 +57,8 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (ledger 1552)."""
     unsettable, additive, split = (record.get(key) is True
                                    for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT))
-    moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(earlier_retired_kernels(
-        _records.moved_record({key: value for key, value in record.items() if key not in MARKERS})))))
+    moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(_records.moved_record(
+        {key: value for key, value in record.items() if key not in MARKERS}))))
     moved = moved if split else earlier_grouped_pins(moved)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
@@ -149,45 +148,17 @@ def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Map
     found = _kernel_pins(record)
     if found is None:
         return record
-    kernels = found[2].get("kernels")
+    fields, diagnostics, pins = found
+    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
+    kernels = pins.get("kernels")
     # A choice the run left unset (written None, as a record of its kernels writes each it names none for)
     # takes `kernel`; one it named stands.
     named_kernels = {name: value for name, value in (kernels.items() if isinstance(kernels, Mapping) else ())
                      if value is not None}
-    return _with_kernels(record, found, {choice: kernel, **named_kernels})
-
-
-RETIRED_KERNELS = frozenset({"generated"})
-"""The kernel choices Dew retired since runs were saved with them: `generated`, which ran the algebra's
-checked twin of a template's written math where a call's exact case was declared and the written math
-elsewhere (rows 3272, 6109: on measurement the twins run in no program), so a run that named either runs the
-written math, as every run does now."""
-
-
-def earlier_retired_kernels(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record without the kernel choices Dew retired since (`RETIRED_KERNELS`), named or
-    written None, whether its kernels are a plain record or a subclass's tagged one (`{"class": ...,
-    "fields": ...}`, the tag kept). Carried to 1.0 (ledger 1552)."""
-    found = _kernel_pins(record)
-    kernels = None if found is None else found[2].get("kernels")
-    if found is None or not isinstance(kernels, Mapping):
-        return record
-    tagged = _records.class_record(kernels)
-    choices = tagged[1] if tagged is not None else kernels
-    if RETIRED_KERNELS.isdisjoint(choices):
-        return record
-    kept = {name: value for name, value in choices.items() if name not in RETIRED_KERNELS}
-    return _with_kernels(record, found, kept if tagged is None else {"class": tagged[0], "fields": kept})
-
-
-def _with_kernels(record: Mapping[str, object], found: _Pins, kernels: Mapping[str, object]
-                  ) -> Mapping[str, object]:
-    """`record`, its kernel pins (`found`, `_kernel_pins`') `kernels`."""
-    fields, diagnostics, pins = found
+    chosen = {choice: kernel, **named_kernels}
     if not isinstance(diagnostics, Mapping):
-        return {**record, "fields": {**fields, "kernels": kernels}}
-    named = _records.class_record(diagnostics)
-    stated = {**pins, "kernels": kernels}
+        return {**record, "fields": {**fields, "kernels": chosen}}
+    stated = {**pins, "kernels": chosen}
     return {**record, "fields": {**fields, "diagnostics": (stated if named is None
                                                             else {"class": named[0], "fields": stated})}}
 

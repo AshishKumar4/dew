@@ -67,8 +67,13 @@ class ReleaseTask:
 
     @classmethod
     def read(cls, record: Mapping[str, object]) -> ReleaseTask:
-        """The task a release's record states (`record`'s inverse)."""
-        return from_record(cls, _records.record(record, "task"), dtypes=False)
+        """The task a release's record states (`record`'s inverse), a kernel choice retired since the release
+        was saved left out (`_records.retired_kernels`)."""
+        held = _records.record(record, "task")
+        kernels = held.get("kernels")
+        if isinstance(kernels, Mapping):
+            held = {**held, "kernels": _records.retired_kernels(kernels)}
+        return from_record(cls, held, dtypes=False)
 
     @property
     def compute(self) -> DtypeName | None:

@@ -755,7 +755,11 @@ def _unnamed(annotation: Annotation, classes: tuple[type, ...], value: Mapping, 
     `rope_scaling={"rope_type": "yarn", "factor": 4.0}` is a `YarnScaling`); refused where several
     classes build from it, as nothing says which it is, or none does. A mapping no class reads as its
     record stays as written, a source's own record its field reads."""
-    fitting = [member for member in classes if member is not object and _holds_record(member, value)]
+    # The classes that read the record as written first; one only where a saved record's retired field
+    # left out (`_records.saved_fields`) where none does, so retirement never makes a record ambiguous.
+    fitting = ([member for member in classes if member is not object and _holds_record(member, value)]
+               or [member for member in classes if member is not object
+                   and _holds_record(member, value, saved=True)])
     if not fitting:
         return configured(value)
     built = []
@@ -787,13 +791,15 @@ def _unnamed(annotation: Annotation, classes: tuple[type, ...], value: Mapping, 
                      f"class record {{'class': ..., 'fields': {{...}}}} that names one")
 
 
-def _holds_record(member: type, value: Mapping) -> bool:
+def _holds_record(member: type, value: Mapping, *, saved: bool = False) -> bool:
     """Whether the dataclass `member` reads `value` as its record (`_declared`): its every key a field the
-    class records, its every required field among them."""
+    class records, its every required field among them; with `saved`, as `_declared` reads a saved record,
+    a field its class lost since left out (`_records.saved_fields`)."""
     if not dataclasses.is_dataclass(member):
         return False
     names, required = _record_fields(member)
-    return set(value) <= set(names) and set(required) <= set(value)
+    held = _records.saved_fields(member, value, names) if saved else value
+    return set(held) <= set(names) and set(required) <= set(held)
 
 
 def _record_fields(member: type) -> tuple[list[str], list[str]]:
@@ -1264,6 +1270,8 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     raises. A field marked `metadata={"record": False}` is a binding the
     value picks up at runtime, not something a record carries."""
     names, required = _record_fields(member)
+    # A saved record's field its class lost since, read without (`_records.saved_fields`).
+    fields = _records.saved_fields(member, fields, names)
     unknown = sorted(set(fields) - set(names))
     missing = [name for name in required if name not in fields]
     if unknown or missing:
@@ -1280,6 +1288,9 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     function does not take, or a parameter without a default that the record
     lacks, raises; a function taking `**kwargs` takes any field."""
     named, open_ended = parameters(function)
+    # A saved record's field its class lost since, read without (`_records.saved_fields`), as `_declared`
+    # reads a dataclass's: a constructor taking `**kwargs` forwards only what its parameters take.
+    fields = _records.saved_fields(function, fields, named)
     unknown = [] if open_ended else sorted(set(fields) - set(named))
     missing = [name for name, (parameter, _) in named.items()
                if name not in fields and parameter.default is parameter.empty]
