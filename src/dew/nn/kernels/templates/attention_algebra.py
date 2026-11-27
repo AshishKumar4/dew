@@ -1813,6 +1813,12 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
     return others + expand(own, others) * anchor_value.astype(jnp.float32)
 
 
+GENERATED_MERGE = Forward("full", 2, ids=False, scale=0.5, natural=False)
+"""The spec the algebra's generated split-KV merge was traced at (`dew.algebra.component_cases`'s
+`split_kv_merge`): a merge reads a spec's base and forms alone (`_stated`), so every spec stating those as it
+does merges by that body."""
+
+
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
@@ -2434,6 +2440,18 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
     (`_rows`): a scaled state's sums joined as the template joins them (`_scaled_merge`) over the factors
     the forms evaluate, through the forms' merge hook."""
+    from dew.algebra import generated
+
+    leading = first.m.shape
+    if generated.enabled():
+        ones, others = _rows(first), _rows(second)
+        operands = (ones.acc, ones.m, ones.total, others.acc, others.m, others.total)
+        declared = (all(state.scale is None and state.low is None for state in (first, second))
+                    and _stated(spec, ones)[0] == _stated(GENERATED_MERGE, ones)[0])
+        if (body := generated.body("dew.algebra.component_cases.split_kv_merge", operands,
+                                   when=declared)) is not None:
+            made = Partial(*body(*operands))
+            return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), made)
     # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf
     # (`finished_rows`), the forms' arithmetic NaN from it, as `resumed` takes an initial state's.
     floored = [state._replace(m=jnp.maximum(state.m, LEAST).astype(state.m.dtype))
@@ -2458,7 +2476,6 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     found = Partial(**dict(zip(fields, merged, strict=True)))
     if joined:
         found = found._replace(scale=joined[0].scale)
-    leading = first.m.shape
     return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), found)
 
 

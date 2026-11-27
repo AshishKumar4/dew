@@ -1459,6 +1459,14 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def _generated_body(name: str, operands: tuple):
+    """The algebra's generated and checked body of this module's component `name` for a call over `operands`
+    where the run asks for it (`dew.algebra.generated.body`); None, the written math to run, otherwise."""
+    from dew.algebra import generated
+
+    return generated.body(f"dew.algebra.component_cases.{name}", operands)
+
+
 def selective_decay(step, rate, kept=None):
     """Mamba's selective scan's decay of a state by a token, `exp(dt A)` of its `rate` `A`, as `exp2((dt A)
     log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
@@ -1469,6 +1477,9 @@ def selective_decay(step, rate, kept=None):
     (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and a step past it times
     a small rate its decay: the step taken to base 2 first, `dt = 3 2^126` overflowed, `A = -2^-126`
     decaying to 0 for `exp(-3)` and `A = 0` to NaN for 1 (mamba1b's review)."""
+    operands = (step, rate) if kept is None else (step, rate, kept)
+    if (generated := _generated_body("selective_decay", operands)) is not None:
+        return generated(*operands)
     decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
@@ -1494,6 +1505,8 @@ def selective_read(states: list, c: list, skip, value):
     balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
     output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
     write the whole state (the interpreted regime test)."""
+    if (generated := _generated_body("selective_read", (*states, *c, skip, value))) is not None:
+        return generated(*states, *c, skip, value)
     return pairwise_sum([c_n * state for c_n, state in zip(c, states, strict=True)]) + skip * value
 
 

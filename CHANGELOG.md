@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `generation.chosen(generated="generated")` runs the algebra's checked generated bodies in place of the
+  selective scan's decay and readout and the split-KV merge where a call's case is declared, counting every
+  fallback (`dew.algebra.generated.taken`); the default runs the written math, unchanged.
 - Add checked portable E4M3/E5M2 decoding and the selective scan readout; keep production dispatch
   unchanged. Split the slowest moment derivative checks by the derivative and draw they already held.
 
