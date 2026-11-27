@@ -178,3 +178,51 @@ def test_a_selected_call_refuses_a_score_hook_reading_its_keys_indices():
                                     hooked(lambda s, q, k: s - (q - k)))
     attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
                                 hooked(lambda s, q, k: 30.0 * jnp.tanh(s / 30.0)))
+
+
+def _parallax_reference(spans: template.KeySpans):
+    """Parallax's output as its paper states it (arXiv 2605.29157, §A row 54), over the softmax's weights
+    `p` and the second product's `t` apart: `O1/d1 (1 + d2/d1) - O2/d1`, `O1 = Σ p v`, `d1 = Σ p`,
+    `O2 = Σ (p t) v`, `d2 = Σ p t`, each weight rounded to the value's dtype for its product."""
+    def reference(query, second, key, second_key, value):
+        logits = template.scores(query, key, spans, scale=SCALE)
+        wide = logits.dtype
+        m = jnp.max(logits, axis=-1, keepdims=True)
+        p = jnp.exp(logits - m)
+        seconds = jnp.einsum("bqhd,bkhd->bhqk", second.astype(wide), second_key.astype(wide))
+        weighed = p * seconds
+
+        def summed(weights):
+            return jnp.einsum("bhqk,bkhd->bhqd", weights.astype(value.dtype).astype(wide), value.astype(wide))
+
+        d1, d2 = p.sum(-1, keepdims=True), weighed.sum(-1, keepdims=True)
+        out = summed(p) / d1 * (1 + d2 / d1) - summed(weighed) / d1
+        return jnp.swapaxes(out.astype(query.dtype), 1, 2)
+
+    return reference
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("case", ["causal", "full"])
+def test_parallax_is_on_par_with_its_two_accumulators(case, form):
+    """Parallax (§A row 54): a second, unscaled query's product weighing a second accumulator, on the
+    template's route (its kernels' forward and backward, `attention_products.parallax`), causal and full:
+    on par with the paper's two accumulators and denominators (check 1), its output and the gradients of the
+    query, the second query, the keys and the value."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=case == "causal")
+    natural, accurate = FORMS[form]
+
+    def ours(query, second, key, value):
+        return attention_products.attend((query, second), (key, key), value, spans,
+                                         attention_products.PARALLAX, scale=SCALE, natural=natural,
+                                         accurate=accurate)
+
+    def reference(query, second, key, value):
+        return _parallax_reference(spans)(query, second, key, key, value)
+
+    def draw(seed: int):
+        q1, q2, k1, _, value, dout = _draw(2)(seed)
+        return q1, q2 * 0.125, k1, value, dout
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), draw,
+                    f"parallax {case} {form}", seeds=SEEDS)
