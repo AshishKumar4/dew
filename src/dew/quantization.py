@@ -757,33 +757,109 @@ def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Arra
 
 
 def decoded_packed(variables: Variables) -> Variables:
+    """`deferred_packed`'s tree, each packed leaf decoded now: the float tree a model call takes."""
+    return jax.tree.map(lambda leaf: np.asarray(leaf) if isinstance(leaf, PackedDecode) else leaf,
+                        deferred_packed(variables), is_leaf=lambda leaf: isinstance(leaf, PackedDecode))
+
+
+def deferred_packed(variables: Variables) -> Variables:
     """`variables` with each packed leaf of `QUANTIZATION` its parameter again in `params`, under its name,
-    the leaf gone from the collection (and the collection where it held nothing else): the float tree an
-    export, a save or a merge takes, as `decoded_frozen_fp8` decodes a frozen FP8 site. The one traversal
-    of every packed format (train 1349's review F4): a packed bank (`dew.nn.dense.packed_matrix`) decoded
-    float32, an expert bank's `[..., experts, in, out]` (a scanned run's banks stacked on its layer axis
-    before their experts) or a Linear's kernel `[..., in, out]`, each value its code times its block's
-    scale times its matrix's, exactly (`packed_values`, on the host's CPU); a lossless bfloat16 window
-    (`bf16_windows`) its kernel bitwise the one it stored (`Bf16Window.decoded`)."""
+    the leaf gone from the collection (and the collection where it held nothing else), each decoded as it
+    is read (`PackedDecode`): the float tree an export or a save takes, holding one tensor's decode at a
+    time under its shards' bound (train 1369's review), as `decoded_frozen_fp8` decodes a frozen FP8 site.
+    The one traversal of every packed format (train 1349's review F4): a packed bank
+    (`dew.nn.dense.packed_matrix`) decoded float32, an expert bank's `[..., experts, in, out]` (a scanned
+    run's banks stacked on its layer axis before their experts) or a Linear's kernel `[..., in, out]`, each
+    value its code times its block's scale times its matrix's, exactly (`packed_values`, on the host's
+    CPU); a lossless bfloat16 window (`bf16_windows`) its kernel bitwise the one it stored, once its format
+    admits it (`Bf16Window.admitted`, as every reader of it asks)."""
     from dew.nn.kernels.formats import Bf16Window, NvFp4
 
     def packed(leaf) -> bool:
         return isinstance(leaf, (NvFp4, Bf16Window))
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: packed(leaf))
-    banks = {path: leaf for path, leaf in held.items() if isinstance(leaf, NvFp4)}
-    windows = {path: leaf for path, leaf in held.items() if isinstance(leaf, Bf16Window)}
-    leaves = {**banks, **windows}
+    # One decode held between this tree's leaves, released with the tree once its export is written.
+    memo: list = []
+    leaves = {path: PackedDecode(leaf, memo) for path, leaf in held.items() if packed(leaf)}
     if not leaves:
         return variables
-    with jax.default_device(jax.devices("cpu")[0]):
-        # A window admitted by its format first (`Bf16Window.admitted`), as every reader of it asks.
-        dense = {**{path: np.asarray(packed_values(bank)) for path, bank in banks.items()},
-                 **{path: window.admitted().decoded() for path, window in windows.items()}}
     rest = {path: leaf for path, leaf in held.items() if path not in leaves}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
-    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **leaves})
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
+class PackedDecode:
+    """A packed leaf's parameter, decoded on the host's CPU as it is read (`np.asarray`, an export's
+    `dew.interop.streaming.HostArray`), its shape and dtype known before, and an index of it (a layer's or
+    an expert's row, a member's columns) a decode of it in turn: a packed bank (`NvFp4`) float32 by
+    `packed_values`, a window (`Bf16Window`) bfloat16 once its format admits it, its planes read home first
+    (`dew._coordination.read_home`: a pool's export reads a leaf spanning its processes together, each
+    process its whole; one on a mesh of some of the pool's processes read whole where it lives and refused
+    where it does not, `read_home`). The last leaf
+    decoded is held in `memo`, which one tree's leaves share (`deferred_packed`), for its next index, a
+    bank's rows read one after another, and only it, released before the next is made: an export holds
+    one leaf's decode at a time, and none once its tree is released."""
+
+    def __init__(self, leaf, memo: list, index: tuple = ()):
+        from dew.nn.kernels.formats import NvFp4
+
+        self.leaf, self.memo, self.index = leaf, memo, index
+        whole = tuple(leaf.shape)
+        dtype = np.float32 if isinstance(leaf, NvFp4) else jnp.bfloat16
+        self.dtype = np.dtype(dtype)
+        # Each index applied in turn, as a read applies them, to a shape held without its values.
+        shaped = np.broadcast_to(np.zeros((), self.dtype), whole)
+        for at in index:
+            shaped = shaped[at]
+        self.shape = tuple(shaped.shape)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def __getitem__(self, index) -> PackedDecode:
+        return PackedDecode(self.leaf, self.memo, (*self.index, index))
+
+    def split(self, widths: Sequence[int]) -> list:
+        """The parameter's last axis in runs of `widths` (a packed projection's members,
+        `dew.nn.projections.unpacked`), each decoded as it is read, the leaf's one decode shared between
+        them while it is the last one made (`memo`)."""
+        from dew.nn.backbones.layer_names import Deferred
+
+        if not widths or min(widths) < 1 or sum(widths) != self.shape[-1]:
+            raise ValueError(f"members {list(widths)} do not partition an axis of {self.shape[-1]}")
+        starts = np.cumsum([0, *widths[:-1]])
+        return [Deferred((*self.shape[:-1], width), self.dtype,
+                         functools.partial(lambda start, width: np.asarray(self)[..., start:start + width],
+                                           int(start), int(width)))
+                for start, width in zip(starts, widths, strict=True)]
+
+    def _whole(self) -> np.ndarray:
+        from dew._coordination import read_home
+        from dew.nn.kernels.formats import NvFp4
+
+        if self.memo and self.memo[0][0] is self.leaf:
+            return self.memo[0][1]
+        # The last leaf's decode released before this one's is made.
+        self.memo.clear()
+        # Its planes home on this host, as host arrays the CPU decodes, a pool's shards read together.
+        home = jax.tree.map(read_home, self.leaf)
+        with jax.default_device(jax.local_devices(backend="cpu")[0]):
+            whole = np.asarray(packed_values(home) if isinstance(home, NvFp4) else home.admitted().decoded())
+        self.memo[:] = [(self.leaf, whole)]
+        return whole
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        del copy
+        value = self._whole()
+        for index in self.index:
+            value = value[index]
+        return np.asarray(value, dtype)
+
+    def __jax_array__(self) -> jax.Array:
+        return jnp.asarray(np.asarray(self))
 
 
 MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)

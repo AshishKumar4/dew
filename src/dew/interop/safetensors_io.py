@@ -411,6 +411,15 @@ def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int 
                      json.dumps({"metadata": metadata, "weight_map": dict(weight_map)}, indent=2))
 
 
+def weight_stem(name: str) -> str | None:
+    """The stem of `WEIGHT_STEMS` a directory's entry `name` is a weights file of, as an export writes
+    them (`save_sharded`): a single file, a shard under any token, or their index; None for any other."""
+    for stem in WEIGHT_STEMS:
+        if _replaced(stem).fullmatch(name) or name == f"{stem}.safetensors.index.json":
+            return stem
+    return None
+
+
 def _replaced(stem: str) -> re.Pattern[str]:
     """The weight files an export under `stem` replaces: the single file, and shards named as
     `save_sharded` (`<stem>-<token>-00001-of-00002`) and transformers' and diffusers'

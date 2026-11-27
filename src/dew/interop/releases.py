@@ -30,9 +30,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 from etils import epath
 
-from dew._coordination import writes_weights
-from dew._files import replacing, write_atomically
-from dew.interop.release_record import Release
+from dew._coordination import agreed_reading, writes_weights
+from dew._files import Entries, is_uri, swapped, write_atomically
+from dew.interop.release_record import RELEASE_FILE, Release
 from dew.interop.safetensors_io import (
     CONFIG_FILE,
     MAX_SHARD_SIZE,
@@ -41,6 +41,7 @@ from dew.interop.safetensors_io import (
     joined_tensors,
     save_sharded,
     tensor_specs,
+    weight_stem,
     write_file,
 )
 
@@ -148,12 +149,56 @@ class ReleasePlan:
         return joined_tensors({"the release's model": self.model.tensors(),
                                f"its head ({where})": self.head.tensors})
 
-    def write(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
-        """Write the release into `directory`: the assets, the model part, the head's files and the record,
-        the weights in shards of at most `max_shard_size`, each file replaced whole."""
+    def write(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE,
+              fresh: bool = False) -> None:
+        """Write the release as `directory`: the assets, the model part, the head's files and the record,
+        the weights in shards of at most `max_shard_size`, the whole release one generation. It is built in
+        a sibling directory and exchanged with the one `directory` held in one call (`dew._files.swapped`),
+        so a save that fails at any file leaves the earlier release whole, never a draft beside another
+        generation's trunk (row 13730); a reader that reads across a save synchronizes with it. A
+        `directory` holding files or folders no export writes or owns (`_foreign`), at any depth, is
+        refused, those entries named. A pool's process that reads its share and publishes none
+        (`writes_weights`) writes the release's small files in place, to a destination of its own
+        (`pooled_export` discards one the pool shares), every process agreeing its setup, its writes and
+        the publisher's replacement in turn; a location with a scheme, which has no rename, is written file
+        by file; and a `fresh` directory, one its caller made empty and private for this write alone, which
+        it publishes itself (a cache release's staging, `pooled_export`), is written in place."""
+        root = Path(directory)
+        in_place = fresh or is_uri(str(directory)) or not writes_weights()
+        with contextlib.ExitStack() as staged:
+            # A pool's processes agree where each writes before any reads a tensor home (the publisher's
+            # staging set up, the others' destinations in place), then their writes, then the publisher's
+            # replacement of the earlier release: a process that fails at any of them is heard by the
+            # others at the next round any of them takes, a gather's among them, after which none takes
+            # another (`_coordination._unheard`), and the earlier release stays in place.
+            target = agreed_reading(
+                lambda: root if in_place else staged.enter_context(swapped(root, self._foreign)))
+            agreed_reading(lambda: self._write(target, max_shard_size))
+            agreed_reading(staged.close)
+
+    @staticmethod
+    def _foreign(written: Entries, held: Entries, directory: Path) -> set[Path]:
+        """What an earlier tree at `directory` holds that this release neither writes, as the same kind of
+        entry, nor owns: an earlier export's weights are files its own only in a folder it writes its own
+        weights of that stem in (`weight_stem`); the release record (`RELEASE_FILE`) its own whether it
+        writes one or drops it (`Release.write`); and the sidecars the earlier release's config declares
+        (`hf_decoders.sidecars`: Inkling 2's draft, which a trunk-only export drops)."""
+        from dew.interop.hf_decoders import sidecars
+
+        stems = {(entry.parent, stem) for entry, kind in written.items()
+                 if kind == "file" and (stem := weight_stem(entry.name)) is not None}
+        unmatched = {entry: kind for entry, kind in held.items() if written.get(entry) != kind}
+        loose = {entry for entry, kind in unmatched.items() if kind == "file" and entry != Path(RELEASE_FILE)
+                 and (entry.parent, weight_stem(entry.name)) not in stems}
+        # The earlier config read only where a regular file is left to own, and only a regular file: a FIFO
+        # or another special entry is foreign, never opened.
+        if loose and held.get(Path("config.json")) == "file":
+            loose -= set(map(Path, sidecars(json.loads((directory / "config.json").read_text()))))
+        return loose | {entry for entry, kind in unmatched.items() if kind != "file"}
+
+    def _write(self, root: Path, max_shard_size: int | str) -> None:
         from dew.interop.hf_decoders import save_export_assets
 
-        root = Path(directory)
         root.mkdir(parents=True, exist_ok=True)
         if self.assets is not None:
             save_export_assets(root / self.assets.folder, tokenizer=self.assets.tokenizer,
@@ -180,38 +225,28 @@ class ReleasePlan:
             if folder:
                 _part(root / folder, config, tensors, max_shard_size)
         config, tensors = model.root()
-        with contextlib.ExitStack() as staged:
-            # Each sidecar written beside the root's weights unpublished, and published only once they are
-            # (`_sidecars_staged`): a save that fails before leaves the release it replaces whole.
-            tensors = _sidecars_staged(tensors, model.sidecars, root, staged)
-            if self.head is not None and self.head.merged:
-                tensors = joined_tensors({"the model": tensors, "its head": self.head.tensors})
-            # The root's weights at the release's root; its config there or in the format's folder.
-            save_sharded(tensors, root, max_shard_size)
+        tensors = _sidecars_written(tensors, model.sidecars, root)
+        if self.head is not None and self.head.merged:
+            tensors = joined_tensors({"the model": tensors, "its head": self.head.tensors})
+        # The root's weights at the release's root; its config there or in the format's folder.
+        save_sharded(tensors, root, max_shard_size)
         (root / model.folder).mkdir(parents=True, exist_ok=True)
         write_atomically(str(root / model.folder / CONFIG_FILE), json.dumps(config, indent=2))
 
 
-def _sidecars_staged(tensors: Mapping[str, np.ndarray], sidecars: Mapping[str, str], root: Path,
-                     staged: contextlib.ExitStack) -> Mapping[str, np.ndarray]:
-    """Each sidecar's tensors of `tensors` (`Placed.sidecars`) written for its own file at `root`, the
-    prefix off their names, each published over the file it replaces when `staged` closes and removed if
-    it raises (`dew._files.replacing`), and the rest returned for the root's shards, each read as it is
-    written. The root's weights committed first, a save interrupted before that leaves every file of the
-    release it replaces as it was, the draft beside its own trunk (train 1349's review F3); the sidecars'
-    renames follow the root's commit at once."""
+def _sidecars_written(tensors: Mapping[str, np.ndarray], sidecars: Mapping[str, str],
+                      root: Path) -> Mapping[str, np.ndarray]:
+    """Each sidecar's tensors of `tensors` (`Placed.sidecars`) written to its own file at `root`, the
+    prefix off their names, and the rest returned for the root's shards, each read as it is written; the
+    release they are written into published whole (`ReleasePlan.write`)."""
     specs = tensor_specs(tensors)
     taken: set[str] = set()
     for filename, prefix in sidecars.items():
         names = {name.removeprefix(prefix): name for name in specs if name.startswith(prefix)}
         if names:
-            # The publisher's file staged; a rank that reads its share and writes none stages nothing, so
-            # no empty file of its is published over the publisher's (`writes_weights`).
-            temporary = (staged.enter_context(replacing(root / filename)) if writes_weights()
-                         else root / filename)
             write_file(LazyTensors({name: specs[source] for name, source in names.items()},
                                    lambda name, names=names: tensors[names[name]]),
-                       temporary, {"format": "pt"})
+                       root / filename, {"format": "pt"})
             taken.update(names.values())
     if not taken:
         return tensors

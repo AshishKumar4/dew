@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
                mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-               publishes: bool = True) -> None:
+               publishes: bool = True, fresh: bool = False) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release (`run_plan`),
     its EMA weights where `ema`. Its weights restore where `mesh` and `layout` place them, so no device
     holds more of them than a load does, and the writer reads them home a tensor at a time as it writes
@@ -63,11 +63,12 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     writer, reading each tensor that spans the pool's processes home together (`reading_home`), so each
     host holds a shard of the release, not the model (ledger 2874). One that does not `publish` reads
     every tensor as the one that does and writes no weights to `destination`, only the release's small
-    files."""
+    files. A `fresh` destination, one its caller made empty and private for this export alone and publishes
+    itself, is written in place (`ReleasePlan.write`)."""
     # Restored before the writer reads its tensors home, each as the writer reaches it.
     plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)
     with reading_home("saved run export", writes=publishes):
-        plan.write(destination)
+        plan.write(destination, fresh=fresh)
 
 
 def run_plan(run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
@@ -445,7 +446,8 @@ def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
             export_run(run, discarded, ema=ema, mesh=mesh, layout=layout, publishes=False)
     elif staging:
         with staged(destination) as staged_at:
-            export_run(run, staged_at, ema=ema, mesh=mesh, layout=layout)
+            # The one publication `staged` makes: the export writes the staging in place.
+            export_run(run, staged_at, ema=ema, mesh=mesh, layout=layout, fresh=True)
             # A cache release states the saved run it holds, which a run that reads it carries.
             _write_held(staged_at, run, ema)
     else:

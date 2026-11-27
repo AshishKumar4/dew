@@ -18,7 +18,6 @@ jax.distributed.initialize() would pin the process to its own devices.
 from __future__ import annotations
 
 import contextlib
-import functools
 import gc
 import hashlib
 from collections.abc import Iterator
@@ -84,6 +83,108 @@ def allocated_growth(into: list[int]) -> Iterator[None]:
             into.append(peak.rise("Allocated"))
 
 
+def sharded_releases(size: int | str):
+    """`ReleasePlan.write` writing in shards of `size` where its caller states none: every release this
+    process writes in shards small enough to span several."""
+    from dew.interop.releases import ReleasePlan
+
+    write = ReleasePlan.write
+
+    def sharded(self: ReleasePlan, directory: str | Path, *, max_shard_size: int | str = size,
+                fresh: bool = False) -> None:
+        write(self, directory, max_shard_size=max_shard_size, fresh=fresh)
+
+    return sharded
+
+
+def refused_exports(run, destination: Path, restoring, model, variables, extension, bundle) -> dict:
+    """Exports of the release at `destination` that fail on one process, each heard by the other at the
+    same boundary, after which neither takes another round, so the exports after them meet as they did
+    (row 13730's review, train 1383's F3), the release exported first staying whole, its directory the one
+    it was: from weights on process 0's devices alone, which process 1 refuses to read rather than wait on
+    a read process 0 never joins; where the publisher can stage none (a file in its directory's place),
+    refused before any process reads a tensor home; where the publisher's disk fills after its first
+    shard (ENOSPC) while the other reads the next shard's tensors home; where its replacement of the
+    release is refused, an entry no export writes found in it then; and a failure raised through two
+    nested agreements."""
+    import errno
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew._coordination import PeerFailure, agreed_reading, reading_home
+    from dew.interop import safetensors_io
+    from dew.interop.pretrained import PretrainedDecoder
+    from dew.interop.saved_sources import run_plan
+
+    rank = jax.process_index()
+
+    def outcome(name: str, step) -> str | None:
+        with reading_home(name, writes=rank == 0):
+            # Caught inside the scope, so no pool failure is published for it.
+            try:
+                step()
+            except (ValueError, OSError, PeerFailure) as failure:
+                return type(failure).__name__
+        return None
+
+    def written(name: str, target: Path) -> str | None:
+        return outcome(name, lambda: run_plan(run).write(target))
+
+    first = destination.stat().st_ino
+    ours = NamedSharding(Mesh(np.asarray([device for device in jax.devices() if device.process_index == 0]),
+                              ("devices",)), PartitionSpec())
+
+    def on_ours(leaf):
+        held = np.asarray(leaf)
+        return jax.make_array_from_callback(held.shape, ours, lambda index: held[index], dtype=held.dtype)
+
+    apart = jax.tree.map(on_ours, variables)
+    restoring(PretrainedDecoder.from_model(model, apart).with_dex(extension, key=0))
+    report = {"refusal": written("a refused export", destination)}
+    restoring(bundle)
+    blocked = destination.parent / f"blocked{rank}"
+    if rank == 0:
+        blocked.write_text("a file, no directory of its own")
+    report["unstaged"] = written("an export the publisher cannot stage", blocked)
+    # The publisher's disk full past its first shard, its shards' files replaced through `replacing`.
+    replacing = safetensors_io.replacing
+    shards: list[Path] = []
+
+    def filling(path):
+        shards.append(Path(path))
+        if len(shards) > 1:
+            raise OSError(errno.ENOSPC, "no space left on device")
+        return replacing(path)
+
+    if rank == 0:
+        safetensors_io.replacing = filling
+    try:
+        report["full"] = written("an export whose disk fills", destination)
+    finally:
+        safetensors_io.replacing = replacing
+
+    # An entry no export writes in the publisher's release, found when it validates the tree it replaces:
+    # its replacement refused there, after every process wrote its share.
+    foreign = destination / "notes.txt"
+    if rank == 0:
+        foreign.write_text("mine")
+    try:
+        report["unexchanged"] = written("an export whose replacement is refused", destination)
+    finally:
+        foreign.unlink(missing_ok=True)
+    report["kept"] = destination.stat().st_ino == first if rank == 0 else None
+
+    def refused_on_zero() -> None:
+        if rank == 0:
+            raise ValueError("process 0 refuses")
+
+    report["nested"] = outcome("two nested agreements",
+                               lambda: agreed_reading(lambda: agreed_reading(refused_on_zero)))
+    return report
+
+
 def exported(args) -> dict:
     """The decoder exported placed across the pool, and written unplaced and outside the scope; and the
     deeper decoder's export measured, and its whole tree held home."""
@@ -100,7 +201,7 @@ def exported(args) -> dict:
     from dew.registry import ModelConfig, models, to_record
     from dew.training import Layout, MeshSpec
 
-    ReleasePlan.write = functools.partialmethod(ReleasePlan.write, max_shard_size=SHARD)
+    ReleasePlan.write = sharded_releases(SHARD)
 
     def built(fields):
         """The decoder of `fields`, its variables, those placed across the pool, every layer's attention
@@ -137,6 +238,7 @@ def exported(args) -> dict:
     destination = root / f"release{rank}"
     restoring(bundle)
     export(destination.name)
+    refusals = refused_exports(run, destination, restoring, model, variables, extension, bundle)
     # The deeper decoder exported once before it is measured, a copy built apart so nothing the measured
     # one holds is left from it: the measured export finds its programs compiled and its modules imported.
     # The copy is released, its restore replaced, before the measure starts, not freed within it.
@@ -162,6 +264,7 @@ def exported(args) -> dict:
                           if written.get(name) != own.get(name)} if rank == 0 else {},
             "spanning": sum(not leaf.is_fully_addressable for leaf in leaves),
             "refused_outside": refused, "release": digests(destination), "alone": digests(alone),
+            **refusals,
             "small_files": sorted(path.name for path in destination.iterdir()
                                   if not path.name.endswith((".safetensors", ".safetensors.index.json"))),
             "exported": growth[0], "held": growth[1],
@@ -204,7 +307,7 @@ def released(args) -> dict:
     from dew.interop import saved_sources
     from dew.interop.releases import ReleasePlan
 
-    ReleasePlan.write = functools.partialmethod(ReleasePlan.write, max_shard_size=RELEASE_SHARD)
+    ReleasePlan.write = sharded_releases(RELEASE_SHARD)
     rank = jax.process_index()
     scopes = scoped_growth(saved_sources)
     # The first export compiles; the second warms the already-compiled execution's native storage.

@@ -800,11 +800,11 @@ class Pretrained:
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
-        from dew.quantization import decoded_packed
+        from dew.quantization import deferred_packed
 
-        # A packed load's banks are written as the dense matrices they hold (`decoded_packed`),
-        # which the source's format encodes back.
-        held = unboxed(decoded_packed(self.variables if variables is None else variables))
+        # A packed load's banks are written as the dense matrices they hold, each decoded as it is written
+        # (`deferred_packed`), which the source's format encodes back.
+        held = unboxed(deferred_packed(self.variables if variables is None else variables))
         values = unpacked(self.model, stored_layers(self.model, held, banks=True))
         if self.adapter is not None:
             values = self.adapter.merge(values)
@@ -886,7 +886,9 @@ class Pretrained:
 
         from huggingface_hub import HfApi
 
-        with tempfile.TemporaryDirectory() as staged:
+        with tempfile.TemporaryDirectory() as private_folder:
+            # The release written inside the private folder, its staging and lock there, removed with it.
+            staged = Path(private_folder) / "release"
             self.save(staged, variables=variables, max_shard_size=max_shard_size)
             api = HfApi()
             api.create_repo(repo_id, private=private, exist_ok=True)

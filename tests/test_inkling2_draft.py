@@ -6,6 +6,7 @@ and records both there (recorded_draft.npz)."""
 
 import dataclasses
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -293,6 +294,131 @@ def test_a_release_whose_trunk_fails_to_write_leaves_its_draft_as_it_was(tmp_pat
     assert sorted(path.name for path in tmp_path.iterdir()) == before
     np.testing.assert_array_equal(load_file(tmp_path / 'mtp.safetensors')['fuse_weight'], head)
     np.testing.assert_array_equal(load_file(tmp_path / 'model.safetensors')['model.weight'], trunk)
+
+
+def test_a_release_replaces_only_entries_of_the_kind_it_writes(tmp_path):
+    """A release replaces an earlier tree's entries only as the same kind of entry (train 1399's review):
+    an empty folder named as a file it writes, or as a shard of its weights, is refused, kept; a FIFO where
+    the earlier config was is a special entry, refused, never opened; and the draft an earlier Inkling 2
+    release's config declared is the export's own to drop."""
+    from dew.interop.releases import Placed, ReleasePlan
+
+    trunk, head = np.arange(6, dtype=np.float32).reshape(2, 3), np.arange(4, dtype=np.float32)
+    parted = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.weight': trunk})}))
+    # An empty folder named as a file the export writes, or as a shard of its weights, is no file of its
+    # own: refused, kept (train 1399's review).
+    for name in ('config.json', 'model.safetensors'):
+        target = tmp_path / f'with-folder-{name}'
+        parted.write(target)
+        (target / name).unlink()
+        (target / name).mkdir()
+        with pytest.raises(FileExistsError):
+            parted.write(target)
+        assert (target / name).is_dir()
+    # Its read waited on a writer under the publication's lock.
+    target = tmp_path / 'with-fifo'
+    parted.write(target)
+    (target / 'config.json').unlink()
+    os.mkfifo(target / 'config.json')
+    (target / 'stale.safetensors').write_bytes(b'')
+    with pytest.raises(FileExistsError):
+        parted.write(target)
+    # A release whose config declared Inkling 2's draft, replaced by one without it: the draft the earlier
+    # release's config declared is the export's own to drop (train 1399's review).
+    drafted_config = {'model_type': 'inkling2_loop', 'mtp_config': {'num_nextn_predict_layers': 1}}
+    drafted = tmp_path / 'drafted'
+    ReleasePlan(Placed({'': (drafted_config, {'model.weight': trunk, 'mtp.fuse_weight': head})},
+                       sidecars={'mtp.safetensors': 'mtp.'})).write(drafted)
+    assert (drafted / 'mtp.safetensors').is_file()
+    ReleasePlan(Placed({'': ({'model_type': 'inkling2_loop'}, {'model.weight': trunk})})).write(drafted)
+    assert not (drafted / 'mtp.safetensors').exists()
+
+
+def test_a_release_is_one_generation_whatever_file_its_save_fails_at(tmp_path):
+    """A release's save builds the whole release apart and puts it in place at once (row 13730): one
+    that fails at its sidecar, as one that fails at its trunk, leaves the earlier release whole, byte for
+    byte, and nothing of its own beside it; one into a directory not yet made, or emptied, is put in
+    place whole; and a directory holding an entry no export writes, at its top or deeper (a file in a
+    folder the export writes, weights in a folder it writes none of or of a stem it writes none of there, a
+    link to a folder, an empty folder), or that is a file or a link itself, is refused, the release beside
+    it as it was; an earlier export's release record, which a release stating none drops, is not."""
+    from dew.interop.release_record import RELEASE_FILE
+    from dew.interop.releases import Placed, ReleasePlan
+    from dew.interop.safetensors_io import LazyTensors, tensor_specs
+
+    def plan(tensors):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, tensors)},
+                                  sidecars={'mtp.safetensors': 'mtp.'}))
+
+    def snapshot(directory):
+        return {path.name: path.read_bytes() for path in directory.iterdir()}
+
+    trunk, head = np.arange(6, dtype=np.float32).reshape(2, 3), np.arange(4, dtype=np.float32)
+    release = tmp_path / 'release'
+    plan({'model.weight': trunk, 'mtp.fuse_weight': head}).write(release)
+    before, around = snapshot(release), sorted(path.name for path in tmp_path.iterdir())
+    changed = {'model.weight': trunk + 1, 'mtp.fuse_weight': head + 1}
+    for failing in changed:
+        def read(name, failing=failing):
+            if name == failing:
+                raise OSError(f"{failing}'s storage went away")
+            return changed[name]
+
+        with pytest.raises(OSError):
+            plan(LazyTensors(tensor_specs(changed), read)).write(release)
+        assert snapshot(release) == before, failing
+        assert sorted(path.name for path in tmp_path.iterdir()) == around, failing
+    fresh = tmp_path / 'fresh' / 'release'
+    plan(changed).write(fresh)
+    plan(changed).write(release)
+    assert snapshot(fresh) == snapshot(release) != before
+    (release / 'notes.txt').write_text('mine')
+    after = snapshot(release)
+    with pytest.raises(FileExistsError):
+        plan({'model.weight': trunk, 'mtp.fuse_weight': head}).write(release)
+    assert snapshot(release) == after
+    # Deeper entries of its own: a file in a folder the next export writes too, weights in a folder it
+    # writes none of, and a link to a folder, none followed: each refused, kept.
+    vocabulary = tmp_path / 'vocab.txt'
+    vocabulary.write_text('a b')
+    parted = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.weight': trunk}),
+                                 'transformer': ({'model_type': 'tiny'}, {'model.weight': trunk})},
+                                files={'transformer/tokenizer/vocab.txt': vocabulary}))
+    for entry in ('transformer/notes.txt', 'backup/model.safetensors', 'linked',
+                  'transformer/tokenizer/model.safetensors',
+                  'transformer/diffusion_pytorch_model.safetensors'):
+        target = tmp_path / entry.replace('/', '-')
+        target.mkdir()
+        parted.write(target)
+        if entry == 'linked':
+            (target / entry).symlink_to(tmp_path / 'fresh', target_is_directory=True)
+        else:
+            (target / entry).parent.mkdir(exist_ok=True)
+            (target / entry).write_text('mine')
+        with pytest.raises(FileExistsError):
+            parted.write(target)
+        assert (target / entry).exists(), entry
+    # An empty folder no export writes is an entry of its own, refused, kept (train 1383's review: one was
+    # dropped unlisted); the release record an earlier export wrote is the writer's own, dropped by a
+    # release that states none (`Release.write`).
+    target = tmp_path / 'with-backup'
+    parted.write(target)
+    (target / 'backup').mkdir()
+    with pytest.raises(FileExistsError):
+        parted.write(target)
+    assert (target / 'backup').is_dir()
+    (target / 'backup').rmdir()
+    (target / RELEASE_FILE).write_text('{"step": 3}')
+    parted.write(target)
+    assert not (target / RELEASE_FILE).exists()
+    # A destination that is a file of its own, or a link to a release: refused, kept as it was.
+    (tmp_path / 'a-file').write_text('mine')
+    (tmp_path / 'a-link').symlink_to(fresh, target_is_directory=True)
+    for name in ('a-file', 'a-link'):
+        with pytest.raises(FileExistsError):
+            parted.write(tmp_path / name)
+    assert (tmp_path / 'a-file').read_text() == 'mine' and (tmp_path / 'a-link').resolve() == fresh
+
 
 
 def test_a_release_written_by_a_rank_that_publishes_none_leaves_its_sidecar_as_it_was(tmp_path):
