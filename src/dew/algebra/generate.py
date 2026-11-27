@@ -14,6 +14,7 @@ deterministic on one platform, and the module records the platform it was measur
 from __future__ import annotations
 
 import argparse
+import collections
 import dataclasses
 import difflib
 import functools
@@ -23,7 +24,7 @@ import importlib.util
 import itertools
 import logging
 import sys
-from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -161,15 +162,16 @@ class SurrogateBodies:
                                    *((case.tangent_name(inactive), tangent)
                                      for inactive, tangent in case.tangents.items()))]
 
-    def declared(self, module: str) -> SurrogateBodies:
-        """Register each case's forward and tangent bodies, each under its own name (`declare`): every name
-        checked free (or already this body's) before any is registered, so a collision leaves the registry
-        as it was."""
+    def declared(self, module: str, *, registry: dict[str, StableForm | ComponentForm] | None = None
+                 ) -> SurrogateBodies:
+        """Register each case's forward and tangent bodies, each under its own name (`declare`, in
+        `registry`, `DECLARATIONS` where none is given): every name checked free (or already this body's)
+        before any is registered, so a collision leaves the registry as it was."""
         bodies = self._bodies()
         for name, form in bodies:
-            _free(f"{module}.{name}", form)
+            _free(f"{module}.{name}", form, registry)
         for name, form in bodies:
-            declare(module, name, form)
+            declare(module, name, form, registry=registry)
         return self
 
     def _case(self, fixed: tuple) -> SurrogateCase | None:
@@ -300,18 +302,22 @@ DECLARATIONS: dict[str, StableForm | ComponentForm] = {}
 """Generated functions by their declaring module and name (`declare`)."""
 
 
-def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: Form) -> Form:
-    """`form` registered under its declaring `module` and `name`, generated into `<module>_derived.py` as a
-    function of that name; a name already declared another form refused, never overwritten."""
+def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: Form, *,
+                                                registry: dict[str, StableForm | ComponentForm] | None = None
+                                                ) -> Form:
+    """`form` registered under its declaring `module` and `name` in `registry` (`DECLARATIONS`, which
+    generation reads, where none is given), generated into `<module>_derived.py` as a function of that
+    name; a name already declared another form refused, never overwritten."""
     qualified = f"{module}.{name}"
-    _free(qualified, form)
-    DECLARATIONS[qualified] = form
+    _free(qualified, form, registry)
+    (DECLARATIONS if registry is None else registry)[qualified] = form
     return form
 
 
-def _free(qualified: str, form) -> None:
-    """Refuse `qualified` where another form is declared under it (`declare`)."""
-    if (held := DECLARATIONS.get(qualified)) is not None and held is not form:
+def _free(qualified: str, form, registry: dict[str, StableForm | ComponentForm] | None = None) -> None:
+    """Refuse `qualified` where another form is declared under it in `registry` (`declare`)."""
+    held = (DECLARATIONS if registry is None else registry).get(qualified)
+    if held is not None and held is not form:
         raise ValueError(f"{qualified} is declared twice: each form, and each surrogate case's static "
                          "arguments and tangent activity, needs a name of its own")
 
@@ -458,14 +464,21 @@ def _admit_components(module: str, chosen: Sequence[_Chosen], text: str) -> None
             raise ValueError(f"{label}: the emitted entrypoint did not pass Check 1")
 
 
-def _bodies(chosen: Sequence[_Chosen]):
+def _bodies(chosen: Sequence[_Chosen], numbered: collections.Counter[str], reserved: Collection[str]):
+    """A declaring module's distinct bodies, each by its private function's name, and each case's: a
+    declaration's `name` numbered by `numbered`, which counts each name's bodies across every module
+    generated together, so a name two modules declare (a `step` in two of them) names each one's apart
+    where the sharing pass reads them in one namespace (`_component_sharing.shared`), and no number naming a
+    declaration (`reserved`: a module's `step` and `_step_1`), whose function its module writes."""
     active: dict[_Chosen, str] = {}
     by_body: dict[tuple[str, str | printed.Body], str] = {}
     bodies: dict[str, str | printed.Body] = {}
     for found in chosen:
         key = found.name, found.body
         if key not in by_body:
-            function = f"_{found.name}_{sum(name == found.name for name, _ in by_body)}"
+            while (function := f"_{found.name}_{numbered[found.name]}") in reserved:
+                numbered[found.name] += 1
+            numbered[found.name] += 1
             by_body[key] = function
             bodies[function] = found.body
         active[found] = by_body[key]
@@ -495,15 +508,13 @@ def _emitted(by_module: Mapping[str, Sequence[_Chosen]]
     """Each module's bodies with the spans its components share with any other's factored into helpers
     (`_component_sharing.shared`, over every sharing module at once), and those helpers. A module holding a
     stable form's compensated text (a body of no bindings to share) keeps its bodies as they are."""
-    per = {module: _bodies(chosen) for module, chosen in by_module.items()}
-    names = [name for bodies, _ in per.values() for name in bodies]
-    if len(set(names)) != len(names):
-        raise ValueError("two declaring modules emit a body of one name; name their declarations apart")
+    declared = sorted({found.name for chosen in by_module.values() for found in chosen})
+    numbered: collections.Counter[str] = collections.Counter()
+    per = {module: _bodies(chosen, numbered, declared) for module, chosen in by_module.items()}
     sharing = [module for module, (bodies, _) in per.items()
                if not any(isinstance(body, str) for body in bodies.values())]
     components = {name: body for module in sharing for name, body in per[module][0].items()
                   if isinstance(body, printed.Body)}
-    declared = sorted({found.name for chosen in by_module.values() for found in chosen})
     shared = _component_sharing.shared(components, reserved=declared) if components else {}
     factored = {name: body for name, body in shared.items() if name not in components}
     made = {}

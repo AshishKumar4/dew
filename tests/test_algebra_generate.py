@@ -28,6 +28,7 @@ from dew.algebra import (
     generate,
     printed,
     recurrence_cases,
+    terms,
 )
 from dew.sampling import guidance_cases
 
@@ -633,7 +634,8 @@ def test_the_chooser_measures_each_pair_of_distinct_programs_once():
                           saturation=algebra.SATURATION, admits=admits)
 
     def program(function) -> str:
-        return str(jax.make_jaxpr(function)(*operands))
+        """The program `function` traces to, by the algebra's structural digest (`terms.jaxpr_digest`)."""
+        return terms.jaxpr_digest(jax.make_jaxpr(function)(*operands), in_process=False)[0]
 
     pairs = [(program(candidate), program(reference)) for candidate, reference in measured]
     assert pairs and all(candidate != reference for candidate, reference in pairs)
@@ -642,17 +644,42 @@ def test_the_chooser_measures_each_pair_of_distinct_programs_once():
     assert len(set(proposed)) == len(proposed)
 
 
+def test_one_name_declared_in_two_modules_generates_each_body_apart():
+    """A declaration's name two declaring modules both use (a `step` in each) names each one's body apart,
+    where the sharing pass reads every module's in one namespace, and no body by a name another declaration
+    holds (a second `_step_1`): each module's generated entrypoints run their own forms (`_written`), the
+    two read under one name no longer refused (the 2026-11-27 audit's K03, and its fix's head review)."""
+    declared = {"first": {"step": lambda x: x * 2.0 + 1.0},
+                "second": {"step": lambda x: x * 3.0 - 1.0, "_step_1": lambda x: x * 5.0}}
+    found = {module: [one for name, function in functions.items()
+                      for one in generate._chosen(f"{module}.{name}", generate.ComponentForm(
+                          function, function, generate.float32_cases(((8,),))))]
+             for module, functions in declared.items()}
+    emitted, factored = generate._emitted(found)
+    assert not factored and not any(made.bound for made in emitted.values())
+    x = np.arange(8, dtype=np.float32)
+    for module, functions in declared.items():
+        _, admitted = generate._written(module, found[module], [f"{module}.{name}" for name in functions],
+                                        emitted[module], factored)
+        loaded = printed.loaded_module(admitted, module)
+        for name, function in functions.items():
+            entry = loaded[name]
+            assert callable(entry)
+            np.testing.assert_array_equal(entry(x), function(x))
+
+
 def test_a_name_declared_twice_is_refused_and_keeps_its_first_form():
     """Two forms of one declared name are refused, the first kept (`generate.declare`): a second surrogate
     case of one body name over the first ran the second's form for both. Declared under a module no
-    generation writes (`DECLARING` names none of it)."""
+    generation writes (`DECLARING` names none of it), in a registry of the test's own."""
     first, second = (generate.ComponentForm(fn, fn, generate.float32_cases(((8,),)))
                      for fn in (lambda x: 2 * x, lambda x: 3 * x))
-    generate.declare(__name__, "gain", first)
-    assert generate.declare(__name__, "gain", first) is first
+    registry = {}
+    generate.declare(__name__, "gain", first, registry=registry)
+    assert generate.declare(__name__, "gain", first, registry=registry) is first
     with pytest.raises(ValueError):
-        generate.declare(__name__, "gain", second)
-    assert generate.DECLARATIONS[f"{__name__}.gain"] is first
+        generate.declare(__name__, "gain", second, registry=registry)
+    assert registry == {f"{__name__}.gain": first}
 
 
 def test_a_surrogate_whose_tangent_name_is_taken_registers_nothing():
@@ -663,11 +690,12 @@ def test_a_surrogate_whose_tangent_name_is_taken_registers_nothing():
                                   generate.Cases(((operand,),), lambda seed, operands: operands, 1))
     tangent = generate.ComponentForm(lambda x, dx, value: dx, lambda x, dx, value: dx,
                                      generate.Cases(((operand,) * 3,), lambda seed, operands: operands, 1))
+    registry = {}
     generate.declare(__name__, "lone_tangent", generate.ComponentForm(lambda x: 2 * x, lambda x: 2 * x,
-                                                                      form.cases))
+                                                                      form.cases), registry=registry)
     case = generate.SurrogateCase("lone", form, {(): tangent}, output_tree=(jax.tree.structure(0),))
-    before = dict(generate.DECLARATIONS)
+    before = dict(registry)
     with pytest.raises(ValueError):
         generate.SurrogateBodies(lambda x: x, lambda *values: values[1][0], (), symbolic_zeros=False,
-                                 cases=(((), case),)).declared(__name__)
-    assert before == generate.DECLARATIONS
+                                 cases=(((), case),)).declared(__name__, registry=registry)
+    assert before == registry
