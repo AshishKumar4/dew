@@ -30,11 +30,11 @@ import numpy as np
 from jax import lax
 
 from dew.algebra import _generated
-from dew.algebra.shared_derived import shared_component_32
+from dew.algebra.shared_derived import shared_component_33
 
 
 def _guided_0(x1, x2, x3):
-    v13, = shared_component_32(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v13, = shared_component_33(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v14 = lax.mul_p.bind(v13, x2, out_dtype=None)
     v15 = lax.mul_p.bind(v13, x1, out_dtype=None)
     v16 = lax.mul_p.bind(v13, x2, out_dtype=None)
@@ -65,7 +65,7 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     v16 = lax.broadcast_in_dim_p.bind(
         v8, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
     v17 = lax.select_n_p.bind(v16, v15, v12)
-    v27, = shared_component_32(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v27, = shared_component_33(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v28 = lax.mul_p.bind(v27, x1, out_dtype=None)
     v29 = lax.mul_p.bind(v27, x2, out_dtype=None)
     v30 = lax.sub_p.bind(v28, v29)

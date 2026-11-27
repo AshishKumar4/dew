@@ -11,12 +11,13 @@ Declarations: dew.algebra.component_cases.chunk_carry, dew.algebra.component_cas
   dew.algebra.component_cases.query_walk_factors, dew.algebra.component_cases.query_weights,
   dew.algebra.component_cases.scores, dew.algebra.component_cases.selective_adjoint,
   dew.algebra.component_cases.selective_decay, dew.algebra.component_cases.selective_dx_scale,
-  dew.algebra.component_cases.selective_read, dew.algebra.component_cases.selective_state_tangent,
-  dew.algebra.component_cases.selective_token, dew.algebra.component_cases.sink_state,
-  dew.algebra.component_cases.skipped_back, dew.algebra.component_cases.sliding_visibility,
-  dew.algebra.component_cases.softcap_tile, dew.algebra.component_cases.split_kv_merge,
-  dew.algebra.component_cases.ssd_chunk_forward, dew.algebra.component_cases.ssd_chunk_pullback,
-  dew.algebra.component_cases.values_gradient, dew.algebra.component_cases.walk_output.
+  dew.algebra.component_cases.selective_lifted_adjoint, dew.algebra.component_cases.selective_read,
+  dew.algebra.component_cases.selective_state_tangent, dew.algebra.component_cases.selective_token,
+  dew.algebra.component_cases.sink_state, dew.algebra.component_cases.skipped_back,
+  dew.algebra.component_cases.sliding_visibility, dew.algebra.component_cases.softcap_tile,
+  dew.algebra.component_cases.split_kv_merge, dew.algebra.component_cases.ssd_chunk_forward,
+  dew.algebra.component_cases.ssd_chunk_pullback, dew.algebra.component_cases.values_gradient,
+  dew.algebra.component_cases.walk_output.
 Rule sets: identities, contracted, stable, linear, reuse, joined.
 egglog 14.0.0.post1; measured on cpu.
 
@@ -56,14 +57,15 @@ from dew.algebra.shared_derived import (
     shared_component_21,
     shared_component_22,
     shared_component_24,
-    shared_component_33,
-    shared_component_36,
+    shared_component_28,
+    shared_component_34,
     shared_component_37,
     shared_component_38,
     shared_component_39,
     shared_component_41,
     shared_component_42,
-    shared_component_45,
+    shared_component_43,
+    shared_component_46,
 )
 
 
@@ -292,11 +294,11 @@ def _queries_cotangent_0(x1, x2, x3, x4, x5, x6, x7, x8):
         x3, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0,), sharding=None)
     v10 = lax.sub_p.bind(x1, v9)
     v11 = lax.min_p.bind(v10, np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')))
-    v12, v17, v18 = shared_component_38(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
+    v12, v17, v18 = shared_component_39(v11, x4, (x1.shape[0],), (), (x1.shape[0], 1), (0,))
     v19 = lax.broadcast_in_dim_p.bind(
         np.array(float.fromhex('0x0.0p+0'), dtype=jnp.dtype('float32')), shape=(x1.shape[0], x1.shape[1]),
         broadcast_dimensions=(), sharding=None)
-    v26, = shared_component_37(x5, x2, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
+    v26, = shared_component_38(x5, x2, x8, v19, x6, v17, v12, (x1.shape[0], 1), (0,))
     v27 = lax.select_n_p.bind(x7, v19, v26)
     return (v12, v18, v27)
 
@@ -332,13 +334,8 @@ def _scores_0(x1, x2, x3):
 
 
 def _selective_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9):
-    v11, v13, v16 = shared_component_39(x1, x2, x3, x7, x5, x6, x9)
-    v17 = lax.mul_p.bind(x1, x5, out_dtype=None)
-    v18 = lax.mul_p.bind(v17, x6, out_dtype=None)
-    v19 = lax.mul_p.bind(x3, x2, out_dtype=None)
-    v20 = lax.add_p.bind(v19, x4)
-    v21 = lax.mul_p.bind(x8, v20, out_dtype=None)
-    v22 = lax.mul_p.bind(v11, x5, out_dtype=None)
+    v11, v13, v16 = shared_component_28(x1, x2, x3, x7, x5, x6, x9)
+    v18, v21, v22 = shared_component_41(x1, x5, x6, x3, x2, x4, x8, v11)
     return (v13, v16, v18, v21, v22)
 
 
@@ -385,6 +382,12 @@ def _selective_dx_scale_0(x1, x2, x3):
     return (v67, v120, v125)
 
 
+def _selective_lifted_adjoint_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10):
+    v12, v14, v17 = shared_component_28(x1, x2, x3, x7, x10, x6, x9)
+    v19, v22, v23 = shared_component_41(x1, x5, x6, x3, x2, x4, x8, v12)
+    return (v14, v17, v19, v22, v23)
+
+
 def _selective_read_0(
         x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
         x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x34):
@@ -396,7 +399,7 @@ def _selective_read_0(
         v35, v36, v37, v38, v39, v40, v41, v42, v43, v44, v45, v46)
     v57 = lax.add_p.bind(v47, v48)
     v58 = lax.add_p.bind(v49, v50)
-    v67, = shared_component_33(v51, v52, v53, v54, v55, v56, v57, v58, x33, x34)
+    v67, = shared_component_34(v51, v52, v53, v54, v55, v56, v57, v58, x33, x34)
     return (v67,)
 
 
@@ -421,20 +424,20 @@ def _selective_read_1(
         v91, v92, v93, v94, v95, v96, v97, v98, v99, v100, v101, v102)
     v117, v118, v119, v120, v121, v122 = shared_component_22(
         v103, v104, v105, v106, v107, v108, v109, v110, v111, v112, v113, v114)
-    v131, = shared_component_33(v115, v116, v117, v118, v119, v120, v121, v122, x65, x66)
+    v131, = shared_component_34(v115, v116, v117, v118, v119, v120, v121, v122, x65, x66)
     return (v131,)
 
 
 def _selective_state_tangent_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12):
-    _, v16, v19 = shared_component_39(x3, x4, x5, x9, x12, x8, x11)
+    _, v16, v19 = shared_component_28(x3, x4, x5, x9, x12, x8, x11)
     v20 = lax.add_p.bind(x1, v16)
     v21 = lax.add_p.bind(x2, v19)
     return (v20, v21)
 
 
 def _selective_token_0(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14):
-    v17, v20 = shared_component_41(x13, x5, x6)
-    v23, v26 = shared_component_41(x13, x7, x8)
+    v17, v20 = shared_component_42(x13, x5, x6)
+    v23, v26 = shared_component_42(x13, x7, x8)
     v27 = lax.mul_p.bind(x13, x14, out_dtype=None)
     v30, v33 = shared_component_11(v17, x1, v27, x9, v20, x2, x10)
     v36, v39 = shared_component_11(v23, x3, v27, x11, v26, x4, x12)
@@ -638,7 +641,7 @@ def _ssd_chunk_pullback_0(x1, x2, x3, x4, x5, x6, x7):
     v76 = lax.iota_p.bind(
         dtype=jnp.dtype('int32'), shape=(x1.shape[0], x1.shape[0]), dimension=0, sharding=None)
     v77 = lax.eq_p.bind(v76, np.array(63, dtype=jnp.dtype('int32')))
-    v83, = shared_component_42(
+    v83, = shared_component_43(
         v69, v77, (1, x1.shape[0]), (1,), jnp.dtype('float32'), (x1.shape[0], x1.shape[0]), (0, 1), ())
     v84 = lax.add_p.bind(v75, v83)
     v85 = lax.convert_element_type_p.bind(v11, new_dtype=jnp.dtype('float32'), weak_type=False, sharding=None)
@@ -839,9 +842,9 @@ def key_memory_decay(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _key_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((64, 32), 'float32'), ((32,), 'float32'))):
-        functools.partial(shared_component_36, p1=(0,), p3=(1, 32), p4=(1,)),
+        functools.partial(shared_component_37, p1=(0,), p3=(1, 32), p4=(1,)),
     ('default', 'sm90', (((128, 64), 'float32'), ((64,), 'float32'))):
-        functools.partial(shared_component_36, p1=(0,), p3=(1, 64), p4=(1,)),
+        functools.partial(shared_component_37, p1=(0,), p3=(1, 64), p4=(1,)),
 }
 
 
@@ -931,9 +934,9 @@ def query_dropped_cotangents(*operands, policy: str = 'default', target: str = '
 
 _query_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((32, 64), 'float32'), ((32,), 'float32'))):
-        functools.partial(shared_component_36, p1=(1,), p3=(32, 1), p4=(0,)),
+        functools.partial(shared_component_37, p1=(1,), p3=(32, 1), p4=(0,)),
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'))):
-        functools.partial(shared_component_36, p1=(1,), p3=(64, 1), p4=(0,)),
+        functools.partial(shared_component_37, p1=(1,), p3=(64, 1), p4=(0,)),
 }
 
 
@@ -1011,6 +1014,19 @@ def selective_dx_scale(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_selective_dx_scale_forms, operands, policy, target, single=False)
 
 
+_selective_lifted_adjoint_forms: dict[tuple, Callable[..., tuple]] = {
+    ('default', 'sm90', (*(((128,), 'float32'),) * 8, ((), 'float32'), ((128,), 'float32'))):
+        _selective_lifted_adjoint_0,
+    ('default', 'sm90', (*(((256,), 'float32'),) * 8, ((), 'float32'), ((256,), 'float32'))):
+        _selective_lifted_adjoint_0,
+}
+
+
+def selective_lifted_adjoint(*operands, policy: str = 'default', target: str = 'sm90'):
+    """selective_lifted_adjoint's generated form for `policy` and `target` at its operands' case."""
+    return _generated.call(_selective_lifted_adjoint_forms, operands, policy, target, single=False)
+
+
 _selective_read_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (*(((64,), 'float32'),) * 34,)):
         _selective_read_0,
@@ -1054,9 +1070,9 @@ def selective_token(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _sink_state_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((1, 32, 8), 'float32'),)):
-        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
+        functools.partial(shared_component_46, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
     ('default', 'sm90', (((2, 64, 16), 'float32'),)):
-        functools.partial(shared_component_45, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
+        functools.partial(shared_component_46, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
 }
 
 
