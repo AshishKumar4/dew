@@ -1999,7 +1999,7 @@ class _Bound[Member](functools.partial[Member]):
 
 
 @dataclasses.dataclass(frozen=True)
-class Bound[Member](ABC):
+class Bound(ABC):
     """A registered member, a class or the function that builds one, bound to the arguments a run states
     (`bound`: a `functools.partial` of the member by keyword alone, which a type checker reads against
     the member's own signature), and `defaults`, every other argument the member defaults as it defaulted
@@ -2012,7 +2012,7 @@ class Bound[Member](ABC):
     settings beside, each by its field (`record`, `read`), the shape every record of it has held, so a run,
     a checkpoint or a release written before reads as written."""
 
-    bound: functools.partial[Member]
+    bound: functools.partial[Any]
     defaults: JsonRecords = dataclasses.field(default_factory=dict)
     """Each argument the member defaults and `bound` leaves out, as a record holds it, read back as that
     record (a function's `{"function": ...}`), so a run read back holds the defaults it was written with;
@@ -2124,7 +2124,7 @@ class Bound[Member](ABC):
         kept = {name: value for name, value in self.fields.items() if name not in names}
         return dataclasses.replace(self, bound=functools.partial(self.member, **kept))
 
-    def recorded(self) -> Bound[Member]:
+    def recorded(self) -> Bound:
         """This record as its kind's own class holds it, where it is a command line's subcommand
         (`record_flags`): its member, its arguments, its defaults and settings, the flags its arguments
         already hold; itself otherwise. What a run's record writes (`to_record`)."""
@@ -2160,7 +2160,7 @@ def _simple_dit() -> functools.partial[nn.Module]:
 
 
 @dataclasses.dataclass(frozen=True)
-class ModelConfig(Bound[Any]):
+class ModelConfig(Bound):
     """A model's class bound to the fields the run gives it.
 
     `bound` is the class, of `dew.registry.models` or any model by its import
