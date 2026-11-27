@@ -17,8 +17,9 @@ Receipts:
   programs, GH200 and A100): within each cell's A/A
 - reuse: docs/design/algebra.md §1.4; the reuse probe of 2026-11-05 (benchmark_step and the parallelism
   matrix: 42 to 452 of 423 to 794 divisions a suite share a divisor), each reciprocal guarded by its
-  divisor's floor and bound (row 9035). Dev-only pending the default-route SimpleDiT-B native receipt (row
-  9777; M-AL-2). Compile-only optimized HLO changes, but do not establish accuracy or speed
+  divisor's floor and bound (row 9035). Measured M-AL-2 (GH200, SimpleDiT-B step, row 9777): check 1 holds
+  and the native program changes, but device time is 1.0007 of without, inside its A/A's 1.0012; dev-only, as
+  it buys no speed
 - joined: docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it changes no shipped
   program, and the pass runs 12% slower without it (13,604 passes)
 """
