@@ -174,21 +174,26 @@ class SurrogateBodies:
                       symbolic_zeros=self.symbolic_zeros))
 
 
+_BITS = frozenset({float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128})
+"""The number types `_exact_key` reads by their bytes: these exactly, a subclass keeping its own equality."""
+
+
 def _exact_key(value) -> Hashable | None:
     """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
-    by its type and bits (`-0.0` no `0.0`, each NaN its own sign and payload), a sequence by its type and
-    parts, any other hashable value by its type and itself (its own equality: a callable by identity). None
-    where any part is unhashable, which no declared case is."""
-    if isinstance(value, (float, complex, np.floating, np.complexfloating)):
-        return type(value), np.asarray(value).tobytes()
-    if isinstance(value, (tuple, list)):
+    of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), a plain tuple by
+    its parts, any other hashable value by its type and itself (its own equality: a callable by identity, a
+    subclass by its own). None where it is unhashable, which no declared case is."""
+    kind = type(value)
+    if kind in _BITS:
+        return kind, np.asarray(value).tobytes()
+    if kind is tuple:
         parts = tuple(_exact_key(part) for part in value)
-        return None if None in parts else (type(value), parts)
+        return None if None in parts else (kind, parts)
     try:
         hash(value)
     except TypeError:
         return None
-    return type(value), value
+    return kind, value
 
 
 def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
