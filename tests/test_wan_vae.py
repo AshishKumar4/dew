@@ -33,17 +33,15 @@ from interop_support import (
     extract_fixture,
     fixture_arrays,
     posterior_of,
-    scaled_gap,
     torch_coder_walk,
 )
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.interop.autoencoders.wan import load_wan_vae
 from dew.interop.diffusion import component_tensors
 from dew.nn.autoencoders.wan import chunked_decode, chunked_moments
 
 ROOT = Path(__file__).resolve().parents[1]
-FORWARD = 1e-5
 
 
 
@@ -239,35 +237,57 @@ def test_the_autoencoder_walks_in_chunks_and_holds_one_chunk(loaded):
                                       params, latents)))
 
 
+PUBLISHED_SEEDS = 8
+"""The published VAE's declared seeds for check 1, as the published FLUX.2 VAE's (test_flux2_source.py's
+`PIPELINE_SEEDS`)."""
+
+
 @pytest.mark.network
 def test_the_published_vae_matches_the_source():
-    """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, encodes a smooth
-    nine-frame 128x192 clip and decodes its posterior mean as diffusers'
-    `AutoencoderKLWan` does."""
+    """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, over drawn smooth nine-frame 128x192 clips:
+    its posterior mean, and the decode of the source's mean, on par with diffusers' `AutoencoderKLWan` in
+    float32 from its float64 twin (check 1)."""
     import diffusers
     import torch
     from huggingface_hub import snapshot_download
 
+    from _dew_torch.precision import float64, float64_twin
+
     path = snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", allow_patterns=["vae/*"])
     t, y, x = np.mgrid[0:9, 0:128, 0:192] / np.array([4.0, 32.0, 32.0])[:, None, None, None]
-    video = np.stack([np.sin(x + y + t), np.cos(2 * x - y - 0.5 * t), np.sin(3 * y + t) * np.cos(x)])[None]
-    video = (0.8 * video + 0.05 * np.random.default_rng(0).standard_normal(video.shape)).astype(np.float32)
-    with torch.no_grad():
-        source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").eval()
-        expected_mean = source.encode(torch.from_numpy(video)).latent_dist.mean
-        expected_pixels = source.decode(expected_mean).sample.numpy()
-        expected_mean = expected_mean.numpy()
-    del source
+    smooth = 0.8 * np.stack([np.sin(x + y + t), np.cos(2 * x - y - 0.5 * t),
+                             np.sin(3 * y + t) * np.cos(x)])[None]
+
+    def draw(seed):
+        noise = np.random.default_rng([37, seed]).standard_normal(smooth.shape)
+        return ((smooth + 0.05 * noise).astype(np.float32),)
+
+    source = diffusers.AutoencoderKLWan.from_pretrained(path, subfolder="vae").eval()
+    wide = float64_twin(source)
+
+    def source_walk(model, dtype, video):
+        with torch.no_grad():
+            mean = model.encode(torch.from_numpy(video).to(dtype)).latent_dist.mean
+            return {"mean": channels_last(mean.numpy()),
+                    "pixels": channels_last(model.decode(mean).sample.numpy())}
 
     autoencoder, params, _, _ = load_wan_vae(path, jnp.float32)
     model = autoencoder.model
-    mean = model.apply({"params": params}, channels_last(video), method=model.encode)
-    pixels = model.apply({"params": params}, channels_last(expected_mean), method=model.decode)
-    gaps = {"mean": scaled_gap(mean, channels_last(expected_mean)),
-            "pixels": scaled_gap(pixels, channels_last(expected_pixels))}
-    print(f"published VAE gaps {gaps}")
-    assert mean.shape == (1, 3, 16, 24, 16)
-    assert max(gaps.values()) < FORWARD, gaps
+
+    @jax.jit
+    def walk(video):
+        mean = model.apply({"params": params}, video, method=model.encode)
+        return {"mean": mean, "pixels": model.apply({"params": params}, mean, method=model.decode)}
+
+    @as_given
+    def truth(video):
+        with float64():
+            return source_walk(wide, torch.float64, video)
+
+    assert walk(channels_last(draw(0)[0]))["mean"].shape == (1, 3, 16, 24, 16)
+    assert_as_exact(as_given(lambda video: walk(channels_last(video))),
+                    as_given(lambda video: source_walk(source, torch.float32, video)), draw,
+                    "published Wan VAE", seeds=PUBLISHED_SEEDS, truth_fn=truth)
 
 
 def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
