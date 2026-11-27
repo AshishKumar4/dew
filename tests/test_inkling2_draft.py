@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
-from speculative_support import assert_replay_drafts_as_a_prefill, block_draw
+from speculative_support import assert_replay_drafts_as_a_prefill, block_draw, greedy_walk
 
 from dew.batch import coordinates as laid_out
 from dew.interop import Pretrained
@@ -139,8 +139,10 @@ def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
     """A speculative block's verified stretch replayed into the cache saved before it and recorded into the
     Markov drafter's windows, its rows keeping four tokens and fewer, drafts its next block as a fresh
     prefill of each row's history does (row 13317; `speculative_support`)."""
+    walk = greedy_walk(source.model, source.variables)
+
     def drawn(seed):
-        return block_draw(draw(seed)['input_ids'], 20, 4, np.random.default_rng([0x1331, seed]))
+        return block_draw(walk, draw(seed)['input_ids'], 20, 4, np.random.default_rng([0x1331, seed]))
 
     assert_replay_drafts_as_a_prefill(source.model, source.variables, drawn,
                                       "Inkling 2's replayed block's draft", seeds=8)
