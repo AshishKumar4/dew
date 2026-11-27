@@ -18,10 +18,10 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, INTERPRETS, lo
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from kernel_compile import (
     compile_mosaic_kernels,
+    failing_runs,
     gate_generations,
     lowered_for,
     mosaic_failures,
-    refused_across_build_failures,
 )
 from test_attention_mosaic import (
     BACKWARD_HOOKS,
@@ -452,11 +452,14 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     failed = mosaic_failures(found)
     if failed and stored == "int8":
         record = found[0]
-        offered = [cert for cert in record.get("certifications", ()) if cert["op"] == "MosaicForward"]
-        assert "derives no config" in record.get("error", ""), "\n".join(failed)
-        assert not record.get("uncertified"), record
-        assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                               for cert in offered), "\n".join(failed)
+        # Refused as every build's GPUs refuse it, each build's run on its own judged evidence: no build's run
+        # lowers a program the gate failed.
+        for run in failing_runs(record):
+            offered = [cert for cert in run.get("certifications", ()) if cert["op"] == "MosaicForward"]
+            assert "derives no config" in run.get("error", ""), "\n".join(failed)
+            assert not run.get("uncertified") and not run.get("unjudged"), run
+            assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
+                                   for cert in offered), "\n".join(failed)
     else:
         assert not failed, "\n".join(failed)
 
@@ -686,12 +689,15 @@ def _check_backward_case(generation_name: str, width: int, accurate: bool, hooks
         return
     if mandatory:
         assert not failed, "\n".join(failed)
-    assert record.get("exhausted"), "\n".join(failed)
-    assert not record.get("uncertified"), record
-    assert offered and all(any(refused for _, _, refused in cert["kernels"].values())
-                           for cert in offered), "\n".join(failed)
-    # Every offer refused under every build its GPUs run, none taken ungated where another build holds it.
-    assert not refused_across_build_failures(record), "\n".join(refused_across_build_failures(record))
+    # Declined as every build's GPUs decline it, each build's run on its own judged evidence: each run that
+    # fails exhausted its derivation, every config it offered refused, none taken ungated where another
+    # build holds a config (row 10766).
+    for run in failing_runs(record):
+        refusals = [cert for cert in run.get("certifications", ()) if cert["op"] == type(op).__name__]
+        assert run.get("exhausted"), "\n".join(failed)
+        assert not run.get("uncertified") and not run.get("unjudged"), run
+        assert refusals and all(any(refused for _, _, refused in cert["kernels"].values())
+                                for cert in refusals), "\n".join(failed)
 
 
 @COMPILES_ON_CPU
