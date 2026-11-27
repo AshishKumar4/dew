@@ -753,6 +753,21 @@ def explicit_placement(aval: ShapedArray) -> jax.sharding.NamedSharding | None:
     return sharding if explicit else None
 
 
+def leading_row(stacked, index: tuple[int, ...]):
+    """`stacked`'s row at `index`, the indices of its leading (stacked) axes, taken where it lies: a JAX array
+    an Explicit axis splits (a stage-local store's leaf on its `stage` axis, `StageLocal`) placed as its own
+    spec past those axes, as JAX's gather of an Explicit dimension needs stated (`out_sharding`); any other
+    array, a host array or a leaf read as it is read (`quantization.PackedDecode`, `StoredRow`) among them,
+    by its own indexing."""
+    if not index:
+        return stacked
+    placed = explicit_spec(stacked) if isinstance(stacked, jax.Array) else None
+    if placed is None:
+        return stacked[index]
+    past = jax.sharding.PartitionSpec(*tuple(placed.spec)[len(index):])
+    return stacked.at[index].get(out_sharding=jax.sharding.NamedSharding(placed.mesh, past))
+
+
 def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
     """Where `x`'s type places it, over its dimensions and `trailing` more
     left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None

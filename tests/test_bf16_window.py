@@ -797,8 +797,9 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     an Explicit dimension, was refused for want of its placement)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    from dew.nn.backbones.layer_names import array_rows
+    from dew.nn.backbones.layer_names import StoredRow, array_rows
     from dew.nn.kernels.formats import NvFp4
+    from dew.nn.sharding import leading_row
 
     stacked = np.random.default_rng(4560).standard_normal((2, 256, 64)).astype(np.float32)
     bank = NvFp4.quantized(jnp.asarray(stacked))
@@ -815,18 +816,36 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     split = jax.tree.map(placed, bank)
     planes = [plane for plane in jax.tree.leaves(split) if plane.sharding.spec[:1] == ("stage",)]
     assert planes
+
     def spec(array):
         held = tuple(array.sharding.spec)
         return held + (None,) * (array.ndim - len(held))
 
     for plane in planes:
         # A row keeps the bank's placement past the stage: its last axis still split where it was.
-        assert spec(quantization._row_of(plane, (1,))) == spec(plane)[1:]
+        assert spec(leading_row(plane, (1,))) == spec(plane)[1:]
     assert any("model" in spec(plane) for plane in planes)
-    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}}})
-    for index, row in enumerate(array_rows(("params", "stages", "kernel"), tree["params"]["stages"]["kernel"],
-                                           (2,))):
-        np.testing.assert_array_equal(np.asarray(row), whole[index])
+    # A store of a packed leaf beside a dense one, both split by stage, cut into its rows as an export
+    # reads them (`array_rows`, and a banked store's `StoredRow`): each its own row (train 1422's review: a
+    # dense leaf's row was a plain gather of the Explicit dimension).
+    dense = placed(stacked)
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}},
+                                         "params": {"stages": {"bias": dense}}})
+    stages = tree["params"]["stages"]
+    for leaf, expected in ((stages["kernel"], whole), (stages["bias"], stacked)):
+        for index, row in enumerate(array_rows(("params", "stages", "kernel"), leaf, (2,))):
+            np.testing.assert_array_equal(np.asarray(row), expected[index])
+        np.testing.assert_array_equal(np.asarray(StoredRow(leaf, (1,))), expected[1])
+    # A mixed index's integer prefix picks the row before its decode: the row alone decoded and held.
+    kernel = stages["kernel"]
+    np.testing.assert_array_equal(np.asarray(kernel[1, :, :8]), whole[1, :, :8])
+    assert [np.shape(decoded) for _, _, decoded in kernel.memo] == [(256, 64)]
+    # An advanced index keeps NumPy's axes: its integers join its arrays, the index applied whole.
+    for index in ((1, slice(None), [0, 1]), (1, slice(None), True)):
+        advanced = kernel[index]
+        np.testing.assert_array_equal(np.asarray(advanced), whole[index])
+        assert np.shape(np.asarray(advanced)) == advanced.shape == np.shape(whole[index])
+    assert np.shape(whole[1, :, [0, 1]]) == (2, 256)
 
 
 WINDOW_WITHOUT_CPU = """

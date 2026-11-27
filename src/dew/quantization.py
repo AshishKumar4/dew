@@ -97,7 +97,8 @@ from dew.nn.precision import (
     twice_scaled,
     uncontracted,
 )
-from dew.nn.sharding import abstract, explicit_spec
+from dew.nn.programs import on_host
+from dew.nn.sharding import abstract, leading_row
 
 if TYPE_CHECKING:
     from qwix import QArray, QtProvider, QuantizationProvider
@@ -770,9 +771,9 @@ def deferred_packed(variables: Variables) -> Variables:
     The one traversal of every packed format (train 1349's review F4): a packed bank
     (`dew.nn.dense.packed_matrix`) decoded float32, an expert bank's `[..., experts, in, out]` (a scanned
     run's banks stacked on its layer axis before their experts) or a Linear's kernel `[..., in, out]`, each
-    value its code times its block's scale times its matrix's, exactly (`packed_values`, on the host's
-    CPU); a lossless bfloat16 window (`bf16_windows`) its kernel bitwise the one it stored, once its format
-    admits it (`Bf16Window.admitted`, as every reader of it asks)."""
+    value its code times its block's scale times its matrix's, exactly (`packed_values`, on this host,
+    `programs.on_host`); a lossless bfloat16 window (`bf16_windows`) its kernel bitwise the one it stored,
+    once its format admits it (`Bf16Window.admitted`, as every reader of it asks)."""
     from dew.nn.kernels.formats import Bf16Window, NvFp4
 
     def packed(leaf) -> bool:
@@ -790,10 +791,16 @@ def deferred_packed(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
+def _integer(index) -> bool:
+    """Whether `index` is an integer as NumPy's basic indexing reads one (a boolean is none)."""
+    return isinstance(index, int | np.integer) and not isinstance(index, bool | np.bool_)
+
+
 class PackedDecode:
-    """A packed leaf's parameter, decoded on the host's CPU (`_decoding`) as it is read (`np.asarray`, an
-    export's `dew.interop.streaming.HostArray`), its shape and dtype known before, and an index of it (a
-    layer's or an expert's row, a member's columns) a decode of it in turn: a packed bank (`NvFp4`) float32 by
+    """A packed leaf's parameter, decoded on this host (`programs.on_host`: its CPU, or its first device where
+    JAX runs no CPU) as it is read (`np.asarray`, an export's `dew.interop.streaming.HostArray`), its shape
+    and dtype known before, and an index of it (a layer's or an expert's row, a member's columns) a decode
+    of it in turn: a packed bank (`NvFp4`) float32 by
     `packed_values`, a window (`Bf16Window`) bfloat16 once its format admits it, its planes read home first
     (`dew._coordination.read_home`: a pool's export reads a leaf spanning its processes together, each
     process its whole; one on a mesh of some of the pool's processes read whole where it lives and refused
@@ -838,20 +845,25 @@ class PackedDecode:
                 for start, width in zip(starts, widths, strict=True)]
 
     def _rows(self) -> tuple[tuple[int, ...], tuple]:
-        """Its index split in two: the integers that pick a row of the leaf's leading (stacked) axes, which
-        every plane of the packed leaf shares and is sliced by before it is decoded (a layer's or an
-        expert's row: audit 2026-11-27 CC04, the whole bank no longer decoded for one row), and the rest,
-        applied to that row's decode (a member's columns)."""
+        """Its index split in two: the leading integers that pick a row of the leaf's leading (stacked)
+        axes, a mixed index's integer prefix among them (`leaf[1, :, :8]`), which every plane of the packed
+        leaf shares and is sliced by before it is decoded (a layer's or an expert's row: audit 2026-11-27
+        CC04, the whole bank no longer decoded for one row), and the rest, applied to that row's decode (a
+        member's columns)."""
         lead = len(self.leaf.shape) - 2
         rows: list[int] = []
         for at, index in enumerate(self.index):
             taken = index if isinstance(index, tuple) else (index,)
-            # A boolean (an int to Python) adds an axis, as NumPy reads it, left to the decoded value.
-            whole = all(isinstance(each, int | np.integer) and not isinstance(each, bool | np.bool_)
-                        for each in taken)
-            if not whole or len(rows) + len(taken) > lead:
+            # Only a basic index (integers, slices, None, Ellipsis) has its integer prefix peeled: an advanced
+            # one (an array, a list, a boolean, which Python counts an integer) joins its integers to its
+            # arrays, its result's axes by NumPy's own rule, so it is applied whole to the decoded value.
+            if not all(each is None or each is Ellipsis or isinstance(each, slice) or _integer(each)
+                       for each in taken):
                 return tuple(rows), self.index[at:]
-            rows.extend(int(each) for each in taken)
+            for place, each in enumerate(taken):
+                if len(rows) == lead or not _integer(each):
+                    return tuple(rows), (taken[place:], *self.index[at + 1:])
+                rows.append(int(each))
         return tuple(rows), ()
 
     def _row(self, rows: tuple[int, ...]) -> np.ndarray:
@@ -864,8 +876,8 @@ class PackedDecode:
         self.memo.clear()
         # The row sliced from each plane where it lives, then read home on this host, a pool's shards
         # read together: only that row's planes leave their devices, and only its decode is made.
-        home = jax.tree.map(lambda plane: read_home(_row_of(plane, rows)), self.leaf)
-        with _decoding():
+        home = jax.tree.map(lambda plane: read_home(leading_row(plane, rows)), self.leaf)
+        with on_host():
             decoded = np.asarray(packed_values(home) if isinstance(home, NvFp4)
                                  else home.admitted().decoded())
         self.memo[:] = [(self.leaf, rows, decoded)]
@@ -881,31 +893,6 @@ class PackedDecode:
 
     def __jax_array__(self) -> jax.Array:
         return jnp.asarray(np.asarray(self))
-
-
-def _row_of(plane, rows: tuple[int, ...]):
-    """`plane`'s row at `rows`, the indices of its leading stacked axes, sliced where the plane lies: placed
-    as the plane's own spec past those axes where an Explicit axis splits it (a stage-local store's bank on
-    its `stage` axis, `dew.training.stages.StageLocal`), whose gather JAX places only as it is told
-    (`out_sharding`; #4560's train review: the row's slice was refused)."""
-    if not rows:
-        return plane
-    placed = explicit_spec(plane) if isinstance(plane, jax.Array) else None
-    if placed is None:
-        return plane[rows]
-    past = jax.sharding.PartitionSpec(*tuple(placed.spec)[len(rows):])
-    return plane.at[rows].get(out_sharding=jax.sharding.NamedSharding(placed.mesh, past))
-
-
-def _decoding() -> contextlib.AbstractContextManager[None]:
-    """Where a packed leaf's host planes are decoded: this process's CPU, so no accelerator holds them; a
-    process whose JAX runs no CPU backend (`JAX_PLATFORMS=cuda`) its default device, the decode the same
-    integer arithmetic, exact on either (audit 2026-11-27 P03: the CPU asked for unconditionally there
-    crashed the export)."""
-    platforms = jax.config.jax_platforms
-    if platforms and "cpu" not in platforms.split(","):
-        return contextlib.nullcontext()
-    return jax.default_device(jax.local_devices(backend="cpu")[0])
 
 
 MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)

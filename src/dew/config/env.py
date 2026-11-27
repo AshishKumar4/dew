@@ -135,7 +135,7 @@ class RolloutConfig(Bound):
 
 EnvChoice = Annotated[EnvConfig, tyro.conf.arg(constructor_factory=envs.flag_choices(EnvConfig))]
 """An environment as a command line chooses it: a subcommand an alias of `envs` (`env:flight`), its
-arguments plain flags (`dew.registry.record_flags`), no record written as JSON (api03)."""
+arguments plain flags (`dew._flags.record_flags`), no record written as JSON (api03)."""
 
 RolloutChoice = Annotated[RolloutConfig,
                           tyro.conf.arg(constructor_factory=rollouts.flag_choices(RolloutConfig))]

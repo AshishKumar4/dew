@@ -118,7 +118,7 @@ def first_non_finite(state: TrainState) -> str | None:
                                   {f"inner.{name}": tree for name, tree in checked(state.inner).items()})}
     leaves = [(f"{name}{jax.tree_util.keystr(path)}", leaf) for name, tree in trees.items()
               for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
-              if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.inexact)]
+              if _inexact(leaf)]
     finite = finite_flags([leaf for _, leaf in leaves])
     return next((path for (path, _), held in zip(leaves, finite, strict=True) if not held), None)
 

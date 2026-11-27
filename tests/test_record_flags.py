@@ -1,4 +1,4 @@
-"""A registered kind's records as a command line chooses them (`dew.registry.record_flags`, api03): each
+"""A registered kind's records as a command line chooses them (`dew._flags.record_flags`, api03): each
 member a subcommand by its alias, its arguments plain flags, no record written as JSON, the records the
 flags make exactly the ones a record states."""
 
@@ -11,9 +11,10 @@ import pytest
 import tyro
 
 from dew import registry
+from dew._flags import implied_subcommand
 from dew.config.env import EnvChoice, EnvConfig, EnvRunConfig, RolloutChoice, RolloutConfig
 from dew.objectives.rl.control import ControlRollout
-from dew.registry import envs, from_record, implied_subcommand, rollouts, to_record
+from dew.registry import envs, from_record, rollouts, to_record
 
 
 @dataclasses.dataclass(frozen=True)
