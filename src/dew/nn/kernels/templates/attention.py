@@ -1752,13 +1752,13 @@ def head_width(width: int) -> int:
 
 
 def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
-    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
-    (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
-    the reference gives it, `prologued`): zeros past its queries, keys and value width, and a head vector
-    at a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
-    value = param.value
-    if widened and jnp.issubdtype(value.dtype, jnp.floating):
-        value = value.astype(jnp.float32)
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score hook (its gradient
+    returns in its own dtype, `kept_value`), in its own where not `widened` (a prologue's, which takes it as
+    the reference gives it, `prologued`; an output hook's, which `attention_algebra.finish` widens as it
+    applies the hook, so a 16-bit gate reaches a kernel at its own bytes, no convert before it: 54 us of a
+    d128 gated forward's 679, M-NA-47): zeros past its queries, keys and value width, and a head vector at
+    a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
+    value = kept_value(param.value) if widened else param.value
     match kind_of(param):
         case Kind.HEAD:
             return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
@@ -1869,7 +1869,8 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score.sides),
-                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output.sides),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv, widened=False)
+                         for param in hooks.output.sides),
                    queries, keys, table, page, spans.per_span,
                    tuple(_padded(param, padded_q, padded_k, padded_d, widened=False)
                          for param in hooks.query.sides))
@@ -1878,6 +1879,11 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
 def kept_dtype(dtype) -> str:
     """A hook parameter's dtype in the kernels: fp32 for a floating one (`padded_call`), else its own."""
     return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+def kept_value(value: jax.Array) -> jax.Array:
+    """A hook parameter's values as the kernels compute its hook on them, in `kept_dtype`."""
+    return value.astype(kept_dtype(value.dtype))
 
 
 def floating_params(params) -> list[int]:

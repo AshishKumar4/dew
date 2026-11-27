@@ -136,15 +136,19 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 
 def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, value_width: int, dtype, *,
-                        residuals: bool, plan: BlockPlan | None = None, masked: bool = False) -> int:
-    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve)."""
+                        residuals: bool, plan: BlockPlan | None = None, masked: bool = False,
+                        output: tuple | None = None) -> int:
+    """Wide (>128) inference epilogue's live registers (chunked, or whole-width finish + masked preserve),
+    an in-kernel output hook's tiles at its chunk (`output`, `(hook, kinds, dtypes)`: `_hook_tiles`) beside
+    the chunk's finish."""
     if residuals or not family.budgets_registers or family.places_on_role or value_width <= 128:
         return 0
     block = plan or BlockPlan(split=False, out_dtype=None, output_hook=False)
     ed = dtype if block.out_dtype is None else block.out_dtype
     w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
     r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
-    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)]) + 2 * r
+    hooked = _hook_tiles(block_q, w, *output) if output is not None and block.output_hook else []
+    fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)] + hooked) + 2 * r
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
 
@@ -169,7 +173,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                       runs: int = 1,
                       merged: bool = False, started: bool = False, dropped: bool = False,
                       weight_parts: int = 1, scaled_products: bool = False,
-                      block_plan: BlockPlan | None = None, masked: bool = False) -> int:
+                      block_plan: BlockPlan | None = None, masked: bool = False,
+                      output: tuple | None = None) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -276,7 +281,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     if codes:
         phases += _converted(block_k, depth, value_width)
     epilogue = _epilogue_registers(family, carried, block_q, value_width, dtype, residuals=residuals,
-                                   plan=block_plan, masked=masked)
+                                   plan=block_plan, masked=masked, output=output)
     held = _held_registers(family, block_q, params, residuals=residuals, natural=natural) + (
         _started_rows(family, block_q) if started else 0) + _runs_bounds(family, block_q, runs)
     walked = max(max(resources.live_registers(family, carried, *phases, *products), scored) + held, epilogue)
@@ -395,7 +400,7 @@ class ForwardRegisters:
     """A forward call's facts its launches' consumer registers read (`forward_registers`, `peaks_registers`):
     operand dtype, query/value widths, training split sums (`residuals`), natural logits, score hook
     parameters, fp32 parts, in-kernel scaling, quantized codes, packed positions, initial-state merge/start,
-    dropout/weight parts, query prologue, prescale flags, output dtype, and output-hook presence."""
+    dropout/weight parts, query prologue, prescale flags, output dtype, and the output hook."""
     dtype: Any
     width: int
     value_width: int
@@ -421,7 +426,9 @@ class ForwardRegisters:
     prescaled: bool = False
     rewalk_prescaled: bool = False
     out_dtype: Any = None
-    has_output_mod: bool = False
+    output: tuple | None = None
+    """The output hook its consumers apply as they finish (`MosaicForward.output_mod`), with its parameters'
+    kinds and dtypes, `(hook, kinds, dtypes)`; None where it has none."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None, masked: bool = False) -> int | None:
@@ -445,7 +452,7 @@ class ForwardRegisters:
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
-                                  has_output_mod=self.has_output_mod, training=self.residuals)
+                                  has_output_mod=self.output is not None, training=self.residuals)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
@@ -453,7 +460,7 @@ class ForwardRegisters:
             positions=self.positions, per_span=self.per_span, runs=self.runs, merged=self.merged,
             started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
-            scaled_products=self.scaled_products, block_plan=plan, masked=masked))
+            scaled_products=self.scaled_products, block_plan=plan, masked=masked, output=self.output))
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,
@@ -464,15 +471,24 @@ def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, h
     once, its program's order being ptxas's (a light prologue's live tiles alone priced the 4B call's
     inference forward's natural rewalk within a B200 consumer's 240 registers, which spilled 48 bytes,
     et-a6-h; Qwen3's QK-norm and RoPE at 64 x 256 held more at every config, et-a6-d)."""
+    tiles = _hook_tiles(block_q, width, hook, kinds, dtypes, tile=jnp.dtype(dtype),
+                        extra=(jax.ShapeDtypeStruct((block_q, 1), jnp.int32),))
+    return resources.live_registers(family, [], tiles)
+
+
+def _hook_tiles(block_q: int, width: int, hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
+                tile=jnp.float32, extra: tuple = ()) -> list[tuple]:
+    """Every `[block_q, width]` tile a hook's traced program makes at a tile of `block_q` rows `width` wide
+    in `tile` (an output hook's at its epilogue's chunk, fp32: `attention_algebra.finish`; a query
+    prologue's at its query tile), its `extra` operands after it and its parameters' tiles (a head's a
+    scalar) in their `dtypes` after those, the tile it reads and its parameters' among them."""
     params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else (block_q, width), kept)
               for kind, kept in zip(kinds, dtypes, strict=True)]
-    closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct((block_q, width), dtype),
-                                  jax.ShapeDtypeStruct((block_q, 1), jnp.int32), *params)
+    closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct((block_q, width), tile), *extra, *params)
     values = [var.aval for var in (*closed.jaxpr.invars,
                                    *(var for equation in closed.jaxpr.eqns for var in equation.outvars))]
-    tiles = [(aval.shape[0], aval.shape[1], aval.dtype) for aval in values
-             if isinstance(aval, ShapedArray) and len(aval.shape) == 2 and aval.shape[0] == block_q]
-    return resources.live_registers(family, [], tiles)
+    return [(aval.shape[0], aval.shape[1], aval.dtype) for aval in values
+            if isinstance(aval, ShapedArray) and len(aval.shape) == 2 and aval.shape[0] == block_q]
 
 
 DQ_ROWS = 7

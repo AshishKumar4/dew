@@ -1127,10 +1127,12 @@ def held_params(family: mosaic.Family, refs: tuple, kinds: tuple, row, head, fir
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
-           keys_first: bool = False, held=None, slot=None, at: tuple = (0, 0), origins=None):
+           keys_first: bool = False, held=None, slot=None, at: tuple = (0, 0), origins=None,
+           column: int | None = None):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
     tile's), as `kind` lays them out: the head's scalar, else the tile's entries (a score tile's `[bq, bk]`,
-    an output tile's `[bq, Dv]`) in the accumulator's layout, its queries' and keys' broadcast. A score hook
+    an output tile's `[bq, Dv]`, or its block of `like`'s columns from `column`, an epilogue's chunk) in the
+    accumulator's layout, its queries' and keys' broadcast. A score hook
     reads them and its coordinates as the tile's entries, where the reference and the other mainloops give a
     query's and a key's as `[bq, 1]` and `[1, bk]`: Mosaic GPU's layouts hold no singleton axis an elementwise
     operation takes (jax 0.11.2's layout inference finds none for a `[64, 1]` or `[1, 64]` array's convert or
@@ -1163,6 +1165,8 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     # copy's keys before its queries.
     laid = kind[:2] + kind[2:][::-1] if keys_first and kind is Kind.TILE else kind
     places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "keys": pl.ds(k_first, keys)}
+    if column is not None:
+        places["width"] = pl.ds(column, like.shape[-1])
     block = ref.at[axes.placed(laid, places)]
     if kind in (Kind.TILE, Kind.OUTPUT):
         return family.tile_of(block)
@@ -1914,7 +1918,7 @@ class BlockPlan(NamedTuple):
 
     def epilogue_chunk(self, family: mosaic.Family, value_width: int, dtype, *,
                        training: bool = False, masked: bool = False, kept: bool | None = None) -> int:
-        if (training or self.output_hook or masked or not family.budgets_registers
+        if (training or masked or not family.budgets_registers
                 or (family.places_on_role if kept is None else kept) or value_width <= 128):
             return 0
         ed = dtype if self.out_dtype is None else self.out_dtype

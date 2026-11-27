@@ -58,6 +58,7 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     head_width,
     kept,
+    kept_value,
     kind_of,
     kinds_of,
     output_hooked,
@@ -643,9 +644,10 @@ def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles
 
 def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
     """The normalized output `out` `[B, H, Qp, Dv]` fp32 under the output hook in XLA, its parameters as the
-    launches read them (`hooked`, padded to the call's blocks; `template.output_hooked`)."""
-    params = tuple(Side(array, param.axes) for array, param in zip(hooked.output, hooks.output.sides,
-                                                                     strict=True))
+    launches compute it on them (`hooked`, padded to the call's blocks, `kept_value`;
+    `template.output_hooked`)."""
+    params = tuple(Side(kept_value(array), param.axes)
+                   for array, param in zip(hooked.output, hooks.output.sides, strict=True))
     return output_hooked(out, hooks.output.fn, params)
 
 
@@ -1572,8 +1574,12 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         # its rows' are: formed before the walk, its query block's base was held across it (a B200's scaled
         # fp32 walk at 64 x 64, two consumers, spilled 12 bytes).
         out_view = stored().out
-        out_params = tuple(_param(family, ref, kind_of(param), row, head, first, state.acc)
-                           for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
+
+        def out_params(like, column=None):
+            # The output hook's parameters at the output tile `like`, its block of columns from `column`.
+            return tuple(_param(family, ref, kind_of(param), row, head, first, like, column=column)
+                         for ref, param in zip(hooked.output, hooks.output.sides, strict=True))
+
         if isinstance(state.acc, mosaic.Kept):
             # Sums its issuer keeps past the walk (`Issuer.accumulated`'s `mosaic.Kept`: a plain walk's, its
             # hooks refused and its rows all its own, `MosaicForward._placed_refusal`): the walk's ratio, as
@@ -1594,7 +1600,11 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         elif (chunk := BlockPlan(split=False, out_dtype=out_view.dtype,
                                  output_hook=hooks.output.fn is not None).epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
-            # so `state.acc` and `output` fit without spilling (rows 5272, 10864).
+            # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, pointwise
+            # in its entries (`Hooks.output`), on each chunk with its parameters' block of the chunk's
+            # columns (a d256 gated forward held whole in one launch, where its whole-width finish split it
+            # into two launches of 128 columns, each walking every key: 1.51x unhooked and XLA's gate,
+            # M-NA-47).
             width = state.acc.shape[-1]
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
             def write_chunks(smem):
@@ -1602,6 +1612,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                     sl = pl.ds(col, chunk)
                     piece = state._replace(acc=state.acc[:, col:col + chunk])
                     out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
+                                               output_mod=hooks.output.fn,
+                                               output_params=out_params(piece.acc, col),
                                                held=program.parts > 1)[0]
                     if smem is None:
                         out_view[:, sl] = out_chunk.astype(out_view.dtype)
@@ -1616,7 +1628,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
         else:
             output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                           output_mod=hooks.output.fn,
-                                                          output_params=out_params,
+                                                          output_params=out_params(state.acc),
                                                           held=program.parts > 1)
             out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                                   smem=stage))

@@ -51,6 +51,7 @@ from dew.nn.kernels.templates.attention import (
     dropped_reach,
     drops_in_place,
     kept,
+    kept_value,
     narrowing_settled,
     saturated,
     within,
@@ -1936,7 +1937,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
                        held=jnp.float32 if held else spec.largest)
         out = settled_store(spec, out, state.acc, state.total, hooked=output_mod is not None)
     if output_mod is not None:
-        out = output_mod(out, *output_params)
+        out = output_mod(out, *map(kept_value, output_params))
     return out, m, denominator
 
 
