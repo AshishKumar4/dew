@@ -626,14 +626,16 @@ def scaled_operands(query: jax.Array, key: jax.Array, *, wide_logits: bool = Fal
     return query * jnp.asarray(query_scale, dtype), key
 
 
-def unscaled_scores(subscripts: str, query: jax.Array, key: jax.Array, *, precision,
+def unscaled_scores(subscripts: str, query: jax.Array, key: jax.Array, *, precision, dtype,
                     scale_logits: bool = False) -> jax.Array:
-    """The reference path's product of `scaled_operands`' query and key (`reference_attention`): at the
-    scores' precision (`Products`), its sums in the logits' dtype; under `scale_logits` jax.nn's fp32 sums
-    at the dot algorithm it names for 16-bit operands (`_jax_nn_algorithm`), never rounded to their dtype."""
+    """The reference path's product of `scaled_operands`' query and key (`reference_attention`), `dtype`
+    the call's operands' own before `scaled_operands` widened any: at the scores' precision (`Products`),
+    its sums in the logits' dtype; under `scale_logits` jax.nn's fp32 sums at the dot algorithm it names for
+    `dtype`'s 16-bit operands (`_jax_nn_algorithm`, read off `dtype`, never the widened operands': a bf16
+    call's preset kept under wide logits too), never rounded to their dtype."""
     products = precision if isinstance(precision, Products) else Products(precision, precision)
-    formed = at_least_fp32(query.dtype) if scale_logits else products.logits
-    algorithm = _jax_nn_algorithm(query.dtype, products.scores) if scale_logits else None
+    formed = at_least_fp32(dtype) if scale_logits else products.logits
+    algorithm = _jax_nn_algorithm(dtype, products.scores) if scale_logits else None
     if algorithm is None:
         return float32_einsum(subscripts, query, key, precision=products.scores,
                               preferred_element_type=formed)
@@ -654,8 +656,10 @@ def reference_scores(query: jax.Array, key: jax.Array, subscripts: str, *, preci
     """The reference path's logits of `query` and `key` (`reference_attention`), formed as it forms them,
     operand scaling, product and scale after: a computation that trains toward the attention's own weights
     reads its logits here (MSA's teacher, `block_sparse.msa_query_kls`)."""
+    dtype = query.dtype
     query, key = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits)
-    logits = unscaled_scores(subscripts, query, key, precision=precision, scale_logits=scale_logits)
+    logits = unscaled_scores(subscripts, query, key, precision=precision, dtype=dtype,
+                             scale_logits=scale_logits)
     return scaled_after(logits, query.shape[-1], wide_logits=wide_logits, scale_logits=scale_logits)
 
 
@@ -725,7 +729,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         return _grouped_as_jax_nn(attend, query, key, value, mask, bias)
     scaled_query, scoring = scaled_operands(query, key, wide_logits=wide_logits, scale_logits=scale_logits,
                                             query_scale=query_scale)
-    logits_of = functools.partial(unscaled_scores, precision=products, scale_logits=scale_logits)
+    logits_of = functools.partial(unscaled_scores, precision=products, dtype=dtype, scale_logits=scale_logits)
 
     if skipped is not None:
         value, logits = _skipped_logits(logits_of, scaled_query, scoring, value, skipped)

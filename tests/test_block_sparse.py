@@ -23,9 +23,11 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
-from dew.nn.attention import reference_scores, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
+from dew.nn.kernels.generation import run_precision
 from dew.nn.mla import SELECTIONS, indexer_target
+from dew.nn.precision import ACCURATE
 from dew.registry import mixers
 
 SEEDS = 8
@@ -519,36 +521,47 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
     assert int(picks[0, 0, -1, 0]) in (2, 3)
 
 
-@pytest.mark.parametrize(("dtype", "precision", "wide_logits", "ambient"), [
-    (jnp.bfloat16, "BF16_BF16_F32", False, None),
-    (jnp.float32, "highest", False, "BF16_BF16_F32"),
-    (jnp.float32, "BF16_BF16_F32", True, None),
-], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "wide-logits"])
-def test_msas_teacher_is_the_weights_its_attention_gives(dtype, precision, wide_logits, ambient):
-    """MSA's teacher (`msa_query_kls` with the mixer's `msa_scores`) over two keys against a uniform student:
-    its KL the float64 KL of the softmax of the logits MSA's attention forms (`attention.reference_scores`,
-    the reference path's own operand scaling, product and scale after, which `reference_attention`
-    composes) at the layer's dtype, precision and logit width: a query `[1, 0]` and keys `[0, 0]` and
-    `[1, 0]` at width 2, whose scaled query a narrowing preset rounds to bf16 (0.70703125), the attention's
-    and so the teacher's; and keys 4096 and 4097 at a layer's `highest` under an ambient bf16 preset (row
-    13706): the teacher's logits never another order or precision than the attention's (train 1359's
-    F1). Read through the attention's output, its weights would round to its dtype first."""
+@pytest.mark.parametrize(("dtype", "precision", "numerics", "keys", "scaled"), [
+    (jnp.bfloat16, "BF16_BF16_F32", None, (0.0, 1.0), float(
+        np.asarray(1.0, jnp.bfloat16) / np.asarray(np.sqrt(2.0), jnp.bfloat16))),
+    (jnp.float32, "highest", "BF16_BF16_F32", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
+    (jnp.float32, "BF16_BF16_F32", "accurate", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
+], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "accurate-run-over-a-layers-bf16-preset"])
+def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precision, numerics, keys, scaled):
+    """An MSA layer's sown indexer loss (`BlockSparseSelfAttention._msa`, `INDEXER_COLLECTION` open) over a
+    query `[1, 0]` and two keys at width 2, blocks of one key, both selected: the float64 KL from its index
+    branch's softmax (its sown scores) to the softmax of the logits its attention forms, written out here
+    (the query scaled by 1/sqrt(2) first in its dtype, its product with each key): at a bf16 preset the
+    scaled query bf16's 1/sqrt(2), 0.70703125; at a layer's `highest` under an ambient bf16 preset (row
+    13706), and under the run's accurate numerics over a layer's bf16 preset, fp32's, so keys of 4096 and
+    4097 stay a logit apart (train 1359's F1). A dropped handoff of the layer's precision or order to its
+    teacher moves its KL."""
+    from types import SimpleNamespace
+
+    from dew.nn.mixer_base import MixerContext
+
+    context = MixerContext(emb_features=4, num_heads=1, num_kv_heads=1, head_dim=2, max_seq_len=2,
+                           qk_norm=False, dtype=dtype, precision=precision)
+    layer = mixers.build("block_sparse_attention", selection="msa", block=1, top_k=2, index_width=4).build(
+        context)()
     query = jnp.asarray([[[[1.0, 0.0]]] * 2], dtype)
-    key = jnp.asarray([[[[0.0, 0.0]], [[1.0, 0.0]]]], dtype)
-    if ambient is not None:
-        key = jnp.asarray([[[[4096.0, 0.0]], [[4097.0, 0.0]]]], dtype)
-    selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
-    uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
-    teacher = block_sparse.msa_scores(dtype, precision, wide_logits=wide_logits)
-    with jax.default_matmul_precision(ambient) if ambient is not None else contextlib.nullcontext():
-        found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2,
-                                                      scale=2 ** -0.5, teacher=teacher))[0, 1]
-        logits = reference_scores(query[:, :, 0], key[:, :, 0], 'bsd,btd->bst', precision=precision,
-                                  wide_logits=wide_logits)
-    row = np.asarray(logits, np.float64)[0, 1]
-    attended = np.exp(row - row.max()) / np.exp(row - row.max()).sum()
-    expected = float(np.sum(attended * np.log(attended)) + np.log(2.0))
-    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0) + 2 * np.finfo(np.float32).eps, 6)
+    key = jnp.asarray([[[[keys[0], 0.0]], [[keys[1], 0.0]]]], dtype)
+    hidden = jax.random.normal(jax.random.key(0), (1, 2, 4), jnp.float32).astype(dtype)
+    masking = SimpleNamespace(documents=None, valid=None)
+    arguments = (query, key, key, masking, None, hidden)
+    params = layer.init(jax.random.key(1), *arguments, method="_msa")
+    ambient = (jax.default_matmul_precision(numerics) if numerics not in (None, "accurate")
+               else run_precision(ACCURATE) if numerics == "accurate" else contextlib.nullcontext())
+    with ambient:
+        _, sown = layer.apply(params, *arguments, method="_msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
+    found = float(np.asarray(jax.tree.leaves(sown[INDEXER_COLLECTION])[0])[0, 1])
+    student = np.asarray(next(leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown[SELECTIONS])[0]
+                              if "scores" in jax.tree_util.keystr(path)), np.float64)[0, 0, 1]
+    student = np.exp(student - student.max()) / np.exp(student - student.max()).sum()
+    logits = np.asarray([keys[0] * scaled, keys[1] * scaled], np.float64)
+    teacher = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    expected = float(np.sum(teacher * (np.log(teacher) - np.log(student))))
+    assert_fp32_reduction_bound(found, expected, float(np.sum(np.abs(teacher * np.log(student)))) + 1.0, 8)
 
 
 def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
