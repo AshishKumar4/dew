@@ -339,7 +339,8 @@ def reading_saved() -> Iterator[None]:
         _SAVED.reset(token)
 
 
-def saved_fields[V](member: object, fields: Mapping[str, V], accepted: Collection[str]) -> Mapping[str, V]:
+def saved_fields[V](member: type | Callable[..., object], fields: Mapping[str, V],
+                    accepted: Collection[str]) -> Mapping[str, V]:
     """`fields`, a record of `member` (a class, or a function a record names), read as a saved record is
     (`reading_saved`), without the fields `member` or a base lost since (`DECODED_REMOVED`, by each class's
     import path in `member`'s order of resolution) that its reader does not accept (`accepted`, the names the
@@ -347,7 +348,7 @@ def saved_fields[V](member: object, fields: Mapping[str, V], accepted: Collectio
     record's reading, or where it holds none."""
     if not _SAVED.get():
         return fields
-    kinds = getattr(member, "__mro__", (member,))
+    kinds = member.__mro__ if isinstance(member, type) else (member,)
     removed = frozenset().union(*(DECODED_REMOVED.get(f"{kind.__module__}:{kind.__qualname__}", frozenset())
                                   for kind in kinds)) - frozenset(accepted)
     if removed.isdisjoint(fields):

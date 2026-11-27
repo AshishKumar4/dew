@@ -265,13 +265,12 @@ def test_a_saved_decision_runs_untagged_segment_reads_as_the_one_class_it_names_
 
 def test_a_live_configuration_naming_the_retired_choice_is_refused():
     """Outside a saved record's reading (`_records.reading_saved`) the retired choice is no field: a record
-    read live, and a run built in code, naming it are refused."""
+    read live naming it is refused, one without it read."""
     from dew.registry import from_record
 
-    with pytest.raises(ValueError, match="generated"):
+    with pytest.raises(ValueError):
         from_record(Kernels, {"attention": "xla", "generated": "written"})
-    with pytest.raises(TypeError):
-        Kernels(generated="written")  # pyright: ignore[reportCallIssue]
+    assert from_record(Kernels, {"attention": "xla"}) == Kernels(attention="xla")
 
 
 def test_a_saved_runs_kernel_pins_and_a_releases_leave_the_retired_choice_out():

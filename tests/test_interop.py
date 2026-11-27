@@ -458,6 +458,7 @@ def test_a_release_pinning_a_retired_kernel_choice_loads_and_generates(tmp_path)
     from test_inference import make_lm_run
 
     from dew.config.release import RELEASE_FILE
+    from dew.inference.tasks import TextGeneration
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
@@ -471,7 +472,7 @@ def test_a_release_pinning_a_retired_kernel_choice_loads_and_generates(tmp_path)
     reloaded = Pretrained.load(destination, dtype="float32")
     assert reloaded.kernels == (("attention", "reference"),)
     task = reloaded.formed(reloaded.pipeline())
-    assert task.kernels == (("attention", "reference"),)
+    assert isinstance(task, TextGeneration) and task.kernels == (("attention", "reference"),)
     task(jnp.asarray([[3, 4, 5]], jnp.int32), 2, key=7)
 
 
