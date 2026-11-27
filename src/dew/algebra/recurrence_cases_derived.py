@@ -511,7 +511,7 @@ def _ssd_chunk_pullback_0(x1, x2, x3, x4, x5, x6, x7):
     return (v50, v55, v60, v102, v66)
 
 
-_chunk_carry_forms = _generated.Forms(False, {
+_chunk_carry_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 32), 'float32'), *(((16, 32), 'float32'),) * 3, ((32, 1), 'float32'))):
         _chunk_carry_0,
     ('default', 'sm90', (
@@ -526,7 +526,7 @@ def chunk_carry(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_carry_forms, operands, policy, target)
 
 
-_chunk_inverse_pullback_forms = _generated.Forms(True, {
+_chunk_inverse_pullback_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 16), 'float32'),) * 2,)):
         _chunk_inverse_pullback_0,
     ('default', 'sm90', (*(((32, 32), 'float32'),) * 2,)):
@@ -541,7 +541,7 @@ def chunk_inverse_pullback(*operands, policy: str = 'default', target: str = 'sm
     return _generated.call(_chunk_inverse_pullback_forms, operands, policy, target)
 
 
-_chunk_pullback_forms = _generated.Forms(False, {
+_chunk_pullback_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 32), 'float32'), *(((16, 32), 'float32'),) * 5, ((32, 1), 'float32'))):
         _chunk_pullback_0,
     ('default', 'sm90', (
@@ -556,7 +556,7 @@ def chunk_pullback(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_pullback_forms, operands, policy, target)
 
 
-_chunk_solve_level_forms = _generated.Forms(True, {
+_chunk_solve_level_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 16), 'float32'),) * 2, ((), 'int32'))):
         _chunk_solve_level_0,
     ('default', 'sm90', (*(((32, 32), 'float32'),) * 2, ((), 'int32'))):
@@ -571,7 +571,7 @@ def chunk_solve_level(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_solve_level_forms, operands, policy, target)
 
 
-_chunk_weighted_forms = _generated.Forms(True, {
+_chunk_weighted_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 16), 'float32'), ((16, 32), 'float32'), ((16,), 'float32'))):
         _chunk_weighted_0,
     ('default', 'sm90', (*(((32, 32), 'float32'),) * 2, ((32,), 'float32'))):
@@ -586,7 +586,7 @@ def chunk_weighted(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_chunk_weighted_forms, operands, policy, target)
 
 
-_gdn_value_pullback_forms = _generated.Forms(False, {
+_gdn_value_pullback_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((64, 16), 'float32'),) * 2, ((64,), 'float32'))):
         _gdn_value_pullback_0,
     ('default', 'sm90', (*(((32, 64), 'float32'),) * 2, ((32,), 'float32'))):
@@ -601,7 +601,7 @@ def gdn_value_pullback(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_gdn_value_pullback_forms, operands, policy, target)
 
 
-_kda_strict_band_forms = _generated.Forms(True, {
+_kda_strict_band_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 16), 'float32'),)):
         _kda_strict_band_0,
     ('default', 'sm90', (((64, 16), 'float32'),)):
@@ -614,7 +614,7 @@ def kda_strict_band(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_kda_strict_band_forms, operands, policy, target)
 
 
-_key_memory_decay_forms = _generated.Forms(True, {
+_key_memory_decay_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((64, 64), 'float32'),) * 2,)):
         _key_memory_decay_0,
     ('default', 'sm90', (((128, 64), 'bfloat16'), ((128, 64), 'float32'))):
@@ -627,7 +627,7 @@ def key_memory_decay(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_key_memory_decay_forms, operands, policy, target)
 
 
-_prefix_difference_forms = _generated.Forms(True, {
+_prefix_difference_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((32,), 'float32'),) * 2, *(((64,), 'float32'),) * 2)):
         _prefix_difference_0,
 })
@@ -638,7 +638,7 @@ def prefix_difference(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_prefix_difference_forms, operands, policy, target)
 
 
-_scores_forms = _generated.Forms(True, {
+_scores_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 16), 'float32'),) * 2, ((16,), 'float32'))):
         _scores_0,
     ('default', 'sm90', (*(((32, 32), 'float32'),) * 2, ((32,), 'float32'))):
@@ -653,7 +653,7 @@ def scores(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_scores_forms, operands, policy, target)
 
 
-_selective_adjoint_forms = _generated.Forms(False, {
+_selective_adjoint_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((128,), 'float32'),) * 8, ((), 'float32'))):
         _selective_adjoint_0,
     ('default', 'sm90', (*(((256,), 'float32'),) * 8, ((), 'float32'))):
@@ -666,7 +666,7 @@ def selective_adjoint(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_selective_adjoint_forms, operands, policy, target)
 
 
-_selective_decay_forms = _generated.Forms(True, {
+_selective_decay_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((128,), 'float32'),) * 2,)):
         _selective_decay_0,
     ('default', 'sm90', (*(((128,), 'float32'),) * 2, ((), 'float32'))):
@@ -681,7 +681,7 @@ def selective_decay(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_selective_decay_forms, operands, policy, target)
 
 
-_selective_dx_scale_forms = _generated.Forms(False, {
+_selective_dx_scale_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((), 'float32'), *(((64,), 'float32'),) * 2)):
         _selective_dx_scale_0,
     ('default', 'sm90', (((), 'float32'), *(((128,), 'float32'),) * 2)):
@@ -694,7 +694,7 @@ def selective_dx_scale(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_selective_dx_scale_forms, operands, policy, target)
 
 
-_selective_lifted_adjoint_forms = _generated.Forms(False, {
+_selective_lifted_adjoint_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((128,), 'float32'),) * 8, ((), 'float32'), ((128,), 'float32'))):
         _selective_lifted_adjoint_0,
     ('default', 'sm90', (*(((256,), 'float32'),) * 8, ((), 'float32'), ((256,), 'float32'))):
@@ -707,7 +707,7 @@ def selective_lifted_adjoint(*operands, policy: str = 'default', target: str = '
     return _generated.call(_selective_lifted_adjoint_forms, operands, policy, target)
 
 
-_selective_read_forms = _generated.Forms(True, {
+_selective_read_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((64,), 'float32'),) * 16, *(((), 'float32'),) * 16, *(((64,), 'float32'),) * 2)):
         _selective_read_0,
     ('default', 'sm90', (
@@ -721,7 +721,7 @@ def selective_read(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_selective_read_forms, operands, policy, target)
 
 
-_selective_state_tangent_forms = _generated.Forms(False, {
+_selective_state_tangent_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((64,), 'float32'),) * 10, ((), 'float32'), ((64,), 'float32'))):
         _selective_state_tangent_0,
     ('default', 'sm90', (*(((128,), 'float32'),) * 10, ((), 'float32'), ((128,), 'float32'))):
@@ -734,7 +734,7 @@ def selective_state_tangent(*operands, policy: str = 'default', target: str = 's
     return _generated.call(_selective_state_tangent_forms, operands, policy, target)
 
 
-_selective_token_forms = _generated.Forms(False, {
+_selective_token_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((64,), 'float32'),) * 8, *(((), 'float32'),) * 4, *(((64,), 'float32'),) * 2)):
         _selective_token_0,
     ('default', 'sm90', (
@@ -749,7 +749,7 @@ def selective_token(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_selective_token_forms, operands, policy, target)
 
 
-_skipped_back_forms = _generated.Forms(False, {
+_skipped_back_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((64, 16), 'float32'),) * 2, ((), 'float32'))):
         _skipped_back_0,
     ('default', 'sm90', (*(((64, 64), 'float32'),) * 2, ((), 'float32'))):
@@ -768,7 +768,7 @@ def skipped_back(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_skipped_back_forms, operands, policy, target)
 
 
-_ssd_chunk_forward_forms = _generated.Forms(False, {
+_ssd_chunk_forward_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (*(((64, 32), 'float32'),) * 3, ((64,), 'float32'), ((32, 32), 'float32'))):
         _ssd_chunk_forward_0,
     ('default', 'sm90', (
@@ -782,7 +782,7 @@ def ssd_chunk_forward(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_ssd_chunk_forward_forms, operands, policy, target)
 
 
-_ssd_chunk_pullback_forms = _generated.Forms(False, {
+_ssd_chunk_pullback_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (
         *(((64, 32), 'float32'),) * 3, ((64,), 'float32'), ((32, 32), 'float32'), ((64, 32), 'float32'),
         ((32, 32), 'float32'))):

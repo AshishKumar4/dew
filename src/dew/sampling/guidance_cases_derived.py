@@ -73,7 +73,7 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     return (v33,)
 
 
-_guided_forms = _generated.Forms(True, {
+_guided_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'))):
         _guided_0,
     ('default', 'sm90', (*(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'))):
@@ -86,7 +86,7 @@ def guided(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_guided_forms, operands, policy, target)
 
 
-_guided_tangent_forms = _generated.Forms(True, {
+_guided_tangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (
         *(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'), *(((16, 64), 'float32'),) * 2,
         ((16, 1), 'float32'), ((16, 64), 'float32'))):

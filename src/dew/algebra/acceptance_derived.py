@@ -46,7 +46,7 @@ def _normalized_values_product_0(x1, x2, x3):
     return (v6,)
 
 
-_lse_folded_probabilities_forms = _generated.Forms(True, {
+_lse_folded_probabilities_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((64, 256), 'float32'),) * 3,)):
         _lse_folded_probabilities_0,
     ('accurate', 'sm90', (*(((64, 256), 'float32'),) * 3,)):
@@ -59,7 +59,7 @@ def lse_folded_probabilities(*operands, policy: str = 'default', target: str = '
     return _generated.call(_lse_folded_probabilities_forms, operands, policy, target)
 
 
-_normalized_values_product_forms = _generated.Forms(True, {
+_normalized_values_product_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):
         _normalized_values_product_0,
     ('accurate', 'sm90', (((256, 256), 'float32'), ((256,), 'float32'), ((256, 64), 'float32'))):

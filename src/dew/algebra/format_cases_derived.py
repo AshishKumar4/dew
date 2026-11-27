@@ -248,7 +248,7 @@ def _rounded_tangent_0(x1, x2, x3):
     return (x2,)
 
 
-_decode_e4m3_forms = _generated.Forms(True, {
+_decode_e4m3_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _decode_e4m3_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
@@ -261,7 +261,7 @@ def decode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_decode_e4m3_forms, operands, policy, target)
 
 
-_decode_e5m2_forms = _generated.Forms(True, {
+_decode_e5m2_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _decode_e5m2_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
@@ -274,7 +274,7 @@ def decode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_decode_e5m2_forms, operands, policy, target)
 
 
-_e8m0_decode_forms = _generated.Forms(True, {
+_e8m0_decode_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _e8m0_decode_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
@@ -287,7 +287,7 @@ def e8m0_decode(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_e8m0_decode_forms, operands, policy, target)
 
 
-_e8m0_exponents_forms = _generated.Forms(False, {
+_e8m0_exponents_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _e8m0_exponents_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
@@ -300,7 +300,7 @@ def e8m0_exponents(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_e8m0_exponents_forms, operands, policy, target)
 
 
-_encode_e2m1_forms = _generated.Forms(True, {
+_encode_e2m1_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -319,7 +319,7 @@ def encode_e2m1(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_encode_e2m1_forms, operands, policy, target)
 
 
-_encode_e4m3_forms = _generated.Forms(True, {
+_encode_e4m3_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -338,7 +338,7 @@ def encode_e4m3(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_encode_e4m3_forms, operands, policy, target)
 
 
-_encode_e5m2_forms = _generated.Forms(True, {
+_encode_e5m2_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
@@ -357,7 +357,7 @@ def encode_e5m2(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_encode_e5m2_forms, operands, policy, target)
 
 
-_fp8_epilogue_forms = _generated.Forms(False, {
+_fp8_epilogue_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 128), 'float32'),)):
         _fp8_epilogue_0,
     ('default', 'sm90', (((64, 256), 'float32'),)):
@@ -370,7 +370,7 @@ def fp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_fp8_epilogue_forms, operands, policy, target)
 
 
-_gemm_partial_scale_forms = _generated.Forms(True, {
+_gemm_partial_scale_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 128), 'float32'), ((32,), 'float32'), ((128,), 'float32'))):
         _gemm_partial_scale_0,
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'), ((128,), 'float32'))):
@@ -383,7 +383,7 @@ def gemm_partial_scale(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_gemm_partial_scale_forms, operands, policy, target)
 
 
-_mxfp8_block_decode_forms = _generated.Forms(True, {
+_mxfp8_block_decode_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
         _mxfp8_block_decode_0,
     ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
@@ -396,7 +396,7 @@ def mxfp8_block_decode(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_mxfp8_block_decode_forms, operands, policy, target)
 
 
-_mxfp8_block_decode_bf16_forms = _generated.Forms(True, {
+_mxfp8_block_decode_bf16_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 256), 'uint8'), ((32, 8), 'uint8'))):
         _mxfp8_block_decode_bf16_0,
     ('default', 'sm90', (((64, 128), 'uint8'), ((64, 4), 'uint8'))):
@@ -409,7 +409,7 @@ def mxfp8_block_decode_bf16(*operands, policy: str = 'default', target: str = 's
     return _generated.call(_mxfp8_block_decode_bf16_forms, operands, policy, target)
 
 
-_mxfp8_epilogue_forms = _generated.Forms(False, {
+_mxfp8_epilogue_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 128), 'float32'),)):
         functools.partial(
         shared_component_23, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
@@ -430,7 +430,7 @@ def mxfp8_epilogue(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_mxfp8_epilogue_forms, operands, policy, target)
 
 
-_mxfp8_scale_forms = _generated.Forms(False, {
+_mxfp8_scale_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 8), 'uint32'),)):
         _mxfp8_scale_0,
     ('default', 'sm90', (((64, 8), 'uint32'),)):
@@ -443,7 +443,7 @@ def mxfp8_scale(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_mxfp8_scale_forms, operands, policy, target)
 
 
-_nvfp4_block_decode_forms = _generated.Forms(True, {
+_nvfp4_block_decode_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((64, 64), 'uint32'), ((4, 64), 'uint8'))):
         functools.partial(
         shared_component_30, p1=(1, 0), p2=(64, 8, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
@@ -465,7 +465,7 @@ def nvfp4_block_decode(*operands, policy: str = 'default', target: str = 'sm90')
     return _generated.call(_nvfp4_block_decode_forms, operands, policy, target)
 
 
-_nvfp4_payload_forms = _generated.Forms(True, {
+_nvfp4_payload_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'uint32'),)):
         functools.partial(
         shared_component_46, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
@@ -484,7 +484,7 @@ def nvfp4_payload(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_nvfp4_payload_forms, operands, policy, target)
 
 
-_nvfp4_scale_forms = _generated.Forms(True, {
+_nvfp4_scale_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 8), 'uint8'),)):
         _nvfp4_scale_0,
     ('default', 'sm90', (((64, 8), 'uint8'),)):
@@ -497,7 +497,7 @@ def nvfp4_scale(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_nvfp4_scale_forms, operands, policy, target)
 
 
-_quantized_ste_forms = _generated.Forms(True, {
+_quantized_ste_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'float32'), ((16, 32), 'bfloat16'))):
         _quantized_ste_0,
     ('default', 'sm90', (((8, 64), 'float32'), ((8, 64), 'bfloat16'))):
@@ -510,7 +510,7 @@ def quantized_ste(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_quantized_ste_forms, operands, policy, target)
 
 
-_quantized_ste_tangent_forms = _generated.Forms(True, {
+_quantized_ste_tangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (
         ((16, 32), 'float32'), ((16, 32), 'bfloat16'), ((16, 32), 'float32'), ((16, 32), 'bfloat16'),
         ((16, 32), 'float32'))):
@@ -527,7 +527,7 @@ def quantized_ste_tangent(*operands, policy: str = 'default', target: str = 'sm9
     return _generated.call(_quantized_ste_tangent_forms, operands, policy, target)
 
 
-_rounded_forms = _generated.Forms(True, {
+_rounded_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
@@ -540,7 +540,7 @@ def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_rounded_forms, operands, policy, target)
 
 
-_rounded_fp16_forms = _generated.Forms(True, {
+_rounded_fp16_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((16, 32), 'float32'),)):
         functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
@@ -553,7 +553,7 @@ def rounded_fp16(*operands, policy: str = 'default', target: str = 'sm90'):
     return _generated.call(_rounded_fp16_forms, operands, policy, target)
 
 
-_rounded_fp16_tangent_forms = _generated.Forms(True, {
+_rounded_fp16_tangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
         _rounded_fp16_tangent_0,
     ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):
@@ -566,7 +566,7 @@ def rounded_fp16_tangent(*operands, policy: str = 'default', target: str = 'sm90
     return _generated.call(_rounded_fp16_tangent_forms, operands, policy, target)
 
 
-_rounded_tangent_forms = _generated.Forms(True, {
+_rounded_tangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 32), 'float32'),) * 3,)):
         _rounded_tangent_0,
     ('default', 'sm90', (*(((8, 64), 'float32'),) * 3,)):

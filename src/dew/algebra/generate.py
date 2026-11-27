@@ -591,7 +591,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
         single = own[0].single
         policy, target = own[0].policy, own[0].target
         table = _generated.table_name(name)
-        body += ["", "", f"{table} = _generated.Forms({single}, {{"]
+        body += ["", "", f"{table} = _generated.Forms(single={single}, cases={{"]
         for found in own:
             operands = _runs(repr(operand) for operand in case_of(found.operands))
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
