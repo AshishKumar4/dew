@@ -210,7 +210,7 @@ def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]
                          "and model it recorded, or train in another directory")
 
 
-def numerics_differs(saved: JSON) -> list[str]:
+def numerics_differs(saved: JSON | None) -> list[str]:
     """Where a checkpoint's training record `saved` states numerics other than those its resume computes
     under where it is read (`numerics_record`): their forms, recipe and outputs, and the precision its
     products computed at (`products`), whatever precision it declared (row 13708). A record a Dew wrote
