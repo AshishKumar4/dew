@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from dew.batch import Batch
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
-from dew.state import Accumulation, TrainState, kept_window, paired, refuse_unpooled, taken
+from dew.state import Accumulation, TrainState, kept_window, paired, taken
 from dew.training.model_flops import TOKENS
 from dew.training.planning import released
 from dew.training.transaction import batch_statistics_shapes, compact_qk, largest_recorded, pooled_by_mean
@@ -98,9 +98,6 @@ def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch
             fill=jnp.zeros((), jnp.int32))
 
     pending = jax.eval_shape(allocate)
-    # A held window the step would take as its own but pools other statistics in is refused
-    # (`refuse_unpooled`), before its reuse.
-    refuse_unpooled(state.accumulation, pending)
     # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
     if kept_window(state.accumulation, pending, read=not shape_only):
         return state

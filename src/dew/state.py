@@ -134,19 +134,6 @@ def occupied(window: Accumulation | None, phase: str = "accumulation occupancy")
     return int(np.max(collective_host(occupancy(window), phase=phase)))
 
 
-def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) -> bool:
-    """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
-    One that replays other shapes is replaced by an empty one where its `fill`, read only then (`read`,
-    not for a step's shapes alone), is 0 in every group, and refused while it holds any."""
-    if held is None or held.replays(pending):
-        return held is not None
-    if read and held.fill is not None and (count := occupied(held)):
-        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
-                         f"other shapes than the step's, which it cannot replay")
-    return False
-
-
-
 def _laid_alike(held, compiled) -> bool:
     """Whether two trees hold leaves of the same shapes and dtypes, compared leaf by leaf."""
     return jax.tree.structure(held) == jax.tree.structure(compiled) and all(
@@ -154,16 +141,26 @@ def _laid_alike(held, compiled) -> bool:
         for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
 
 
-def refuse_unpooled(held: Accumulation | None, pending: Accumulation) -> None:
-    """Refuse a held window that replays the step's batches (`Accumulation.replays`) but pools other
-    statistics (`Accumulation.pools`), whatever it holds, by its shapes alone: a window the step would take
-    as its own (`kept_window`) and fail to pool into, a resumed one pooled by an earlier Dew (an objective
-    whose statistics gained a term since: an indexer's KL beside its prediction, row 13705). A window
-    replaying other batches is the step's to replace, as a ramp's boundary's (`kept_window`)."""
-    if held is not None and held.replays(pending) and not held.pools(pending):
-        raise ValueError("the state's accumulation window holds batches or statistics of other shapes than "
-                         "the step's, which it cannot replay or pool: resume from a step that closed its "
-                         "window, or with the Dew that wrote it")
+def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) -> bool:
+    """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
+    One that replays other shapes is replaced by an empty one where its `fill`, read only then (`read`,
+    not for a step's shapes alone), is 0 in every group, and refused while it holds any. One the step
+    cannot continue is refused whatever it holds, by its shapes alone: one pooling a shared mean where the
+    step replays its batches, or the other way (`mass` held or not), or one replaying the step's batches
+    but pooling other statistics (`Accumulation.pools`): a resumed one pooled by an earlier Dew (an
+    objective whose statistics gained a term since: an indexer's KL beside its prediction, row 13705)."""
+    if held is None:
+        return False
+    if (held.mass is None) != (pending.mass is None) or (held.replays(pending) and not held.pools(pending)):
+        raise ValueError("the state's accumulation window pools other statistics than the step's, which it "
+                         "cannot continue: resume from a step that closed its window, or with the Dew that "
+                         "wrote it")
+    if held.replays(pending):
+        return True
+    if read and held.fill is not None and (count := occupied(held)):
+        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
+                         f"other shapes than the step's, which it cannot replay")
+    return False
 
 
 REPLICA: Mapping[str, bool] = MappingProxyType({"replica": True})

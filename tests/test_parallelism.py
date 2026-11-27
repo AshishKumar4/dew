@@ -722,7 +722,7 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
 def test_a_window_pooling_other_statistics_is_refused_as_the_step_compiles():
     """A held window pooling other statistics than the step traces, its batches laid out alike (a window an
     earlier Dew saved, before its objective's statistics gained a term: an indexer's KL beside its
-    prediction, row 13705), is refused as the step over it compiles (`empty_window`'s `refuse_unpooled`),
+    prediction, row 13705), is refused as the step over it compiles (`kept_window`),
     by its shapes alone, whatever it holds, not reused and failing the step's pooling; the window as the
     step pools it is taken."""
     trainer = make_accumulating(accumulation=4)
@@ -740,3 +740,26 @@ def test_a_window_pooling_other_statistics_is_refused_as_the_step_compiles():
     cleared = stale.with_window(dataclasses.replace(stale.window, fill=jnp.zeros_like(window.fill)))
     with pytest.raises(ValueError):
         make_accumulating(accumulation=4).compile(cleared, batch)
+
+
+def test_a_window_pooling_a_shared_mean_is_refused_where_the_step_replays_its_batches():
+    """A held window that pooled a shared mean (a gradient and mass, no replayed batches), as an earlier Dew
+    pooled a sparse indexer's lone ratio, is no window a step that replays its batches continues, nor the
+    other way, refused by its shapes alone whatever it holds (`kept_window`, row 13705); one replaying the
+    step's batches but pooling stale statistics is refused too."""
+    from dew.state import Accumulation, kept_window
+
+    def window(*, shared: bool, statistics: int = 2) -> Accumulation:
+        leaf = jax.ShapeDtypeStruct((), jnp.float32)
+        return Accumulation(gradient={"w": leaf} if shared else None, mass=leaf if shared else None,
+                            statistics=tuple(leaf for _ in range(statistics)), effects=(), qk_stats=None,
+                            batches=None if shared else {"x": jax.ShapeDtypeStruct((2, 4), jnp.float32)},
+                            variables=None, attempts=None, fill=jax.ShapeDtypeStruct((), jnp.int32))
+
+    replaying, sharing = window(shared=False), window(shared=True)
+    assert kept_window(replaying, replaying, read=False) and kept_window(sharing, sharing, read=False)
+    for held, pending in ((sharing, replaying), (replaying, sharing), (window(shared=False, statistics=1),
+                                                                       replaying)):
+        with pytest.raises(ValueError):
+            kept_window(held, pending, read=False)
+
