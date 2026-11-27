@@ -139,6 +139,8 @@ def _corrupted(record, corrupt):
     if corrupt == "an untyped empty vector":
         return {**record, "terms": [*table, ["reduce", [["t", 0], ["s", "add"], ["u", []], ["i", 0]]]],
                 "steps": [len(table), *record["steps"][1:]]}
+    if corrupt == "a literal no array":
+        return {**record, "literals": [*record["literals"], ["T", [["p", 1], ["T", []]]]]}
     if corrupt == "a finish dropped":
         return {**record, "finishes": [None for _ in record["finishes"]]}
     raise AssertionError(corrupt)
@@ -148,6 +150,7 @@ def _corrupted(record, corrupt):
                                      "a merge's side in a step", "a short part", "unreadable",
                                      "an argument of another sort", "a term of its own", "a float past range",
                                      "a dtype of objects", "an untyped empty vector", "a finish dropped",
+                                     "a literal no array",
                                      "nested past depth", "a flipped byte", "another entry's"])
 def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
@@ -205,9 +208,13 @@ def test_a_primitive_its_name_does_not_identify_keys_nothing():
     own = jcore.Primitive("exp")
     own.def_abstract_eval(lambda operand: operand)
     operand = np.ones(4, np.float32)
-    assert stored.key(jax.make_jaxpr(lambda x: own.bind(x))(operand), (), ()) is None
-    assert stored.key(jax.make_jaxpr(lambda x: jax.jit(own.bind)(x))(operand), (), ()) is None
-    assert stored.key(jax.make_jaxpr(lambda x: jax.jit(jax.lax.exp)(x))(operand), (), ()) is not None
+    def branched(function):
+        return jax.make_jaxpr(lambda p, x: jax.lax.cond(p, function, jax.lax.neg, x))(True, operand)
+
+    assert stored.key(jax.make_jaxpr(own.bind)(operand), (), ()) is None
+    assert stored.key(branched(own.bind), (), ()) is None
+    assert stored.key(jax.make_jaxpr(jax.lax.exp)(operand), (), ()) is not None
+    assert stored.key(branched(jax.lax.exp), (), ()) is not None
 
 
 def test_a_program_capturing_an_outer_traces_value_has_no_key():

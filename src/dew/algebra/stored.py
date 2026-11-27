@@ -31,6 +31,7 @@ never reaches here. Each outcome is counted in the kernel report (`report.record
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
 import hashlib
 import importlib.metadata
@@ -43,6 +44,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 from egglog import ConvertError, String, Vec, f64, get_callable_args, i64
+from jax.core import ShapedArray
 from jax.extend.core import Jaxpr, Primitive, primitives
 
 from dew import _code, _files
@@ -126,23 +128,25 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms]) ->
                 FORMAT, len(region.params), len(region.literals), len(region.shapes)):
             raise ValueError("an entry of another layout or another trace's region")
         params = [_parameter(entry) for entry in _listed(record["params"])]
-        literals = [_value(value) for value in _listed(record["literals"])]
+        literals = [_literal(value) for value in _listed(record["literals"])]
         decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
                            literals=len(region.literals) + len(literals),
                            params=len(region.params) + len(params), states=len(_listed(record["steps"])))
         made = assembled(record, decoded=decoded, value=_value)
+        # Each literal a derivation appends is shaped as it is (`_appended`).
+        shapes = [(Term.literal(i64(index)), literal.shape)
+                  for index, literal in enumerate(literals, start=len(region.literals))]
     except (KeyError, TypeError, ValueError, IndexError, OverflowError, RecursionError,
             ConvertError) as failed:
         # ConvertError: an argument of a sort its constructor does not take; OverflowError: a float past
         # range; RecursionError: a value nested past Python's depth.
         _invalid(path, failed)
         return None
-    # The region extended once the whole entry has read: one that fails leaves it as traced. Each literal a
-    # derivation appends is shaped as it is (`_appended`).
+    # The region extended once the whole entry has read: one that fails leaves it as traced.
     region.params.extend(params)
-    for literal in literals:
-        region.literals.append(literal)
-        region.shaped(Term.literal(i64(len(region.literals) - 1)), np.shape(literal))
+    region.literals.extend(literals)
+    for term, extent in shapes:
+        region.shaped(term, extent)
     kernel_report.record_stored("hit")
     return made
 
@@ -365,6 +369,14 @@ def _extent(value) -> tuple[int, ...]:
     return tuple(value)
 
 
+def _literal(encoded) -> np.ndarray:
+    """An appended literal read from JSON: an array, as a derivation appends one (`np.asarray`)."""
+    value = _value(encoded)
+    if not isinstance(value, np.ndarray):
+        raise ValueError(f"a literal of {type(value).__name__}, no array")
+    return value
+
+
 def _parameter(entry) -> tuple[Primitive, dict]:
     """An appended parameter read from JSON: its primitive by name and its values by theirs."""
     primitive, given = _listed(entry)
@@ -389,21 +401,35 @@ def _primitives() -> Mapping[str, Primitive]:
     return {name: next(iter(found.values())) for name, found in held.items() if len(found) == 1}
 
 
+_PLAIN = (type(None), bool, int, float, complex, str, bytes, np.dtype, np.generic, np.ndarray, enum.Enum,
+          type, ShapedArray, jax.sharding.Sharding, jax.sharding.Mesh, jax.sharding.AbstractMesh)
+"""The parameter values that hold no program: what `_bound` reads past without descending."""
+
+
 def _bound(closed: Jaxpr) -> bool:
     """Whether each primitive of `closed`, and of every program its parameters hold at any depth, is the
-    one JAX binds to its name (`_primitives`)."""
+    one JAX binds to its name (`_primitives`): its parameters read through sequences and mappings (their
+    keys and values), each once, to programs and plain values (`_PLAIN`); a parameter of any other kind,
+    which may hold a program out of this walk's sight, is none it binds."""
+    bound = _primitives()
     pending: list = [closed]
+    seen: set[int] = set()
     while pending:
         value = pending.pop()
+        if isinstance(value, _PLAIN) or id(value) in seen:
+            continue
+        seen.add(id(value))
         if isinstance(value, Jaxpr):
             for equation in value.jaxpr.eqns:
-                if _primitives().get(equation.primitive.name) is not equation.primitive:
+                if bound.get(equation.primitive.name) is not equation.primitive:
                     return False
                 pending.extend(equation.params.values())
-        elif isinstance(value, (tuple, list)):
+        elif isinstance(value, (tuple, list, set, frozenset)):
             pending.extend(value)
         elif isinstance(value, Mapping):
-            pending.extend(value.values())
+            pending.extend((*value.keys(), *value.values()))
+        else:
+            return False
     return True
 
 
