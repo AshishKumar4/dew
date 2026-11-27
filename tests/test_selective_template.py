@@ -152,6 +152,12 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted(case):
                     truth_fn=exact)
 
 
+CANCELLING_SEEDS = 192
+"""The decaying skip-cancelling site's seeds (the large-input gates' test): at 40 its ratio's interval was
+wider than check 1 resolves on a GH200 and an A100 (pooled 1.283 in [0.758, 2.321], the main tiers at
+448d44837 sm90 and 638cc3cb2 a100), at 192 green (M-JS-306 on a GH200; rows 10579, 10701)."""
+
+
 @pytest.mark.parametrize("case", ("normal step", "zero step", "skip cancelling",
                                   "subnormal skip cancelling", "subnormal step",
                                   "decaying skip cancelling"))
@@ -217,7 +223,9 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
         return jax.tree.map(lambda arr: arr.astype(jnp.float32), out)
     reference = range_safe if case in ("subnormal skip cancelling", "subnormal step") else exact
     assert_as_exact(jax.jit(with_gradients(routed)), reference, draw,
-                    f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
+                    f"the selective template at large B, {case}",
+                    seeds=CANCELLING_SEEDS if case == "decaying skip cancelling" else FEWEST_SEEDS,
+                    truth_fn=exact)
 
 
 def taken_scan(dtype, **options):
