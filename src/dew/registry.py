@@ -2165,8 +2165,8 @@ class Bound(ABC):
                      if isinstance(value, functools.partial | Mapping | list | tuple) else None)
             if found is not None:
                 raise Unrecordable(f"{self.name}'s {name} holds {found!r}, which its annotation reads back "
-                                   "as no bound member: an argument declaring functools.partial of a kind its "
-                                   "member is reads one")
+                                   "as no bound member: an argument declaring functools.partial of a kind "
+                                   "its member is reads one")
         with recording():
             # Each written as held, against no parameter's annotation, as the record held them before
             # (`JsonDict`): a recorded kind's records again as they are, and a world model's views named
