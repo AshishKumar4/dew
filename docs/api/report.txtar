@@ -529,7 +529,7 @@ dew.config.jepa.JepaRunConfig
   probe_classes: int | None = None
   knn_k: int = 20
 dew.config.lm.LMRunConfig
-  model: ModelConfig = (lambda: ModelConfig(_transformer()))()
+  model: ModelConfig = dew.config.DecoderRunConfig.transformer_model()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
@@ -656,7 +656,7 @@ dew.decision.config.CrossContext
   text: TextCondition | None = None
   form: Literal['idefics', 'shared'] = 'idefics'
 dew.decision.config.DecisionRunConfig
-  model: ModelConfig = (lambda: ModelConfig(_transformer()))()
+  model: ModelConfig = dew.config.DecoderRunConfig.transformer_model()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
