@@ -20,6 +20,7 @@ import errno
 import fcntl
 import functools
 import hashlib
+import logging
 import operator
 import os
 import secrets
@@ -285,7 +286,7 @@ def _removed(tree: Path) -> None:
 
     root = os.path.abspath(tree)
 
-    def retried(remove: Callable[..., object], path: str, failure: BaseException) -> None:
+    def retried(remove: Callable[..., None], path: str, failure: BaseException) -> None:
         # An entry's removal alone retried (no traversal, whose calls take more than a path), and only in a
         # folder of the tree: its root's own parent, the release's, is never changed.
         folder = os.path.dirname(os.path.abspath(path))
@@ -296,8 +297,10 @@ def _removed(tree: Path) -> None:
         try:
             os.chmod(folder, 0o700)
             remove(path)
-        except OSError:
-            return
+        except OSError as left:
+            # A save's own leftover, named for whoever clears it; the save's outcome is its own.
+            logging.getLogger(__name__).warning("could not remove %s from a save's discarded tree: %s",
+                                                path, left)
 
     shutil.rmtree(tree, onexc=retried)
 
