@@ -849,6 +849,11 @@ class PackedDecode:
         rows: list[int] = []
         for at, index in enumerate(self.index):
             taken = index if isinstance(index, tuple) else (index,)
+            # An index with an array or a list in it is NumPy's advanced indexing, whose integers join its
+            # arrays and whose result's axes follow their own rule: applied whole to the decoded value.
+            if any(isinstance(each, list) or np.ndim(each) > 0 for each in taken
+                   if each is not Ellipsis and not isinstance(each, slice)):
+                return tuple(rows), self.index[at:]
             for place, each in enumerate(taken):
                 # A boolean (an int to Python) adds an axis, as NumPy reads it, left to the decoded value.
                 if (len(rows) == lead or not isinstance(each, int | np.integer)

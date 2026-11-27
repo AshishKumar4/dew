@@ -828,7 +828,7 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     # A store of a packed leaf beside a dense one, both split by stage, cut into its rows as an export
     # reads them (`array_rows`, and a banked store's `StoredRow`): each its own row (train 1422's review: a
     # dense leaf's row was a plain gather of the Explicit dimension).
-    dense = jax.device_put(jnp.asarray(stacked), placed(stacked))
+    dense = placed(stacked)
     tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": split}},
                                          "params": {"stages": {"bias": dense}}})
     stages = tree["params"]["stages"]
@@ -840,6 +840,10 @@ def test_a_packed_bank_split_by_stage_over_an_explicit_axis_reads_its_rows():
     kernel = stages["kernel"]
     np.testing.assert_array_equal(np.asarray(kernel[1, :, :8]), whole[1, :, :8])
     assert [np.shape(decoded) for _, _, decoded in kernel.memo] == [(256, 64)]
+    # An advanced index keeps NumPy's axes: its integers join its arrays, the index applied whole.
+    advanced = kernel[1, :, [0, 1]]
+    np.testing.assert_array_equal(np.asarray(advanced), whole[1, :, [0, 1]])
+    assert np.shape(np.asarray(advanced)) == advanced.shape == (2, 256)
 
 
 WINDOW_WITHOUT_CPU = """
