@@ -542,18 +542,27 @@ def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precisi
 
     context = MixerContext(emb_features=4, num_heads=1, num_kv_heads=1, head_dim=2, max_seq_len=2,
                            qk_norm=False, dtype=dtype, precision=precision)
-    layer = mixers.build("block_sparse_attention", selection="msa", block=1, top_k=2, index_width=4).build(
-        context)()
+    built = mixers.build("block_sparse_attention", selection="msa", block=1, top_k=2, index_width=4).build(
+        context)
+
+    class Called(built.func):
+        """The layer's `_msa` as its own call, the index branch its submodule."""
+
+        @nn.compact
+        def msa(self, *arguments):
+            return self._msa(*arguments)
+
+    layer = Called(*built.args, **built.keywords)
     query = jnp.asarray([[[[1.0, 0.0]]] * 2], dtype)
     key = jnp.asarray([[[[keys[0], 0.0]], [[keys[1], 0.0]]]], dtype)
     hidden = jax.random.normal(jax.random.key(0), (1, 2, 4), jnp.float32).astype(dtype)
     masking = SimpleNamespace(documents=None, valid=None)
     arguments = (query, key, key, masking, None, hidden)
-    params = layer.init(jax.random.key(1), *arguments, method="_msa")
+    params = layer.init(jax.random.key(1), *arguments, method="msa")
     ambient = (jax.default_matmul_precision(numerics) if numerics not in (None, "accurate")
                else run_precision(ACCURATE) if numerics == "accurate" else contextlib.nullcontext())
     with ambient:
-        _, sown = layer.apply(params, *arguments, method="_msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
+        _, sown = layer.apply(params, *arguments, method="msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
     found = float(np.asarray(jax.tree.leaves(sown[INDEXER_COLLECTION])[0])[0, 1])
     student = np.asarray(next(leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown[SELECTIONS])[0]
                               if "scores" in jax.tree_util.keystr(path)), np.float64)[0, 0, 1]
