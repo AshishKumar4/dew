@@ -597,6 +597,15 @@ def test_a_resharded_release_keeps_its_weights_private(tmp_path):
         assert stat.S_IMODE(shard.stat().st_mode) == 0o600, shard
 
 
+def _scaled(scale):
+    """A tiny release of two 64 x 64 weights, both moved by `scale`."""
+    from dew.interop.releases import Placed, ReleasePlan
+
+    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
+                                                             'model.b': weight + scale})}))
+
+
 def test_two_first_saves_written_together_publish_one_under_its_names(tmp_path):
     """Two saves to a destination not yet made, written together, both name their shards as their library
     does: the one that publishes first keeps them, and the other is refused rather than put in its place
@@ -604,20 +613,14 @@ def test_two_first_saves_written_together_publish_one_under_its_names(tmp_path):
     import os
 
     from dew._files import swapped
-    from dew.interop.releases import ConcurrentRelease, Placed, ReleasePlan, refused_entries
+    from dew.interop.releases import ConcurrentRelease, refused_entries
 
-    weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
     target = tmp_path / 'release'
-
-    def plan(scale):
-        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
-                                                                 'model.b': weight + scale})}))
-
     with pytest.raises(ConcurrentRelease), swapped(target, refused_entries) as staging:
         # The same release's files, named while the destination holds nothing (its staging written in
         # place), then the other save publishes, then this one commits.
-        plan(2).write(staging, max_shard_size=20000, fresh=True)
-        plan(1).write(target, max_shard_size=20000)
+        _scaled(2).write(staging, max_shard_size=20000, fresh=True)
+        _scaled(1).write(target, max_shard_size=20000)
     assert not os.path.lexists(staging)
     shards = sorted(path.name for path in target.glob('model-*.safetensors'))
     assert len(shards) > 1 and all(name.startswith('model-0') for name in shards), shards
@@ -635,21 +638,17 @@ def test_a_first_save_a_third_replaced_between_is_refused_its_names(tmp_path):
     from safetensors.numpy import load_file
 
     from dew._files import swapped
-    from dew.interop.releases import ConcurrentRelease, Placed, ReleasePlan, refused_entries
+    from dew.interop.releases import ConcurrentRelease, refused_entries
 
     weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
     target = tmp_path / 'release'
 
-    def plan(scale):
-        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
-                                                                 'model.b': weight + scale})}))
-
     with pytest.raises(ConcurrentRelease), swapped(target, refused_entries) as staging:
-        plan(3).write(staging, max_shard_size=20000, fresh=True)
-        plan(1).write(target, max_shard_size=20000)
+        _scaled(3).write(staging, max_shard_size=20000, fresh=True)
+        _scaled(1).write(target, max_shard_size=20000)
         # A reader opens the first published save's index, then a third save replaces that save.
         first = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
-        plan(2).write(target, max_shard_size=20000)
+        _scaled(2).write(target, max_shard_size=20000)
     assert not os.path.lexists(staging)
     assert not any((target / name).exists() for name in set(first.values()))
     index = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
@@ -667,20 +666,14 @@ def test_a_release_whose_index_alone_is_left_saves_again_in_shards(tmp_path):
 
     from safetensors.numpy import load_file
 
-    from dew.interop.releases import Placed, ReleasePlan
-
     weight = np.arange(4096, dtype=np.float32).reshape(64, 64)
     target = tmp_path / 'release'
 
-    def plan(scale):
-        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, {'model.a': weight * scale,
-                                                                 'model.b': weight + scale})}))
-
-    plan(1).write(target, max_shard_size=20000)
+    _scaled(1).write(target, max_shard_size=20000)
     named = set(json.loads((target / 'model.safetensors.index.json').read_text())['weight_map'].values())
     for name in named:
         (target / name).unlink()
-    plan(2).write(target, max_shard_size=20000)
+    _scaled(2).write(target, max_shard_size=20000)
     index = json.loads((target / 'model.safetensors.index.json').read_text())['weight_map']
     assert not named & set(index.values())
     published = {name: value for file in set(index.values())
