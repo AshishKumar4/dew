@@ -148,18 +148,23 @@ class SurrogateBodies:
             if key in keyed:
                 raise ValueError(f"surrogate cases {keyed[key].name} and {case.name}: one key, {fixed!r}")
             keyed[key] = case
-        names = [name for _, case in self.cases
-                 for name in (case.name, *map(case.tangent_name, case.tangents))]
+        names = [name for name, _ in self._bodies()]
         if len(set(names)) != len(names):
             raise ValueError(f"surrogate cases share a body's name: {sorted(names)}")
         object.__setattr__(self, "_keyed", keyed)
 
+    def _bodies(self) -> list[tuple[str, ComponentForm]]:
+        """Each case's forward and tangent bodies by their names: what is checked, registered and held to a
+        generated module alike."""
+        return [(name, form) for _, case in self.cases
+                for name, form in ((case.name, case.forward),
+                                   *((case.tangent_name(inactive), tangent)
+                                     for inactive, tangent in case.tangents.items()))]
+
     def declared(self, module: str) -> SurrogateBodies:
         """Register each case's forward and tangent bodies, each under its own name (`declare`)."""
-        for _, case in self.cases:
-            declare(module, case.name, case.forward)
-            for inactive, form in case.tangents.items():
-                declare(module, case.tangent_name(inactive), form)
+        for name, form in self._bodies():
+            declare(module, name, form)
         return self
 
     def _case(self, fixed: tuple) -> SurrogateCase | None:
@@ -171,10 +176,7 @@ class SurrogateBodies:
         """Refuse a generated module whose tables are not this declaration's: each body's table holds
         exactly its declared policies, targets and cases, so a call's one lookup finds a declared case's form
         and nothing else (a stale module: generate it again)."""
-        bodies = [(case.name, case.forward) for _, case in self.cases]
-        bodies += [(case.tangent_name(inactive), form) for _, case in self.cases
-                   for inactive, form in case.tangents.items()]
-        for name, form in bodies:
+        for name, form in self._bodies():
             declared = {(policy, target, case_of(operands)) for operands in form.cases.operands
                         for policy in form.cases.policies for target in form.cases.targets}
             if set(_generated.table(emitted, name)) != declared:
