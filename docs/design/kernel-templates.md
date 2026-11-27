@@ -256,7 +256,7 @@ A call of spans therefore keeps one `BlockMap` (`templates/attention.py`'s `bloc
 **Toolkit, per generation, shared by every template.** It reuses JAX's machinery directly, with no wrapper that renames a native API:
 - **Pipelines:**
   - sm80, sm86 and sm89: Mosaic GPU's cp.async pipeline, the mma.sync bundle's walk; sm120, and mma.sync on every device Mosaic moves blocks by TMA on, rings its consumer fills by TMA (`bundles.MmaFed`);
-  - sm90/100: Mosaic GPU's `emit_pipeline_warp_specialized`, its rings, barriers, register reallocation, TMA and clusters;
+  - sm90/100: the bundles' persistent TMA rings (`ring_family.RingFamily`), a producer warpgroup or the consumers filling them (`fed.ConsumerFed`), their barriers, register reallocation and clusters; it tied Mosaic GPU's `emit_pipeline_warp_specialized` wherever both ran (M-FS-94b, mma-sync-family.md §3.3);
   - TPU: Mosaic TPU's pipeline and DMA.
 - **One tile scheduler:** persistent grid, LPT, rasterization and swizzle, and split-K, stream-K and split-KV work lists. A work scheduler yields each program's ranges and ownership; a separate reduction and fix-up primitive supplies the partials' workspace, their completion and the combine and store, the combine's arithmetic the algebra's. Today: the planar snake (`tail.planar_snake`), and the balanced last wave (`tail.Tail`: the tiles past whole waves have their steps shared out, each program leaving its partial of a tile and the last of them to arrive at the tile's counter merging them in the programs' order, `Family.fixed_up`) on the dense kernel gradient and the dense product.
 - **Machine primitives, only where JAX has none:** layout-aware coordinates and row vectors; the promoted, scaled `mma`.
