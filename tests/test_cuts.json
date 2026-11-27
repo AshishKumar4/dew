@@ -1976,8 +1976,8 @@
 "tests/test_gemm_template.py::test_each_familys_deepest_ring_compiles_within_its_resources[forward-sm90-wgmma]",
 "tests/test_gemm_template.py::test_the_fused_epilogue_keeps_the_programs_value[two_consumers-sm90]",
 "tests/test_gemm_template.py::test_the_template_holds_check_1_with_its_hooks[row scaled-sm90]",
-"tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[cast prologue-sm90]",
-"tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[dense two outputs-v5e]",
+"tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[cast prologue-v5e]",
+"tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[gated prologue-sm90]",
 "tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[norm and bias-v6e]",
 "tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[scaled-v6e]",
 "tests/test_gemm_template.py::test_the_templates_gradients_hold_check_1[wide output-sm90]"
@@ -2846,12 +2846,12 @@
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[gated delta net and its short conv-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[latent attention, a user's-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[latent attention, the lane's-sm90]",
-"tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[sinks, a user's-sm80]",
+"tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[selective scan-sm90]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[sinks, the lane's-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[state-space duality (SSD), bf16-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[window and softcap, a user's-sm90]",
 "tests/test_model_flows.py::test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so",
-"tests/test_model_flows.py::test_a_flows_truth_computes_in_float64[experts packed NVFP4]",
+"tests/test_model_flows.py::test_a_flows_truth_computes_in_float64[dense bf16, a user's]",
 "tests/test_model_flows.py::test_a_flows_truth_computes_in_float64[selective scan]",
 "tests/test_model_flows.py::test_a_flows_truth_computes_in_float64[sinks, the lane's]",
 "tests/test_model_flows.py::test_a_flows_truth_computes_in_float64[state-space duality (SSD), bf16]",
@@ -3943,7 +3943,7 @@
 "tests/test_selective_template.py::test_a_forked_calls_training_step_compiles[sm90]",
 "tests/test_selective_template.py::test_a_routed_forked_training_step_compiles_spill_free[sm80]",
 "tests/test_selective_template.py::test_a_spilled_backward_takes_its_models_next_plan[sm80]",
-"tests/test_selective_template.py::test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted[normal step]"
+"tests/test_selective_template.py::test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted[skip cancelling]"
 ],
 "tests/test_sequence_parallel.py": [
 "tests/test_sequence_parallel.py::test_per_token_visibility_passes_through_either_exchange[gather runs-template]"
@@ -4310,9 +4310,6 @@
 ],
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
-],
-"tests/test_weighed_check.py": [
-"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
