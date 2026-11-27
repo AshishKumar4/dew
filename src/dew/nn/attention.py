@@ -57,6 +57,7 @@ from .attention_masks import (
 from .attention_parallel import (
     check_rows,
     four_dimensional,
+    launched,
     on_attention_shards,
     pad_rows,
     sequence_parallel_attention,
@@ -1658,7 +1659,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms,
-        quantized=quantized_rule(sinks is not None, dropout))
+        quantized=quantized_rule(sinks is not None, dropout), launch=launched(query, key))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
