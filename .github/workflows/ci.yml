@@ -27,6 +27,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The CUDA generations a release's wheel carries derivations of, each one at least: the one list the release's
+  # derivations job (`derived`) maps and its package job checks (tools/ci/package.sh's DEW_GENERATIONS). sm120 joins
+  # once its Mosaic kernel's layout inference holds there (row 14034).
+  DERIVED_GENERATIONS: sm80 sm90 sm100
   # The armada runner every armada job uses: one that waits out a redeploy's refusal of a new job (armada 1626e08),
   # so a deploy's drain delays a run and never fails it (Main, 2026-11-06), and whose judge's red row says how each
   # failed map task ended and the tail of what it said (armada f6cc2b3; Main, 2026-11-09), and that shares a run's
@@ -143,14 +147,10 @@ jobs:
 
   # The template derivations a release's wheel ships (tools/ci/derived.sh), each CUDA generation's on an armada
   # container of its own in the commit's environment, whose locks are the egglog and JAX builds every entry's key
-  # states: a release's run alone, as a pull request's holds no armada credentials. sm120 is none of them until
-  # its Mosaic kernel's layout inference holds there (row 14034): the tool fails a generation it cannot lower.
+  # states, for each of DERIVED_GENERATIONS: a release's run alone, as a pull request's holds no armada credentials.
   derived:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
-    env:
-      # The generations a release's wheel carries derivations of, each one at least (tools/ci/package.sh).
-      GENERATIONS: sm80 sm90 sm100
     steps:
     - uses: actions/checkout@v4
     - uses: oven-sh/setup-bun@v2
@@ -166,7 +166,7 @@ jobs:
         # is no catalogue. Each generation's entries are moved to a directory named for it (armada's are by index),
         # and every one must hold one entry at least (tools/ci/package.sh checks it again before it builds).
         set +e
-        printf '%s\n' $GENERATIONS | armada map --commit=${{ github.sha }} --items=- --size=large \
+        printf '%s\n' $DERIVED_GENERATIONS | armada map --commit=${{ github.sha }} --items=- --size=large \
           --label="derived-$GITHUB_REF_NAME" --artifacts="$RUNNER_TEMP/runs" --json -- \
           sh -c 'sh tools/ci/derived.sh "$1" "$2/derived"' sh '{item}' '{artifacts}' > "$RUNNER_TEMP/derived.jsonl"
         mapped=$?
@@ -175,7 +175,7 @@ jobs:
           "$RUNNER_TEMP/derived.jsonl" | tee "$RUNNER_TEMP/rows.jsonl"
         [ "$mapped" = 0 ] || { echo "armada map exited $mapped"; exit 1; }
         mkdir -p "$RUNNER_TEMP/derived"
-        for generation in $GENERATIONS; do
+        for generation in $DERIVED_GENERATIONS; do
           from=$(jq -r --arg g "$generation" 'select(.item == $g and .kind == "ok" and .exitCode == 0
             and (.artifactsLost | not) and .artifacts != null) | .artifacts' "$RUNNER_TEMP/rows.jsonl")
           [ -n "$from" ] && [ -n "$(ls "$from/derived"/*.json 2> /dev/null)" ] ||
@@ -209,7 +209,7 @@ jobs:
     - name: Build, check, install and run the sdist and wheel; resolve the accelerator extras
       env:
         DEW_DERIVED: ${{ github.event_name == 'release' && format('{0}/derived', runner.temp) || '' }}
-        DEW_GENERATIONS: ${{ github.event_name == 'release' && 'sm80 sm90 sm100' || '' }}
+        DEW_GENERATIONS: ${{ github.event_name == 'release' && env.DERIVED_GENERATIONS || '' }}
       run: sh tools/ci/package.sh dist
     # A release publishes this sdist and wheel, the ones built and smoked here (python-publish.yml).
     - if: github.event_name == 'release'
