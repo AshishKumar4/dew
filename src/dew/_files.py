@@ -15,6 +15,7 @@ cache keys a source file by.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import ctypes
 import errno
 import fcntl
@@ -177,6 +178,22 @@ def same_entries(written: Entries, held: Entries) -> Replacements:
             if kind in ("file", "folder") and held.get(entry) == kind]
 
 
+_STAGED: contextvars.ContextVar[tuple[Path, Path] | None] = contextvars.ContextVar("_STAGED", default=None)
+"""The staging `swapped` is writing and the destination it replaces, while its block runs."""
+
+
+def published_counterpart(path: Path) -> Path | None:
+    """Where `path`, inside the staging `swapped` is writing, lies in the tree the staging replaces; None
+    outside one. A writer that names its files apart from the earlier tree's reads it there
+    (`safetensors_io.save_sharded`)."""
+    staged = _STAGED.get()
+    if staged is None:
+        return None
+    staging, directory = staged
+    absolute = Path(os.path.abspath(path))
+    return directory / absolute.relative_to(staging) if absolute.is_relative_to(staging) else None
+
+
 @contextlib.contextmanager
 def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Path]], *,
             exchange: Callable[[Path, Path], None] = exchange_directories,
@@ -241,7 +258,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             if staging.stat().st_gid != before.st_gid:
                 os.chown(staging, -1, before.st_gid)
             staging.chmod(0o700 | (stat.S_IMODE(before.st_mode) & stat.S_ISGID))
-        yield staging
+        staged = _STAGED.set((Path(os.path.abspath(staging)), directory))
+        try:
+            yield staging
+        finally:
+            _STAGED.reset(staged)
         with _publishing(directory):
             held_at = existing()
             if held_at is None:

@@ -24,7 +24,7 @@ import ml_dtypes
 import numpy as np
 
 from dew._coordination import read_home, writes_weights
-from dew._files import replacing, write_atomically
+from dew._files import published_counterpart, replacing, write_atomically
 from dew._records import JSON
 from dew.batch import unboxed
 from dew.interop.unread import Stored, Unread
@@ -483,8 +483,13 @@ def save_sharded(
     old_index = folder / f"{stem}.safetensors.index.json"
     # An interrupted export may leave both an index and a single file.
     replaced = {name for name in _listing(folder) if _replaced(stem).fullmatch(name)}
+    # Written into a staging that replaces a tree whole (`dew._files.swapped`), its shards are named apart
+    # from the weights the tree it replaces held there too: a reader holding the earlier index finds its
+    # files gone rather than this export's under their names (train 1411's return).
+    earlier = published_counterpart(folder)
+    held = {name for name in _listing(earlier) if _replaced(stem).fullmatch(name)} if earlier else set()
     token = secrets.token_hex(4)
-    replacing = split.is_sharded and bool(replaced)
+    replacing = split.is_sharded and bool(replaced | held)
     names = {filename: (filename.replace(f"{stem}-", f"{stem}-{token}-", 1) if replacing else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
