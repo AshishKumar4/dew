@@ -85,10 +85,11 @@ def test_what_waits_rolls_once_an_update_applies_and_a_skipped_input_waits_for_n
 
 
 def _held_partway(directory) -> Trainer:
-    """A run of three steps checkpointed at each, its last partway through its second held update."""
+    """A run of three steps checkpointed at each and keeping each, its second where its first held update
+    applied and its last partway through its second."""
     from dew.checkpoints import Checkpoints
 
-    run = delayed_lm(1, Checkpoints(str(directory)), optimizer=_every_second())
+    run = delayed_lm(1, Checkpoints(str(directory), keep=3), optimizer=_every_second())
     run.fit(data(), steps=3, checkpoint_every=1)
     return run
 
@@ -119,19 +120,16 @@ def test_an_earlier_dews_checkpoint_resumes_where_an_update_applied_and_is_refus
     from dew.nn.dense import NVFP4_PENDING
 
     with generation.run_precision(DELAYED):
-        _held_partway(tmp_path / "held")
-        # A run's checkpoint where its update applied (step 2): one keeps its latest step alone.
-        delayed_lm(1, Checkpoints(str(tmp_path / "applied")), optimizer=_every_second()).fit(
-            data(), steps=2, checkpoint_every=2)
+        # One run's checkpoints, read by one trainer: step 2's, where its update applied, and step 3's,
+        # partway through the next (row 13747: a run apart for step 2, and a reader a step, cost the cell).
+        source = _held_partway(tmp_path / "held")
+        placed = source.place()[0]
 
         def resaved(step: int, name: str, waiting) -> Trainer:
-            """The run's checkpoint at `step` (step 2's run's, else the held one's step 3) written again at
-            `name` with `waiting` as what waits to roll (`NVFP4_PENDING`): None, as an earlier Dew wrote it,
-            holds none."""
-            source = delayed_lm(1, Checkpoints(str(tmp_path / ("applied" if step == 2 else "held"))),
-                                optimizer=_every_second())
+            """The run's checkpoint at `step` written again at `name` with `waiting` as what waits to roll
+            (`NVFP4_PENDING`): None, as an earlier Dew wrote it, holds none."""
             # Its layers on `layers_N`, as a checkpoint holds them (`Trainer.stored`).
-            state = source.stored(source.checkpoints.restore(source.place()[0], step)[0])
+            state = source.stored(source.checkpoints.restore(placed, step)[0])
             variables = {key: value for key, value in state.variables.items() if key != NVFP4_PENDING}
             if waiting is not None:
                 variables[NVFP4_PENDING] = waiting(state.variables[NVFP4_PENDING])
