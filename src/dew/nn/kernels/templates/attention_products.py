@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax._src import core as jaxpr_core
 
-from dew.nn.derivatives import surrogate
+from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.templates import attention_route
 from dew.nn.kernels.templates.attention import (
     REFERENCE_PRECISION,
@@ -161,10 +161,14 @@ def parallax(query: jax.Array, second: jax.Array, key: jax.Array, second_key: ja
     def derivative(primals, tangents, out):
         del out
         *operands, spans = primals
-        return jax.jvp(lambda *each: _parallax_formula(*each, spans, scale=scale), tuple(operands),
-                       tuple(tangents[:-1]))[1]
 
-    return surrogate(kernels, derivative)(query, second, key, second_key, value, spans)
+        def formula(query, second, key, second_key, value):
+            return _parallax_formula(query, second, key, second_key, value, spans, scale=scale)
+
+        return jax.jvp(formula, tuple(operands), tuple(tangents[:-1]))[1]
+
+    rule = contracted("test_parallax_holds_every_order")(surrogate(kernels, derivative))
+    return rule(query, second, key, second_key, value, spans)
 
 
 def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *, scale: float, natural,

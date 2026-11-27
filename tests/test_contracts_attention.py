@@ -17,6 +17,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
+    attention_products,
     attention_quantized,
     merged,
 )
@@ -309,4 +310,35 @@ def test_a_giant_heads_clip_holds_every_order(taken):
     for edge, scale in {**EDGES, "past the bound": 2.0 ** 64}.items():
         assert_contract(lambda x: clipped(x, 8.0, 1e-6), (x * scale,), (direction * scale,), cotangent,
                         f"a head's clip {edge}", plain_fn=plain, taking=ORDER_SETS[taken])
+
+
+def plain_parallax(query, second, key, second_key, value):
+    """Parallax as its formula reads, `[B, S, H, D]` each: the softmax's weights `a` over every key at the
+    width's inverse root, each taken by `1 + τ - t` where `t` is the second query's product with the second
+    keys and `τ` its mean under `a` (none of Dew's attention code)."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) * query.shape[-1] ** -0.5
+    weights = jax.nn.softmax(logits, axis=-1)
+    seconds = jnp.einsum("bqhd,bkhd->bhqk", second, second_key)
+    mean = jnp.sum(weights * seconds, axis=-1, keepdims=True)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights * (1 + mean - seconds), value)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_parallax_holds_every_order(edge):
+    """Parallax (`attention_products.parallax`: the template's kernels' value, the plain formula's derivative
+    in XLA, a surrogate): every order runs, finite wherever float64 is a normal float32 and the plain
+    formula is, at queries, keys and values whose products near float32's ends."""
+    shape = (1, 16, 2, 16)
+    spans = template.spans(16, 16, 1)
+
+    def inputs(seed: int, scale: float) -> tuple:
+        return (normal_draw([13690, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13691, seed], *(shape,) * 5, scale=scale),
+                normal_draw([13692, seed], shape)[0])
+
+    def parallax(query, second, key, second_key, value):
+        return attention_products.parallax(query, second, key, second_key, value, spans)
+
+    assert_drawn_contract(parallax, inputs, EDGES[edge], f"parallax {edge}", truth_fn=plain_parallax,
+                          plain_fn=plain_parallax)
 
