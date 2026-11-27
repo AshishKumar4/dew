@@ -739,6 +739,48 @@ def test_a_gated_expert_layer_runs_its_chain_where_the_gated_mlps_selector_choos
     assert bool(chained) == named, calls
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_gated_expert_layer_runs_apart_where_a_mesh_splits_what_its_launches_read():
+    """A gated expert layer named fused (`gated_mlp.GATED_MLP`'s grouped cell, row 12847) whose stacks a mesh
+    axis splits by their width as they are placed (a jitted argument's type keeps its mesh outside the
+    mesh's context): its chain's launches would read them whole on every device, so its selector asks of
+    the operands those launches read (`launched_whole`), which their shapes cannot say, and its projections
+    run apart, XLA's products partitioning them; the same operands on one device run the chain, as they do
+    beside a split slot table no launch of it reads (`Gathered.slots`, the dispatch's). Train 1403's review:
+    the grouped preview read the context's automatic axes alone, and chose the chain."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn import moe
+    from dew.nn.kernels import generation
+
+    draw, _, _, (slots, _, _) = _gated_case()
+    x, gate, up, down = draw(0)
+    rows, sizes = jnp.arange(slots, dtype=jnp.int32) // 2, jnp.asarray([70, 66], jnp.int32)
+
+    def gated(x, gate, up, down, where):
+        # One layer index all three read, as one stack's layer is (`moe._paired` pairs a layer by identity).
+        layer = jnp.asarray(1, jnp.int32)
+        kernels = (moe.Layered(kernel, layer) for kernel in (gate, up, down))
+        return moe.gated_experts(moe.Gathered(x, rows, where), *kernels, sizes, x.dtype, "auto", None,
+                                 "swiglu", None)
+
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Auto,), devices=jax.devices()[:2])
+
+    def placed(value, *spec):
+        return jax.device_put(value, NamedSharding(mesh, PartitionSpec(*spec)))
+
+    def chosen(*operands):
+        with generation.assumed("sm90"), generation.chosen(gated_mlp="fused"), generation.routes() as routes:
+            jax.eval_shape(gated, *operands)
+        return [route.kernel for route in routes if route.choice == "gated_mlp"]
+
+    where = jnp.arange(slots, dtype=jnp.int32)
+    assert chosen(x, gate, up, down, where) == ["fused"]
+    assert chosen(x, gate, up, down, placed(where, "tensor")) == ["fused"]
+    assert chosen(placed(x), placed(gate, None, None, None, "tensor"), placed(up, None, None, None, "tensor"),
+                  placed(down, None, None, "tensor"), placed(where)) == ["apart"]
+
+
 def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swiglu():
     """On an H100 whose grouped matmul is Mosaic GPU's and whose SwiGLU is declared Pallas's (a dense layer's
     `norm_swiglu` launch), a gated expert layer's chain selects Mosaic GPU's launches, forward and backward,

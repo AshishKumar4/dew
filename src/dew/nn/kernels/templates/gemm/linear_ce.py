@@ -28,7 +28,7 @@ from dew.nn.kernels.templates import (
     tail as tail_of,
 )
 from dew.nn.kernels.templates.axes import whole
-from dew.nn.kernels.templates.gemm import derivation
+from dew.nn.kernels.templates.gemm import derivation, launched_whole
 from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     APPROX_MATH,
     MOVES,
@@ -49,7 +49,6 @@ from dew.nn.kernels.templates.gemm.pricing import (
 )
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 from dew.nn.precision import exact_products
-from dew.nn.sharding import automatic_axes
 
 LINEAR_CE = "dew_linear_ce"
 """Kernel name for GEMM-fused linear cross-entropy launches."""
@@ -520,7 +519,7 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
                 None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
                 transpose_rhs=transpose_rhs, round_logits=round_logits, interpret=False))
 
-        case = LinearCECase(not automatic_axes(), exact, dtype_ok, plan)
+        case = LinearCECase(launched_whole(x, weight, targets, bias), exact, dtype_ok, plan)
         if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
             return None
         return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,

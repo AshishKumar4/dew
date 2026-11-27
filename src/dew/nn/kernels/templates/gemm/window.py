@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
 from dew.nn.kernels.formats import Bf16Window
-from dew.nn.sharding import automatic_axes
+from dew.nn.kernels.templates.gemm import launched_whole
 
 WINDOW_ROW = "ledger 5387"
 
@@ -55,7 +55,8 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None, out_dtype="float32",
                         trans_rhs=False, interpret=interpret_on_cpu, dense=dense, exact_sums=False)
     with xla_products.interpreted_context(interpret_on_cpu):
-        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
+        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound),
+                                   launched_whole(lhs, window, group_sizes))
         mosaic = selection.select(WINDOW, case).kernel == "mosaic"
     if mosaic:
         rules = gemm._packed_weight_rules(launch, lambda w, m: Bf16Window(w, m, window.form),

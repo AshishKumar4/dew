@@ -144,9 +144,16 @@ def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = 
     group's rows (`as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
     trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
     contraction (XLA's own on a CPU, row 5448)."""
+    from ..sharding import contracted_alike
+
     tokens, matrix, precision = as_multiplied(tokens, matrix, precision)
-    return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
-                                         precision=precision),
+    numbers = (((1,), (0,)), ((), ()))
+    # A contraction Explicit axes split on both operands lands its sum where JAX asks to be told (a placed
+    # dense product's input gradient, its cotangent's and its matrix's columns on one axis; row 12225).
+    tokens, matrix, placed = contracted_alike(tokens, matrix, numbers)
+    located = {} if placed is None else {"out_sharding": placed}
+    return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=numbers, precision=precision,
+                                         **located),
                        tokens, matrix, preferred_element_type=preferred_element_type)
 
 

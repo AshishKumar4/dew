@@ -2047,7 +2047,12 @@ def launched(launches, arguments, options, *, product: Product, whole: bool,
     route a caller's own selection of this call found unreported (a reverse pass's one launch for several
     products, `gemm._one_launch`): taken and reported as it is, the call selected once (row 8735)."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    route = selection.select(GROUPED, case) if selected is None else generation.published(selected)
+    # A caller's route is taken as it found it unless it names a launch its operands' placement refuses
+    # (`whole`; a preview of their shapes alone, row 13724): the call is then selected again as it lies.
+    if selected is None or (not whole and selected.kernel not in ('xla', APART.name)):
+        route = selection.select(GROUPED, case)
+    else:
+        route = generation.published(selected)
     if (collected := _WEIGHED.get()) is not None:
         collected.append((case.call, route.kernel))
     if route.kernel in ('xla', APART.name):

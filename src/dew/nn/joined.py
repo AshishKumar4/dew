@@ -38,7 +38,8 @@ from .kernels import gemm, generation
 from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.projections import kernel_path, mapped_shards, recipe_takes, shard_placement
 from .kernels.selection import Kernel, KernelRefused, Op, Requirement, forced, select
-from .sharding import automatic_axes, on_shards
+from .kernels.templates.gemm import launched_whole
+from .sharding import on_shards
 
 
 @dataclasses.dataclass(frozen=True)
@@ -407,10 +408,10 @@ class BesideCase:
         rows = (placement[2] if placement is not None
                 else jax.ShapeDtypeStruct((math.prod(inputs.shape[:-1]), inputs.shape[-1]), inputs.dtype))
         matrices = tuple(jax.ShapeDtypeStruct(kernel.shape, kernel.dtype) for kernel in kernels)
-        # Seen whole where a placement maps the rows, else where the rows and every kernel are, as `gemm`'s
-        # forward and input gradient read them (head review of b68fc2382: replicated rows by a varying kernel
-        # in a shard_map took no compound launch there).
-        whole = placement is not None or not automatic_axes()
+        # Seen whole where a placement maps the rows, else where the rows and every kernel are
+        # (`launched_whole`), as `gemm`'s forward and input gradient read them (head review of b68fc2382:
+        # replicated rows by a varying kernel in a shard_map took no compound launch there).
+        whole = placement is not None or launched_whole(inputs, kernels)
         with _launching(self.plan.named):
             try:
                 return gemm.side_by_side(rows, matrices, inputs.dtype, self.plan.precision, whole=whole)

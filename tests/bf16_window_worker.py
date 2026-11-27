@@ -11,37 +11,63 @@ from process_support import serve_mode, worker_parser
 
 
 def width_split(args) -> dict:
-    """A `[256, 256]` bfloat16 kernel split by its columns across every device of the pool's processes:
-    its window encoded where each column lives, each process's planes the window of its own columns, and
-    decoded on each process its own columns' bits again."""
+    """A `[256, 256]` bfloat16 kernel split by its columns across every device of the pool's processes, over
+    Explicit axes and over Auto ones: its window encoded where each column lives, each process's planes the
+    window of its own columns, decoded on each process its own columns' bits again; times the identity's
+    first eight rows on an H100's selection (`gemm.window_product`, row 13724), jitted outside the mesh's
+    context, XLA's decoded product, which partitions the planes, each device's output its own columns'
+    weights bit for bit and the kernel's columns there, and the Mosaic launch named, which would read the
+    planes whole on every device, refused by their placement (an Auto axis by the planes' type's mesh)."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
     from dew import quantization
+    from dew.nn.kernels import gemm, generation, selection
     from dew.nn.kernels.formats import Bf16Window
 
     rng = np.random.default_rng(13702)
     kernel = (rng.normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
-    # Its depth named by an Explicit axis of one device, which leaves each column whole.
-    mesh = Mesh(np.asarray(jax.devices()).reshape(1, -1), ("depths", "columns"),
-                axis_types=(AxisType.Explicit, AxisType.Explicit))
-    spec = PartitionSpec("depths", "columns")
-    placed = jax.make_array_from_callback(kernel.shape, NamedSharding(mesh, spec),
-                                          lambda index: kernel[index])
-    assert not placed.is_fully_addressable, "the pool's processes each hold their own columns"
-    window = quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])[quantization.QUANTIZATION][
-        "kernel"]
-    # Each device's plane shard the window of the columns the kernel placed on that device (its own map of
-    # devices to columns, not the planes'), and the window decoded there those columns' bits again.
-    columns = {shard.device: shard.index[1] for shard in placed.addressable_shards}
-    planes = [bool(np.array_equal(np.asarray(shard.data),
-                                  Bf16Window.of(kernel[:, columns[shard.device]]).words))
-              for shard in window.words.addressable_shards]
-    decoded = [bool(np.array_equal(np.asarray(shard.data).view(np.uint16),
-                                   kernel[:, columns[shard.device]].view(np.uint16)))
-               for shard in jax.jit(lambda held: held.decoded())(window).addressable_shards]
-    return {"planes": planes, "decoded": decoded}
+    rows = np.eye(8, 256, dtype=jnp.bfloat16)
+
+    def product(rows, window):
+        return gemm.window_product(rows, window, out_dtype=jnp.float32)
+
+    def placed_over(axis_type) -> dict:
+        # Its depth named by an axis of one device, which leaves each column whole.
+        mesh = Mesh(np.asarray(jax.devices()).reshape(1, -1), ("depths", "columns"),
+                    axis_types=(axis_type, axis_type))
+        sharding = NamedSharding(mesh, PartitionSpec("depths", "columns"))
+        placed = jax.make_array_from_callback(kernel.shape, sharding, lambda index: kernel[index])
+        assert not placed.is_fully_addressable, "the pool's processes each hold their own columns"
+        window = quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])[
+            quantization.QUANTIZATION]["kernel"]
+        # Each device's plane shard the window of the columns the kernel placed on that device (its own map
+        # of devices to columns, not the planes'), and the window decoded there those columns' bits again.
+        columns = {shard.device: shard.index[1] for shard in placed.addressable_shards}
+        planes = [bool(np.array_equal(np.asarray(shard.data),
+                                      Bf16Window.of(kernel[:, columns[shard.device]]).words))
+                  for shard in window.words.addressable_shards]
+        decoded = [bool(np.array_equal(np.asarray(shard.data).view(np.uint16),
+                                       kernel[:, columns[shard.device]].view(np.uint16)))
+                   for shard in jax.jit(lambda held: held.decoded())(window).addressable_shards]
+        with generation.assumed("sm90"):
+            got = jax.jit(product)(rows, window)
+            try:
+                with generation.chosen(grouped_matmul="mosaic"):
+                    jax.jit(product)(rows, window)
+            except selection.KernelRefused as error:
+                refused = error.first.code
+            else:
+                refused = None
+        held = kernel[:8].astype(np.float32)
+        owned = [shard.index[1] == columns[shard.device]
+                 and bool(np.array_equal(np.asarray(shard.data).view(np.uint32),
+                                         held[shard.index].view(np.uint32)))
+                 for shard in got.addressable_shards]
+        return {"planes": planes, "decoded": decoded, "owned": owned, "refused": refused}
+
+    return {kind.name: placed_over(kind) for kind in (AxisType.Explicit, AxisType.Auto)}
 
 
 def depth_split(args) -> dict:
