@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010]
 - The kernel challenge's lessons in the templates. [5271]
@@ -37,7 +37,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - A gathered gemm call through a narrow prologue rounds each route's operand cotangent at the prologue's dtype before the token's wide sum. [13508]
-- Dew's DC-AE ReLU linear attention (src/dew/nn/autoencoders/dc_ae.py linear_attention) on a CPU's float32 sums leaves its queries', keys' and values' gradients…. [13524]
 - A paged decode step whose pages are smaller than its key tile (page 16, the reads a key a run) at width 128 never finishes under the Mosaic interpreter on sm90. [13656]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
 - Sm120's scaled GEMM forwards are derived at a tile their compile spills. [12687]
@@ -53,6 +52,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1459, 1460, 1646]
 - The suite's wall. [5478, 12431, 12433]
+- Dew's per-destination publication lock (dew._files._publishing, theme 63c) is keyed by the destination's name as given. [13744]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
