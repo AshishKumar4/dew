@@ -23,6 +23,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _width,
     bundle_of,
     forward_block_plan,
+    pointwise_tiles,
     powered_in_kernel,
     query_swizzle,
     scopes_products,
@@ -429,9 +430,11 @@ class ForwardRegisters:
     rewalk_prescaled: bool = False
     out_dtype: Any = None
     has_output_mod: bool = False
-    output: tuple[str, ...] | None = None
-    """The dtypes of a pointwise output hook's tiles past its input (`MosaicForward.output_tiles`), which its
-    epilogue holds a chunk of columns at a time; None where its hook is not pointwise or it has none."""
+    output: tuple | None = None
+    """The output hook its consumers apply as they finish, `(hook, kinds, dtypes)` (`MosaicForward`'s), whose
+    program at each candidate's own output tile decides and prices its epilogue
+    (`attention_mosaic_program.pointwise_tiles`, as the walk replays it there, `sliced_hook`); None where it
+    has none."""
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None, masked: bool = False) -> int | None:
@@ -454,9 +457,11 @@ class ForwardRegisters:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
+        # The hook's program at this candidate's own output tile, as its walk takes it (`sliced_hook`).
+        hooked = None if self.output is None else pointwise_tiles(*self.output, (tiles.block_q, value_width))
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
                                   has_output_mod=self.has_output_mod, training=self.residuals,
-                                  pointwise=self.output is not None)
+                                  pointwise=hooked is not None)
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,
@@ -464,7 +469,7 @@ class ForwardRegisters:
             positions=self.positions, per_span=self.per_span, runs=self.runs, merged=self.merged,
             started=self.started,
             dropped=self.dropped, weight_parts=self.weight_parts,
-            scaled_products=self.scaled_products, block_plan=plan, masked=masked, output=self.output))
+            scaled_products=self.scaled_products, block_plan=plan, masked=masked, output=hooked))
 
 
 def prologue_registers(family: mosaic.Family, block_q: int, width: int, dtype, hook: Callable,

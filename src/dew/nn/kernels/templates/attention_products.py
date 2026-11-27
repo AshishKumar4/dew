@@ -33,7 +33,6 @@ from dew.nn.kernels.templates.attention import (
     moved_places,
     widened_places,
 )
-from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.hooks import Hook, Side
 
 SUM = "sum"
@@ -72,8 +71,8 @@ def selected(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax
     `[B, K, Hk, Dp]` over `value` `[B, K, Hk, Dv]` selected by `combine` (`Banded`) within `spans`, under
     `hooks`: `(query, key, value, spans, hooks)` as the module's docstring lays them, each query's distances
     counted from its place `places` `[B, Q]` (its index by default). A score hook's KEY and TILE parameters
-    stand once a copy; one reading its keys' indices is refused (each copy's are its own), as are a band's
-    and the prologues (each product's query and key take theirs before the call); a dropping call draws
+    stand once a copy and it reads each key's own index (`_copied_hooks`); a band's parameters and the
+    prologues are refused (each product's query and key take theirs before the call); a dropping call draws
     each entry at its key's own place."""
     hooks = Hooks() if hooks is None else hooks
     products = _paired(queries, keys)
@@ -187,15 +186,21 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
 
 
 def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
-    """`hooks` over the keys' `products` copies (`selected`): a KEY or TILE parameter once a copy, a dropping
-    call's draw at each copy's keys' own places."""
+    """`hooks` over the keys' `products` copies (`selected`): its score hook given each key's own index, a
+    copy's taken back to its key's (`k % count`), in every mainloop and derivative alike; a KEY or TILE
+    parameter once a copy, a dropping call's draw at each copy's keys' own places. Read off the hook's
+    program at one tile, a shape-dependent hook reading its keys' indices at another passed unseen and was
+    read at its copy's index (train 1362's F1)."""
     for side in hooks.score.sides:
         if kind_of(side) is Kind.BAND:
             raise ValueError("a band's parameters hold each query's keys about it, which a selected call's "
                              "copies of the keys do not")
-    if score_places(hooks, may=True)[1]:
-        raise ValueError("a selected call's score hook reads no key's index: each copy's keys take indices "
-                         "of their own")
+    score = hooks.score.fn
+    if score is not None:
+        original = score
+
+        def score(s, q_pos, k_pos, *params):
+            return original(s, q_pos, k_pos % count, *params)
     # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its
     # copies' gradients sum before they round to its own (a 16-bit bias's near and far terms each past its
     # largest, summing to 0).
@@ -206,4 +211,4 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
     if drop is not None:
         keys = jnp.arange(count, dtype=jnp.int32) if drop.keys is None else drop.keys
         drop = dataclasses.replace(drop, keys=jnp.concatenate([keys] * products))
-    return dataclasses.replace(hooks, score=Hook(hooks.score.fn, sides), drop=drop)
+    return dataclasses.replace(hooks, score=Hook(score, sides), drop=drop)

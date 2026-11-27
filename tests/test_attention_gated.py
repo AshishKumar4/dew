@@ -47,7 +47,8 @@ def _wide(queries: int, width: int):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("hook", ["pointwise", "whole-width", "width-reading", "rows-reading"])
+@pytest.mark.parametrize("hook", ["pointwise", "whole-width", "width-reading", "rows-reading",
+                                  "entrywise-at-its-tile-alone"])
 @pytest.mark.parametrize("device", ["sm90", "sm80"])
 def test_a_wide_gated_launch_is_on_par_with_its_16_bit_gate_interpreted(device, hook):
     """A bf16 gate over a forward 256 wide under the interpreter: a pointwise gate in one launch of every
@@ -72,6 +73,14 @@ def test_a_wide_gated_launch_is_on_par_with_its_16_bit_gate_interpreted(device, 
             # Its constant its tile's rows' and width's: 1 at the launch's 64 x 256 tile, another elsewhere.
             def tiled(out, g):
                 return out * jax.nn.sigmoid(g) * (out.shape[-1] / width if out.shape[0] >= 64 else 1.0)
+
+            return template.Hooks(output=Hook(tiled, (Side(gate, template.Kind.OUTPUT),)))
+        if hook == "entrywise-at-its-tile-alone":
+            # Entrywise at a launch's own tile, a transpose at another's rows (8, a tile the epilogue's
+            # pricing read alone): priced and walked at the one tile, its config's (train 1362's F6).
+            def tiled(out, g):
+                gated = out * jax.nn.sigmoid(g)
+                return gated.T.reshape(gated.shape) if out.shape[0] == 8 else gated
 
             return template.Hooks(output=Hook(tiled, (Side(gate, template.Kind.OUTPUT),)))
         return template.Hooks(output=Hook(lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, width))),

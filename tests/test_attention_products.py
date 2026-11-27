@@ -199,26 +199,36 @@ def test_a_banded_combine_refuses_bands_whose_products_would_share_keys(bands):
         attention_products.Banded(bands)
 
 
-def test_a_selected_call_refuses_a_score_hook_reading_its_keys_indices():
-    """A score hook reading its keys' indices (ALiBi's distance) is refused on a selected call, whose copies'
-    keys take indices of their own; one reading the scores alone (a softcap) is taken."""
+@pytest.mark.parametrize("form", FORMS)
+def test_a_banded_calls_score_hook_reads_each_keys_own_index(form):
+    """A banded call (`Banded((WINDOW,))`, causal) under an ALiBi-like score hook reading its keys' indices,
+    `s - (q - k) / 16`, on the template's route: on par with each key's own product's logits under the
+    hook at its own index (check 1), output and every product's gradients; the copies' keys taken back to
+    their own (`k % K`), where read off one tile's program a hook reading them at another passed unseen at
+    its copy's index (train 1362's F1)."""
     spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+    natural, accurate = FORMS[form]
     combine = attention_products.Banded((WINDOW,))
-    operand = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.bfloat16)
 
-    def hooked(fn):
-        return template.Hooks(score=Hook(fn))
+    def alibi(s, q, k):
+        return s - (q - k).astype(s.dtype) / 16
 
-    with pytest.raises(ValueError):
-        attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
-                                    hooked(lambda s, q, k: s - (q - k)))
-    # One that may read them, in a branch: refused alike.
-    with pytest.raises(ValueError):
-        attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
-                                    hooked(lambda s, q, k: jax.lax.cond(s[0, 0] > 0, lambda k: s + k,
-                                                                        lambda k: s - k, k)))
-    attention_products.selected((operand,) * 2, (operand,) * 2, operand, spans, combine,
-                                hooked(lambda s, q, k: 30.0 * jnp.tanh(s / 30.0)))
+    hooks = template.Hooks(score=Hook(alibi))
+
+    def ours(q1, q2, k1, k2, value):
+        return attention_products.attend((q1, q2), (k1, k2), value, spans, combine, hooks, scale=SCALE,
+                                         natural=natural, accurate=accurate)
+
+    def reference(q1, q2, k1, k2, value):
+        logits = [template.scores(q, k, spans, scale=SCALE) for q, k in ((q1, k1), (q2, k2))]
+        apart = jnp.arange(TOKENS)[:, None] - jnp.arange(TOKENS)[None, :]
+        near = jnp.abs(apart) <= WINDOW
+        biased = jnp.where(near, logits[0], logits[1]) - apart.astype(jnp.float32) / 16
+        return _softmax_reference(jnp.where(template.dense(spans)[:, None], biased, -jnp.inf), value,
+                                  q1.dtype)
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), _draw(2),
+                    f"banded products under a hook reading keys {form}", seeds=SEEDS)
 
 
 def test_a_banded_call_selects_by_a_querys_explicit_place_however_far():

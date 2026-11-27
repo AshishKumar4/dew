@@ -1954,18 +1954,14 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
     return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split, pointwise)
 
 
-POINTWISE_ROWS = 8
-"""The rows the forward's register model traces an output hook at (`pointwise_tiles`), before its launch's
-query tile is chosen."""
-
-
 def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
                     tile: tuple[int, int]) -> tuple[str, ...] | None:
     """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input where its program at a
     `tile` of fp32 output acts one entry at a time (`entrywise_hook`), which its epilogue then replays on a
     chunk of the tile's columns (`sliced_hook`); None where it does not, or there is none (the whole-width
-    finish). Its tiles' dtypes are plain data, which a launch keyed by its hook's fingerprint
-    (`tuning.KernelOp.keyed`) keeps."""
+    finish): the forward's pricing and its walk read it at the one tile, a config's `[block_q, width]`. A
+    launch keyed by its hook's fingerprint (`tuning.KernelOp.keyed`) holds no program, so prices the
+    whole-width finish, the larger."""
     closed = entrywise_hook(hook, kinds, dtypes, tile)
     if closed is None:
         return None
