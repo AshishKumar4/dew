@@ -1449,7 +1449,7 @@ def test_a_hoppers_nvfp4_decode_tile_bands_its_columns_and_stages_unrestaged(dep
     (traced, `tuning.seen`): at 64 rows, which no swap takes (a role's rows), its tile's planar snake bands
     every column tile a wave reaches (its one row tile spanned, `resources.band`: 64 column tiles a band at
     q/o and down, 128 of up's 224), as the parent of row 5874 did where the balanced band of 8 ran 2x slower
-    (M-FS-89c/d); at 1 and 16 rows, its swapped call's derived tile (`_swapped`, `_derived`: warpgroup MMA's
+    (M-FS-89c/d); at 1 and 16 rows, its swapped call's derived tile (`_swapped_tile`: warpgroup MMA's
     fed ring) keeps its outputs unrestaged, which ran 1.65x slower restaged to four stages at (32, 1)
     (M-FS-89c/d)."""
     from dew.nn.kernels import formats
@@ -1466,14 +1466,14 @@ def test_a_hoppers_nvfp4_decode_tile_bands_its_columns_and_stages_unrestaged(dep
                   if isinstance(op, grouped_quantized.MosaicPackedGmm)]
         assert packed, launches.taken
         for op, config, ba in packed:
-            swapped = op._swapped(ba, target)
+            assert isinstance(config, tiling.Tiles), config
+            swapped = op._swapped_tile(ba, target)
             if rows == 64:
                 columns = width // config.block_n
                 assert swapped is None and not config.swapped, config
                 assert config.grid_block_n == 1 << (min(columns, 132).bit_length() - 1), config
             else:
-                tile = op._derived(swapped, target)
-                assert tile is not None and tile.staging is None, tile
+                assert swapped is not None and swapped.staging is None, swapped
 
 
 @pytest.mark.parametrize(("generation_name", "family", "cluster", "searched", "walked", "width", "band"), [
@@ -1492,8 +1492,8 @@ def test_a_bands_columns_are_its_clusters_and_its_rows_the_walked_ones(generatio
         target = generation.gpu_target()
         layout = pricing.family_of(tiling.Tiles(128, 128, 64, 2, 1, cluster=cluster, family=family),
                                    jnp.bfloat16, target)
-        tile = derivation._shaped(layout, 128 if cluster > 1 else 64, 128 if cluster > 1 else 64, 64,
-                                  consumers=2 if cluster > 1 else 1, programs=1, rows=searched, width=width,
+        side = 128 if cluster > 1 else 64
+        tile = derivation._shaped(layout, side, side, 64, consumers=1, programs=1, rows=searched, width=width,
                                   multiprocessors=target.multiprocessors, grouped=False, walked=walked)
     assert tile.grid_block_n == band, tile
 
