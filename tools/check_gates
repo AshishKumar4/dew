@@ -6,9 +6,9 @@
 locks	sh tools/locks_gate.sh
 flake8	"$PYTHON" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=.venv*
 ruff	"$PYTHON" -m ruff check $ruff_inputs
-slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
+slop	JAX_PLATFORMS=cpu "$PYTHON" -m tools.lint_slop
 # Dew's layering contracts, read from the source's imports (docs/design/architecture.md).
-layers	"$PYTHON" tools/lint_layers.py
+layers	"$PYTHON" -m tools.lint_layers
 # Every test file collects on each tested Python, one gate a Python (`ci.py pythons --check` holds these to PYTHONS):
 # a name a package's __all__ lists that it does not bind, or any import error, stops a file at collection, which a head
 # whose train runs it learns only from that train (Main, 2026-11-13: a head's reach runs no whole suite; a head's
@@ -20,7 +20,7 @@ collect-3.14	( l=$(mktemp); trap 'rm -f "$l"' EXIT; .venv-3.14/bin/python tools/
 # A released version keeps the notes it shipped, and new entries go under ## Unreleased (row 3050).
 changelog	"$PYTHON" tools/changelog_released.py check
 # The ratchet reads the inventory's whole history, which a shallow checkout fetches first.
-ratchet	sh tools/base_history.sh && "$PYTHON" tools/lint_slop.py --ratchet --base="$BASE"
+ratchet	sh tools/base_history.sh && "$PYTHON" -m tools.lint_slop --ratchet --base="$BASE"
 # No forecasts in the prose and messages a change adds (the bible), nor a reviewer's internal handle.
 public-text	sh tools/base_history.sh && "$PYTHON" tools/public_text.py "$BASE"
 # No test a change touches reads an attribute its class never defines that it did not read before.
@@ -57,5 +57,5 @@ tool-types-5	"$PYTHON" -m tools.check_tool_types --shard 5/6
 tool-types-6	"$PYTHON" -m tools.check_tool_types --shard 6/6
 # Main still holds structural copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's,
 # whose history a shallow checkout fetches first; main holds no text copy, so any fails.
-duplicate-text	"$PYTHON" tools/duplicates.py --reading=text $duplicate_roots
-duplicate-structure	sh tools/base_history.sh && "$PYTHON" tools/duplicates.py --reading=structure --base=origin/main $duplicate_roots
+duplicate-text	"$PYTHON" -m tools.duplicates --reading=text $duplicate_roots
+duplicate-structure	sh tools/base_history.sh && "$PYTHON" -m tools.duplicates --reading=structure --base=origin/main $duplicate_roots
