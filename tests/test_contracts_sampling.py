@@ -135,3 +135,38 @@ def test_a_guided_prediction_holds_every_order(edge):
 
     assert_drawn_contract(guidance.guide, inputs, EDGES[edge], f"a guided prediction {edge}", truth_fn=affine,
                           plain_fn=affine)
+
+
+def test_a_guided_predictions_derivative_along_its_scale_and_conditional_is_the_affine_ones_at_a_unit_scale():
+    """`guidance.guide`'s derivative along its scale and its conditional prediction is the affine
+    combination's, one, at every scale, a unit one included, where its value is the conditional exactly; and
+    along its scale and its unconditional, minus one (a branch on the unit scale made both zero there: 512
+    of 1024 unit-scale elements of a mixed derivative missed)."""
+    from dew.sampling import guidance
+
+    conditional, unconditional = normal_draw((2302, 0), (4, 5), (4, 5))
+    scale = jnp.asarray([1.0, 3.5, -0.5, 1.0], jnp.float32)
+    ones, zeros = jnp.ones_like(conditional), jnp.zeros_like(conditional)
+
+    def along(conditional_direction, unconditional_direction):
+        def tangent(scale):
+            return jax.jvp(lambda c, u: guidance.guide(c, u, scale), (conditional, unconditional),
+                           (conditional_direction, unconditional_direction))[1]
+        return jax.jvp(tangent, (scale,), (jnp.ones_like(scale),))[1]
+
+    np.testing.assert_array_equal(np.asarray(along(ones, zeros)), np.ones((4, 5), np.float32))
+    np.testing.assert_array_equal(np.asarray(along(zeros, ones)), -np.ones((4, 5), np.float32))
+
+
+def test_a_guided_predictions_direction_stays_finite_where_its_affine_combination_is():
+    """`guidance.guide`'s direction is the affine combination's in its own order, the directions' difference
+    formed first, finite wherever that is: two directions of 1e38 at a scale of 4 give 1e38 (weighed apart,
+    4 times one less 3 times the other overflows); at a unit scale it is the conditional's direction
+    exactly."""
+    from dew.sampling import guidance
+
+    huge = jnp.full((2, 3), 1e38, jnp.float32)
+    zeros = jnp.zeros((2, 3), jnp.float32)
+    scaled = jax.jvp(lambda c, u: guidance.guide(c, u, jnp.asarray([4.0, 1.0], jnp.float32)),
+                     (zeros, zeros), (huge, huge))[1]
+    np.testing.assert_array_equal(np.asarray(scaled), np.asarray(huge))

@@ -541,8 +541,8 @@ def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
 
 def pinned_by_url(fs: AbstractFileSystem, path: str) -> bool:
     """Whether the object at `path` is one version by its URL alone: a Hub repository's file at a full
-    commit, which no write moves."""
-    if not isinstance(fs, HfFileSystem):
+    commit, which no write moves, read directly or through a transport cache over the Hub (`backing`)."""
+    if not isinstance(backing(fs), HfFileSystem):
         return False
     revision = parse_hf_uri(f"hf://{path}").revision
     return revision is not None and REGEX_COMMIT_HASH.fullmatch(revision) is not None
@@ -653,11 +653,16 @@ class Store:
     def pinned(self) -> Store:
         """This object at the commit its revision names now, where it is a Hub repository's file at a
         branch or a tag, which a later commit moves (a file at a commit is one version by its URL,
-        `pinned_by_url`); this object itself on any other store, and at a commit already."""
+        `pinned_by_url`), read directly or through a transport cache over the Hub, which it keeps in front;
+        this object itself on any other store, and at a commit already."""
         fs, path = self.resolve()
-        if not isinstance(fs, HfFileSystem) or pinned_by_url(fs, path):
+        hub = backing(fs)
+        if not isinstance(hub, HfFileSystem) or pinned_by_url(fs, path):
             return self
-        return replace(self, url="hf://" + _hub_commit(fs, path)[1])
+        # At the Hub, its transport chain kept in front (`blockcache::hf://...@main/...` is read at the commit
+        # through the same cache): a chain's last link is the store's own URL (row 13554).
+        chain, _, _ = self.url.rpartition("::")
+        return replace(self, url=(chain + "::" if chain else "") + "hf://" + _hub_commit(hub, path)[1])
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):

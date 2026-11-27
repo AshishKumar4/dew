@@ -309,6 +309,22 @@ def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_repor
     assert active_profile() is None
 
 
+def test_a_trace_it_cannot_read_fails_its_export_after_its_manifest_says_so(tmp_path):
+    """A GPU capture stopped cleanly whose trace cannot be read (an `OSError` past its absence: its file a
+    link to itself) fails its export, raised as `ExportFailed`, once its manifest names the capture failed
+    and why, as a manifest explains every failed capture (row 13551)."""
+    from dew.telemetry.profile import ExportFailed, _export
+
+    capture = tmp_path / "capture"
+    (capture / "plugins" / "profile" / "run").mkdir(parents=True)
+    looped = capture / "plugins" / "profile" / "run" / "host.xplane.pb"
+    looped.symlink_to(looped)
+    with pytest.raises(ExportFailed):
+        _export(capture, None, {"backend": "gpu", "device_kinds": ["NVIDIA H100"], "options": {}}, [])
+    written = manifest(capture)
+    assert written["capture_status"] == "failed" and written["capture_errors"], written
+
+
 def test_a_capture_without_reports_keeps_its_trace_and_manifest_and_needs_no_xprof(tmp_path):
     """A capture whose reader reads its trace alone (`reports=False`), as a benchmark's device timeline
     and XLA's profile-guided estimates do, keeps its trace and its manifest and writes no report, so it

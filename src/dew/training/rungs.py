@@ -116,10 +116,11 @@ def _configured(settings: StepSettings) -> Mapping[str, object] | None:
     optimizer config it was built from. None where the objective's key states none (a class of a user's
     that states no key of its own): such a run keeps no record. Two runs of one shape and code whose steps
     compute otherwise by a setting name two records (the 2026-11-26 audit: a run skipping a step not
-    finite, or scoring its head in other chunks, took another's rung). A raw optimizer's settings are
-    functions, which only its code states."""
+    finite, or scoring its head in other chunks, took another's rung). A raw optimizer (an Optax
+    transformation handed in built) is its functions as an identity states them (`dew._stated.stated`: their
+    code and what they read, a closure's values among it), so two that update otherwise, one state's type
+    alike, name two records (row 13556); one whose functions read what no identity states keeps none."""
     from dew.objectives.base import stated_trace
-    from dew.optim import OptimConfig
 
     trace = stated_trace(settings.objective)
     if trace is None:
@@ -127,8 +128,7 @@ def _configured(settings: StepSettings) -> Mapping[str, object] | None:
     apart = ("objective", "built_optimizer", "device_mesh", "state_mesh", "step", "optimizer_source")
     held = {field.name: getattr(settings, field.name) for field in dataclasses.fields(settings)
             if field.name not in apart}
-    source = settings.optimizer_source
-    return {**held, "objective": trace, "optimizer": source if isinstance(source, OptimConfig) else None}
+    return {**held, "objective": trace, "optimizer": settings.optimizer_source}
 
 
 def _code(settings: StepSettings, modules: Sequence[object], step: Callable[..., StepFn] | None) -> list[str]:

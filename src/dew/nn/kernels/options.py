@@ -173,7 +173,22 @@ def host_callbacks(lowered: jax.stages.Lowered) -> tuple:
 
 
 def _text_digest(lowered: jax.stages.Lowered) -> str:
-    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+    """The digest of `lowered`'s program, rendered once a lowering, which holds one program for as long as
+    it lives: its process-local key (`program_key`) and every fingerprint a file of programs holds it by
+    (`program_digest`, a step handed an executable compiled ahead checked against it once its key was read,
+    row 13555) read the one digest. Its StableHLO module as JAX prints it without debug locations
+    (`Lowered.as_text`), which hold the paths a program was traced from, another on every host that reads a
+    file of programs (its bytecode holds them)."""
+    with _KEYING:
+        if (known := _TEXT_DIGESTS.get(lowered)) is not None:
+            return known
+    digest = hashlib.sha256(lowered.as_text().encode()).hexdigest()
+    with _KEYING:
+        _TEXT_DIGESTS[lowered] = digest
+    return digest
+
+
+_TEXT_DIGESTS: weakref.WeakKeyDictionary[jax.stages.Lowered, str] = weakref.WeakKeyDictionary()
 
 
 def program_digest(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None) -> str:
