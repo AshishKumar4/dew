@@ -366,8 +366,8 @@ def _window_served(lhs, rhs, compute, precision):
 
 
 def _window_takes(lhs, compute, precision) -> bool:
-    """Whether a `Bf16Window`'s product (`window_product`: bf16 rows' exact products summed in fp32, no partial
-    sums promoted) is the one `gemm` is asked: its products' dtype (`compute`, `lhs`'s where None) bf16's,
+    """Whether a `Bf16Window`'s product (`window_product`: bf16 rows' exact products summed in fp32, none
+    promoted) is the one `gemm` is asked: its products' dtype (`compute`, `lhs`'s where None) bf16's,
     at the default precision the call and the run each ask (above it an fp32 output's partial sums are
     promoted, `templates.product.declared`; an algorithm may narrow the operands) (row 13686)."""
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
