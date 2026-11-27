@@ -730,6 +730,12 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
     return False
 
 
+def _iota(jaxpr: jax_core.Jaxpr) -> bool:
+    """Whether `jaxpr`, or a computation it nests, forms an iota: a value of its places, not its entries."""
+    return any(eqn.primitive.name == "iota" or any(_iota(nested) for nested in jax_core.jaxprs_in_params(
+        eqn.params)) for eqn in jaxpr.eqns)
+
+
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                  differentiated: bool = False, query: tuple | None = None) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
@@ -1911,14 +1917,17 @@ def powered_in_kernel(family: mosaic.Family, dtype, *, has_query_mod: bool = Fal
 
 
 class BlockPlan(NamedTuple):
-    """Forward value-column block plan (`forward_block_plan`): hook split, `out_dtype`, in-kernel hook."""
+    """Forward value-column block plan (`forward_block_plan`): hook split, `out_dtype`, in-kernel hook, and
+    whether that hook is pointwise (`pointwise_tiles`), which its epilogue may finish a chunk of columns at a
+    time."""
     split: bool
     out_dtype: Any
     output_hook: bool
+    pointwise: bool = True
 
     def epilogue_chunk(self, family: mosaic.Family, value_width: int, dtype, *,
                        training: bool = False, masked: bool = False, kept: bool | None = None) -> int:
-        if (training or masked or not family.budgets_registers
+        if (training or masked or not family.budgets_registers or (self.output_hook and not self.pointwise)
                 or (family.places_on_role if kept is None else kept) or value_width <= 128):
             return 0
         ed = dtype if self.out_dtype is None else self.out_dtype
@@ -1938,10 +1947,35 @@ def output_stage_swizzle(family: mosaic.Family, value_width: int, out_dtype) -> 
 
 
 def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
-                       training: bool) -> BlockPlan:
-    """Derive hook placement and block `out_dtype` from `value_columns` (row 9542)."""
+                       training: bool, pointwise: bool = True) -> BlockPlan:
+    """Derive hook placement and block `out_dtype` from `value_columns` (row 9542), and whether the
+    in-kernel hook is `pointwise` (`pointwise_tiles`)."""
     split = not training and has_output_mod and value_columns(total_v, columns) < total_v
-    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split)
+    return BlockPlan(split, jnp.float32 if split else out_dtype, has_output_mod and not split, pointwise)
+
+
+POINTWISE_TILE = (8, 16)
+"""The tile an output hook is traced at to read whether it is pointwise (`pointwise_tiles`)."""
+
+
+def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...]
+                    ) -> tuple[str, ...] | None:
+    """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input, where it is pointwise:
+    traced at a tile (`POINTWISE_TILE`) of fp32 output and its parameters' tiles (a head's a scalar), every
+    value of its program that tile's or a scalar's (`_off_tile`, a jitted helper's read so) and none an
+    iota's, so a block of an output tile's columns and the parameters' same columns give that block of its
+    value (`BlockPlan.epilogue_chunk`); None where it is not (a hook laying its parameter at the whole width,
+    a reshape's, keeps the whole-width finish) or where there is none. Its tiles' dtypes are plain data, which
+    a launch keyed by its hook's fingerprint (`tuning.KernelOp.keyed`) keeps."""
+    if hook is None or not callable(hook):
+        return None
+    params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else POINTWISE_TILE, kept)
+              for kind, kept in zip(kinds, dtypes, strict=True)]
+    closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(POINTWISE_TILE, jnp.float32), *params)
+    if _off_tile(closed.jaxpr, POINTWISE_TILE) or _iota(closed.jaxpr):
+        return None
+    return tuple(jnp.dtype(var.aval.dtype).name for eqn in closed.jaxpr.eqns for var in eqn.outvars
+                 if tuple(var.aval.shape) == POINTWISE_TILE)
 
 
 def value_columns(padded: int, columns: int | None) -> int:

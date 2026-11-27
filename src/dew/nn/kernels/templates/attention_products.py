@@ -28,11 +28,11 @@ each combine lowered onto one call of the template, its one softmax over one val
 
 import dataclasses
 import itertools
+import math
 from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
-from jax._src import core as jaxpr_core
 
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.templates import attention_route
@@ -42,10 +42,11 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Kind,
     dense,
-    kept_dtype,
+    kept_value,
     kind_of,
     logit_scale,
 )
+from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum
 
@@ -130,8 +131,9 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
         if len(queries) != 2:
             raise ValueError(f"a parallax call holds two products, the softmax's and the second's, not "
                              f"{len(queries)}")
-        return parallax(queries[0], queries[1], keys[0], keys[1], value, spans, scale=scale, natural=natural,
-                        accurate=accurate)
+        # Its value is a forward and a backward of the template, the backward's in its accurate form whatever
+        # `accurate` names (`_parallax_kernels`).
+        return parallax(queries[0], queries[1], keys[0], keys[1], value, spans, scale=scale, natural=natural)
     if not isinstance(combine, Banded):
         raise ValueError(f"a step's products combine by SUM, a Banded selection or PARALLAX, not {combine!r}")
     # The keys' and the value's copies laid out wide and their gradients handed back unrounded
@@ -145,18 +147,19 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
 
 
 def parallax(query: jax.Array, second: jax.Array, key: jax.Array, second_key: jax.Array, value: jax.Array,
-             spans: KeySpans, *, scale: float | None = None, natural: bool | None = None,
-             accurate: bool | None = None) -> jax.Array:
+             spans: KeySpans, *, scale: float | None = None, natural: bool | None = None) -> jax.Array:
     """Parallax's attention `[B, Q, H, Dv]` (`PARALLAX`): the softmax of `query` `[B, Q, H, D]` by `key`
     `[B, K, Hk, D]` over `value` `[B, K, Hk, Dv]` within `spans`, its weights each taken by
     `1 + τ - t` where `t = second · second_keyᵀ`, unscaled, and `τ` its mean under the weights; on the
     template's kernels (the module's docstring), differentiable in every operand by the plain formula
     (`_parallax_formula`). `scale` is `D ** -0.5` by default."""
     scale = logit_scale(query.shape[-1], scale)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"a parallax call's logit scale is positive and finite, its second product's "
+                         f"derivative taken along the queries over it: {scale}")
 
     def kernels(query, second, key, second_key, value, spans):
-        return _parallax_kernels(query, second, key, second_key, value, spans, scale=scale, natural=natural,
-                                 accurate=accurate)
+        return _parallax_kernels(query, second, key, second_key, value, spans, scale=scale, natural=natural)
 
     def derivative(primals, tangents, out):
         del out
@@ -171,10 +174,15 @@ def parallax(query: jax.Array, second: jax.Array, key: jax.Array, second_key: ja
     return rule(query, second, key, second_key, value, spans)
 
 
-def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *, scale: float, natural,
-                      accurate) -> jax.Array:
+def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *, scale: float,
+                      natural) -> jax.Array:
     """`parallax`'s value on the template's kernels: the softmax's output and its dQ along `second / scale`,
-    one forward and one backward of the call the module's docstring lays out (`jax.vjp` of the route)."""
+    one forward and one backward of the call the module's docstring lays out (`jax.vjp` of the route). The
+    backward takes its accurate products and D about each query's anchor from its split sums whatever the
+    call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast
+    form's `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in
+    fp16 gave a mean of 8192). The cotangent takes the logit scale's inverse to its nearest power of two,
+    exactly, and the dQ the rest of it, so neither under- nor overflows where the result does not."""
     width = query.shape[-1]
     laid_query = jnp.concatenate([query, jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)], -1)
     laid_key = jnp.concatenate([key, value], axis=-1)
@@ -182,14 +190,15 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
 
     def attended(laid_query):
         return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
-                                      accurate=accurate)
+                                      accurate=True)
 
     out, pull = jax.vjp(attended, laid_query)
-    cotangent = jnp.concatenate([second.astype(out.dtype),
+    power = float(2.0 ** round(-math.log2(scale)))
+    cotangent = jnp.concatenate([(second * jnp.asarray(power, second.dtype)).astype(out.dtype),
                                  jnp.zeros((*out.shape[:-1], value.shape[-1]), out.dtype)], axis=-1)
     (moved,) = pull(cotangent)
     softmax = out[..., second_key.shape[-1]:].astype(jnp.float32)
-    along = moved[..., width:].astype(jnp.float32) / jnp.float32(scale)
+    along = moved[..., width:].astype(jnp.float32) * jnp.float32(1.0 / (scale * power))
     return (softmax - along).astype(query.dtype)
 
 
@@ -249,14 +258,20 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
         # Each run's keys within `[lo, hi)` of the query's index, empty where none.
         return jnp.maximum(start, jnp.clip(lo, 0, count)), jnp.minimum(end, jnp.clip(hi, 0, count))
 
+    # A band past every distance a query and a key of the call lie apart reads as that distance, so no edge
+    # passes int32's range.
+    reach = start.shape[1] + count
+    bands = tuple(min(band, reach) for band in bands)
     copies = []
     for p in range(len(bands) + 1):
         if p == 0:
             sides = [within(place - bands[0], place + bands[0] + 1)]
         else:
-            # Past band p - 1 and within band p: the keys before the query, then those after it.
-            before = place - (bands[p] if p < len(bands) else count)
-            after = place + (bands[p] if p < len(bands) else count) + 1
+            # Past band p - 1 and within band p: the keys before the query, then those after it; the last
+            # band's outer edges the keys' own, whatever the query's place (one past the keys, a rectangular
+            # call's).
+            before = place - bands[p] if p < len(bands) else jnp.zeros_like(place)
+            after = place + bands[p] + 1 if p < len(bands) else jnp.full_like(place, count)
             sides = [within(before, place - bands[p - 1]), within(place + bands[p - 1] + 1, after)]
         lo = jnp.concatenate([side[0] for side in sides], axis=-1)
         hi = jnp.concatenate([side[1] for side in sides], axis=-1)
@@ -279,28 +294,17 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
         if kind_of(side) is Kind.BAND:
             raise ValueError("a band's parameters hold each query's keys about it, which a selected call's "
                              "copies of the keys do not")
-    if hooks.score.fn is not None and _reads_keys(hooks.score):
+    if score_places(hooks)[1]:
         raise ValueError("a selected call's score hook reads no key's index: each copy's keys take indices "
                          "of their own")
-    sides = tuple(Side(jnp.concatenate([side.value] * products, axis=side.axes.index("keys")), side.axes)
+    # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its
+    # copies' gradients sum before they round to its own (a 16-bit bias's near and far terms each past its
+    # largest, summing to 0).
+    sides = tuple(Side(jnp.concatenate([kept_value(side.value)] * products, axis=side.axes.index("keys")),
+                       side.axes)
                   if "keys" in side.axes else side for side in hooks.score.sides)
     drop = hooks.drop
     if drop is not None:
         keys = jnp.arange(count, dtype=jnp.int32) if drop.keys is None else drop.keys
         drop = dataclasses.replace(drop, keys=jnp.concatenate([keys] * products))
     return dataclasses.replace(hooks, score=Hook(hooks.score.fn, sides), drop=drop)
-
-
-def _reads_keys(hook: Hook) -> bool:
-    """Whether a score hook `fn(s, q_pos, k_pos, *params)` reads its keys' indices: its traced program uses
-    `k_pos`."""
-    if hook.fn is None:
-        return False
-    tile = (8, 8)
-    params = [jax.ShapeDtypeStruct(() if kind_of(side) is Kind.HEAD else tile, kept_dtype(side.value.dtype))
-              for side in hook.sides]
-    places = jax.ShapeDtypeStruct(tile, jnp.int32)
-    traced = jax.make_jaxpr(hook.fn)(jax.ShapeDtypeStruct(tile, jnp.float32), places, places, *params)
-    used = {var for eqn in traced.jaxpr.eqns for var in eqn.invars if isinstance(var, jaxpr_core.Var)}
-    used |= {var for var in traced.jaxpr.outvars if isinstance(var, jaxpr_core.Var)}
-    return traced.jaxpr.invars[2] in used

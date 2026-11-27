@@ -119,6 +119,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     most_consumers,
     placed_draws,
     placed_scratch,
+    pointwise_tiles,
     reducing,
     refused,
     scaled_drop,
@@ -377,6 +378,11 @@ class MosaicForward(_Mainloop[Tiles]):
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
     output_dtypes: tuple[str, ...] = ()
+    output_tiles: tuple[str, ...] | None = None
+    """The dtypes of its output hook's tiles past its input where the hook is pointwise
+    (`attention_mosaic_program.pointwise_tiles`), its epilogue finishing a chunk of columns at a time; None
+    where it is not, or there is none. Read off the hook as its builder takes it (`_forward_call`): a keyed
+    launch's hook is its fingerprint, which keeps no trace of it."""
     output_width: int = TRACED_TILE
     query_mod: Callable | None = None
     """The query prologue (`Hooks.query`), which each consumer takes on its query tile where it loads it,
@@ -1121,7 +1127,8 @@ class MosaicForward(_Mainloop[Tiles]):
         training = ba.arguments.get("residuals") is Kept.SPLIT
         out_dtype = None if self.out_dtype is None else jnp.dtype(self.out_dtype)
         plan = forward_block_plan(full_v, config.columns, out_dtype,
-                                  has_output_mod=self.output_mod is not None, training=training)
+                                  has_output_mod=self.output_mod is not None, training=training,
+                                  pointwise=self.output_tiles is not None)
         # A paged call's key tile of several pages loaded as its launch loads it (`paged_reads`).
         page = _page(ba)
         deciding = self.deciding(ba, config, target=target) if decides is None else decides
@@ -1284,8 +1291,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                           else (self.query_mod, self.query_kinds, self.query_dtypes)),
                                 prescaled=spec.prescale != 1.0, rewalk_prescaled=taken != 1.0,
                                 out_dtype=self.out_dtype,
-                                output=(None if self.output_mod is None
-                                        else (self.output_mod, self.output_kinds, self.output_dtypes)))
+                                has_output_mod=self.output_mod is not None, output=self.output_tiles)
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -1559,6 +1565,9 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_kinds=kinds_of(hooks.output.sides),
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score.sides),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output.sides),
+                       output_tiles=pointwise_tiles(hooks.output.fn, kinds_of(hooks.output.sides),
+                                                    tuple(kept_dtype(param.value.dtype)
+                                                          for param in hooks.output.sides)),
                        score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,

@@ -5,6 +5,7 @@ the Mosaic mainloop interpreted as an H100's and an A100's."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from attention_oracle import traced_attention_terms
 from generation_support import INTERPRETS
@@ -12,7 +13,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_products
-from dew.nn.kernels.templates.hooks import Hook
+from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.precision import float32_einsum
 
 pytestmark = pytest.mark.kernel
@@ -26,17 +27,19 @@ FORMS = {"fast": (False, False), "accurate": (True, True)}
 """Each form's `(natural, accurate)`."""
 
 
-def _draw(products: int, dtype=jnp.bfloat16):
+def _draw(products: int, dtype=jnp.bfloat16, *, queries: int = TOKENS, keys: int = TOKENS):
     """A draw of `products` queries and keys, a value and the output's cotangent, unit Gaussians by seed."""
+    count = keys
+
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 2 * products + 2)
-        queries = [jax.random.normal(stream, (1, TOKENS, HEADS, WIDTH), jnp.float32).astype(dtype)
-                   for stream in streams[:products]]
-        keys = [jax.random.normal(stream, (1, TOKENS, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
+        laid = [jax.random.normal(stream, (1, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+                for stream in streams[:products]]
+        keys = [jax.random.normal(stream, (1, count, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
                 for stream in streams[products:2 * products]]
-        value = jax.random.normal(streams[-2], (1, TOKENS, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
-        dout = jax.random.normal(streams[-1], (1, TOKENS, HEADS, WIDTH), jnp.float32).astype(dtype)
-        return (*queries, *keys, value, dout)
+        value = jax.random.normal(streams[-2], (1, count, KV_HEADS, WIDTH), jnp.float32).astype(dtype)
+        dout = jax.random.normal(streams[-1], (1, queries, HEADS, WIDTH), jnp.float32).astype(dtype)
+        return (*laid, *keys, value, dout)
 
     return draw
 
@@ -66,7 +69,7 @@ def _banded_reference(spans: template.KeySpans, bands: tuple[int, ...]):
         queries, keys, value = arguments[:products], arguments[products:2 * products], arguments[-1]
         logits = [template.scores(query, key, spans, scale=SCALE)
                   for query, key in zip(queries, keys, strict=True)]
-        distance = jnp.abs(jnp.arange(TOKENS)[:, None] - jnp.arange(spans.keys)[None, :])
+        distance = jnp.abs(jnp.arange(queries[0].shape[1])[:, None] - jnp.arange(spans.keys)[None, :])
         chosen = jnp.searchsorted(jnp.asarray(bands), distance, side="left")
         selected = logits[-1]
         for p in reversed(range(products - 1)):
@@ -105,29 +108,43 @@ def test_summed_products_are_on_par_with_their_logits_summed(form):
 
 
 @pytest.mark.parametrize("form", FORMS)
-@pytest.mark.parametrize(("case", "bands"),
-                         [("causal", (WINDOW,)), ("full", (WINDOW,)), ("causal", (11, 53))],
-                         ids=["causal-two", "full-two", "causal-three"])
-def test_banded_products_are_on_par_with_their_logits_selected(case, bands, form):
+@pytest.mark.parametrize(("case", "bands", "queries"),
+                         [("causal", (WINDOW,), TOKENS), ("full", (WINDOW,), TOKENS),
+                          ("causal", (11, 53), TOKENS), ("full", (5,), TOKENS + 48)],
+                         ids=["causal-two", "full-two", "causal-three", "full-more-queries"])
+def test_banded_products_are_on_par_with_their_logits_selected(case, bands, queries, form):
     """Products selected by bands of distance (piecewise attention, §A row 16a), causal and full, two products
-    and three, on the template's route: on par with a softmax over each key's own product's logits, its
-    output and every product's gradients (check 1), the bands' edges inside key tiles."""
-    spans = template.spans(TOKENS, TOKENS, 1, causal=case == "causal")
+    and three, and over more queries than keys (queries past the last key, whose far band holds every key
+    past its near one): on the template's route, on par with a softmax over each key's own product's logits,
+    its output and every product's gradients (check 1), the bands' edges inside key tiles."""
+    spans = template.spans(queries, TOKENS, 1, causal=case == "causal")
     products = len(bands) + 1
     ours = _routed(attention_products.Banded(bands), spans, form, products)
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(_banded_reference(spans, bands))),
-                    _draw(products), f"banded products {case} {bands} {form}", seeds=SEEDS)
+                    _draw(products, queries=queries), f"banded products {case} {bands} {queries} {form}",
+                    seeds=SEEDS)
 
 
 def _banded_terms(spans: template.KeySpans, combine: attention_products.Banded):
     """The float64 terms of a two-product banded call's output and gradients (`attention_oracle`'s
-    `attention_terms` of the call it lays out, `attention_products.selected`): a row that cancels, a query
-    of one key's dQ among them, held to what it sums, as the template's own backward checks hold it; each
-    copy's key and value terms its product's, the value's copies' summed in quadrature."""
+    `attention_terms` of the call laid out by hand from the bands' own predicate, at the products' scale):
+    a row that cancels, a query of one key's dQ among them, held to what it sums, as the template's own
+    backward checks hold it; each copy's key and value terms its product's, the value's copies' summed in
+    quadrature."""
     def terms(q1, q2, k1, k2, value, dout):
-        query, key, values, laid, _ = attention_products.selected((q1, q2), (k1, k2), value, spans, combine)
-        out, dq, dk, dv = traced_attention_terms(query, key, values, dout, template.dense(laid)[:, None])
+        # The call laid out by hand, each copy's keys those its band's predicate holds, and its queries taken
+        # so `attention_terms`' scale at the laid width is the products' (`SCALE`), the query's terms back.
         count = spans.keys
+        distance = jnp.abs(jnp.arange(q1.shape[1])[:, None] - jnp.arange(count)[None, :])
+        near = distance <= combine.bands[0]
+        seen = template.dense(spans)
+        keep = jnp.concatenate([seen & near, seen & ~near], axis=-1)[:, None]
+        lift = (2 * WIDTH) ** 0.5 * SCALE
+        query = jnp.concatenate([q1, q2], axis=-1) * lift
+        key = jnp.concatenate([jnp.pad(k1, ((0, 0), (0, 0), (0, 0), (0, WIDTH))),
+                               jnp.pad(k2, ((0, 0), (0, 0), (0, 0), (WIDTH, 0)))], axis=1)
+        out, dq, dk, dv = traced_attention_terms(query, key, jnp.concatenate([value] * 2, axis=1), dout, keep)
+        dq = dq * lift
         return (out, dq[..., :WIDTH], dq[..., WIDTH:], dk[:, :count, :, :WIDTH], dk[:, count:, :, WIDTH:],
                 jnp.sqrt(dv[:, :count] ** 2 + dv[:, count:] ** 2))
 
@@ -245,3 +262,36 @@ def test_parallax_is_on_par_with_its_two_accumulators(case, form):
 
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), draw,
                     f"parallax {case} {form}", seeds=SEEDS)
+
+
+def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_rounds():
+    """A fp16 key bias (a KEY side) on a banded call whose near and far products' bias gradients each pass
+    fp16's largest and cancel: uniform logits, values 3 and -3, output cotangents 65504 and -65504; the
+    bias's gradient finite, its copies' summed wide before their one rounding."""
+    spans = template.spans(2, 2, 1)
+    combine = attention_products.Banded((0,))
+    query = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    value = jnp.broadcast_to(jnp.asarray([3.0, -3.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+    dout = jnp.broadcast_to(jnp.asarray([65504.0, -65504.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
+
+    def attended(bias):
+        hooks = template.Hooks(score=Hook(lambda s, q, k, b: s + b, (Side(bias, template.Kind.KEY),)))
+        return attention_products.attend((query, query), (key, key), value, spans, combine, hooks, scale=1.0)
+
+    _, pull = jax.vjp(attended, jnp.zeros((1, 1, 2), jnp.float16))
+    assert np.isfinite(np.asarray(pull(dout)[0], np.float32)).all()
+
+
+def test_parallax_holds_its_second_products_mean_where_a_rounded_output_would_move_it():
+    """Parallax over uniform logits, values all 1 and fp16 second keys 8192 and 8200 (their mean 8196, which
+    fp16 rounds to 8192): its weights `a (1 + τ - t)` sum to 1, so its output is 1, its backward's D the
+    second product's mean about an anchor key, not a rounded output's (the fast form's), which moved it by
+    4."""
+    spans = template.spans(2, 2, 1)
+    query = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    second = jnp.zeros((1, 2, 1, 8), jnp.float16).at[..., 0].set(1.0)
+    second_key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, :, 0, 0].set(jnp.asarray([8192.0, 8200.0]))
+    value = jnp.ones((1, 2, 1, 8), jnp.float16)
+    out = attention_products.parallax(query, second, query, second_key, value, spans, scale=1.0)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.ones((1, 2, 1, 8), np.float32))

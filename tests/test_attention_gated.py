@@ -1,6 +1,7 @@
-"""An output gate fused into the Mosaic forward's epilogue (row 1956, M-NA-47): a gate over a forward 256
-wide finishes a chunk of columns at a time in the launch its ungated call derives, the gate read at its own
-bytes; on par with the reference (check 1)."""
+"""An output hook fused into the Mosaic forward's epilogue (row 1956, M-NA-47): a pointwise gate over a
+forward 256 wide finishes a chunk of columns at a time in one launch of every value column, the gate read at
+its own bytes; a hook laid at the whole width keeps the whole-width finish; each on par with the reference
+(check 1)."""
 
 import jax
 import jax.numpy as jnp
@@ -8,7 +9,7 @@ import pytest
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 from dew.nn.kernels.templates.hooks import Hook, Side
 
@@ -27,15 +28,14 @@ def _gated(gate) -> template.Hooks:
     return template.Hooks(output=Hook(_gate, (Side(gate, template.Kind.OUTPUT),)))
 
 
-@INTERPRETS
-@pytest.mark.parametrize("device", ["sm90", "sm80"])
-def test_a_wide_gated_forward_is_on_par_with_its_16_bit_gate_interpreted(device):
-    """A bf16 gate over a forward 256 wide, under the interpreter at each family's derived tiles: its launch
-    finishes its sums a chunk of columns at a time, gating each with the gate's own columns, the gate read at
-    its own bytes and widened as the hook takes it; on par with the reference (check 1)."""
-    queries, width = 128, 256
-    spans = template.spans(queries, queries, 1, causal=True)
+UNSPLIT = {"sm90": attention_mosaic.Tiles(64, 64, 2, 2, family="wgmma")}
+"""A launch of every value column (`Tiles.columns` None) on an H100's family, pinned, so the epilogue its
+width takes is the one judged whatever tile a derivation would pick (an A100's registers hold no such tile
+at width 256, its derivation splitting the columns)."""
 
+
+def _wide(queries: int, width: int):
+    """A draw of a causal call's query, key and value `width` wide and a bf16 gate."""
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 4)
         shapes = ((1, queries, 2, width), (1, queries, 1, width), (1, queries, 1, width),
@@ -43,35 +43,36 @@ def test_a_wide_gated_forward_is_on_par_with_its_16_bit_gate_interpreted(device)
         return tuple(jax.random.normal(stream, shape, jnp.float32).astype(jnp.bfloat16)
                      for stream, shape in zip(streams, shapes, strict=True))
 
+    return draw
+
+
+@INTERPRETS
+@pytest.mark.parametrize("hook", ["pointwise", "whole-width"])
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_wide_gated_launch_is_on_par_with_its_16_bit_gate_interpreted(device, hook):
+    """A bf16 gate over a forward 256 wide under the interpreter: a pointwise gate in one launch of every
+    value column (pinned on an H100, `UNSPLIT`), finished a chunk of columns at a time with the gate's own
+    columns (`attention_mosaic_program.pointwise_tiles`); a gate its hook lays at the whole width (a reshape
+    to `[-1, 256]`, no chunk's) at the tiles its call derives, the whole width's; the gate read at its own
+    bytes and widened as the hook takes it; on par with the reference (check 1)."""
+    queries, width = 128, 256
+    spans = template.spans(queries, queries, 1, causal=True)
+
+    def hooked(gate):
+        if hook == "pointwise":
+            return _gated(gate)
+        return template.Hooks(output=Hook(lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, width))),
+                                          (Side(gate, template.Kind.OUTPUT),)))
+
+    pins = ({attention_mosaic.MosaicForward: UNSPLIT[device]}
+            if hook == "pointwise" and device in UNSPLIT else {})
+
     def ours(query, key, value, gate):
-        with generation.assumed(device, interpreted=True):
-            return attention_mosaic.forward(query, key, value, spans, _gated(gate), interpret=True)
+        with generation.assumed(device, interpreted=True), tuning.pinned(pins):
+            return attention_mosaic.forward(query, key, value, spans, hooked(gate), interpret=True)
 
     def reference(query, key, value, gate):
-        return template.reference(query, key, value, spans, _gated(gate))
+        return template.reference(query, key, value, spans, hooked(gate))
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic forward, a bf16 gate 256 wide",
-                    seeds=SEEDS)
-
-
-@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
-def test_a_wide_gated_forward_walks_the_value_columns_its_ungated_forward_does(generation_name):
-    """Qwen3.5-4B's gated attention (16 heads over 4, width 256, a 12,288-token causal row) derives the
-    launches of value columns its ungated call does: its gate finishes a chunk of columns at a time, where a
-    whole-width gated finish split an H100's one launch into two of 128 columns, each walking every key (1.51x
-    the ungated forward and XLA's gate on a GH200, M-NA-47)."""
-    rows, tokens, heads, kv_heads, width = 1, 12288, 16, 4, 256
-    spans = template.spans(tokens, tokens, rows, causal=True)
-    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
-    gate = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
-    derived = {}
-    for gated in (False, True):
-        hook = {"output_mod": _gate, "output_kinds": (template.Kind.OUTPUT,),
-                "output_dtypes": (template.kept_dtype(gate.dtype),)} if gated else {}
-        op = attention_mosaic.MosaicForward(form="causal", keys=tokens, scale=width ** -0.5, **hook)
-        ba = op.bind(query, key, key, spans.start, spans.end, None, None, (), (gate,) if gated else (),
-                     None, residuals=template.Kept.NONE, interpret=False)
-        with generation.assumed(generation_name):
-            derived[gated] = op.derived(ba, generation.gpu_target())
-    assert derived[True] is not None and derived[True].columns == derived[False].columns
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _wide(queries, width),
+                    f"mosaic forward, a {hook} bf16 gate 256 wide", seeds=SEEDS)
