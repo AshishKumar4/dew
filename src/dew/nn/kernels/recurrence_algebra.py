@@ -720,9 +720,16 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scales = jnp.ones((gate.shape[0],), jnp.float32) if column_scale is None else column_scale
-    # The tile's algebra over its products and decays its declaration's derived forms (`scores_of`).
-    tile = derived_tile("scores", apart)
-    return tile.mapped({"products": scores, "decays": decay, "scales": scales}).astype(dtype)
+    return scores_tile(scores, decay, scales, apart).astype(dtype)
+
+
+def scores_tile(products, decays, scales, apart: int = 0) -> jax.Array:
+    """The scores tile's algebra over a chunk's products, their decays and the key columns' scales, its
+    declaration's derived forms (`derived_tile("scores", apart)`, `scores_of`); the algebra's generated and
+    checked body of a tile read with its own writes, where the run asks for it (`_generated_body`)."""
+    if (generated := _generated_body("scores", (products, decays, scales), when=not apart)) is not None:
+        return generated(products, decays, scales)
+    return derived_tile("scores", apart).mapped({"products": products, "decays": decays, "scales": scales})
 
 
 def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
@@ -1115,6 +1122,8 @@ def key_memory_decay(entered, leaving) -> jax.Array:
     key's row of each: `sum(h dh)` over the value columns of the memory the chunk entered `entered` `[BK,
     BV]` and the gradient of the one it leaves `leaving`, `[BK]` fp32, the log decay's term on the chunk's
     last token (`key_memory_block`'s other)."""
+    if (generated := _generated_body("key_memory_decay", (entered, leaving))) is not None:
+        return generated(entered, leaving)
     return jnp.sum(entered.astype(jnp.float32) * leaving.astype(jnp.float32), axis=1)
 
 
@@ -1459,6 +1468,15 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
+def _generated_body(name: str, operands: tuple, *, when: bool = True):
+    """The algebra's generated and checked body of this module's component `name` for a call over `operands`
+    where the run asks for it and `when` holds (`dew.algebra.generated.body`); None, the written math to
+    run, otherwise."""
+    from dew.algebra import generated
+
+    return generated.body(f"dew.algebra.recurrence_cases.{name}", operands, when=when)
+
+
 def selective_decay(step, rate, kept=None):
     """Mamba's selective scan's decay of a state by a token, `exp(dt A)` of its `rate` `A`, as `exp2((dt A)
     log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
@@ -1469,6 +1487,9 @@ def selective_decay(step, rate, kept=None):
     (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and a step past it times
     a small rate its decay: the step taken to base 2 first, `dt = 3 2^126` overflowed, `A = -2^-126`
     decaying to 0 for `exp(-3)` and `A = 0` to NaN for 1 (mamba1b's review)."""
+    operands = (step, rate) if kept is None else (step, rate, kept)
+    if (generated := _generated_body("selective_decay", operands)) is not None:
+        return generated(*operands)
     decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
@@ -1494,6 +1515,8 @@ def selective_read(states: list, c: list, skip, value):
     balanced tree, its depth log2 of their count: summed in turn, the readout's 16 states put an fp32 scan's
     output 1.68 times the portable scan's distance from float64 where every decay is near zero, its own
     write the whole state (the interpreted regime test)."""
+    if (generated := _generated_body("selective_read", (*states, *c, skip, value))) is not None:
+        return generated(*states, *c, skip, value)
     return pairwise_sum([c_n * state for c_n, state in zip(c, states, strict=True)]) + skip * value
 
 
@@ -1507,6 +1530,8 @@ def selective_dx_scale(skip, dy, step):
     and `step` by `2^64` via `float_bits.raised_exactly` (bit-safe on flush-to-zero backends, row 9089) and
     return `inv_scale = 2^-64`; otherwise return `(skip * dy, step, 1.0)` (row 8722, base reviews da734bf54
     F3, b65e3cab4 F8, b0601005b F6)."""
+    if (generated := _generated_body("selective_dx_scale", (skip, dy, step))) is not None:
+        return generated(skip, dy, step)
     base = skip * dy
     scaled = ((jnp.abs(step) < jnp.float32(_SELECTIVE_SUBNORMAL_STEP))
               & (jnp.abs(base) < jnp.float32(2.0 ** 60)))
@@ -1524,6 +1549,11 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
     a token's term its schedule sums. `exp(dt A)`'s derivative in `dt` is `A` times it, in `A` `dt` times
     it. Where `dx_step` is given (`selective_dx_scale`), it scales only `dx`'s `step` factor so per-state
     terms and `skip * dy` stay normal across the state sum (row 8722, base review b0601005b F6)."""
+    lifted = () if dx_step is None else (dx_step,)
+    operands = (cotangent, before, decay, written, step, value, b, dy, rate, *lifted)
+    name = "selective_lifted_adjoint" if lifted else "selective_adjoint"
+    if (generated := _generated_body(name, operands)) is not None:
+        return generated(*operands)
     through = cotangent * before * decay
     d_written = cotangent * b
     return (d_written * (step if dx_step is None else dx_step), d_written * value + through * rate,
@@ -1533,6 +1563,8 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
 def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
     """The write gate's gradient on values gated, `u = v beta`, from `u_grad` `[..., V]`, fp32: the values'
     own, `du beta`, and beta's `[...]`, `sum(v du)` over the last axis's columns."""
+    if (generated := _generated_body("gdn_value_pullback", (u_grad, values, beta))) is not None:
+        return generated(u_grad, values, beta)
     return u_grad * beta[..., None], jnp.sum(u_grad * values, axis=-1)
 
 
@@ -1540,6 +1572,8 @@ def skipped_back(out_grad, values, skip) -> tuple[jax.Array, jax.Array]:
     """The skip `y += D v`'s gradient on values from the output's gradient `out_grad` `[..., V]`, fp32: the
     values' own, `D do` (`skip` broadcasting), and the skip's own rows `[...]`, `sum(v do)` over the last
     axis's columns."""
+    if (generated := _generated_body("skipped_back", (out_grad, values, skip))) is not None:
+        return generated(out_grad, values, skip)
     return skip * out_grad, jnp.sum(out_grad * values, axis=-1)
 
 

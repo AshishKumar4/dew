@@ -973,15 +973,22 @@ def _exact_integer(values) -> tuple[np.ndarray, np.ndarray]:
 _HALF = np.dtype(np.float16)
 _FLOAT = np.dtype(np.float32)
 _HALF_CONVERSIONS = frozenset({(_HALF, _FLOAT), (_FLOAT, _HALF)})
+_FP8_WIDENING = frozenset((np.dtype(code), _FLOAT)
+                          for code in (jax.numpy.float8_e4m3fn, jax.numpy.float8_e5m2))
+"""FP8 codes widened to float32, every value exact there: no FP8 arithmetic, a stored code read."""
 
 
 def _converted(params, operands, result, fmt):
     """A cast, as XLA's CPU lowering casts: between float formats correctly rounded, subnormals kept
-    (bit manipulation); to a float from an integer or boolean correctly rounded from the exact integer;
+    (bit manipulation); an FP8 code to float32 exactly; to a float from an integer or boolean correctly
+    rounded from the exact integer;
     to an integer from a float truncated toward zero, saturated at the integer's range and NaN to 0; to
     a boolean nonzero; between integers wrapped to the result's width."""
     (value,) = operands
     value, result = np.asarray(value), np.asarray(result)
+    if (value.dtype, result.dtype) in _FP8_WIDENING:
+        # The host's decode (ml_dtypes, not XLA's), exact in float32: zeros by sign, a NaN code a NaN.
+        return _same(result, value.astype(np.float64))
     source = _format(value.dtype)
     if (value.dtype, result.dtype) in _HALF_CONVERSIONS:
         source = FLOAT16 if value.dtype == _HALF else source
@@ -2244,7 +2251,9 @@ def _held(eqn, operands, results, findings, at) -> None:
     half_storage = (primitive is jax.lax.optimization_barrier_p
                     or (primitive is jax.lax.convert_element_type_p
                         and (hosted[0].dtype, hosted_results[0].dtype) in _HALF_CONVERSIONS))
-    for value in () if raw_bitcast else (*hosted, *hosted_results):
+    widened = (primitive is jax.lax.convert_element_type_p
+               and (hosted[0].dtype, hosted_results[0].dtype) in _FP8_WIDENING)
+    for value in () if raw_bitcast or widened else (*hosted, *hosted_results):
         dtype = getattr(value, "dtype", None)
         if dtype == _HALF and half_storage:
             continue

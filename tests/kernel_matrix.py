@@ -162,6 +162,12 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "form": ("plain", "scanned"),
         "window": ("one", "accumulated", "split"),
     },
+    "generated": {
+        "generation": ("sm90",),
+        "site": ("selective_decay", "selective_read", "split_kv_merge", "selective_token",
+                 "selective_dx_scale", "skipped_back", "key_memory_decay", "gdn_value_pullback",
+                 "selective_adjoint", "selective_lifted_adjoint", "scores"),
+    },
 }
 """Each family's axes and their values. Attention's: the GPU; the head width; 8 query heads over 8 key heads,
 2, or 4; a causal, a full or a causal call over three documents and padding; no hook, two key or two tile
@@ -204,7 +210,8 @@ product; the norm's plain, stream (a residual stream and its norm) or gated form
 an up projection apart or of one packed projection; the operands' dtype; the feature width, narrower than a
 warp, ragged, a whole row of a program, or past the norm's register tile (4096 and 16384 features: the norm
 refuses the last). The narrow copies' (the choice `narrow_copies`): the GPU; the dtype the decoder computes
-in; its layers plain or scanned; one microbatch an update, two accumulated, or one batch read in two parts."""
+in; its layers plain or scanned; one microbatch an update, two accumulated, or one batch read in two parts.
+The generated bodies' (the choice `generated`): the GPU their components were generated for; the site."""
 
 SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
@@ -272,6 +279,7 @@ CELLS: dict[str, tuple[str, str]] = {
     "delta_decode": ("delta_decode_matrix", "a_decode_token_is_on_par"),
     "norm_swiglu": ("norm_swiglu_matrix", "a_fused_entrys_training_step_is_on_par"),
     "narrow_copies": ("narrow_copies_matrix", "a_narrow_copy_training_run_is_on_par"),
+    "generated": ("generated_matrix", "a_generated_body_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 

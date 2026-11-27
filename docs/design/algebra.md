@@ -168,10 +168,10 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     a combined XLA round trip can hide this by deleting both casts. Narrow subnormals remain as
     written until preservation is known for every lowering; a bfloat16 subnormal is subnormal in float32
     too. A reciprocal square root's form and a magnitude's magnitude remain XLA's simplifier's.
-  - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
-    dev-only until a changed default-route executable has a native receipt (row 9777; M-AL-2). The
-    compile-only default-route SimpleDiT-B comparison changes the optimized HLO; it is not a timing
-    or native accuracy receipt. An equal term is one e-class and extraction prices a shared
+  - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set is
+    dev-only: on the GH200's default-route SimpleDiT-B step (M-AL-2, row 9777) it changes the native
+    program and holds check 1, but its device time is within the A/A's spread, so it buys no speed for
+    the reordering it costs. An equal term is one e-class and extraction prices a shared
     one once, so a value written twice is read once without a rule. The rules relate a new value to another
     the program holds or hoist a division past a broadcast or square root: a quotient by a value whose
     reciprocal the program holds, `a / y` as `a (1/y)`, also for a held `integer_pow(y, -1)` and
@@ -229,7 +229,9 @@ floating-point expressions:
 - **Error is a property of a candidate, not of an e-class.** The forms an e-class holds are equal in ℝ and differ
   in error, and a form's error depends on which form of each operand it reads, so the estimate belongs to a
   concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price, and
-  each is measured before it is admitted (§6.5). Error is never an e-class fact.
+  each is measured before it is admitted (§6.5). Each program is proposed once: an extraction that prints as
+  an earlier candidate does (a variant that is the form as written) is the same measurement. Error is never an
+  e-class fact.
 - **Dev time measures each candidate** by sampling: the candidate evaluated in its dtype against the declaration
   at float64 on the gate's drawn and adversarial families (cancellation, wide ranges, near-equal operands, one-key
   rows), as check 1 measures error.
@@ -815,7 +817,8 @@ actual capacity still governs which compiler and training plans fit; it is not c
   reference)` passes, the gate's check of the two against the float64 truth (§1.5): under default numerics
   against the form as written, which is always a candidate. Under accurate numerics the same gate first
   admits candidates against the written form, then compares only those survivors with one another; if none
-  meets every surviving reference, it refuses. Neither mode compares a candidate with itself. Each
+  meets every surviving reference, it refuses. Neither mode compares a program with itself: a proposal whose
+  printed program, or compensated print, is an earlier candidate's is dropped before measurement. Each
   uncompensated candidate precedes every compensated candidate, with each group ordered by seconds where
   the GPU target states its rates. The stable-form generator calls `choose` for each registered
   case, precision policy and target (§6.11).
@@ -1371,27 +1374,32 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV
-merge, the backward's overlapped weight and dropped anchored cotangent phases in both tile orientations,
-the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
-pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
-solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
-the selective scan's packed and unpacked decay. A paired surrogate declaration checks both BF16 and
-FP16 rounded-operand bodies and preserves their written higher-order rule. Other cases cover the masked
-softcap hook and its slope, projected sink state,
-document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
-Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
-witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload.
-The forward walk emits the pure weights and rescale in either layout without owning its dot;
+The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components (`ComponentForm`,
+rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV merge, the backward's
+overlapped weight and dropped anchored cotangent phases in both tile orientations, the accurate query
+cotangent, the key-first weight consumer and the value-gradient tile. Recurrence pilots cover scores,
+compensated prefix differences, chunk carry and reverse carry, the strict-lower solver's doubling, weighted
+value application and inverse adjoint, KDA's memory-decay cotangent, and the selective scan's packed and
+unpacked decay. A paired surrogate declaration checks both BF16 and FP16 rounded-operand bodies and
+preserves their written higher-order rule. Other cases cover the masked softcap hook and its slope,
+projected sink state, document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band,
+the selective adjoint, Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8
+epilogues. Exact byte witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4
+packed payload. The forward walk emits the pure weights and rescale in either layout without owning its dot;
 finalization reads the walk's existing named slots. The straight-through quantizer and classifier-free
 guidance have separately checked value and tangent bodies. Independent code witnesses cover the portable
-saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone
-E8M0 decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including
-signed zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's
-readout uses its written balanced tree over the named per-state values. Both written and generated
-components check their primitives on the CPU.
-Production still uses the written bodies (row 3272).
+saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone E8M0
+decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including signed
+zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's readout uses
+its written balanced tree over the named per-state values. The MX block read covers every E8M0 byte's
+exponent, and the MXFP8 block decode's portable scale application lands each E4M3 code and each scale byte
+of every draw in FP32 and BF16 with one rounding, their pairings sampled across the draws, subnormals and
+signed NaNs included. The selective scan's token stage composes its per-state decay and update as the
+template steps it; its backward's subnormal-step lift and one state's turn of the tangent sums are checked
+as the block's loop takes them. NVFP4's block decode lands each code and each finite E4M3 scale byte of
+every draw in BF16, and the recurrence skip's pullback is checked beside the gated values'. Both written and
+generated components check their primitives on the CPU; an FP8 code's exact widening to FP32 is the one FP8
+conversion check 2 admits. Production still uses the written bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1418,13 +1426,16 @@ class StableForm:                     # a numeric function of Dew's own
 DECLARATIONS: dict[str, StableForm | ComponentForm]
 
 def declare(module: str, name: str, form: StableForm | ComponentForm): ...
-def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
+def generate(*, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
-typed primitive bindings share a helper before source is rendered. Geometry, integer literals and
-logical shift direction are static arguments; callers keep their own layout and live results. The
+primitive bindings share a helper before source is rendered, across every declaring module at once, the
+helpers one generated module of their own (`dew.algebra.shared_derived`), so a declaring module splits
+along its seams without writing a helper twice; every declaration therefore generates together. Geometry,
+integer literals and their dtypes, and logical shift direction are static arguments; callers keep their
+own layout and live results. The
 generator admits the final emitted entrypoint, including its case dispatch and shared helpers, against
 the written trace and independent truth. Sharing and case selection add no run-time branch to the program.
 
@@ -1458,8 +1469,19 @@ the written trace and independent truth. Sharing and case selection add no run-t
   against the existing template on the same device before activating it (§4). The checked-in module,
   typed case manifest and `--check` share the stable-form writer and its gate suite; no receipt means
   no replacement. Production integration of later components needs those receipts, not just a generated file.
+- **The opt-in seam.** A template's own function asks `dew.algebra.generated.body(qualified, operands,
+  when=...)` for its component's generated body, `when` its static program being the declared one, and runs
+  it in place of its written math where given. Under the kernel choice `generated` ("written", the default)
+  nothing changes: the site's written math runs and its program is the one traced before. Under "generated"
+  a call whose case (policy, target, operand shapes and dtypes) its generated module declares runs the
+  checked body, and any other call its written math; every answer is counted by its outcome
+  (`generated.taken`), so a measurement tells a generated body that ran from a written one that stood in.
+  The selective scan's decay, token stage, readout, backward step lift and adjoint, the recurrence skip's
+  pullback, the gated delta rule's value pullback, key memory decay and scores tile, and the derived
+  split-KV merge (`attention_algebra._derived_merge`, every walk's and split decode's) are its sites. A
+  component's default changes only on its native receipts (M-AL-5).
 
-- `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it
+- `python -m dew.algebra.generate [--check]` traces every declared case. For a stable form it
   saturates with the dev-time sets, measures error against the declaration at float64 and selects
   by accuracy and price (`dew.algebra.error.choose`). For a component it checks the printed arithmetic
   against the traced form and its declared reference, without searching for an alternative form. The
@@ -1468,8 +1490,8 @@ the written trace and independent truth. Sharing and case selection add no run-t
 - The output is ordinary Python (`dew.algebra.printed`): each equation its primitive bound at its own
   parameters (`lax.<name>_p.bind`), so it computes bit for bit what the chosen candidate computed when it was
   measured, with a compensated form's sums through `dew.nn.precision`. Its only Algebra-package
-  dependency is `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
-  target without importing the registry, rules or extractor. Generated modules are linted and typed
+  dependencies are `dew.algebra._generated`, which selects the checked case by shape, dtype, policy and
+  target without importing the registry, rules or extractor, and the generated shared helpers. Generated modules are linted and typed
   as usual; their headers name the declarations, rule sets, receipts and egglog version. The writer
   refuses equations it cannot print as plain calls, such as a call with a custom derivative rule.
 - `--check` regenerates in memory and fails where the checked-in output differs; it runs as a test

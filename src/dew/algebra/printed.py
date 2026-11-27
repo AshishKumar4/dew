@@ -70,7 +70,7 @@ class Layout:
 
 @dataclasses.dataclass(frozen=True)
 class Literal:
-    dtype: str
+    dtype: str | Ref
     shape: tuple[int, ...]
     data: bytes
     integer: int | Ref | None = None
@@ -118,6 +118,7 @@ class Binding:
         if isinstance(self.value, Call):
             return wrapped(head + _callee(self.value.callee) + "(", _arguments(self.value), ")")
         if self.constant and isinstance(self.value, Literal):
+            assert isinstance(self.value.dtype, str)
             held = np.frombuffer(self.value.data, np.dtype(self.value.dtype)).reshape(self.value.shape)
             return _constant(names, held)
         return [head + expression(self.value)]
@@ -163,11 +164,12 @@ def expression(value: Operand) -> str:
     if isinstance(value, StaticTuple):
         return _tuple(map(expression, value.values))
     if isinstance(value, Literal):
-        dtype = np.dtype(value.dtype)
         if isinstance(value.integer, Ref):
-            return f"np.array({value.integer.name}, dtype=jnp.dtype({value.dtype!r}))"
-        held = np.frombuffer(value.data, dtype).reshape(value.shape)
-        return _value(held, dtype)
+            dtype = value.dtype.name if isinstance(value.dtype, Ref) else f"jnp.dtype({value.dtype!r})"
+            return f"np.array({value.integer.name}, dtype={dtype})"
+        assert isinstance(value.dtype, str)
+        held = np.frombuffer(value.data, np.dtype(value.dtype)).reshape(value.shape)
+        return _value(held, np.dtype(value.dtype))
     return _param(value)
 
 
@@ -451,15 +453,17 @@ def refused(closed: core.Jaxpr, *, compensated: bool = False) -> str | None:
     return None
 
 
-def reprinted(function: Callable, operands, tree) -> Callable | None:
+def reprinted(function: Callable, operands, tree) -> tuple[Callable, str] | None:
     """`function` over operands of `operands`' shapes as its printed text computes it (`source`, `loaded`),
     returning its outputs in their structure `tree`: what a generated module of it would compute, where a
-    platform's choice takes its default branch; None where it is not printable (`refused`)."""
+    platform's choice takes its default branch; and that text, the program it computes. None where it is not
+    printable (`refused`)."""
     closed = jax.make_jaxpr(function)(*operands)
     if refused(closed) is not None:
         return None
-    flat = loaded(source(closed, "reprinted")[0], "reprinted")
-    return lambda *values: jax.tree.unflatten(tree, list(flat(*values)))
+    text = source(closed, "reprinted")[0]
+    flat = loaded(text, "reprinted")
+    return (lambda *values: jax.tree.unflatten(tree, list(flat(*values)))), text
 
 
 def loaded_module(text: str, name: str) -> Mapping[str, object]:
@@ -488,7 +492,7 @@ def _value(value, dtype) -> str:
         return _bytes(held)
     named = f"jnp.dtype({np.dtype(dtype).name!r})"
     if np.dtype(dtype) == np.bool_:
-        return f"np.array({bool(held)}, dtype={named})"
+        return f"np.array(np.{bool(held)}_, dtype={named})"
     if jnp.issubdtype(dtype, jnp.integer):
         return f"np.array({int(held)}, dtype={named})"
     if jnp.issubdtype(dtype, jnp.floating) and not np.isnan(held):
