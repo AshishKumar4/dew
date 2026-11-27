@@ -594,7 +594,17 @@ def to_record(value, annotation) -> JSON:
             return record
         return {"class": import_path(type(held)), "fields": record}
     if isinstance(value, functools.partial):
-        # A member bound by keyword (`Bound.bound`), recorded as the class record of what it builds.
+        # A member bound by keyword (`Bound.bound`), recorded as the class record of what it builds, where its
+        # reader reads one back (a field declaring `functools.partial[...]`, `_bound`; or a member's held
+        # argument, read against the member's own annotation, `Bound.read`): any other field's reader builds
+        # what such a record names, or refuses a function's, so the partial is refused here.
+        declared = resolve_alias(annotation)
+        if typing.get_origin(declared) is typing.Annotated:
+            declared = typing.get_args(declared)[0]
+        if annotation is not None and not (declared is functools.partial
+                                           or typing.get_origin(declared) is functools.partial):
+            raise Unrecordable(f"{value!r} is held where {annotation!r} is declared, whose record reads back "
+                               "no bound member: declare the field functools.partial[...]")
         if value.args:
             raise Unrecordable(f"{value!r} binds arguments by position, which a record names none of")
         return {"class": import_path(value.func), "fields": argument_records(value.func, value.keywords)}
@@ -1216,14 +1226,16 @@ def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
 
 
 def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
-    """What `member` builds from a record of its fields (`_taken`), checked as
-    a configured value (`configured`); a bound member's record by its own shape (`Bound.read`)."""
-    if isinstance(member, type) and issubclass(member, Bound):
-        return member.read(fields, dtypes=dtypes)
-    built = member(**_taken(member, fields, dtypes=dtypes))
+    """What `member` builds from a record of its fields, checked as a configured value (`configured`): a
+    dataclass built from its fields as a field's own class is (`_construct`, a bound member's record by its
+    own shape among them), anything else from its parameters (`_arguments`)."""
+    held = record_class(member)
+    if held is not None:
+        return _construct(held, fields, dtypes=dtypes)
+    built = member(**_arguments(member, fields, dtypes=dtypes))
     # A plain class of Dew's or a trusted package's is the value its record
     # describes (`to_record` writes it from its constructor's parameters).
-    plain = record_class(member) is None and isinstance(member, type) and _owned(member, called=False)
+    plain = isinstance(member, type) and _owned(member, called=False)
     return built if plain else configured(built)
 
 
@@ -2110,7 +2122,8 @@ class Bound[Member](ABC):
             member = default().func
         else:
             raise ValueError(f"{cls.__name__}'s record names no member, and the kind has no default one")
-        fields = _records.record(record.get("fields") or {}, f"{cls.__name__}.fields")
+        # Fields absent are none; any other value but a record's is refused, as an empty list's is.
+        fields = _records.record(record.get("fields", {}), f"{cls.__name__}.fields")
         settings: dict[str, Any] = {name: _rebuilt(declared_type(cls, name), value, dtypes=dtypes, name=name)
                                     for name, value in record.items() if name in own}
         return cls(functools.partial(member, **fields), **settings)

@@ -635,3 +635,32 @@ def test_a_bound_member_reads_back_through_its_alias():
     again = from_record(_Predictor, to_record(bound, _Predictor))
     assert isinstance(again, functools.partial)
     assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 4})
+
+
+def test_a_bound_records_fields_that_are_no_record_are_refused():
+    """A bound member's `fields` that are no record (an empty list, an empty string, zero) are refused, not
+    read as no fields; fields absent are none (train 1416's review)."""
+    from dew.config.env import RolloutConfig
+    from dew.registry import ModelConfig
+
+    for fields in ([], "", 0):
+        with pytest.raises(ValueError):
+            ModelConfig.from_dict({"name": "simple_dit", "fields": fields})
+        with pytest.raises(ValueError):
+            from_record(RolloutConfig, {"fields": fields})
+    assert dict(ModelConfig.from_dict({"name": "simple_dit"}).fields) == {}
+
+
+def test_a_partial_is_recorded_only_where_its_field_reads_one_back():
+    """A partial held where its field declares no `functools.partial[...]` (a function's or a class's under
+    a callable or a class) is refused as it is written, not saved as a class record its reader builds the
+    class from, or refuses as a function's (train 1416's review: a reward's partial saved, its run unread).
+    """
+    from dew.registry import Unrecordable, to_record
+
+    for value, annotation in ((functools.partial(json.dumps, indent=2), Callable[..., str]),
+                              (functools.partial(JepaPredictor, num_layers=1), JepaPredictor)):
+        with pytest.raises(Unrecordable):
+            to_record(value, annotation)
+    assert to_record(functools.partial(JepaPredictor, num_layers=1), functools.partial[JepaPredictor])[
+        "class"].endswith(":JepaPredictor")
