@@ -1201,24 +1201,21 @@ def _resolved(annotation: Annotation) -> Annotation:
     return held
 
 
-def _admits_partial(annotation: Annotation) -> bool:
-    """Whether a field declaring `annotation` reads a bound member back from its class record (`_bound`),
-    flattened as its reader flattens it (`_rebuilt`): an alias resolved, an Annotated's type (`_resolved`),
-    and a union of one member besides None that member, each at any depth."""
+def _flattened(annotation: Annotation) -> Annotation:
+    """`annotation` as its reader dispatches a value on it (`_rebuilt`): normalized (`_resolved`), and a union
+    of one member besides None that member, flattened in turn; any other union as it is."""
     held = _resolved(annotation)
     if typing.get_origin(held) in (Union, types.UnionType):
         inner = [member for member in _union_members(held) if member is not type(None)]
-        return len(inner) == 1 and _admits_partial(inner[0])
+        return _flattened(inner[0]) if len(inner) == 1 else held
+    return held
+
+
+def _admits_partial(annotation: Annotation) -> bool:
+    """Whether a field declaring `annotation` reads a bound member back from its class record (`_bound`), as
+    its reader flattens it (`_flattened`)."""
+    held = _flattened(annotation)
     return held is functools.partial or typing.get_origin(held) is functools.partial
-
-
-def _holds_partial(value: Configured) -> bool:
-    """Whether `value` is a partial or a container holding one at any depth."""
-    if isinstance(value, functools.partial):
-        return True
-    if isinstance(value, Mapping):
-        return any(_holds_partial(entry) for entry in value.values())
-    return isinstance(value, list | tuple) and any(_holds_partial(entry) for entry in value)
 
 
 def _unread_partial(value: Configured, annotation: Annotation) -> functools.partial | None:
@@ -1227,17 +1224,15 @@ def _unread_partial(value: Configured, annotation: Annotation) -> functools.part
     entry of no type it states takes none); None where every one reads back."""
     if isinstance(value, functools.partial):
         return None if _admits_partial(annotation) else value
-    if isinstance(value, Mapping):
-        values = list(value.values())
-    elif isinstance(value, list | tuple):
-        values = list(value)
-    else:
+    if not isinstance(value, Mapping | list | tuple):
         return None
     try:
-        types_ = entry_types(annotation, len(values))
+        # The container's entries typed as its reader types them, its alias and Optional flattened first.
+        types_ = entry_types(_flattened(annotation), len(value))
     except ValueError:
-        types_ = [None] * len(values)
-    return next((found for entry, held in zip(values, types_, strict=True)
+        types_ = [None] * len(value)
+    entries = value.values() if isinstance(value, Mapping) else value
+    return next((found for entry, held in zip(entries, types_, strict=True)
                  if (found := _unread_partial(entry, held)) is not None), None)
 
 
@@ -2161,8 +2156,8 @@ class Bound(ABC):
         # refused, as `to_record` refuses it under a field's annotation (train 1429's review): its record
         # would read back as no partial. The rest written as held, read against nothing.
         for name, value in self.fields.items():
-            held = _holds_partial(value)
-            found = _unread_partial(value, _argument_type(self.member, name)) if held else None
+            found = (_unread_partial(value, _argument_type(self.member, name))
+                     if isinstance(value, functools.partial | Mapping | list | tuple) else None)
             if found is not None:
                 raise Unrecordable(f"{self.name}'s {name} holds {found!r}, which its annotation reads back "
                                    "as no bound member: declare it functools.partial[...]")

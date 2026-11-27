@@ -703,3 +703,19 @@ def test_a_partial_under_a_nested_optional_alias_reads_back():
         again = from_record(annotation, to_record(bound, annotation))
         assert isinstance(again, functools.partial)
         assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 2})
+
+
+type _Predictors = list[functools.partial[JepaPredictor]]
+
+
+def test_a_held_container_of_partials_is_checked_as_its_reader_types_its_entries():
+    """A held argument's container of partials is typed as its reader types it, its alias and Optional
+    flattened before its entries' types are read: a list of predictor partials under `_Predictors | None`
+    reads back, and a function's partial in it does not (theme 73's review)."""
+    from dew.nn.activations import cast_rounded
+
+    predictors = [functools.partial(JepaPredictor, num_layers=1)]
+    assert registry._unread_partial(predictors, _Predictors | None) is None
+    stray = functools.partial(cast_rounded, dtype="bfloat16")
+    assert registry._unread_partial([*predictors, stray], _Predictors | None) is stray
+
