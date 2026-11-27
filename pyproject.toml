@@ -479,7 +479,7 @@ concurrency = ["thread", "multiprocessing"]
 version = {attr = "dew._version.__version__"}
 
 [tool.setuptools.package-data]
-dew = ["py.typed"]
+dew = ["py.typed", "telemetry/xla_protos.binpb"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -2111,9 +2111,6 @@ SCAN_CELLS: dict[tuple[str | None, ScanCell], tuple[Kernel[ScanCase], str]] = {
         SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD, its 80-wide heads padded to the port's 128 "
                   "(ssd-train-a100-fdab2424c)"),
-    ('sm80', ScanCell('bfloat16', 'training', (64, 64), (8, 128), 128, TIMED, wide=True)): (
-        SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 1.584 ms against the template's "
-                  "2.200 on Nemotron-H 30B's SSD (ssd-train-a100-fdab2424c)"),
 }
 """The cells, each a device generation, a product and a geometry (`ScanCase.cell`), where a receipt timing
 the same product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows Dew's
@@ -2121,8 +2118,11 @@ port of mamba_ssm's kernels (`mamba_ssd.ssd_scan`; "the port" below) faster than
 its old route's kernel and that receipt; every time below sets the template against that port, not against
 mamba_ssm's own kernels (tools/benchmark_recurrence.py's `mamba_ssm` arm): the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
-template wins its cells. Warpgroup MMA's training is the template's: on a GH200 480GB, by device time, its
-forward and gradient 1.475 ms against the port's 2.065 on Nemotron-H 4B's SSD (its 80-wide heads padded to
+template wins its cells. An A100's training of Nemotron-H 30B's SSD is the template's: its forward and
+gradient 1.898 ms against the port's 2.052, check 1 green from float64 over 8 draws (M-JS-271b-a100 at
+b5d605d1f09, ABBA of four turns at 1095 MHz). Warpgroup MMA's training is the template's: on a GH200 480GB,
+by device time, its forward and gradient 1.475 ms against the port's 2.065 on Nemotron-H 4B's SSD (its
+80-wide heads padded to
 the port's 128) and 0.865 against 0.836 on 30B's (LF-REC4-gh200 at 59b96a9b4c2), where an H100's had the
 port 1.592 against 1.877 and 0.660 against 0.820 (window-h100-c70aaa8-b8109ee). An A100's forward is the
 template's: 1.418 ms against the port's 1.506 on Nemotron-H

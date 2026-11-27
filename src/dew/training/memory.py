@@ -40,6 +40,7 @@ from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
+from dew.training.live_buffers import peak_live
 
 _log = logging.getLogger(__name__)
 
@@ -867,7 +868,7 @@ class CodeBounded[K: Hashable, V]:
 
 @dataclasses.dataclass(frozen=True)
 class LiveSet:
-    """What a compile's live set at its peak (`jax.stages.Compiled.peak_live`: each buffer's dimensions'
+    """What a compile's live set at its peak (`dew.training.live_buffers.peak_live`: each buffer's dimensions'
     provenance among the step's arguments) says of the step: the bytes of the buffers a microbatch's rows
     scale (`scaled`: a dimension descends from a batch argument's row axis), and those whose provenance no
     op states (`unknown`: an opaque kernel's). An argument's buffer (the state, the batch) is neither: no
@@ -876,15 +877,16 @@ class LiveSet:
     scaled: int
     unknown: int
     made: tuple[tuple[int, str, tuple[str, ...]], ...] = ()
-    """Each buffer not an argument's: its bytes, the `op_name` of the op that made it and the
-    `checkpoint_name` names it carries, which a search reads what a remat rung or a release frees by
-    (`forward_bytes`)."""
+    """Each buffer not an argument's and no library call's scratch (`LiveBuffer.role`'s `workspace`, which a
+    recomputation frees none of): its bytes, the `op_name` of the op that made it and the `checkpoint_name`
+    names it carries, which a search reads what a remat rung or a release frees by (`forward_bytes`). A
+    workspace is held in `scaled` and `unknown` all the same: it is live at the peak."""
 
     @staticmethod
     def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
         """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows; None where
         the backend states none."""
-        live = executable.peak_live()
+        live = peak_live(executable)
         if live is None:
             return None
         scaled = unknown = 0
@@ -892,7 +894,8 @@ class LiveSet:
         for buffer in live:
             if buffer.kind == "parameter":
                 continue
-            made.append((buffer.bytes, buffer.op_name, tuple(buffer.names)))
+            if buffer.role != "workspace":
+                made.append((buffer.bytes, buffer.op_name, tuple(buffer.names)))
             if any(dimension is None for dimension in buffer.dims):
                 unknown += buffer.bytes
             elif any(dimension is not None and dimension & rows for dimension in buffer.dims):

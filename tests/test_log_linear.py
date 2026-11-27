@@ -193,3 +193,16 @@ def test_log_linear_levels_train_on_the_template_on_each_gpu_family(target):
     taken = {(route.kernel, None if route.refusal is None else route.refusal.code)
              for route in found if route.choice == generation.Choice.GATED_DELTA_RULE}
     assert taken == {("mosaic_gpu", None)}, taken
+
+
+def test_a_level_weights_forward_derivative_is_its_tangents_gathered():
+    """The pairs' level weights' forward derivative (`jax.jvp`, `jax.linearize`) of a two-token call whose
+    level weights alone move: the call is linear in them, so its tangent is the call at the direction, as
+    its select chain's was, where a custom reverse rule alone refused forward mode (head review of
+    9d435e066; `log_linear._level_pairs`, a linear map whose transpose selects and sums)."""
+    attend, weights = _two_tokens([[0.5, 0.25], [0.75, 1.0]])
+    direction = jnp.asarray([[1.0, -2.0], [0.5, 3.0]], jnp.float32).reshape(weights.shape)
+    _, tangent = jax.jvp(attend, (weights,), (direction,))
+    _, linear = jax.linearize(attend, weights)
+    np.testing.assert_array_equal(np.asarray(tangent), np.asarray(attend(direction)))
+    np.testing.assert_array_equal(np.asarray(linear(direction)), np.asarray(tangent))

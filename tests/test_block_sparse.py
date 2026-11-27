@@ -2,12 +2,14 @@
 numpy, the runs a selection gives against the keys it reads, and the attention over a selection on par with
 the reference over its dense mask (check 1)."""
 
+import contextlib
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import selection_margins
 from attention_oracle import qkv
 from flax import linen as nn
 from reference_error import (
@@ -23,7 +25,9 @@ from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inspection import INDEXER_COLLECTION
-from dew.nn.mla import SELECTIONS
+from dew.nn.kernels.generation import run_precision
+from dew.nn.mla import SELECTIONS, indexer_target
+from dew.nn.precision import ACCURATE
 from dew.registry import mixers
 
 SEEDS = 8
@@ -219,9 +223,10 @@ def test_a_pooled_selection_takes_each_groups_top_blocks_by_its_indexers_block_m
 def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
     """InfLLM-V2's selection (`infllm_selection`): keys mean-pooled by windows of `kernel` every `stride`,
     each head's softmax over the windows its query reaches whole (no future key moves a score), summed over
-    its group's heads, max-pooled onto blocks by eq. 7, the `top_k` earlier blocks beside the first and the
-    query's own, as written out; with fewer keys than a window, the forced blocks alone."""
-    rows, groups, per, width, block, top_k, kernel, stride = 1, 2, 2, 8, 16, 1, 8, 4
+    its group's heads, max-pooled onto blocks by eq. 7, the first and the query's own and its top earlier
+    blocks, `top_k` in all, as written out, a block no reached window covers no candidate; with fewer keys
+    than a window, the forced blocks alone."""
+    rows, groups, per, width, block, top_k, kernel, stride = 1, 2, 2, 8, 16, 3, 8, 4
     rng = np.random.default_rng(4)
     query = rng.standard_normal((rows, keys, groups, per, width)).astype(np.float32)
     key = rng.standard_normal((rows, keys, groups, width)).astype(np.float32)
@@ -241,9 +246,10 @@ def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
                     logits = pooled[reached] @ query[0, index, group, head] * width ** -0.5
                     shifted = np.exp(logits - logits.max())
                     weights[reached] += shifted / shifted.sum()
-            scores = np.asarray([max(weights[step * j:step * j + span], default=-np.inf)
-                                 if j < own else -np.inf for j in range(-(-keys // block))])
-            assert {int(b) for b in selected[0, group, index] if b >= 0} == _top(scores, top_k, {0, own})
+            scores = np.asarray([max((weights[w] for w in reached if step * j <= w < step * j + span),
+                                     default=-np.inf) if j < own else -np.inf
+                                 for j in range(-(-keys // block))])
+            assert {int(b) for b in selected[0, group, index] if b >= 0} == _top(scores, top_k - 2, {0, own})
 
 
 def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_past_it():
@@ -252,7 +258,7 @@ def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_p
     (`infllm_selection`'s), has its output and every gradient on par with the reference attention over that
     selection's dense mask (check 1)."""
     rows, queries, heads, groups, width = 1, 256, 8, 2, 32
-    shape = {"block": 16, "top_k": 3, "kernel": 8, "stride": 4}
+    shape = {"block": 16, "top_k": 5, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
     query, key, value, _ = draw(0)
     short = block_sparse.infllm_attention(query, key, value, **shape)
@@ -408,9 +414,183 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     mass = np.exp(-87.0) / (1 + np.exp(-87.0))
     terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
     assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
+    # A teacher's mass of e^-110, below fp32's least subnormal, at the same gap: its term 1.44e-10, a normal
+    # fp32, met with the gap in their logarithms, where the mass rounded to 0 first held nothing (train 1345's
+    # F2).
+    farther = jnp.zeros((1, 2, 2, 1), jnp.float32).at[0, 1, 0, 0].set(-110.0)
+    found = block_sparse.msa_query_kls(gapped, rare, farther, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                       scale=1.0)
+    mass = np.exp(-110.0) / (1 + np.exp(-110.0))
+    terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0**126]) / 2
+    assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
+    # The same mass against scores fp32's largest and least, a gap past fp32's range: its term 2 F e^-110,
+    # its weight and its score's shares met in their logarithms.
+    spanned = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]], [[0.0, -np.inf], [0.0, 0.0]]]],
+                          jnp.float32)
+    found = block_sparse.msa_query_kls(spanned, rare, farther, jnp.zeros((1, 2, 2, 1), jnp.int32), block=2,
+                                       scale=1.0)
+    terms = np.asarray([(1 - mass) * np.log1p(-mass), mass * np.log(mass), mass * 2.0 * float(largest)]) / 2
+    assert_fp32_reduction_bound(np.asarray(found)[0, 1], terms.sum(), np.abs(terms).sum(), len(terms) + 2)
     # The first query selects its own token alone (the second is past it), scored fp32's least.
     hidden = jnp.asarray([[[[-largest, 0.0], [0.0, 0.0]]]], jnp.float32)
     assert np.asarray(loss(hidden))[0, 0] == 0.0
+
+
+def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infinitely_low_score():
+    """MSA's indexer loss (`msa_query_kls`) over two selected tokens whose teacher logits are 0 and -88 (a
+    mass below fp32's least normal): its branch scoring them the same, KL 0 within fp32's rounding of its
+    terms (88 e^-88, normal), the entropy's tiny term formed as the gap's, where a flushed weight dropped
+    it; scored 0 and -inf against logits 0 and -110, its KL +inf and the low score's gradient the weight's
+    (0 in fp32), not the infinity's own slope, and scored -2^126 under a large cotangent, the weight's
+    product normal; a teacher logit of NaN, its KL and gradient NaN, not a finite loss over the
+    rest."""
+    query = jnp.ones((1, 2, 1, 1), jnp.float32)
+    selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
+
+    def loss(scores, key):
+        return block_sparse.msa_query_kls(scores, query, key, selected, block=2, scale=1.0)[0, 1]
+
+    key = jnp.asarray([[[[0.0]], [[-88.0]]]], jnp.float32)
+    equal = jnp.asarray([[[[0.0, -np.inf], [0.0, -88.0]]]], jnp.float32)
+    assert_fp32_reduction_bound(np.asarray(loss(equal, key)), 0.0, 2 * 88 * np.exp(-88.0), 4)
+    # Teacher logits 0 and -110: scored 0 and -inf, the low score's gradient the weight's, -e^-110, 0 in
+    # fp32, the high score's 1 less its weight's 1, 0; scored 0 and -2^126 under a cotangent of 2^126, the
+    # low score's -2^126 e^-110 (1.44e-10, normal), formed between the weight's halves.
+    farther = jnp.asarray([[[[0.0]], [[-110.0]]]], jnp.float32)
+    infinite = jnp.asarray([[[[0.0, -np.inf], [0.0, -np.inf]]]], jnp.float32)
+    assert float(loss(infinite, farther)) == np.inf
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther))(infinite))[0, 0, 1]
+    np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
+    far = jnp.asarray([[[[0.0, -np.inf], [0.0, -(2.0**126)]]]], jnp.float32)
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther) * 2.0**126)(far))[0, 0, 1, 1]
+    expected = -(2.0**126) * np.exp(-110.0) / (1 + np.exp(-110.0))
+    assert_fp32_reduction_bound(gradient, expected, abs(expected), 3)
+    # Teacher logits 0 and -176 against scores 0 and fp32's least: the term fp32's largest e^-176, 1.25e-38,
+    # normal, though the weight's half e^-88 is not (a flushing backend's 0).
+    farthest = jnp.asarray([[[[0.0]], [[-176.0]]]], jnp.float32)
+    largest = float(np.finfo(np.float32).max)
+    spanned = jnp.asarray([[[[0.0, -np.inf], [0.0, -largest]]]], jnp.float32)
+    mass = np.exp(-176.0)
+    terms = np.asarray([mass * np.log(mass), mass * largest])
+    assert_fp32_reduction_bound(np.asarray(loss(spanned, farthest)), terms.sum(), np.abs(terms).sum(), 4)
+    # Teacher logits 0 and -176.5 against scores fp32's largest and least, a gap past fp32's range: the
+    # term 2 F e^-176.5 normal though its halved gap's is not; and teacher 0 and -110 under a cotangent of
+    # 2^127, the low score's cotangent -2^127 e^-110 normal, the factor of the halved gap inside the chain.
+    farther_still = jnp.asarray([[[[0.0]], [[-176.5]]]], jnp.float32)
+    spanning = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]]], jnp.float32)
+    mass = np.exp(-176.5)
+    terms = np.asarray([mass * np.log(mass), mass * 2.0 * largest])
+    found = np.asarray(loss(spanning, farther_still))
+    assert_fp32_reduction_bound(found, terms.sum(), np.abs(terms).sum(), 4)
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther) * 2.0**127)(spanning))[0, 0, 1, 1]
+    expected = -(2.0**127) * np.exp(-110.0) / (1 + np.exp(-110.0))
+    assert_fp32_reduction_bound(gradient, expected, abs(expected), 4)
+    invalid = jnp.asarray([[[[0.0]], [[np.nan]]]], jnp.float32)
+    uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
+    assert np.isnan(float(loss(uniform, invalid)))
+    assert np.isnan(np.asarray(jax.grad(lambda s: loss(s, invalid))(uniform))[0, 0, 1]).all()
+
+
+def test_infllm_v2s_selection_over_padding_picks_what_its_real_keys_pick():
+    """InfLLM-V2's selection (`infllm_selection`) at blocks of 16, a window of 64 every 16 and one optional
+    pick (`top_k` 3): over a row's 48 real keys no window holds 64, so each query reads its forced blocks
+    alone; the same row padded to 64 keys (`key_valid`), whose one window no real query reaches, picks the
+    same, where the unreached window's weight of 0 made block 1 a candidate and took it (train 1359's
+    F3)."""
+    rng = np.random.default_rng(1359)
+    query = jnp.asarray(rng.standard_normal((1, 64, 2, 8)), jnp.float32)
+    key = jnp.asarray(rng.standard_normal((1, 64, 1, 8)), jnp.float32)
+    shape = {"block": 16, "top_k": 3, "kernel": 64, "stride": 16}
+    real = np.asarray(block_sparse.infllm_selection(query[:, :48], key[:, :48], **shape))
+    valid = jnp.arange(64)[None, :] < 48
+    padded = np.asarray(block_sparse.infllm_selection(query, key, key_valid=valid, **shape))[:, :, :48]
+    for row in np.ndindex(real.shape[:-1]):
+        assert {int(b) for b in real[row] if b >= 0} == {int(b) for b in padded[row] if b >= 0}
+
+
+def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
+    """InfLLM-V2's selection (`infllm_selection`) over five blocks of 16 keys, the second block's every key
+    hidden (`key_valid`), its real blocks' pooled logits negative: the last query's one optional pick is a
+    real block, never the hidden one, whose windows score nothing."""
+    rows, keys, width = 1, 80, 8
+    query = -jnp.ones((rows, keys, 1, width), jnp.float32)
+    key = jnp.ones((rows, keys, 1, width), jnp.float32)
+    valid = jnp.ones((rows, keys), bool).at[:, 16:32].set(False)
+    picks = block_sparse.infllm_selection(query, key, block=16, top_k=3, kernel=16, stride=16, initial=1,
+                                          local=1, key_valid=valid)
+    assert int(picks[0, 0, -1, 0]) in (2, 3)
+
+
+@pytest.mark.parametrize(("dtype", "precision", "numerics", "keys", "scaled"), [
+    (jnp.bfloat16, "BF16_BF16_F32", None, (0.0, 1.0), float(
+        np.asarray(1.0, jnp.bfloat16) / np.asarray(np.sqrt(2.0), jnp.bfloat16))),
+    (jnp.float32, "highest", "BF16_BF16_F32", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
+    (jnp.float32, "BF16_BF16_F32", "accurate", (4096.0, 4097.0), float(np.float32(2.0 ** -0.5))),
+], ids=["bf16-preset", "layer-highest-under-ambient-bf16", "accurate-run-over-a-layers-bf16-preset"])
+def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precision, numerics, keys, scaled):
+    """An MSA layer's sown indexer loss (`BlockSparseSelfAttention._msa`, `INDEXER_COLLECTION` open) over a
+    query `[1, 0]` and two keys at width 2, blocks of one key, both selected: the float64 KL from its index
+    branch's softmax (its sown scores) to the softmax of the logits its attention forms, written out here
+    (the query scaled by 1/sqrt(2) first in its dtype, its fp32 product with each key): at a bf16 preset the
+    scaled query bf16's 1/sqrt(2), 0.70703125; at a layer's `highest` under an ambient bf16 preset (row
+    13706), and under the run's accurate numerics over a layer's bf16 preset, fp32's, so keys of 4096 and
+    4097 stay a logit apart (train 1359's F1). A dropped handoff of the layer's precision or order to its
+    teacher moves its KL."""
+    from types import SimpleNamespace
+
+    from dew.nn.mixer_base import MixerContext
+
+    context = MixerContext(emb_features=4, num_heads=1, num_kv_heads=1, head_dim=2, max_seq_len=2,
+                           qk_norm=False, dtype=dtype, precision=precision)
+    built = mixers.build("block_sparse_attention", selection="msa", block=1, top_k=2, index_width=4).build(
+        context)
+
+    class Called(built.func):
+        """The layer's `_msa` as its own call, the index branch its submodule."""
+
+        @nn.compact
+        def msa(self, *arguments):
+            return self._msa(*arguments)
+
+    layer = Called(*built.args, **built.keywords)
+    query = jnp.asarray([[[[1.0, 0.0]]] * 2], dtype)
+    key = jnp.asarray([[[[keys[0], 0.0]], [[keys[1], 0.0]]]], dtype)
+    hidden = jax.random.normal(jax.random.key(0), (1, 2, 4), jnp.float32).astype(dtype)
+    masking = SimpleNamespace(documents=None, valid=None)
+    arguments = (query, key, key, masking, None, hidden)
+    params = layer.init(jax.random.key(1), *arguments, method="msa")
+    ambient = (jax.default_matmul_precision(numerics) if numerics not in (None, "accurate")
+               else run_precision(ACCURATE) if numerics == "accurate" else contextlib.nullcontext())
+    with ambient:
+        _, sown = layer.apply(params, *arguments, method="msa", mutable=[INDEXER_COLLECTION, SELECTIONS])
+    found = float(np.asarray(jax.tree.leaves(sown[INDEXER_COLLECTION])[0])[0, 1])
+    student = np.asarray(next(leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown[SELECTIONS])[0]
+                              if "scores" in jax.tree_util.keystr(path)), np.float64)[0, 0, 1]
+    student = np.exp(student - student.max()) / np.exp(student - student.max()).sum()
+    # Each logit the fp32 product its attention sums: the scaled query times the key, rounded once.
+    logits = np.asarray([np.float32(scaled) * np.float32(k) for k in keys], np.float64)
+    teacher = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    expected = float(np.sum(teacher * (np.log(teacher) - np.log(student))))
+    assert_fp32_reduction_bound(found, expected, float(np.sum(np.abs(teacher * np.log(student)))) + 1.0, 8)
+
+
+def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
+    """The indexer's teacher (`mla.indexer_target`, MSA's and the lightning indexers'): each head's softmax
+    over the keys its call allows alone. Two fp32 heads over two allowed keys and a hidden one, the first
+    head's allowed logits fp32's least both, the second's 0 and -128: the heads' masses 1.5 and 0.5 within
+    fp32's rounding, the hidden key none, where a hidden key given fp32's least logit tied the first head's
+    and took a third of it (4/3 and 1/3, train 1345's F1); a row that allows no key, each head's uniform
+    over every key, the references' masked softmax's."""
+    least = float(np.finfo(np.float32).min)
+    query = jnp.ones((1, 2, 2, 1), jnp.float32)
+    key = jnp.asarray([[[[least], [0.0]], [[least], [-128.0]], [[least], [0.0]]]], jnp.float32)
+    keep = jnp.asarray([[[True, True, False], [False, False, False]]])
+    target = np.asarray(indexer_target(query, key, keep, 1.0))
+    for found, exact in ((target[0, 0, 0], 1.5), (target[0, 0, 1], 0.5)):
+        assert_fp32_reduction_bound(found, exact, exact, 8)
+    np.testing.assert_array_equal(target[0, 0, 2], 0.0)
+    for found in target[0, 1]:
+        assert_fp32_reduction_bound(found, 2 / 3, 2 / 3, 8)
 
 
 def test_msas_selection_keeps_its_slots_and_forces_each_block_once_within_reach():
@@ -443,9 +623,9 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     """InfLLM-V2's attention past its dense cut whose selection takes every block a query sees (its top as
     many as the blocks) reads every key the dense causal call reads: its output and gradients are on par
     with that call's (check 1), the two branches one function at the cut. An operand laid by the call's
-    heads, rows or places (a sink, query slots, key runs) is no argument of either branch."""
+    places (query slots, key runs) is no argument of either branch."""
     rows, queries, heads, groups, width = 1, 128, 8, 2, 32
-    shape = {"block": 16, "top_k": queries // 16, "kernel": 8, "stride": 4}
+    shape = {"block": 16, "top_k": queries // 16 + 2, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
 
     def selected(query, key, value):
@@ -457,12 +637,72 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     assert_as_exact(jax.jit(with_gradients(selected)), jax.jit(with_gradients(dense)), draw,
                     "InfLLM-V2's attention over every block", seeds=SEEDS)
     query, key, value, _ = draw(0)
-    laid = {"sinks": jnp.zeros((heads,)), "query_slots": jnp.zeros((rows, queries), jnp.int32),
+    laid = {"query_slots": jnp.zeros((rows, queries), jnp.int32),
             "key_runs": jnp.zeros((rows, queries, 1, 2), jnp.int32)}
     for dense_below, (name, operand) in itertools.product((queries + 1, queries), laid.items()):
         with pytest.raises(TypeError):
             block_sparse.infllm_attention(query, key, value, dense_below=dense_below, **{name: operand},
                                           **shape)
+
+
+def test_infllm_attention_takes_each_rows_cut_at_its_real_keys():
+    """InfLLM-V2's attention over right-padded rows (`key_valid`) past its cut by the call's 80 keys: a row of
+    60 real keys, below the cut of 64, attends densely as its 60 tokens do alone, and a row of 80 by its
+    selection as its tokens do unpadded, its output and gradients on par with theirs (check 1), each row's
+    real queries; a head's sinks join both branches (train 1345's F3 and F4)."""
+    rows, queries, heads, groups, width = 2, 80, 4, 2, 32
+    shape = {"block": 16, "top_k": 3, "kernel": 8, "stride": 4, "dense_below": 64}
+    real = 60
+    valid = jnp.arange(queries)[None, :] < jnp.asarray([[real], [queries]])
+    sinks = jnp.asarray([0.5, -1.0, 2.0, 0.0], jnp.float32)
+    draw = _drawn(rows, queries, heads, groups, width)
+
+    def drawn(seed: int):
+        # Each row's own output's cotangent: the first's over its real queries.
+        query, key, value, dout = draw(seed)
+        return query, key, value, (dout[0, :real], dout[1])
+
+    def ours(query, key, value):
+        out = block_sparse.infllm_attention(query, key, value, key_valid=valid, sinks=sinks, **shape)
+        return out[0, :real], out[1]
+
+    def alone(query, key, value):
+        short = block_sparse.infllm_attention(query[:1, :real], key[:1, :real], value[:1, :real], sinks=sinks,
+                                              implementation="xla", **shape)
+        long = block_sparse.infllm_attention(query[1:], key[1:], value[1:], sinks=sinks,
+                                             implementation="xla", **shape)
+        return short[0], long[0]
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(alone)), drawn,
+                    "InfLLM-V2's cut at each row's real keys", seeds=SEEDS)
+
+
+@pytest.mark.parametrize("selection", ["moba", "infllm"])
+@pytest.mark.parametrize("sinks", ["attention_sinks", "projected_sinks"])
+def test_a_block_sparse_decoders_sinks_reach_its_softmax(selection, sinks):
+    """A decoder of block-selected attention with sinks (a head's learned, or a query's own projected from
+    its input) reads them in its softmax: its logits move with them (train 1345's F4: they were dropped)."""
+    options = {"projected_sinks": True} if sinks == "projected_sinks" else {}
+    mixer = mixers.build("block_sparse_attention", selection=selection, block=16, top_k=3, dense_below=16,
+                         **options)
+    model = tiny(mixer=mixer, dtype="float32", **({"attention_sinks": True} if not options else {}))
+    tokens = jax.random.randint(jax.random.key(0), (1, 32), 0, VOCAB)
+    params = model.init(jax.random.key(1), tokens)
+    moved = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: leaf + 3.0 if "sink" in jax.tree_util.keystr(path) else leaf, params)
+    assert not np.array_equal(np.asarray(model.apply(params, tokens)), np.asarray(model.apply(moved, tokens)))
+
+
+@pytest.mark.parametrize("sinks", ["attention_sinks", "projected_sinks"])
+def test_an_msa_decoder_refuses_sinks(sinks):
+    """An MSA decoder with sinks is refused at build: its indexer's loss targets its heads' plain softmax
+    (`msa_query_kls`), which the sinks' would part from."""
+    options = {"projected_sinks": True} if sinks == "projected_sinks" else {}
+    mixer = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1, index_width=8,
+                         **options)
+    with pytest.raises(ValueError):
+        tiny(mixer=mixer, **({"attention_sinks": True} if not options else {})).init(
+            jax.random.key(1), jnp.zeros((1, 16), jnp.int32))
 
 
 def test_nsa_attention_holds_check_1_against_its_branches_written_out():
@@ -523,27 +763,70 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     `selection="infllm"`) over a row shorter than the selection's dense cut (8192 keys) attends densely:
     its logits are the same model's under causal attention's mixer, its parameters the same, bit for bit
     (`infllm_attention`'s dense branch is the plain causal call). Past its cut the mixer runs its selected
-    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses, and a
-    right-padded row, whose padding would move its dense cut."""
-    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2),
+    branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses. A
+    right-padded row (`training.md`'s) it takes, its real queries' logits bitwise as they were whatever token
+    its padding holds (train 1345's F3: it was refused), and one of a single document by its ids alone
+    (train 1359's F2)."""
+    infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=4),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (2, 64), 0, VOCAB)
     params = dense.init(jax.random.key(1), tokens)
     np.testing.assert_array_equal(np.asarray(infllm.apply(params, tokens)),
                                   np.asarray(dense.apply(params, tokens)))
-    # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone: the first, its
-    # own and its top one of those between, not the dense decoder's every key.
-    sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=1,
+    # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone, three in all (its
+    # top_k, row 13720): the first, its own and its top one of those between, not the dense decoder's every
+    # key; a top_k below the forced two it refuses.
+    sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=3,
                                      dense_below=32), dtype="float32")
     selected = np.asarray(sparse.apply(params, tokens))
     assert not np.array_equal(selected, np.asarray(dense.apply(params, tokens)))
     with pytest.raises(ValueError):
         tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
             jax.random.key(1), tokens)
-    padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
     with pytest.raises(ValueError):
-        sparse.apply(params, tokens, coordinates=coordinates(valid=padded, right_padded=True))
+        tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=1)).init(
+            jax.random.key(1), tokens)
+    # A top_k of its forced blocks alone: each query reads its first and own blocks, no other (the 64 keys'
+    # third block, the last query's top by score at a top_k of 3, read by none).
+    forced = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2,
+                                     dense_below=32), dtype="float32")
+    third = tokens.at[:, 32:48].set((tokens[:, 32:48] + 5) % VOCAB)
+    np.testing.assert_array_equal(np.asarray(forced.apply(params, tokens))[:, 48:],
+                                  np.asarray(forced.apply(params, third))[:, 48:])
+    padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
+    forward = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(valid=padded,
+                                                                                    right_padded=True)))
+    changed = tokens.at[:, -1].set((tokens[:, -1] + 5) % VOCAB)
+    np.testing.assert_array_equal(np.asarray(forward(tokens))[:, :-1], np.asarray(forward(changed))[:, :-1])
+    # A right-padded row of one document by its ids alone (`lm(..., segments=1)`'s: its padding id 0), no
+    # validity stated: taken, its padding read as hidden (train 1359's F2: it was refused), its real
+    # queries' logits as the validity-stated row's.
+    segments = padded.astype(jnp.int32)
+    by_ids = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(
+        segments=segments, max_segments=1, right_padded=True)))
+    np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(by_ids(changed))[:, :-1])
+    np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(forward(tokens))[:, :-1])
+
+
+def test_infllm_v2s_cut_counts_the_keys_its_ids_and_validity_both_hold():
+    """An InfLLM-V2 decoder row of 64 slots, 48 of one document (its ids, padding 0) and a validity hiding
+    one of those and none of the padding: its real keys 47, below the cut of 56, so it attends densely, its
+    real queries' logits the dense decoder's, where the validity alone counted 63 and took the selection."""
+    tokens = jax.random.randint(jax.random.key(0), (1, 64), 0, VOCAB)
+    segments = (jnp.arange(64) < 48).astype(jnp.int32)[None]
+    valid = jnp.ones((1, 64), bool).at[0, 10].set(False)
+    rows = coordinates(segments=segments, valid=valid, max_segments=1, right_padded=True)
+
+    def decoder(dense_below):
+        return tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=3,
+                                       dense_below=dense_below), dtype="float32")
+
+    params = decoder(56).init(jax.random.key(1), tokens)
+    real = np.flatnonzero(np.asarray(segments[0]) & np.asarray(valid[0]))
+    cut = np.asarray(decoder(56).apply(params, tokens, coordinates=rows))[0, real]
+    dense = np.asarray(decoder(1 << 20).apply(params, tokens, coordinates=rows))[0, real]
+    np.testing.assert_array_equal(cut, dense)
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():
@@ -551,7 +834,9 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
     `selection="msa"`): its index branch's parameters are the model's (`msa_indexer`), it sows its index
     scores and its selection (`SELECTIONS`) and, where an objective trains an indexer, its loss per query
     (`msa_query_kls`, `INDEXER_COLLECTION`; an indexed mixer), and the main loss's
-    gradient leaves the index branch untouched: its input is read detached, the selection taking none."""
+    gradient leaves the index branch untouched: its input is read detached, the selection taking none. Its
+    selection is sown as every selection is (`mla.sow_selection`'s record), which the selection gate reads
+    (`selection_margins`): an MSA decoder's config selects and its margin is finite."""
     model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2,
                                     index_width=8), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
@@ -563,7 +848,13 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
 
     assert named(params, "msa_indexer")
     _, sown = model.apply(params, tokens, mutable=[SELECTIONS, INDEXER_COLLECTION])
-    assert named(sown, "index_scores") and named(sown, "selected")
+    assert named(sown, "scores") and named(sown, "visible") and named(sown, "budget")
+    # The gate asks the model's own config, its mixer typed, and of a hybrid's layer kind alike.
+    config = {"mixer": model.mixer}
+    assert selection_margins.selects(config)
+    assert selection_margins.selects({"mixer": None, "kinds": {"sparse": {"mixer": model.mixer}}})
+    captured = selection_margins.capture(model)(params, tokens)
+    assert np.isfinite(selection_margins.margin(config, captured, "msa"))
     # Its indexer's loss per query, each layer's, where an objective training an indexer opens its
     # collection.
     kls = named(sown, "kl")
@@ -575,20 +866,21 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
 
 def test_an_msa_decoder_of_a_top_of_one_selects_each_querys_own_block_alone():
     """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): it
-    builds and runs, each query's one slot its own block (`msa_selection`'s forcing), as it sows it."""
+    builds and runs, sowing a budget of no block past its own, and its selection's one slot is each query's
+    own block (`msa_selection`'s forcing) whatever the scores."""
     model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1,
                                     index_width=8), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
     params = model.init(jax.random.key(1), tokens)
     logits, sown = model.apply(params, tokens, mutable=[SELECTIONS])
     assert np.all(np.isfinite(np.asarray(logits)))
-    selections = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown)[0]
-                  if "selected" in "/".join(str(key) for key in path)]
-    assert selections
-    for selected in selections:
-        first = np.asarray(selected)[..., 0]
-        assert first.shape[-1] == 16
-        np.testing.assert_array_equal(first, np.broadcast_to(np.arange(16) // 4, first.shape))
+    budgets = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown)[0]
+               if "budget" in "/".join(str(key) for key in path)]
+    assert budgets and all(int(budget) == 0 for budget in budgets)
+    scores = jax.random.normal(jax.random.key(2), (1, 2, 16, 16), jnp.float32)
+    scores = jnp.where(jnp.arange(16)[None, :] <= jnp.arange(16)[:, None], scores, -jnp.inf)
+    first = np.asarray(block_sparse.msa_selection(scores, block=4, top_k=1))[..., 0]
+    np.testing.assert_array_equal(first, np.broadcast_to(np.arange(16) // 4, first.shape))
 
 
 def test_an_msa_decoder_refuses_a_logit_softcap():

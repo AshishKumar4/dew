@@ -98,11 +98,11 @@ from dew.scores import Summary
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
-from dew.training._fit import FitArguments
+from dew.training._fit import FitArguments, validation_suites
 from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
-from dew.training.evaluation import EvalSuite, Split
+from dew.training.evaluation import EvalSuite, Split, episodic
 from dew.training.phase_passes import PassPolicy, SampledPasses
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
@@ -1399,6 +1399,13 @@ class RunConfig:
                              "carries none of it: train the run through `run()`, or call prepare_process "
                              "with them before anything calls JAX")
 
+    def skipped_preview(self, objective: Objective[Loss, Effects]) -> str | None:
+        """Why the run previews its model at no validation where it would by default, a tracker's run: its
+        objective cannot sample (`Objective.preview_refusal`, a model that refuses generation), where a
+        preview asked of `Trainer.fit` is refused. The run records it in its summary (`train`); None where
+        it previews, or tracks nothing to preview to."""
+        return None if self.trainer.wandb is None else objective.preview_refusal()
+
     def readied(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader,
                 validation: Dataset | Mapping[str, Dataset | Split] | None, metrics: Sequence[Metric],
                 name: str) -> tuple[Self, Loader, Mapping[str, Split] | None, Mapping[str, EvalSuite] | None,
@@ -1469,19 +1476,29 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
+        skipped = self.skipped_preview(objective)
+        eval_every = trainer.eval_interval(dataset)
         # What `fit` is asked for but its resume, which a run compiled ahead compiles its evaluations from.
         fitted = FitArguments(
             # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
             steps=steps, tokens=trainer.tokens, max_tokens=trainer.max_tokens,
             log_every=trainer.log_every,
             examples=dataset.examples if steps is None else None,
-            eval_every=trainer.eval_interval(dataset), checkpoint_every=trainer.checkpoint_interval(dataset),
+            eval_every=eval_every, checkpoint_every=trainer.checkpoint_interval(dataset),
             checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
-            metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+            metrics=metrics if suites is None else (), preview=trainer.wandb is not None and skipped is None,
             best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.
             validation=validation if suites is None else suites or None, summaries=self.val_summaries)
+        # The splits `fit` validates, resolved as it resolves them (`validation_suites`).
+        validated = [] if skipped is None or lowering is not None else validation_suites(
+            dataset, validation if suites is None else suites or None, metrics if suites is None else (),
+            eval_every).values()
+        if any(not episodic(suite.data) for suite in validated):
+            # A run that validates a batch split, where a preview samples (`Evaluation.run`; a split of
+            # episodes previews none), records the preview it skips, and why.
+            summary = {**(summary or {}), "preview": {"skipped": skipped}}
         if isinstance(lowering, AheadTarget):
             raise self.compiled_ahead(objective, dataset, steps, rollout, name, lowering, fitted)
         lower_for = lowering.generation if isinstance(lowering, LowerFor) else None

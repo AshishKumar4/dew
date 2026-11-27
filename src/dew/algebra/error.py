@@ -34,6 +34,9 @@ class Candidate:
     no price reads (`compensated`)."""
     form: Callable | None = None
     """The uncompensated form it compensates; None for an uncompensated candidate, its own `function`."""
+    program: str | None = None
+    """The printed text `function` runs (`printed.reprinted`, a compensated one's `printed.source`), which
+    tells one proposed program from another; None where no plain call writes it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,9 +57,9 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     """`function`'s form chosen for operands of `operands`' shapes and dtypes: its candidates proposed in
     order of price (the form as written, the cheapest and the most stable extractions, and each root's
     forms beside the others' cheapest, `VARIANTS`, each distinct one priced as a whole, `_priced`), then each
-    one's sums compensated (`compensated`), and the first the gate admits chosen (`admits(candidate,
-    reference)`, whether `candidate` is as exact as `reference` from the float64 truth;
-    docs/design/algebra.md §1.5, §6.5): under default numerics against
+    one's sums compensated (`compensated`), each program proposed once (`_distinct`), and the first the gate
+    admits chosen (`admits(candidate, reference)`, whether `candidate` is as exact as `reference` from the
+    float64 truth; docs/design/algebra.md §1.5, §6.5): under default numerics against
     the form as written, so one is always admitted; under the accurate numerics (`precision="accurate"`)
     against the form as written and every other candidate as exact as it, so a choice is never less
     accurate than any admissible form proposed, and a form that is not (one past the float's range) blocks
@@ -75,20 +78,17 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     for index, variants in enumerate(graph.extract_multiple(list(roots), VARIANTS)):
         for number, form in enumerate(variants):
             proposed[f"root {index}'s form {number}"] = [*cheapest[:index], form, *cheapest[index + 1:]]
-    # Each candidate measured as its printed text computes it (`printed.reprinted`), what a generated
-    # module of it computes; one no plain call writes as it is (`printed.Unprintable`), as it is.
-    written = Candidate("as written", written_seconds.value,
-                        printed.reprinted(function, operands, tree) or function)
+    written = _reprinted("as written", written_seconds.value, function, operands, tree)
     candidates, seen = [written], set()
     for name, chosen in proposed.items():
         if (key := tuple(map(terms.key, chosen))) in seen:
             continue
         seen.add(key)
         valued = _valued(region, closed.consts, dict(zip(map(terms.key, roots), chosen, strict=True)), tree)
-        candidates.append(Candidate(name, _priced(region, chosen, timed),
-                                    printed.reprinted(valued, operands, tree) or valued))
-    candidates += [found for candidate in candidates
-                   if (found := compensated(candidate, operands, tree)) is not None]
+        candidates.append(_reprinted(name, _priced(region, chosen, timed), valued, operands, tree))
+    candidates = _distinct(candidates)
+    candidates = _distinct([*candidates, *(found for candidate in candidates
+                                           if (found := compensated(candidate, operands, tree)) is not None)])
     candidates.sort(key=lambda candidate: (candidate.compensated, candidate.seconds))
     if not accurate:
         for candidate in candidates:
@@ -124,7 +124,33 @@ def compensated(candidate: Candidate, operands: Sequence[jax.ShapeDtypeStruct], 
     flat = printed.loaded(text, "compensated")
     return Candidate(f"{candidate.name}, compensated", candidate.seconds,
                      lambda *values: jax.tree.unflatten(tree, list(flat(*values))), compensated=True,
-                     form=candidate.function)
+                     form=candidate.function, program=text)
+
+
+def _reprinted(name: str, seconds: float, function: Callable, operands: Sequence[jax.ShapeDtypeStruct],
+               tree) -> Candidate:
+    """A candidate measured as its printed text computes it (`printed.reprinted`), what a generated module
+    of it computes, that text its program; one no plain call writes (`printed.Unprintable`) as it is."""
+    found = printed.reprinted(function, operands, tree)
+    if found is None:
+        return Candidate(name, seconds, function)
+    measured, text = found
+    return Candidate(name, seconds, measured, program=text)
+
+
+def _distinct(candidates: Sequence[Candidate]) -> list[Candidate]:
+    """`candidates` in their order, each program once: a later one whose printed program an earlier one's
+    is (another extraction printing as the form as written does) is the same measurement, and the gate,
+    pairwise, would compare a program with itself (§1.5). One no plain call writes is kept; its extraction
+    is told apart by its terms alone."""
+    kept, programs = [], set()
+    for candidate in candidates:
+        if candidate.program is not None:
+            if candidate.program in programs:
+                continue
+            programs.add(candidate.program)
+        kept.append(candidate)
+    return kept
 
 
 def at_least(asked: jax.lax.DotAlgorithmPreset, dtype) -> Callable[[jax.lax.DotAlgorithmPreset], bool]:

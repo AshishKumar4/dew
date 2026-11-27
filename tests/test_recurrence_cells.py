@@ -29,23 +29,36 @@ def test_a_b200s_port_cells_route_no_other_tcgen05_generation(timed, sibling):
     assert routes == {timed: {('fla', True)}, sibling: {('mosaic_gpu', False)}}, routes
 
 
+def _ssd_training_routes(generation_name: str, heads: int, width: int, chunk_size: int) -> set:
+    """The routes (`_measured_routes`) of an SSD's bf16 training on `generation_name` at a Nemotron-H
+    receipt's shapes: one row of 4096 tokens, `heads` heads `width` wide, eight groups of 128-wide states,
+    chunks of `chunk_size`, a float32 output."""
+    def loss(x, B, C, dt, A, D):
+        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D)
+        out, _ = chunk(FORMED[4], operands, chunk_size=chunk_size, dtype=jnp.float32)
+        return out.astype(jnp.float32).sum()
+
+    shapes = (jax.ShapeDtypeStruct((1, 4096, heads, width), jnp.bfloat16),
+              *[jax.ShapeDtypeStruct((1, 4096, 8, 128), jnp.bfloat16)] * 2,
+              jax.ShapeDtypeStruct((1, 4096, heads), jnp.float32),
+              *[jax.ShapeDtypeStruct((heads,), jnp.float32)] * 2)
+    return set(_measured_routes(recurrence_chunk.SCAN.choice, generation_name,
+                                jax.grad(loss, argnums=(0, 1, 2, 3)), *shapes))
+
+
 @pytest.mark.parametrize('sibling', ['sm86', 'sm89', 'sm120'])
 def test_an_a100s_ssd_port_cells_route_no_other_mma_sync_generation(sibling):
-    """Nemotron-H 30B's SSD training at its A100 receipt's shapes: the port by its cell on an A100, the
+    """Nemotron-H 4B's SSD training at its A100 receipt's shapes: the port by its cell on an A100, the
     template on another mma.sync generation (an A10's, an L4's, an RTX PRO 6000's), which no receipt
     timed."""
     assert generation.family('sm80') == generation.family(sibling)
-
-    def loss(x, B, C, dt, A, D):
-        operands = Chunk(C, B, x, beta=dt, rate=A, skip=D)
-        out, _ = chunk(FORMED[4], operands, chunk_size=128, dtype=jnp.float32)
-        return out.astype(jnp.float32).sum()
-
-    shapes = (jax.ShapeDtypeStruct((1, 4096, 64, 64), jnp.bfloat16),
-              *[jax.ShapeDtypeStruct((1, 4096, 8, 128), jnp.bfloat16)] * 2,
-              jax.ShapeDtypeStruct((1, 4096, 64), jnp.float32),
-              *[jax.ShapeDtypeStruct((64,), jnp.float32)] * 2)
-    training = jax.grad(loss, argnums=(0, 1, 2, 3))
-    routes = {name: set(_measured_routes(recurrence_chunk.SCAN.choice, name, training, *shapes))
-              for name in ('sm80', sibling)}
+    routes = {name: _ssd_training_routes(name, 96, 80, 256) for name in ('sm80', sibling)}
     assert ('pallas', True) in routes['sm80'] and routes[sibling] == {('mosaic_gpu', False)}, routes
+
+
+def test_an_a100s_nemotron_h_30b_ssd_training_is_the_templates():
+    """Nemotron-H 30B's SSD training at its A100 receipt's shapes takes the template on an A100, its port cell
+    retired (M-JS-271b-a100: 1.898 ms against the port's 2.052): its every route the template's, none a
+    receipt's override, no fallback to the port or the portable math."""
+    routes = _ssd_training_routes('sm80', 64, 64, 128)
+    assert routes == {('mosaic_gpu', False)}, routes

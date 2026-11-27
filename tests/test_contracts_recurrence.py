@@ -1029,3 +1029,23 @@ def test_the_squash_holds_every_order(edge):
 
     assert_contract(preconditioned._squash, primals, direction, cotangent, f"ATK's squash {edge}",
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_log_linear_pairs_level_weight_holds_every_order(edge):
+    """`log_linear._level_pairs`, a block's pairs' weights each its query's at its level, gathered, a linear
+    map whose transpose selects and sums each level's cotangents (`generation.linear_map`): every order,
+    forward and reverse, under a nested jit and a scan, finite wherever float64 is a normal float32 and
+    wherever the plain gather's own derivatives are (row 10525)."""
+    from dew.nn.kernels import log_linear
+
+    count = 5
+    (weight,) = normal_draw(10525, (log_linear.WITHIN, count), scale=EDGES[edge])
+    (direction,) = normal_draw(10526, (log_linear.WITHIN, count), scale=EDGES[edge])
+    (cotangent,) = normal_draw(10527, (log_linear.WITHIN, log_linear.WITHIN))
+
+    def plain(operand):
+        return jnp.take_along_axis(operand, jnp.asarray(log_linear._levels(count)), axis=1)
+
+    assert_contract(lambda operand: log_linear._level_pairs(operand, count), (weight,), (direction,),
+                    cotangent, f"log-linear pairs' level weights {edge}", plain_fn=plain)

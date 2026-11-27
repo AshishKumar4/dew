@@ -248,7 +248,7 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     held = float64_held({"params": params, "buffers": buffers,
                          "inputs": (latent, times, pooled)})
 
-    @as_given
+    # A float64 program of JAX's, traced and compiled by the check as its arms are, its float64 read off it.
     def truth(context, probe):
         def wide_loss(variables, context):
             output = wide.apply({"params": variables, "buffers": held["buffers"]}, held["inputs"][0],

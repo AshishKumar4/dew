@@ -21,7 +21,6 @@ in fp32); a level within, as a recurrence, laid each of its blocks as a chunk of
 
 from __future__ import annotations
 
-import functools
 import math
 
 import jax
@@ -29,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.algebra import scan
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.precision import at_least_fp32
 
@@ -81,16 +80,29 @@ def log_linear_attention(query, key, value, g, level_scales, *, scale: float | N
 
 
 def _levels(count: int) -> np.ndarray:
-    """`[L, WITHIN, WITHIN]` bool: each pair of a block's slots at its level (`_within`'s), one-hot over the
-    `L` levels its pairs reach, of a sequence's `count` (`levels`). A query's weights taken at its pairs'
-    levels a level's selection at a time, no arithmetic: a weight's infinity or NaN its own level's pairs'
-    alone, and its gradient each level's pairs' selected and summed, another level's infinite cotangent no
-    term of it (as a product with the masks' zeros was, head review of fd3af8c41). Gathered by the levels'
-    indices, the gradient was a scatter: XLA's select and reduce over every pair and level, 3.0 ms of a G4's
-    9.1 ms log-linear Mamba-2 training step against fla's 2.3 ms whole (M-JS-275)."""
+    """`[WITHIN, WITHIN]` int: each pair of a block's slots' level (`_within`'s) of a sequence's `count`
+    (`levels`)."""
     offsets = np.arange(WITHIN)
-    level = np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], count - 1)
-    return level[None] == np.arange(level.max() + 1)[:, None, None]
+    return np.minimum(np.frexp(np.bitwise_xor.outer(offsets, offsets))[1], count - 1)
+
+
+def _level_pairs(weight, count: int):
+    """A block's pairs' weights `[WITHIN, WITHIN]`, each its query's (`weight` `[WITHIN, count]`) at its level
+    (`_levels(count)`): gathered, no arithmetic, so a weight's infinity or NaN reaches its own level's pairs
+    alone; a linear map (`generation.linear_map`) whose transpose selects and sums each level's cotangents a
+    level at a time, so another level's infinite cotangent is no term of it (as a product with the levels'
+    one-hot masks' zeros was, head review of fd3af8c41) and no scatter forms (autodiff's transpose of the
+    gather, 3.0 ms of a G4's 9.1 ms log-linear Mamba-2 training step against fla's 2.3 ms whole, M-JS-275),
+    every order of it a map of tangents. A level's select of the weights a level at a time took 295.7 us of a
+    GH200's log-linear Mamba-2 forward against 47.9 for the masks' product (M-JS-287)."""
+    def gathered(levels, moving):
+        return jnp.take_along_axis(moving, levels, axis=1)
+
+    def selected(levels, cotangent):
+        return jnp.stack([jnp.sum(jnp.where(levels == level, cotangent, 0.0), axis=-1)
+                          for level in range(count)], axis=-1)
+
+    return generation.linear_map(gathered, selected, jnp.asarray(_levels(count)), weight)
 
 
 def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, packed: bool):
@@ -136,12 +148,9 @@ def _within(q, k, v, g, weights, positions, *, scale: float, documents: int, pac
     v, g, weights = (grouped(blocked(x)) for x in (v, g, weights))
     # A pair's level: zero for a token's own key, else the bit length of their offsets' XOR (the exponent
     # `frexp` gives, 1 for 1, 0 for 0); past the sequence's levels, a pair of slots no token takes. Each
-    # pair's weight its query's at its level, selected level by level (`_levels`).
-    masks = _levels(weights.shape[-1])
-
+    # pair's weight its query's at its level (`_level_pairs`).
     def head(query, key, value, decay, weight):
-        pairs = functools.reduce(lambda taken, level: jnp.where(masks[level], weight[:, level, None], taken),
-                                 range(1, len(masks)), jnp.broadcast_to(weight[:, :1], masks.shape[1:]))
+        pairs = _level_pairs(weight, weight.shape[-1])
         return scan.spread(query, key, value, scan.between(decay[:, None]), weights=pairs)
 
     # A key head's value heads, its queries and keys unmapped among them, so their scores are formed once a

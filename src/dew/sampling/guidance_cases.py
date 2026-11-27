@@ -47,8 +47,8 @@ def _cases(*, tangent):
 
 
 GUIDED = SurrogateBodies(guidance._guided_value, guidance._guided_derivative, (),
-                         symbolic_zeros=False, cases={
-    (): SurrogateCase("guided", ComponentForm(guidance._guided_value, _value_truth, _cases(tangent=False)),
-                      {(): ComponentForm(_flat_tangent, _tangent_truth, _cases(tangent=True))},
-                      output_tree=(jax.tree.structure(0),)),
-}).declared(__name__)
+                         symbolic_zeros=False, cases=(
+    ((), SurrogateCase("guided", ComponentForm(guidance._guided_value, _value_truth, _cases(tangent=False)),
+                       {(): ComponentForm(_flat_tangent, _tangent_truth, _cases(tangent=True))},
+                       output_tree=(jax.tree.structure(0),))),
+)).declared(__name__)

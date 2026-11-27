@@ -7,8 +7,10 @@ error decides (`dew.algebra.acceptance`)."""
 import dataclasses
 import functools
 import importlib
+import os
 import subprocess
 import sys
+import types
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +19,16 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, component_cases, error, generate, printed
+from dew.algebra import (
+    _generated,
+    acceptance,
+    attention_cases,
+    error,
+    format_cases,
+    generate,
+    printed,
+    recurrence_cases,
+)
 from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
@@ -44,15 +55,50 @@ def test_the_written_modules_are_what_generation_writes(on_its_platform):
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["discovered", "qualified"])
-def test_the_command_checks_the_declaring_modules_own_declarations(named, on_its_platform):
-    """A fresh CLI checks every installed artifact, even without explicit declaration names."""
-    names = sorted(generate.DECLARATIONS) if named else []
-    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check", *names],
-                          check=False, capture_output=True, text=True)
-    assert done.returncode == 0, done.stderr
-    assert any(line.startswith("checked ") and line.endswith("/guidance_cases_derived.py")
-               for line in done.stderr.splitlines())
+_ISOLATED = """
+from dew.algebra.generate import ComponentForm, declare, float32_cases
+
+
+def _affine(x):
+    return x * 2 + 1
+
+
+AFFINE = declare(__name__, "affine", ComponentForm(_affine, _affine, float32_cases(((8,),))))
+"""
+
+_COMMAND = ("import runpy; from dew.algebra import generate; generate.DECLARING = ('isolated.cases',); "
+            "runpy.run_module('dew.algebra.generate', run_name='__main__', alter_sys=True)")
+"""The command as `python -m dew.algebra.generate` runs it (its `__main__` handing over to the module the
+declaring modules register with), that module's `DECLARING` the isolated one alone."""
+
+
+def test_the_command_refuses_a_stale_module_and_generation_repairs_it(tmp_path, on_its_platform):
+    """A fresh CLI process over one small declaring module of its own (`DECLARING` named alone): `--check`
+    refuses its missing and then its stale generated module without writing either, and generation writes
+    the module and its shared helpers, which `--check` then holds as written."""
+    package = tmp_path / "isolated"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "cases.py").write_text(_ISOLATED)
+    derived, shared = package / "cases_derived.py", package / "shared_derived.py"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")])}
+
+    def command(*arguments):
+        return subprocess.run([sys.executable, "-c", _COMMAND, *arguments], check=False, capture_output=True,
+                              text=True, env=env)
+
+    refused = command("--check")
+    assert refused.returncode != 0
+    assert not derived.exists() and not shared.exists()
+    written = command()
+    assert written.returncode == 0, written.stderr
+    assert "def affine(" in derived.read_text() and shared.exists()
+    held = command("--check")
+    assert held.returncode == 0, held.stderr
+    derived.write_text(derived.read_text().replace("def affine(", "def affine_stale("))
+    stale = derived.read_text()
+    assert command("--check").returncode != 0 and derived.read_text() == stale
+    assert command().returncode == 0 and command("--check").returncode == 0
 
 
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
@@ -77,14 +123,19 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "rounded_fp16", "rounded_fp16_tangent", "query_walk_factors",
                                   "key_walk_factors", "walk_output", "quantized_ste", "quantized_ste_tangent",
                                   "encode_e4m3", "encode_e5m2", "encode_e2m1", "e8m0_decode",
-                                  "decode_e4m3", "decode_e5m2", "selective_read",
+                                  "decode_e4m3", "decode_e5m2", "selective_read", "e8m0_exponents",
+                                  "mxfp8_block_decode", "mxfp8_block_decode_bf16", "selective_token",
+                                  "selective_dx_scale", "selective_state_tangent", "nvfp4_block_decode",
+                                  "skipped_back", "selective_lifted_adjoint",
                                   f"{guidance_cases.__name__}.guided",
                                   f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
 
-    qualified = name if "." in name else f"{component_cases.__name__}.{name}"
+    qualified = name if "." in name else next(
+        f"{module.__name__}.{name}" for module in (attention_cases, format_cases, recurrence_cases)
+        if f"{module.__name__}.{name}" in generate.DECLARATIONS)
     declaration = generate.DECLARATIONS[qualified]
     for policy in declaration.cases.policies:
         function = (declaration.function if arm == "written" else
@@ -115,11 +166,11 @@ def test_shared_component_preserves_layouts_constants_and_live_results():
         fn = functools.partial(tile, axis=axis, keep_product=keep_product, bias=bias)
         separate[name] = printed.formed(jax.make_jaxpr(fn)(*arguments[name]), borrow_shapes=True)[0]
     # An existing emitted body and a public wrapper can both occupy the helper's preferred name.
-    occupied = "_shared_component_0"
+    occupied = "shared_component_0"
     arguments[occupied] = (jax.ShapeDtypeStruct((7,), jnp.bfloat16),)
     separate[occupied] = printed.formed(jax.make_jaxpr(lambda x: (x * x,))(*arguments[occupied]),
                                         borrow_shapes=True)[0]
-    reserved = "_shared_component_1"
+    reserved = "shared_component_1"
     shared = _component_sharing.shared(separate, reserved=(reserved,))
     assert len(shared) == len(separate) + 1 and reserved not in shared
     for name, operands in arguments.items():
@@ -163,7 +214,7 @@ def test_shared_component_preserves_two_ordered_spans_in_one_body():
 
 @pytest.mark.parametrize("kind", ["placed", "duplicate"])
 def test_component_dispatch_refuses_cases_its_flat_key_cannot_distinguish(kind):
-    form = component_cases.ROUNDED.cases[jnp.bfloat16,].forward
+    form = dict(format_cases.ROUNDED.cases)[jnp.bfloat16,].forward
     (example,) = form.cases.operands[0]
     if kind == "placed":
         mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
@@ -191,9 +242,9 @@ def test_a_component_preserves_one_result_convention_across_cases():
 
 
 def test_generated_query_cotangents_default_to_the_accurate_small_weight_order():
-    from dew.algebra.component_cases_derived import queries_cotangent
+    from dew.algebra.attention_cases_derived import queries_cotangent
 
-    cases = component_cases.QUERIES_COTANGENT.cases
+    cases = attention_cases.QUERIES_COTANGENT.cases
     inputs = cases.draw(1, cases.operands[0])
     _, weights, cotangents = jax.jit(queries_cotangent)(*inputs)
     assert weights[0, 1] == 0
@@ -202,7 +253,7 @@ def test_generated_query_cotangents_default_to_the_accurate_small_weight_order()
 
 
 def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
-    from dew.algebra.component_cases_derived import online_softmax_step, split_kv_merge
+    from dew.algebra.attention_cases_derived import online_softmax_step, split_kv_merge
 
     def empty(logits, values):
         rows = logits.shape[0]
@@ -217,14 +268,14 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
 
     def split(left, left_values, right, right_values):
         start = empty(left, left_values)
-        first = component_cases._online_truth(*start, left, left_values)
-        second = component_cases._online_truth(*start, right, right_values)
-        return component_cases._split_kv_truth(*first, *second)
+        first = attention_cases._online_truth(*start, left, left_values)
+        second = attention_cases._online_truth(*start, right, right_values)
+        return attention_cases._split_kv_truth(*first, *second)
 
     def whole(left, left_values, right, right_values):
         logits = jnp.concatenate((left, right), axis=1)
         values = jnp.concatenate((left_values, right_values), axis=0)
-        return component_cases._online_truth(*empty(logits, values), logits, values)
+        return attention_cases._online_truth(*empty(logits, values), logits, values)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -240,7 +291,7 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
 
 
 def _generated_inverse(system):
-    from dew.algebra.component_cases_derived import chunk_solve_level
+    from dew.algebra.recurrence_cases_derived import chunk_solve_level
 
     size = system.shape[0]
     place = jnp.arange(size)
@@ -254,22 +305,22 @@ def _generated_inverse(system):
 
 @pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
 def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
-    from dew.algebra.component_cases_derived import chunk_weighted
+    from dew.algebra.recurrence_cases_derived import chunk_weighted
     from dew.nn.kernels import recurrence_algebra
 
     def generated(system, values, strengths):
         return chunk_weighted(_generated_inverse(system), values, strengths)
 
     def written(system, values, strengths):
-        lower = recurrence_algebra.solved(system, component_cases._carry_product)
-        return component_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
+        lower = recurrence_algebra.solved(system, recurrence_cases._carry_product)
+        return recurrence_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
 
     def truth(system, values, strengths):
         rhs = values * strengths[:, None]
         return jax.lax.linalg.triangular_solve(system, rhs, left_side=True, lower=True, unit_diagonal=True)
 
     def draw(seed):
-        system = component_cases._chunk_system(seed, size)
+        system = recurrence_cases._chunk_system(seed, size)
         rng = np.random.default_rng(seed)
         rhs = rng.uniform(-0.25, 0.25, (size, columns)).astype(np.float32)
         strength = rng.uniform(0.125, 0.5, size).astype(np.float32)
@@ -282,15 +333,15 @@ def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_s
 
 @pytest.mark.parametrize("size", [16, 32, 64])
 def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
-    from dew.algebra.component_cases_derived import chunk_inverse_pullback
+    from dew.algebra.recurrence_cases_derived import chunk_inverse_pullback
     from dew.nn.kernels import recurrence_algebra
 
     def generated(system, cotangent):
         return chunk_inverse_pullback(_generated_inverse(system), cotangent)
 
     def written(system, cotangent):
-        lower = recurrence_algebra.solved(system, component_cases._carry_product)
-        return component_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
+        lower = recurrence_algebra.solved(system, recurrence_cases._carry_product)
+        return recurrence_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
 
     def truth(system, cotangent):
         identity = jnp.eye(size, dtype=system.dtype)
@@ -315,14 +366,14 @@ def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
 
 
 def test_generated_value_gradient_accumulates_two_query_tiles():
-    from dew.algebra.component_cases_derived import values_gradient
+    from dew.algebra.attention_cases_derived import values_gradient
 
     def generated(scores, cotangent, peak, total):
         return (values_gradient(scores[:32], cotangent[:32], peak[:32], total[:32])
                 + values_gradient(scores[32:], cotangent[32:], peak[32:], total[32:]))
 
     def written(scores, cotangent, peak, total):
-        return component_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
+        return attention_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
 
     def truth(scores, cotangent, peak, total):
         keep = jnp.isfinite(peak)
@@ -330,7 +381,7 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
         return weights.T @ (cotangent / jnp.where(total > 0, total, 1)[:, None])
 
     def draw(seed):
-        case = component_cases.VALUES_GRADIENT.cases
+        case = attention_cases.VALUES_GRADIENT.cases
         left = case.draw(seed, case.operands[0])
         right = case.draw(seed + 19, case.operands[0])
         return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
@@ -339,7 +390,7 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
 
 
 def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
-    from dew.algebra import component_cases_derived as emitted
+    from dew.algebra import format_cases_derived as emitted
     from dew.nn import precision
 
     def dtype_of(spec):
@@ -351,8 +402,8 @@ def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
     def tangent(spec, primals, directions, value):
         return precision._rounded_tangent(dtype_of(spec), primals, directions, value)
 
-    paired = dataclasses.replace(component_cases.ROUNDED, forward=forward, tangent=tangent)
-    composed = paired.assembled(lambda name: getattr(emitted, name))
+    paired = dataclasses.replace(format_cases.ROUNDED, forward=forward, tangent=tangent)
+    composed = paired.assembled(emitted)
     options = {"dtype": jnp.bfloat16}
     x = jnp.full((16, 32), 1.003, jnp.float32)
     dx = jnp.full_like(x, 1.007)
@@ -402,20 +453,25 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     case = generate.SurrogateCase("partial", forward, {(1,): active},
                                   input_tree=(jax.tree.structure(({"x": tile, "y": tile},)),),
                                   output_tree=(jax.tree.structure({"difference": tile, "sum": tile}),))
-    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases={(): case})
-    reachable = {}
-    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
-        _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)
-        reachable[name] = printed.loaded(body.render("form"), "form")
-
+    declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases=(((), case),))
     called = set()
+    tables = {}
+    # Every declared case in the module double, the tangent's small one too: its fallback below is the
+    # forward's output tree's, never a missing row's.
+    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
+        rows = {}
+        for operands in component.cases.operands:
+            _, body, _ = generate._component(component, operands, "default", "sm90", name)
+            loaded = printed.loaded(body.render("form"), "form")
 
-    def emitted(name):
-        fn = reachable[name]
-        called.add(fn)
-        return lambda *operands, policy, target: fn(*operands)
+            def form(*values, name=name, loaded=loaded):
+                called.add(name)
+                return loaded(*values)
+            rows |= {(policy, target, _generated.case_of(operands)): form
+                     for policy in component.cases.policies for target in component.cases.targets}
+        tables[_generated.table_name(name)] = rows
 
-    composed = declared.assembled(emitted)
+    composed = declared.assembled(types.SimpleNamespace(**tables))
     x = np.arange(8, dtype=np.float32)
     y = np.full_like(x, 3.5)
     dx = np.full_like(x, 2.25)
@@ -428,7 +484,7 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     np.testing.assert_array_equal(primal["sum"], x + y)
     np.testing.assert_array_equal(direction["difference"], (x - y) * dx)
     np.testing.assert_array_equal(direction["sum"], (x + y) * dx)
-    assert called == set(reachable.values())
+    assert called == {case.name, case.tangent_name((1,))}
 
     # The tangent key is valid at this size, but the forward fallback returns a different PyTree.
     called.clear()
@@ -561,3 +617,39 @@ def test_dvs_normalization_is_proposed_on_either_side_of_its_contraction():
     found = [divides_the_cotangent(candidate) for candidate in choice.candidates]
     assert not found[[candidate.name for candidate in choice.candidates].index("as written")]
     assert any(found)
+
+
+def test_the_chooser_measures_each_pair_of_distinct_programs_once():
+    """§1.5: the log-sum-exp fold's second extraction prints as its form as written does. Under the accurate
+    policy, whose gate is pairwise, no program is compared with itself and no pair is measured twice."""
+    (operands,) = generate.DECLARATIONS[f"{acceptance.__name__}.lse_folded_probabilities"].cases.operands
+    measured = []
+
+    def admits(candidate, reference):
+        measured.append((candidate, reference))
+        return True
+
+    choice = error.choose(acceptance.lse_folded_probabilities, operands, accurate=True,
+                          saturation=algebra.SATURATION, admits=admits)
+
+    def program(function) -> str:
+        return str(jax.make_jaxpr(function)(*operands))
+
+    pairs = [(program(candidate), program(reference)) for candidate, reference in measured]
+    assert pairs and all(candidate != reference for candidate, reference in pairs)
+    assert len(set(pairs)) == len(pairs)
+    proposed = [program(candidate.function) for candidate in choice.candidates]
+    assert len(set(proposed)) == len(proposed)
+
+
+def test_a_name_declared_twice_is_refused_and_keeps_its_first_form():
+    """Two forms of one declared name are refused, the first kept (`generate.declare`): a second surrogate
+    case of one body name over the first ran the second's form for both. Declared under a module no
+    generation writes (`DECLARING` names none of it)."""
+    first, second = (generate.ComponentForm(fn, fn, generate.float32_cases(((8,),)))
+                     for fn in (lambda x: 2 * x, lambda x: 3 * x))
+    generate.declare(__name__, "gain", first)
+    assert generate.declare(__name__, "gain", first) is first
+    with pytest.raises(ValueError):
+        generate.declare(__name__, "gain", second)
+    assert generate.DECLARATIONS[f"{__name__}.gain"] is first

@@ -35,7 +35,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON
-from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
+from dew.batch import Batch, Variables, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Resume
 from dew.data.dataset import (
     Checkpointable,
@@ -1128,10 +1128,11 @@ class Trainer(Generic[Loss, Effects]):
 
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
-                       frontier: bool = False) -> Planned:
+                       frontier: bool = False, placed: Variables | None = None) -> Planned:
         """The plan the run's step compiles at (`StepCompiler.plan`), taken as `compile` takes its compile;
-        the caller reads its lowering before releasing it or serializing its executable (`compile_ahead`)."""
-        planned, compiled = self._compiler.plan(self._stepping(), state, batch, trials, frontier)
+        the caller reads its lowering before releasing it or serializing its executable (`compile_ahead`),
+        `placed` the variables as placed where `state` holds their shapes alone."""
+        planned, compiled = self._compiler.plan(self._stepping(), state, batch, trials, frontier, placed)
         self._took(compiled)
         return planned
 
@@ -2271,6 +2272,8 @@ class Trainer(Generic[Loss, Effects]):
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
+        if preview and self.tracker is not None and (refusal := self.objective.preview_refusal()) is not None:
+            raise ValueError(f"preview=True samples the model, which refuses generation: {refusal}")
         for name, suite in suites.items():
             if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):
                 self.objective._check_validation_loss()

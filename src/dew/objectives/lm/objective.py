@@ -93,6 +93,7 @@ from dew.nn.protocols import (
     CrossAttending,
     DecoderTraining,
     ForkedCalls,
+    Generating,
     Lacks,
     LayerStates,
     Looped,
@@ -1353,6 +1354,14 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"rows of {tokens.shape[-1]} ids hold {tokens.shape[-1] - finals} inputs, more than the "
                 f"{self.context}-token context of the objective's seq_len and the model's max_seq_len")
         return tokens[:, :-finals], tokens[:, 1:]
+
+    def preview_refusal(self) -> str | None:
+        """The model's generation refusal (`generation_refusal`, a block-sparse selection reading a row's own
+        tokens uncached) where the preview samples (`samples`, a token budget), None otherwise."""
+        settings = self.samples
+        if settings is None or settings.max_new_tokens <= 0:
+            return None
+        return self.model.generation_refusal() if isinstance(self.model, Generating) else None
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.

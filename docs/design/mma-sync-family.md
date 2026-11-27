@@ -10,8 +10,8 @@ deleted; the rest records the design as its review left it on `feat/mma-sync-fam
 
 One complete mma.sync Family bundle (`templates/mosaic_sm80.Mma`): the one every template's Ampere-class
 mainloop runs on. This round: two consumer warpgroups, a collective cp.async pipeline, hooks, the kernel
-gradient (dW), one resource descriptor and one derived launch. It is measured on an A100 and an L4 against
-the Pallas-Triton route.
+gradient (dW), one resource descriptor and one derived launch. It is measured on an A100 against the
+Pallas-Triton route (§8: no L4 is reachable, and an A10 joins where an approved window holds one).
 
 Scope is sm80, sm86 and sm89, the parts whose copies are cp.async. On sm120 (consumer Blackwell) JAX picks the
 copy transport by compute capability, not by the MMA family (`pipeline.py:331`, `primitives.py:1088`): cp.async
@@ -53,7 +53,8 @@ fork.
 
 1. **mma.sync walks through `emit_pipeline`** (J, aa3936052). This means one call per segment, a dynamic grid,
    and the derived stages as `max_concurrent_steps`. A walk's segments each drain. GEMM walks have one segment
-   and the recurrence's have one a document range. The drain's cost is measured in this round (§8).
+   and the recurrence's have one a document range. The round times a recurrence walk at one, two and four
+   documents (§8), each its own segment count and grid, so the drain's cost is bounded, not isolated.
 2. **The fork gives `emit_pipeline`'s cp.async path a collective thread axis** (JAX fork, `pipeline.py:384`,
    matching `docs/installation.md`). `BlockSpec.collective_axes` stays refused on `emit_pipeline`
    (`pl.BlockSpec with collective_axes= is not supported`); instead `emit_pipeline(..., thread_axis="wg")`
@@ -81,21 +82,21 @@ fork.
    - This round measures, at one head and one JAX, the wgmma fixed-depth forward on
      `emit_pipeline_warp_specialized` in START/STEADY/STOP mode against `RingFamily.persist`. Arms: H100,
      route rows, time and peak.
-   - The ring stays only where a stated limit forces it: dynamic grouped step counts (static grids only),
-     step counts not divisible by the stages, or the in-flight wgmma release (`delay_release` refused). The
-     note then names that limit and the measurement.
    - Measured (M-FS-94b, GH200, 128x256x64 at four stages, two consumers, three alternating rounds): the two
-     forms tie wherever the pipeline of pipelines compiles (2048x4096x4096 0.998, 8192x4096x4096 and
-     16384x2048x2048 1.000), and it walks one tile axis, so a launch of two (4096x4096x14336) runs on the ring
-     alone. The ring stays for every wgmma launch: nothing is gained where both run, and only it runs where
-     a launch takes two tile axes.
+     forms tie wherever both ran (2048x4096x4096 0.998, 8192x4096x4096 and 16384x2048x2048 1.000). The
+     comparison arm (`WgmmaPipelined`, toolkit/theme-k01-16) pipelined one tile axis by its own construction
+     (its `persist` refused `len(tiles) != 1`), so the two-axis launch (4096x4096x14336) ran on the ring
+     alone and holds no comparison. The ring stays for every wgmma launch: nothing is gained where both
+     ran.
 4. **mma.sync streaming across tiles.** Today each mma.sync tile's `emit_pipeline` drains. The existing
    alternative is one flattened `emit_pipeline` over (tile, step), carrying the accumulator in `init_carry`,
    storing and resetting it at tile boundaries while JAX prefetches across them (:320-323, :416-427,
-   :502-529). Measured, the per-tile form leaves it nothing to recover (M-FS-95, an A100): every grouped
-   GEMM row within 1.04x of Triton, five of eight ahead (input gradients 0.83-0.86x, an 8-group MoE
-   forward 0.46x), and a recurrence walk split into documents running faster, not slower (2.032 ms whole,
-   1.846 in two). The per-tile drain stays; the flattened pipeline is not built.
+   :502-529). Measured, the per-tile form leaves it nothing to recover against Triton (M-FS-95, an A100):
+   every grouped GEMM row within 1.05x of it (the slowest, a 128-group MoE forward, about 1.05x), five
+   of eight ahead (input gradients 0.83-0.86x, an 8-group MoE forward 0.46x). A recurrence walk over two
+   and four packed documents took 1.846 and 1.890 ms against 2.032 whole: workload timings, each its own
+   segment count and grid, which bound the drain's cost but do not isolate it. The per-tile drain stays;
+   the flattened pipeline is not built.
 
 ### Sources the derivation learns from (owner, bible §6)
 
@@ -202,9 +203,11 @@ Bible §8: no local tests. Each step goes to armada, then one GPU round for the 
   - test_grouped_gemm, test_kernel_configs (sm80/86/89 compile gates through ptxas), test_moe, test_recurrence;
   - the fork's pipeline test for collective cp.async.
 - GPU, one round:
-  - A100 and L4: the GEMM GPU tier, the fork's collective pipeline test natively, time against Triton
-    (bench_route2, arms mosaic_gpu and triton), measured peak (tools/peak_memory.py), and the per-segment
-    drain cost (a recurrence walk with one segment against several);
+  - A100 (no L4 is reachable: Colab offers G4 alone and Lambda no L4; an A10 joins where an approved
+    window holds one): the GEMM GPU tier, the fork's collective pipeline test natively, time against Triton
+    (arms mosaic_gpu and triton), each arm's peak in a process of its own (`tools/peak_memory.measured`: a
+    process-wide high-water holds every arm run before it), and a recurrence walk at one, two and four
+    documents (workload timings);
   - H100: §3.3's ring against START/STEADY/STOP.
 - Done means: two warpgroups, hooks and dW hold check 1 natively on the A100. The time ratio to Triton is
   reported per row, and each row slower than 1.10x is profiled (ncu) as a template defect.

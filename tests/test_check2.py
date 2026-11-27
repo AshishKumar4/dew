@@ -683,7 +683,7 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
 
 @pytest.mark.parametrize("dtype", [ml_dtypes.float8_e4m3fn, ml_dtypes.float8_e8m0fnu])
 @pytest.mark.parametrize("raw", [False, True], ids=["fp8-first", "bytes-first"])
-def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(raw, dtype):
+def test_fp8_storage_bitcasts_and_widening_preserve_every_code_without_admitting_arithmetic(raw, dtype):
     codes = np.arange(256, dtype=np.uint8)
     stored = codes.view(dtype)
     start, middle, returned = (codes, dtype, jnp.uint8) if raw else (stored, jnp.uint8, dtype)
@@ -696,7 +696,16 @@ def test_fp8_storage_bitcasts_preserve_every_code_without_admitting_arithmetic(r
     assert not findings, findings
     np.testing.assert_array_equal(np.asarray(other).view(np.uint8), codes)
     np.testing.assert_array_equal(np.asarray(repeat).view(np.uint8), codes)
-    _, findings = ct.certified(lambda value: value.astype(jnp.float32), stored)
+    widened, findings = ct.certified(lambda value: value.astype(jnp.float32), stored)
+    if dtype is ml_dtypes.float8_e8m0fnu:
+        assert findings and all(f"no format for {np.dtype(dtype)}" in finding for finding in findings)
+        return
+    # An E4M3 code's widening is exact: every value and both zeros as the host decodes it, a NaN a NaN.
+    assert not findings, findings
+    host = stored.astype(np.float32)
+    np.testing.assert_array_equal(widened, host)
+    np.testing.assert_array_equal(np.signbit(widened)[~np.isnan(host)], np.signbit(host)[~np.isnan(host)])
+    _, findings = ct.certified(lambda value: value + value, stored)
     assert findings and all(f"no format for {np.dtype(dtype)}" in finding for finding in findings)
 
 

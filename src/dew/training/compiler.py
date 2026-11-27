@@ -930,8 +930,10 @@ class StepCompiler[L, E]:
             self.at_base_rung(batch)
             # The rung the run's policy starts its step at, which its search would compile (`FitSearch`).
             self.unsearched_rung(self.objective)
-            raise Lowered(target, *routed(
-                lambda: [("step", lowered_for(stepping, state, batch, target, self.narrow))]))
+            (lowered, options), routes = routed(
+                lambda: lowered_for(stepping, self.objective, state, batch, target, self.narrow,
+                                    self._xla_defaults))
+            raise Lowered(target, [("step", lowered)], routes, options=options)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
@@ -1166,12 +1168,14 @@ class StepCompiler[L, E]:
             raise refusal
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
-             trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
+             trials: Trials | None, frontier: bool = False, placed: Variables | None = None
+             ) -> tuple[Planned, Compiled]:
         """The shared device-step planner: the plan it admitted and what its compile found (`Compiled`, its
         step none: the caller reads its lowering before releasing it, `compile`, or serializing its
         executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`), its rung
-        recorded (`keep_rung`)."""
-        planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier)
+        recorded (`keep_rung`); `placed`, the variables as placed, where `state` holds their shapes alone
+        (`_plan`)."""
+        planned, compiled, keep = self._plan(stepping, state, batch, trials, frontier, placed=placed)
         keep()
         return planned, compiled
 

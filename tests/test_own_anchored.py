@@ -177,13 +177,17 @@ def test_check_1_rejects_a_zeroed_query_gradient_of_the_cancelling_draws():
                         truth_fn=_token_by_token)
 
 
-@pytest.mark.parametrize("target", ["sm86", "sm120"])
-def test_kimis_training_plan_anchors_its_forward_own_pairs_alone(target):
+@pytest.mark.parametrize(("target", "anchors"),
+                         [("sm80", 0), ("sm86", 0), ("sm90", 1), ("sm100", 1), ("sm120", 0)])
+def test_kimis_training_plan_anchors_its_forward_own_pairs_alone_where_products_read_shared_memory(
+        target, anchors):
     """Kimi delta attention's bf16 training step as the template plans it on `target`: its forward's own pairs
-    anchored (`intra_own` reducing its guard across warps, `mainloop.Launch.reducing`), its backward's
-    (`key_pairs_own`) each its own decay: anchored, a GH200's took 899.7 us where these took 501.8, its
-    training step 2912.7 against 2445.1 (M-JS-293), its block holding half the programs a multiprocessor
-    these do on an H100, a quarter on an A100."""
+    anchored (`intra_own` reducing its guard across warps, `mainloop.Launch.reducing`) where its family's
+    products read shared memory (`anchored.anchors_on`: an A100's anchored intra_own 10.9% slower, a
+    GH200's 12.1% faster, M-JS-291c and M-JS-291b), its backward's (`key_pairs_own`) each its own decay:
+    anchored, a GH200's took 899.7 us where these took 501.8, its training step 2912.7 against 2445.1
+    (M-JS-293), its block holding half the programs a multiprocessor these do on an H100, a quarter on an
+    A100."""
     from test_recurrence_mosaic import RESOURCE_SHAPES, resource_operands
 
     from dew.nn.kda import KimiDeltaAttention
@@ -203,7 +207,7 @@ def test_kimis_training_plan_anchors_its_forward_own_pairs_alone(target):
                                                                              backward=True)}
     reducing = {name: launches[name].reducing
                 for name in ("recurrence_intra_own", "recurrence_key_pairs_own")}
-    assert reducing == {"recurrence_intra_own": 1, "recurrence_key_pairs_own": 0}, reducing
+    assert reducing == {"recurrence_intra_own": anchors, "recurrence_key_pairs_own": 0}, reducing
 
 
 OWN_LAUNCHES = {"recurrence_intra_own", "recurrence_intra_own_scores", "recurrence_key_pairs_own"}
@@ -211,7 +215,7 @@ OWN_LAUNCHES = {"recurrence_intra_own", "recurrence_intra_own_scores", "recurren
 backward's."""
 
 
-@pytest.mark.parametrize("target", ["sm86", "sm120"])
+@pytest.mark.parametrize("target", ["sm86", "sm90", "sm120"])
 def test_kimis_own_pairs_launches_fit_each_budget_they_are_planned_at(target):
     """Kimi's bf16 training step planned at its device's shared budget and at a budget 4 KiB below it (an
     RTX PRO 6000's 8 KiB below derives none): the template derives at each, and each own pairs launch
@@ -245,7 +249,7 @@ def test_kimis_own_pairs_launches_fit_each_budget_they_are_planned_at(target):
 
 def test_kimis_forward_own_pairs_fall_back_where_no_anchored_block_fits():
     """Kimi's forward own pairs (`own_pairs.own_plan`, the scores' and the system's) planned directly on an
-    RTX A6000 whose shared budget is the least its anchored products take, and a byte below it: there
+    H100 whose shared budget is the least its anchored products take, and a byte below it: there
     anchored, here each pair its own decay at a key block that holds a program (`mainloop.key_block_holds`
     of the exact plan), the anchored scratch and staging no longer fitting. (The template's other launches
     need about twice the forward's own pairs', so no budget the whole template derives at reaches this
@@ -258,7 +262,7 @@ def test_kimis_forward_own_pairs_fall_back_where_no_anchored_block_fits():
 
     q, k, v, g, beta, h0 = (jnp.zeros(shape.shape, shape.dtype) for shape in
                             resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 512))
-    base = generation.gpu_target("sm86")
+    base = generation.gpu_target("sm90")
     with generation.assumed(base), chunk_forward.observed() as calls:
         jax.eval_shape(lambda *x: chunk_on('mosaic_gpu', UNBOUND_QUERIES, Chunk(
             x[0], x[1], x[2], log_decay=x[3], beta=x[4], state=x[5])), q, k, v, g, beta, h0)

@@ -1321,8 +1321,8 @@ def test_a_swiglu_past_two_to_the_31_elements_compiles_for_an_h100():
 
 def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():
     """Every RMSNorm and SwiGLU Triton launch (forward, backward, packed) lowered for an H100 declares
-    its outputs' dimensions (`outputs.OUTPUT_DIMS`, rows 10816, 10817), so `Compiled.peak_live` reads
-    which operand axes each buffer scales with."""
+    its outputs' dimensions (`outputs.OUTPUT_DIMS`, rows 10816, 10817), so
+    `dew.training.live_buffers.peak_live` reads which operand axes each buffer scales with."""
     from jax.sharding import NamedSharding
     from kernel_compile import stated_outputs
 

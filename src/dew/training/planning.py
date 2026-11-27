@@ -960,8 +960,8 @@ class FitSearch[LossT, EffectsT]:
     Each compile that misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is
     warned of where it misses; where nothing fits it raises with the closest candidate's numbers. The
     objective is left at the plan's rung. A miss read from JAX's persistent cache states its live set as
-    a fresh compile does (`peak_live` reads its stored buffer assignment, its argument map from the
-    lowering's kept arguments).
+    a fresh compile does (`dew.training.live_buffers.peak_live` reads its stored buffer assignment, its
+    argument map from the lowering's kept arguments).
 
     The live ladder chooses no host placement. A run places its commit state in pinned host memory by its
     layout (`Layout.host`), which `Transaction.past` stages; its compiled assignment and its allocator's

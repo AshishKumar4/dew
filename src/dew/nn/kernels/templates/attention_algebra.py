@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew.algebra import derive, means, windows
+from dew.algebra import derive, generated, means, windows
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels import tuning
@@ -1814,6 +1814,9 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
     return others + expand(own, others) * anchor_value.astype(jnp.float32)
 
 
+GENERATED_MERGE = Forward("full", 2, ids=False, scale=0.5, natural=False)  # The generated merge's spec.
+
+
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
@@ -2435,6 +2438,14 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
     (`_rows`): a scaled state's sums joined as the template joins them (`_scaled_merge`) over the factors
     the forms evaluate, through the forms' merge hook."""
+    leading = first.m.shape
+    if generated.enabled():  # The generated body where the run asks for it (`generated.body`).
+        operands = (*_rows(first)[:3], *_rows(second)[:3])
+        declared = (all(state.scale is None and state.low is None for state in (first, second))
+                    and _stated(spec, first)[0] == _stated(GENERATED_MERGE, first)[0])
+        if body := generated.body("dew.algebra.attention_cases.split_kv_merge", operands, when=declared):
+            made = Partial(**dict(zip(("acc", "m", "total"), body(*operands), strict=True)))
+            return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), made)
     # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf
     # (`finished_rows`), the forms' arithmetic NaN from it, as `resumed` takes an initial state's.
     floored = [state._replace(m=jnp.maximum(state.m, LEAST).astype(state.m.dtype))
@@ -2459,7 +2470,6 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     found = Partial(**dict(zip(fields, merged, strict=True)))
     if joined:
         found = found._replace(scale=joined[0].scale)
-    leading = first.m.shape
     return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), found)
 
 

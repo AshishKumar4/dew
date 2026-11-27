@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from map_judge import marked_seeds
 from model_support import attending
 from reference_error import assert_as_exact, equations, widened, with_gradients
 
@@ -317,7 +318,7 @@ def test_a_gate_multiplier_keeps_gate_and_up_joined():
     # NVFP4's emulated quantization of every arm's products and gradients took its cell past one group's
     # 120 s (123 s in train 1341): its draws run in armada's map tasks.
     pytest.param("nvfp4", id="nvfp4", marks=pytest.mark.check1_shards(seeds=8, per_task=8))])
-def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_float64(recipe):
+def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_float64(recipe, request):
     """Under each preset's low-precision recipe, a gated delta net of Qwen3.5-0.8B's 16 value heads, its b
     and a gates 16 wide each and 32 joined, whose row joins them: as exact as the layer with them apart,
     output and every gradient, from float64 (check 1), every arm quantized as the gates are apart. A join
@@ -348,7 +349,9 @@ def test_a_delta_nets_gates_joined_under_a_recipe_are_as_exact_as_apart_from_flo
         assert dots(under(layer.apply), params, x) == apart - (recipe == "blockwise_fp8")
     assert_joined_as_exact("delta_gates", under(with_gradients(layer.apply)), draw,
                            with_gradients(layer.clone(dtype=jnp.float64).apply),
-                           f"the delta net's gates joined under {recipe}", seeds=JOINED_SEEDS["recipe gates"])
+                           f"the delta net's gates joined under {recipe}",
+                           seeds=marked_seeds(request) if request.node.get_closest_marker("check1_shards")
+                           else JOINED_SEEDS["recipe gates"])
 
 
 def _attention(bias: bool, dtype=jnp.bfloat16) -> CausalSelfAttention:

@@ -85,6 +85,9 @@ def vision_source(tmp_path_factory):
 
 
 @attending("reference")
+# The recording's 32 seeds in map tasks: the cell took 147 s in train 1228's CI and 120.3 s cold in main
+# 2f6b65a64's durations record, past one group's 120 s (row 12314).
+@pytest.mark.check1_shards(seeds=32, per_task=16)
 def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
     """The vision half over drawn image prompts its selections clear: the span the image fills, the
     prefill's logits with it and each teacher-forced text step's after it, through Dew's cache

@@ -30,7 +30,7 @@ import functools
 import math
 import operator
 from collections.abc import Callable, Sequence
-from typing import ClassVar, NamedTuple, overload
+from typing import ClassVar, Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -2074,6 +2074,22 @@ class Gradients:
     initial: Initial | None
 
 
+class BackwardRows(NamedTuple):
+    """The rows of D a backward's launches took (`gradients`' `certify`), each `[B, H, Q]` in the units its
+    launches take them: each query's centre `c` (the anchor key's `v_c · dO`), `D - c` as
+    `attention_gradient.split_delta` took it from the forward's split sums (`prior`, which the dQ program's
+    sums are about), the anchor key (`chosen`, -1 where D is taken about 0, `c` 0), `D - c` refined from
+    the dQ program's sums (`delta`, the dK/dV program's) and what its rounding lost (`lost`), and the dQ
+    program's own denominator (`denominator`, `attention_gradient.dq_finish`)."""
+
+    anchor: jax.Array
+    prior: jax.Array
+    chosen: jax.Array
+    delta: jax.Array
+    lost: jax.Array
+    denominator: jax.Array
+
+
 
 def launch_cotangent(dout: jax.Array, dtype: DTypeLike, hooks: Hooks, totals: jax.Array) -> jax.Array:
     """The one cotangent every part of the backward takes, its shift's (`value_shift`) and its launch's
@@ -2327,10 +2343,26 @@ def _initial_gradients(state: Initial, starts: tuple[jax.Array, jax.Array, jax.A
         acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
 
 
+@overload
+def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+              hooks: Hooks | None, dout: jax.Array, residuals: tuple, *, block: int,
+              scale: float | None = None, rounded: bool = True, certify: Literal[False] = False) -> Gradients:
+    ...
+
+
+@overload
+def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+              hooks: Hooks | None, dout: jax.Array, residuals: tuple, *, block: int,
+              scale: float | None = None, rounded: bool = True,
+              certify: Literal[True]) -> tuple[Gradients, BackwardRows]:
+    ...
+
+
 def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
               hooks: Hooks | None, dout: jax.Array,
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
-              scale: float | None = None, rounded: bool = True) -> Gradients:
+              scale: float | None = None, rounded: bool = True,
+              certify: bool = False) -> Gradients | tuple[Gradients, BackwardRows]:
     """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
     forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first holding
     the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's `launch` (the
@@ -2352,7 +2384,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     summed in XLA); the Mosaic one-launch schedule adds dQ's tiles and a key head's query heads' dK and dV
     atomically, in their arrival order. A resumed decode state (`Initial.normalized`) is refused
     (`walked_initial`), as every walk refuses it: its `acc` the output, which the state's gradient would
-    divide by its total again."""
+    divide by its total again. Under `certify` (a certify form's, `attention_mosaic.backward_certified`) the
+    launch returns last the D `split_delta` took, and the gradients come with the rows of D the launches
+    took (`BackwardRows`)."""
     hooks = Hooks() if hooks is None else hooks
     walked_initial(hooks.initial)
     if hooks.output.fn is not None:
@@ -2376,11 +2410,15 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     state = hooks.initial
     kinds = params["score_kinds"]
     outputs = launch(*arrays, **params)
+    # A certify form's launch returns last the D `split_delta` took (`BackwardRows.prior`).
+    outputs, prior = (outputs[:-1], outputs[-1]) if certify else (outputs, None)
     dq, softmax = restored(outputs[0]), outputs[1:7]
     grads_out = list(outputs[8:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
     delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
+    rows = None if prior is None else BackwardRows(anchor, prior[:, :, :queries], outputs[7][:, :, :queries],
+                                                   delta, lost, total)
     # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
     delta, low = two_sum(anchor, delta)
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
@@ -2413,9 +2451,10 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
-    return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
-                     dk[:, :keys, :, :width].astype(key_dtype),
-                     dv[:, :keys, :, :value_width].astype(value_dtype),
-                     tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score.sides,
-                                                                                 strict=True)),
-                     initial)
+    found = Gradients(dq[:, :queries, :, :width].astype(query.dtype),
+                      dk[:, :keys, :, :width].astype(key_dtype),
+                      dv[:, :keys, :, :value_width].astype(value_dtype),
+                      tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score.sides,
+                                                                                  strict=True)),
+                      initial)
+    return found if rows is None else (found, rows)

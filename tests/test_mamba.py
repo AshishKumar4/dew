@@ -283,6 +283,27 @@ DECODE_SEEDS = 8
 sized by `seeds_for` on armada."""
 
 
+def test_a_forked_segment_keeps_its_entering_states_bits_past_the_tokens_it_excludes():
+    """A forked call's second document taking up a given state of -0 at the second token of a two-token
+    chunk (`selective_scan`'s `forked`, its segments walked in place) and running two unit-decay steps of -0
+    writes: its final state -0, as the recurrence from -0 keeps it, its chunks' excluded tokens (the first
+    chunk's first, the last chunk's padding) carrying the state by selection; an identity step's
+    `1 * (-0) + 0` there made it +0 (row 13721). An unforked call over the same three tokens ends at -0 too,
+    its padding's step carried alike."""
+    from dew.nn.kernels.chunked_launch import Forked
+
+    x = jnp.full((1, 3, 1), -0.0, jnp.float32)
+    ones = jnp.ones((1, 3, 1), jnp.float32)
+    A, D = jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32)
+    forked = Forked(jnp.asarray([[0, 1]], jnp.int32), jnp.asarray([[0, 1]], jnp.int32),
+                    jnp.zeros((1, 2), jnp.int32), None, 0)
+    given = jnp.full((1, 1, 1, 1), -0.0, jnp.float32)
+    _, final = selective_scan(x, ones, A, ones, ones, D, given, chunk_size=2, forked=forked)
+    assert float(final[0, 0, 0]) == 0.0 and bool(jnp.signbit(final[0, 0, 0])), final
+    _, unforked = selective_scan(x, ones, A, ones, ones, D, given[:, 0], chunk_size=2)
+    assert float(unforked[0, 0, 0]) == 0.0 and bool(jnp.signbit(unforked[0, 0, 0])), unforked
+
+
 def test_forked_documents_in_one_chunk_read_none_of_each_others_operands():
     """Two one-token documents in one chunk of a forked call (`selective_scan`'s `forked`, walked in place
     a segment a document), each entering a zero memory: the first's infinite write (B = inf) reaches no

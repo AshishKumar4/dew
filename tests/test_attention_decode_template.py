@@ -8,6 +8,7 @@ covering each row's keys.
 """
 
 import dataclasses
+import functools
 import itertools
 import math
 
@@ -15,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import qkv
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact, equations
 
@@ -73,7 +75,8 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64, va
 
 
 def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
-    """`[B, K, KV, D]` keys as pools `[KV, P, page, D]` holding each row's at the pages its `table` names."""
+    """`[B, K, KV, ...]` keys (or their per-key bounds, `[B, K, KV]`) as pools `[KV, P, page, ...]` holding
+    each row's at the pages its `table` names, a dense permutation of the pages."""
     rows, keys = cache.shape[:2]
     pages = jnp.moveaxis(cache.reshape(rows * keys // page, page, *cache.shape[2:]), 2, 0)
     return pages[:, jnp.argsort(table.reshape(-1))]
@@ -81,24 +84,19 @@ def _pooled(cache: jax.Array, table: jax.Array, page: int) -> jax.Array:
 
 def _one_query_draws(rows: int, heads: int, keys: int, kv_heads: int, dtype):
     """A draw of `rows` rows' one query of `heads` heads 64 wide, and their keys and values over `keys`."""
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        return (jax.random.normal(streams[0], (rows, 1, heads, 64), dtype),
-                *(jax.random.normal(stream, (rows, keys, kv_heads, 64), dtype) for stream in streams[1:]))
+    return functools.partial(_normals, (rows, 1, heads, 64), (rows, keys, kv_heads, 64), dtype)
 
-    return draw
+
+def _normals(query_shape: tuple[int, ...], kv_shape: tuple[int, ...], dtype, seed: int) -> tuple:
+    """A seed's queries of `query_shape` and keys and values (or their pools) of `kv_shape`
+    (`attention_oracle.qkv`)."""
+    return qkv(query_shape, dtype, seed, kv_shape)
 
 
 def _operands(query_shape: tuple[int, ...], keys: int):
     """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
     heads 64 wide."""
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], query_shape, jnp.bfloat16)
-        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
-        return query, key, value
-
-    return draw
+    return functools.partial(_normals, query_shape, (2, keys, 2, 64), jnp.bfloat16)
 
 
 @INTERPRETS
@@ -285,10 +283,7 @@ def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
     table = jnp.asarray(np.random.default_rng(37).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
 
     def pooled(rows):
-        # `[B, K, KV, D]` as a pool `[KV, P, page, D]` holding row `b`'s page `j` at `table[b, j]`.
-        held = jnp.moveaxis(rows.reshape(2, per_row, page, *rows.shape[2:]), 3, 0)
-        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
-        return pool.at[:, table].set(held)
+        return _pooled(rows, table, page)
 
     draw = _one_query_draws(2, heads, keys, kv_heads, jnp.bfloat16)
 
@@ -703,11 +698,7 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
                                                 implementation=implementation)
         return attend
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (rows, drafts, 32, 128), jnp.bfloat16)
-        key, value = (jax.random.normal(stream, (rows, keys, 8, 128), jnp.bfloat16) for stream in streams[1:])
-        return query, key, value
+    draw = functools.partial(_normals, (rows, drafts, 32, 128), (rows, keys, 8, 128), jnp.bfloat16)
 
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), draw,
                     f"verify block of {drafts} through the route", seeds=SEEDS)
@@ -735,12 +726,7 @@ def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
         rows = pool[:, table]
         return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(2, keys, kv_heads, pool.shape[-1])
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (2, 1, 32, 128), jnp.bfloat16)
-        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
-                 for stream in streams[1:])
-        return (query, *pools)
+    draw = functools.partial(_normals, (2, 1, 32, 128), (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
 
     def ours(query, key_pool, value_pool):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
@@ -828,10 +814,7 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
     table = jnp.asarray(np.random.default_rng(7).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
 
     def pooled(rows):
-        # `[B, K, KV, ...]` as a pool `[KV, P, page, ...]` holding row `b`'s page `j` at `table[b, j]`.
-        held = jnp.moveaxis(rows.reshape(len(LENGTHS), per_row, page, *rows.shape[2:]), 3, 0)
-        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
-        return pool.at[:, table].set(held)
+        return _pooled(rows, table, page)
 
     def ours(query, k_codes, k_scale, v_codes, v_scale):
         scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
@@ -1086,12 +1069,9 @@ def test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_int
     page = 4
     table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
                         jnp.int32)
-    order = jnp.argsort(table.reshape(-1))
 
     def pooled(cache):
-        # [B, K, ...] as pools [KV, P, page, ...] holding each row's keys at the pages its table names.
-        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
-        return pages[:, order]
+        return _pooled(cache, table, page)
 
     def attended(bounds):
         with generation.assumed("sm90"):

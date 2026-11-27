@@ -71,7 +71,13 @@ from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from dew._hashing import array_fingerprint
 from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
-from dew.nn.kernels.templates.recurrence import chunk_forward, intra, mainloop, template
+from dew.nn.kernels.templates.recurrence import (
+    anchored as anchored_pairs,
+    chunk_forward,
+    intra,
+    mainloop,
+    template,
+)
 
 LOG2E = recurrence_algebra.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
@@ -505,14 +511,10 @@ def key_anchored(rows: Iv, k, exponents: Exponents, lane: Lane, *, undecided: bo
     sum's bound of their terms (`key_pairs`' own); zero elsewhere. Where its guard may fail on a key block
     (`undecided`, `_undecided`), each term either arithmetic's (`_diagonal_terms`'), enclosed a term at a time
     before their sum: a key block takes either, so any mixture of them is enclosed."""
-    exact, bound = exponents.exact, exponents.bound
     size = np.shape(k)[0]
     tokens = np.arange(size)
-    anchors = tokens // SUB * SUB + SUB // 2
-    down = between(exact, bound, exact[anchors], bound[anchors], lane)
-    up = between(exact[anchors], bound[anchors], exact, bound, lane)
-    gated = operand(fp32(mul(rows, down), lane), lane, lane.pairing)
-    keyed = operand(fp32(mul(point(np.asarray(k)), up), lane), lane, lane.pairing)
+    gated, keyed = (operand(found, lane, lane.pairing)
+                    for found in _anchored_operands(rows, k, exponents, lane))
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
     zeros = point(np.zeros((size, size)))
     if not undecided:
@@ -540,26 +542,49 @@ def product_terms(parts: int) -> tuple[int, float, float]:
             sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in dropped))
 
 
-def _undecided(outputs: Sequence[Iv], k: np.ndarray, exact: np.ndarray) -> bool:
-    """Whether `anchored.step`'s guard may fail on any of a chunk's key blocks, which it decides jointly
-    over every output's rows and the keys (`recurrence_algebra`'s `own_reach_exceeded` and `own_out_of_band`):
-    of the exact exponents' reach, and of every output's rows and the keys scaled by their anchored factors,
-    each element's interval: one past the band at either end, one reaching below it (a nonzero value in it
-    may, an interval meeting zero but not zero alone), or not finite. Where it may, the kernel takes either
-    arithmetic a block, so `key_anchored` encloses both."""
+def _anchored_operands(rows: Iv, k, exponents: Exponents, lane: Lane) -> tuple[Iv, Iv]:
+    """`anchored.step`'s scaled rows and keys `[C, K]` before their parts: each times its anchored factor
+    (`algebra.own_anchored`, `between` of its prefix and its sub-chunk's middle token's, either sign), one
+    fp32 product."""
+    exact, bound = exponents.exact, exponents.bound
     tokens = np.arange(np.shape(k)[0])
     anchors = tokens // SUB * SUB + SUB // 2
-    span = exact - exact[anchors]
-    halves = recurrence_algebra.separated(np.asarray(exact, np.float32))
-    if np.any(recurrence_algebra.own_reach_exceeded(halves, tuple(half[anchors] for half in halves))):
+    down = between(exact, bound, exact[anchors], bound[anchors], lane)
+    up = between(exact[anchors], bound[anchors], exact, bound, lane)
+    return fp32(mul(rows, down), lane), fp32(mul(point(np.asarray(k)), up), lane)
+
+
+def _undecided(outputs: Sequence[Iv], k, exponents: Exponents, lane: Lane) -> bool:
+    """Whether `anchored.step`'s guard may fail on any of a chunk's key blocks, which it decides jointly
+    over every output's rows and the keys (`recurrence_algebra`'s `own_reach_exceeded` and `own_out_of_band`):
+    a token's whole exponent within its prefix's bound possibly past `OWN_REACH` from its anchor's, or an
+    element of the rows or keys as `key_anchored` scales them (`_anchored_operands`, the same intervals)
+    past the band at either end, reaching below it (a nonzero value in it may: an interval meeting zero but
+    not zero alone), or not finite. Where it may, the kernel takes either arithmetic a block, so
+    `key_anchored` encloses both."""
+    exact, bound = exponents.exact, exponents.bound
+    tokens = np.arange(np.shape(k)[0])
+    anchors = tokens // SUB * SUB + SUB // 2
+    if not np.all(np.isfinite(exact + bound)):
         return True
+    # The kernel's own reach test (`own_reach_exceeded`) of the prefix's whole powers of two at either end
+    # of its bound against its anchor's at the other.
+    low, high = (np.floor(end).astype(np.float32) for end in (exact - bound, exact + bound))
+    whole = np.zeros(low.shape, np.float32)
+    for near, far in ((low, high), (high, low)):
+        if np.any(recurrence_algebra.own_reach_exceeded((near, whole), (far[anchors], whole))):
+            return True
     band = 2.0 ** recurrence_algebra.OWN_BAND
-    scaled = [(rows.lo * np.exp2(span), rows.hi * np.exp2(span)) for rows in outputs]
-    scaled.append((k * np.exp2(-span), k * np.exp2(-span)))
-    for lo, hi in scaled:
-        largest = np.maximum(np.abs(lo), np.abs(hi))
-        least = np.where((lo <= 0) & (hi >= 0), 0.0, np.minimum(np.abs(lo), np.abs(hi)))
-        nonzero = (lo != 0) | (hi != 0)
+    # Each scaled operand beside its given one: the kernel's band test reads whether the given element is
+    # nonzero (`own_out_of_band`), so a nonzero one its scaling rounds to zero still leaves the band (a review
+    # of 9aec30a9f: a bf16 query of 2^-110 fifty powers below its anchor scales to 2^-160, zero in fp32).
+    pairs = [(rows, _anchored_operands(rows, k, exponents, lane)[0]) for rows in outputs]
+    pairs.append((point(np.asarray(k)), _anchored_operands(outputs[0], k, exponents, lane)[1]))
+    for given, found in pairs:
+        largest = np.maximum(np.abs(found.lo), np.abs(found.hi))
+        least = np.where((found.lo <= 0) & (found.hi >= 0), 0.0,
+                         np.minimum(np.abs(found.lo), np.abs(found.hi)))
+        nonzero = (given.lo != 0) | (given.hi != 0)
         if (np.any(~np.isfinite(largest)) or np.any(largest > band)
                 or np.any(nonzero & (least < 1 / band))):
             return True
@@ -582,7 +607,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     own = (tokens[:, None] // SUB) == (tokens[None, :] // SUB)
 
     writes = fp32(mul(point(step.k), point(np.asarray(step.beta)[:, None])), lane)
-    undecided = lane.anchored and _undecided((writes, point(step.q)), np.asarray(step.k), exponents.exact)
+    undecided = lane.anchored and _undecided((writes, point(step.q)), step.k, exponents, lane)
 
     def diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
         """A sub-chunk's own pairs as the kernel forms them: each its own decay (`key_diagonal`); anchored
@@ -714,8 +739,8 @@ class Run:
     """Whether its own pairs fold each decay into the key before the row (`Lane.unit_pairs`): a delta rule's
     unit keys, as the draws' layers declare them."""
     anchored: bool
-    """Whether its own pairs are anchored products (`Lane.anchored`: the layer declares its decay bound,
-    `anchored.anchoring`)."""
+    """Whether its own pairs are anchored products (`Lane.anchored`: the layer declares its decay bound and
+    its family's products read shared memory, `anchored.anchoring`)."""
     rounded_prefix: bool
     """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
     `mainloop.prefix_limbs`)."""
@@ -1005,7 +1030,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained), unit_pairs=unit_pairs,
-               anchored=np.ndim(g) == 4 and decay_bound is not None and jnp.dtype(dtype).itemsize == 2,
+               anchored=(np.ndim(g) == 4 and decay_bound is not None and jnp.dtype(dtype).itemsize == 2
+                         and anchored_pairs.anchors_on(family)),
                solve=(mainloop.merge_parts(solving, jnp.float32 if wide else dtype, held=held, ranged=False),
                       tf32_conversion(solving)),
                rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,

@@ -19,6 +19,26 @@ TARGETS = ("sm80", "sm90")
 """The native cells' bundles: mma.sync's (an A100's) and warpgroup MMA's (an H100's)."""
 
 
+def test_the_forward_witness_reads_a_flushed_operand_as_the_guard_does():
+    """The anchored forward's witness (`rw._undecided`) reads an operand's band as the kernel's guard does
+    (`recurrence_algebra.own_out_of_band`, given nonzero): a sub-chunk's query of 2^-110 at a token whose
+    prefix is 50 powers of two below its anchor's scales to 2^-160, zero in fp32, and its tile, otherwise
+    in band (unit writes and keys, the keys scaled to 2^50), may take either arithmetic, so the witness
+    encloses both; read from the scaled zero it took the anchored alone (a review of 9aec30a9f)."""
+    size, width = rw.SUB, 2
+    exact = np.zeros((size, width))
+    exact[0] = -50.0
+    exponents = rw.Exponents(exact=exact, bound=np.zeros((size, width)))
+    queries = np.ones((size, width))
+    queries[0] = 2.0 ** -110
+    keys = np.ones((size, width))
+    assert rw._undecided((point(np.ones((size, width))), point(queries)), keys, exponents,
+                         rw.interpreted_lane())
+    queries[0] = 1.0
+    assert not rw._undecided((point(np.ones((size, width))), point(queries)), keys, exponents,
+                             rw.interpreted_lane())
+
+
 def test_a_decay_encloses_every_fraction_the_algebra_raises():
     """A chunk's decays as `algebra.raised` forms them, an integer power of two times the exp2 of an fp32
     fraction correctly rounded, rounded to fp32 as the scaling's last product rounds it (subnormals kept,

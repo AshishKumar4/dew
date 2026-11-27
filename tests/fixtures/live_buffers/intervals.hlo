@@ -1,0 +1,12 @@
+HloModule m, entry_computation_layout={(f32[4]{0})->f32[4]{0}}
+
+ENTRY e {
+  p = f32[4]{0} parameter(0)
+  a = f32[4]{0} negate(p), frontend_attributes={checkpoint_name="first"}
+  b = f32[4]{0} exponential(a)
+  c = f32[4]{0} sine(b)
+  d = f32[4]{0} cosine(c)
+  e = f32[4]{0} tanh(d)
+  ROOT r = f32[4]{0} add(e, c)
+  z = f32[0]{0} constant({})
+}

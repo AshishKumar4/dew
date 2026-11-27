@@ -16,8 +16,9 @@ Receipts:
   programs, GH200 and A100): within each cell's A/A
 - reuse: docs/design/algebra.md §1.4; the reuse probe of 2026-11-05 (benchmark_step and the parallelism
   matrix: 42 to 452 of 423 to 794 divisions a suite share a divisor), each reciprocal guarded by its
-  divisor's floor and bound (row 9035). Dev-only pending the default-route SimpleDiT-B native receipt (row
-  9777; M-AL-2). Compile-only optimized HLO changes, but do not establish accuracy or speed
+  divisor's floor and bound (row 9035). Measured M-AL-2 (GH200, SimpleDiT-B step, row 9777): check 1 holds
+  and the native program changes, but device time is 1.0007 of without, inside its A/A's 1.0012; dev-only, as
+  it buys no speed
 - joined: docs/design/algebra.md §1; ledger 1308; the rule-set survey of 2026-11-14: it changes no shipped
   program, and the pass runs 12% slower without it (13,604 passes)
 """
@@ -29,10 +30,11 @@ import numpy as np
 from jax import lax
 
 from dew.algebra import _generated
+from dew.algebra.shared_derived import shared_component_31
 
 
 def _guided_0(x1, x2, x3):
-    v13, = _shared_component_0(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v13, = shared_component_31(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v14 = lax.mul_p.bind(v13, x2, out_dtype=None)
     v15 = lax.mul_p.bind(v13, x1, out_dtype=None)
     v16 = lax.mul_p.bind(v13, x2, out_dtype=None)
@@ -63,7 +65,7 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     v16 = lax.broadcast_in_dim_p.bind(
         v8, shape=(x1.shape[0], x1.shape[1]), broadcast_dimensions=(0, 1), sharding=None)
     v17 = lax.select_n_p.bind(v16, v15, v12)
-    v27, = _shared_component_0(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
+    v27, = shared_component_31(x1, x2, (x1.shape[0], x1.shape[1]), (), jnp.dtype('float32'))
     v28 = lax.mul_p.bind(v27, x1, out_dtype=None)
     v29 = lax.mul_p.bind(v27, x2, out_dtype=None)
     v30 = lax.sub_p.bind(v28, v29)
@@ -73,24 +75,10 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     return (v33,)
 
 
-def _shared_component_0(p0, p1, p2, p3, p4):
-    v0 = lax.abs_p.bind(p0)
-    v1 = lax.abs_p.bind(p1)
-    v2 = lax.max_p.bind(v0, v1)
-    v3 = lax.gt_p.bind(v2, np.array(float.fromhex('0x1.fffffe0000000p+126'), dtype=jnp.dtype('float32')))
-    v4 = np.array(float.fromhex('0x1.0000000000000p-1'), dtype=jnp.dtype('float32'))
-    v5 = np.array(float.fromhex('0x1.0000000000000p+0'), dtype=jnp.dtype('float32'))
-    v6 = lax.broadcast_in_dim_p.bind(v4, shape=p2, broadcast_dimensions=p3, sharding=None)
-    v7 = lax.broadcast_in_dim_p.bind(v5, shape=p2, broadcast_dimensions=p3, sharding=None)
-    v8 = lax.select_n_p.bind(v3, v7, v6)
-    v9 = lax.convert_element_type_p.bind(v8, new_dtype=p4, weak_type=False, sharding=None)
-    return (v9,)
-
-
 _guided_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 64), 'float32'), ((16, 64), 'float32'), ((16, 1), 'float32'))):
+    ('default', 'sm90', (*(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'))):
         _guided_0,
-    ('default', 'sm90', (((32, 128), 'float32'), ((32, 128), 'float32'), ((32, 1), 'float32'))):
+    ('default', 'sm90', (*(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'))):
         _guided_0,
 }
 
@@ -102,12 +90,12 @@ def guided(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _guided_tangent_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (
-        ((16, 64), 'float32'), ((16, 64), 'float32'), ((16, 1), 'float32'), ((16, 64), 'float32'),
-        ((16, 64), 'float32'), ((16, 1), 'float32'), ((16, 64), 'float32'))):
+        *(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'), *(((16, 64), 'float32'),) * 2,
+        ((16, 1), 'float32'), ((16, 64), 'float32'))):
         _guided_tangent_0,
     ('default', 'sm90', (
-        ((32, 128), 'float32'), ((32, 128), 'float32'), ((32, 1), 'float32'), ((32, 128), 'float32'),
-        ((32, 128), 'float32'), ((32, 1), 'float32'), ((32, 128), 'float32'))):
+        *(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'), *(((32, 128), 'float32'),) * 2,
+        ((32, 1), 'float32'), ((32, 128), 'float32'))):
         _guided_tangent_0,
 }
 

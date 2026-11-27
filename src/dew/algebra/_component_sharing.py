@@ -22,6 +22,7 @@ from dew.algebra.printed import (
 )
 
 _MIN_SHARED = 6
+_MIN_TAIL = _MIN_SHARED - 1
 _MIN_WHOLE = 2
 _MAX_SHARED = 64
 _GEOMETRY = frozenset({"shape", "broadcast_dimensions", "new_sizes"})
@@ -35,6 +36,9 @@ class _Fragment:
         self.inputs: dict[Operand, Ref] = {}
         self.arguments: list[Operand] = []
         self.separate: set[int] = set()
+        """The slots of a call's integer arguments, which `shared` bakes in where every copy agrees."""
+        self.statics: set[int] = set()
+        """Every static value's slot, which `shared` joins with another every copy fills alike."""
         self.bound: dict[str, Ref] = {}
 
     def input(self, value: Operand) -> Ref:
@@ -47,30 +51,43 @@ class _Fragment:
         self.arguments.append(value)
         return ref
 
-    def integer(self, value: int) -> Ref:
-        self.separate.add(len(self.arguments))
+    def static(self, value: Operand) -> Ref:
+        """A static value at a slot of its own, whatever another slot holds: two copies match by their
+        operations alone, and `shared` merges the slots every copy fills alike (`_coalesced`)."""
+        self.statics.add(len(self.arguments))
         return self.argument(value)
+
+    def integer(self, value: int) -> Ref:
+        """A call's integer argument at a static slot of its own, baked into the helper where every copy
+        passes it alike (`_shared_integer_arguments`)."""
+        self.separate.add(len(self.arguments))
+        return self.static(value)
 
     def operand(self, value: Operand) -> Operand:
         if isinstance(value, Ref):
             return self.bound.get(value.name) or self.input(value)
         if isinstance(value, Extent):
             if value.operand.name not in self.bound:
-                return self.input(value)
+                return self.static(value)
             return Extent(self.bound[value.operand.name], value.axis)
         if isinstance(value, Layout):
             if all(name not in self.bound for name in _reads(value)):
-                return self.input(value)
+                return self.static(value)
             return Layout(tuple(n if isinstance(n, int) else self.dimension(n) for n in value.dimensions))
         if isinstance(value, StaticTuple) and all(type(n) is int for n in value.values):
-            return self.input(value)
+            return self.static(value)
         if isinstance(value, Literal) and value.integer is not None:
             original = value.integer
-            integer = self.operand(original) if isinstance(original, Ref) else self.input(original)
-            assert isinstance(integer, Ref)
-            return dataclasses.replace(value, integer=integer, data=b"")
+            integer = self.operand(original) if isinstance(original, Ref) else self.static(original)
+            # Its type an input too, as a cast's: the same bindings over another word or float width.
+            dtype = (self.operand(value.dtype) if isinstance(value.dtype, Ref)
+                     else self.static(np.dtype(value.dtype)))
+            assert isinstance(integer, Ref) and isinstance(dtype, Ref)
+            return dataclasses.replace(value, integer=integer, dtype=dtype, data=b"")
+        if isinstance(value, np.dtype):
+            return self.static(value)
         if isinstance(value, Primitive) and value.value in _SHIFTS:
-            return self.input(value)
+            return self.static(value)
         return value
 
     def dimension(self, value: Extent) -> Extent:
@@ -87,19 +104,19 @@ class _Fragment:
             # just one case (e.g. an exponent bias equal to a shift). That need not prevent sharing.
             arguments = tuple(self.integer(value) if type(value) is int and isinstance(raw.callee, str)
                               else self.operand(value) for value in raw.operands)
-            keywords = tuple((name, self.input(value) if _static_parameter(name, value)
+            keywords = tuple((name, self.static(value) if _static_parameter(name, value)
                               else self.operand(value)) for name, value in raw.keywords)
             raw = Call(callee, arguments, keywords)
         else:
             raw = self.operand(raw)
         targets = []
         for target in statement.targets:
-            if target == "_":
-                targets.append(target)
-            else:
-                name = f"v{len(self.bound)}"
-                self.bound[target] = Ref(name)
-                targets.append(name)
+            # A discarded output named as a kept one is: two copies match whether or not each reads it, and
+            # an unread name (no program writes `_n`) is no output of the helper (`shared`'s `kept`).
+            held = f"_{len(self.bound)}" if target == "_" else target
+            name = f"v{len(self.bound)}"
+            self.bound[held] = Ref(name)
+            targets.append(name)
         return Binding(tuple(targets), raw, statement.unpack)
 
 
@@ -122,6 +139,7 @@ class _Copy:
     arguments: tuple[Operand, ...]
     written: tuple[str, ...]
     separate: frozenset[int]
+    statics: frozenset[int]
 
 
 @dataclasses.dataclass
@@ -130,6 +148,8 @@ class _Span:
     first: int
     available: int
     whole: bool
+    tail: bool = False
+    """Whether its run ends the body, whose return statement follows its last binding."""
     normal: _Fragment = dataclasses.field(default_factory=_Fragment)
     statements: list[Binding] = dataclasses.field(default_factory=list)
 
@@ -142,7 +162,8 @@ class _Span:
 
     def snapshot(self) -> _Copy:
         return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.arguments),
-                     tuple(self.normal.bound), frozenset(self.normal.separate))
+                     tuple(self.normal.bound), frozenset(self.normal.separate),
+                     frozenset(self.normal.statics))
 
 
 def _spans(bodies: dict[str, Body]) -> list[_Span]:
@@ -154,9 +175,10 @@ def _spans(bodies: dict[str, Body]) -> list[_Span]:
                 continue
             starts = [index for index, _ in group]
             end = starts[-1] + 1
-            whole = starts[0] == 0 and end == len(body.statements)
-            minimum = _MIN_WHOLE if whole else _MIN_SHARED
-            candidates.extend(_Span(name, start, end - start, whole and start == 0)
+            tail = end == len(body.statements)
+            whole = starts[0] == 0 and tail
+            minimum = _MIN_WHOLE if whole else _MIN_TAIL if tail else _MIN_SHARED
+            candidates.extend(_Span(name, start, end - start, whole and start == 0, tail)
                               for start in starts[:len(starts) - minimum + 1])
     return candidates
 
@@ -187,7 +209,10 @@ def _largest(bodies: dict[str, Body]) -> tuple[_Copy, ...]:
                 continue
             candidates.extend(entries)
             if width < _MIN_SHARED:
-                copies = [span for span in copies if span.whole and span.available == width]
+                # Below a shared span's width, only a whole body, or a run ending one, which its return
+                # statement completes to six statements as rendered.
+                copies = [span for span in copies if span.available == width
+                          and (span.whole or (span.tail and width >= _MIN_TAIL))]
             avoided = width * (len(copies) - 1)
             if avoided > saved:
                 best, saved = tuple(span.snapshot() for span in copies), avoided
@@ -204,8 +229,10 @@ def _reads(value: Operand) -> Iterator[str]:
     elif isinstance(value, Layout):
         for dimension in value.dimensions:
             yield from _reads(dimension)
-    elif isinstance(value, Literal) and isinstance(value.integer, Ref):
-        yield value.integer.name
+    elif isinstance(value, Literal):
+        for part in (value.integer, value.dtype):
+            if isinstance(part, Ref):
+                yield part.name
     elif isinstance(value, Call):
         if isinstance(value.callee, Ref):
             yield value.callee.name
@@ -234,13 +261,52 @@ def _shared_integer_arguments(copies: tuple[_Copy, ...]) -> dict[str, int]:
     return fixed
 
 
-def _baked_integer(statement: Binding, fixed: dict[str, int]) -> Binding:
-    call = statement.value
-    if not isinstance(call, Call) or not isinstance(call.callee, str):
-        return statement
-    args = tuple(fixed[arg.name] if isinstance(arg, Ref) and arg.name in fixed else arg
-                 for arg in call.operands)
-    return dataclasses.replace(statement, value=dataclasses.replace(call, operands=args))
+def _coalesced(copies: tuple[_Copy, ...], fixed: dict[str, int]) -> dict[str, Ref]:
+    """Each static slot every copy fills with the value another, earlier slot holds, by the parameter it
+    joins: one parameter where the copies give the slots one value (a mask and a shift alike in each), two
+    where any copy gives them two."""
+    first = copies[0]
+    slots = [i for i in sorted(first.statics) if f"p{i}" not in fixed]
+    merged: dict[int, int] = {}
+    for at, i in enumerate(slots):
+        if i in merged:
+            continue
+        for j in slots[at + 1:]:
+            if j not in merged and all(_same(copy.arguments[i], copy.arguments[j]) for copy in copies):
+                merged[j] = i
+    return {f"p{j}": Ref(f"p{i}") for j, i in merged.items()}
+
+
+def _same(first: Operand, second: Operand) -> bool:
+    return type(first) is type(second) and first == second
+
+
+def _substituted(value: Operand, values: dict[str, Operand]) -> Operand:
+    """`value` with each parameter `values` names in place of its reference: a static integer every copy
+    shares baked in (`_shared_integer_arguments`), a slot joining another renamed (`_coalesced`)."""
+    if isinstance(value, Ref):
+        return values.get(value.name, value)
+    if isinstance(value, Extent):
+        operand = _substituted(value.operand, values)
+        assert isinstance(operand, Ref)
+        return Extent(operand, value.axis)
+    if isinstance(value, Layout):
+        substituted = (_substituted(dimension, values) for dimension in value.dimensions)
+        dimensions = tuple(dimension for dimension in substituted if isinstance(dimension, int | Extent))
+        assert len(dimensions) == len(value.dimensions)
+        return Layout(dimensions)
+    if isinstance(value, StaticTuple):
+        return StaticTuple(tuple(_substituted(part, values) for part in value.values))
+    if isinstance(value, Literal):
+        integer, dtype = (_substituted(part, values) if isinstance(part, Ref) else part
+                          for part in (value.integer, value.dtype))
+        return dataclasses.replace(value, integer=integer, dtype=dtype)
+    if isinstance(value, Call):
+        callee = _substituted(value.callee, values) if isinstance(value.callee, Ref) else value.callee
+        assert isinstance(callee, str | Ref | Primitive)
+        return Call(callee, tuple(_substituted(operand, values) for operand in value.operands),
+                    tuple((name, _substituted(operand, values)) for name, operand in value.keywords))
+    return value
 
 
 def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[str, Body]:
@@ -254,16 +320,18 @@ def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[s
         suffixes = [_live(forms[found.name], found.first + width) for found in copies]
         kept = [i for i in range(len(first.written))
                 if any(found.written[i] in reads for found, reads in zip(copies, suffixes, strict=True))]
-        while (name := f"_shared_component_{next(numbers)}") in occupied:
+        while (name := f"shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
         # Give every helper the dynamic-array prefix the case table can pass directly.
         fixed = _shared_integer_arguments(copies)
-        remaining = (i for i in range(len(first.arguments)) if f"p{i}" not in fixed)
+        merged = _coalesced(copies, fixed)
+        remaining = (i for i in range(len(first.arguments)) if f"p{i}" not in fixed and f"p{i}" not in merged)
         order = sorted(remaining, key=lambda i: not isinstance(first.arguments[i], Ref))
         outputs = tuple(Ref(f"v{i}") for i in kept)
-        statements = (tuple(_baked_integer(statement, fixed) for statement in first.statements)
-                      if fixed else first.statements)
+        substituted = {**fixed, **merged}
+        statements = tuple(dataclasses.replace(statement, value=_substituted(statement.value, substituted))
+                           for statement in first.statements)
         forms[name] = Body(tuple(f"p{i}" for i in order), statements, outputs)
         for found, reads in reversed(tuple(zip(copies, suffixes, strict=True))):
             body = forms[found.name]

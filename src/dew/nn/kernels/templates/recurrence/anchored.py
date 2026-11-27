@@ -30,12 +30,25 @@ def anchoring(call: Call, *, reading: bool = False) -> bool:
     """Whether a call's forward own pairs are anchored products a key block (`step`): its decay a key
     dimension and its layer bounds it a token (`Call.decay_bound`: Kimi delta attention's -5, a sub-chunk's
     factors within 2^58 from its middle, its guard holding on all but steep draws), its system's rows its
-    keys (no erase along reads), and its operands 16-bit, as fla_kda's safe-gate diagonal takes them: an
+    keys (no erase along reads), its operands 16-bit, as fla_kda's safe-gate diagonal takes them: an
     fp32 call's queries and keys, its own 24 bits, staged in two bf16 parts lost a score cancelling below
     them (`(1 + 2^-9 + 2^-20, 1 + 2^-9)` against `(1/2, -1/2)` to zero, its exact `2^-21`, the head
-    review's P0 of 6496f845f), which its pairs each their own decay keep."""
+    review's P0 of 6496f845f), which its pairs each their own decay keep; and its family's products
+    reading shared memory (`anchors_on`)."""
     return (call.per_key and not reading and call.decay_bound is not None
-            and jnp.dtype(call.given.dtype).itemsize == 2)
+            and jnp.dtype(call.given.dtype).itemsize == 2 and anchors_on(call.family))
+
+
+def anchors_on(family: mosaic.Issuer) -> bool:
+    """Whether a family takes a bounded call's forward own pairs as anchored products (`anchoring`): where
+    its products read their operands from shared memory (`mosaic.Issuer.operands_in_registers` False:
+    warpgroup MMA's, tcgen05's), not where a consumer loads them into its registers (mma.sync's). Kimi
+    Linear's bf16 forward at 4096 tokens, anchored against each pair its own decay: a GH200's intra_own
+    12.1% faster (M-JS-291b), an A100's 10.9% slower, its forward 1801.8 us against 1757.0 and its training
+    step 6227.3 against 6147.8 (M-JS-291c at 3354a54356a). The anchored block holds fewer programs a
+    multiprocessor on every family (an H100's 3 against 6, an A100's 3 against 5), so residency does not
+    decide it; sm100's and the mma.sync families' other than sm80 unmeasured."""
+    return not family.operands_in_registers
 
 
 def prefix_at(call: Call, prefix_refs: tuple, row, column, keys: int, token) -> tuple:

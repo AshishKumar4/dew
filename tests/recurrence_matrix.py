@@ -142,25 +142,28 @@ def _op(hooks) -> generation.Choice:
 
 
 
-FP32_HEADS = 16
-"""The value heads an fp32 cell draws (`_drawn`): its per-head parameters' gradients (a gate's `log_a` and
-`bias`, a rate) an element a head, which at the draw's two left three fp32 cells' paired ratios unresolved
-within 512 seeds (M-JS-75d); a 16-bit cell's rounding resolves at two."""
+PARAMETER_HEADS = 16
+"""The value heads an fp32 cell and a TPU cell draw (`_drawn`): its per-head parameters' gradients (a
+gate's `log_a` and `bias`, a rate) an element a head, which at the draw's two left three fp32 cells' paired
+ratios unresolved within 512 seeds (M-JS-75d), and a v6e's bf16 rated scan's rate's its reference against
+itself (M-JS-298); a GPU's 16-bit cell's rounding resolves at two."""
 
 
 MODEL_WIDTHS = {"Qwen3.5-27B": {"key_heads": 16, "value_heads": 48, "key_width": 128, "value_width": 128,
-                                "length": 1024}}
+                                "length": 256, "rows": 1}}
 """A model's gated delta net widths a cell may draw at (`_drawn`'s `widths`): Qwen3.5-27B's 16 key heads
-and 48 value heads of 128 (tools/benchmark_recurrence.py's shape, its fixture's config.json) over 1,024
-tokens, sixteen of its template's chunks."""
+and 48 value heads of 128 (tools/benchmark_recurrence.py's shape, its fixture's config.json) over 256
+tokens, four of its template's chunks, one row. Its float64 truth a token at a time and that truth's terms
+keep a memory a token: two rows over 1,024 tokens asked 40.37 GiB of an A100's 40 (row 13580), a row over
+256 an eighth of it."""
 
 
 def _drawn(case: dict[str, str], seed: int):
     """`case`'s operands from `seed` (`draw`, its queries, keys and values and write gate in the case's
-    dtype; an fp32 cell's over `FP32_HEADS` value heads; a case naming `widths` at a model's,
-    `MODEL_WIDTHS`) and fp32 cotangents of its output and final memory."""
+    dtype; an fp32 cell's and a TPU cell's over `PARAMETER_HEADS` value heads; a case naming `widths` at a
+    model's, `MODEL_WIDTHS`) and fp32 cotangents of its output and final memory."""
     hooks = FORMS[case["form"]]
-    heads = FP32_HEADS if case["dtype"] == "float32" else VALUE_HEADS
+    heads = PARAMETER_HEADS if case["dtype"] == "float32" or case["kernel"] == "tpu" else VALUE_HEADS
     widths = MODEL_WIDTHS[case["widths"]] if "widths" in case else {"value_heads": heads}
     (operands,) = draw(hooks, packed=case["documents"] == "packed", seed=seed, **widths)
     narrow = jnp.dtype(case["dtype"])
@@ -299,7 +302,7 @@ SEEDS = {
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
-cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
+cells over `PARAMETER_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
 took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it, and
 the write gate's on the template (its bf16 training on it since 55cd6a126de) and the rated scan's fp32 one
 (row 7673) its form and dtype's on the portable math's until an H100 sizes it."""
@@ -357,10 +360,7 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS, *, wi
     # One label for its recording, its compiled truths and its verdict: a model's widths' cell its own beside
     # the drawn widths' cell of the same axes (`truths_ahead` refuses two sites of one label).
     site = "-".join(named.values())
-    hooks, starts = FORMS[named["form"]], _starts(named)
-
-    def truth(operands):
-        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
+    truth = _truth(named)
 
     step = jax.jit(_step(named, named["kernel"]))
     # A GPU tier part's prepare compiles the cell's sites on a device that computes nothing: the routes' run
@@ -387,6 +387,17 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS, *, wi
               f"own chunk math's: {distance}", flush=True)
     assert_as_exact(step, held_to, functools.partial(_drawn, named), site, seeds=seeds,
                     truth_fn=with_gradients(truth))
+
+
+def _truth(case: dict[str, str]):
+    """`case`'s truth: its recurrence a token at a time (`token_by_token`) on its documents, its output and
+    final memory at least fp32 (`_wide`)."""
+    hooks, starts = FORMS[case["form"]], _starts(case)
+
+    def truth(operands):
+        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
+
+    return truth
 
 
 def _held_to_a_recording(upstream: str | None, site: str, environ: Mapping[str, str] = os.environ) -> bool:
@@ -470,10 +481,6 @@ def per_shard(choice: str, kernel: str) -> dict:
     # A TPU's scan over fp32, as its cases run it (`TPU_CASES`).
     target, dtype = ("v6e", "float32") if kernel == "tpu" else ("sm90", "bfloat16")
     case = {"generation": target, "form": form, "kernel": kernel, "dtype": dtype, "documents": "packed"}
-    hooks, starts = FORMS[form], _starts(case)
-
-    def truth(operands):
-        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
     def specs(axis: str):
         def placed(leaf) -> PartitionSpec:
@@ -487,5 +494,5 @@ def per_shard(choice: str, kernel: str) -> dict:
         return laid
 
     return {axis: Shard(_step(case, kernel), functools.partial(_drawn, case), specs(axis),
-                        with_gradients(truth), SHARDED_SEEDS, axis, target=target)
+                        with_gradients(_truth(case)), SHARDED_SEEDS, axis, target=target)
             for axis in ("data", "fsdp")}

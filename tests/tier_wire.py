@@ -110,7 +110,7 @@ def needs_file(store: Path, unit: str) -> Path:
     return store / "needs" / f"{hashlib.sha256(unit.encode()).hexdigest()[:16]}.json"
 
 
-def unit_needs(programs: list[dict[str, int]]) -> None:
+def unit_needs(programs: list[dict[str, int | str]]) -> None:
     """`programs` (each a program's admission, `truths_ahead.admitted_needs`) added to the needs of the
     tier's unit this prepare runs (`UNIT`), its file under the tier's store (`needs_file`), from which its
     lane sizes the unit's worker: the one publisher of a prepare's needs, a flow's and a test's check-1

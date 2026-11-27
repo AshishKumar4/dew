@@ -29,6 +29,7 @@ from dew.distributed.placement import Placement, Validation, allocated_bytes, pl
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import (
+    compiler_options,
     held_context,
     held_until_release,
     known_program_key,
@@ -40,7 +41,7 @@ from dew.state import Accumulation, TrainState, apart, taken, together
 from dew.training._lowering import Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
-from dew.training.memory import resident_on
+from dew.training.memory import layer_gathers, resident_on, step_options, unlimited
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import holds_copies, narrow_copies, narrowed, state_reads
 from dew.training.planning import Candidate, splits
@@ -493,19 +494,32 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
                          out_shardings=returned, donate_argnums=0)
 
 
-def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 generation: str, narrow: bool) -> jax.stages.Lowered:
+def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective: Objective[LossT, EffectsT],
+                                 state: TrainState, batch: Batch, generation: str, narrow: bool,
+                                 xla_defaults: bool = False
+                                 ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
     objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
-    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`)."""
+    A step whose state the host holds lowers its programs apart (`StepCompiler._lowered_host`). Beside it,
+    the XLA options its plan compiles it under, a compile's limit aside (`unlimited`): the step's own
+    (`step_options`), or at a rung of XLA's defaults (`xla_defaults`) those its modules need alone
+    (`compiler_options`), as `FitSearch.compiled_options` chooses them; a step's fingerprint is its program
+    under them (`dew.training.ahead._fingerprint`)."""
     settings = stepping.settings
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
         split = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
-        return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                             mesh=mesh, platforms=('cuda',)).lowered
+        candidate = candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
+                                  mesh=mesh, platforms=('cuda',))
+        # The plan's sizing of its largest layer over the variables as the target's mesh places them, as a
+        # run's search sizes it over its placed ones (`StepCompiler`'s `gathered`).
+        variables = candidate.prepared.variables
+        gathered = layer_gathers(objective, variables, mesh.size)
+        options = (compiler_options() or None if xla_defaults
+                   else step_options(objective, candidate.micro, variables, mesh, gathered))
+        return candidate.lowered, unlimited(options)

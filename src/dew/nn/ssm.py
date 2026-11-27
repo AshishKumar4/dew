@@ -33,9 +33,11 @@ def affine_spans(left, right, multiply=operator.mul, add=operator.add):
     return multiply(a1, a2), add(multiply(a2, b1), b2)
 
 
-def affine_states(decay, write, entering, axis: int):
+def affine_states(decay, write, entering, axis: int, taken=None):
     """The states `h_t = a_t h_(t-1) + b_t` along `axis` of decays `decay` (each at most one in magnitude) and
-    writes `write` from the state `entering` (`write`'s shape without `axis`): the recurrence a token at a
+    writes `write` from the state `entering` (`write`'s shape without `axis`), a token `taken` false (where
+    given, broadcast as `decay`) carrying the state before it by selection, its bits as they were (an
+    identity step's `1 h + 0` turns `-0` to `+0`): the recurrence a token at a
     time over the axis (a chunk's tokens, at most `UNROLLED`: its caller's loop runs the chunks),
     straight-line code, so its arithmetic and JAX's derivative of it at every order are the recurrence's own.
     An associative scan's spans of writes from a zero state passed float32's largest where every state was
@@ -43,7 +45,8 @@ def affine_states(decay, write, entering, axis: int):
     formed its last carry's zero cotangent times an infinite state, NaN at a second order (the head review of
     fd1a993b6)."""
     decay, write = (jnp.moveaxis(t, axis, 0) for t in (decay, write))
-    return jnp.moveaxis(_tokens(decay, write, entering), 0, axis)
+    taken = None if taken is None else jnp.moveaxis(taken, axis, 0)
+    return jnp.moveaxis(_tokens(decay, write, entering, taken), 0, axis)
 
 
 UNROLLED = 64
@@ -53,11 +56,12 @@ the same state with its own dtype and live-carry rules and tests, and reached by
 ran slower and held more memory (row 8796)."""
 
 
-def _tokens(decay, write, entering):
-    """The recurrence over the leading axis of `decay` and `write`, a token at a time, straight-line."""
+def _tokens(decay, write, entering, taken=None):
+    """The recurrence over the leading axis of `decay` and `write`, a token at a time, straight-line, a token
+    not `taken` (where given) carrying the state before it."""
     states, state = [], entering
-    for a, b in zip(decay, write, strict=True):
-        state = a * state + b
+    for index, (a, b) in enumerate(zip(decay, write, strict=True)):
+        state = a * state + b if taken is None else jnp.where(taken[index], a * state + b, state)
         states.append(state)
     return jnp.stack(states) if states else write
 

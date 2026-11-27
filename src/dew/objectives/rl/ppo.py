@@ -360,6 +360,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
 
+    def preview_refusal(self) -> str | None:
+        """The actor's, whose preview this one is."""
+        return self.actor.preview_refusal()
+
     def preview(self, params: Variables, batch, step: Step, *, scored=None):
         return self.actor.preview(part(params, "policy"), batch, replace(step, ema=None), scored=scored)
 
