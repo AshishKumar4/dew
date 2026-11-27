@@ -423,12 +423,12 @@ def _dynamic_taps(record: Mapping[str, object]) -> int | None:
                  if isinstance(value, Mapping) and (taps := _dynamic_taps(value)) is not None), None)
 
 
-def _query(name: str, parts: tuple[str, ...]) -> Stacked:
+def _query(name: str, parts: tuple[str, ...], width: int) -> Stacked:
     """A depth query `[D]`, or a global layer's sites' `[3, D]`, as the `[1, D]` projection each leaf
-    reads (a kernel, `[out, in]`)."""
+    reads (a kernel, `[out, in]`), `D` the decoder's `width`."""
     if len(parts) == 1:
-        return Stacked(name, parts, (Split(0),), grid=())
-    return Stacked(name, parts, (Split(1),))
+        return Stacked(name, parts, (Split(0, width), Split(1)))
+    return Stacked(name, parts, (Split(1, width),))
 
 
 def _sites(kind: Mapping[str, object]) -> tuple[str, ...]:
@@ -460,13 +460,13 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
     mixture = None if stated is None else _records.record(stated, 'mixture')
     routed = () if mixture is None else _records.integers(mixture['layers'], 'layers')
     experts = 0 if mixture is None else _records.integer(mixture['experts'], 'experts')
-    stacks = [_query('model.llm.attn_res.output_query', ('model.llm.output_query',))]
+    stacks = [_query('model.llm.attn_res.output_query', ('model.llm.output_query',), width)]
     for layer, kind in enumerate(_records.record(kinds[kind], 'kinds') for kind in types):
         stem = f'model.llm.layers.{layer}'
         if layer:
             stacks.append(_query(f'model.llm.attn_res.attn_queries.{layer - 1}',
-                                 tuple(f'{stem}.{site}_query' for site in _sites(kind))))
-        stacks.append(_query(f'model.llm.attn_res.mlp_queries.{layer}', (f'{stem}.mlp_query',)))
+                                 tuple(f'{stem}.{site}_query' for site in _sites(kind)), width))
+        stacks.append(_query(f'model.llm.attn_res.mlp_queries.{layer}', (f'{stem}.mlp_query',), width))
         if (taps := _dynamic_taps(kind)) is not None:
             for site in 'kv':
                 conv = f'{stem}.attn.{site}_sconv'
@@ -497,7 +497,7 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
     if loop.get('messages') is not None:
         stacks += [Stacked(f'model.llm.middle_cycle_cross_pass_{stack}',
                            tuple(f'model.llm.layers.{layer}.controllers.{site}.query'
-                                 for layer in span for site in sites), (Split(1),))
+                                 for layer in span for site in sites), (Split(1, width),))
                    for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v')))]
     return stacks
 

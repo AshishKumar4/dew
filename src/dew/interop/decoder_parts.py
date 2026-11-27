@@ -15,7 +15,16 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    NamedTuple,
+    NoReturn,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    get_type_hints,
+)
 
 import jax
 import jax.numpy as jnp
@@ -1876,7 +1885,8 @@ FUSED_EXPERTS = (Packed('.experts.gate_up_proj', ('.experts.gate_proj', '.expert
 
 
 type Step = Transposed | Reversed | Split | Inverted
-"""One invertible step of a `Stacked` view: each declares both of its directions."""
+"""One invertible step of a `Stacked` view: each declares both of its directions, and whether its forward
+one views what it is given (`views`), which a stored tensor built in place reads."""
 
 
 @dataclass(frozen=True)
@@ -1884,6 +1894,7 @@ class Transposed:
     """A view's axes in the order `axes` (`numpy.transpose`); its inverse orders them back."""
 
     axes: tuple[int, ...]
+    views: ClassVar[bool] = True
 
     def forward(self, tensor: Stored) -> Stored:
         return tensor.transpose(self.axes)
@@ -1897,6 +1908,7 @@ class Reversed:
     """A view's axis `axis` in reverse order, which is its own inverse."""
 
     axis: int
+    views: ClassVar[bool] = True
 
     def forward(self, tensor: Stored) -> Stored:
         return tensor[(slice(None),) * self.axis + (slice(None, None, -1),)]
@@ -1912,6 +1924,7 @@ class Split:
 
     axis: int
     inner: int | None = None
+    views: ClassVar[bool] = True
 
     def forward(self, tensor: Stored) -> Stored:
         shape = tensor.shape
@@ -1931,6 +1944,11 @@ class Inverted:
     """`step` the other way: a join of two axes as `Inverted(Split(...))`."""
 
     step: Step
+
+    @property
+    def views(self) -> bool:
+        # Two axes joined are a view only of some strides: a join is taken as a copy.
+        return not isinstance(self.step, Split) and self.step.views
 
     def forward(self, tensor: Stored) -> Stored:
         return self.step.inverse(tensor)
@@ -1966,13 +1984,35 @@ class Stacked:
                              f"stacks {grid}, {list(self.parts)}")
         return dict(zip(self.parts, (tensor[index] for index in np.ndindex(*grid)), strict=True))
 
-    def stacked(self, parts: Sequence[Stored]) -> Stored:
-        """The stored tensor of its `parts`, in their order."""
-        tensor = np.stack(parts)
+    def stored(self, parts: Sequence[jax.ShapeDtypeStruct]) -> jax.ShapeDtypeStruct:
+        """The stored tensor's shape and dtype, of its parts', in their order, which hold one dtype."""
+        if len(dtypes := {part.dtype for part in parts}) > 1:
+            raise ValueError(f"{self.name} stacks {list(self.parts)} of the dtypes "
+                             f"{sorted(map(str, dtypes))}")
+        tensor = np.stack([Unread(part.shape, part.dtype) for part in parts])
         tensor = tensor.reshape(*self._grid, *tensor.shape[1:])
         for step in reversed(self.view):
             tensor = step.inverse(tensor)
-        return tensor
+        return jax.ShapeDtypeStruct(tensor.shape, parts[0].dtype)
+
+    def stacked(self, read: Callable[[str], np.ndarray], stored: jax.ShapeDtypeStruct) -> np.ndarray:
+        """The stored tensor (`stored`, its shape and dtype) of its parts, each read (`read`) as it is placed:
+        into its place in the one stored tensor where each step's forward views it (`Step.views`), so the
+        stored tensor and one part are held at a time, as an expert bank's are; else stacked, and taken
+        back through the steps' inverses (a join of two axes, which only a copy makes)."""
+        if all(step.views for step in self.view):
+            tensor = np.empty(stored.shape, stored.dtype)
+            placed = tensor
+            for step in self.view:
+                placed = step.forward(placed)
+            for index, part in zip(np.ndindex(*self._grid), self.parts, strict=True):
+                placed[index] = read(part)
+            return tensor
+        stacked = np.stack([read(part) for part in self.parts])
+        stacked = stacked.reshape(*self._grid, *stacked.shape[1:])
+        for step in reversed(self.view):
+            stacked = step.inverse(stacked)
+        return stacked
 
 
 @dataclass(frozen=True)
@@ -2027,23 +2067,24 @@ class Restacked:
         built: dict[str, tuple[jax.ShapeDtypeStruct, Callable[[], Stored]]] = {}
 
         def take(name: str, spec: jax.ShapeDtypeStruct, build: Callable[[], Stored]) -> None:
+            # A name two of the tensors would be written back under, a stack's or one passed through, refused
+            # whichever comes first.
             if name in built:
                 raise ValueError(f"two of the prepared tensors write back {name}")
             built[name] = (spec, build)
 
+        stacked: set[str] = set()
         for name, spec in specs.items():
             stack = owner.get(name)
-            if name in unstored or (stack is not None and stack.name in built):
+            if name in unstored or (stack is not None and stack.name in stacked):
                 continue
             if stack is None:
                 take(name, spec, lambda name=name: tensors[name])
                 continue
-            if len(dtypes := {specs[part].dtype for part in stack.parts}) > 1:
-                raise ValueError(f"{stack.name} stacks {list(stack.parts)} of the dtypes "
-                                 f"{sorted(map(str, dtypes))}")
-            shape = stack.stacked([Unread(specs[part].shape, spec.dtype) for part in stack.parts]).shape
-            take(stack.name, jax.ShapeDtypeStruct(shape, spec.dtype), lambda stack=stack: stack.stacked(
-                [np.asarray(tensors[part]) for part in stack.parts]))
+            stacked.add(stack.name)
+            stored = stack.stored([specs[part] for part in stack.parts])
+            take(stack.name, stored, lambda stack=stack, stored=stored: stack.stacked(
+                lambda held: np.asarray(tensors[held]), stored))
         return LazyTensors({name: spec for name, (spec, _) in built.items()}, lambda name: built[name][1]())
 
 
