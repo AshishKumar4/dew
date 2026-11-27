@@ -225,7 +225,7 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
 
 
 def _saved_run(config, task, state, step: int, directory) -> None:
-    """`state` saved as `config`'s run in `directory` at `step`, with the record its task's inference reads."""
+    """`state` saved as `config`'s run in `directory` at `step`, with the record its inference reads."""
     from dew.training import Checkpoints
 
     checkpoints = Checkpoints(str(directory))
