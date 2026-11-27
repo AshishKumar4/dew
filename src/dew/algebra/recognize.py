@@ -426,18 +426,20 @@ def _check_joint(closed: jcore.Jaxpr, widths: Sequence[int], accurate: bool, *,
     if not saturating:
         return shared
     region = terms.region(closed)
-    graph, _, _ = program.graphed(region)
-    program.saturate(graph, region, rules.admitted(accurate), SATURATION, facts_settled=True)
+    admitted = rules.admitted(accurate)
     # Each output's term, the program's results first, then each declaration's in the same order.
     terms_made = region.outputs
     equal, program_at = [], 0
     declared_at = sum(widths)
-    for width in widths:
-        pairs = [(terms_made[program_at + n], terms_made[declared_at + n]) for n in range(width)]
-        equal.append(all(ours is not None and theirs is not None and graph.check_bool(eq(ours).to(theirs))
-                         for ours, theirs in pairs))
-        program_at += width
-        declared_at += width
+    with program.fresh_graph(rules.FACTS, *(sets.ruleset for sets in admitted)) as graph:
+        program.graphed(region, graph)
+        program.saturate(graph, region, admitted, SATURATION, facts_settled=True)
+        for width in widths:
+            pairs = [(terms_made[program_at + n], terms_made[declared_at + n]) for n in range(width)]
+            equal.append(all(ours is not None and theirs is not None and graph.check_bool(eq(ours).to(theirs))
+                             for ours, theirs in pairs))
+            program_at += width
+            declared_at += width
     return equal
 
 

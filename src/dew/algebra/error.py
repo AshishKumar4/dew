@@ -66,18 +66,20 @@ def choose(function: Callable, operands: Sequence[jax.ShapeDtypeStruct], *, accu
     none."""
     closed, shaped = jax.make_jaxpr(function, return_shape=True)(*operands)
     region = terms.region(closed)
-    graph, bundle, roots = program.graphed(region)
     facts = cost.target()
     timed = cost.model(region, cost.fused(facts))
-    _, written_seconds = extract.cheapest(graph, bundle, timed)
-    program.saturate(graph, region, rules.admitted(accurate=False, dev=True), saturation, facts_settled=True)
+    admitted = rules.admitted(accurate=False, dev=True)
     tree = jax.tree.structure(shaped)
-    cheapest, _ = program.extracted(graph, bundle, timed)
-    proposed = {"cheapest": cheapest,
-                "stable": program.extracted(graph, bundle, cost.stable(region, cost.fused(facts)))[0]}
-    for index, variants in enumerate(graph.extract_multiple(list(roots), VARIANTS)):
-        for number, form in enumerate(variants):
-            proposed[f"root {index}'s form {number}"] = [*cheapest[:index], form, *cheapest[index + 1:]]
+    with program.fresh_graph(rules.FACTS, *(sets.ruleset for sets in admitted)) as graph:
+        bundle, roots = program.graphed(region, graph)
+        _, written_seconds = extract.cheapest(graph, bundle, timed)
+        program.saturate(graph, region, admitted, saturation, facts_settled=True)
+        cheapest, _ = program.extracted(graph, bundle, timed)
+        proposed = {"cheapest": cheapest,
+                    "stable": program.extracted(graph, bundle, cost.stable(region, cost.fused(facts)))[0]}
+        for index, variants in enumerate(graph.extract_multiple(list(roots), VARIANTS)):
+            for number, form in enumerate(variants):
+                proposed[f"root {index}'s form {number}"] = [*cheapest[:index], form, *cheapest[index + 1:]]
     written = _reprinted("as written", written_seconds.value, function, operands, tree)
     candidates, seen = [written], set()
     for name, chosen in proposed.items():
@@ -234,11 +236,12 @@ def _lowered(found: Sequence[jax.lax.DotAlgorithmPreset],
 def _priced(region: terms.Region, chosen: list[terms.Term], model: DagCostModel[cost.Seconds]) -> float:
     """The price of `chosen` together under `model`, each shared value once: extracted from an unsaturated
     graph of `region`'s facts holding them, where no rule has made another form of theirs."""
-    graph, _, _ = program.graphed(region)
-    alone = terms.Term.bundle(Vec[terms.Term](*chosen))
-    graph.register(alone)
-    graph.run(rules.FACTS.saturate())
-    _, price = extract.cheapest(graph, alone, model)
+    with program.fresh_graph(rules.FACTS) as graph:
+        program.graphed(region, graph)
+        alone = terms.Term.bundle(Vec[terms.Term](*chosen))
+        graph.register(alone)
+        graph.run(rules.FACTS.saturate())
+        _, price = extract.cheapest(graph, alone, model)
     return price.value
 
 

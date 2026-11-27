@@ -8,6 +8,9 @@ every order's finiteness by its contract (tests/test_contracts_algebra.py)."""
 
 import functools
 import itertools
+import json
+import subprocess
+import sys
 
 import hypothesis
 import jax
@@ -497,6 +500,26 @@ def test_the_primitives_result_types_keep_weak_types():
 
     assert jax.eval_shape(product, weak, weak, exponent).weak_type
     assert not jax.eval_shape(product, weak, strong, exponent).weak_type
+
+
+FIRST_KERNEL = """
+import json, sys
+from dew.nn.kernels import launches
+launches._register_mosaic_gpu_lowerings()
+from jax._src.pallas.mosaic_gpu import lowering
+held = {primitive for rules in lowering.mosaic_lowering_rules.values() for primitive in rules}
+from dew.algebra import means, ratios
+print(json.dumps([means.merged_state_p in held, ratios.ratio_p in held]))
+"""
+
+
+def test_a_first_kernel_registers_every_operation_of_the_construct():
+    """A process's first kernel registers the Pallas Mosaic GPU lowering of every operation of the construct,
+    the law's merge and ratio among them, though nothing it imported made them yet (`scaled.made`): no
+    later kernel registers one after a lowering was keyed by the registries (row 13752: the merge's rule
+    registered at a later kernel, the lowering cache's identity made again and read by thread timing)."""
+    done = subprocess.run([sys.executable, "-c", FIRST_KERNEL], capture_output=True, text=True, check=True)
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == [True, True]
 
 
 def test_every_primitive_of_the_construct_is_recorded_with_the_value_it_lowers_as():
