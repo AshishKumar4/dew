@@ -1533,11 +1533,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation == 'reference' or (implementation == 'xla' and (
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
-        # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
-        if generation.numerics().forms == "accurate":
-            precision = EXACT_FLOAT32
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
-                                   dtype=dtype, precision=precision,
+                                   dtype=dtype, precision=score_precision(precision),
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=scale_logits, mask_fill=mask_fill, dropout_rate=dropout_rate,
                                    dropout_seed=dropout_seed, dropout_places=dropout_places)
@@ -1567,6 +1564,15 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         return at_precision(precision, parameters=(3, 4))(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)
+
+
+def score_precision(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
+    """The precision the reference path forms a call's logits at, the call's `precision` stated: the
+    accurate form's IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32 nor a narrowing preset, under
+    the run's accurate numerics; the stated one otherwise (JAX's configured one where None). A computation
+    that trains toward the attention's own weights reads its logits at it (MSA's teacher,
+    `block_sparse.msa_query_kls`)."""
+    return EXACT_FLOAT32 if generation.numerics().forms == "accurate" else precision
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits: bool = False) -> bool:

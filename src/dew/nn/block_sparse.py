@@ -25,7 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import AttentionImpl, scaled_dot_product_attention, score_precision
 from dew.nn.dense import Dense
 from dew.nn.documents import CrossDocuments, DocumentWindows, document_windows
 from dew.nn.inspection import INDEXER_COLLECTION, QK
@@ -619,7 +619,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
             # (`IndexerTraining`, `mla.indexer_kl`'s collection).
             self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
                 scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
-                precision=self.ctx.precision))
+                precision=score_precision(self.ctx.precision)))
         return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
                                   dtype=self.ctx.dtype, precision=self.ctx.precision,
                                   force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,

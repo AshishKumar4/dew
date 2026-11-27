@@ -22,9 +22,11 @@ from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
 from dew.batch import coordinates
 from dew.nn import block_sparse, sparse_selection
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention, score_precision
 from dew.nn.inspection import INDEXER_COLLECTION
+from dew.nn.kernels import generation
 from dew.nn.mla import SELECTIONS, indexer_target
+from dew.nn.precision import ACCURATE
 from dew.registry import mixers
 
 SEEDS = 8
@@ -503,7 +505,8 @@ def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
     """MSA's indexer loss (`msa_query_kls`) at the layer's precision, `highest`, under an ambient bf16
     product preset (`BF16_BF16_F32`, whose operands Dew rounds to bf16 on any backend): its teacher's logits 4096 and 4097 (a query of 1 against keys 4096 and 4097) stay apart, so a
     uniform student's KL is the float64 run's, where the ambient preset rounded both to 4096 and gave 0
-    (row 13706)."""
+    (row 13706); and a layer stating that preset under the run's accurate numerics, whose attention forms
+    IEEE fp32 logits, alike."""
     query = jnp.ones((1, 2, 1, 1), jnp.float32)
     key = jnp.asarray([[[[4096.0]], [[4097.0]]]], jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
@@ -514,6 +517,12 @@ def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
     target = np.exp([4096.0 - 4097.0, 0.0])
     target /= target.sum()
     expected = float(np.sum(target * np.log(target)) + np.log(2.0))
+    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
+    # A layer stating the narrowing preset under the run's accurate numerics: the attention forms its logits
+    # in IEEE fp32 (`attention.score_precision`), and the teacher with it.
+    with generation.run_precision(ACCURATE):
+        found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=1.0,
+                                                      precision=score_precision("BF16_BF16_F32")))[0, 1]
     assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
 
 
