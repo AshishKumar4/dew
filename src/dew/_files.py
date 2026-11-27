@@ -278,7 +278,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             # The groups and access the published tree takes, bound under the lock to what the destination
             # is now (audit 2026-11-27 P05: a publisher that began before another's commit, or against no
             # tree, chose them from another view), while the staging is still private.
-            mode = _granted(staging, directory, held_at, made, parent_before, written,
+            mode = _granted(staging, directory, held_at, before is not None, made, parent_before, written,
                             replaces(written, held))
             if held_at is None:
                 staging.chmod(mode)
@@ -346,7 +346,7 @@ def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
         log.warning("could not remove %s from a save's discarded tree: %s", name, left)
 
 
-def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int,
+def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, held_before: bool, made: int,
              parent_before: os.stat_result, written: Entries, replacements: Replacements) -> int:
     """Give each entry of `staging` the group and access the tree published from it takes at `directory`,
     as the destination is now, and return the mode its root takes, which its caller sets last.
@@ -375,6 +375,12 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
     if held_at is None:
         parent = directory.parent.stat()
         setgid = parent.st_mode & stat.S_ISGID
+        if held_before:
+            # The staging took the group of the tree it was to replace, which is gone: which group a folder
+            # made here takes (the publisher's, or the parent's on a `grpid` mount) no stat says, so it is
+            # refused rather than published in the group of a tree no longer there (theme 72's review).
+            raise FileExistsError(f"{directory} was removed while this save was written, whose files took "
+                                  "its group: save again")
         if parent_before.st_mode & stat.S_ISGID and not setgid:
             # The staging took the setgid parent's group, which a folder made there now takes no longer,
             # and which group it does take (the publisher's, or the parent's on a `grpid` mount) no stat
