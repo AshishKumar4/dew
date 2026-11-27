@@ -227,6 +227,46 @@ def test_an_absorbed_mla_decode_step_whose_values_are_its_keys_leading_columns_i
 
 
 @INTERPRETS
+def test_an_absorbed_mla_window_over_a_paged_latent_cache_returns_its_partial_for_the_merge_interpreted():
+    """MLA over a sliding window of a paged latent cache returning its partial accumulators
+    (kernel-templates.md §A row 63, tokamax's `mla_swa`): an absorbed step (`in_key`, the values its
+    latents' leading 512 columns) over each row's last 64 keys read from 16-key pages through a shuffled
+    table, `finished=False` (its state, an `Initial`), merged by the step over the rest of its keys (the
+    sparse part's, here its earlier keys whole, a dense cache) as its initial state: on par with the
+    reference path over every key (check 1), as an H100 runs it under the interpreter."""
+    page, window, latent, heads = 16, 64, 576, 4
+    lengths = jnp.asarray([KEYS - 56, KEYS // 3 * 2], jnp.int32)
+    starts = lengths - window
+    windowed = template.spans(1, KEYS, 2, lengths=lengths, starts=starts)
+    rest = template.spans(1, KEYS, 2, lengths=starts)
+    whole = template.spans(1, KEYS, 2, lengths=lengths)
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
+                        jnp.int32)
+
+    def pooled(cache):
+        return _pooled(cache, table, page)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        return (jax.random.normal(streams[0], (2, 1, heads, latent), jnp.bfloat16),
+                jax.random.normal(streams[1], (2, KEYS, 1, latent), jnp.bfloat16))
+
+    def ours(query, key):
+        with generation.assumed("sm90"):
+            pool = pooled(key)
+            state = attention_decode.attend(query, pool, pool[..., :512], windowed, interpret=True,
+                                            table=table, in_key=True, finished=False)
+            return attention_decode.attend(query, key, key[..., :512], rest, template.Hooks(initial=state),
+                                           interpret=True, in_key=True)
+
+    def reference(query, key):
+        return template.reference(query, key, key[..., :512], whole)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    "template decode absorbed MLA paged window merged", seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_page_selected_decode_step_over_a_paged_cache_is_on_par_interpreted():
     """MiniMax M3's sparse decode (kernel-templates.md §A row 37a): a decode step over a paged cache of
     128-token pages reading only the pages its selection names (the first, its own, and one between, as
@@ -717,17 +757,21 @@ PAGE = 128
 
 
 @INTERPRETS
-@pytest.mark.parametrize(("device", "page"),
-                         [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4), ("sm80", 1)])
+@pytest.mark.parametrize(("device", "page", "width"),
+                         [("sm90", PAGE, 64), ("sm90", 16, 64), ("sm90", 1, 64), ("sm90", 16, 128),
+                          ("sm80", 16, 64), ("sm80", 4, 64), ("sm80", 1, 64)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
+def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, width, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
     and pages of 16, 4 and 1 keys, the docs' (docs/concepts/inference.md), several to a key tile, its rows
     gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772): an
     H100's by its loading warpgroup's ring, an A100's by its one warpgroup's cp.async copies in its
-    pipeline's groups (`mosaic_sm80._gathered_walk`)."""
+    pipeline's groups (`mosaic_sm80._gathered_walk`). Heads 64 wide, and an H100's 128 wide over 16-key
+    pages, whose interpreted ring copies a key's row whole into its slot staged where layout inference lays
+    it out, its load barrier awaiting those copies (`rings.piece_copies`; counted at a 128-byte swizzle's two
+    a row, it awaited arrivals no copy made, row 13656)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
@@ -747,13 +791,13 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), jnp.bfloat16)
-        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 64), jnp.bfloat16)
+        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, width), jnp.bfloat16)
+        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, width), jnp.bfloat16)
                  for stream in streams[1:])
         return query, *pools
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page} {device}",
-                    seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"template paged decode {call} {page} {width} {device}", seeds=SEEDS)
 
 
 

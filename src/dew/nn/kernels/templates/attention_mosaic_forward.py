@@ -318,10 +318,12 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     elif not interpret or family.gathers_interpreted:
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=keyed)
     else:
-        # A copy a row of each swizzled tile's columns (`rings.Ring.parts`), where no lane-level copy runs.
-        unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
-                for name in keyed}
-        copies = {name: blocks[name][0][0] * max(1, blocks[name][0][1] // unit[name]) for name in keyed}
+        # Each row's copies as `rings.Ring.parts` makes them where no lane-level copy runs, at the swizzle the
+        # slot is staged at (`rings.piece_copies`: none stated, layout inference's, one copy a row), so its
+        # load barrier takes the arrivals they make: counted at a 128-byte swizzle the slot was not staged
+        # at, a 128-wide step's barrier awaited 128 arrivals of its 64 rows' 64 copies forever (row 13656).
+        copies = {name: blocks[name][0][0] * rings.piece_copies(*blocks[name], swizzles.get(name), 1)
+                  for name in keyed}
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
     return scoped, streams, after
 
