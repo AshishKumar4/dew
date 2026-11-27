@@ -813,11 +813,11 @@ actual capacity still governs which compiler and training plans fit; it is not c
   `dew.algebra.error.choose` proposes candidates cheapest first (the form as written, the cheapest and the most
   stable extractions, and each root's variants) and takes the first its caller's `admits(candidate,
   reference)` passes, the gate's check of the two against the float64 truth (§1.5): under default numerics
-  against the form as written, which is always a candidate, so one is always admitted; under the accurate
-  numerics against every other candidate, which may admit none, and then nothing is chosen. A candidate is
-  measured where it is reached in that order, the form as written never against itself; candidates are
-  ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
-  rate prices is the compile-time splice's). The stable-form generator calls `choose` for each registered
+  against the form as written, which is always a candidate. Under accurate numerics the same gate first
+  admits candidates against the written form, then compares only those survivors with one another; if none
+  meets every surviving reference, it refuses. Neither mode compares a candidate with itself. Each
+  uncompensated candidate precedes every compensated candidate, with each group ordered by seconds where
+  the GPU target states its rates. The stable-form generator calls `choose` for each registered
   case, precision policy and target (§6.11).
 - A product's dot algorithm for the accuracy its site asks (`dew.algebra.error.product_precision`, row 5473)
   is chosen from JAX's presets for the operands as stored (`dew.nn.programs.dot_algorithms`). Filter for
@@ -1383,7 +1383,14 @@ softcap hook and its slope, projected sink state,
 document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
 Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
 witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload.
-Each case has an independent reference. The template component suites check their primitives on the CPU.
+The forward walk emits the pure weights and rescale in either layout without owning its dot;
+finalization reads the walk's existing named slots. The straight-through quantizer and classifier-free
+guidance have separately checked value and tangent bodies. Independent code witnesses cover the portable
+saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone
+E8M0 decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including
+signed zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's
+readout uses its written balanced tree over the named per-state values. Both written and generated
+components check their primitives on the CPU.
 Production still uses the written bodies (row 3272).
 
 ```python

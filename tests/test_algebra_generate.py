@@ -18,6 +18,7 @@ from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.algebra import acceptance, component_cases, error, generate, printed
+from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
 
@@ -43,14 +44,15 @@ def test_the_written_modules_are_what_generation_writes(on_its_platform):
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
-def test_the_command_checks_the_declaring_modules_own_declarations(on_its_platform):
-    """`python -m dew.algebra.generate --check`, run as a script (its module `__main__`, beside the one the
-    declaring modules register with), checks the declarations they register, each named: it had held an
-    empty registry of its own, which knew none of them (and passed checking nothing where none was
-    named)."""
-    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check",
-                           *sorted(generate.DECLARATIONS)], check=False)
-    assert done.returncode == 0
+@pytest.mark.parametrize("named", [False, True], ids=["discovered", "qualified"])
+def test_the_command_checks_the_declaring_modules_own_declarations(named, on_its_platform):
+    """A fresh CLI checks every installed artifact, even without explicit declaration names."""
+    names = sorted(generate.DECLARATIONS) if named else []
+    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check", *names],
+                          check=False, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert any(line.startswith("checked ") and line.endswith("/guidance_cases_derived.py")
+               for line in done.stderr.splitlines())
 
 
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
@@ -72,12 +74,17 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "ssd_chunk_pullback",
                                   "gemm_partial_scale", "fp8_epilogue", "mxfp8_scale", "mxfp8_epilogue",
                                   "nvfp4_scale", "nvfp4_payload", "rounded", "rounded_tangent",
-                                  "rounded_fp16", "rounded_fp16_tangent"])
+                                  "rounded_fp16", "rounded_fp16_tangent", "query_walk_factors",
+                                  "key_walk_factors", "walk_output", "quantized_ste", "quantized_ste_tangent",
+                                  "encode_e4m3", "encode_e5m2", "encode_e2m1", "e8m0_decode",
+                                  "decode_e4m3", "decode_e5m2", "selective_read",
+                                  f"{guidance_cases.__name__}.guided",
+                                  f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
 def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, on_its_platform):
     from certified import assert_certified
 
-    qualified = f"{component_cases.__name__}.{name}"
+    qualified = name if "." in name else f"{component_cases.__name__}.{name}"
     declaration = generate.DECLARATIONS[qualified]
     for policy in declaration.cases.policies:
         function = (declaration.function if arm == "written" else

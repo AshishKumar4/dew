@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Add checked portable E4M3/E5M2 decoding and the selective scan readout; keep production dispatch
+  unchanged. Split the slowest moment derivative checks by the derivative and draw they already held.
+
+- Generate checked attention walk factors and finish, FP4/FP8 storage encoders, and quantization and
+  guidance surrogates without changing production dispatch.
+
 - A generated surrogate now uses its written value and derivative when an unhashable static argument
   cannot select a generated case.
 

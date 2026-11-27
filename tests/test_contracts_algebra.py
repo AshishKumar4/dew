@@ -34,6 +34,47 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
         _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
         np.testing.assert_array_equal(higher, 2 * dx)
 
+
+def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
+    from dew.algebra import component_cases, component_cases_derived as emitted
+    from dew.nn import fake_quant
+
+    composed = component_cases.QUANTIZED_STE.assembled(lambda name: getattr(emitted, name))
+    x = jnp.full((16, 32), 7.0, jnp.float32)
+    stored = jnp.full(x.shape, -0.0, jnp.bfloat16)
+    tangent = jnp.full_like(x, 3)
+    rounded_tangent = jnp.ones_like(stored)
+    primal, moved = jax.jit(lambda a, b, da, db: jax.jvp(composed, (a, b), (da, db)))(
+        x, stored, tangent, rounded_tangent)
+    np.testing.assert_array_equal(np.asarray(primal).view(np.uint32),
+                                  np.asarray(fake_quant.straight_through(x, stored)).view(np.uint32))
+    np.testing.assert_array_equal(moved, tangent)
+    gradient = jax.grad(lambda arg: jnp.square(composed(arg, stored)).sum())
+    _, higher = jax.jvp(gradient, (x,), (tangent,))
+    np.testing.assert_array_equal(higher, 2 * tangent)
+
+
+def test_generated_guidance_preserves_the_scale_direction_at_both_endpoints():
+    from dew.sampling import guidance_cases, guidance_cases_derived as emitted
+
+    composed = guidance_cases.GUIDED.assembled(lambda name: getattr(emitted, name))
+    c = jnp.full((16, 64), 3.0, jnp.float32)
+    u = jnp.full_like(c, 1)
+    weight = jnp.broadcast_to(jnp.arange(16, dtype=jnp.float32)[:, None] % 2, (16, 1))
+
+    def moved_at(scale):
+        return jax.jvp(lambda w: composed(c, u, w), (scale,), (jnp.ones_like(scale),))
+
+    primal, moved = jax.jit(moved_at)(weight)
+    np.testing.assert_array_equal(primal, jnp.where(weight == 0, u, c))
+    np.testing.assert_array_equal(moved, c - u)
+    def higher(fn):
+        gradient = jax.grad(lambda arg, w: jnp.sum(fn(arg, u, w)), argnums=0)
+        return jax.jvp(lambda w: gradient(c, w), (weight,), (jnp.ones_like(weight),))[1]
+
+    np.testing.assert_array_equal(higher(composed), jnp.ones_like(c))
+
+
 def _plain(outputs, totals, anchors):
     """The convex mean as written: each state's mass at the joined anchor, its outputs weighed by it."""
     masses = totals * jnp.exp(anchors - jnp.max(anchors, axis=0, keepdims=True))
