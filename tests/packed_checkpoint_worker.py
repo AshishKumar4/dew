@@ -58,7 +58,8 @@ def _read(written: dict, restored: dict) -> dict:
     import jax
 
     def own(tree) -> list[tuple]:
-        return [(leaf.shape, leaf.dtype, [np.asarray(held.data).tobytes() for held in leaf.addressable_shards])
+        return [(leaf.shape, leaf.dtype, [np.asarray(held.data).tobytes()
+                                          for held in leaf.addressable_shards])
                 for leaf in jax.tree.leaves(tree)]
 
     return {name: type(restored[name]) is type(matrix) and restored[name].form == matrix.form
