@@ -20,6 +20,7 @@ Every saver writes a plan, and every plan is written by `ReleasePlan.write`: `de
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 from collections.abc import Callable, Mapping, Sequence
@@ -29,7 +30,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from etils import epath
 
-from dew._files import write_atomically
+from dew._coordination import writes_weights
+from dew._files import replacing, write_atomically
 from dew.interop.release_record import Release
 from dew.interop.safetensors_io import (
     CONFIG_FILE,
@@ -178,27 +180,38 @@ class ReleasePlan:
             if folder:
                 _part(root / folder, config, tensors, max_shard_size)
         config, tensors = model.root()
-        tensors = _sidecars_written(tensors, model.sidecars, root)
-        if self.head is not None and self.head.merged:
-            tensors = joined_tensors({"the model": tensors, "its head": self.head.tensors})
-        # The root's weights at the release's root; its config there or in the format's folder.
-        save_sharded(tensors, root, max_shard_size)
+        with contextlib.ExitStack() as staged:
+            # Each sidecar written beside the root's weights unpublished, and published only once they are
+            # (`_sidecars_staged`): a save that fails before leaves the release it replaces whole.
+            tensors = _sidecars_staged(tensors, model.sidecars, root, staged)
+            if self.head is not None and self.head.merged:
+                tensors = joined_tensors({"the model": tensors, "its head": self.head.tensors})
+            # The root's weights at the release's root; its config there or in the format's folder.
+            save_sharded(tensors, root, max_shard_size)
         (root / model.folder).mkdir(parents=True, exist_ok=True)
         write_atomically(str(root / model.folder / CONFIG_FILE), json.dumps(config, indent=2))
 
 
-def _sidecars_written(tensors: Mapping[str, np.ndarray], sidecars: Mapping[str, str],
-                      root: Path) -> Mapping[str, np.ndarray]:
-    """Each sidecar's tensors of `tensors` (`Placed.sidecars`) written to its own file at `root`, the
-    prefix off their names, and the rest returned for the root's shards, each read as it is written."""
+def _sidecars_staged(tensors: Mapping[str, np.ndarray], sidecars: Mapping[str, str], root: Path,
+                     staged: contextlib.ExitStack) -> Mapping[str, np.ndarray]:
+    """Each sidecar's tensors of `tensors` (`Placed.sidecars`) written for its own file at `root`, the
+    prefix off their names, each published over the file it replaces when `staged` closes and removed if
+    it raises (`dew._files.replacing`), and the rest returned for the root's shards, each read as it is
+    written. The root's weights committed first, a save interrupted before that leaves every file of the
+    release it replaces as it was, the draft beside its own trunk (train 1349's review F3); the sidecars'
+    renames follow the root's commit at once."""
     specs = tensor_specs(tensors)
     taken: set[str] = set()
     for filename, prefix in sidecars.items():
         names = {name.removeprefix(prefix): name for name in specs if name.startswith(prefix)}
         if names:
+            # The publisher's file staged; a rank that reads its share and writes none stages nothing, so
+            # no empty file of its is published over the publisher's (`writes_weights`).
+            temporary = (staged.enter_context(replacing(root / filename)) if writes_weights()
+                         else root / filename)
             write_file(LazyTensors({name: specs[source] for name, source in names.items()},
                                    lambda name, names=names: tensors[names[name]]),
-                       root / filename, {"format": "pt"})
+                       temporary, {"format": "pt"})
             taken.update(names.values())
     if not taken:
         return tensors

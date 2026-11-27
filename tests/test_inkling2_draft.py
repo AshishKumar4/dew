@@ -148,6 +148,18 @@ def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
                                       "Inkling 2's replayed block's draft", seeds=8)
 
 
+def test_a_windows_ring_holds_each_slots_latest_place_below_its_count():
+    """A local draft layer's ring of `window` slots (`block_draft.ring_places`) holds at each slot the latest
+    place below its row's count that lands there, read off the count alone, and no place where the count
+    reached none of the slot's: a row of none, one, a window and a half and two windows of a ring of 4."""
+    from dew.nn.block_draft import ring_places
+
+    held = ring_places(jnp.asarray([0, 1, 6, 8], jnp.int32), 4)
+    np.testing.assert_array_equal(np.asarray(held) >= 0, [[False] * 4, [True, False, False, False],
+                                                           [True] * 4, [True] * 4])
+    np.testing.assert_array_equal(np.asarray(held)[1:], [[0, -3, -2, -1], [4, 5, 2, 3], [4, 5, 6, 7]])
+
+
 def test_a_local_draft_layer_caches_its_window_alone(source):
     """A local draft layer's cached context holds its window's places alone (row 13541): its stores are
     `window` slots long where a global layer's hold the decoder's capacity, as the cached draft after a
@@ -251,6 +263,56 @@ def test_a_release_writes_each_sidecars_tensors_to_its_own_file(tmp_path):
               load_file(path).items()}
     assert list(shards) == ['model.weight']
     np.testing.assert_array_equal(shards['model.weight'], trunk)
+
+
+def test_a_release_whose_trunk_fails_to_write_leaves_its_draft_as_it_was(tmp_path):
+    """A save over a release that fails while it writes the trunk's shards leaves the release it would
+    replace whole, its sidecar the earlier draft beside the earlier trunk, none of the failed save's
+    files beside them (train 1349's review F3; row 13538)."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.releases import Placed, ReleasePlan
+    from dew.interop.safetensors_io import LazyTensors, tensor_specs
+
+    def plan(tensors):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, tensors)},
+                                  sidecars={'mtp.safetensors': 'mtp.'}))
+
+    trunk, head = np.arange(6, dtype=np.float32).reshape(2, 3), np.arange(4, dtype=np.float32)
+    plan({'model.weight': trunk, 'mtp.fuse_weight': head}).write(tmp_path)
+    before = sorted(path.name for path in tmp_path.iterdir())
+    changed = {'model.weight': trunk + 1, 'mtp.fuse_weight': head + 1}
+
+    def read(name):
+        if name == 'model.weight':
+            raise OSError("the trunk's storage went away")
+        return changed[name]
+
+    with pytest.raises(OSError):
+        plan(LazyTensors(tensor_specs(changed), read)).write(tmp_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+    np.testing.assert_array_equal(load_file(tmp_path / 'mtp.safetensors')['fuse_weight'], head)
+    np.testing.assert_array_equal(load_file(tmp_path / 'model.safetensors')['model.weight'], trunk)
+
+
+def test_a_release_written_by_a_rank_that_publishes_none_leaves_its_sidecar_as_it_was(tmp_path):
+    """A pool's rank that reads its share of a release and writes none of it (`reading_home(writes=False)`,
+    beside the one that publishes) leaves the release's sidecar as the publisher wrote it: no file of its
+    own is staged or published over it (train 1360's review of theme 61)."""
+    from safetensors.numpy import load_file
+
+    from dew._coordination import reading_home
+    from dew.interop.releases import Placed, ReleasePlan
+
+    def plan(tensors):
+        return ReleasePlan(Placed({'': ({'model_type': 'tiny'}, tensors)},
+                                  sidecars={'mtp.safetensors': 'mtp.'}))
+
+    trunk, head = np.arange(6, dtype=np.float32).reshape(2, 3), np.arange(4, dtype=np.float32)
+    plan({'model.weight': trunk, 'mtp.fuse_weight': head}).write(tmp_path)
+    with reading_home("a rank beside the publisher", writes=False):
+        plan({'model.weight': trunk + 1, 'mtp.fuse_weight': head + 1}).write(tmp_path)
+    np.testing.assert_array_equal(load_file(tmp_path / 'mtp.safetensors')['fuse_weight'], head)
 
 
 def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):

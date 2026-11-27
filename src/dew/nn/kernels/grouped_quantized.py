@@ -213,11 +213,10 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
         from .templates import resources
         share = config.block_m // config.warpgroups
         desc = self._desc(ba)
-        # A group's blocks and the lane being decoded, a `[columns, 16]` tile each, and a window's meta
-        # halves beside them.
-        tiles = desc.blocks + 1 + desc.meta
+        # A group's blocks and the lane being decoded, a `[columns, 16]` tile each, and a step's meta halves
+        # beside them (`PackedWeightFormat.meta_columns`).
         decoded = (2 * share * 16 + share * config.block_k // 2 if ba.arguments['packed_rows']
-                   else tiles * config.block_n * 16)
+                   else config.block_n * (16 * (desc.blocks + 1) + desc.meta_columns(config.block_k)))
         return _beside(MosaicGmm._registers(self, ba, config, merging=merging, target=target),
                        decoded // resources.THREADS + desc.decode_live)
 

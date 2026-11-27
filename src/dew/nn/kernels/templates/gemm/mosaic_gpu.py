@@ -188,8 +188,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     def words(across: int) -> dict:
         if packed_format is not None:
             # Its blocks of sixteen words a column, and its meta halves where its format reads them.
-            meta = ({'scales': ((across, block_k // 16), jnp.uint16)}
-                    if packing.weight_format(packed_format).meta else {})
+            desc = packing.weight_format(packed_format)
+            meta = {'scales': ((across, desc.meta_columns(block_k)), jnp.uint16)} if desc.meta else {}
             return {**{f'words_{q}': ((across, 16), jnp.uint32)
                        for q in range(packing.packed_blocks(packed_format, block_k))}, **meta}
         return {**{f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // 128)},

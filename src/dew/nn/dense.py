@@ -484,14 +484,16 @@ class Dense(_LinearEnvelope, nn.Dense):
             'kernel', declared(self.kernel_init, axes), (width, self.features), self.param_dtype))
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
+        if isinstance(kernel, PACKED_FORMATS) and tuple(kernel.shape) != (width, self.features):
+            # Checked before any route reads it: a window decoded for the run's recipe takes its own shape.
+            raise ValueError(f"{self.name}'s packed kernel is {list(kernel.shape)}, its layer "
+                             f"[{width}, {self.features}]")
         if isinstance(kernel, Bf16Window) and not _windowed(self, width, bias):
             # A window's weights are its kernel's bits again: a layer whose product is not the window's
             # multiplies them as its kernel, promoted as any (its dtype not bfloat16, its own
-            # `dot_general`'s: a float32 result, the run's recipe's, its bias stored fp32), once its format
-            # admits it (`window.admitted`, as the window's product and gemm's decode ask).
-            from dew.nn.kernels.templates.gemm.window import admitted
-
-            kernel = admitted(kernel).decoded()
+            # `dot_general`'s: a float32 result, the run's recipe's, its bias stored fp32), once the format
+            # admits its window (`Bf16Window.admitted`, as every reader of it asks).
+            kernel = kernel.admitted().decoded()
         if isinstance(kernel, PACKED_FORMATS):
             return self._packed(inputs, kernel, bias)
         stored = bias
@@ -524,9 +526,6 @@ class Dense(_LinearEnvelope, nn.Dense):
             raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's codes, served as they "
                              "are), and a quantization rule owns its product: load it without packed_weights")
         width = jnp.shape(inputs)[-1]
-        if tuple(matrix.shape) != (width, self.features):
-            raise ValueError(f"{self.name}'s packed kernel is {list(matrix.shape)}, its layer "
-                             f"[{width}, {self.features}]")
         dtype = self.dtype if self.dtype is not None else jnp.result_type(inputs)
         # The rows counted, not inferred: a packed matrix of no depth takes inputs of no width.
         rows = jnp.reshape(inputs, (math.prod(jnp.shape(inputs)[:-1]), width))

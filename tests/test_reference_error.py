@@ -342,6 +342,13 @@ def test_check_1_reads_a_discrete_leaf_in_its_own_representation():
     for counts in (np.asarray([0, 1], np.int64), np.asarray([0, 1], np.uint8)):
         [(log_mse, *_)] = _error_rows([np.asarray([False, True])], [counts], xp=np)
         assert log_mse == -np.inf, counts.dtype
+    # Each example's evidence reads the same residual as the pooled (train 1349's review F6): one count apart
+    # past 2^53 is one, not the float64 zero.
+    from dew.parity import LOG_ZERO, example_mse, example_worst
+
+    held, true = np.asarray([[big + 1, big]]), np.asarray([[big, big]])
+    np.testing.assert_array_equal(example_mse(held, true), [0.5])
+    assert example_worst(held, true)[0] > LOG_ZERO
 
     def counted(value):
         return as_given(lambda seed: {"count": np.asarray([value], np.int64)})
