@@ -907,7 +907,10 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     from dew.data.dataset import FilledBatch
     from dew.objectives.base import Step
 
-    rate, slow_decay, obs_size, action_size = 0.05, 0.9, 16, 16
+    # A step large beside its leaves (rate 0.5, nudged by 0.2): at 0.05 over leaves nudged by 0.6 an update
+    # sat under their float32 grid, each arm's error that grid's rounding, its ratios spread past what
+    # check 1 reads (audit PT02).
+    rate, slow_decay, obs_size, action_size = 0.5, 0.9, 16, 16
     dyn = (None if dynamics_kind == "gru"
            else TSSM(action_size=action_size, stoch=4, classes=4, width=32, layers=1, heads=2, context=6))
     model = WorldModel(obs_size, action_size, dynamics=dyn, deter=32, hidden=32, stoch=4, classes=4,
@@ -921,7 +924,7 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
 
     def draw(seed: int):
         base_params = init_fn(jax.random.key(seed))["params"]
-        variables = {"params": nudged_tree(base_params, seed + 1000, scale=0.6), "returns": seeded_returns}
+        variables = {"params": nudged_tree(base_params, seed + 1000, scale=0.2), "returns": seeded_returns}
         ema = {"params": {"value": jax.tree.map(lambda x: x * 0.8, variables["params"]["value"])}}
         return variables, ema, dreamer_windows(6, seed, obs_size=obs_size, action_size=action_size)
 
