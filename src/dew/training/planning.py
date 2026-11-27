@@ -408,9 +408,11 @@ class Probe:
         bytes its fit check held beside it (`FitSearch.fitting`)."""
         stats = None if executable is None else compiled_memory(executable)
         beside = None if stats is None else placed_beside(stats, held)
-        return cls(split, rows_of(candidate.micro), rung, fit, headroom,
-                   None if stats is None else stats.temp, None if stats is None else stats.argument,
-                   beside=beside)
+        # A compile stopped before optimizing (its arguments alone over the limit) states no temporaries,
+        # its zero no measure of them: the record says none was read.
+        temp = None if stats is None or (stats.stopped and stats.temp == 0) else stats.temp
+        return cls(split, rows_of(candidate.micro), rung, fit, headroom, temp,
+                   None if stats is None else stats.argument, beside=beside)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
@@ -539,10 +541,10 @@ def kept_at(rung: Rung, start: Rung) -> tuple[Callable[[Held], bool], Callable[[
     return (lambda buffer: not (gone(buffer) or recomputed(buffer))), recomputed
 
 
-Tiled = Callable[[tuple[int, int], tuple[int, int], bool], int | None]
+Tiled = Callable[[tuple[int, int], tuple[int, int], bool, int], int | None]
 """The bytes of logits a head tiled at a tile, fused or not, holds at once, given the shape of the whole
-logits a device held (`dew.objectives.lm.head.HeadedObjective.tiled_logits`); None where it does not
-price that move."""
+logits a device held and their bytes each (`dew.objectives.lm.head.HeadedObjective.tiled_logits`); None
+where it does not price that move."""
 
 
 def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tiled | None,
@@ -568,7 +570,8 @@ def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tile
             return None
         for call in calls:
             tokens, columns = call.shape
-            held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused)
+            itemsize = call.bytes // (tokens * columns)
+            held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused, itemsize)
             if held is None:
                 return None
             added.append(Held(held, call.op_name, (), scaled=False, residual=False, trace=call.trace,

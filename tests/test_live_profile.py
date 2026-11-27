@@ -106,6 +106,21 @@ def test_a_residual_is_held_through_its_forwards_reads_before_the_backward():
     assert profile(4).frees(lambda op_name, names: True) == 170 - 100
 
 
+def test_a_residual_read_by_an_op_of_no_name_is_held_to_its_end():
+    """A residual a read of no op name reads (a fusion whose computation names none: no phase told of it)
+    is held to its interval's end, as one read placed nowhere: freeing it at its forward's last named read
+    would credit a release the compile may not make (train 1406); read by its forward alone, it frees the
+    scratch's share."""
+    def profile(uses) -> LiveProfile:
+        found = LiveProfile.of((interval(100, 0, 6, 0, uses=uses), interval(70, 1, 3, 1),
+                                interval(10, 4, 6, 2, op_name=BACKWARD)), frozenset())
+        assert found is not None
+        return found
+
+    assert profile(((0, FORWARD), (5, BACKWARD))).frees(lambda op_name, names: True) == 170 - 100
+    assert profile(((0, FORWARD), (2, ""), (5, BACKWARD))).frees(lambda op_name, names: True) == 0
+
+
 def test_a_replayed_residual_is_held_through_its_forwards_last_read():
     """A forward replayed after the backward began (a resident transaction's) makes the value its own
     pullback reads all the same, and a rung recomputing it holds it until that forward last reads it
@@ -186,18 +201,27 @@ def test_a_finer_split_frees_its_rows_share_beside_what_the_place_drops():
 
 def test_a_heads_tile_holds_what_its_route_holds():
     """A head tiled unfused holds a tile of its tokens by its columns' width over its chunks; fused, a chunk
-    of its tokens over the whole vocabulary, 4 bytes a logit; a fused head whose whole head's columns were
-    a split of the vocabulary, its tokens then its group's gathered, is priced by none."""
+    of its tokens over every column it scores, its whole logits' bytes a logit (4 at float32, 8 at
+    float64); a fused head whose whole head's columns were a split of what it scores, its tokens then its
+    group's gathered, is priced by none. A head scoring fewer columns than its table's rows (Inkling 2's
+    200058 of 201024, `output_vocab`) is priced at those columns (train 1406)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    model = CausalTransformer(vocab_size=65536, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
-                              max_seq_len=8)
-    objective = LMObjective(model, seq_len=8, head_chunks=16)
-    assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=False) == 4 * 1024 * 4096
-    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=False) == 4 * 1024 * 2048
-    assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=True) == 4 * 1024 * 65536
-    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=True) is None
+    def objective(**options):
+        model = CausalTransformer(vocab_size=65536, emb_features=8, num_layers=1, num_heads=1,
+                                  mlp_features=16, max_seq_len=8, **options)
+        return LMObjective(model, seq_len=8, head_chunks=16)
+
+    whole = objective()
+    assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=False, itemsize=4) == 4 * 1024 * 4096
+    assert whole.tiled_logits((4096, 32768), (1024, 8192), fused=False, itemsize=4) == 4 * 1024 * 2048
+    assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=True, itemsize=4) == 4 * 1024 * 65536
+    assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=True, itemsize=8) == 8 * 1024 * 65536
+    assert whole.tiled_logits((4096, 32768), (1024, 8192), fused=True, itemsize=4) is None
+    scoring = objective(output_vocab=65000)
+    assert scoring.tiled_logits((4096, 65000), (1024, 8192), fused=True, itemsize=4) == 4 * 1024 * 65000
+    assert scoring.tiled_logits((4096, 65536), (1024, 8192), fused=True, itemsize=4) is None
 
 
 def test_a_compiles_residuals_are_read_by_its_backward_where_it_holds_them():

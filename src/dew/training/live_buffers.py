@@ -254,7 +254,9 @@ class Assignment:
     def used(self, buffer_id: int, ran: Mapping[tuple[str, str], int]) -> tuple[tuple[int, str], ...]:
         """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
         buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
-        element's through the getter of its index; a reader the trace states no event of is none of them."""
+        element's through the getter of its index; a reader the trace states no event of is none of them. A
+        fusion of no op_name of its own reads as each op its computation names (`_read_as`), and as "" where
+        it names none, a read no phase is told of."""
         readers = self.readers
         if readers is None:
             # Each instruction's readers, built where an interval is read alone.
@@ -278,7 +280,8 @@ class Assignment:
                 continue
             key = (self.computation_of[reader.id], reader.name)
             if key in ran:
-                found.append((ran[key], reader.metadata.op_name))
+                found += [(ran[key], op_name)
+                          for op_name in _read_as(reader, self.computations)]
             elif readers.get(reader.id):
                 # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
                 # the value through it.
@@ -355,6 +358,17 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
             freed = canonical.get(owned, owned)
             instances[freed] = instances.get(freed, 0) - 1
     return charged
+
+
+def _read_as(reader, computations) -> tuple[str, ...]:
+    """The op names `reader` reads a value as: its own, or a fusion's of none (XLA:GPU's own fusions carry
+    none, `_maker`) each op name its fused computation's instructions carry, which ops of a forward and of
+    a backward both may be (train 1406); ("",) where none carries one."""
+    if reader.metadata.op_name or reader.opcode != "fusion":
+        return (reader.metadata.op_name,)
+    fused = computations[reader.called_computation_ids[0]]
+    named = sorted({each.metadata.op_name for each in fused.instructions if each.metadata.op_name})
+    return tuple(named) or ("",)
 
 
 def _maker(instruction, index: tuple[int, ...], instructions,
