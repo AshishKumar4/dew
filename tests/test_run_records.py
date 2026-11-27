@@ -233,7 +233,7 @@ def test_a_live_run_record_naming_the_retired_choice_is_refused():
     each of its fields: one naming the retired choice is refused, as only a saved run's load reads it
     without (`RunConfig.load`)."""
     from dew import _records
-    from dew.registry import from_record
+    from dew.registry import from_record, record_argument
 
     record = json.loads(json.dumps(RunConfig().record()))
     assert RunConfig.read(record) == RunConfig()
@@ -252,6 +252,11 @@ def test_a_live_run_record_naming_the_retired_choice_is_refused():
         assert RunConfig().override({"diagnostics.kernels": kernels}).diagnostics.kernels == Kernels()
         with pytest.raises(ValueError):
             RunConfig().override({"diagnostics.kernels": saved})
+        # A command line's record of kernel choices (`registry.record_argument`) is one too.
+        flag = record_argument(Kernels)
+        assert flag.instance_from_str([json.dumps(kernels)]) == Kernels()
+        with pytest.raises(ValueError):
+            flag.instance_from_str([json.dumps(saved)])
 
 
 @dataclasses.dataclass(frozen=True)
