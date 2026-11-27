@@ -107,7 +107,7 @@ def fused_program(jaxpr: jcore.Jaxpr, *, _base: tuple[Hashable, Hashable] | None
         if held & set(found.places):
             continue
         taken = _taken(index, found, lambda region: _decided(
-            _identity(jaxpr, region), lambda: _takes(jaxpr, region), _base=base))
+            _identity(jaxpr, region), lambda: _takes(index, region), _base=base))
         if taken is not None:
             identities[taken] = _identity(jaxpr, taken)
     products = list(identities)
@@ -441,24 +441,25 @@ def _prologue(index: Index, start: int, claimed: set[int]) -> tuple[int, ...]:
     return tuple(sorted(members | _captured(index, sorted(members), members, claimed)))
 
 
-def regions(jaxpr: jcore.Jaxpr) -> tuple[Region, ...]:
-    """Each product region of `jaxpr` as `fused_program` finds it (`_regions`), before any is weighed: a
-    caller weighing a region's variants itself (`fewer`, `analyzed`) starts from these. `fused_program` skips
-    those an attention or recurrence region `recognize` writes holds an equation of."""
-    return tuple(_regions(Index(jaxpr)))
+def regions(index: Index) -> tuple[Region, ...]:
+    """Each product region of `index`'s body as `fused_program` finds it (`_regions`), before any is weighed:
+    a caller weighing a region's variants itself (`fewer`, `analyzed`, over the same `index`, one a body as
+    `recognize.recognized` takes it) starts from these. `fused_program` skips those an attention or
+    recurrence region `recognize` writes holds an equation of."""
+    return tuple(_regions(index))
 
 
-def fewer(jaxpr: jcore.Jaxpr, region: Region) -> tuple[Region, ...]:
+def fewer(index: Index, region: Region) -> tuple[Region, ...]:
     """Every region of `region`'s product with stages fewer (`_fewer`, each stage it has dropped in turn:
     without its prologue, without its epilogue, the product alone), each once, whatever any launch decides,
     in the order `_taken` reaches them: a caller weighing them itself (`analyzed`) sees each one
     `fused_program` may weigh."""
     every = RegionDecision(taken=False, launchable=True, launched=True)
-    return tuple(found for found, _ in _walked(Index(jaxpr), region, lambda _: every))[1:]
+    return tuple(found for found, _ in _walked(index, region, lambda _: every))[1:]
 
 
-def analyzed(jaxpr: jcore.Jaxpr, region: Region):
-    """`region` of `jaxpr` as `fused_program` weighs it (`_takes`): `fused_gemm.analysis` of the region
+def analyzed(index: Index, region: Region):
+    """`region` of `index`'s body as `fused_program` weighs it (`_takes`): `fused_gemm.analysis` of the region
     replayed (`_replayed`) over its inputs' shapes, its routes and both prices (`fused_gemm.Analysis`), a
     region of a program staged under x64 (the CPU arithmetic's float64 sums) analyzed under it, its 64-bit
     values as it states them."""
@@ -467,7 +468,7 @@ def analyzed(jaxpr: jcore.Jaxpr, region: Region):
     inputs = _shapes(region.inputs)
     wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
     with jax.enable_x64(new_val=wide):
-        return fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
+        return fused_gemm.analysis(_replayed(index.jaxpr, region, fused_gemm), *inputs)
 
 
 def _regions(index: Index) -> list[Region]:
@@ -678,7 +679,7 @@ def _decided(identity: Hashable, decide: Callable[[], RegionDecision], *,
     return _cache.holding(_held, (identity, choice_context_of(_base)), weighed, DECISIONS_HELD)
 
 
-def _takes(jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
+def _takes(index: Index, region: Region) -> RegionDecision:
     """Whether the region is fused (`fused_gemm.analysis`): its product's launch the template's (its
     selector's choice, or a call's, `generation.chosen`), its prologue and epilogue the kernel's, nothing
     refused, fused the cheaper (`fused_gemm.Analysis.cheaper`), and its launch keeping with them the
@@ -688,7 +689,7 @@ def _takes(jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
     cell where the launch is not declared for the template (`grouped_matmul.DECLARED`, per generation) they
     favour fusion more than measurement does, so a region whose launch the selector gives XLA is never fused
     by price alone; a call naming the template (an A/B's arm) fuses it."""
-    found = analyzed(jaxpr, region)
+    found = analyzed(index, region)
 
     def kernel(route) -> bool:
         return route is not None and route.refusal is None and route.kernel != "xla"
