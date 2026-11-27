@@ -140,16 +140,16 @@ class HeadedObjective(Objective[Loss, Effects]):
         whole head held logits of shape `whole` (`[tokens, columns]`), by the rules its route takes: a fused
         head scores a chunk of its tokens over the whole vocabulary, the table gathered whole however the
         whole head's columns were split (`fused_tokens`); an unfused head a tile of tokens by its columns'
-        width (`tile_columns`, over `head_chunks`). None where the model states no vocabulary
-        (`StatesVocabulary`) a fused head's chunk is read by: what a fit search prices a head's move from
-        its whole logits by (`dew.training.planning.priced`)."""
+        width (`tile_columns`, over `head_chunks`). None for a fused head where the model states no
+        vocabulary (`StatesVocabulary`), or where the whole head's columns were a split of it, whose tokens
+        are its vocabulary group's gathered where the fused head scores its own alone: what a fit search
+        prices a head's move from its whole logits by (`dew.training.planning.priced`)."""
         tokens, columns = whole
         if not fused:
             return 4 * min(tile[0], tokens) * tile_columns(columns, self.head_chunks, tile[1])
-        if not isinstance(self.model, StatesVocabulary):
+        if not isinstance(self.model, StatesVocabulary) or self.model.vocab_size != columns:
             return None
-        vocab = self.model.vocab_size
-        return 4 * fused_tokens(tokens, vocab, tile) * vocab
+        return 4 * fused_tokens(tokens, columns, tile) * columns
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

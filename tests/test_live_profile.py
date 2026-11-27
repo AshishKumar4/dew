@@ -75,12 +75,23 @@ def test_a_residual_is_a_forward_value_live_into_the_backward():
     is its own scratch, which a rung recomputing the forward makes again, and frees none of the peak; one
     made before it and live past it is a residual the rung drops; a forward replayed after the backward
     began (a resident transaction's) makes scratch a rung makes again too."""
-    profile = LiveProfile.of((interval(30, 0, 3, 0), interval(20, 1, 6, 1),
+    profile = LiveProfile.of((interval(30, 0, 3, 0), interval(20, 3, 6, 1),
                               interval(25, 4, 6, 2, op_name=BACKWARD), interval(5, 5, 7, 3)), frozenset())
     assert profile is not None
     assert [buffer.residual for buffer in profile.held] == [False, True, False, False]
     assert profile.most == 50
     assert profile.frees(lambda op_name, names: True) == 50 - 30
+
+
+def test_a_recomputed_residual_is_held_through_its_forwards_uses():
+    """A residual a rung recomputes is made by its forward all the same, and held until the backward begins
+    (`LiveProfile.backward`): where it shares the forward's peak with its scratch, dropping it frees none
+    of that peak, though it is alone in the backward."""
+    profile = LiveProfile((held(100, 0, 6, 0, residual=True), held(70, 1, 3, 1), held(10, 4, 5, 2,
+                                                                                         op_name=BACKWARD)),
+                          backward=4)
+    assert profile.most == 170
+    assert profile.frees(lambda op_name, names: True) == 0
 
 
 def test_a_heaps_pages_hold_their_buffers_together_and_heaps_apart_read_no_profile():
@@ -144,8 +155,8 @@ def test_a_finer_split_frees_its_rows_share_beside_what_the_place_drops():
 
 def test_a_heads_tile_holds_what_its_route_holds():
     """A head tiled unfused holds a tile of its tokens by its columns' width over its chunks; fused, a chunk
-    of its tokens over the whole vocabulary, gathered whole where the whole head's columns were a split of
-    it: 4 bytes a logit."""
+    of its tokens over the whole vocabulary, 4 bytes a logit; a fused head whose whole head's columns were
+    a split of the vocabulary, its tokens then its group's gathered, is priced by none."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -154,4 +165,5 @@ def test_a_heads_tile_holds_what_its_route_holds():
     objective = LMObjective(model, seq_len=8, head_chunks=16)
     assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=False) == 4 * 1024 * 4096
     assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=False) == 4 * 1024 * 2048
-    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=True) == 4 * 1024 * 65536
+    assert objective.tiled_logits((4096, 65536), (1024, 8192), fused=True) == 4 * 1024 * 65536
+    assert objective.tiled_logits((4096, 32768), (1024, 8192), fused=True) is None

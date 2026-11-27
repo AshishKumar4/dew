@@ -546,28 +546,28 @@ def priced(rung: Rung, start: Rung, profile: LiveProfile, bank: int, tiled: Tile
     """What the step at `rung` frees of the peak it held at `start`, priced over `start`'s whole schedule
     (`profile`), at `ratio` times the microbatches the profile's compile read (a microbatch's rows' buffers
     at their share, `LiveProfile.peak`): its peak less the peak of the buffers `rung` keeps (`kept_at`)
-    with the logits a head `rung` tiles holds at once (`tiled`, from the shape of the start's whole logits,
-    `WHOLE_LOGITS`) charged over the positions its whole head held (`HEAD_SCOPE`'s), plus the narrow copies'
-    `bank` (their bytes among the step's arguments on a device, in the units the shortfall reads) where
-    `rung` drops them. None where `kept_at` reads none, or where `rung` tiles a head whose whole logits
-    the schedule names no buffer of or whose tile `tiled` does not price."""
+    with the logits each head call `rung` tiles holds at once in their place (`tiled`, from the shape of
+    that call's whole logits, `WHOLE_LOGITS`, over the positions they held: a step's main head and its
+    next-token heads apart), plus the narrow copies' `bank` (their bytes among the step's arguments on a
+    device, in the units the shortfall reads) where `rung` drops them. None where `kept_at` reads none, or
+    where `rung` tiles a head whose whole logits the schedule names no buffer of under the head's scope
+    (`HEAD_SCOPE`), or whose tile `tiled` does not price."""
     kept = kept_at(rung, start)
     if kept is None:
         return None
     added: list[Held] = []
     if start.tile is None and rung.tile is not None:
-        logits = next((buffer for buffer in profile.held
-                       if WHOLE_LOGITS in buffer.names and len(buffer.shape) == 2), None)
-        head = [buffer for buffer in profile.held if HEAD_SCOPE in buffer.op_name]
-        if logits is None or tiled is None:
+        calls = [buffer for buffer in profile.held if WHOLE_LOGITS in buffer.names]
+        if tiled is None or not calls or any(HEAD_SCOPE not in call.op_name or len(call.shape) != 2
+                                             for call in calls):
             return None
-        tokens, columns = logits.shape
-        held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused)
-        if held is None:
-            return None
-        added.append(Held(held, HEAD_SCOPE, (), scaled=False, residual=False, trace=logits.trace,
-                          start=min(buffer.start for buffer in head), end=max(buffer.end for buffer in head),
-                          buffer=-1, storage=-1))
+        for call in calls:
+            tokens, columns = call.shape
+            held = tiled((-(-tokens // ratio), columns), rung.tile, rung.fused)
+            if held is None:
+                return None
+            added.append(Held(held, call.op_name, (), scaled=False, residual=False, trace=call.trace,
+                              start=call.start, end=call.end, buffer=-1, storage=-1 - len(added)))
     released = bank if start.narrow and not rung.narrow else 0
     return profile.most - profile.peak(kept, ratio, added) + released
 
@@ -1630,10 +1630,13 @@ class FitSearch[LossT, EffectsT]:
     def start_walked(self, candidates: Sequence[int], first: int
                      ) -> tuple[int | None, tuple[int, int] | None]:
         """The split the start's rung fits at from `candidates[first]` (`walked`, `after`), or None and where
-        its walk goes on: at its first miss that some process computes no split above it as fitting
-        (`MemoryMiss.fits_at`), the walk stops there for the place the start's schedule reads as fitting
-        (`jumped`), its next split (`after`'s) left to ask past that place's miss, with the index that
-        missed; None where it walked every split it reaches."""
+        its walk goes on. The policy (Main, 2026-11-27): split first, no recomputation before remat. A finer
+        split of the start's rung recomputes nothing (a remat rung pays about a third of a forward again), so
+        where every process's miss computes a split above it as fitting (`MemoryMiss.fits_at`), that split
+        is the next compile, itself a predicted fit; at its first miss that some process computes none so,
+        the walk stops there for the place the start's schedule reads as fitting (`jumped`: its remat, tile
+        and copies priced jointly), its next split (`after`'s) left to ask past that place's miss, with the
+        index that missed; None where it walked every split it reaches."""
         resumed: list[tuple[int, int]] = []
 
         def after(index: int) -> int | None:
@@ -1829,7 +1832,9 @@ class FitSearch[LossT, EffectsT]:
         profiles = {split: live.profile for (rung, split), live in self.live.items()
                     if rung == begun and live.profile is not None}
         tiled = self.objective.tiled_logits if isinstance(self.objective, HeadedObjective) else None
-        freed: dict[tuple[int, int], int] = {}
+        # Each place and split read as fitting, by the quote that clears its shortfall most: what it frees,
+        # the split the start missed at whose profile priced it, and what the start was short by there.
+        quotes: dict[tuple[int, int], tuple[int, int, int]] = {}
         for split, profile in profiles.items():
             short = self.shortfall_at(begun, split)
             candidate = self.lowered.get((split, begun))
@@ -1842,9 +1847,11 @@ class FitSearch[LossT, EffectsT]:
             for at, place in enumerate(places):
                 for index, ratio in finer:
                     frees = priced(place, start, profile, bank, tiled, ratio)
-                    if short is not None and frees is not None and frees >= short:
-                        freed[(at, index)] = max(frees, freed.get((at, index), frees))
-        fitting = sorted([at, index] for at, index in freed)
+                    held = quotes.get((at, index))
+                    if (short is not None and frees is not None and frees >= short
+                            and (held is None or frees - short > held[0] - held[2])):
+                        quotes[(at, index)] = (frees, split, short)
+        fitting = sorted([at, index] for at, index in quotes)
         read = self.gather(sorted(fitting) if profiles else None)
         if any(verdict is None for verdict in read):
             self.jump = {"jumped": False, "why": "a process's start states no schedule"}
@@ -1856,8 +1863,9 @@ class FitSearch[LossT, EffectsT]:
         at, index = common[0]
         jump = places[at]
         self.at(jump)
+        frees, priced_at, short = quotes[(at, index)]
         self.jump = {"jumped": jump not in self.asked, "rung": self.current(), "split": candidates[index],
-                     "short": self.shortfall_at(begun, candidates[index]), "freed": freed.get((at, index))}
+                     "priced_at": priced_at, "short": short, "freed": frees}
         self.at(start)
         if jump in self.asked:
             self.jump["why"] = "asked already"

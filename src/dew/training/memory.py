@@ -13,6 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import heapq
 import json
 import logging
 import math
@@ -960,6 +961,9 @@ class LiveProfile:
     a difference no such buffer enters."""
 
     held: tuple[Held, ...]
+    backward: int | None = None
+    """The position its backward makes its first buffer at: a residual a rung recomputes is held until there
+    (`peak`), as its forward's own uses hold it no later."""
 
     @staticmethod
     def of(intervals: Sequence[LiveInterval], rows: frozenset[tuple[int, int]]) -> LiveProfile | None:
@@ -981,7 +985,7 @@ class LiveProfile:
                  interval.role != "workspace" and forward_made(interval.op_name) and backward is not None
                  and interval.start < backward < interval.end, interval.trace, interval.start,
                  interval.end, interval.buffer, interval.storage, interval.shape)
-            for interval in whole))
+            for interval in whole), backward)
 
     @functools.cached_property
     def _events(self) -> list[tuple[int, int, int]]:
@@ -1001,17 +1005,20 @@ class LiveProfile:
         in their place (a tiled head's tile over the positions its whole logits held): each storage of each
         trace once, at the most bytes of the buffers kept in it that are live there, a buffer a microbatch's
         rows scale at its share of `split` (rounded up), as the heap simulation counts the memory it occupies
-        (a storage reused after it was freed held again where a buffer reusing it is live)."""
+        (a storage reused after it was freed held again where a buffer reusing it is live). A residual it
+        does not keep is held until the backward begins (`backward`), its forward's uses within that: a rung
+        recomputing it frees its span past them alone."""
         held = self.held + tuple(added)
         keeps = [kept(buffer) for buffer in self.held] + [True] * len(added)
-        events = self._events if not added else sorted(
-            [*self._events, *(event for at, buffer in enumerate(added, len(self.held))
-                              for event in ((buffer.start, 1, at), (buffer.end, 0, at)))])
+        events: Iterable[tuple[int, int, int]] = self._events if not added else heapq.merge(
+            self._events, sorted(event for at, buffer in enumerate(added, len(self.held))
+                                 for event in ((buffer.start, 1, at), (buffer.end, 0, at))))
         covering: dict[tuple[int, int], collections.Counter[int]] = {}
         live = most = 0
-        for _, starts, index in events:
-            if not keeps[index]:
-                continue
+        until: list[int] = []
+
+        def moved(index: int, starts: bool) -> None:
+            nonlocal live, most
             buffer = held[index]
             size = -(-buffer.bytes // split) if buffer.scaled else buffer.bytes
             sizes = covering.setdefault((buffer.trace, buffer.storage), collections.Counter())
@@ -1021,6 +1028,17 @@ class LiveProfile:
                 del sizes[size]
             live += max(sizes, default=0) - before
             most = max(most, live)
+
+        for position, starts, index in events:
+            if until and self.backward is not None and position >= self.backward:
+                for dropped in until:
+                    moved(dropped, starts=False)
+                until.clear()
+            if keeps[index]:
+                moved(index, bool(starts))
+            elif starts and held[index].residual and self.backward is not None:
+                moved(index, starts=True)
+                until.append(index)
         return most
 
     def frees(self, dropped: Callable[[str, tuple[str, ...]], bool], split: int = 1) -> int:
