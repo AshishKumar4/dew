@@ -64,7 +64,20 @@ def test_a_base_whose_probe_failed_owes_its_comparison_and_fails_the_report(gate
     args = SimpleNamespace(only=[probe.rows[0].name], claim=False, model="unused", flowers="unused",
                            torch_python="torch", out=tmp_path / "run.json")
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=False)
-    assert all(sample[row.name].startswith(f"failed: {probe.tool} exited 3") for row in probe.rows)
+    # The receipt a base whose probe exited so writes, reported: each of its rows "base failed", the report
+    # failing on them.
+    measured = {row.name: 10.0 for row in probe.rows}
+    receipt = {"base": "main", "head": "head", "alone": "main~aa",
+               "rows": [row.__dict__ for row in probe.rows], "rounds": 6,
+               "samples": {"base": [sample] * 6, "alone": [measured] * 6, "head": [measured] * 6}}
+    (tmp_path / "failed.json").write_text(json.dumps(receipt))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "failed.json"),
+                                      "--verdicts", str(tmp_path / "verdicts.json")])
+    assert gate.main() == 1
+    verdicts = json.loads((tmp_path / "verdicts.json").read_text())
+    assert {name: row["state"] for name, row in verdicts["rows"].items()} == {
+        row.name: "base failed" for row in probe.rows}
+    assert verdicts["failed"] == [f"{row.name} (base failed)" for row in probe.rows]
 
 
 def test_a_selection_of_no_row_is_refused_before_setup_and_an_empty_receipt_fails(
