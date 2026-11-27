@@ -355,14 +355,17 @@ def test_an_indexed_reader_holds_the_declared_file_it_checked(tmp_path):
         holding[1]
 
 
+@pytest.mark.parametrize("scheme", ["hf", "privatehub"], ids=["the hub", "a named hub profile"])
 @pytest.mark.parametrize("transport", ["", "simplecache::"], ids=["direct", "through a transport cache"])
 def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named(monkeypatch, tmp_path,
-                                                                              transport):
+                                                                              transport, scheme):
     """An export on a Hub repository read by its branch, directly or through a transport cache over the Hub
     (`simplecache::hf://`), is read at the commit the branch named as its manifest was read, each file it
     lists at that commit (a Hub file at a commit is one version by its URL): the branch moved on since, to a
     commit whose files hold other records, the source reads the records its manifest listed, from the files
-    it listed (row 13554: through a cache, its files were read at the moved branch)."""
+    it listed (row 13554: through a cache, its files were read at the moved branch), through the Hub
+    filesystem its URL names, a named profile's (`privatehub://`, its credential its own) as the Hub's
+    own (row 13709: its files were reopened through the plain Hub, which holds no credential of it)."""
     from types import SimpleNamespace
 
     from huggingface_hub import HfApi, HfFileSystem, parse_hf_uri
@@ -403,11 +406,25 @@ def test_a_hub_export_read_by_its_branch_reads_every_file_at_the_commit_it_named
             # A transport cache fetches a file whole (`simplecache`), which the Hub's own fetches over HTTP.
             shutil.copyfile(self._local(rpath), lpath)
 
+    class Unreadable(LocalHub):
+        """The Hub filesystem a named profile's files would be read through without the profile's
+        credential."""
+
+        def _local(self, path) -> Path:
+            raise PermissionError(f"no credential reads {path}")
+
+    class Profiled(LocalHub):
+        """A named Hub profile, as `dew.data.storage` registers one over the Hub's filesystem."""
+
+        protocol = ("privatehub", "hf")
+
     monkeypatch.setattr(HfApi, "repo_info", lambda self, repo_id, repo_type=None, revision=None, **options:
                         SimpleNamespace(sha=branch.get(revision or "main", revision)))
     # The real Hub's filesystem again once the test ends.
-    monkeypatch.setitem(importlib.import_module("fsspec.registry")._registry, "hf", LocalHub)
-    source = Files(f"{transport}hf://datasets/owner/data@main/export", format="parquet",
+    registry = importlib.import_module("fsspec.registry")._registry
+    monkeypatch.setitem(registry, "hf", LocalHub if scheme == "hf" else Unreadable)
+    monkeypatch.setitem(registry, scheme, LocalHub if scheme == "hf" else Profiled)
+    source = Files(f"{transport}{scheme}://datasets/owner/data@main/export", format="parquet",
                    storage_options={"simplecache": {"cache_storage": str(tmp_path / "cache")}} if transport
                    else None)
     # Its manifest read, none of its files yet, as a run's identity is taken before its reads.
