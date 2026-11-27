@@ -222,6 +222,12 @@ _RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(conte
 """The `recording` scopes open in this context, innermost last."""
 
 
+_STORED_IN: contextvars.ContextVar[tuple[_Registry | Recorded, ...] | None] = _cache.untraced(
+    contextvars.ContextVar("stored_in", default=None))
+"""Within a replacement's proposal (`_proposing`), the registry and `recording` scopes its stored
+derivations' outcomes are recorded in: the kept program's, whether or not the replacement is kept."""
+
+
 _PROCESS = _Registry()
 """The process's registry, every thread's. A shared executable cache does not share these decisions:
 only an explicitly handed plan seeds them, after validating its program and target."""
@@ -1405,10 +1411,16 @@ def record_pass(seconds: float) -> None:
 
 
 def record_stored(outcome: StoredOutcome) -> None:
-    """Record one stored derivation's lookup by its `outcome`."""
+    """Record one stored derivation's lookup by its `outcome`: the cache's reading or writing, done whether or
+    not a replacement it was made for is kept, recorded as the kept program's at once (`_STORED_IN`)."""
     if outcome not in get_args(StoredOutcome):
         raise ValueError(f"no stored derivation's outcome {outcome!r}")
-    _add(stored=(outcome,))
+    if (holders := _STORED_IN.get()) is None:
+        _add(stored=(outcome,))
+        return
+    with _GUARD:
+        for held in holders:
+            held.stored[outcome] += 1
 
 
 def stored() -> Mapping[StoredOutcome, int]:
@@ -1466,20 +1478,24 @@ def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[
         proposed = dict(registry.refused)
     for identity, kernel in entries:
         proposed[identity] = _joined(proposed.get(identity, frozenset()) | {kernel})
-    # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
+    # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`); its
+    # stored derivations' outcomes, the cache's work done either way, reach them at once (`record_stored`).
     proposal = Recorded()
+    stored_in = _STORED_IN.get() or (registry, *_RECORDING.get())
     token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
+    storing = _STORED_IN.set(stored_in)
     try:
         yield proposal
     finally:
+        _STORED_IN.reset(storing)
         _RECORDING.reset(held)
         _SCOPE.reset(token)
 
 
 def _commit(proposal: Recorded) -> None:
-    """A successful replacement's rewrites, its passes' seconds and its stored derivations' outcomes
-    (`_proposing`'s) recorded as the kept program's."""
-    _add(rewritten=proposal.rewritten, passes=proposal.passes, stored=list(proposal.stored.elements()))
+    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s) recorded as the kept
+    program's."""
+    _add(rewritten=proposal.rewritten, passes=proposal.passes)
 
 
 def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = (),
