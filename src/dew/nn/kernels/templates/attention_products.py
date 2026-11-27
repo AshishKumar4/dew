@@ -195,12 +195,12 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
         if kind_of(side) is Kind.BAND:
             raise ValueError("a band's parameters hold each query's keys about it, which a selected call's "
                              "copies of the keys do not")
-    score = hooks.score.fn
-    if score is not None:
-        original = score
+    original = hooks.score.fn
 
-        def score(s, q_pos, k_pos, *params):
-            return original(s, q_pos, k_pos % count, *params)
+    def remapped(s, q_pos, k_pos, *params):
+        assert original is not None
+        return original(s, q_pos, k_pos % count, *params)
+
     # A side along the keys once a copy, at the dtype the kernels compute it in (`kept_value`), so its
     # copies' gradients sum before they round to its own (a 16-bit bias's near and far terms each past its
     # largest, summing to 0).
@@ -211,4 +211,4 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
     if drop is not None:
         keys = jnp.arange(count, dtype=jnp.int32) if drop.keys is None else drop.keys
         drop = dataclasses.replace(drop, keys=jnp.concatenate([keys] * products))
-    return dataclasses.replace(hooks, score=Hook(score, sides), drop=drop)
+    return dataclasses.replace(hooks, score=Hook(None if original is None else remapped, sides), drop=drop)

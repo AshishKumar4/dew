@@ -458,7 +458,10 @@ class ForwardRegisters:
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
         # The hook's program at this candidate's own output tile, as its walk takes it (`sliced_hook`).
-        hooked = None if self.output is None else pointwise_tiles(*self.output, (tiles.block_q, value_width))
+        hooked = None
+        if self.output is not None:
+            hook, kinds, dtypes = self.output
+            hooked = pointwise_tiles(hook, kinds, dtypes, (tiles.block_q, value_width))
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
                                   has_output_mod=self.has_output_mod, training=self.residuals,
                                   pointwise=hooked is not None)

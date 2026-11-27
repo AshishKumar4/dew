@@ -222,8 +222,8 @@ def test_a_banded_calls_score_hook_reads_each_keys_own_index(form):
     def reference(q1, q2, k1, k2, value):
         logits = [template.scores(q, k, spans, scale=SCALE) for q, k in ((q1, k1), (q2, k2))]
         apart = jnp.arange(TOKENS)[:, None] - jnp.arange(TOKENS)[None, :]
-        near = jnp.abs(apart) <= WINDOW
-        biased = jnp.where(near, logits[0], logits[1]) - apart.astype(jnp.float32) / 16
+        near = jnp.searchsorted(jnp.asarray(combine.bands), jnp.abs(apart), side="left") == 0
+        biased = jnp.where(near, logits[0], logits[1]) - apart.astype(logits[0].dtype) / 16
         return _softmax_reference(jnp.where(template.dense(spans)[:, None], biased, -jnp.inf), value,
                                   q1.dtype)
 
