@@ -131,7 +131,6 @@ def stage_packed(args) -> dict:
     (`Checkpoints.save` of a pipeline's rows held apart) and restored into its template, each matrix as
     written where it is held; then a step whose window is under another encoder's form, refused on every
     process alike, the one reading the digest by its check and the other by the pool's agreement."""
-    import jax
     from jax.sharding import NamedSharding, PartitionSpec
     from multiprocess_worker import pipeline_trainer
     from stage_save_worker import paired_devices
