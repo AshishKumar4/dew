@@ -14,7 +14,7 @@ import copy
 import functools
 import json
 import os
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -65,6 +65,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
+from dew.interop.quantized_weights import QuantizedWeight, decoded_weights, weight_records
 from dew.interop.release import load_settings, with_rounding
 from dew.interop.routes import (
     DecoderRoute,
@@ -143,23 +144,6 @@ class Placing(Protocol):
                  axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
 
 
-def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[tuple[str, str], ...],
-                             quantized: tuple[str, ...]) -> None:
-    """Share only aliases verified on original values before codec narrowing.
-
-    A component may mix quantized and unquantized copies, or several MTP
-    copies of a tied head. Each group of spellings the checked pairs join
-    (`alias_groups`) reuses its quantized member's decoded storage: no
-    second cast or weight copy.
-    """
-    for group in decoders.alias_groups(aliases):
-        representative = next((name for name in quantized if name in group), None)
-        if representative is not None:
-            value = tensors[representative]
-            for name in group:
-                tensors[name] = value
-
-
 def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], Leaf] | None = None
                       ) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
@@ -177,20 +161,6 @@ def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], L
     # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
     # outlives its device copy.
     return placed_leaves(variables, placed, in_place=True)
-
-
-@dataclass(frozen=True)
-class QuantizedWeight:
-    """A quantized source's weight as its load holds it, all an export writes it back from: its stored
-    tensors as the source's headers state them (`stored`: the weight's and its parts', which the export
-    writes it back as, `SourceQuantization.requantize`), the scales and zeros it encodes against as the
-    source stored them (`grid`), and how the load holds it (`decoded`: the dtype it decoded the weight
-    into, its param dtype as resolved, or None for a bank it serves packed, undecoded, which an export
-    decodes exactly in float32, `quantization.packed_values`)."""
-
-    stored: Mapping[str, jax.ShapeDtypeStruct]
-    grid: Mapping[str, unread.Stored]
-    decoded: str | None
 
 
 @dataclass(frozen=True)
@@ -1756,42 +1726,6 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
-             media: bool) -> tuple[Mapping[str, unread.Stored], dict[str, QuantizedWeight], str | None,
-                                   decoders.Checked]:
-    """The tensors with a quantized source's weights decoded, and what `save`
-    needs to write them back: each quantized weight's record (`QuantizedWeight`:
-    its stored tensors, its grid and the dtype it was decoded into) and the
-    scales' dtype; and the spellings checked equal before a narrowing cast,
-    which the readers then take as equal (`decoders.Checked`). `media` is
-    whether the loader reads the source as a media wrapper (`media_wrapper`)."""
-    quantization = source_quantization(config)
-    if quantization is None:
-        return tensors, {}, None, decoders.NOTHING_CHECKED
-    names, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
-    specs = tensor_specs(tensors)
-    parts = {name: (_held_parts(specs, (name, *quantization.partners(name))),
-                    {part: tensors[part] for part in quantization.grid(name) if part in tensors})
-             for name in names}
-    aliases: tuple[tuple[str, str], ...] = ()
-    if param_dtype != "float32":
-        aliases = decoders.validate_source_aliases(
-            quantization.tensor_names(tensors), partial(quantization.read, tensors, set(names)),
-            config, media=media)
-    tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
-    quantized = {name: QuantizedWeight(stored, grid, str(np.dtype(tensors[name].dtype)))
-                 for name, (stored, grid) in parts.items()}
-    _share_quantized_aliases(tensors, aliases, names)
-    return tensors, quantized, scale_dtype, decoders.checked_groups(aliases)
-
-
-def _held_parts(specs: Mapping[str, jax.ShapeDtypeStruct], parts: Iterable[str]
-                ) -> dict[str, jax.ShapeDtypeStruct]:
-    """`parts`' specs, those of them the source holds (an optional part, compressed-tensors' act-order
-    index, may be absent)."""
-    return {part: specs[part] for part in parts if part in specs}
-
-
 def _folders(config: Mapping[str, object]) -> tuple[str, ...]:
     """The folders of a bundle whose media read their own config and weights
     (`DecoderFamily.wrapper_folders`); none for any other source."""
@@ -2275,7 +2209,7 @@ def _translated(config: Mapping[str, object],
         # are replaced before any is read (`quantized_loads.with_banks`), the rest read below where the
         # load places none.
         streaming = streaming or bool(banks)
-    tensors, quantized, scale_dtype, checked = _decoded(
+    tensors, quantized, scale_dtype, checked = decoded_weights(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     if banks:
@@ -2283,11 +2217,7 @@ def _translated(config: Mapping[str, object],
         # served packed, undecoded.
         codec = source_quantization(config)
         assert codec is not None, "packed banks are a quantized source's"
-        specs = tensor_specs(given)
-        quantized = {**quantized, **{
-            name: QuantizedWeight(_held_parts(specs, (name, *codec.partners(name))),
-                                  {part: given[part] for part in codec.grid(name) if part in given}, None)
-            for name in banks}}
+        quantized = {**quantized, **weight_records(codec, given, banks, None)}
         scale_dtype = codec.scale_dtype(given)
     grid = {part: held for weight in quantized.values() for part, held in weight.grid.items()}
     match route:
