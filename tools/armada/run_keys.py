@@ -228,8 +228,8 @@ def baselines(python: str, rows: list[dict], held: str, until: float | None = No
 
 
 def due(ran: Mapping) -> bool:
-    """Whether a row owes this commit a baseline: a green dry prepare's (`baselined`)."""
-    return head_commit() is not None and ran.get("exitCode") == 0 and "unprepared" in ran
+    """Whether a row owes its commit a baseline: a green dry prepare's (`baselined`)."""
+    return ran.get("exitCode") == 0 and "unprepared" in ran
 
 
 def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
@@ -237,9 +237,9 @@ def baselined(python: str, place: str, held: str, token: str, ran: Mapping,
     """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
     written now, tried once within `until` where one is given, or none is due; a green row with none stands
     stale (`unbaselined`)."""
-    if not due(ran):
+    if (commit := head_commit()) is None or not due(ran):
         return True
-    return written(baseline_key(head_commit(), python, place, held), token,
+    return written(baseline_key(commit, python, place, held), token,
                    json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1, until=until)
 
 
