@@ -319,6 +319,11 @@ def _extent(ref, transforms) -> "tuple | frozenset[tuple] | None":
             return None
         if view is None:
             rank, view = len(shape), list(range(len(shape)))
+        if all(hasattr(index, "start") and index.start is not None and getattr(index, "stride", 1) == 1
+               and int(np.asarray(index.start)) == 0 and index.size == extent
+               for index, extent in zip(indices, shape, strict=True)):
+            # The view taken whole, whatever its rank (a reshaped view read whole): no index of the ref's.
+            continue
         if len(indices) != len(view):
             # Indices of another rank than the view's (a transform between reshaped it): unmapped.
             return None
