@@ -656,11 +656,17 @@ def test_a_partial_is_recorded_only_where_its_field_reads_one_back():
     a callable or a class) is refused as it is written, not saved as a class record its reader builds the
     class from, or refuses as a function's (train 1416's review: a reward's partial saved, its run unread).
     """
-    from dew.registry import Unrecordable, to_record
+    from dew.registry import Unrecordable, import_path, to_record
 
     for value, annotation in ((functools.partial(json.dumps, indent=2), Callable[..., str]),
                               (functools.partial(JepaPredictor, num_layers=1), JepaPredictor)):
         with pytest.raises(Unrecordable):
             to_record(value, annotation)
-    assert to_record(functools.partial(JepaPredictor, num_layers=1), functools.partial[JepaPredictor])[
-        "class"].endswith(":JepaPredictor")
+    # Under the partial its field declares, or its Optional, it is the class record that reads back.
+    bound = functools.partial(JepaPredictor, num_layers=1)
+    for annotation in (functools.partial[JepaPredictor], functools.partial[JepaPredictor] | None):
+        record = to_record(bound, annotation)
+        assert isinstance(record, dict) and record["class"] == import_path(JepaPredictor)
+        again = from_record(annotation, record)
+        assert isinstance(again, functools.partial)
+        assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 1})

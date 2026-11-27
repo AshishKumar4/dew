@@ -598,7 +598,8 @@ def to_record(value, annotation) -> JSON:
         # reader reads one back (a field declaring `functools.partial[...]`, `_bound`; or a member's held
         # argument, read against the member's own annotation, `Bound.read`): any other field's reader builds
         # what such a record names, or refuses a function's, so the partial is refused here.
-        declared = resolve_alias(annotation)
+        # An Optional looked through, as its reader looks through it (`_unwrapped`).
+        declared = _unwrapped(annotation)
         if typing.get_origin(declared) is typing.Annotated:
             declared = typing.get_args(declared)[0]
         if annotation is not None and not (declared is functools.partial

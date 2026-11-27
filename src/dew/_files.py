@@ -253,6 +253,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # A new tree's mode read before anything is written: a probe once the write is done could find no
     # inode left.
     made = _made_mode(directory.parent)
+    lock_path = _lock_path(directory)
     staging = _beside(directory, ".staging")
     os.mkdir(staging, 0o700)
     try:
@@ -266,7 +267,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             yield staging
         finally:
             _STAGED.reset(staged)
-        with _publishing(directory):
+        with _publishing(lock_path):
             held_at = existing()
             written = _entries(staging)
             held = {} if held_at is None else _entries(directory)
@@ -436,26 +437,32 @@ no release takes (`swapped` refuses one)."""
 
 
 @contextlib.contextmanager
-def _publishing(directory: Path) -> Iterator[None]:
-    """Hold Dew's lock of `directory`'s publication, an exclusive `flock` of its own file beside it (named
-    by a digest of its name, `PUBLISHING_LOCK`), so its publishers validate and replace it one at a time and
-    one destination's publication holds no other's. The file is opened for writing, which an exclusive lock
+def _publishing(lock_path: Path) -> Iterator[None]:
+    """Hold Dew's lock of a destination's publication, an exclusive `flock` of its own file beside it
+    (`lock_path`, `_lock_path`), so its publishers validate and replace it one at a time and one
+    destination's publication holds no other's. The file is opened for writing, which an exclusive lock
     takes on every filesystem (NFS's among them), no link followed to it: an existing one as it is (a
     sticky folder refuses creating over another user's), else made exclusively, as every file Dew writes is,
     under the umask, and left in place, the one inode every publisher locks. Whoever the umask lets write
-    beside the release takes its lock; one it does not is refused opening it, not left waiting. The lock is
-    keyed by the destination's name, so publishers of one release name it alike; in a folder that takes two
-    spellings of a name for one entry (a case-folding or normalizing filesystem, `_folds_names`), whose
-    rules no digest of a spelling follows, by the folder alone, every publication in it one at a time
-    (row 13744)."""
-    key = b"" if _folds_names(directory.parent) else os.fsencode(directory.name)
-    name = PUBLISHING_LOCK + hashlib.sha256(key).hexdigest()[:16]
-    lock = _lock_file(directory.parent / name)
+    beside the release takes its lock; one it does not is refused opening it, not left waiting."""
+    lock = _lock_file(lock_path)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
     finally:
         os.close(lock)
+
+
+def _lock_path(directory: Path) -> Path:
+    """The lock file of `directory`'s publication (`_publishing`), named by a digest of its name
+    (`PUBLISHING_LOCK`), so publishers of one release name it alike: in a folder that takes two spellings of
+    a name for one entry (a case-folding or normalizing filesystem, `_folds_names`), of its name decomposed
+    and case-folded, as those filesystems fold it (row 13744). Read before a publication writes anything,
+    as the folder's other probe is (`_made_mode`)."""
+    name = directory.name
+    if _folds_names(directory.parent):
+        name = unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+    return directory.parent / (PUBLISHING_LOCK + hashlib.sha256(os.fsencode(name)).hexdigest()[:16])
 
 
 def _folds_names(folder: Path) -> bool:
