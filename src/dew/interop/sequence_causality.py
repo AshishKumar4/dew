@@ -49,6 +49,7 @@ from dew.nn.programs import (
     branches,
     called,
     cumulative,
+    is_inlined_call,
     loop_programs,
     on_host,
     positionwise,
@@ -352,7 +353,7 @@ class _Walk:
     def equation(self, eqn: core.JaxprEqn, given: list[Held],
                  operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
         primitive = eqn.primitive
-        if primitive.inlined_call:
+        if is_inlined_call(primitive):
             return _call(self, eqn, given, operands)
         if not any(isinstance(value, Reads | Pair) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)

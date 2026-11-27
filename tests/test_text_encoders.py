@@ -588,3 +588,4 @@ def test_a_tower_layer_asking_wide_logits_attends_with_them():
     asked, own = operands(wide), operands(narrow)
     assert asked and all(dtype.itemsize >= 4 for dtype in asked)
     assert own and all(dtype.itemsize == 2 for dtype in own)
+

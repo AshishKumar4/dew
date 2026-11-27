@@ -49,6 +49,7 @@ from jax.typing import DTypeLike
 
 from dew.mesh import SEQUENCE_AXIS, logical_spec, mesh_axes
 
+from . import programs
 from .flops import conv_flops
 from .precision import at_least_fp32, biased, exact_products
 from .sharding import auto_part, constrained, placed_axes
@@ -62,6 +63,8 @@ mlir.register_lowering(
     _barrier_p, mlir.lower_fun(jax.lax.optimization_barrier, multiple_results=False))
 ad.deflinear(_barrier_p, lambda cotangent: (_barrier_p.bind(cotangent),))
 batching.defvectorized(_barrier_p)
+# Each position its own, as its batching states: what the analyses of a program's positions read.
+programs.register_positionwise(_barrier_p)
 
 
 def _per_axis(value: int | Sequence[int] | None, rank: int) -> tuple[int, ...]:

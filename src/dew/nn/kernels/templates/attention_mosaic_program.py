@@ -59,7 +59,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.hooks import Side
-from dew.nn.programs import called, equations
+from dew.nn.programs import called, equations, is_inlined_call
 
 
 def few_rows(family: mosaic.Family, rows: int | None) -> bool:
@@ -724,7 +724,7 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
         if any(getattr(var.aval, "shape", ()) not in ((), tile) for var in (*eqn.invars, *eqn.outvars)):
             return True
         nested = list(jax_core.jaxprs_in_params(eqn.params))
-        on_tile = eqn.primitive.inlined_call and len(nested) == 1 and not _off_tile(nested[0], tile)
+        on_tile = is_inlined_call(eqn.primitive) and len(nested) == 1 and not _off_tile(nested[0], tile)
         if nested and not on_tile:
             return True
     return False
@@ -961,7 +961,7 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
         nested = list(jax_core.jaxprs_in_params(eqn.params))
         if nested:
             # A call or a custom derivative's primal (whose rule `layout.transposed` checks).
-            if not eqn.primitive.inlined_call or not all(
+            if not is_inlined_call(eqn.primitive) or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
         elif not (layout.entrywise(eqn) or layout.placed(eqn)):
