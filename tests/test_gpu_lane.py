@@ -904,7 +904,8 @@ def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_o
               variant=ci.prepares.variant("sm90", users=False),
               judged=lambda rows: [{**each, "unprepared": ["a @ x"]} for each in rows])
     [row] = json.loads(out.read_text())["rows"]
-    written = set(stored) - before
+    # The Worker's stand-in keeps each object by its request's path.
+    written = {key.removeprefix("/") for key in set(stored) - before}
     if asked == "tested":
         held = ci.run_keys.device_class(network=False)
         assert written == {ci.records.baseline_key(head, "3.12", row["name"], held)}
