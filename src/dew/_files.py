@@ -218,10 +218,12 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     locks are (`PUBLISHING_LOCK`); and one whose tree cannot be read whole, when it is replaced.
 
     The new tree is made private from its first call (mode 0700), in the group and with the setgid bit
-    of the one it replaces, so what is written in it takes that group, and published with the mode of the
-    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), each file
-    and folder it writes where the earlier tree held one by that name with that one's mode, so a private
-    destination's weights, or a private file in it, are never readable by others. Dew's publishers of one
+    of the one it replaces, so what is written in it takes that group, and published, under the lock, as
+    the destination is then (`_granted`): with the group and mode of the tree it replaces, or the mode a
+    new folder takes beside it under the umask (`_made_mode`) with the group and setgid bit its parent
+    gives one, each file and folder it writes where the earlier tree held one by that name with that one's
+    group and mode, so a private destination's weights, or a private component's in a group of its own,
+    are never readable by others. Dew's publishers of one
     destination take its validation and replacement in turn (`_publishing`, a lock file of its own beside
     it), so one cannot validate a tree another then replaces; a writer outside Dew is not excluded.
     The earlier one is removed once it is out of place. `exchange` is the one call that exchanges the two
@@ -265,33 +267,22 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             _STAGED.reset(staged)
         with _publishing(directory):
             held_at = existing()
-            # The group the published tree takes, and its setgid, bound under the lock to what the
-            # destination is now (the tree it replaces, or a parent's setgid where there is none): a
-            # publisher that began before another's commit, or against no tree, chose them from another view
-            # (audit 2026-11-27 P05).
-            _grouped(staging, directory.parent.stat() if held_at is None else held_at, made, held_at is None)
-            if held_at is None:
-                staging.chmod(made)
-                os.rename(staging, directory)
-                return
-            written, held = _entries(staging), _entries(directory)
-            refused = foreign(written, held, directory)
+            written = _entries(staging)
+            held = {} if held_at is None else _entries(directory)
+            refused = set() if held_at is None else foreign(written, held, directory)
             if refused:
                 raise FileExistsError(f"{directory} holds {sorted(map(str, refused))}, which the export "
                                       "would not write: export into an empty directory, or one holding only "
                                       "an export")
-            # Each entry the new tree writes in place of earlier ones (`replaces`: the same entry, or a
-            # release's reshard of its weights) takes the access every one of them allowed, a private file
-            # kept private, a new one its umask's (trains 1406 and 1407's reviews), while the staging is
-            # still private; its own mode last, just before it is put in place.
-            for entries, earlier in replaces(written, held):
-                if earlier:
-                    # The access every earlier entry allowed, read once for the group.
-                    modes = (stat.S_IMODE((directory / each).lstat().st_mode) for each in earlier)
-                    allowed = functools.reduce(operator.and_, modes)
-                    for entry in entries:
-                        (staging / entry).chmod(allowed)
-            staging.chmod(stat.S_IMODE(held_at.st_mode))
+            # The groups and access the published tree takes, bound under the lock to what the destination
+            # is now (audit 2026-11-27 P05: a publisher that began before another's commit, or against no
+            # tree, chose them from another view), while the staging is still private.
+            mode = _granted(staging, directory, held_at, made, written, replaces(written, held))
+            if held_at is None:
+                staging.chmod(mode)
+                os.rename(staging, directory)
+                return
+            staging.chmod(mode)
             if held:
                 exchange(staging, directory)
             else:
@@ -331,23 +322,63 @@ def _removed(tree: Path) -> None:
     shutil.rmtree(tree, onexc=retried)
 
 
-def _grouped(staging: Path, source: os.stat_result, made: int, fresh: bool) -> None:
-    """Give every entry of `staging` the group a tree published from it takes beside `source` (the tree it
-    replaces, or, `fresh`, its parent), and every folder the setgid bit that tree's root takes (`made` for
-    a new tree, else the replaced root's): only where the group differs, so a tree written under the group
-    it publishes with is left as it is. A group this process cannot give is refused, as `chown` refuses
-    it, before anything moves."""
-    if fresh and not source.st_mode & stat.S_ISGID:
-        # A new tree outside a setgid parent takes the publisher's own group, which it was written in.
-        return
-    setgid = (made if fresh else stat.S_IMODE(source.st_mode)) & stat.S_ISGID
-    for here, folders, files in os.walk(staging, followlinks=False):
-        for path in (Path(here), *(Path(here) / name for name in (*folders, *files))):
-            held = path.lstat()
-            if held.st_gid != source.st_gid:
-                os.chown(path, -1, source.st_gid, follow_symlinks=False)
-            if stat.S_ISDIR(held.st_mode) and (held.st_mode & stat.S_ISGID) != setgid:
-                path.chmod((stat.S_IMODE(held.st_mode) & ~stat.S_ISGID) | setgid)
+def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, written: Entries,
+             replacements: Replacements) -> int:
+    """Give each entry of `staging` the group and access the tree published from it takes at `directory`,
+    as the destination is now, and return the mode its root takes, which its caller sets last.
+
+    The root takes the group, mode and setgid bit of the tree it replaces (`held_at`), or, new, a folder's
+    made there (`made`, its mode under the umask) with the setgid bit and group its parent gives one now.
+    An entry that replaces earlier ones (`replacements`) takes their group, which they share (one they do
+    not, or one this process cannot give, refused, as `chown` refuses it, before anything moves), and the
+    access every one of them allowed, so a component's private weights in a group of their own stay so
+    (trains 1406, 1407 and 1414's reviews); any other the group a new entry in its folder takes, the
+    folder's where it is setgid, else this process's own, and a new folder the setgid bit of its own."""
+    earlier: dict[Path, tuple[int, int]] = {}
+    for entries, replaced in replacements:
+        if not replaced:
+            continue
+        found = [(directory / each).lstat() for each in replaced]
+        groups = {each.st_gid for each in found}
+        if len(groups) > 1:
+            raise PermissionError(f"{directory}'s {sorted(map(str, replaced))}, which "
+                                  f"{list(map(str, entries))} replace, are in the groups {sorted(groups)}, "
+                                  "which no one entry keeps")
+        group = next(iter(groups))
+        allowed = functools.reduce(operator.and_, (stat.S_IMODE(each.st_mode) for each in found))
+        earlier.update((entry, (group, allowed)) for entry in entries)
+    if held_at is None:
+        parent = directory.parent.stat()
+        setgid = parent.st_mode & stat.S_ISGID
+        root = (parent.st_gid if setgid else os.getegid(), (made & ~stat.S_ISGID) | setgid)
+    else:
+        root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
+    # Each folder's group and setgid bit as published, its entries following it (a folder before them).
+    placed = {Path(): (root[0], root[1] & stat.S_ISGID)}
+    _given(staging, root[0], None)
+    for entry in sorted(written, key=lambda entry: len(entry.parts)):
+        path, kind = staging / entry, written[entry]
+        group, setgid = placed[entry.parent]
+        if entry in earlier:
+            group, mode = earlier[entry]
+        else:
+            group = group if setgid else os.getegid()
+            mode = (stat.S_IMODE(path.lstat().st_mode) & ~stat.S_ISGID) | setgid if kind == "folder" else None
+        _given(path, group, None if kind == "link" else mode)
+        if kind == "folder" and mode is not None:
+            placed[entry] = (group, mode & stat.S_ISGID)
+    return root[1]
+
+
+def _given(path: Path, group: int, mode: int | None) -> None:
+    """`path` (a link not followed) in `group`, and with `mode` where one is given, changing only what
+    differs: the group first, which a change of resets a file's setgid bit."""
+    held = path.lstat()
+    regrouped = held.st_gid != group
+    if regrouped:
+        os.chown(path, -1, group, follow_symlinks=False)
+    if mode is not None and (regrouped or stat.S_IMODE(held.st_mode) != mode):
+        path.chmod(mode)
 
 
 def _made_mode(parent: Path) -> int:

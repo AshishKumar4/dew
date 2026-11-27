@@ -296,8 +296,8 @@ def test_a_read_only_folder_replaced_leaves_no_tree_behind(tmp_path):
 
 def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(tmp_path):
     """A publisher that began against no tree, which another published while it wrote, publishes in the
-    group of the tree it replaces as its publication lock finds it, every entry of it (audit 2026-11-27
-    P05: the group was chosen from the view at its start)."""
+    group and setgid inheritance of the tree it replaces as its publication lock finds it, every entry of
+    it (audit 2026-11-27 P05: the group was chosen from the view at its start)."""
     groups = sorted({*os.getgroups(), os.getgid()} - {os.getgid()})
     other = groups[0] if groups else (os.getgid() + 1 if os.geteuid() == 0 else None)
     if other is None:
@@ -306,9 +306,60 @@ def test_a_release_takes_the_group_of_the_tree_it_replaces_as_the_lock_finds_it(
     with swapped(destination, _nothing_foreign) as staging:
         (staging / "nested").mkdir()
         (staging / "nested" / "model.safetensors").write_text("ours")
-        # Another publisher's tree, in another group, published while this one is written.
+        # Another publisher's tree, in another group its folders pass on (setgid), published while this one
+        # is written.
         destination.mkdir()
         (destination / "model.safetensors").write_text("theirs")
         os.chown(destination, -1, other)
+        destination.chmod(0o2755)
     published = [destination, *destination.rglob("*")]
     assert {path.lstat().st_gid for path in published} == {other}
+    assert destination.stat().st_mode & (destination / "nested").stat().st_mode & stat.S_ISGID
+
+
+def test_a_component_in_a_group_of_its_own_keeps_it_and_its_access_when_replaced(tmp_path):
+    """A release whose component folder and weights are in a group of their own, the folder setgid and the
+    weights private to that group, replaced whole: the component's folder and weights keep that group and
+    that access, not the release root's group (train 1414's review: only the modes were kept, so the
+    root's group could read the weights)."""
+    groups = sorted({*os.getgroups(), os.getgid()} - {os.getgid()})
+    other = groups[0] if groups else (os.getgid() + 1 if os.geteuid() == 0 else None)
+    if other is None:
+        pytest.skip("this process can give no group but its own")
+    destination = tmp_path / "release"
+    component = destination / "text_encoder"
+    component.mkdir(parents=True)
+    (component / "model.safetensors").write_text("before")
+    for path in (component, component / "model.safetensors"):
+        os.chown(path, -1, other)
+    component.chmod(0o2750)
+    (component / "model.safetensors").chmod(0o640)
+    with swapped(destination, _nothing_foreign) as staging:
+        (staging / "text_encoder").mkdir()
+        (staging / "text_encoder" / "model.safetensors").write_text("after")
+        (staging / "text_encoder" / "config.json").write_text("{}")
+    published = [component, component / "model.safetensors", component / "config.json"]
+    assert {path.lstat().st_gid for path in published} == {other}
+    assert stat.S_IMODE(component.stat().st_mode) == 0o2750
+    assert stat.S_IMODE((component / "model.safetensors").stat().st_mode) == 0o640
+
+
+def test_a_new_release_takes_the_setgid_its_parent_holds_as_the_lock_finds_it(tmp_path):
+    """A new release whose parent became setgid in another group while it was written publishes as a
+    folder made there then would be, setgid and in that group, every entry of it (Theme 70's review: its
+    setgid bit was the parent's before the write)."""
+    groups = sorted({*os.getgroups(), os.getgid()} - {os.getgid()})
+    other = groups[0] if groups else (os.getgid() + 1 if os.geteuid() == 0 else None)
+    if other is None:
+        pytest.skip("this process can give no group but its own")
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    destination = parent / "release"
+    with swapped(destination, _nothing_foreign) as staging:
+        (staging / "nested").mkdir()
+        (staging / "nested" / "model.safetensors").write_text("ours")
+        os.chown(parent, -1, other)
+        parent.chmod(0o2775)
+    published = [destination, *destination.rglob("*")]
+    assert {path.lstat().st_gid for path in published} == {other}
+    assert destination.stat().st_mode & (destination / "nested").stat().st_mode & stat.S_ISGID
