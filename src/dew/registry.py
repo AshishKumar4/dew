@@ -503,6 +503,14 @@ def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
     return (annotation,)
 
 
+def _sole_sequence(annotation: Annotation) -> Annotation | None:
+    """A union's one sequence member, which a record's list reads as (`Files.url: str | tuple[str, ...]`,
+    `_rebuilt`); None where it holds none or several."""
+    sequences = [member for member in _union_members(annotation) if member in (tuple, Sequence, list)
+                 or typing.get_origin(member) in (tuple, Sequence, list, MutableSequence)]
+    return sequences[0] if len(sequences) == 1 else None
+
+
 def _unwrapped(annotation: Annotation) -> Annotation:
     """Return `annotation` with an Optional looked through. A union of several
     members says nothing about its entries and answers None."""
@@ -894,11 +902,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
-        sequences = [member for member in inner if member in (tuple, Sequence, list)
-                     or typing.get_origin(member) in (tuple, Sequence, list, MutableSequence)]
-        if isinstance(value, list) and len(sequences) == 1:
-            # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
-            return _rebuilt(sequences[0], value, dtypes=dtypes)
+        if isinstance(value, list) and (sequence := _sole_sequence(annotation)) is not None:
+            return _rebuilt(sequence, value, dtypes=dtypes)
         if isinstance(value, Mapping) and not mappings:
             return _unnamed(annotation, classes, value, dtypes=dtypes)
         return configured(value)
@@ -1234,9 +1239,13 @@ def _unread_partial(value: Configured, annotation: Annotation) -> functools.part
         return None if _admits_partial(annotation, value) else value
     if not isinstance(value, Mapping | list | tuple):
         return None
+    held = _flattened(annotation)
+    if isinstance(value, list | tuple) and typing.get_origin(held) in (Union, types.UnionType):
+        # A sequence under a union reads as the union's one sequence member, as its reader takes it.
+        held = _sole_sequence(held) or held
     try:
         # The container's entries typed as its reader types them, its alias and Optional flattened first.
-        types_ = entry_types(_flattened(annotation), len(value))
+        types_ = entry_types(held, len(value))
     except ValueError:
         types_ = [None] * len(value)
     entries = value.values() if isinstance(value, Mapping) else value

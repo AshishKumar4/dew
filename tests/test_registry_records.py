@@ -719,3 +719,28 @@ def test_a_held_container_of_partials_is_checked_as_its_reader_types_its_entries
     stray = functools.partial(cast_rounded, dtype="bfloat16")
     assert registry._unread_partial([*predictors, stray], _Predictors | None) is stray
 
+
+
+class Predicting(nn.Module):
+    """A user's module holding a name or a tuple of predictor partials: a union whose one sequence member
+    a record's list reads as."""
+
+    predictors: str | tuple[functools.partial[JepaPredictor], ...] = "none"
+
+    @nn.compact
+    def __call__(self, x):
+        return x
+
+
+def test_a_tuple_of_partials_under_a_union_records_and_builds_as_its_sequence_member():
+    """A bound member's tuple of partials under a union of a name and a tuple of partials is written as its
+    reader reads it, the union's one sequence member, and builds back the partials it held (train 1430's
+    review: the writer typed the entries by no member and refused them)."""
+    from dew.registry import ModelConfig
+
+    predictor = functools.partial(JepaPredictor, num_layers=2)
+    config = ModelConfig(functools.partial(registry.models[f"{__name__}:Predicting"], predictors=(predictor,)))
+    rebuilt = ModelConfig.from_dict(json.loads(json.dumps(config.record())))
+    (built,) = rebuilt.build().predictors
+    assert isinstance(built, functools.partial)
+    assert (built.func, built.keywords) == (JepaPredictor, {"num_layers": 2})
