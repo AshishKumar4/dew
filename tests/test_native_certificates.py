@@ -16,9 +16,11 @@ store between them held inside its launch step's enclosure on the native records
 (`recurrence_witness`), its faults a dropped carry, a state rounded to bf16 where fp32 is held, the decay from
 rounded cumulative sums and an off-by-one chunk boundary. Link 4: the attention template's Mosaic forward,
 each online-softmax state its certify launch stores after a key tile and its output held inside one plain
-step's enclosure on the state before it (`attention_witness`), full, causal, windowed and over packed
-documents, its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16, a mask off by
-one key and a window's or the documents' records held as one undivided call's."""
+step's enclosure on the state before it (`attention_witness`), full, causal, windowed, over packed documents
+and capped, its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16, a mask off by
+one key, a window's or the documents' records held as one undivided call's and a cap's read; and its fast
+backward's gradients held to their enclosures from the forward's stored residuals, its faults a wrong
+scale, a sixty-fourth off and a mask."""
 
 import collections
 import functools
@@ -31,7 +33,14 @@ import numpy as np
 import pytest
 import recurrence_witness as rw
 import tier_wire
-from attention_witness import FORMS, assert_faults_refused, assert_witnessed
+from attention_witness import (
+    BACKWARD_FORMS,
+    FORMS,
+    assert_backward_faults_refused,
+    assert_backward_witnessed,
+    assert_faults_refused,
+    assert_witnessed,
+)
 from gpu_flow import RUNNING, Cell, in_parts, run_cells
 from interval_certificates import Lane, exp2_reach, tanh_reach
 from jax.experimental import pallas as pl
@@ -747,6 +756,21 @@ def the_attention_templates_states_certify_natively_a_step_at_a_time(generation_
         assert_witnessed(0, form, interpret=False, lane=mosaic_lane())
 
 
+def the_attention_backwards_gradients_certify_natively(generation_name, form):
+    """Every gradient of the attention template's fast backward under `form` lies inside its enclosure from
+    the forward's stored output, maxima and denominators (`attention_witness.assert_backward_witnessed`), at
+    this GPU's `ex2` (PTX's reach)."""
+    with generation.assumed(generation_name):
+        assert_backward_witnessed(0, form, interpret=False, lane=mosaic_lane())
+
+
+def the_attention_backward_witness_refuses_its_faults_natively(generation_name):
+    """The backward witness's faults, each refused where it lands natively
+    (`attention_witness.assert_backward_faults_refused`)."""
+    with generation.assumed(generation_name):
+        assert_backward_faults_refused(interpret=False, lane=mosaic_lane())
+
+
 def the_attention_witness_refuses_its_faults_natively(generation_name):
     """The attention step witness's faults, each refused where it lands natively
     (`attention_witness.assert_faults_refused`): a dropped rescale, a maximum from the wrong tile, sums
@@ -815,6 +839,10 @@ FLOWS = {
         *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, form)
           for g in GENERATIONS for form in FORMS),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
+          for g in GENERATIONS),
+        *(cell(the_attention_backwards_gradients_certify_natively, g, form)
+          for g in GENERATIONS for form in BACKWARD_FORMS),
+        *(cell(the_attention_backward_witness_refuses_its_faults_natively, g)
           for g in GENERATIONS)],
 }
 """The flows the native cells run in (`gpu_flow.run_cells`), a family's links each: a GPU part runs each

@@ -1,15 +1,25 @@
-"""Check 2's native step witness for the Mosaic attention forward (tests/attention_witness.py, row 2084 (f)),
-on Mosaic GPU's interpreter: the certify launch's states and output inside their step enclosures (nulls),
-full, causal, windowed and over packed documents, and each fault the witness exists for refused at its
-elements: a dropped rescale, a maximum from the wrong tile, sums rounded to bf16 where the walk holds
-fp32, a mask off by one key, and a window's or the documents' records held as one undivided call's. A
-GPU's native launches run the same checks in the native certificates' flow
-(tests/test_native_certificates.py)."""
+"""Check 2's native witness for the Mosaic attention template (tests/attention_witness.py, rows 2084 (f) and
+6130), on Mosaic GPU's interpreter: the forward's certify launch's states and output inside their step
+enclosures (nulls), full, causal, windowed, over packed documents and capped, and each fault the witness
+exists for refused at its elements: a dropped rescale, a maximum from the wrong tile, sums rounded to bf16
+where the walk holds fp32, a mask off by one key, a window's or the documents' records held as one
+undivided call's, and a cap's read; and the fast backward's gradients inside their enclosures, its faults
+(a wrong scale, a sixty-fourth off, a mask) refused. A GPU's native launches run the same checks in the
+native certificates' flow (tests/test_native_certificates.py)."""
 
 import jax
 import numpy as np
 import pytest
-from attention_witness import FORMS, assert_faults_refused, assert_witnessed, launched, operands
+from attention_witness import (
+    BACKWARD_FORMS,
+    FORMS,
+    assert_backward_faults_refused,
+    assert_backward_witnessed,
+    assert_faults_refused,
+    assert_witnessed,
+    launched,
+    operands,
+)
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -66,3 +76,12 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
     for expected in ("attention witness, witness, causal,", "attention witness, witness, full,",
                      "attention witness, faults, causal,", "attention witness, faults, full,"):
         assert any(expected in label for label in labels), (expected, labels)
+
+
+@pytest.mark.parametrize("form", BACKWARD_FORMS)
+def test_each_gradient_of_the_fast_backward_lies_in_its_enclosure(form):
+    assert_backward_witnessed(0, form, interpret=True)
+
+
+def test_each_backward_fault_is_refused_at_its_elements():
+    assert_backward_faults_refused(interpret=True)

@@ -22,7 +22,11 @@ confirmed by the attention lane, 11-06):
 over the step's own operands (`attention_lane`). Each state is held from the stored state before it, so no
 enclosure grows across the walk; a bias below one step's enclosure is not visible (design-20's stated limit).
 A query row's tiles past its last kept key are walked with nothing kept, which leaves its state bit for bit;
-the witness holds a row's states up to the last tile it keeps a key of, and its output from there."""
+the witness holds a row's states up to the last tile it keeps a key of, and its output from there.
+
+The fast backward has no certify form: its gradients, dQ, dK and dV, are held whole (`backward_witnessed`)
+from the forward's stored output, maxima and denominators, each a tensor-core sum over the walked tiles of
+its weights' or score cotangents' enclosures (row 6130)."""
 
 import dataclasses
 import functools
@@ -341,3 +345,143 @@ def assert_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     constants = capped_constants("capped", SHAPE[3])
     assert sum(refused(witnessed(q, k, v, causal, claimed, lane=lane, capped=constants), name)
                for name in ("m", "l", "acc"))
+
+def backward_launched(query, key, value, dout, form: str, *, interpret: bool, site: str = "backward") -> dict:
+    """The fast backward's gradients (`attention_mosaic.backward`, not accurate: its one fused launch where
+    derived) of the call under `form` (`FORMS`), from its training forward's output residuals
+    (`template.Kept.OUTPUT`: the output, the rows' maxima in the walk's log2 units and their denominators),
+    each as float64: what `backward_witnessed` holds them by."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn.kernels import generation
+
+    def program(q, k, v, do):
+        spans = spans_of(form, q.shape[0])
+        out, *residuals = attention_mosaic.forward(q, k, v, spans, hooks_of(form),
+                                                   residuals=template.Kept.OUTPUT, interpret=interpret)
+        grads = attention_mosaic.backward(q, k, v, spans, hooks_of(form), do, residuals=tuple(residuals),
+                                          accurate=False, interpret=interpret)
+        return out, residuals[0], residuals[1], grads.query, grads.key, grads.value
+
+    if interpret:
+        with generation.assumed("sm90"):
+            found = jax.jit(program)(query, key, value, dout)
+    else:
+        from reference_error import ahead_arm
+
+        shapes = ", ".join(f"{np.dtype(x.dtype).name}{list(np.shape(x))}" for x in (query, key, value, dout))
+        label = f"attention backward witness, {site}, {form}, {generation.assumption()}, {shapes}"
+        found = ahead_arm(jax.jit(program), label)(query, key, value, dout)
+    names = ("out", "m", "l", "dq", "dk", "dv")
+    return {name: np.asarray(jnp.asarray(x, jnp.float32), np.float64)
+            for name, x in zip(names, found, strict=True)}
+
+
+def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: Lane | None = None
+                       ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Each gradient of the fast backward's `records` (`backward_launched`) held elementwise to its
+    enclosure under the mask `kept`, from the forward's stored output, maxima and denominators, natural
+    units (as the forward's witness holds each state from the stored ones; the attention lane's order,
+    2026-11-27): each query's and key's products `s` (fp32 on the tensor cores), the weights
+    `P = exp2(s f - m log2(e)) (1/l)` (the walk's factor `f`; the maximum's units an fp32 product; the
+    multiply and the subtraction one FMA or two roundings; `1/l` a divide within two steps of its correctly
+    rounded value, `div.full`'s reach), `dP = dO Vᵀ` (fp32), the score cotangents `P ((dP - c) - (D - c))`
+    about an anchor `c`, one of the row's `dP` as XLA sums it (`gradient.split_delta`), held for any such
+    anchor: `dP - D` within three fp32 roundings of the row's magnitudes, `D`'s and `D - c`'s sums `gamma`
+    of their terms; times the call's whole scale (`grad_scale`) in fp32, cast to bf16; and the gradients
+    `dV = bf16(P)ᵀ dO`, `dK = dSᵀ Q`, `dQ = dS K`, each a tensor-core sum over every walked query or key in
+    any order, cast to bf16. For each gradient, the entries held and those inside."""
+    lane = attention_lane() if lane is None else lane
+    lane = dataclasses.replace(lane, block=0)
+    q, k, v, do = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value, dout))
+    power, left = template.prescale(np.dtype(query.dtype), q.shape[3], None)
+    factor, grad_scale = float(np.float32(left * LOG2E)) * power, power * left
+    unit = 2.0 ** -FLOAT32.precision
+    held = {name: [] for name in ("dq", "dk", "dv")}
+    for b in range(q.shape[0]):
+        keeps = np.broadcast_to(kept, (q.shape[0], 1, *kept.shape[2:]))[b, 0]
+        for h in range(q.shape[2]):
+            kv = h * k.shape[2] // q.shape[2]
+            peak = fp32(mul(point(records["m"][b, h]), point(LOG2E)), lane)
+            total = records["l"][b, h]
+            products = dot(point(q[b, :, h]), point(k[b, :, kv].T), lane)
+            logits = mul(products, point(factor))
+            below = Iv(-peak.hi[:, None], -peak.lo[:, None])
+            exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
+            exponents = Iv(np.where(keeps, np.minimum(exponents.lo, 0.0), 0.0),
+                           np.where(keeps, np.minimum(exponents.hi, 0.0), 0.0))
+            inverse = np.where(total > 0, 1.0 / np.where(total > 0, total, 1.0), 0.0)
+            low, high = nearest(inverse, FLOAT32), nearest(inverse, FLOAT32)
+            for _ in range(2):
+                low, high = stepped(low, FLOAT32, -np.inf), stepped(high, FLOAT32, np.inf)
+            weights = fp32(mul(exp2(exponents, lane), Iv(low[:, None], high[:, None])), lane)
+            weights = Iv(np.where(keeps, weights.lo, 0.0), np.where(keeps, weights.hi, 0.0))
+            pulled = dot(point(do[b, :, h]), point(v[b, :, kv].T), lane)
+            # D and an anchor's terms: dO times the output, and times any key's values (`D - c`'s, summed
+            # whole), each bf16 product exact in fp32, their sums gamma_n of their magnitudes.
+            out, width = records["out"][b, :, h], do.shape[3]
+            gamma = width * unit / (1 - width * unit) + (width + 2) * 2.0 ** -52
+            magnitudes = (np.abs(do[b, :, h]) * (np.abs(out) + np.abs(v[b, :, kv]).max(0))).sum(-1)
+            delta = (do[b, :, h] * out).sum(-1)
+            reach = np.maximum(np.abs(pulled.lo), np.abs(pulled.hi))
+            anchor = reach.max(-1)
+            slack = ((gamma * magnitudes)[:, None]
+                     + 3 * unit * (reach + np.abs(delta)[:, None] + 3 * anchor[:, None]))
+            differences = Iv(pulled.lo - delta[:, None] - slack, pulled.hi - delta[:, None] + slack)
+            cotangents = fp32(mul(fp32(mul(weights, differences), lane), point(grad_scale)), lane)
+            cotangents = cast(Iv(np.where(keeps, cotangents.lo, 0.0), np.where(keeps, cotangents.hi, 0.0)),
+                              BFLOAT16)
+            dv = dot(cast(Iv(weights.lo.T, weights.hi.T), BFLOAT16), point(do[b, :, h]), lane)
+            dk = dot(Iv(cotangents.lo.T, cotangents.hi.T), point(q[b, :, h]), lane)
+            dq = dot(cotangents, point(k[b, :, kv]), lane)
+            for name, found in (("dq", dq), ("dk", dk), ("dv", dv)):
+                stored = records[name][b, :, h if name == "dq" else kv]
+                held[name].append((np.ones(stored.shape, bool), within(stored, cast(found, BFLOAT16))))
+    return {name: (np.concatenate([rows.ravel() for rows, _ in found]),
+                   np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
+
+
+BACKWARD_FORMS = ("full", "causal", "window", "documents")
+"""The forms the backward's witness holds: every uncapped one (a capped call's backward takes the score
+hook's derivative, which its enclosure does not state)."""
+
+
+def backward_operands(seed: int):
+    """`operands(seed)` and a bf16 cotangent of the output drawn beside them on the host (row 9546)."""
+    import jax.numpy as jnp
+
+    q, k, v = operands(seed)
+    rng = np.random.default_rng(seed + 7)
+    return q, k, v, rng.standard_normal(SHAPE, dtype=np.float32).astype(np.dtype(jnp.bfloat16))
+
+
+def assert_backward_witnessed(seed: int, form: str, *, interpret: bool, lane: Lane | None = None) -> None:
+    """Every gradient of the fast backward over draw `seed` under `form` inside its enclosure
+    (`backward_witnessed`)."""
+    import tier_wire
+
+    q, k, v, do = backward_operands(seed)
+    records = backward_launched(q, k, v, do, form, interpret=interpret)
+    if not interpret and tier_wire.preparing():
+        return
+    for name, (rows, inside) in backward_witnessed(q, k, v, do, mask_of(form), records, lane=lane).items():
+        assert rows.any(), name
+        assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
+
+
+def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
+    """Each fault the backward's witness exists for, refused at its elements: dK at twice its scale, dQ and
+    dV a sixty-fourth off, and a causal call's gradients held as a full call's."""
+    import tier_wire
+
+    q, k, v, do = backward_operands(3)
+    causal = backward_launched(q, k, v, do, "causal", interpret=interpret, site="faults")
+    if not interpret and tier_wire.preparing():
+        return
+    mask = mask_of("causal")
+    for name, bent in (("dk", 2.0), ("dq", 1.0 + 2.0 ** -6), ("dv", 1.0 - 2.0 ** -6)):
+        held = backward_witnessed(q, k, v, do, mask, dict(causal, **{name: causal[name] * bent}), lane=lane)
+        assert refused(held, name), name
+    held = backward_witnessed(q, k, v, do, mask_of("full"), causal, lane=lane)
+    assert sum(refused(held, name) for name in ("dq", "dk", "dv"))
