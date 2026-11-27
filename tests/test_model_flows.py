@@ -210,10 +210,14 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     topology = node_topology(store / "topology.bin")
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
     monkeypatch.setenv(tier_wire.TRUTHS, str(store / "tier"))
-    monkeypatch.setenv(tier_wire.PREPARE, "1")
     monkeypatch.setenv(tier_wire.UNIT, "a dense decoder's unit")
     flow = model_flows.flow_named("dense fp32")
-    took = model_flows.prepared_apart(flow)
+    # A prepare's flag set for the prepare alone: left set, the suite reads this test's failed assertions
+    # below as a prepare's and reports them skipped (tests/conftest.py's report hook; a review of 353a09053).
+    with monkeypatch.context() as preparing:
+        preparing.setenv(tier_wire.PREPARE, "1")
+        took = model_flows.prepared_apart(flow)
+    assert not tier_wire.preparing()
     store = model_flows.store_of(flow)
     assert took is not None and took["written_bytes"] > 0 and took["seconds"] > 0
     assert (store / "dew.programs").is_file() and (store / "reference.programs").is_file()
@@ -231,8 +235,10 @@ def test_a_parts_prepare_compiles_a_flows_programs_and_its_truths_programs_for_i
     named = {f"{flow.name}: {name}" for arm in ("dew", "reference")
              for name, program in AheadPrograms.load(store / f"{arm}.programs").programs.items()
              if program.memory is not None}
+    # Its arms first (`admitted_needs`), then its truths, whose site labels carry the flow's name too.
     labels = [program["label"] for program in stated]
-    assert named and named == {label for label in labels if label.startswith(f"{flow.name}: ")}, labels
+    assert named and set(labels[:len(named)]) == named, labels
+    assert all(": truth " in label or ": terms " in label for label in labels[len(named):]), labels
 
 
 def test_a_flows_prepare_leaves_a_convolution_to_its_run_and_says_so(store, monkeypatch):
