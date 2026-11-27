@@ -439,8 +439,8 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     if key_valid is not None:
         valid = jnp.broadcast_to(key_valid, (rows, keys))
         pooled_keys = jnp.where(valid[:, :, None, None], pooled_keys, 0.0)
-        held = jax.lax.reduce_window(valid.astype(jnp.int32), 0, jax.lax.add, (1, kernel), (1, stride),
-                                     "VALID") > 0
+        held = jax.lax.reduce_window(valid.astype(jnp.int32), np.int32(0), jax.lax.add, (1, kernel),
+                                     (1, stride), "VALID") > 0
         reach = reach[None] & held[:, None, :]
         lived = jnp.pad(valid, ((0, 0), (0, blocks * block - keys))).reshape(rows, blocks, block).any(-1)
         earlier = earlier & lived[:, None, None, :]
@@ -464,7 +464,7 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     seen = reach if reach.ndim == 2 else reach[:, 0]
     covered = jnp.pad(jnp.broadcast_to(seen, (*scores.shape[:-1], windows)).astype(jnp.int32),
                       ((0, 0),) * (scores.ndim - 1) + ((0, max(0, (blocks - 1) * step + span - windows)),))
-    reached = jax.lax.reduce_window(covered, 0, jax.lax.max, (1,) * (scores.ndim - 1) + (span,),
+    reached = jax.lax.reduce_window(covered, np.int32(0), jax.lax.max, (1,) * (scores.ndim - 1) + (span,),
                                     (1,) * (scores.ndim - 1) + (step,), "VALID")[..., :blocks] > 0
     return top_k_selection(scores, earlier & reached, optional, forced=forced)
 
