@@ -382,7 +382,7 @@ def held_rows(family: "Family", consumers: int, columns: int) -> int:
     return share // family.role_rows * family.role_rows * consumers
 
 
-def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int, *, row_tiles: int,
+def band(multiprocessors: int, rows: int, columns: int, column_tiles: int, *, row_tiles: int,
          grouped: bool = False, cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
     blocks in the L2 (`grid_block_n`). A grouped walk's every column tile: each row tile's columns walked
@@ -399,12 +399,14 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int, *,
     tile: Llama-3-8B's NVFP4 projections on a GH200 ran 2x slower at the balanced band of 8 than at 64 or
     128, their tile alike, M-FS-89c/d, row 5874). The band is a power of two, as its snake's division by
     another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes spilled
-    at a band of three, NS4053-1), which the register model does not see. A cluster of `cluster`
-    multiprocessors is one program, its tile `cluster` row tiles (`row_tiles` counts clusters' tiles)."""
+    at a band of three, NS4053-1), which the register model does not see. `rows` and `columns` are a
+    cluster tile's extents (`gemm.pricing.tile_rows`, `gemm.pricing.tile_columns`), `row_tiles` and
+    `column_tiles` its walk's counts of them; `cluster`, the multiprocessors a cluster's one program spans,
+    which divides the wave's `multiprocessors` into its programs."""
     if grouped:
         return column_tiles
-    programs, rows = multiprocessors // cluster, block_m * cluster
-    balanced = math.sqrt(programs * rows / block_n)
+    programs = multiprocessors // cluster
+    balanced = math.sqrt(programs * rows / columns)
     spanning = programs / max(row_tiles, 1)
     wide = max(1, min(int(max(balanced, spanning)), column_tiles))
     return 1 << (wide.bit_length() - 1)

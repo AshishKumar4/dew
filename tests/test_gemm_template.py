@@ -1022,7 +1022,7 @@ def test_a_band_walks_every_tile_once_and_a_grouped_walk_reads_each_row_block_on
     GH200 read 7.40 GB at the band of 8 and 6.73 at every column tile, 1.037x and 0.997x CUTLASS's
     forward)."""
     rows = 6
-    band = resources.band(132, 128, 128, columns, row_tiles=rows, grouped=grouped, cluster=2)
+    band = resources.band(132, 256, 128, columns, row_tiles=rows, grouped=grouped, cluster=2)
     assert 1 <= band <= columns, band
     assert band == columns if grouped else band & (band - 1) == 0, band
     walk = jax.vmap(lambda index: tail.planar_snake(index, (rows, columns), 1, band))(
