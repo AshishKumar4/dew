@@ -14,7 +14,9 @@ from attention_witness import (
     FORMS,
     assert_backward_faults_refused,
     assert_backward_witnessed,
+    assert_equal_totals_held,
     assert_faults_refused,
+    assert_two_launches_held_to_their_own_d,
     assert_witnessed,
     launched,
     operands,
@@ -81,6 +83,25 @@ def test_native_attention_witness_cells_prepare_without_deferring(tmp_path, monk
 @pytest.mark.parametrize("form", FORMS)
 def test_each_gradient_of_the_backward_lies_in_its_enclosure(form, accurate):
     assert_backward_witnessed(0, form, interpret=True, accurate=accurate)
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure(form, with_deterministic_ops):
+    """Row 13697: under --xla_gpu_deterministic_ops, the GPU tier's lane, the fast backward takes two
+    launches (`MosaicBackward.legal` refuses the fused one), its dK/dV launch over the dQ launch's own
+    denominator and D refined from its sums (`gradient.dq_finish`): each gradient inside the enclosure of
+    the schedule that ran, as its rows state it."""
+    assert_backward_witnessed(0, form, interpret=True)
+
+
+def test_two_launches_are_held_to_their_own_refined_d(with_deterministic_ops):
+    """Two launches' gradients held as the fused launch's (its D and denominator) refused at dK."""
+    assert_two_launches_held_to_their_own_d(interpret=True)
+
+
+def test_two_launches_of_the_forwards_own_denominator_are_held_by_their_schedule(with_deterministic_ops):
+    """Two launches whose denominators equal the forward's to the bit, their D refined all the same, held."""
+    assert_equal_totals_held(interpret=True)
 
 
 def test_each_backward_fault_is_refused_at_its_elements():
