@@ -20,7 +20,7 @@ def _draft(ops, state, first, fed):
     logits = []
 
     def choose(index, scores):
-        logits.append(scores.astype(jnp.float32))
+        logits.append(scores)
         return fed[:, min(index, fed.shape[1] - 1)]
 
     ops.draft(state, first, choose)
@@ -40,15 +40,19 @@ def _arms(model, params):
         assert seen is not None, "a block drafter's verify returns the states its windows record"
         return _draft(ops, ops.record(following, seen, keep), first, fed)
 
-    @jax.jit
+    # Its rows' real tokens read on the host, as a prompt's mask is (a sparse attention's prefill reads them).
+    drafted = jax.jit(lambda state, first, fed: _draft(ops, state, first, fed))
+
+    @as_given
     def fresh(prompts, stretch, counts, first, fed):
         # Each row's history, the prompt and its kept tokens, left-padded to one width.
-        joined = jnp.concatenate([prompts, stretch], axis=1)
-        source = jnp.arange(joined.shape[1])[None, :] - (stretch.shape[1] - counts[:, None])
+        joined = np.concatenate([prompts, stretch], axis=1)
+        source = np.arange(joined.shape[1])[None, :] - (stretch.shape[1] - np.asarray(counts)[:, None])
         valid = source >= 0
-        history = jnp.where(valid, jnp.take_along_axis(joined, jnp.maximum(source, 0), axis=1), 0)
-        state, _ = prefill_state(model, params, ModelInputs(history, {"attention_mask": valid}), ops)
-        return _draft(ops, state, first, fed)
+        history = np.where(valid, np.take_along_axis(joined, np.maximum(source, 0), axis=1), 0)
+        inputs = ModelInputs(jnp.asarray(history, jnp.int32), {"attention_mask": jnp.asarray(valid)})
+        state, _ = prefill_state(model, params, inputs, ops)
+        return drafted(state, jnp.asarray(first), jnp.asarray(fed))
 
     return replayed, fresh
 
@@ -65,7 +69,7 @@ def assert_replay_drafts_as_a_prefill(model, params, draw, label: str, *, seeds:
     @as_given
     def truth(*inputs):
         with jax.enable_x64(new_val=True):
-            return wide(*(jnp.asarray(np.asarray(value)) for value in inputs))
+            return wide(*inputs)
 
     assert_as_exact(replayed, dew_path(fresh), draw, label, seeds=seeds, truth_fn=truth)
 
