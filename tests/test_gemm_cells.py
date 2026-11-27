@@ -105,6 +105,23 @@ def test_a_generation_no_receipt_timed_runs_the_template():
             assert _route(_dense_case("sm103", made, (2560, 9216), 24576)) == "mosaic", made
 
 
+@pytest.mark.parametrize("generation_name, takes", [("sm80", True), ("sm90", False), ("sm100", False)])
+def test_an_fp32_products_template_launch_is_a_family_that_rounds_to_tf32(generation_name, takes):
+    """A dense fp32 input gradient at the default precision (TF32 products, `product.declared`) of a 4B
+    projection: the template derives a launch on an A100, whose mma.sync rounds each fp32 operand to TF32 to
+    nearest as XLA's TF32 product does, and none on an H100 or a B200, whose warpgroup MMA and tcgen05 read
+    it unrounded (row 13735: a GH200's fp32 SSD flow's gradients 3.0 times XLA's error), whose selector so
+    runs XLA's product."""
+    case = _dense_case(generation_name, grouped_cells.Made.INPUT_GRADIENT, (2560, 9216), 4096,
+                       dtype=jnp.float32, stored=jnp.float32)
+    launch, ba = case.call.bound[grouped_matmul.MosaicGmm.name]
+    with generation.assumed(generation_name):
+        derived = launch.derived(ba, case.call.target)
+    assert isinstance(launch, grouped_matmul.MosaicGmm) and (derived is not None) == takes, derived
+    if not takes:
+        assert _route(case) == "xla"
+
+
 def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
     """A pinned two-way split runs where its fp32 partials, as its launch declares them, fit the 4 MiB an
     A100's cuBLAS GEMM's workspace is (`GpuTarget.reference_workspace`, row 12850), and is refused

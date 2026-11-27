@@ -336,11 +336,15 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
 
     def _tf32(self, ba, dtype, family: mosaic.Family) -> bool:
         """Whether an fp32 TF32 call runs here (`product.declared` at DEFAULT precision, `takes_tf32`,
-        row 3428): plain unscaled unhooked call; non-transposing TF32 families (Hopper WGMMA) require
-        K-major B (`trans_rhs=True`, not `STAGED_ROWS`), while transposing families (Ampere/Blackwell) take
-        both orientations and kernel gradients."""
+        row 3428): plain unscaled unhooked call on a family that rounds each fp32 operand to TF32 to nearest
+        (`rounds_tf32`: mma.sync's), as XLA's TF32 product does; non-transposing TF32 families require
+        K-major B (`trans_rhs=True`, not `STAGED_ROWS`), while transposing families take both orientations
+        and kernel gradients. A family reading its fp32 operands as TF32 unrounded (warpgroup MMA's,
+        tcgen05's: their low 13 bits dropped, each product's magnitude biased low, the bias summed over the
+        depth) takes none: a GH200's dense input gradients of an fp32 SSD flow read 3.0 times XLA's error
+        through them (row 13735)."""
         k_major = not self.STAGED_ROWS and self._matrix_transposed(ba)
-        return (jnp.dtype(dtype) == jnp.float32 and family.takes_tf32
+        return (jnp.dtype(dtype) == jnp.float32 and family.takes_tf32 and family.rounds_tf32
                 and not ba.arguments.get('exact_sums') and not self._scaled
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and (family.transposes_tf32 or k_major))
