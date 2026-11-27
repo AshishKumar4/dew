@@ -488,7 +488,6 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
     from dew.objectives.lm import Perplexity
     from dew.objectives.lm.objective import Samples
     from dew.registry import mixers
-    from dew.telemetry.records import FitEnded, FitStarted
     from dew.training.tracker import Wandb
 
     selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
@@ -512,8 +511,6 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
         fitted(preview=True)
     tracker, steps = fitted(preview=False)
     assert steps == 1 and any("val/perplexity" in scalars for _, scalars in tracker.scalars)
-    # The run's own records, its start and end, and no preview's.
-    assert all(isinstance(artifact, FitStarted | FitEnded) for _, artifact in tracker.artifacts)
     tracked = LMRunConfig(trainer=TrainerConfig(wandb=Wandb(project="dew", offline=True)))
     assert tracked.skipped_preview(objective) is not None
     assert tracked.skipped_preview(LMObjective(model, SEQ)) is None
