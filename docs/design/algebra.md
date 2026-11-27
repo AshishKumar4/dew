@@ -1470,13 +1470,14 @@ the written trace and independent truth. Sharing and case selection add no run-t
   no replacement. Production integration of later components needs those receipts, not just a generated file.
 - **Production stays written, by measurement.** The generated components run in no production program; they
   are the written math's checked twins, regenerated and held to Check 1 and Check 2 by the dev-time suite.
-  On the GH200 the generated components matched their written bodies' host wall (M-AL-5: 62 cases, Check 1
-  and native Check 2 all held), so they buy no speed; and an opt-in seam that ran them where a call's exact
-  case was declared reached one site of the real Mamba scan, at a case no declaration held (M-AL-6:
-  2x64x1536 decays), running no generated body: an exact-case table covers one model's sizes, and a table
-  keyed by pattern would run a body checked at other sizes. The seam was removed (rows 3272, 6109). A
-  template's trace-time derivation at its fixed tiles remains a cold process's first-step cost (9 s of a 26 s
-  cold attention step), which these twins do not remove.
+  On the GH200 the generated components held Check 1 and native Check 2 at their written bodies' host wall
+  (M-AL-5: 62 cases, dispatch-dominated, no device-time claim), and an opt-in seam that ran them where a
+  call's exact case was declared reached, in the portable Mamba selective scan
+  (`dew.nn.mixers.mamba.selective_scan`), one site at a case no declaration held (M-AL-6: its decay's step
+  operand at 2x64x1536), running no generated body: an exact-case table holds only the sizes declared, and a
+  table keyed by pattern would run a body checked at other sizes, for no measured gain. The seam was removed
+  (rows 3272, 6109). A template's trace-time derivation at its fixed tiles remains a cold process's first-
+  step cost (9 s of a 26 s cold attention step), which these twins do not remove.
 
 - `python -m dew.algebra.generate [--check]` traces every declared case. For a stable form it
   saturates with the dev-time sets, measures error against the declaration at float64 and selects
