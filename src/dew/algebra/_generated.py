@@ -1,5 +1,6 @@
 """Case keys and dispatch for checked-in generated modules, without loading the dev-time registry."""
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
 
@@ -25,28 +26,42 @@ def refused(operands: Sequence) -> str | None:
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class Forms:
+    """A generated function's checked forms by policy, target and case, and its return convention: one value
+    (`single`, its forms' one-element tuples unwrapped) or its forms' tuple."""
+
+    single: bool
+    cases: Mapping[tuple, Callable[..., tuple]]
+
+
 def table_name(name: str) -> str:
-    """The name of a generated module's table of `name`'s forms, by policy, target and case."""
+    """The name of a generated module's table of `name`'s forms (`Forms`)."""
     return f"_{name}_forms"
 
 
-def table(module: ModuleType, name: str) -> Mapping[tuple, Callable[..., tuple]]:
+def table(module: ModuleType, name: str) -> Forms:
     """The generated `module`'s table of `name`'s forms; one it lacks raises (the module is stale: generate
     it again)."""
     return getattr(module, table_name(name))
 
 
-def found(forms: Mapping[tuple, Callable[..., tuple]], operands: Sequence, policy: str,
-          target: str) -> Callable[..., tuple] | None:
+def found(forms: Forms, operands: Sequence, policy: str, target: str) -> Callable[..., tuple] | None:
     """The checked form for `operands`' exact policy, target, shape and dtype key, one lookup; None for
     operands of no generated ABI (`refused`) or a case the table does not hold."""
     if refused(operands) is not None:
         return None
-    return forms.get((policy, target, case_of(operands)))
+    return forms.cases.get((policy, target, case_of(operands)))
 
 
-def call(forms: Mapping[tuple, Callable[..., tuple]], operands: tuple, policy: str, target: str, *,
-         single: bool):
-    """Run only the checked form for the exact policy, target, shape and dtype key."""
-    outputs = forms[policy, target, case_of(operands)](*operands)
-    return outputs[0] if single else outputs
+def entry(form: Callable[..., tuple], *, single: bool) -> Callable:
+    """A checked form as its declaration's function returns, for a caller that runs it later: its one value
+    where `single`."""
+    return (lambda *operands: form(*operands)[0]) if single else form
+
+
+def call(forms: Forms, operands: tuple, policy: str, target: str):
+    """Run only the checked form for the exact policy, target, shape and dtype key, as its function
+    returns."""
+    outputs = forms.cases[policy, target, case_of(operands)](*operands)
+    return outputs[0] if forms.single else outputs

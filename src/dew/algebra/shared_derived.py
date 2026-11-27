@@ -104,7 +104,7 @@ def shared_component_3(p0, p1, p2, p3, p5, p6, p8, p10, p12, p15, p19, p27, p32,
     v6, v7, v8, v21, v25 = shared_component_22(v0, p2, p3, p5, p6, p8, p10, p12, p15, p19, p27, p32, p34)
     v26 = lax.add_p.bind(v25, np.array(p36, dtype=p12))
     v27 = lax.add_p.bind(v26, np.array(p32, dtype=p12))
-    v33, = shared_component_12(p40, p12, p42, v27)
+    v33, = shared_component_41(p40, p12, p42, v27)
     v34 = p27.bind(v33, np.array(p6, dtype=p12))
     v35 = lax.or_p.bind(v6, v34)
     v36 = lax.or_p.bind(v35, v21)
@@ -154,14 +154,14 @@ def shared_component_5(
     v8 = lax.add_p.bind(v7, p15)
     v9 = lax.add_p.bind(v8, np.array(p2, dtype=p12))
     v10 = lax.sub_p.bind(v9, np.array(p18, dtype=p12))
-    v16, = shared_component_12(p20, p12, p22, v8)
-    v22, = shared_component_12(p26, p12, p22, v10)
+    v16, = shared_component_41(p20, p12, p22, v8)
+    v22, = shared_component_41(p26, p12, p22, v10)
     v23 = lax.sub_p.bind(v22, v16)
-    v29, = shared_component_12(p32, p12, p34, v23)
+    v29, = shared_component_41(p32, p12, p34, v23)
     v30 = lax.convert_element_type_p.bind(v29, new_dtype=p3, weak_type=False, sharding=None)
     v31 = lax.le_p.bind(v23, np.array(p8, dtype=p12))
     v32 = lax.neg_p.bind(v23)
-    v38, = shared_component_12(p8, p12, p34, v32)
+    v38, = shared_component_41(p8, p12, p34, v32)
     v39 = lax.convert_element_type_p.bind(v38, new_dtype=p3, weak_type=False, sharding=None)
     v40 = p48.bind(v5, v39)
     v41 = lax.le_p.bind(v23, np.array(p34, dtype=p12))
@@ -251,7 +251,7 @@ def shared_component_7(
     v27 = lax.add_p.bind(v14, np.array(p4, dtype=p3))
     v28 = lax.add_p.bind(v27, np.array(p29, dtype=p3))
     v29 = lax.ge_p.bind(v28, np.array(p6, dtype=p3))
-    v35, = shared_component_12(p51, p3, p53, v28)
+    v35, = shared_component_41(p51, p3, p53, v28)
     v36 = lax.convert_element_type_p.bind(v35, new_dtype=p17, weak_type=False, sharding=None)
     v37 = p35.bind(v36, np.array(p29, dtype=p17))
     v38 = lax.add_p.bind(v37, v26)
@@ -316,17 +316,12 @@ def shared_component_11(p0, p35, p1, p2, p4, p5, p7, p9, p11, p14, p18, p26, p31
     v5, v6, v7, v20, v24 = shared_component_22(p0, p1, p2, p4, p5, p7, p9, p11, p14, p18, p26, p31, p33)
     v25 = lax.add_p.bind(v24, p35)
     v26 = lax.add_p.bind(v25, np.array(p31, dtype=p11))
-    v32, = shared_component_12(p38, p11, p40, v26)
+    v32, = shared_component_41(p38, p11, p40, v26)
     v33 = p26.bind(v32, np.array(p5, dtype=p11))
     v34 = lax.or_p.bind(v5, v33)
     v35 = lax.or_p.bind(v34, v20)
     v52, = shared_component_29(p18, p11, p14, p35, p26, v7, v5, v25, p33, v35, v6, p7, p62, p0)
     return (v52,)
-
-
-def shared_component_12(p0, p1, p2, p3):
-    v5, = shared_component_41(p0, p1, p2, p3)
-    return (v5,)
 
 
 def shared_component_13(p0, p1, p2, p3, p5, p7, p10, p12, p14, p20, p23, p24):
@@ -559,7 +554,7 @@ def shared_component_22(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12):
     v8 = lax.clz_p.bind(v7)
     v9 = lax.sub_p.bind(np.array(p8, dtype=p7), v8)
     v10 = lax.sub_p.bind(np.array(p4, dtype=p7), v9)
-    v11, = shared_component_12(p9, p7, p4, v10)
+    v11, = shared_component_41(p9, p7, p4, v10)
     v12 = lax.gt_p.bind(v6, np.array(p9, dtype=p7))
     v13 = p10.bind(v7, v11)
     v14 = lax.and_p.bind(v13, np.array(p6, dtype=p7))
@@ -669,7 +664,7 @@ def shared_component_28(p0, p1, p2, p3, p4, p5, p6, p7, p8):
 
 
 def shared_component_29(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, p12, p13):
-    v0, = shared_component_12(p0, p1, p2, p3)
+    v0, = shared_component_41(p0, p1, p2, p3)
     v1 = p4.bind(p5, v0)
     v2 = lax.or_p.bind(p6, v1)
     v3 = lax.ge_p.bind(p7, np.array(p8, dtype=p1))

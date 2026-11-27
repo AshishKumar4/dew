@@ -23,8 +23,6 @@ Receipts:
   program, and the pass runs 12% slower without it (13,604 passes)
 """
 
-from collections.abc import Callable
-
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
@@ -75,20 +73,20 @@ def _guided_tangent_0(x1, x2, x3, x4, x5, x6, x7):
     return (v33,)
 
 
-_guided_forms: dict[tuple, Callable[..., tuple]] = {
+_guided_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'))):
         _guided_0,
     ('default', 'sm90', (*(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'))):
         _guided_0,
-}
+})
 
 
 def guided(*operands, policy: str = 'default', target: str = 'sm90'):
     """guided's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_guided_forms, operands, policy, target, single=True)
+    return _generated.call(_guided_forms, operands, policy, target)
 
 
-_guided_tangent_forms: dict[tuple, Callable[..., tuple]] = {
+_guided_tangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (
         *(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'), *(((16, 64), 'float32'),) * 2,
         ((16, 1), 'float32'), ((16, 64), 'float32'))):
@@ -97,9 +95,9 @@ _guided_tangent_forms: dict[tuple, Callable[..., tuple]] = {
         *(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'), *(((32, 128), 'float32'),) * 2,
         ((32, 1), 'float32'), ((32, 128), 'float32'))):
         _guided_tangent_0,
-}
+})
 
 
 def guided_tangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """guided_tangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_guided_tangent_forms, operands, policy, target, single=True)
+    return _generated.call(_guided_tangent_forms, operands, policy, target)

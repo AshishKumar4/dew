@@ -162,8 +162,13 @@ class SurrogateBodies:
                                      for inactive, tangent in case.tangents.items()))]
 
     def declared(self, module: str) -> SurrogateBodies:
-        """Register each case's forward and tangent bodies, each under its own name (`declare`)."""
-        for name, form in self._bodies():
+        """Register each case's forward and tangent bodies, each under its own name (`declare`): every name
+        checked free (or already this body's) before any is registered, so a collision leaves the registry
+        as it was."""
+        bodies = self._bodies()
+        for name, form in bodies:
+            _free(f"{module}.{name}", form)
+        for name, form in bodies:
             declare(module, name, form)
         return self
 
@@ -179,7 +184,7 @@ class SurrogateBodies:
         for name, form in self._bodies():
             declared = {(policy, target, case_of(operands)) for operands in form.cases.operands
                         for policy in form.cases.policies for target in form.cases.targets}
-            if set(_generated.table(emitted, name)) != declared:
+            if set(_generated.table(emitted, name).cases) != declared:
                 raise ValueError(f"the generated table of {name} is not its declaration's: run `python -m "
                                  "dew.algebra.generate`")
 
@@ -299,11 +304,16 @@ def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: For
     """`form` registered under its declaring `module` and `name`, generated into `<module>_derived.py` as a
     function of that name; a name already declared another form refused, never overwritten."""
     qualified = f"{module}.{name}"
+    _free(qualified, form)
+    DECLARATIONS[qualified] = form
+    return form
+
+
+def _free(qualified: str, form) -> None:
+    """Refuse `qualified` where another form is declared under it (`declare`)."""
     if (held := DECLARATIONS.get(qualified)) is not None and held is not form:
         raise ValueError(f"{qualified} is declared twice: each form, and each surrogate case's static "
                          "arguments and tangent activity, needs a name of its own")
-    DECLARATIONS[qualified] = form
-    return form
 
 
 def admits(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...], cases: Cases,
@@ -581,7 +591,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
         single = own[0].single
         policy, target = own[0].policy, own[0].target
         table = _generated.table_name(name)
-        body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
+        body += ["", "", f"{table} = _generated.Forms(single={single}, cases={{"]
         for found in own:
             operands = _runs(repr(operand) for operand in case_of(found.operands))
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
@@ -595,9 +605,9 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
                 args = [str(binding.callee), *(f"{key}={printed.expression(value)}"
                                                for key, value in binding.keywords)]
                 body += printed.wrapped("        functools.partial(", args, "),")
-        body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
+        body += ["})", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
-                 f"    return _generated.call({table}, operands, policy, target, single={single})"]
+                 f"    return _generated.call({table}, operands, policy, target)"]
     header = _header(f"from {module}", names)
     reads = _helper_reads([*emitted.bodies.values(), *emitted.bound.values()], factored)
     imports = printed.imports("\n".join(body))

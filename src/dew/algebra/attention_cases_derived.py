@@ -31,7 +31,6 @@ Receipts:
 """
 
 import functools
-from collections.abc import Callable
 
 import jax.numpy as jnp
 import numpy as np
@@ -227,7 +226,7 @@ def _walk_output_0(x1, x2, x3):
     return (v8,)
 
 
-_key_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
+_key_dropped_cotangents_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (
         *(((64, 32), 'float32'),) * 2, *(((32,), 'float32'),) * 4, ((64, 32), 'float32'),
         *(((64, 32), 'bool'),) * 2)):
@@ -236,79 +235,79 @@ _key_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
         *(((128, 64), 'float32'),) * 2, *(((64,), 'float32'),) * 4, ((128, 64), 'float32'),
         *(((128, 64), 'bool'),) * 2)):
         _key_dropped_cotangents_0,
-}
+})
 
 
 def key_dropped_cotangents(*operands, policy: str = 'default', target: str = 'sm90'):
     """key_dropped_cotangents's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_key_dropped_cotangents_forms, operands, policy, target, single=False)
+    return _generated.call(_key_dropped_cotangents_forms, operands, policy, target)
 
 
-_key_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
+_key_walk_factors_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((64, 32), 'float32'), ((32,), 'float32'))):
         functools.partial(shared_component_34, p1=(0,), p3=(1, 32), p4=(1,)),
     ('default', 'sm90', (((128, 64), 'float32'), ((64,), 'float32'))):
         functools.partial(shared_component_34, p1=(0,), p3=(1, 64), p4=(1,)),
-}
+})
 
 
 def key_walk_factors(*operands, policy: str = 'default', target: str = 'sm90'):
     """key_walk_factors's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_key_walk_factors_forms, operands, policy, target, single=False)
+    return _generated.call(_key_walk_factors_forms, operands, policy, target)
 
 
-_key_weights_forms: dict[tuple, Callable[..., tuple]] = {
+_key_weights_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((64, 32), 'float32'), *(((32,), 'float32'),) * 2)):
         _key_weights_0,
     ('default', 'sm90', (((128, 64), 'float32'), *(((64,), 'float32'),) * 2)):
         _key_weights_0,
-}
+})
 
 
 def key_weights(*operands, policy: str = 'default', target: str = 'sm90'):
     """key_weights's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_key_weights_forms, operands, policy, target, single=False)
+    return _generated.call(_key_weights_forms, operands, policy, target)
 
 
-_keys_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
+_keys_cotangent_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (*(((64, 32), 'float32'),) * 2, *(((32,), 'float32'),) * 2, ((64, 32), 'bool'))):
         _keys_cotangent_0,
-}
+})
 
 
 def keys_cotangent(*operands, policy: str = 'default', target: str = 'sm90'):
     """keys_cotangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_keys_cotangent_forms, operands, policy, target, single=True)
+    return _generated.call(_keys_cotangent_forms, operands, policy, target)
 
 
-_online_softmax_step_forms: dict[tuple, Callable[..., tuple]] = {
+_online_softmax_step_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (
         ((32, 64), 'float32'), *(((32,), 'float32'),) * 2, ((32, 64), 'float32'), ((64, 64), 'float32'))):
         _online_softmax_step_0,
     ('default', 'sm90', (
         ((64, 128), 'float32'), *(((64,), 'float32'),) * 2, ((64, 64), 'float32'), ((64, 128), 'float32'))):
         _online_softmax_step_0,
-}
+})
 
 
 def online_softmax_step(*operands, policy: str = 'default', target: str = 'sm90'):
     """online_softmax_step's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_online_softmax_step_forms, operands, policy, target, single=False)
+    return _generated.call(_online_softmax_step_forms, operands, policy, target)
 
 
-_queries_cotangent_forms: dict[tuple, Callable[..., tuple]] = {
+_queries_cotangent_forms = _generated.Forms(single=False, cases={
     ('accurate', 'sm90', (
         *(((32, 64), 'float32'),) * 2, *(((32,), 'float32'),) * 4, *(((32, 64), 'bool'),) * 2)):
         _queries_cotangent_0,
-}
+})
 
 
 def queries_cotangent(*operands, policy: str = 'accurate', target: str = 'sm90'):
     """queries_cotangent's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_queries_cotangent_forms, operands, policy, target, single=False)
+    return _generated.call(_queries_cotangent_forms, operands, policy, target)
 
 
-_query_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
+_query_dropped_cotangents_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (
         *(((32, 64), 'float32'),) * 2, *(((32,), 'float32'),) * 4, ((32, 64), 'float32'),
         *(((32, 64), 'bool'),) * 2)):
@@ -317,80 +316,80 @@ _query_dropped_cotangents_forms: dict[tuple, Callable[..., tuple]] = {
         *(((64, 128), 'float32'),) * 2, *(((64,), 'float32'),) * 4, ((64, 128), 'float32'),
         *(((64, 128), 'bool'),) * 2)):
         _query_dropped_cotangents_0,
-}
+})
 
 
 def query_dropped_cotangents(*operands, policy: str = 'default', target: str = 'sm90'):
     """query_dropped_cotangents's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_query_dropped_cotangents_forms, operands, policy, target, single=False)
+    return _generated.call(_query_dropped_cotangents_forms, operands, policy, target)
 
 
-_query_walk_factors_forms: dict[tuple, Callable[..., tuple]] = {
+_query_walk_factors_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 64), 'float32'), ((32,), 'float32'))):
         functools.partial(shared_component_34, p1=(1,), p3=(32, 1), p4=(0,)),
     ('default', 'sm90', (((64, 128), 'float32'), ((64,), 'float32'))):
         functools.partial(shared_component_34, p1=(1,), p3=(64, 1), p4=(0,)),
-}
+})
 
 
 def query_walk_factors(*operands, policy: str = 'default', target: str = 'sm90'):
     """query_walk_factors's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_query_walk_factors_forms, operands, policy, target, single=False)
+    return _generated.call(_query_walk_factors_forms, operands, policy, target)
 
 
-_query_weights_forms: dict[tuple, Callable[..., tuple]] = {
+_query_weights_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 64), 'float32'), *(((32,), 'float32'),) * 2)):
         _query_weights_0,
     ('default', 'sm90', (((64, 128), 'float32'), *(((64,), 'float32'),) * 2)):
         _query_weights_0,
-}
+})
 
 
 def query_weights(*operands, policy: str = 'default', target: str = 'sm90'):
     """query_weights's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_query_weights_forms, operands, policy, target, single=False)
+    return _generated.call(_query_weights_forms, operands, policy, target)
 
 
-_sink_state_forms: dict[tuple, Callable[..., tuple]] = {
+_sink_state_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((1, 32, 8), 'float32'),)):
         functools.partial(shared_component_44, p1=(0, 2, 1), p2=(1, 8, 32), p3=(), p4=(1, 8, 32, 64)),
     ('default', 'sm90', (((2, 64, 16), 'float32'),)):
         functools.partial(shared_component_44, p1=(0, 2, 1), p2=(2, 16, 64), p3=(), p4=(2, 16, 64, 64)),
-}
+})
 
 
 def sink_state(*operands, policy: str = 'default', target: str = 'sm90'):
     """sink_state's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_sink_state_forms, operands, policy, target, single=False)
+    return _generated.call(_sink_state_forms, operands, policy, target)
 
 
-_sliding_visibility_forms: dict[tuple, Callable[..., tuple]] = {
+_sliding_visibility_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((64,), 'int32'), *(((32,), 'int32'),) * 3, ((64,), 'int32'))):
         _sliding_visibility_0,
     ('default', 'sm90', (((128,), 'int32'), *(((64,), 'int32'),) * 3, ((128,), 'int32'))):
         _sliding_visibility_0,
-}
+})
 
 
 def sliding_visibility(*operands, policy: str = 'default', target: str = 'sm90'):
     """sliding_visibility's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_sliding_visibility_forms, operands, policy, target, single=True)
+    return _generated.call(_sliding_visibility_forms, operands, policy, target)
 
 
-_softcap_tile_forms: dict[tuple, Callable[..., tuple]] = {
+_softcap_tile_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (((32, 64), 'float32'), ((32, 64), 'bool'))):
         _softcap_tile_0,
     ('default', 'sm90', (((64, 128), 'float32'), ((64, 128), 'bool'))):
         _softcap_tile_0,
-}
+})
 
 
 def softcap_tile(*operands, policy: str = 'default', target: str = 'sm90'):
     """softcap_tile's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_softcap_tile_forms, operands, policy, target, single=False)
+    return _generated.call(_softcap_tile_forms, operands, policy, target)
 
 
-_split_kv_merge_forms: dict[tuple, Callable[..., tuple]] = {
+_split_kv_merge_forms = _generated.Forms(single=False, cases={
     ('default', 'sm90', (
         ((32, 64), 'float32'), *(((32,), 'float32'),) * 2, ((32, 64), 'float32'),
         *(((32,), 'float32'),) * 2)):
@@ -399,35 +398,35 @@ _split_kv_merge_forms: dict[tuple, Callable[..., tuple]] = {
         ((64, 128), 'float32'), *(((64,), 'float32'),) * 2, ((64, 128), 'float32'),
         *(((64,), 'float32'),) * 2)):
         _split_kv_merge_0,
-}
+})
 
 
 def split_kv_merge(*operands, policy: str = 'default', target: str = 'sm90'):
     """split_kv_merge's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_split_kv_merge_forms, operands, policy, target, single=False)
+    return _generated.call(_split_kv_merge_forms, operands, policy, target)
 
 
-_values_gradient_forms: dict[tuple, Callable[..., tuple]] = {
+_values_gradient_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 64), 'float32'), ((32, 128), 'float32'), *(((32,), 'float32'),) * 2)):
         _values_gradient_0,
     ('default', 'sm90', (((64, 128), 'float32'), ((64, 256), 'float32'), *(((64,), 'float32'),) * 2)):
         _values_gradient_0,
-}
+})
 
 
 def values_gradient(*operands, policy: str = 'default', target: str = 'sm90'):
     """values_gradient's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_values_gradient_forms, operands, policy, target, single=True)
+    return _generated.call(_values_gradient_forms, operands, policy, target)
 
 
-_walk_output_forms: dict[tuple, Callable[..., tuple]] = {
+_walk_output_forms = _generated.Forms(single=True, cases={
     ('default', 'sm90', (((32, 64), 'float32'), *(((32,), 'float32'),) * 2)):
         _walk_output_0,
     ('default', 'sm90', (((64, 128), 'float32'), *(((64,), 'float32'),) * 2)):
         _walk_output_0,
-}
+})
 
 
 def walk_output(*operands, policy: str = 'default', target: str = 'sm90'):
     """walk_output's generated form for `policy` and `target` at its operands' case."""
-    return _generated.call(_walk_output_forms, operands, policy, target, single=True)
+    return _generated.call(_walk_output_forms, operands, policy, target)

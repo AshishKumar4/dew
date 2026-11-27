@@ -339,7 +339,42 @@ def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[s
             invoke = Binding(outputs, Call(name, tuple(found.arguments[i] for i in order)), unpack=True)
             statements = (*body.statements[:found.first], invoke, *body.statements[found.first + width:])
             forms[found.name] = dataclasses.replace(body, statements=statements)
-    return forms
+    return _forwarded(forms, set(source))
+
+
+def _forwarded(forms: dict[str, Body], kept: set[str]) -> dict[str, Body]:
+    """`forms` without a helper that only forwards to another (its inputs passed in order, every output
+    returned as it came), each call of it the other's: a span factored again whole leaves one. The
+    declarations' own bodies (`kept`) stay, a caller's names."""
+    target = {}
+    for name, body in forms.items():
+        if name in kept or len(body.statements) != 1:
+            continue
+        (binding,) = body.statements
+        if (isinstance(binding, Binding) and binding.unpack and isinstance(call := binding.value, Call)
+                and isinstance(call.callee, str) and call.callee in forms and not call.keywords
+                and call.operands == tuple(map(Ref, body.inputs))
+                and body.outputs == tuple(map(Ref, binding.targets))
+                and len(forms[call.callee].outputs) == len(binding.targets)):
+            target[name] = call.callee
+    if not target:
+        return forms
+
+    def resolved(callee: str) -> str:
+        # A chain's end: every forwarder found above, a rewrite of callees making none another.
+        while callee in target:
+            callee = target[callee]
+        return callee
+
+    def retargeted(statement):
+        if (isinstance(statement, Binding) and isinstance(call := statement.value, Call)
+                and isinstance(call.callee, str) and call.callee in target):
+            moved = dataclasses.replace(call, callee=resolved(call.callee))
+            return dataclasses.replace(statement, value=moved)
+        return statement
+
+    return {name: dataclasses.replace(body, statements=tuple(map(retargeted, body.statements)))
+            for name, body in forms.items() if name not in target}
 
 
 def bound_call(body: Body, shared_bodies: dict[str, Body],
