@@ -296,17 +296,25 @@ def test_a_read_only_folder_replaced_leaves_no_tree_behind(tmp_path):
     assert left == ["release"], left
 
 
+def losing_build(tmp_path):
+    """A destination another writer published first, and the build a second writer made beside it, one
+    file in each."""
+    directory = tmp_path / "published"
+    directory.mkdir()
+    (directory / "who").write_text("first")
+    built = tmp_path / "built"
+    built.mkdir()
+    (built / "who").write_text("second")
+    return directory, built
+
+
 def test_a_build_published_second_is_removed_whole_where_its_owner_cannot_search_it(tmp_path):
     """A build that loses its publication to another writer, each folder of it readable to its owner but
     not searchable (`0400`), a file and a folder in each, is removed whole: each folder is opened to its
     owner before its entries are looked up (train 1430's review: the first lookup failed, and the build
     was left beside the release)."""
-    directory = tmp_path / "published"
-    directory.mkdir()
-    (directory / "who").write_text("first")
-    built = tmp_path / "built"
-    (built / "inner").mkdir(parents=True)
-    (built / "who").write_text("second")
+    directory, built = losing_build(tmp_path)
+    (built / "inner").mkdir()
     (built / "inner" / "weights").write_text("second")
     (built / "inner").chmod(0o400)
     built.chmod(0o400)
@@ -320,11 +328,7 @@ def test_a_build_deeper_than_pythons_stack_is_removed_whole_when_published_secon
     allows (its recursion limit lowered to 150 frames past the test's own), is removed whole: its folders
     are walked on a stack of descriptors, not Python's (theme 74's review: a recursive walk raised
     RecursionError out of the cleanup)."""
-    directory = tmp_path / "published"
-    directory.mkdir()
-    (directory / "who").write_text("first")
-    built = tmp_path / "built"
-    built.mkdir()
+    directory, built = losing_build(tmp_path)
     folder = os.open(built, os.O_RDONLY)
     try:
         for _ in range(300):
@@ -347,12 +351,8 @@ def test_a_build_published_second_is_removed_whole_with_an_empty_folder_no_one_m
     """A build that loses its publication to another writer, holding an empty folder of mode `0000` that
     no right of its owner opens, is removed whole: the folder is removed by its name, as the entry it was
     read as, without being walked (train 1443's review: the walk skipped it and left the build)."""
-    directory = tmp_path / "published"
-    directory.mkdir()
-    (directory / "who").write_text("first")
-    built = tmp_path / "built"
-    (built / "sealed").mkdir(parents=True)
-    (built / "who").write_text("second")
+    directory, built = losing_build(tmp_path)
+    (built / "sealed").mkdir()
     (built / "sealed").chmod(0)
     assert not published(built, directory)
     assert not built.exists()

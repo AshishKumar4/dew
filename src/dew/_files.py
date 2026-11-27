@@ -258,9 +258,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     # group one takes then (`_granted`, `_made_in`), released just before: a write that takes the
     # filesystem's last inode leaves the commit its own (train 1443's review).
     held_inode = None if grpid is not None else _beside(directory.parent / "probe", ".held")
+    # Its publication's lock file made or opened now, before anything is written, and locked at the commit.
+    lock = _publication_lock(directory)
     staging = _beside(directory, ".staging")
-    os.mkdir(staging, 0o700)
     try:
+        os.mkdir(staging, 0o700)
         if held_inode is not None:
             held_inode.mkdir(0o700)
         if before is not None:
@@ -273,7 +275,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             yield staging
         finally:
             _STAGED.reset(staged)
-        with _publishing(directory):
+        with _publishing(lock):
             held_at = existing()
             written = _entries(staging)
             held = {} if held_at is None else _entries(directory)
@@ -303,6 +305,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
         _removed(staging)
         if held_inode is not None:
             _removed(held_inode)
+        os.close(lock)
 
 
 _FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -391,9 +394,9 @@ def _emptied(root: int, log: logging.Logger) -> None:
             try:
                 inner = os.open(name, _FOLDER, dir_fd=folder)
             except OSError:
-                # A folder no right of this process opens (a `0000` one): removed where it is empty, while
-                # its name names the entry it was read as, never walked (train 1443's review).
-                _rmdir_held(folder, name, found, log)
+                # A folder no right of this process opens to read (a `0000` one): removed where it is empty,
+                # never walked (train 1443's review), held as the entry it was read as (`_rmdir_pinned`).
+                _rmdir_pinned(folder, name, found, log)
                 continue
             try:
                 held = os.fstat(inner)
@@ -420,6 +423,29 @@ def _listed(folder: int, log: logging.Logger) -> Iterator[str]:
     except OSError as unread:
         log.warning("could not read a folder of a save's discarded tree: %s", unread)
         return iter(())
+
+
+def _rmdir_pinned(folder: int, name: str, found: os.stat_result, log: logging.Logger) -> None:
+    """The folder `name` of the folder the descriptor `folder` holds, which no right of this process opens to
+    read, removed where it is empty (`_rmdir_held`) while a descriptor that reads nothing of it (Linux's
+    `O_PATH`) holds the entry it was read as (`found`), so no other folder takes its inode meanwhile; left,
+    logged, where this system has no such descriptor or it is no longer that entry."""
+    pinning = getattr(os, "O_PATH", None)
+    if pinning is None:
+        log.warning("left %s of a save's discarded tree: no right opens it and this system pins none", name)
+        return
+    try:
+        pin = os.open(name, pinning | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+    except OSError as left:
+        log.warning("could not remove %s from a save's discarded tree: %s", name, left)
+        return
+    try:
+        if not os.path.samestat(os.fstat(pin), found):
+            log.warning("left %s of a save's discarded tree: another entry took its name", name)
+            return
+        _rmdir_held(folder, name, found, log)
+    finally:
+        os.close(pin)
 
 
 def _rmdir_held(folder: int, name: str, held: os.stat_result, log: logging.Logger) -> None:
@@ -602,26 +628,33 @@ PUBLISHING_LOCK = ".dew-lock-"
 no release takes (`swapped` refuses one)."""
 
 
-@contextlib.contextmanager
-def _publishing(directory: Path) -> Iterator[None]:
-    """Hold Dew's lock of `directory`'s publication, an exclusive `flock` of its own file beside it (named
-    by a digest of its name, `PUBLISHING_LOCK`), so its publishers validate and replace it one at a time and
-    one destination's publication holds no other's. The file is opened for writing, which an exclusive lock
-    takes on every filesystem (NFS's among them), no link followed to it: an existing one as it is (a
-    sticky folder refuses creating over another user's), else made exclusively, as every file Dew writes is,
-    under the umask, and left in place, the one inode every publisher locks. Whoever the umask lets write
-    beside the release takes its lock; one it does not is refused opening it, not left waiting. The lock is
-    keyed by the destination's name as given, so publishers of one release name it alike: two spellings a
-    case-folding filesystem takes for one entry take two locks."""
+def _publication_lock(directory: Path) -> int:
+    """Dew's lock file of `directory`'s publication opened (`_publishing`), its own file beside it named by a
+    digest of its name (`PUBLISHING_LOCK`), so one destination's publication holds no other's. The file is
+    opened for writing, which an exclusive lock takes on every filesystem (NFS's among them), no link
+    followed to it: an existing one as it is (a sticky folder refuses creating over another user's), else
+    made exclusively, as every file Dew writes is, under the umask, and left in place, the one inode every
+    publisher locks. Whoever the umask lets write beside the release opens it; one it does not is refused
+    opening it, not left waiting. Opened before the export is written (`swapped`), so a write that takes the
+    filesystem's last inode leaves its commit the lock (train 1443's review). The lock is keyed by the
+    destination's name as given, so publishers of one release name it alike: two spellings a case-folding
+    filesystem takes for one entry take two locks."""
     # Keyed by the name as given: publishers of one release name it alike; two spellings a case-folding
     # filesystem takes for one entry take two locks (row 13744).
     name = PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
-    lock = _lock_file(directory.parent / name)
+    return _lock_file(directory.parent / name)
+
+
+@contextlib.contextmanager
+def _publishing(lock: int) -> Iterator[None]:
+    """Hold Dew's lock of a release's publication, an exclusive `flock` of its lock file (`lock`, its
+    descriptor, `_publication_lock`), so its publishers validate and replace it one at a time; released on
+    exit, the descriptor its caller's to close."""
+    fcntl.flock(lock, fcntl.LOCK_EX)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
         yield
     finally:
-        os.close(lock)
+        fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _lock_file(path: Path) -> int:
