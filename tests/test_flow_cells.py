@@ -208,11 +208,15 @@ def test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100(tmp_pa
     from truths_ahead import prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin")))
-    monkeypatch.setenv(tier_wire.PREPARE, "1")
     monkeypatch.setenv(tier_wire.UNIT, "a part")
     monkeypatch.setenv(tier_wire.TRUTHS, str(tmp_path))
-    with prepared(tmp_path / "sites", stamp="a", target=model_flows.node_target()):
-        recurrence_matrix.a_gated_delta_nets_training_step_at_a_models_widths_is_on_par("sm80")
+    # A prepare's flag set for the prepare alone: left set, the suite reads this test's failed assertions
+    # below as a prepare's and reports them skipped (tests/conftest.py's report hook; train 1355's review).
+    with monkeypatch.context() as preparing:
+        preparing.setenv(tier_wire.PREPARE, "1")
+        with prepared(tmp_path / "sites", stamp="a", target=model_flows.node_target()):
+            recurrence_matrix.a_gated_delta_nets_training_step_at_a_models_widths_is_on_par("sm80")
+    assert not tier_wire.preparing()
     filed = json.loads(tier_wire.needs_file(tmp_path, "a part").read_text())["programs"]
     asked = {program.get("label"): program["resident"] + program["beside"] + program["temporaries"]
              for program in filed}

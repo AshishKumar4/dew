@@ -149,18 +149,12 @@ within 512 seeds (M-JS-75d); a 16-bit cell's rounding resolves at two."""
 
 
 MODEL_WIDTHS = {"Qwen3.5-27B": {"key_heads": 16, "value_heads": 48, "key_width": 128, "value_width": 128,
-                                "length": 256}}
+                                "length": 256, "rows": 1}}
 """A model's gated delta net widths a cell may draw at (`_drawn`'s `widths`): Qwen3.5-27B's 16 key heads
 and 48 value heads of 128 (tools/benchmark_recurrence.py's shape, its fixture's config.json) over 256
-tokens, four of its template's chunks, one row (`MODEL_ROWS`). Its float64 truth a token at a time and that
-truth's terms keep a memory a token: two rows over 1,024 tokens asked 40.37 GiB of an A100's 40 (row 13580),
-a row over 256 an eighth of it."""
-
-MODEL_ROWS = 1
-"""The rows a model's widths' cell draws (`MODEL_WIDTHS`)."""
-
-MODEL_ROWS_OF = ("query", "key", "value", "state", "log_decay", "gate", "beta", "z")
-"""A gated delta net's operands with an entry a row, which a model's widths' cell takes `MODEL_ROWS` of."""
+tokens, four of its template's chunks, one row. Its float64 truth a token at a time and that truth's terms
+keep a memory a token: two rows over 1,024 tokens asked 40.37 GiB of an A100's 40 (row 13580), a row over
+256 an eighth of it."""
 
 
 def _drawn(case: dict[str, str], seed: int):
@@ -171,11 +165,6 @@ def _drawn(case: dict[str, str], seed: int):
     heads = FP32_HEADS if case["dtype"] == "float32" else VALUE_HEADS
     widths = MODEL_WIDTHS[case["widths"]] if "widths" in case else {"value_heads": heads}
     (operands,) = draw(hooks, packed=case["documents"] == "packed", seed=seed, **widths)
-    if "widths" in case:
-        # Its row-major operands' first rows; a head's own (a skip, a rate) whole.
-        operands = dataclasses.replace(operands, **{
-            name: getattr(operands, name)[:MODEL_ROWS] for name in MODEL_ROWS_OF
-            if getattr(operands, name) is not None})
     narrow = jnp.dtype(case["dtype"])
     operands = dataclasses.replace(operands, starts=None, **{
         name: getattr(operands, name).astype(narrow) for name in ("query", "key", "value", "beta")
@@ -491,10 +480,6 @@ def per_shard(choice: str, kernel: str) -> dict:
     # A TPU's scan over fp32, as its cases run it (`TPU_CASES`).
     target, dtype = ("v6e", "float32") if kernel == "tpu" else ("sm90", "bfloat16")
     case = {"generation": target, "form": form, "kernel": kernel, "dtype": dtype, "documents": "packed"}
-    hooks, starts = FORMS[form], _starts(case)
-
-    def truth(operands):
-        return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
     def specs(axis: str):
         def placed(leaf) -> PartitionSpec:
@@ -508,5 +493,5 @@ def per_shard(choice: str, kernel: str) -> dict:
         return laid
 
     return {axis: Shard(_step(case, kernel), functools.partial(_drawn, case), specs(axis),
-                        with_gradients(truth), SHARDED_SEEDS, axis, target=target)
+                        with_gradients(_truth(case)), SHARDED_SEEDS, axis, target=target)
             for axis in ("data", "fsdp")}
