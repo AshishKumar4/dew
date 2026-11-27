@@ -155,13 +155,15 @@ def test_a_fusion_output_a_named_getter_selects_keeps_the_getters_name():
 TUPLED = (FIXTURES / "tupled.hlo").read_text()
 
 
-def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace():
+@pytest.mark.parametrize("call", ["pair", "__cublas$triangularSolve"])
+def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call):
     """Dew's decoder: a gemm fusion's root is its cuBLAS call, a tuple of its result and its 32 MiB
     workspace, named by the checkpoint its dot is in. The name is the result's alone (the call's first
     element); the workspace, and every element of another instruction's tuple, keep the op_name and take no
-    name. The workspace says so (its role), apart from an unnamed value, which a memory planner frees none of
-    by recomputing (`dew.training.memory.LiveSet`)."""
-    module = module_bytes(TUPLED)
+    name, another cuBLAS call's (a triangular solve, no GEMM) among them. The workspace says so (its role),
+    apart from an unnamed value, which a memory planner frees none of by recomputing
+    (`dew.training.memory.LiveSet`)."""
+    module = module_bytes(TUPLED.replace("CALL", call))
     defined = instruction_ids(module, "e")
     assignment = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=2 * 33554432 + 16)

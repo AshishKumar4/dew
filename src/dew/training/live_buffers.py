@@ -314,7 +314,9 @@ def _maker(instruction, index: tuple[int, ...], instructions,
 
 
 def _cublas(maker) -> bool:
-    return maker.opcode == "custom-call" and maker.custom_call_target.startswith("__cublas$")
+    """Whether `maker` is a cuBLAS GEMM (`_GEMMS`), whose result leads a tuple its gemm rewriter appends a
+    workspace to; another `__cublas$` call (a triangular solve) lays out no such tuple."""
+    return maker.opcode == "custom-call" and maker.custom_call_target in _GEMMS
 
 
 def _names_output(maker, index: tuple[int, ...]) -> bool:
