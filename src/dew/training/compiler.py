@@ -931,7 +931,7 @@ class StepCompiler[L, E]:
             # The rung the run's policy starts its step at, which its search would compile (`FitSearch`).
             self.unsearched_rung(self.objective)
             (lowered, options), routes = routed(
-                lambda: lowered_for(stepping, state, batch, target, self.narrow))
+                lambda: lowered_for(stepping, self.objective, state, batch, target, self.narrow))
             raise Lowered(target, [("step", lowered)], routes, options=options)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the

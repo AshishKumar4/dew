@@ -493,8 +493,8 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
                          out_shardings=returned, donate_argnums=0)
 
 
-def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 generation: str, narrow: bool
+def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective: Objective[LossT, EffectsT],
+                                 state: TrainState, batch: Batch, generation: str, narrow: bool
                                  ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
@@ -512,6 +512,6 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
         candidate = candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow,
                                   mesh=mesh, platforms=('cuda',))
-        gathered = layer_gathers(stepping.objective, state.variables, mesh.devices.size)
-        return candidate.lowered, unlimited(step_options(stepping.objective, candidate.micro,
+        gathered = layer_gathers(objective, state.variables, mesh.devices.size)
+        return candidate.lowered, unlimited(step_options(objective, candidate.micro,
                                                          candidate.prepared.variables, mesh, gathered))

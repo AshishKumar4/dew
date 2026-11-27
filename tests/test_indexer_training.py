@@ -480,7 +480,7 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
     a tracker's, is skipped (train 1345's review F6)."""
     from test_mixers import tiny
 
-    from dew.config import LMRunConfig
+    from dew.config.lm import LMRunConfig
     from dew.config.trainer import TrainerConfig
     from dew.objectives.lm.objective import Samples
     from dew.registry import mixers
