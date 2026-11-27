@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import images_of, saved_after_one_step
+from diffusion_support import images_of, saved_after_one_step, saved_unstepped
 from interop_support import extract_fixture
 from model_support import attending
 
@@ -132,8 +132,9 @@ def test_the_loss_is_the_papers_equation(runs):
 
 @attending("xla")
 def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, tmp_path):
-    _, config, batch = runs
-    task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-2)
+    # Its weights moved by a draw: a saved run samples what its state holds, a step of it no part of that.
+    _, config, _ = runs
+    task, state = saved_unstepped(config, tmp_path / "student")
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert restored.guidance is None and TEACHER not in restored.variables
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

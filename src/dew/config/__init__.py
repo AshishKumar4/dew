@@ -100,7 +100,6 @@ from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training._fit import FitArguments, validation_suites
 from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
-from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split, episodic
 from dew.training.phase_passes import PassPolicy, SampledPasses
@@ -813,15 +812,9 @@ class RunConfig:
         main's fields reads as its checkpoint's record does."""
         from dew.inference.tasks import earlier_model
 
+        # A `stop` naming no class reads through the registry's one rule (`registry._unnamed`): a record
+        # written while it held a Pause alone (ledger 1552) a Pause, a plateau's fields a Plateau (row 12115).
         rest = {name: value for name, value in values.items() if name not in CHAINS}
-        trainer = rest.get("trainer")
-        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
-        stop = fields.get("stop")
-        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
-            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
-            # Carried until 1.0 (ledger 1552).
-            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
-            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
         # A model recorded before its components' fields changed reads as today's, as its checkpoint's
         # record does (`earlier_model`, ledger 2423).
         if isinstance(rest.get("model"), Mapping):

@@ -334,6 +334,11 @@ class TrainerConfig:
         if (isinstance(self.checkpoint_every, str) and self.checkpoint_every not in ('epoch', PASSES)
                 and not is_share(self.checkpoint_every)):
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
+        if self.stop is not None and not isinstance(self.stop, Pause | Plateau):
+            # A record's stop no class reads (`registry._unnamed` keeps it as written) would train to the
+            # full budget, neither paused nor stopped (row 12115).
+            raise TypeError(f"trainer.stop is a Pause (fraction) or a Plateau (metric, evals), not "
+                            f"{self.stop!r}")
         if self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None and (not isinstance(self.best, Best) or self.best.score is not None):

@@ -3,6 +3,8 @@ and its batch, a student stepped once and saved as a run, and a trainer's update
 objective's gradient by check 1 (`moved_weights`, `applied`, `objective_gradient`)."""
 
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -212,7 +214,7 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     inference reads. Returns the task, its stepped state and the batch."""
     import optax
 
-    from dew.training import Checkpoints, Trainer
+    from dew.training import Trainer
 
     task = config.build()
     batch = batch(task) if callable(batch) else batch
@@ -220,11 +222,34 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     # Placed as a run places it, its init one program rather than each of its operations apart.
     state, _, _ = trainer.place()
     state, *_ = trainer.compile(state, batch)(state, batch)
+    _saved_run(config, task, state, 1, directory)
+    return task, state, batch
+
+
+def _saved_run(config, task, state, step: int, directory) -> None:
+    """`state` saved as `config`'s run in `directory` at `step`, with the record its inference reads."""
+    from dew.training import Checkpoints
+
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
+    checkpoints.save(step, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(directory))
-    return task, state, batch
+
+
+def saved_unstepped(config, directory):
+    """`config`'s task at the state its run starts from (`Trainer.place`), its trained weights each moved
+    by a draw so its zero-initialized layers hold weights too (`moved`), saved as a run in `directory` with
+    the record its inference reads: a saved run that compiles no step. Returns the task and that state."""
+    import optax
+
+    from dew.training import Trainer
+
+    task = config.build()
+    state, _, _ = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3)).place()
+    state = dataclasses.replace(state, variables={
+        **state.variables, "params": moved(state.variables["params"], jax.random.key(3), 0.02)})
+    _saved_run(config, task, state, 0, directory)
+    return task, state
 
 
 def moved_weights(variables):
