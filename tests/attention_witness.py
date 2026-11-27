@@ -486,16 +486,19 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
 
 
 def _centred(pulled: Iv, records: dict, b: int, h: int, lane: Lane, *, prior: bool = False) -> Iv:
-    """The accurate backward's `(dP - c) - delta` of each query's row (`backward_witnessed`), about the
-    centre its launch takes (`attention_gradient.split_delta`'s `chosen`: an anchor key's, or 0 where it is
-    -1), from that launch's own anchor product `c` and refined `delta` (the records', with what its rounding
-    lost): `c` as split_delta sums it or as the walk's own `dP` at the anchor key, each difference rounded
-    to fp32, or `c` and `delta` summed first."""
+    """The backward's `(dP - c) - delta` of each query's row (`backward_witnessed`), about the centre its
+    launch takes (`attention_gradient.split_delta`'s `chosen`: an anchor key's, or 0 where it is -1), from
+    that launch's own anchor product `c` and refined `delta` (the records'): the rounded `delta` alone is
+    what either form's dK/dV launch receives (`attention_mosaic_backward.py`'s `refined`), which the fast
+    form's witness takes; the accurate form's keeps its existing allowance of anything to `delta + lost`
+    (its low part consumed elsewhere, as the initial state's pullback): `c` as split_delta sums it or as the
+    walk's own `dP` at the anchor key, each difference rounded to fp32, or `c` and `delta` summed first."""
     chosen = records["chosen"][b, h].astype(np.int64)
     centre = records["anchor"][b, h]
-    # About the prior D (`split_delta`'s, dQ's pass's sums), or the refined one with what its rounding lost.
+    # About the prior D (`split_delta`'s, dQ's pass's sums), or the refined one, the accurate form's within
+    # its existing allowance of what its rounding lost.
     delta = records["prior"][b, h] if prior else records["delta"][b, h]
-    widened = delta if prior else delta + records["lost"][b, h]
+    widened = delta if prior or not bool(records["accurate"]) else delta + records["lost"][b, h]
     refined = Iv(np.minimum(delta, widened), np.maximum(delta, widened))
     rows = np.arange(chosen.shape[0])
     own = Iv(pulled.lo[rows, np.maximum(chosen, 0)], pulled.hi[rows, np.maximum(chosen, 0)])
@@ -539,7 +542,8 @@ def _fast_rows(pulled: Iv, weights: Iv, exponentials: Iv, keeps: np.ndarray, do:
     """The fast backward's rows of D (`template.BackwardRows`) held to enclosures of their own, apart from
     the gradients they centre (a launch that took and stated a wrong D refused): the prior `D - c` within
     `gamma` of its terms' magnitudes of `dO · O` less the chosen key's `dO · v_c` (exact, float64; 0 where
-    it took none), and the anchor `c` within the same of its own; where two launches ran (the denominator
+    it took none), and the anchor `c` within the same of its own, exactly 0 where it took none (the fast
+    form's output residuals, `attention.output_split`); where two launches ran (the denominator
     the dQ launch's own), that denominator within its exponentials' fp32 sum in any order, and the refined
     `D - c` within `fl((D - c) + r)` of `dq_finish`'s refinement `r = fl(fl(R ratio) / fl(T' fl(1/T')))`,
     `R` the first pass's cotangents' fp32 sum; where one did (`records["fused"]`, the certify launch's
@@ -555,8 +559,11 @@ def _fast_rows(pulled: Iv, weights: Iv, exponentials: Iv, keeps: np.ndarray, do:
     # Each sum within `gamma` of its terms' magnitudes, `D - c` one more rounding.
     reach = gamma * magnitudes + 2 * FLOAT32.unit_roundoff * np.abs(delta)
     own_reach = gamma * magnitudes
+    # A row of no anchor key (`chosen` -1: the fast form's output residuals, `attention.output_split`) its
+    # anchor exactly 0; else its key's product within its sum's reach.
     found = {"prior": within(prior, Iv(delta - reach, delta + reach)),
-             "anchor": (chosen < 0) | within(anchor, Iv(centre - own_reach, centre + own_reach))}
+             "anchor": np.where(chosen < 0, anchor == 0.0,
+                                within(anchor, Iv(centre - own_reach, centre + own_reach)))}
     total, own = records["l"][b, h], records["denominator"][b, h]
     if records["fused"]:
         # One launch (`BackwardTiles.fused`, as the certify form derived it): the forward's own rows.
@@ -671,7 +678,8 @@ def assert_two_launches_held_to_their_own_d(*, interpret: bool, lane: Lane | Non
     """The backward's two launches (deterministic ops, under which `MosaicBackward.legal` refuses the fused
     one: the GPU tier's, row 13697) held to their own schedule: their gradients about the D they refined and
     over the dQ launch's own denominator held, the same gradients held as the fused launch's (the D
-    `split_delta` took, nothing lost, the forward's denominator) refused at dK."""
+    `split_delta` took, nothing lost, the forward's denominator) refused at dK; a D off, a `lost` its launch
+    never reads widening dK, and an anchor where it took none each refused."""
     import tier_wire
 
     q, k, v, do = backward_operands(3)
@@ -688,6 +696,17 @@ def assert_two_launches_held_to_their_own_d(*, interpret: bool, lane: Lane | Non
     # A refined D taken and stated a sixty-fourth off, refused at the row whatever the gradients.
     off = dict(records, delta=records["delta"] * (1 + 2.0 ** -6) + 2.0 ** -6)
     assert refused(backward_witnessed(q, k, v, do, mask, off, lane=lane), "delta")
+    # A `lost` its dK/dV launch never reads (it receives the rounded D alone) widens nothing: dK a sixteenth
+    # off beside a `lost` of a thousand times each row's D refused at dK, where D between `delta` and
+    # `delta + lost` admitted it (train 1394's P1).
+    widened = dict(records, lost=1e3 * (np.abs(records["delta"]) + 1.0),
+                   dk=records["dk"] * (1 + 2.0 ** -4) + 2.0 ** -4)
+    assert refused(backward_witnessed(q, k, v, do, mask, widened, lane=lane), "dk")
+    # The fast form's output residuals take no anchor key (`chosen` -1, `attention.output_split`): an anchor
+    # of 1 there refused at its row, where `chosen < 0` passed any.
+    assert (records["chosen"] < 0).all(), "the fast form's output residuals take no anchor key"
+    anchored = dict(records, anchor=records["anchor"] + 1.0)
+    assert refused(backward_witnessed(q, k, v, do, mask, anchored, lane=lane), "anchor")
 
 
 def assert_equal_totals_held(*, interpret: bool, lane: Lane | None = None) -> None:
