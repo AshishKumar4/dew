@@ -2416,7 +2416,14 @@ def test_hopper_forward_derives_consumer_count_from_analytic_launch_price():
             assert op.takes(ba, two, target) and op.takes(ba, three, target)
             p2, p3 = op.price_config(ba, two, target), op.price_config(ba, three, target)
             assert p2 is not None and p3 is not None
-            assert (p3 > p2 if batch == 1 else p3 >= p2), (batch, seq, heads, width, p2, p3)
+            if batch == 1:
+                assert p3 > p2, (batch, seq, heads, width, p2, p3)
+            else:
+                # Two consumers' waves and three's carry the same work here (fifteen of a tile's, ten of
+                # half again as much), so their prices part only by three's fewer programs' fixed costs,
+                # while three consumers' products ran 17% longer on a GH200's tensor cores (M-NA-41c),
+                # which no price states: the forward takes two.
+                assert op.derived(ba, target).consumers == 2, (batch, seq, heads, width, p2, p3)
 
 
 def test_an_h100s_forward_prices_its_tiles_in_their_measured_order():
