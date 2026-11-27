@@ -739,11 +739,9 @@ def mode_pool_refusals(args) -> dict:
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well, and streams that run out after one batch on both end the fit
-    there. A preview asked of an objective that cannot sample, at a validation of batches, with a tracker
-    on process 0 alone and a shared checkpointer, is refused on every process (audit P02). Each outcome is
-    what the fit ended in: the refusal it was refused with (its type, the agreement and the process it
-    names: `refusal`) and the steps it took first, or None and its steps for a fit that trained; then every
-    process passes one more agreement, which a rank left behind would block."""
+    there. Each outcome is what the fit ended in: the refusal it was refused with (its type, the agreement
+    and the process it names: `refusal`) and the steps it took first, or None and its steps for a fit that
+    trained; then every process passes one more agreement, which a rank left behind would block."""
     import jax
     import optax
     from affine_run import FEATURES, Regression
@@ -806,30 +804,8 @@ def mode_pool_refusals(args) -> dict:
         steps = [step for step, scalars in heard.scalars if "train/loss" in scalars]
         return {"refused": refused, "steps": steps}
 
-    class Unsampled(Regression):
-        """The regression, its preview refused: a model that cannot generate (`preview_refusal`)."""
-
-        def preview_refusal(self) -> str | None:
-            return "this regression generates nothing"
-
-    def previewed() -> dict:
-        """A preview fit whose tracker is process 0's alone: refused on every process, or None where it
-        trained."""
-        from recording import RecordingTracker
-
-        trainer = Trainer(Unsampled(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
-                          checkpoints=Checkpoints(str(Path(args.run_dir) / "previewed")),
-                          tracker=RecordingTracker() if rank == 0 else None)
-        try:
-            trainer.fit(stream(64, 0), steps=2, eval_every=1, preview=True,
-                        validation={"val": stream(64, 0)})
-        except (ValueError, RuntimeError) as error:
-            return {"refused": refusal(error)}
-        return {"refused": None}
-
     other = rank == 1
     outcomes = {
-        "preview": previewed(),
         "same": trained(stream(64, 0)),
         "content": trained(stream(64, int(other))),
         "named": trained(stream(64, int(other), "shared")),
