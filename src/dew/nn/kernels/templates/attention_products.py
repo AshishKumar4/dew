@@ -180,40 +180,57 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
                       natural) -> jax.Array:
     """`parallax`'s value on the template's kernels: the softmax's output and its correction along the
     second query, one forward and one backward of the call the module's docstring lays out (`jax.vjp` of
-    the route). The backward takes its accurate products and D about each query's anchor from its split sums
-    whatever the call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast
-    form's `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in
-    fp16 gave a mean of 8192). The call runs in fp32 at a logit scale of 1, its scale taken into its
-    queries and keys before it (`_scale_split`), so its dQ is the correction itself, `Σ a (t - τ) v`, no
-    scale multiplied in and divided out: at a scale of 2^-120 a correction of 2^-40 was 2^-160 in dQ, past
-    fp32's least, and at a 16-bit dQ smaller scales rounded it away. Its cost, an fp32 call's (the parts'
-    products on a GPU), is the formula's price until one walk forms it natively."""
+    the route), its logits the route's own arithmetic at `scale`. The backward takes its accurate products
+    and D about each query's anchor from its split sums whatever the call's form: D here is `τ`, the second
+    product's mean, which a rounded output's (the fast form's `rowsum(dO ⊙ O)`) moved by the second keys'
+    rounding, not their spread (keys of 8192 and 8200 in fp16 gave a mean of 8192). The call runs in fp32,
+    and the dQ it gives, `scale Σ a (t - τ) v`, takes the scale's inverse beforehand in the cotangent and
+    the value columns (`_unscaled`), exact powers of two within each one's headroom, so it is the
+    correction itself to a factor of at most √2: at a scale of 2^-120 a correction of 2^-40 was 2^-160,
+    past fp32's least, and at a 16-bit dQ smaller scales rounded it away."""
     width = query.shape[-1]
     wide = jnp.float32
-    on_query, on_key = _scale_split(scale)
-    laid_query = jnp.concatenate([query.astype(wide) * on_query,
-                                  jnp.zeros((*query.shape[:-1], value.shape[-1]), wide)], -1)
-    laid_key = jnp.concatenate([key.astype(wide) * on_key, value.astype(wide)], axis=-1)
+    on_second, on_value, rest = _unscaled(scale, second.astype(wide), value.astype(wide))
+    laid_query = jnp.concatenate([query.astype(wide), jnp.zeros((*query.shape[:-1], value.shape[-1]), wide)],
+                                 -1)
+    laid_key = jnp.concatenate([key.astype(wide), value.astype(wide) * on_value], axis=-1)
     laid_value = jnp.concatenate([second_key, value], axis=-1).astype(wide)
 
     def attended(laid_query):
-        return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=1.0, natural=natural,
+        return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
                                       accurate=True)
 
     out, pull = jax.vjp(attended, laid_query)
-    cotangent = jnp.concatenate([second.astype(wide), jnp.zeros((*out.shape[:-1], value.shape[-1]), wide)],
-                                axis=-1)
+    cotangent = jnp.concatenate([second.astype(wide) * on_second,
+                                 jnp.zeros((*out.shape[:-1], value.shape[-1]), wide)], axis=-1)
     (moved,) = pull(cotangent)
     softmax = out[..., second_key.shape[-1]:].astype(wide)
-    return (softmax - moved[..., width:].astype(wide)).astype(query.dtype)
+    return (softmax - moved[..., width:].astype(wide) / jnp.asarray(rest, wide)).astype(query.dtype)
 
 
-def _scale_split(scale: float) -> tuple[float, float]:
-    """A logit scale as its query's factor and its key's, `on_query * on_key == scale` exactly: the query's
-    the power of two nearest the scale's square root, the key's the rest, so neither moves its operands far
-    from their range where the scale is far from 1."""
-    on_query = 2.0 ** round(math.log2(scale) / 2)
-    return on_query, scale / on_query
+def _unscaled(scale: float, second: jax.Array, value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The logit scale's inverse as exact powers of two on the second query and on the value columns, each
+    within its headroom (its largest magnitude's exponent from fp32's largest, read off the data), and the
+    scale those leave on the dQ, `scale · on_second · on_value`: within √2 of 1 where the headroom holds the
+    inverse. A raising factor goes to the second query first, then the values; a lowering one to the larger
+    of the two."""
+    power = -round(math.log2(scale))
+    room = jnp.finfo(jnp.float32).maxexp - 2
+
+    def exponent(array):
+        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(array)))
+        return jnp.where(largest > 0, jnp.frexp(largest)[1], 0)
+
+    if power >= 0:
+        on_second = jnp.clip(power, 0, room - exponent(second))
+        on_value = jnp.clip(power - on_second, 0, room - exponent(value))
+    else:
+        on_second = jnp.where(exponent(second) >= exponent(value), power, 0)
+        on_value = power - on_second
+    one = jnp.float32(1)
+    # The scale's own mantissa (`scale · 2^power`, a Python double within √2 of 1) times the powers taken.
+    rest = jnp.ldexp(jnp.float32(scale * 2.0 ** power), on_second + on_value - power)
+    return jnp.ldexp(one, on_second), jnp.ldexp(one, on_value), rest
 
 
 def _parallax_formula(query, second, key, second_key, value, spans: KeySpans, *, scale: float) -> jax.Array:
@@ -272,8 +289,10 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
     if not jnp.issubdtype(place.dtype, jnp.integer):
         raise ValueError(f"a query's place is an integer, not {place.dtype}")
     # In a dtype that holds the keys' exclusive end too, the window's rule (`widened_places`), so an edge
-    # moved past a narrow place's range still reaches the keys (an int8 place of 127 over 129 keys).
-    place, _ = widened_places((place, jnp.asarray(count, jnp.int32)))
+    # moved past a narrow place's range still reaches the keys (an int8 place of 127 over 129 keys); the
+    # end of the place's own signedness (an unsigned place's beside an unsigned end, no x64 needed).
+    bound = jnp.asarray(count, jnp.uint32 if jnp.issubdtype(place.dtype, jnp.unsignedinteger) else jnp.int32)
+    place, _ = widened_places((place, bound))
 
     def within(lo, hi):
         # Each run's keys within `[lo, hi)` of the query's place, empty where none.

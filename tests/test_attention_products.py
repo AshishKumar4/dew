@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from attention_oracle import traced_attention_terms
 from generation_support import INTERPRETS
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, assert_fp32_reduction_bound, with_gradients
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_products
@@ -338,6 +338,33 @@ def test_parallax_holds_a_correction_whose_scaled_gradient_passes_fp32s_least():
     value = jnp.broadcast_to(jnp.asarray([-(2.0**-40), 2.0**-40])[None, :, None, None], (1, 2, 1, 8))
     out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-120)
     np.testing.assert_array_equal(np.asarray(out), np.full((1, 2, 1, 8), -(2.0**-40), np.float32))
+
+
+def test_parallax_forms_its_logits_as_the_route_does_at_a_scale_past_one():
+    """Parallax in fp32 at a logit scale of 4, a query of 2^127 on one column against keys of 0 and 2^-126
+    there, no second query, values 0 and 1: its logits 0 and 8 (the route's own, `scale · q·k`), its output
+    the softmax's, e^8 / (1 + e^8), where the scale split into the query made it infinite."""
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(2.0**127)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float32).at[0, 1, 0, 0].set(2.0**-126)
+    value = jnp.broadcast_to(jnp.asarray([0.0, 1.0])[None, :, None, None], (1, 2, 1, 8))
+    out = attention_products.parallax(query, jnp.zeros_like(query), key, key, value, spans, scale=4.0)
+    weight = np.exp(8.0) / (1 + np.exp(8.0))
+    assert_fp32_reduction_bound(np.asarray(out), np.full(out.shape, weight), np.full(out.shape, weight), 4)
+
+
+def test_a_banded_call_takes_an_unsigned_place_without_x64():
+    """A uint32 place of 0 over two keys, x64 off: the near product's key 0, the far's key 1 (band 0), its
+    keys' end held unsigned beside it."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    with jax.enable_x64(new_val=False):
+        laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                           attention_products.Banded((0,)),
+                                           places=jnp.asarray([[0]], jnp.uint32))[3]
+        seen = np.asarray(template.dense(laid))[0, 0]
+    np.testing.assert_array_equal(seen, [True, False, False, True])
 
 
 def test_a_banded_call_moves_a_narrow_place_past_its_dtypes_range():
