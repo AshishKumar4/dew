@@ -430,6 +430,47 @@ def test_msas_indexer_loss_holds_a_token_its_branch_scores_far_below_the_attenti
     assert np.asarray(loss(hidden))[0, 0] == 0.0
 
 
+def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infinitely_low_score():
+    """MSA's indexer loss (`msa_query_kls`) over two selected tokens whose teacher logits are 0 and -88 (a
+    mass below fp32's least normal): its branch scoring them the same, KL 0 within fp32's rounding of its
+    terms (88 e^-88, normal), the entropy's tiny term formed as the gap's, where a flushed weight dropped
+    it; scored 0 and -inf, its KL +inf and the low score's gradient the weight's, -e^-88 / 1 (0 in fp32), not
+    the infinity's own slope; a teacher logit of NaN, its KL and gradient NaN, not a finite loss over the
+    rest."""
+    query = jnp.ones((1, 2, 1, 1), jnp.float32)
+    selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
+
+    def loss(scores, key):
+        return block_sparse.msa_query_kls(scores, query, key, selected, block=2, scale=1.0)[0, 1]
+
+    key = jnp.asarray([[[[0.0]], [[-88.0]]]], jnp.float32)
+    equal = jnp.asarray([[[[0.0, -np.inf], [0.0, -88.0]]]], jnp.float32)
+    assert_fp32_reduction_bound(np.asarray(loss(equal, key)), 0.0, 2 * 88 * np.exp(-88.0), 4)
+    infinite = jnp.asarray([[[[0.0, -np.inf], [0.0, -np.inf]]]], jnp.float32)
+    assert float(loss(infinite, key)) == np.inf
+    gradient = np.asarray(jax.grad(lambda s: loss(s, key))(infinite))[0, 0, 1]
+    # The high score's: its softmax's 1 less its weight's 1 - e^-88; the low score's the weight's alone.
+    assert_fp32_reduction_bound(gradient[0], np.exp(-88.0), 2.0, 2)
+    assert -2 * np.exp(-88.0) <= gradient[1] <= 0
+    invalid = jnp.asarray([[[[0.0]], [[np.nan]]]], jnp.float32)
+    uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
+    assert np.isnan(float(loss(uniform, invalid)))
+    assert np.isnan(np.asarray(jax.grad(lambda s: loss(s, invalid))(uniform))[0, 0, 1]).all()
+
+
+def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
+    """InfLLM-V2's selection (`infllm_selection`) over five blocks of 16 keys, the second block's every key
+    hidden (`key_valid`), its real blocks' pooled logits negative: the last query's one optional pick is a
+    real block, never the hidden one, whose windows score nothing."""
+    rows, keys, width = 1, 80, 8
+    query = -jnp.ones((rows, keys, 1, width), jnp.float32)
+    key = jnp.ones((rows, keys, 1, width), jnp.float32)
+    valid = jnp.ones((rows, keys), bool).at[:, 16:32].set(False)
+    picks = block_sparse.infllm_selection(query, key, block=16, top_k=1, kernel=16, stride=16, initial=1,
+                                          local=1, key_valid=valid)
+    assert int(picks[0, 0, -1, 0]) in (2, 3)
+
+
 def test_the_indexer_teacher_gives_a_hidden_key_no_share_of_a_heads_mass():
     """The indexer's teacher (`mla.indexer_target`, MSA's and the lightning indexers'): each head's softmax
     over the keys its call allows alone. Two fp32 heads over two allowed keys and a hidden one, the first

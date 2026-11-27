@@ -286,6 +286,22 @@ def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
     return chosen & (jnp.arange(keys)[None, :] <= jnp.arange(queries)[:, None])
 
 
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def _halved_product(x: jax.Array, half: jax.Array, groups: int) -> jax.Array:
+    """`half² x / groups`, formed between the halves (`(half x)(half / groups)`), so a weight `half²` below
+    fp32's least normal flushes neither: an infinite `x` its own signed infinity at any positive weight. Its
+    derivative in `x` is the weight's, `half² / groups` (the weight takes none: the teacher is detached), an
+    infinite `x`'s alike, where the infinity's own slope was 1."""
+    return jnp.where(jnp.isinf(x), x, (half * x) * (half / groups))
+
+
+@_halved_product.defjvp
+def _halved_product_jvp(groups, primals, tangents):
+    x, half = primals
+    x_dot, _ = tangents
+    return _halved_product(x, half, groups), (half * (half / groups)) * x_dot
+
+
 def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, selected: jax.Array, *,
                   block: int, scale: float) -> jax.Array:
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
@@ -314,7 +330,8 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         top = jnp.where(jnp.isfinite(top), top, 0)
         shares = jnp.exp(logged - top)
         total = compensated_sum(shares, (shares.ndim - 1,))[..., None]
-        log_target = jnp.where(total > 0, logged - top - jnp.log(jnp.where(total > 0, total, 1)), -jnp.inf)
+        # A row of no mass none; a NaN total (an invalid teacher) propagates.
+        log_target = jnp.where(total == 0, -jnp.inf, logged - top - jnp.log(jnp.where(total == 0, 1, total)))
         # A key of the teacher's mass, a NaN's too (a teacher's invalid logit surfaces, never read as none).
         taken = keep & (log_target != -jnp.inf)
         target = jnp.exp(log_target)
@@ -336,13 +353,13 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         gap = peak - held
         tiny = log_target < jnp.log(jnp.finfo(wide).tiny)
 
+        half = jnp.exp(log_target / 2)
+
         def scaled(x):
             # `target * x / groups` of a weight below fp32's least normal: its weight's halves each a normal
             # number (e^(L/2), exact halving of its logarithm L), the product formed between them, so neither
-            # rounds to 0 first and each takes one rounding.
-            half = jnp.exp(log_target / 2)
-            # An infinite `x` (a selected score of -inf) at any positive weight is its own sign's infinity.
-            return jnp.where(jnp.isinf(x), x, (half * x) * (half / groups))
+            # rounds to 0 first and each takes one rounding (`_halved_product`).
+            return _halved_product(x, half, groups)
 
         product = target * gap
         direct = jnp.where(jnp.isfinite(gap),
@@ -350,7 +367,10 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
                            target * (peak / groups) - target * (held / groups))
         halved = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak) - scaled(held))
         gaps = jnp.where(taken, jnp.where(tiny, halved, direct), 0)
-        entropy = jnp.where(taken, target * jnp.where(taken, log_target, 0) / groups, 0)
+        # The entropy's terms formed as the gaps' are, a tiny weight's between its halves, so equal teacher
+        # and student cancel where a flushed weight dropped one side.
+        logged_safe = jnp.where(taken, log_target, 0)
+        entropy = jnp.where(taken, jnp.where(tiny, scaled(logged_safe), target * logged_safe / groups), 0)
         divergence = compensated_sum(gaps, (gaps.ndim - 1,)) + spread / groups + compensated_sum(
             entropy, (entropy.ndim - 1,))
         return jnp.where(jnp.any(keep, axis=-1), divergence, 0)
@@ -389,16 +409,25 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
         # No window holds `kernel` keys: the forced blocks alone.
         nothing = jnp.zeros((rows, groups, queries, blocks), bool)
         return top_k_selection(jnp.zeros(nothing.shape), nothing, top_k, forced=forced)
-    # A hidden key (`key_valid`) pooled as a zero, so no hidden token moves a pick.
+    # A hidden key (`key_valid`) pooled as a zero, so no hidden token moves a pick; a window of none but
+    # hidden keys scores nothing, and a block of none is no optional pick (the forced ones stand).
     pooled_keys = key.astype(jnp.float32)
+    reach = jnp.arange(windows)[None, :] * stride + kernel <= jnp.arange(queries)[:, None] + 1
     if key_valid is not None:
-        pooled_keys = jnp.where(jnp.broadcast_to(key_valid, (rows, keys))[:, :, None, None], pooled_keys, 0.0)
+        valid = jnp.broadcast_to(key_valid, (rows, keys))
+        pooled_keys = jnp.where(valid[:, :, None, None], pooled_keys, 0.0)
+        held = jax.lax.reduce_window(valid.astype(jnp.int32), 0, jax.lax.add, (1, kernel), (1, stride),
+                                     "VALID") > 0
+        reach = reach[None] & held[:, None, :]
+        lived = jnp.pad(valid, ((0, 0), (0, blocks * block - keys))).reshape(rows, blocks, block).any(-1)
+        earlier = earlier & lived[:, None, None, :]
     summed = jax.lax.reduce_window(pooled_keys, 0.0, jax.lax.add, (1, kernel, 1, 1),
                                    (1, stride, 1, 1), "VALID")
     pooled = summed / kernel
     logits = jnp.einsum("bqghd,bwgd->bghqw", query.astype(jnp.float32), pooled) * width ** -0.5
-    # A query reaches a window whose last key is at or before its own.
-    reach = jnp.arange(windows)[None, :] * stride + kernel <= jnp.arange(queries)[:, None] + 1
+    # A query reaches a window whose last key is at or before its own (and, of a row with hidden keys, one
+    # holding a real key: `reach` `[B, Q, W]`, at the logits' rows, groups and heads).
+    reach = reach if reach.ndim == 2 else reach[:, None, None]
     logits = jnp.where(reach, logits, -jnp.inf)
     weights = jnp.where(reach, jax.nn.softmax(logits, axis=-1), 0.0).sum(axis=2)
     step = block // stride
