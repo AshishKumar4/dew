@@ -299,7 +299,11 @@ def _draft(mtp: Mapping[str, object], text: Mapping[str, object]) -> NativeField
 
 
 _SITES = {'q': 'attn', 'k': 'k', 'v': 'v', 'mlp': 'mlp'}
-"""Each cross-pass site of Dew's (`cross_pass_<site>`) by the release's name of its controller."""
+"""Each cross-pass site of Dew's (`cross_pass_<site>`) by the release's name of its controller and of its
+depth query (`<site>_query`)."""
+
+_RESIDUALS = {'q': 'attention_res', 'k': 'attention_res_k', 'v': 'attention_res_v', 'mlp': 'mlp_res'}
+"""Each site's depth query in the shared decoder (`_LAYER_LEAVES`), by Dew's name of the site (`_SITES`)."""
 
 _NAMES: Renames = (
     ('model.llm.unembed', 'lm_head'), ('model.llm.embed', 'model.embed_tokens'),
@@ -322,8 +326,7 @@ decoder under `model.llm.`) onto the shared decoder's and this family's own (`_L
 transformers' conversion reads them (conversion_mapping.py `inkling2_text`, `inkling2_loop_text`)."""
 
 _LAYER_LEAVES: Leaves = {
-    'attn_query': ('attention_res', 'kernel'), 'k_query': ('attention_res_k', 'kernel'),
-    'v_query': ('attention_res_v', 'kernel'), 'mlp_query': ('mlp_res', 'kernel'),
+    **{f'{theirs}_query': (_RESIDUALS[site], 'kernel') for site, theirs in _SITES.items()},
     'input_layernorm_k.weight': ('input_layernorm_k', 'scale'),
     'input_layernorm_v.weight': ('input_layernorm_v', 'scale'),
     'attn_conv.weight': ('attn_conv', 'conv', 'weight'), 'mlp_conv.weight': ('mlp_conv', 'conv', 'weight'),
@@ -514,8 +517,8 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
         if layer:
             sites = tuple(_named('query', layer=layer, site=site) for site in _sites(kind))
             stacks.append(_query(_named('attn_queries', index=layer - 1), sites, width))
-        stacks.append(_query(_named('mlp_queries', layer=layer), (_named('query', layer=layer, site='mlp'),),
-                             width))
+        stacks.append(_query(_named('mlp_queries', layer=layer),
+                             (_named('query', layer=layer, site=_SITES['mlp']),), width))
         if (taps := _dynamic_taps(kind)) is not None:
             for conv in ('k', 'v'):
                 projection = _named('projection', layer=layer, conv=conv)

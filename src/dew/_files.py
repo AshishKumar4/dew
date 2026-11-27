@@ -219,8 +219,8 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
     The new tree is made private from its first call (mode 0700), in the group and with the setgid bit
     of the one it replaces, so what is written in it takes that group, and published, under the lock, as
     the destination is then (`_granted`): with the group and mode of the tree it replaces, or the mode a
-    new folder takes beside it under the umask (`_made_mode`) with the group and setgid bit its parent
-    gives one, each file and folder it writes where the earlier tree held one by that name with that one's
+    new folder takes beside it under the umask (`_made_mode`) with the group and setgid bit one made there
+    under the lock takes (`_made_in`), each file and folder it writes where the earlier tree held one by that name with that one's
     group and mode, so a private destination's weights, or a private component's in a group of its own,
     are never readable by others. Dew's publishers of one
     destination take its validation and replacement in turn (`_publishing`, a lock file of its own beside
@@ -294,6 +294,10 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
         _removed(staging)
 
 
+_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+"""How `_removed` opens a folder of a discarded tree: to read, a folder alone, a link not followed."""
+
+
 def _removed(tree: Path) -> None:
     """Remove `tree`, a tree of a save's own (a staging, the earlier tree an exchange put there, or a build
     another writer published before), as far as this process may: a folder whose read-only mode keeps an
@@ -301,38 +305,69 @@ def _removed(tree: Path) -> None:
     it, and no other touched, nor any failure raised, so a cleanup neither fails a save already published
     nor hides the error it unwinds from (train 1407's review). The live tree is never walked.
 
-    Walked through descriptors (`os.fwalk`, no link followed), top-down first, each folder of this
-    process's own given its owner's read, write and search through the descriptor the walk holds of it
-    before the walk looks up or descends into its entries (`_opened`: a `0400` build lists its entries but
-    reaches none, train 1430's review), then bottom-up, each folder's entries removed through the descriptor
-    held of it: a folder or a link put in the tree's place meanwhile is neither changed nor followed (trains
-    1414 and 1423's reviews). The root's own parent, the release's, is never changed."""
+    Walked depth first through descriptors, each folder opened once (`_emptied`): given its owner's read,
+    write and search through its own descriptor before its entries are read (a `0400` build lists its
+    entries but reaches none, train 1430's review), its entries removed through that same descriptor, and a
+    folder's name removed only while it still names the folder emptied, the root's among them: a folder or
+    a link put in the tree's place meanwhile is neither changed, followed nor removed (trains 1414 and
+    1423's reviews, theme 74's). The root's own parent, the release's, is never changed."""
     if not os.path.lexists(tree) or os.path.islink(tree):
         return
     log = logging.getLogger(__name__)
-
-    def unread(error: OSError) -> None:
-        log.warning("could not read %s of a save's discarded tree: %s", error.filename, error)
-
+    emptied = None
     try:
-        for _, _, _, held in os.fwalk(tree, onerror=unread, follow_symlinks=False):
-            _opened(held, log)
-        for _, folders, files, held in os.fwalk(tree, topdown=False, onerror=unread, follow_symlinks=False):
-            for name in (*files, *folders):
-                _removed_in(held, name, log)
-    except OSError as unwalked:
-        # Its root opened by none of this process's rights (a mode an earlier tree's restored on it).
-        unread(unwalked)
+        root = os.open(tree, _FOLDER)
+    except OSError as unopened:
+        # Its root opened by none of this process's rights (a mode an earlier tree's restored on it): an
+        # empty one is removed all the same.
+        log.warning("could not read %s of a save's discarded tree: %s", tree, unopened)
+    else:
+        try:
+            _emptied(root, log)
+            emptied = os.fstat(root)
+        finally:
+            os.close(root)
     try:
+        if emptied is not None and not os.path.samestat(os.lstat(tree), emptied):
+            raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", str(tree))
         os.rmdir(tree)
     except OSError as left:
         # A save's own leftover, named for whoever clears it; the save's outcome is its own.
         log.warning("could not remove a save's discarded tree %s: %s", tree, left)
 
 
+def _emptied(folder: int, log: logging.Logger) -> None:
+    """Every entry of the folder the descriptor `folder` holds removed through it (`_removed`), a link not
+    followed: the folder given its owner's read, write and search first (`_opened`), and each folder in it
+    opened, emptied so and its name removed while it still names that folder; a failure logged, not
+    raised."""
+    _opened(folder, log)
+    try:
+        names = os.listdir(folder)
+    except OSError as unread:
+        log.warning("could not read a folder of a save's discarded tree: %s", unread)
+        return
+    for name in names:
+        try:
+            if not stat.S_ISDIR(os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode):
+                os.unlink(name, dir_fd=folder)
+                continue
+            inner = os.open(name, _FOLDER, dir_fd=folder)
+            try:
+                _emptied(inner, log)
+                held = os.fstat(inner)
+            finally:
+                os.close(inner)
+            if not os.path.samestat(os.stat(name, dir_fd=folder, follow_symlinks=False), held):
+                raise FileExistsError(errno.EEXIST, "another entry took its name while it was removed", name)
+            os.rmdir(name, dir_fd=folder)
+        except OSError as left:
+            log.warning("could not remove %s from a save's discarded tree: %s", name, left)
+
+
 def _opened(folder: int, log: logging.Logger) -> None:
     """The folder the descriptor `folder` holds given its owner's read, write and search where this process
-    owns it and its mode withholds any (`_removed`); a folder of another's left as it is, a failure logged,
+    owns it and its mode withholds any (`_emptied`); a folder of another's left as it is, a failure logged,
     not raised."""
     try:
         held = os.fstat(folder)
@@ -342,23 +377,14 @@ def _opened(folder: int, log: logging.Logger) -> None:
         log.warning("could not open a folder of a save's discarded tree to its owner: %s", kept)
 
 
-def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
-    """Remove the entry `name` of the folder the descriptor `folder` holds (a folder, emptied already, or
-    any other entry, a link not followed); a failure logged, not raised."""
-    try:
-        kind = os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode
-        (os.rmdir if stat.S_ISDIR(kind) else os.unlink)(name, dir_fd=folder)
-    except OSError as left:
-        log.warning("could not remove %s from a save's discarded tree: %s", name, left)
-
-
 def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, grpid: bool | None,
              written: Entries, replacements: Replacements) -> int:
     """Give each entry of `staging` the group and access the tree published from it takes at `directory`,
     as the destination is now, and return the mode its root takes, which its caller sets last.
 
     The root takes the group, mode and setgid bit of the tree it replaces (`held_at`), or, new, a folder's
-    made there (`made`, its mode under the umask) with the setgid bit and group its parent gives one now.
+    made there (`made`, its mode under the umask) with the setgid bit and group a folder made there now
+    takes (`_made_in`).
     An entry that replaces earlier ones (`replacements`) takes their group, which they share (one they do
     not, or one this process cannot give, refused, as `chown` refuses it, before anything moves), and the
     access every one of them allowed, so a component's private weights in a group of their own stay so
@@ -380,16 +406,12 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
         earlier.update((entry, (group, allowed)) for entry in entries)
     egid = os.getegid()
     if held_at is None:
-        parent = directory.parent.stat()
-        setgid = parent.st_mode & stat.S_ISGID
-        # The group a folder made in the parent takes now: its own where it is setgid or the filesystem
-        # gives an entry its folder's (`grpid`), the publisher's otherwise.
-        if not setgid and grpid is None and parent.st_gid != egid:
-            raise PermissionError(f"{directory} is new in a folder of another group than the publisher's, "
-                                  "which this filesystem gives it or not by a rule no probe of this process "
-                                  "reads: publish it as a user of another group, or set the folder's setgid "
-                                  "bit")
-        root = (parent.st_gid if setgid or grpid else egid, (made & ~stat.S_ISGID) | setgid)
+        # The group and setgid bit a folder made in the parent takes now, read off one made there under the
+        # lock (`_made_in`), whatever rule gives them: a publisher of one group in a folder of another's
+        # publishes where the rule is the maker's group, no rule of the filesystem's asked (theme 74's
+        # review: the grpid probe, no longer reading the parent, answered none there).
+        fresh = _made_in(directory.parent)
+        root = (fresh.st_gid, (made & ~stat.S_ISGID) | (stat.S_IMODE(fresh.st_mode) & stat.S_ISGID))
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
     _grouped(staging, root[0])
@@ -468,15 +490,22 @@ def _keeps_folder_group(parent: Path) -> bool | None:
         _removed(probe)
 
 
-def _made_mode(parent: Path) -> int:
-    """The mode a folder made in `parent` takes under the process's umask, the parent's setgid bit among
-    it: read off one made and removed, the umask read nowhere else, so no other thread's is changed."""
+def _made_in(parent: Path) -> os.stat_result:
+    """A folder made in `parent` now, read off one made and removed: the mode it takes under the process's
+    umask, the parent's setgid bit among it, read nowhere else, so no other thread's umask is changed, and
+    the group the filesystem gives it, by whatever rule (`_granted`)."""
     probe = _beside(parent / "probe", ".mode")
     probe.mkdir()
     try:
-        return stat.S_IMODE(probe.stat().st_mode)
+        return probe.stat()
     finally:
         probe.rmdir()
+
+
+def _made_mode(parent: Path) -> int:
+    """The mode a folder made in `parent` takes under the process's umask, the parent's setgid bit among it
+    (`_made_in`)."""
+    return stat.S_IMODE(_made_in(parent).st_mode)
 
 
 def _located(directory: Path) -> Path:

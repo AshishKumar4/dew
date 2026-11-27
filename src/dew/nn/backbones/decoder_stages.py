@@ -127,7 +127,11 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         # (`decoder_cache._banked_runs`), each run's layers' under the run's name, as the run's scan
         # carries it; a cache handed in a layer at a time goes back so.
         banked = (*banked, 'cache')
-    if stages == 1 and not staged and not banked and span is None:
+    if (stages == 1 and not staged and not banked and span is None and 'streaming' not in decoder.variables
+            and not captures_any_method(decoder)):
+        # A one-stage run whose every layer is frozen reads them where they lie, as a stage-local state's
+        # runs: but under a caller's capture of any method, whose non-array returns no scan stacks, it runs
+        # them as the plain stack does below (theme 74's review).
         staged = _frozen_staged(decoder)
     if stages == 1 and staged:
         if span is not None:

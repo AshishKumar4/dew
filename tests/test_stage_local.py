@@ -993,6 +993,50 @@ def test_a_head_only_run_reads_its_frozen_layers_where_they_lie():
     assert held[True] <= held[False], held
 
 
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.mesh(devices=1)
+def test_a_head_only_runs_frozen_layers_run_under_a_capture_of_every_method():
+    """A head-only stage-local decoder whose every layer is frozen, under a caller's capture of every method
+    (`capture_intermediates=lambda module, method: True`, a method returning no array among them), runs its
+    layers as the plain stack does and captures them, as a decoder whose layers are not frozen does: its
+    frozen layers are read where they lie only where no such capture is open (theme 74's review: the scan
+    stacked a layer's string kind as its intermediates)."""
+    from dew.nn.sharding import held_by_stage
+
+    model = decoder()
+    ids = jnp.asarray(np.random.default_rng(4751).integers(0, VOCAB, (2, SEQ)), jnp.int32)
+    base = model.init(jax.random.key(0), ids)
+    head = freeze(base, lambda path: not any(key.startswith("layers_") for key in path))
+    (site,) = model.stage_sites({"params": head["params"], FROZEN: head[FROZEN]}, 1)
+    assert site.frozen
+    with held_by_stage((site,)):
+        _, captured = model.apply({"params": merge(head["params"], head[FROZEN])}, ids,
+                                  capture_intermediates=lambda module, method: True, mutable=["intermediates"])
+    layers = sorted(captured["intermediates"])
+    assert any(name.startswith("layers_") for name in layers), layers
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.mesh(devices=1)
+def test_a_head_only_run_over_frozen_layers_read_where_they_lie_trains_as_one_holding_no_stage_state():
+    """A head-only run on one stage, its frozen layers read a row an iteration where they lie
+    (`DecoderBank.frozen`), trains its head two steps on par with the same run holding no stage-local state,
+    against one device's float64 (check 1): each iteration reads its own layer's rows, each layer drawn
+    apart (theme 74's review: the memory bound alone holds a wrong row read)."""
+    model = decoder()
+
+    def head(seed: int):
+        base = model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32))
+        return freeze(base, lambda path: not any(key.startswith("layers_") for key in path))
+
+    initial = initials(model, LORA_OPTIMIZER, head)
+    local, whole = (stepped(model, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=head(0),
+                            stage_local=held) for held in (True, False))
+    truth = stepped(model, LORA_OPTIMIZER, MeshSpec(), 1, initial, variables=head(0), exact=True)
+    assert_as_exact(local, whole, draw, "a head-only run's frozen layers read where they lie", seeds=SEEDS,
+                    truth_fn=truth)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
     """A rollout samples from the state a stage-local run holds, each layer on its own stage's devices,
