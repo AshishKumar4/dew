@@ -95,6 +95,7 @@ from dew.nn.kernels.templates.attention_mosaic_fused import (
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BACKWARD_CONSUMERS,
+    POINTWISE_ROWS,
     ROUNDED,
     BackwardTiles,
     Tiles,
@@ -1568,7 +1569,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_tiles=pointwise_tiles(hooks.output.fn, kinds_of(hooks.output.sides),
                                                     tuple(kept_dtype(param.value.dtype)
                                                           for param in hooks.output.sides),
-                                                    head_width(value.shape[3])),
+                                                    (POINTWISE_ROWS, head_width(value.shape[3]))),
                        score_reduces=hook_reduces(hooks), output_width=head_width(value.shape[3]),
                        form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,

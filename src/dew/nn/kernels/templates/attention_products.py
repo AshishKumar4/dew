@@ -182,10 +182,10 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
     backward takes its accurate products and D about each query's anchor from its split sums whatever the
     call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast form's
     `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in fp16
-    gave a mean of 8192). The call's operands arrive in fp32 and narrow to the query's dtype in the
-    mainloops (`attention_route.attend`'s `operand_dtype`), so its dQ comes back unrounded: the cotangent
-    is the second query as given, and its scale leaves the fp32 dQ (`scale Σ a (t - τ) v`) before any
-    rounding, under- or overflowing nowhere the result does not."""
+    gave a mean of 8192). The call runs in fp32 whatever its operands' dtype, so its dQ (`scale Σ a (t - τ)
+    v`) holds in fp32's range and the scale leaves it there: a 16-bit dQ rounded it away at a small scale
+    (fp16 at 2^-26 gave 0 for -1), and the mainloops round dQ to the query's dtype. Its cost, an fp32
+    call's (the parts' products on a GPU), is the formula's price until one walk forms it natively."""
     width = query.shape[-1]
     wide = jnp.float32
     laid_query = jnp.concatenate([query, jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)],
@@ -195,7 +195,7 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
 
     def attended(laid_query):
         return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
-                                      accurate=True, operand_dtype=query.dtype)
+                                      accurate=True)
 
     out, pull = jax.vjp(attended, laid_query)
     cotangent = jnp.concatenate([second.astype(out.dtype),
@@ -255,12 +255,18 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
     count, bands = spans.keys, combine.bands
     start, end = ((spans.start, spans.end) if spans.start.ndim == 3
                   else (spans.start[..., None], spans.end[..., None]))
+    # Each query's place in its own integer dtype (an index's int32 by default), its edges moved there and
+    # clipped to the keys before they narrow to the spans' int32.
     place = (jnp.broadcast_to(jnp.arange(start.shape[1], dtype=jnp.int32)[None, :], start.shape[:2])
-             if places is None else jnp.asarray(places, jnp.int32))[..., None]
+             if places is None else jnp.asarray(places))[..., None]
+    if not jnp.issubdtype(place.dtype, jnp.integer):
+        raise ValueError(f"a query's place is an integer, not {place.dtype}")
 
     def within(lo, hi):
-        # Each run's keys within `[lo, hi)` of the query's index, empty where none.
-        return jnp.maximum(start, jnp.clip(lo, 0, count)), jnp.minimum(end, jnp.clip(hi, 0, count))
+        # Each run's keys within `[lo, hi)` of the query's place, empty where none.
+        def held(edge):
+            return jnp.clip(jnp.asarray(edge), 0, count).astype(start.dtype)
+        return jnp.maximum(start, held(lo)), jnp.minimum(end, held(hi))
 
     # Each edge a place moved by a band, held at int32's ends rather than wrapping (`moved_places`), then
     # clipped to the keys: a band however wide, about a place however far, selects the keys it holds.
@@ -271,8 +277,8 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
         else:
             # Past band p - 1 and within band p: the keys before the query, then those after it; the last
             # band's outer edges the keys' own, whatever the query's place.
-            before = moved_places(place, -bands[p]) if p < len(bands) else jnp.zeros_like(place)
-            after = moved_places(place, bands[p] + 1) if p < len(bands) else jnp.full_like(place, count)
+            before = moved_places(place, -bands[p]) if p < len(bands) else 0
+            after = moved_places(place, bands[p] + 1) if p < len(bands) else count
             sides = [within(before, moved_places(place, -bands[p - 1])),
                      within(moved_places(place, bands[p - 1] + 1), after)]
         lo = jnp.concatenate([side[0] for side in sides], axis=-1)

@@ -313,6 +313,34 @@ def test_parallax_holds_a_second_query_past_its_dtypes_range_over_the_scale():
     np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
 
 
+def test_parallax_holds_its_correction_at_a_scale_a_16_bit_gradient_would_round_away():
+    """Parallax in fp16 at a logit scale of 2^-26, zero logits, a second query of 1 against second keys and
+    values of -1 and 1: its correction 1 (the softmax's 0 less it), -1 exactly, where its dQ, the scale
+    times it, rounded to fp16 was 0."""
+    spans = template.spans(2, 2, 1)
+    zeros = jnp.zeros((1, 2, 1, 8), jnp.float16)
+    second = zeros.at[..., 0].set(1.0)
+    pair = jnp.asarray([-1.0, 1.0], jnp.float16)
+    second_key = zeros.at[0, :, 0, 0].set(pair)
+    value = jnp.broadcast_to(pair[None, :, None, None], (1, 2, 1, 8))
+    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-26)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
+
+
+def test_a_banded_call_keeps_a_querys_place_in_its_own_dtype():
+    """A query placed at 2^32 (int64) over two keys, a near band of 0: both keys are the far product's, the
+    place's distance from each past int32's range, where an int32 place wrapped to 0 and took key 0 near."""
+    spans = template.spans(1, 2, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 2, KV_HEADS, WIDTH), jnp.bfloat16)
+    with jax.enable_x64(new_val=True):
+        laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                           attention_products.Banded((0,)),
+                                           places=jnp.asarray([[2**32]], jnp.int64))[3]
+        seen = np.asarray(template.dense(laid))[0, 0]
+    np.testing.assert_array_equal(seen, [False, False, True, True])
+
+
 def test_parallax_holds_its_second_products_mean_where_a_rounded_output_would_move_it():
     """Parallax over uniform logits, values all 1 and fp16 second keys 8192 and 8200 (their mean 8196, which
     fp16 rounds to 8192): its weights `a (1 + τ - t)` sum to 1, so its output is 1, its backward's D the

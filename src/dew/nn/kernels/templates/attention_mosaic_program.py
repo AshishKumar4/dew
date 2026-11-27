@@ -1955,55 +1955,96 @@ def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_outp
 
 
 POINTWISE_ROWS = 8
-"""The rows an output hook is traced at to read whether it is pointwise (`pointwise_tiles`)."""
+"""The rows the forward's register model traces an output hook at (`pointwise_tiles`), before its launch's
+query tile is chosen."""
 
 
-def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], width: int
-                    ) -> tuple[str, ...] | None:
-    """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input where its epilogue may
-    finish it a chunk of columns at a time (`BlockPlan.epilogue_chunk`): traced at a tile `[POINTWISE_ROWS,
-    width]` of fp32 output (`width` the launch's padded value width) and its parameters' tiles (a head's a
-    scalar), every equation entrywise (`layout.entrywise`, a call's or a conditional's program so), every
-    value that tile's or a scalar's, every constant it closes over a scalar; and its program the same at
-    every narrower power-of-two width a chunk may take, constants and literals alike (`_encoded`), so a
-    block of an output tile's columns and the parameters' same columns give that block of its value (a hook
-    reading its width, `o * o.shape[-1]`, multiplied a 256-wide output by a chunk's 32). None where it is
-    not, or where there is none (the whole-width finish). Its tiles' dtypes are plain data, which a launch
-    keyed by its hook's fingerprint (`tuning.KernelOp.keyed`) keeps."""
+def pointwise_tiles(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
+                    tile: tuple[int, int]) -> tuple[str, ...] | None:
+    """The dtypes of the tiles an output hook `hook(o, *sides)` makes past its input where its program at a
+    `tile` of fp32 output acts one entry at a time (`entrywise_hook`), which its epilogue then replays on a
+    chunk of the tile's columns (`sliced_hook`); None where it does not, or there is none (the whole-width
+    finish). Its tiles' dtypes are plain data, which a launch keyed by its hook's fingerprint
+    (`tuning.KernelOp.keyed`) keeps."""
+    closed = entrywise_hook(hook, kinds, dtypes, tile)
+    if closed is None:
+        return None
+    return tuple(jnp.dtype(_aval(var).dtype).name for eqn in closed.jaxpr.eqns for var in eqn.outvars
+                 if tuple(_aval(var).shape) == tile)
+
+
+def entrywise_hook(hook: Callable | None, kinds: tuple[Kind, ...], dtypes: tuple[str, ...],
+                   tile: tuple[int, int]):
+    """An output hook's program at a `tile` of fp32 output and its parameters' tiles (a head's a scalar),
+    where it acts one entry at a time: every equation entrywise (`layout.entrywise`, a call's or a
+    conditional's program so), every value that tile's or a scalar's, every constant it closes over a
+    scalar. None where it does not or there is none. Whatever it reads of its tile's shape (`o.shape`) is
+    a literal of that shape in the program, which `sliced_hook` replays as it is on each chunk."""
     if hook is None or not callable(hook):
         return None
-    return _pointwise_tiles(hook, kinds, dtypes, width)
+    return _entrywise_hook(hook, kinds, dtypes, tile)
 
 
 @functools.lru_cache(maxsize=256)
-def _pointwise_tiles(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], width: int
-                     ) -> tuple[str, ...] | None:
-    """`pointwise_tiles` of `hook`, once a hook and geometry."""
+def _entrywise_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]):
+    """`entrywise_hook` of `hook`, once a hook and tile."""
+    params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else tile, kept)
+              for kind, kept in zip(kinds, dtypes, strict=True)]
+    closed = None
+    with contextlib.suppress(TypeError, ValueError):  # a hook of another tile's shape traces at none of this
+        closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
+    held = (closed is not None and all(np.ndim(const) == 0 for const in closed.consts)
+            and _acts_by_entry(closed.jaxpr, tile))
+    return closed if held else None
 
-    def traced(columns: int):
-        # Its program at a tile `columns` wide, where it acts one entry at a time there; else None (a hook
-        # of a fixed width's, which takes no other).
-        tile = (POINTWISE_ROWS, columns)
-        params = [jax.ShapeDtypeStruct(() if kind is Kind.HEAD else tile, kept)
-                  for kind, kept in zip(kinds, dtypes, strict=True)]
-        closed = None
-        with contextlib.suppress(TypeError, ValueError):  # a hook of a fixed width's traces at no other
-            closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
-        held = (closed is not None and all(np.ndim(const) == 0 for const in closed.consts)
-                and _acts_by_entry(closed.jaxpr, tile))
-        return closed if held else None
 
-    full = traced(width)
-    if full is None:
+def sliced_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], tile: tuple[int, int]
+                ) -> Callable | None:
+    """An entrywise output hook (`entrywise_hook`) as its program at the whole `tile` computes it, replayed on
+    any block of the tile's columns and its parameters' same columns (`_replayed`): its block of the
+    whole tile's value, whatever the hook reads of the tile's shape. None where it is not entrywise."""
+    closed = entrywise_hook(hook, kinds, dtypes, tile)
+    if closed is None:
         return None
-    columns = width // 2
-    while columns >= POINTWISE_ROWS:
-        narrow = traced(columns)
-        if narrow is None or _encoded(narrow.jaxpr, narrow.consts) != _encoded(full.jaxpr, full.consts):
-            return None
-        columns //= 2
-    return tuple(jnp.dtype(_aval(var).dtype).name for eqn in full.jaxpr.eqns for var in eqn.outvars
-                 if tuple(_aval(var).shape) == (POINTWISE_ROWS, width))
+
+    def replay(out, *params):
+        return _replayed(closed.jaxpr, closed.consts, (out, *params), out.shape)[0]
+
+    return replay
+
+
+def _replayed(jaxpr: jax_core.Jaxpr, consts, arguments, shape: tuple[int, ...]) -> list:
+    """`jaxpr`'s results on `arguments`, each equation bound as it stands but a scalar's broadcast, which
+    takes `shape` (a block of the columns its program was traced at): a call's or a conditional's program
+    replayed alike."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True))
+    values.update(zip(jaxpr.invars, arguments, strict=True))
+
+    def read(var):
+        return var.val if isinstance(var, jax_core.Literal) else values[var]
+
+    for eqn in jaxpr.eqns:
+        operands = [read(var) for var in eqn.invars]
+        body = called(eqn)
+        if body is not None:
+            results = _replayed(body, getattr(body, "consts", ()), operands, shape)
+        elif eqn.primitive is jax.lax.cond_p:
+            index, *rest = operands
+            results = jax.lax.switch(index, [functools.partial(_replay_branch, branch, shape)
+                                             for branch in branches(eqn)], *rest)
+        elif eqn.primitive is jax.lax.broadcast_in_dim_p:
+            (scalar,) = operands
+            results = [jax.lax.broadcast_in_dim(scalar, shape if eqn.params["shape"] else (), ())]
+        else:
+            bound = eqn.primitive.bind(*operands, **eqn.params)
+            results = bound if eqn.primitive.multiple_results else [bound]
+        values.update(zip(eqn.outvars, results, strict=True))
+    return [read(var) for var in jaxpr.outvars]
+
+
+def _replay_branch(branch, shape: tuple[int, ...], *operands) -> list:
+    """A conditional's branch replayed on `operands` (`_replayed`)."""
+    return _replayed(branch.jaxpr, branch.consts, operands, shape)
 
 
 def _aval(var) -> ShapedArray:
@@ -2031,37 +2072,6 @@ def _acts_by_entry(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
         elif not layout.entrywise(eqn):
             return False
     return True
-
-
-def _encoded(jaxpr: jax_core.Jaxpr, consts=()) -> tuple:
-    """`jaxpr` as data that holds no shape: each equation's primitive, its operands by the order they are
-    defined in (a literal by its value), its parameters but a shape (a nested program's encoded so) and its
-    results' dtypes; its constants' values. Two traces of one program at two widths encode alike."""
-    names = {var: index for index, var in enumerate((*jaxpr.constvars, *jaxpr.invars))}
-
-    def operand(var) -> tuple | int:
-        if isinstance(var, jax_core.Literal):
-            return ("literal", repr(var.val), str(_aval(var).dtype))
-        return names[var]
-
-    def parameter(value):
-        if isinstance(getattr(value, "jaxpr", None), jax_core.Jaxpr):
-            return _encoded(value.jaxpr, value.consts)
-        if isinstance(value, jax_core.Jaxpr):
-            return _encoded(value)
-        if isinstance(value, tuple | list):
-            return tuple(parameter(each) for each in value)
-        return repr(value)
-
-    encoded: list[tuple] = [tuple(repr(np.asarray(const).tolist()) for const in consts)]
-    for eqn in jaxpr.eqns:
-        params = tuple(sorted((name, parameter(value)) for name, value in eqn.params.items()
-                              if name != "shape"))
-        encoded.append((eqn.primitive.name, tuple(operand(var) for var in eqn.invars), params,
-                        tuple(str(_aval(var).dtype) for var in eqn.outvars)))
-        names.update((var, len(names)) for var in eqn.outvars)
-    encoded.append(tuple(operand(var) for var in jaxpr.outvars))
-    return tuple(encoded)
 
 
 def value_columns(padded: int, columns: int | None) -> int:

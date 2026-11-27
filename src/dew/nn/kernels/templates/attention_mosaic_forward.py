@@ -106,7 +106,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     output_stage_swizzle,
     param_types,
     params_read,
-    pointwise_tiles,
     powered_in_kernel,
     query_swizzle,
     reducing,
@@ -118,6 +117,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_stream,
     score_streams,
     score_views,
+    sliced_hook,
     staged_after,
     stages_after_walks,
     stated,
@@ -1601,15 +1601,16 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
         elif (chunk := BlockPlan(
                 split=False, out_dtype=out_view.dtype, output_hook=hooks.output.fn is not None,
-                pointwise=pointwise_tiles(hooks.output.fn, kinds_of(hooks.output.sides),
-                                          tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides),
-                                          state.acc.shape[-1]) is not None).epilogue_chunk(
+                pointwise=(sliced := sliced_hook(
+                    hooks.output.fn, kinds_of(hooks.output.sides),
+                    tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides),
+                    tuple(state.acc.shape))) is not None).epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
-            # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, pointwise
-            # in its entries (`Hooks.output`), on each chunk with its parameters' block of the chunk's
-            # columns (a d256 gated forward held whole in one launch, where its whole-width finish split it
-            # into two launches of 128 columns, each walking every key: 1.51x unhooked and XLA's gate,
-            # M-NA-47).
+            # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, its
+            # program at the whole tile replayed on each chunk with its parameters' block of the chunk's
+            # columns (`sliced_hook`: a d256 gated forward held whole in one launch, where its whole-width
+            # finish split it into two launches of 128 columns, each walking every key: 1.51x unhooked and
+            # XLA's gate, M-NA-47).
             width = state.acc.shape[-1]
             maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)
             def write_chunks(smem):
@@ -1617,7 +1618,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                     sl = pl.ds(col, chunk)
                     piece = state._replace(acc=state.acc[:, col:col + chunk])
                     out_chunk = algebra.finish(spec, piece, initial=hooked.initial is not None,
-                                               output_mod=hooks.output.fn,
+                                               output_mod=None if hooks.output.fn is None else sliced,
                                                output_params=out_params(piece.acc, col),
                                                held=program.parts > 1)[0]
                     if smem is None:
