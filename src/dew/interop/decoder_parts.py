@@ -2007,7 +2007,7 @@ class Stacked:
             tensor = step.inverse(tensor)
         return jax.ShapeDtypeStruct(tensor.shape, parts[0].dtype)
 
-    def stacked(self, read: Callable[[str], np.ndarray], stored: jax.ShapeDtypeStruct) -> np.ndarray:
+    def stacked(self, read: Callable[[str], np.ndarray], stored: jax.ShapeDtypeStruct) -> Stored:
         """The stored tensor (`stored`, its shape and dtype) of its parts, each read (`read`) as it is placed:
         into its place in the one stored tensor where each step's forward views it (`Step.views`), so the
         stored tensor and one part are held at a time, as an expert bank's are; else stacked, and taken
