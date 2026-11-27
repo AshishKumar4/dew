@@ -205,30 +205,34 @@ def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *,
                                  jnp.zeros((*out.shape[:-1], value.shape[-1]), wide)], axis=-1)
     (moved,) = pull(cotangent)
     softmax = out[..., second_key.shape[-1]:].astype(wide)
-    return (softmax - moved[..., width:].astype(wide) / jnp.asarray(rest, wide)).astype(query.dtype)
+    return (softmax - moved[..., width:].astype(wide) / rest).astype(query.dtype)
 
 
 def _unscaled(scale: float, second: jax.Array, value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The logit scale's inverse as exact powers of two on the second query and on the value columns, each
-    within its headroom (its largest magnitude's exponent from fp32's largest, read off the data), and the
-    scale those leave on the dQ, `scale · on_second · on_value`: within √2 of 1 where the headroom holds the
-    inverse. A raising factor goes to the second query first, then the values; a lowering one to the larger
-    of the two."""
+    """A logit scale below 1 undone in exact powers of two, so the dQ of `_parallax_kernels` holds its
+    correction itself, not the scale times it: on each query row's cotangent (its second query) within that
+    row's headroom, the rest on the value columns within theirs, each read off the data (a magnitude's
+    exponent from fp32's largest; no magnitude, all of it). Returns the cotangent's factor `[B, Q, H, 1]`,
+    the value columns' and what remains of the scale on each row's dQ, `scale · on_second · on_value`
+    (within √2 of 1 where the headroom holds the inverse). A scale of 1 or more stays on the dQ, which it
+    cannot take below fp32's least."""
     power = -round(math.log2(scale))
     room = jnp.finfo(jnp.float32).maxexp - 2
 
-    def exponent(array):
-        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(array)))
+    def exponent(array, axes):
+        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(array), axis=axes, keepdims=True, initial=0.0))
         return jnp.where(largest > 0, jnp.frexp(largest)[1], 0)
 
-    if power >= 0:
-        on_second = jnp.clip(power, 0, room - exponent(second))
-        on_value = jnp.clip(power - on_second, 0, room - exponent(value))
+    second_room = room - exponent(second, -1)
+    if power <= 0:
+        on_second, on_value = jnp.zeros_like(second_room), jnp.zeros((), jnp.int32)
     else:
-        on_second = jnp.where(exponent(second) >= exponent(value), power, 0)
-        on_value = power - on_second
+        # The values take what the rows that most need it cannot, their headroom permitting; each row's
+        # cotangent the rest, within its own.
+        on_value = jnp.clip(jnp.max(power - second_room, initial=0), 0, room - exponent(value, None))
+        on_second = jnp.clip(power - on_value, 0, second_room)
     one = jnp.float32(1)
-    # The scale's own mantissa (`scale · 2^power`, a Python double within √2 of 1) times the powers taken.
+    # The scale's mantissa (`scale · 2^power`, a Python double within √2 of 1) at the powers left untaken.
     rest = jnp.ldexp(jnp.float32(scale * 2.0 ** power), on_second + on_value - power)
     return jnp.ldexp(one, on_second), jnp.ldexp(one, on_value), rest
 

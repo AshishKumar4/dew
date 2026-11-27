@@ -340,6 +340,25 @@ def test_parallax_holds_a_correction_whose_scaled_gradient_passes_fp32s_least():
     np.testing.assert_array_equal(np.asarray(out), np.full((1, 2, 1, 8), -(2.0**-40), np.float32))
 
 
+def test_parallax_holds_each_rows_correction_whatever_another_rows_magnitudes():
+    """Parallax in fp32 at a logit scale of 2^-120 over two rows: the first the 2^-40 witness's (second keys
+    -1 and 1, values -2^-40 and 2^-40, its output -2^-40 exactly), the second a second query and values of
+    2^125 over second keys of 0 (its output the softmax's, 2^125): each row's correction its own, where one
+    headroom over every row left the first row's dQ at 2^-160; and a call of no keys, zeros."""
+    spans = template.spans(2, 2, 2)
+    zeros = jnp.zeros((2, 2, 1, 8), jnp.float32)
+    second = zeros.at[0, ..., 0].set(1.0).at[1, ..., 0].set(2.0**125)
+    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-1.0, 1.0]))
+    value = jnp.stack([jnp.broadcast_to(jnp.asarray([-(2.0**-40), 2.0**-40])[:, None, None], (2, 1, 8)),
+                       jnp.full((2, 1, 8), 2.0**125)])
+    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-120)
+    np.testing.assert_array_equal(np.asarray(out[0]), np.full((2, 1, 8), -(2.0**-40), np.float32))
+    np.testing.assert_array_equal(np.asarray(out[1]), np.full((2, 1, 8), 2.0**125, np.float32))
+    empty = jnp.zeros((1, 0, 1, 8), jnp.float32)
+    none = attention_products.parallax(zeros[:1], second[:1], empty, empty, empty, template.spans(2, 0, 1))
+    np.testing.assert_array_equal(np.asarray(none), np.zeros((1, 2, 1, 8), np.float32))
+
+
 def test_parallax_forms_its_logits_as_the_route_does_at_a_scale_past_one():
     """Parallax in fp32 at a logit scale of 4, a query of 2^127 on one column against keys of 0 and 2^-126
     there, no second query, values 0 and 1: its logits 0 and 8 (the route's own, `scale · q·k`), its output
