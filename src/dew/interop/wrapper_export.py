@@ -4,6 +4,7 @@ the load read written back under the names its source stores, as `Pretrained.exp
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Collection, Mapping, Sequence
 
 import numpy as np
@@ -72,9 +73,10 @@ def wrapper_layouts(tensors, record, variables, language: Sequence[decoder_parts
 
 def bundle_media_sections(config: Mapping[str, object]) -> dict[str, object]:
     """A media bundle's config sections its language model's config leaves out (`bundle_text_config`): its
-    towers' and its folders', which a load of its language model alone retains unread."""
+    towers' and its folders', which a load of its language model alone retains unread. A deep copy, so a
+    snapshot taken at load stays as loaded while its config's nested sections are edited in place."""
     text = decoders.bundle_text_config(config)
-    return {name: value for name, value in config.items() if name not in text}
+    return copy.deepcopy({name: value for name, value in config.items() if name not in text})
 
 
 def unprepared_export(unprepare: decoder_parts.WeightPreparer, record: Mapping[str, object],

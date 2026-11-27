@@ -285,15 +285,17 @@ def test_an_nvfp4_bank_writes_back_every_code_its_scales_decode_unchanged():
 
 def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from():
     """Inkling 2's MXFP8 writer compares each value in the dtype its load kept it in: a code whose decode
-    `2^-136` a bfloat16 load holds as 0 writes back as the code it was loaded from, not as a fresh 0
-    (train 1370's review F2), and a value its training changed takes its nearest code."""
+    `2^-136` (E4M3's `2^-9` under E8M0's `2^-127`) a bfloat16 load holds as 0 writes back as the code it
+    was loaded from, not as a fresh 0 (train 1370's review F2), and a value its training changed takes its
+    nearest code."""
     import ml_dtypes
 
     from dew.interop.codecs import inkling2_experts
 
     name = 'model.llm.layers.2.mlp.experts.down_proj'
     codes = np.full((1, 2, 32), 1.0, ml_dtypes.float8_e4m3fn)
-    exponents = np.asarray([[[127 - 136], [127]]], np.uint8)
+    codes[0, 0] = ml_dtypes.float8_e4m3fn(2.0 ** -9)
+    exponents = np.asarray([[[0], [127]]], np.uint8)
     stored = {name: codes, name + '_scale': exponents}
     codec = inkling2_experts(stored)
     decoded = np.asarray(codec.decode(stored, name), np.float32)

@@ -411,3 +411,7 @@ def test_a_bundles_language_model_saved_alone_refuses_an_edited_towers_section(t
         **loaded.config, 'vision_config': {**vision, 'layer_norm_eps': 2 * vision['layer_norm_eps']}})
     with pytest.raises(ExportRefused):
         edited.save(tmp_path / 'edited')
+    # Edited in place, the section the load's snapshot holds stays as loaded.
+    vision['layer_norm_eps'] = 2 * vision['layer_norm_eps']
+    with pytest.raises(ExportRefused):
+        loaded.save(tmp_path / 'edited-in-place')
