@@ -418,7 +418,7 @@ def _emitted(by_module: Mapping[str, Sequence[_Chosen]]
                   if isinstance(body, printed.Body)}
     declared = sorted({found.name for chosen in by_module.values() for found in chosen})
     shared = _component_sharing.shared(components, reserved=declared) if components else {}
-    helpers = {name: body for name, body in shared.items() if name not in components}
+    factored = {name: body for name, body in shared.items() if name not in components}
     made = {}
     for module, (bodies, named) in per.items():
         if module not in sharing:
@@ -426,13 +426,13 @@ def _emitted(by_module: Mapping[str, Sequence[_Chosen]]
             continue
         bound = {}
         for found, name in named.items():
-            call = _component_sharing.bound_call(shared[name], helpers,
+            call = _component_sharing.bound_call(shared[name], factored,
                                                  tuple(arg.shape for arg in found.operands))
             if call is not None:
                 bound[found] = call
         needed = {name for found, name in named.items() if found not in bound}
         made[module] = _Emitted({name: shared[name] for name in bodies if name in needed}, named, bound)
-    return made, helpers
+    return made, factored
 
 
 def _header(first: str, names: Sequence[str]) -> list[str]:
@@ -456,21 +456,21 @@ def _rendered(sources: Mapping[str, str | printed.Body]) -> list[str]:
     return body
 
 
-def _helpers_written(helpers: Mapping[str, printed.Body]) -> str:
+def _helpers_written(factored: Mapping[str, printed.Body]) -> str:
     """The shared helpers' module: its header and each helper printed."""
-    body = _rendered(helpers)
+    body = _rendered(factored)
     return "\n".join([*_header("for every generated module's shared spans", ()),
                       *printed.imports("\n".join(body)), *body]) + "\n"
 
 
-def _helper_reads(body: Sequence[str], helpers: Mapping[str, printed.Body]) -> list[str]:
+def _helper_reads(body: Sequence[str], factored: Mapping[str, printed.Body]) -> list[str]:
     """The shared helpers `body`'s lines call, in their module's order."""
     text = "\n".join(body)
-    return [name for name in helpers if re.search(rf"(?<![\w.]){name}\b", text)]
+    return [name for name in factored if re.search(rf"(?<![\w.]){name}\b", text)]
 
 
 def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitted: _Emitted,
-             helpers: Mapping[str, printed.Body]) -> tuple[str, str]:
+             factored: Mapping[str, printed.Body]) -> tuple[str, str]:
     """The generated module's text: its header, each chosen form printed (`printed.source`), the shared
     helpers it calls imported (`SHARED`), and each declaration's function, which picks its form by policy,
     target and its operands' shapes and dtypes; and the same module with those helpers written in place of
@@ -500,7 +500,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]
     header = _header(f"from {module}", names)
-    reads = _helper_reads(body, helpers)
+    reads = _helper_reads(body, factored)
     imports = printed.imports("\n".join(body))
     if reads:
         one = f"from {SHARED} import {', '.join(reads)}"
@@ -511,20 +511,20 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
                   len(imports))
         imports[at:at] = lines
     text = "\n".join([*header, *imports, *body]) + "\n"
-    inlined = _rendered({name: helpers[name] for name in _closure(reads, helpers)})
+    inlined = _rendered({name: factored[name] for name in _closure(reads, factored)})
     admitted = "\n".join([*header, *printed.imports("\n".join([*inlined, *body])), *inlined, *body]) + "\n"
     return text, admitted
 
 
-def _closure(names: Sequence[str], helpers: Mapping[str, printed.Body]) -> list[str]:
+def _closure(names: Sequence[str], factored: Mapping[str, printed.Body]) -> list[str]:
     """`names` and every helper they call in turn, in the helpers' module order."""
     held, pending = set(), list(names)
     while pending:
         if (name := pending.pop()) in held:
             continue
         held.add(name)
-        pending += _helper_reads(_rendered({name: helpers[name]}), helpers)
-    return [name for name in helpers if name in held]
+        pending += _helper_reads(_rendered({name: factored[name]}), factored)
+    return [name for name in factored if name in held]
 
 
 def _runs(keys: Iterable[str]) -> list[str]:
@@ -590,15 +590,15 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
     found = {module: [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
              for module, declared in by_module.items()}
-    emitted, helpers = _emitted(found)
-    texts = {module: _written(module, found[module], by_module[module], emitted[module], helpers)
+    emitted, factored = _emitted(found)
+    texts = {module: _written(module, found[module], by_module[module], emitted[module], factored)
              for module in by_module}
     for module, (_, admitted) in texts.items():
         _admit_components(module, found[module], admitted)
     made, stale = [], []
     writes = [(_path(module), text, tuple(by_module[module])) for module, (text, _) in texts.items()]
-    package = Path(str(importlib.util.find_spec("dew.algebra").origin))
-    writes.append((package.with_name(f"{SHARED.rsplit('.', 1)[1]}.py"), _helpers_written(helpers), ()))
+    shared_path = Path(__file__).with_name(f"{SHARED.rsplit('.', 1)[1]}.py")
+    writes.append((shared_path, _helpers_written(factored), ()))
     for path, text, declared in writes:
         if check:
             written = path.read_text() if path.exists() else ""
