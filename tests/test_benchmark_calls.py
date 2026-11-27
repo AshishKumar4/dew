@@ -468,8 +468,9 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     program's one run on its devices, each its device milliseconds: another program's ops and run, a host
     transfer and another device's left out; a call on two devices, each one's. A capture where the call's
     program did not run on one of its devices, or ran there without an op (a host transfer its only one), is
-    refused, though another program ran there (`NoKernels`), and one where it ran twice on a device, or whose
-    runs name no program or two, is refused as ambiguous (`AmbiguousCapture`)."""
+    refused, though another program ran there (`NoKernels`), and one where it ran twice on a device, whose
+    runs name no program, two, or another than an earlier read found, or where another program's run
+    overlaps the call's, is refused as ambiguous (`AmbiguousCapture`)."""
     from dew.telemetry.benchmark import AmbiguousCapture, NoKernels, tpu_ops
 
     ops = [(0, "fusion.1", 0.0, 0.25, 7), (0, "custom-call.2", 0.25, 1.0, 7), (0, "transfer", 1.0, 1.5, None),
@@ -477,9 +478,14 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     runs = [(0, "jit_run(7)", 0.0, 1.0, 7), (0, "jit_other(9)", 2.0, 3.0, 9), (1, "jit_run(7)", 0.0, 4.0, 7)]
     one = tmp_path / "one"
     _tpu_capture(one, ops, runs)
-    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run")] == [("fusion.1", 0.25),
-                                                                                   ("custom-call.2", 0.75)]
-    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run")] == ["fusion.1", "custom-call.2", "fusion.9"]
+    assert [(op.name, op.milliseconds) for op in tpu_ops(one, {0}, "jit_run").ops] == [
+        ("fusion.1", 0.25), ("custom-call.2", 0.75)]
+    assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", program="7").ops] == [
+        "fusion.1", "custom-call.2", "fusion.9"]
+    # A read pinned to the program an earlier read of its executable found (`TpuTime`): a run of the same
+    # name naming another, its executable another, refused.
+    with pytest.raises(AmbiguousCapture):
+        tpu_ops(one, {0, 1}, "jit_run", program="9")
     for devices in ({2}, set()):
         with pytest.raises(NoKernels):
             tpu_ops(one, devices, "jit_run")
@@ -501,7 +507,7 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         tpu_ops(twice, {0}, "jit_run")
     # Another program's run overlapping the call's on its core: the ops within it not told apart, refused.
     overlapped = tmp_path / "overlapped"
-    _tpu_capture(overlapped, [*ops, (0, "fusion.5", 0.5, 0.75, 9)], [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
+    _tpu_capture(overlapped, ops, [*runs, (0, "jit_other(9)", 0.4, 0.8, 9)])
     with pytest.raises(AmbiguousCapture):
         tpu_ops(overlapped, {0}, "jit_run")
     # An op inside the call's run stating another program, or one where the run states none: refused.
@@ -527,25 +533,30 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
 
 
 def test_a_tpu_call_is_timed_by_the_ops_inside_its_run_as_a_v5e_records_them(tmp_path):
-    """A v5e's XProf (M-FS-90's capture of a bf16 8192x4096 by 4096x4096 GEMM): its run on the `XLA Modules`
-    line names its program in its name, `jit_gemm(370734272565018276)`, with no program_id stat, and its ops
-    on `XLA Ops`, named by their HLO text, state no program at all; the call is the ops inside its run's span
-    on its core (one program running there at a time), another program's run before or after it and its ops
-    left out."""
+    """A v5e's XProf (M-FS-90's capture of a bf16 8192x4096 by 4096x4096 GEMM, its three ops' spans as
+    recorded, their HLO text shortened): its run on the `XLA Modules` line names its program in its name,
+    `jit_fs90_profiled_gemm(370734272565018276)`, with no program_id stat, and its ops on `XLA Ops` state no
+    program at all; the call is the ops inside its run's span on its core (one program running there at a
+    time), another program's run before and after it (synthetic, as are their ops) left out."""
     from dew.telemetry.benchmark import tpu_ops
 
-    copied = "%copy-start = (bf16[4096,4096]{1,0:T(8,128)(2,1)}) copy-start(%param.1)"
-    fused = "%fusion = bf16[8192,4096]{1,0:T(8,128)(2,1)} fusion(%param.0, %copy-done)"
+    started = "%copy-start = (bf16[8192,4096]{1,0:T(8,128)(2,1)S(1)}) copy-start(%x.1)"
+    done = "%copy-done = bf16[8192,4096]{1,0:T(8,128)(2,1)S(1)} copy-done(%copy-start)"
+    fused = "%fusion = bf16[8192,4096]{1,0:T(8,128)(2,1)} fusion(%copy-done, %w.1)"
     other = "%fusion.2 = f32[8] fusion(%param.0)"
-    ops = [(0, other, 0.0, 0.5, None), (0, copied, 7.198531, 7.198556, None),
-           (0, fused, 7.198568, 8.624394, None), (0, other, 8.625, 8.626, None)]
+    ops = [(0, other, 0.0, 0.5, None), (0, started, 7.198531, 7.198544, None),
+           (0, done, 7.198556, 7.198558, None), (0, fused, 7.198568, 8.624394, None),
+           (0, other, 8.625, 8.626, None)]
+    gemm = "jit_fs90_profiled_gemm(370734272565018276)"
     runs = [(0, "jit_init(11)", 0.0, 0.6, None), (0, "jit_init(11)", 8.6249, 8.6265, None),
-            (0, "jit_gemm(370734272565018276)", 7.198516, 8.624395, None)]
+            (0, gemm, 7.198516, 8.624395, None)]
     v5e = tmp_path / "v5e"
     _tpu_capture(v5e, ops, runs)
-    read = tpu_ops(v5e, {0}, "jit_gemm")
+    read = tpu_ops(v5e, {0}, "jit_fs90_profiled_gemm")
     # Each op's milliseconds its own picoseconds, as the capture states them.
-    assert [(op.name, round(op.milliseconds * 1e9)) for op in read] == [(copied, 25000), (fused, 1425826000)]
+    assert [(op.name, round(op.milliseconds * 1e9)) for op in read.ops] == [
+        (started, 13000), (done, 2000), (fused, 1425826000)]
+    assert read.program == "370734272565018276"
 
 
 def test_a_tpu_call_is_timed_as_the_compiled_program_its_module_names_and_any_other_call_refused():
