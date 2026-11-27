@@ -140,14 +140,17 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     # A padded step is dt 0, which neither decays nor writes, and no reset.
     resets = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
 
-    def scanned(h, step):
+    def scanned(h, step, taken=None):
+        """A chunk's scan from `h`: its last state and its reads; a token not `taken` `[B, C]` (where given,
+        a forked segment's tokens outside it) carrying the state before it by selection."""
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
         # The kernels' decay (`recurrence_algebra.selective_decay`), zero at a reset.
         kept = 1.0 - reset_c[..., None, None].astype(work)
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A, kept)
         write = (dt_c * x_c)[..., None] * _spread(B_c, channels)
         # The chunk's states a token at a time from the state entering it (`ssm.affine_states`).
-        states = affine_states(decay, write, h, axis=1)
+        states = affine_states(decay, write, h, axis=1,
+                               taken=None if taken is None else taken[..., None, None])
         # The readout's contraction over the states as it was (`portable_einsum`'s, its accumulation policy),
         # each channel its own batch: C spread over the channels inside the product, so a wide sum widens C
         # itself and rounds its cotangent after the channels' tree.
@@ -163,7 +166,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         loads, stores, _ = forked.tokens(length)
         loads, stores = rowed(loads, -1), rowed(stores)
         walk = functools.partial(_forked_row, scanned, documents=forked.loads.shape[1], held=forked.held,
-                                 segments=chunked_launch.Forked.most_segments(loads))
+                                 segments=chunked_launch.Forked.most_segments(loads), length=length)
         out, last = jax.vmap(walk)(rowed(x), rowed(dt), rowed(B), rowed(C), loads, stores,
                                    jnp.asarray(state, work))
         out = out.reshape(batch, length + pad, channels)[:, :length] + x * D
@@ -171,12 +174,19 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
     carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
                else jnp.asarray(state, work))
-    final, out = jax.lax.scan(scanned, carried, steps)
+    if pad:
+        # The padding's tokens carry the state by selection: the final state the last token's, bit for bit
+        # (a padded step's `1 h + 0` turned `-0` to `+0`, row 13721).
+        taken = chunks(jnp.ones((batch, length), jnp.bool_))
+        final, out = jax.lax.scan(lambda h, step: scanned(h, step[:-1], step[-1]), carried, (*steps, taken))
+    else:
+        final, out = jax.lax.scan(scanned, carried, steps)
     out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
     return out.astype(dtype), final.astype(dtype)
 
 
-def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, held: int, segments):
+def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, held: int, segments,
+                length: int):
     """A forked row's selective scan (`selective_scan`'s), its documents walked in place: its segments in
     token order (`chunked_launch.Forked.segment_origins`), a segment a document's tokens within one chunk,
     each from the state entering it, the chunk's own where its document continued from the chunk before,
@@ -204,13 +214,17 @@ def _forked_row(scanned, x, dt, B, C, loads, stores, given, *, documents: int, h
         """A segment's scan over its chunk from the state entering it (`state`, its chunk's own where it
         takes no table load, else `taken`, its document's from the table), every token outside it the
         identity step, its operands zero before any arithmetic (another document's infinite write, B = inf
-        at dt = 0, no NaN here, forward or back): `(the state it leaves, its reads, zero outside it)`, a
-        sentinel's (not `real`) `state` and zeros. Checkpointed, its residuals its inputs, a state or two and
-        scalars a trip: the row's operands the walk's, no trip's slices or masks."""
+        at dt = 0, no NaN here, forward or back) and its state carried by selection, so the state it leaves
+        is its last token's, bit for bit (an identity step's `1 h + 0` turned `-0` to `+0`, row 13721):
+        `(the state it leaves, its reads, zero outside it)`, a sentinel's (not `real`) `state` and zeros.
+        Checkpointed, its residuals its inputs, a state or two and scalars a trip: the row's operands the
+        walk's, no trip's slices or masks."""
         memory = jnp.where(load < 0, state, taken)
-        inside = (place >= origin) & (place <= through) & real
+        # Its tokens, the row's padding past its `length` none of them.
+        inside = (place >= origin) & (place <= through) & real & (chunk * count + place < length)
         step = tuple(jnp.where(inside[:, None], t[chunk], 0.0) for t in (x, dt, B, C))
-        left, read = scanned(memory[None], tuple(t[None] for t in (*step, jnp.zeros((count,), bool))))
+        left, read = scanned(memory[None], tuple(t[None] for t in (*step, jnp.zeros((count,), bool))),
+                             inside[None])
         return jnp.where(real, left[0], state), jnp.where(inside[:, None], read[0], 0.0)
 
     def walked(carried, at):
