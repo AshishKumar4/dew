@@ -165,14 +165,18 @@ class Lowered(SystemExit):
     and no traceback, the step's kernels logged (`dew lower` target:check's dry run). `programs` are the
     step's programs, each lowered with its name: a device step's one, a host step's each (the CPU's and the
     accelerator's, `dew.training.compiler.HostRun`, as its steady steps call them); `kernels` is their
-    kernel report (`KernelReport`: the dispatches' routes and the lowered launches). A step for devices
+    kernel report (`KernelReport`: the dispatches' routes and the lowered launches); `options` the XLA options
+    a device step's plan compiles it under at its base rung, a compile's limit aside, under which its
+    program is the step compiled ahead's (`dew.training.ahead.AheadOfTime.program`). A step for devices
     this host is not compiles ahead (`dew.training.ahead`).
     """
 
-    def __init__(self, target: str, programs: Sequence[tuple[str, jax.stages.Lowered]], routes=()):
+    def __init__(self, target: str, programs: Sequence[tuple[str, jax.stages.Lowered]], routes=(), *,
+                 options: jax.stages.CompilerOptions | None = None):
         super().__init__(0)
         self.generation = target
         self.programs = tuple(programs)
+        self.options = options
         self.kernels = kernel_report(routes, *(lowered for _, lowered in self.programs))
         _log.info("the step lowered for %s; its %s", target, self.kernels.summary())
 

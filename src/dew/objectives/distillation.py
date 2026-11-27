@@ -514,6 +514,10 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         return self.student.evaluate(self.student_variables(params), batch, self._student_step(step))
 
+    def preview_refusal(self) -> str | None:
+        """The student's, whose preview this one is."""
+        return self.student.preview_refusal()
+
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
