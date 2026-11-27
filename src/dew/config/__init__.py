@@ -125,7 +125,7 @@ topology it compiles ahead for and saves (`AheadTarget`), or a CUDA generation i
 
 
 @dataclasses.dataclass(frozen=True)
-class ObjectiveConfig(Bound["Objective"]):
+class ObjectiveConfig(Bound):
     """An objective's class bound to the arguments the run gives it.
 
     `bound` is the class, of `dew.registry.objectives` or any objective by its
@@ -156,7 +156,7 @@ class ObjectiveConfig(Bound["Objective"]):
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig(Bound["Metric"]):
+class MetricConfig(Bound):
     """A metric's class bound to the arguments the run gives it.
 
     `bound` is the class, of `dew.registry.metrics` or any metric by its import

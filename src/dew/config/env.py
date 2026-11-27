@@ -64,7 +64,7 @@ _BUILT = ("objective", "env", "replay", "teacher", "demonstrator")
 
 
 @dataclasses.dataclass(frozen=True)
-class EnvConfig(Bound[Environment]):
+class EnvConfig(Bound):
     """An environment's class bound to the arguments the run gives it, and how the run wraps it.
 
     `bound` is a JAX `Env` class, a host `Simulator` class, or a function or classmethod that returns one
@@ -96,7 +96,7 @@ class EnvConfig(Bound[Environment]):
 
 
 @dataclasses.dataclass(frozen=True)
-class RolloutConfig(Bound[Rollout]):
+class RolloutConfig(Bound):
     """The rollout that collects the run's batches (`dew.training.rollout.Rollout`): `bound` a rollout class
     of `dew.registry.rollouts` (`dreamer`, `control`) or by its import path, by the settings the run gives
     it: a `DreamerRollout`'s `batch`, `length`, `train_ratio`, `prefill`, `capacity` and
