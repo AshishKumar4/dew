@@ -20,7 +20,7 @@ import re
 import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, Literal, get_args, overload
 
 import jax
 import jax.numpy as jnp
@@ -180,6 +180,12 @@ record of both, a kernel once a refusal (`_record` joins its roles), so whatever
 refusal (`derivation_inputs`, `_proposing`, `refusal_snapshot`) carries what a launch's ladder steps by."""
 
 
+StoredOutcome = Literal["hit", "miss", "invalid", "unstorable"]
+"""A stored derivation's lookup (`dew.algebra.stored`): read from the store, derived afresh and written,
+derived afresh past an entry that failed to read, or derived afresh and not written (a program or a value
+its key or codec does not state)."""
+
+
 @dataclasses.dataclass
 class _Registry:
     """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by its kernels that
@@ -193,6 +199,8 @@ class _Registry:
     passes: collections.deque[float] = dataclasses.field(
         default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
     """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+    stored: collections.Counter[StoredOutcome] = dataclasses.field(default_factory=collections.Counter)
+    """Each stored derivation's lookup by its outcome (`record_stored`)."""
     by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
     """`refusals_of`'s answers by launch identity, each dropped as a refusal of its launch is recorded: read
     for every config a derivation weighs, each answer gathered from every launch's refusals took 426 of a
@@ -206,6 +214,7 @@ class Recorded:
     missed: list["Miss"] = dataclasses.field(default_factory=list)
     rewritten: list = dataclasses.field(default_factory=list)
     passes: list[float] = dataclasses.field(default_factory=list)
+    stored: collections.Counter[StoredOutcome] = dataclasses.field(default_factory=collections.Counter)
 
 
 _RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(contextvars.ContextVar("recording",
@@ -1395,6 +1404,19 @@ def record_pass(seconds: float) -> None:
     _add(passes=(seconds,))
 
 
+def record_stored(outcome: StoredOutcome) -> None:
+    """Record one stored derivation's lookup by its `outcome`."""
+    if outcome not in get_args(StoredOutcome):
+        raise ValueError(f"no stored derivation's outcome {outcome!r}")
+    _add(stored=(outcome,))
+
+
+def stored() -> Mapping[StoredOutcome, int]:
+    """Each stored derivation's lookup this process's programs made, by its outcome (`record_stored`)."""
+    with _GUARD:
+        return dict(_registry().stored)
+
+
 def passes() -> tuple[float, ...]:
     """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`), the
     latest `RECORDS_HELD`: its regions' (`rewrites`) and its walks of the program around them."""
@@ -1455,12 +1477,13 @@ def _proposing(entries: list[tuple[tuple[str, Hashable], Refused]]) -> Iterator[
 
 
 def _commit(proposal: Recorded) -> None:
-    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s) recorded as the kept
-    program's."""
-    _add(rewritten=proposal.rewritten, passes=proposal.passes)
+    """A successful replacement's rewrites, its passes' seconds and its stored derivations' outcomes
+    (`_proposing`'s) recorded as the kept program's."""
+    _add(rewritten=proposal.rewritten, passes=proposal.passes, stored=list(proposal.stored.elements()))
 
 
-def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = ()) -> None:
+def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Sequence[float] = (),
+         stored: Sequence[StoredOutcome] = ()) -> None:
     """`Recorded` entries added to this context's registry and to every `recording` open in it: a miss once
     a holder (`_record`), each rewrite and pass as often as it is made."""
     with _GUARD:
@@ -1468,6 +1491,7 @@ def _add(*, missed: Sequence["Miss"] = (), rewritten: Sequence = (), passes: Seq
             held.missed.extend(miss for miss in missed if miss not in held.missed)
             held.rewritten.extend(rewritten)
             held.passes.extend(passes)
+            held.stored.update(stored)
 
 
 def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:

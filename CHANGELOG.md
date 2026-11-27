@@ -7,6 +7,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A template's trace-time derivations are stored in Dew's cache across processes: a cold process reads a
+  fixed tile's forms back instead of saturating them again (a cold attention step 25 s to 15 s on armada).
 - Generated components share one helper module across declaring modules, so each family's components are
   declared on their own (`dew.algebra.attention_cases`, `format_cases`, `recurrence_cases`). Add checked
   NVFP4 block decode and the recurrence skip's pullback; production dispatch is unchanged.

@@ -364,7 +364,9 @@ class Rules:
     def declared(cls, name: str, rounding: Literal["exact", "reorders", "bounded"],
                  families: tuple[RuleFamily, ...], receipt: str, *, dev: bool = False,
                  aid: bool = False) -> Rules:
-        """A set whose ruleset is its `families`' rules, every one of them declared with its instance."""
+        """A set whose ruleset is its `families`' rules, every one of them declared with its instance. A
+        set is immutable once built: changing its egglog ruleset in place is unsupported, as monkeypatching
+        is (a stored derivation keys on its name, `sourced`); a set of other rules is another set."""
         made = ruleset(*(each for family in families for each in family.rules), name=name)
         return cls(name, rounding, made, receipt, families, dev=dev, aid=aid)
 
@@ -1123,3 +1125,16 @@ def instances() -> Mapping[str, Instance]:
     qualification inventory its accuracy test holds each right side to its left side over."""
     return {f"{rules.name}: {name}": instance for rules in RULES.values()
             for name, instance in rules.instances.items()}
+
+
+_SOURCED: dict[str, Rules] = dict(RULES)
+"""Each rule set this module's source registers, by name, as it registered it: what a stored derivation
+keys on by name (`sourced`). A registered set is immutable: its ruleset is built once from its families'
+immutable rules (`Rules.declared`), and code that changes a built set's ruleset is unsupported."""
+
+
+def sourced(admitted: Sequence[Rules]) -> bool:
+    """Whether every set of `admitted` is one this module's source registers, so its name states its rules:
+    a set registered at run time, or declared under a source set's name, is not, and no derivation with it is
+    stored (`dew.algebra.stored`)."""
+    return all(_SOURCED.get(sets.name) is sets for sets in admitted)

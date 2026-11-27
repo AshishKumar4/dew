@@ -1226,7 +1226,22 @@ a derived form replaces a hand-written one only where it states the walk, passes
   numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
 - A Mosaic launch built from the derived chunk forms' terms is the generator's work (§6.11). Until then the
   Mosaic recurrence takes derived tile algebra inside its own launches.
-- The derived forms run at trace time.
+- The derived forms run at trace time. A template derivation's forms at one tile (`derive._derived`) are
+  stored across processes in Dew's cache (`dew.algebra.stored`), keyed by everything they read: the
+  declaration's traced program (its structural digest and its captured constants), its walked axes, the
+  tile's shapes and dtypes, its numerics' class and limits, the context it is priced and traced in
+  (`derive.context`, in a canonical form), the rule sets it saturates with (by name, each as `rules.py`'s
+  source registers it), the algebra's code and egglog's version. An entry holds each chosen term as the Term
+  language's constructors write it and the parameters and literals the derivation appended to its region,
+  the region itself traced again; it is checked against that region before any of it is taken. One that
+  fails to read is derived afresh past, a program or value the key or codec does not state, or an entry that
+  cannot be written, is not stored, and the extractor's oracle (`Passes.checked`) derives without the store;
+  both derive from the one live set of rules. A registered rule set is immutable once built
+  (`Rules.declared`, from its families' immutable rules): changing a built set's egglog ruleset in place is
+  unsupported, as monkeypatching is, and a set registered at run time stores nothing. Each outcome is
+  counted in the kernel report (`report.stored`) and a plan's kernel record. A cold attention step's 20
+  forms (9 s of 25 s on armada) read back in a fresh process with the store alone warm, the step 15 s, its
+  program the same.
 
 Production derives these forms at trace time (`derive.derive`, `scan.derive_scan`). The component pilots
 in §6.11 emit checked-in cases without replacing the launches. Generating and taking a complete template
