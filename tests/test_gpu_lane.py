@@ -425,6 +425,41 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
         assert graded([], before=skipped_x, found=reused_sharing)["exitCode"] == 1
 
 
+def test_a_baseline_keeps_its_cells_by_their_fields_and_main_s_capped_cells_are_read_so(ci):
+    """A graded row keeps its cells by their fields (`cells`), which its baseline gives back as such
+    (prepares.py's `cells_of`), and main's capped cells are read from those fields: a baseline cell whose
+    node id merely holds " @ <cap> [" (a parameter id), at a site of its own, is no cell main capped, where
+    its identity read back as a string named one; a cell main did cap still exempts the same cell reached
+    elsewhere (train 1361's review)."""
+    name = "3.12:tests/test_gpu_vae.py#@prepare-sm90"
+    wire = ci.tier_wire()
+
+    def graded(records, before, found=None):
+        found = found or {"name": name, "exitCode": 0, "output": "ran"}
+        [row] = ci.prepares.graded(
+            [found], {} if "unprepared" in found else {"tests/test_gpu_vae.py": records}, before, "sm90",
+            lambda named_: ci.grading.owning(ci.parsed_row(named_)[1]), ci.grading.STALE, wire.CAPPED)
+        return row
+    # A parameter id holding " @ <cap> [": main's cell of it at an ordinary site, labeled.
+    lookalike = ("tests/test_gpu_vae.py::test_flow[p] @ " + wire.CAPPED + " [q", "a site", "c")
+    # This run's cell that main's lookalike, read as a string, names as one main capped.
+    reached = {"test": "tests/test_gpu_vae.py::test_flow[p]", "where": "a site", "error": "e",
+               "cell": "q @ a site [c"}
+    assert graded([reached], before={lookalike})["new_unprepared"] == [ci.prepares.identity(reached)]
+    # A cell main capped, by its fields, exempts its same cell wherever this run reached it, fresh or reused.
+    capped = ("tests/test_gpu_vae.py::test_flow", wire.CAPPED, "two")
+    same = {"test": "tests/test_gpu_vae.py::test_flow", "where": "tests/test_gpu_vae.py", "error": "e",
+            "cell": "two"}
+    row = graded([same], before={capped})
+    assert row["exitCode"] == 0
+    assert row["cells"] == [["tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two"]]
+    assert ci.prepares.cells_of(json.loads(json.dumps(row))) == {
+        ("tests/test_gpu_vae.py::test_flow", "tests/test_gpu_vae.py", "two")}
+    assert graded([], before={capped}, found=json.loads(json.dumps(row)))["exitCode"] == 0
+    sibling = {**same, "cell": "three"}
+    assert graded([same, sibling], before={capped})["new_unprepared"] == [ci.prepares.identity(sibling)]
+
+
 @pytest.mark.parametrize("capped", [False, True])
 def test_only_a_dry_prepare_runs_under_a_time_cap(ci, tmp_path, monkeypatch, capped):
     """A dry prepare's process (prepares.py's `process`, `capped`) runs under a cap (tests/tier_wire.py's
