@@ -438,7 +438,7 @@ READ = "dew.tpu_read.0"
 """The read's annotation a fixture's host enqueues its runs within (`_tpu_capture`, `TpuTime`'s)."""
 
 
-def _tpu_capture(directory, ops, runs, read=None):
+def _tpu_capture(directory, ops, runs, read=None, *, deferred: bool = False):
     """A capture under `directory` as JAX writes a TPU's (plugins/profile/<run>/<host>.xplane.pb): `ops`, each
     (device, name, start ms, end ms, program id), on each TPU's `XLA Ops` line, and `runs`, each (device,
     module name, start ms, end ms, program id), on its `XLA Modules` line, an event of a program id carrying
@@ -447,7 +447,9 @@ def _tpu_capture(directory, ops, runs, read=None):
     the host's plane the read's annotation (`READ`) over the PJRT C API's execute linkage, the runtime
     thread's execute the linkage flows to holding a `DoEnqueueProgram` of each run `read` names by run id
     (every run where None), and another thread's enqueue of each other run within the annotation's span, as
-    a v5e's XProf ties a call to its runs (M-FS-104)."""
+    a v5e's XProf ties a call to its runs (M-FS-104); where `deferred`, the execute's enqueues on a queue's
+    thread instead, within the event consuming a flow the execute's `tpu::System::Execute` produces, as an
+    executable taking a tuple index table enqueues once its transfer is done (M-FS-105)."""
     from jax.profiler import ProfileData
 
     names = sorted({name for _, name, *_ in [*ops, *runs]})
@@ -479,16 +481,21 @@ def _tpu_capture(directory, ops, runs, read=None):
                              device_ordinal=runs[index - 1][0])
                        for index in range(1, len(runs) + 1) if (index in ours) == mine)
 
+    # The execute's own enqueues, or its system execute's flow to a queue's issue holding them.
+    executed = (event(5, 0.75, 0.8, _pt=7, _p=9) if deferred else enqueues(mine=True))
+    queued = (event(6, 0.9, 2.0, _ct=7, _c=9) + enqueues(mine=True)) if deferred else ""
     host = ('planes { id: 99 name: "/host:CPU" '
             'lines { id: 1 name: "python3" timestamp_ns: 0 ' + event(1, 0.0, 10.0)
             + event(3, 0.5, 0.6, _pt=14, _p=5) + '} '
-            'lines { id: 2 name: "main" timestamp_ns: 0 ' + event(4, 0.7, 9.0, _ct=14, _c=5)
-            + enqueues(mine=True) + '} lines { id: 3 name: "foreign" timestamp_ns: 0 '
-            + enqueues(mine=False) + '} '
+            'lines { id: 2 name: "main" timestamp_ns: 0 ' + event(4, 0.7, 9.0, _ct=14, _c=5) + executed
+            + '} lines { id: 3 name: "foreign" timestamp_ns: 0 ' + enqueues(mine=False) + '} '
+            'lines { id: 4 name: "queue" timestamp_ns: 0 ' + queued + '} '
             f'event_metadata {{ key: 1 value {{ id: 1 name: "{READ}" }} }} '
             'event_metadata { key: 2 value { id: 2 name: "DoEnqueueProgram" } } '
             'event_metadata { key: 3 value { id: 3 name: "PJRT_LoadedExecutable_Execute linkage" } } '
             'event_metadata { key: 4 value { id: 4 name: "PJRT_LoadedExecutable_Execute" } } '
+            'event_metadata { key: 5 value { id: 5 name: "tpu::System::Execute" } } '
+            'event_metadata { key: 6 value { id: 6 name: "tpu::System::Execute=>IssueSequencedEvent" } } '
             + statted + '}')
     run = directory / "plugins" / "profile" / "run"
     run.mkdir(parents=True)
@@ -515,6 +522,16 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         ("fusion.1", 0.25), ("custom-call.2", 0.75)]
     assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", annotation=READ)] == [
         "fusion.1", "custom-call.2", "fusion.9"]
+    # Its enqueue deferred to a queue's thread (a tuple index table's transfer first, M-FS-105): read through
+    # the flow its execute produces, a foreign thread's enqueue beside it still not the call's.
+    deferred = tmp_path / "deferred"
+    _tpu_capture(deferred, ops, runs, deferred=True)
+    assert [op.name for op in tpu_ops(deferred, {0, 1}, "jit_run", annotation=READ)] == [
+        "fusion.1", "custom-call.2", "fusion.9"]
+    deferred_foreign = tmp_path / "deferred-foreign"
+    _tpu_capture(deferred_foreign, ops, runs, read=(3,), deferred=True)
+    with pytest.raises(NoKernels):
+        tpu_ops(deferred_foreign, {0}, "jit_run", annotation=READ)
     # A same-named executable's run the read's call did not enqueue (another thread's, within the read's
     # annotation): no run of the call's, though its name is the call's module's.
     foreign = tmp_path / "foreign"
