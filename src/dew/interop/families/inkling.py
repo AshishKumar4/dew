@@ -427,8 +427,8 @@ def _query(name: str, parts: tuple[str, ...], width: int) -> Stacked:
     """A depth query `[D]`, or a global layer's sites' `[3, D]`, as the `[1, D]` projection each leaf
     reads (a kernel, `[out, in]`), `D` the decoder's `width`."""
     if len(parts) == 1:
-        return Stacked(name, parts, (Split(0, width), Split(1)))
-    return Stacked(name, parts, (Split(1, width),))
+        return Stacked(name, parts, (Split(0),), grid=(), shape=(1, width))
+    return Stacked(name, parts, (Split(1),), shape=(1, width))
 
 
 def _sites(kind: Mapping[str, object]) -> tuple[str, ...]:
@@ -471,7 +471,7 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
             for site in 'kv':
                 conv = f'{stem}.attn.{site}_sconv'
                 stacks += [Stacked(f'{conv}.static_w', (f'{conv}.weight',),
-                                   (Reversed(0), Transposed((1, 0)), Split(1)), grid=()),
+                                   (Reversed(0), Transposed((1, 0)), Split(1)), grid=(), spelled=True),
                            Stacked(f'{conv}.weight_proj', (f'{conv}.weight_proj',),
                                    (Split(0, taps), Reversed(1), Inverted(Split(0, taps))), grid=())]
         if layer in routed:
@@ -497,7 +497,7 @@ def _stacks(config: Mapping[str, object]) -> list[Stacked]:
     if loop.get('messages') is not None:
         stacks += [Stacked(f'model.llm.middle_cycle_cross_pass_{stack}',
                            tuple(f'model.llm.layers.{layer}.controllers.{site}.query'
-                                 for layer in span for site in sites), (Split(1, width),))
+                                 for layer in span for site in sites), (Split(1),), shape=(1, width))
                    for stack, sites in (('queries', ('attn', 'mlp')), ('kv_queries', ('k', 'v')))]
     return stacks
 

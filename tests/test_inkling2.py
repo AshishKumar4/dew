@@ -186,11 +186,19 @@ def test_its_prepares_inverse_gives_back_every_tensor_of_the_release():
     for twice in ({**stale, **prepared}, {**prepared, **stale}):
         with pytest.raises(ValueError):
             INKLING2.unprepare(twice, record)
-    # A query of another width than the decoder's is refused as it is read, not placed as a wider kernel.
+    # A query of another width than the decoder's, a layer's or a global layer's three sites', is refused as
+    # it is read, not placed as a wider kernel.
     width = record['emb_features']
-    for wrong in (np.zeros(width + 1, np.float32), np.zeros(2 * width, np.float32)):
+    for name, wrong in (('model.llm.attn_res.mlp_queries.0', np.zeros(width + 1, np.float32)),
+                        ('model.llm.attn_res.mlp_queries.0', np.zeros(2 * width, np.float32)),
+                        ('model.llm.attn_res.attn_queries.2', np.zeros((3, 2 * width), np.float32))):
         with pytest.raises(ValueError):
-            INKLING2.prepare({**tensors, 'model.llm.attn_res.mlp_queries.0': wrong}, record)
+            INKLING2.prepare({**tensors, name: wrong}, record)
+    # A prepared query site the decoder's geometry has none of (a local layer's key query) is refused, not
+    # written into the release under its prepared name.
+    stray = {**prepared, 'model.llm.layers.1.k_query': prepared['model.llm.layers.1.attn_query']}
+    with pytest.raises(ValueError):
+        INKLING2.unprepare(stray, record)
 
 
 @pytest.mark.parametrize('fixture', ['inkling2-tiny', 'inkling2-tiny-nvfp4'])

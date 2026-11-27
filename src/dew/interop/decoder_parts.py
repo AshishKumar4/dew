@@ -11,6 +11,7 @@ and writes checkpoints through that table: each imports only what precedes it.
 
 import dataclasses
 import math
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1961,14 +1962,25 @@ class Inverted:
 class Stacked:
     """One stored tensor, `name`, holding `parts`, the tensors the path map reads: its `view` (each step
     in order) holds them stacked on its leading axes, `grid` (one an entry of `parts` where None; none,
-    the view itself the one part, where empty), in row-major order. A load splits the tensor into views of
+    the view itself the one part, where empty), in row-major order, each of the `shape` the record states
+    where it states one (a part of another refused either way). A load splits the tensor into views of
     its parts (`split`) and an export stacks them back through each step's inverse (`stacked`), so the one
-    declaration is both directions."""
+    declaration is both directions. `spelled` marks parts the release also stores as they are elsewhere
+    (a static convolution's taps, where a dynamic one's are stacked), whose names no other tensor is
+    refused for (`Restacked.unprepare`)."""
 
     name: str
     parts: tuple[str, ...]
     view: tuple[Step, ...] = ()
     grid: tuple[int, ...] | None = None
+    shape: tuple[int, ...] | None = None
+    spelled: bool = False
+
+    def _shaped(self, shapes: Sequence[tuple[int, ...]]) -> None:
+        """Refuse a part of another shape than the record states."""
+        if self.shape is not None and (wrong := sorted({shape for shape in shapes if shape != self.shape})):
+            raise ValueError(f"{self.name} stacks parts of the shapes {wrong}, not the {self.shape} its "
+                             "record states")
 
     @property
     def _grid(self) -> tuple[int, ...]:
@@ -1982,13 +1994,16 @@ class Stacked:
         if tensor.shape[:len(grid)] != grid or math.prod(grid) != len(self.parts):
             raise ValueError(f"{self.name} stacks {tensor.shape[:len(grid)]} tensors where its record "
                              f"stacks {grid}, {list(self.parts)}")
-        return dict(zip(self.parts, (tensor[index] for index in np.ndindex(*grid)), strict=True))
+        parts = dict(zip(self.parts, (tensor[index] for index in np.ndindex(*grid)), strict=True))
+        self._shaped([part.shape for part in parts.values()])
+        return parts
 
     def stored(self, parts: Sequence[jax.ShapeDtypeStruct]) -> jax.ShapeDtypeStruct:
         """The stored tensor's shape and dtype, of its parts', in their order, which hold one dtype."""
         if len(dtypes := {part.dtype for part in parts}) > 1:
             raise ValueError(f"{self.name} stacks {list(self.parts)} of the dtypes "
                              f"{sorted(map(str, dtypes))}")
+        self._shaped([part.shape for part in parts])
         tensor = np.stack([Unread(part.shape, part.dtype) for part in parts])
         tensor = tensor.reshape(*self._grid, *tensor.shape[1:])
         for step in reversed(self.view):
@@ -2057,7 +2072,8 @@ class Restacked:
                 raise ValueError(f"{name} holds {specs.get(name)}, not the value no read of the release "
                                  "reaches, which it stores none of")
         owner: dict[str, Stacked] = {}
-        for stack in self.stacks(config):
+        stacks = self.stacks(config)
+        for stack in stacks:
             if missing := [part for part in stack.parts if part not in specs]:
                 raise ValueError(f"{stack.name} stacks {missing}, which the tensors miss")
             for part in stack.parts:
@@ -2073,6 +2089,16 @@ class Restacked:
                 raise ValueError(f"two of the prepared tensors write back {name}")
             built[name] = (spec, build)
 
+        # A tensor passed through under a name spelled as a stack's or its parts' (their layer and expert
+        # numbers any), which the record stacks no tensor under, is no tensor of the release: refused, not
+        # written as it is.
+        spelling = re.compile("|".join(sorted({
+            re.sub(r"\d+", r"\\d+", re.escape(name))
+            for stack in stacks for name in (stack.name, *([] if stack.spelled else stack.parts))})))
+        if stray := sorted(name for name in specs if name not in owner and name not in unstored
+                           and stacks and spelling.fullmatch(name)):
+            raise ValueError(f"{stray} are spelled as the release's stacked tensors or their parts, which "
+                             "its record stacks none of")
         stacked: set[str] = set()
         for name, spec in specs.items():
             stack = owner.get(name)
