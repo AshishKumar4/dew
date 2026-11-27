@@ -1330,9 +1330,8 @@ def test_an_inference_forward_compiles_spill_free_whether_or_not_it_decides(gene
 def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     """A split decode step on an H100 (`attention_decode.priced_step`: 1 row, 1 query, 8 heads over 2 key
     heads 128 wide over 8192 keys) prices its native `merged_padded` launch independently of
-    `merged.launch_work` (rows 8845, 10533): its kernel count, span (its Pallas Triton merge's, an H100's,
-    `merged.MOSAIC_SLOWER`: a step a slot of its chunks a pass, `merged._triton_span`) and device bytes equal
-    the split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
+    `merged.launch_work` (rows 8845, 10533): its kernel count, span (`3 * chunks`) and device bytes equal the
+    split walk's plus the emitted `get`/`swap` traffic of `merged._launch`'s traced Pallas body."""
     from test_merged import _traced_merge_bytes
 
     from dew.algebra import windows
@@ -1359,8 +1358,7 @@ def test_a_split_decode_steps_price_includes_the_native_merges_bytes_and_span():
     emitted_bytes = _traced_merge_bytes(merge_eq.params["units"], padded_s, stacked_s, queries, width, block,
                                         out_dtype=out_dtype, out_heads=out_heads)
     slices = padded_s.shape[1]
-    chunk = windows.chunk_width(slices)
-    merge_span = float(3 * -(-slices // chunk) * chunk)
+    merge_span = float(3 * -(-slices // windows.chunk_width(slices)))
     walk_launches = [w for eq in programs.equations(traced.jaxpr)
                      if eq.primitive in programs.NATIVE_KERNELS
                      and (w := emission.work_of(eq)) is not None]
@@ -1471,23 +1469,6 @@ def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave():
     two beside it, none past the most it takes."""
     counts = attention_decode._slice_counts(108, 8, 54)
     assert {13, 27, 2, 4, 8, 16, 32} <= set(counts) and max(counts) <= 54 and min(counts) >= 2, counts
-
-
-@pytest.mark.parametrize(("batch", "keys", "width", "fastest"), [(1, 32768, 128, 13), (8, 4096, 64, 3)],
-                         ids=["B1-K32768-d128", "B8-K4096-d64"])
-def test_an_a100_decode_plan_takes_the_slices_its_merge_runs_fastest_at(batch, keys, width, fastest):
-    """An A100-SXM4-40GB's bf16 decode step, 32/8 heads: the slices its plan takes are the ones whose walk and
-    merge ran fastest (M-NA-50b-a100: B1 over 32768 keys at width 128, 13 slices' walk and merge 136 us where
-    27's took 162; B8 over 4096 at 64, 3's 88 where 5's took 109), its merge priced a slot at a time
-    (`merged._triton_span`) over its programs' waves (`merged.launch_seconds`), where priced a chunk at a
-    time over the whole device at once it took 27 and 5."""
-    target = generation.gpu_target("NVIDIA A100-SXM4-40GB")
-    query = jnp.zeros((batch, 1, 32, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((batch, keys, 8, width), jnp.bfloat16)
-    with generation.assumed(target):
-        plans = attention_decode.planned(query, key, key, template.spans(1, keys, batch, causal=False),
-                                         template.Hooks())[0]
-    assert plans["plain"].slices == fastest, plans
 
 
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():

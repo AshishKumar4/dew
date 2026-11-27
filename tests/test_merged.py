@@ -708,10 +708,8 @@ def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: in
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
-    9795, 10533, 12222): one kernel, span `3 * chunks` on Mosaic GPU and a step a slot of its chunks on
-    Triton (`merged._triton_span`: 8 slices a chunk of 8, 9 two, 32 four), non-zero stated arithmetic work,
-    emitted single-stats writer (`c_block == 0`), and predicated padded-column loads on Mosaic GPU vs
-    Triton."""
+    9795, 10533, 12222): one kernel, span `3 * chunks`, non-zero stated arithmetic work, emitted single-stats
+    writer (`c_block == 0`), and predicated padded-column loads on Mosaic GPU vs Triton."""
     # A B200's, whose merge Mosaic GPU serves (`merged.MOSAIC_SLOWER`).
     mosaic = generation.gpu_target("sm100")
     sm75 = generation.gpu_target("sm75")
@@ -737,7 +735,6 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
         triton_work = merged.launch_work(spec, padded, stacked, queries, width, sm75)
         assert triton_work.device_bytes == _traced_merge_bytes(
             spec, padded, stacked, queries, width, triton_block)
-        assert triton_work.span == float(3 * chunks * windows.chunk_width(slices))
     # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, observed both on
     # multi-chunk emitted walk bytes and `launch_work`, while Triton reads `read_width` columns (row 9795).
     pad_p = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)

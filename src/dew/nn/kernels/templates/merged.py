@@ -293,8 +293,8 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     """Full launch work and grid size at `block` channels for the selected backend (`merged_mosaic.launch`
     when `family` is set, else Pallas Triton `_launch`) on the common one-window path
     (`means.merged_state_chunked`): one anchor/hull joining pass plus one window's two dependent passes
-    (`_placing` and `_summing`), for a span of `3 * chunks` steps on Mosaic GPU and of `3 * chunks` chunks'
-    slots on Triton (`_triton_span`). Device traffic charges
+    (`_placing` and `_summing`), for a span of `3 * chunks` steps; a Triton launch's waited path a step a slot
+    besides, its time as measured (`_triton_slot_steps`). Device traffic charges
     `min(width, read_width)` channels per slice on Mosaic GPU (predicated loads) and `read_width` on Triton
     (physical ref bounds), `width` channels for output writes, initial-state reads, and `Kind.OUTPUT` hook
     reads, scalar hook reads per block, and row-stat stores once per row (`c_block == 0`, omitted when
@@ -343,7 +343,6 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
                 + emission.repeated(mean_walk, 2 * chunks))
 
     passes = 3 * chunks
-    span = float(passes) if family is not None else _triton_span(total_slices)
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
     init_reads = int(has_initial)
     output_bytes = sum(
@@ -383,27 +382,30 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     # part's copy latency each, over a program's reads (its blocks read alike) and none of its stores. A
     # GH200's merge at one row, 8 and 16 slices of 64 channels, took 3.84 and 7.10 us (M-NA-20-gh200), its
     # device work priced 1.30 and 1.72 without them (FS-5274-LAT1).
-    waited = cost.Chain(copies=float(passes), copy_bytes=read_bytes / launched, stages=1)
-    total = dataclasses.replace(emitted_total, device_bytes=total_device_bytes, span=span,
+    waited = cost.Chain(span=0.0 if family is not None else _triton_slot_steps(total_slices),
+                        copies=float(passes), copy_bytes=read_bytes / launched, stages=1)
+    total = dataclasses.replace(emitted_total, device_bytes=total_device_bytes, span=float(passes),
                                 kernels=1.0, chains=(*emitted_total.chains, waited))
     return total, launched
 
 
-def _triton_span(total_slices: int) -> float:
-    """The dependent steps of a Pallas Triton merge's program: each of its three passes a step a slot of its
-    chunks (`windows.chunk_width` of them a chunk, padded slots alike). Its time rose a slot at a time,
-    not a chunk: an A100's merge of 32 rows' 128 channels took 20.3 us over 16 slots and 33.9 over 32
-    (M-FS-101: 13, 16 and 27 slices), 0.85 us a slot against 3 x 225.3 ns steps; a GH200's of one row's 64
-    channels 3.84 over 8 and 7.10 over 16 (M-NA-20-gh200), 0.41 a slot against 3 x 142.7 ns. Priced a step a
-    pass a chunk, the A100's was 3.9 us and 5.4 (row 5274's decode plan took 27 slices where 13 ran 25%
-    faster, M-NA-50)."""
+def _triton_slot_steps(total_slices: int) -> float:
+    """A Pallas Triton merge's waited path, priced as measured, not as the law's structure: a step a slot of
+    its chunks (`windows.chunk_width` a chunk, padded slots alike) for each of its three passes. The law loads
+    a chunk at once and reduces it in halving trees (`means.merged_state_chunked`, `windows._streamed`), its
+    span three passes a chunk (`_launch_for_block`), but the launches' time rose a slot at a time: an A100's
+    merge of 32 rows' 128 channels took 20.3 us over 16 slots and 33.9 over 32 (M-FS-101-a100: 13, 16 and 27
+    slices), 0.85 us a slot against 3 x 225.3 ns steps; a GH200's of one row's 64 channels 3.84 over 8 and
+    7.10 over 16 (M-NA-20-gh200), 0.41 a slot against 3 x 142.7 ns. Priced a step a pass a chunk, the A100's
+    were 3.9 and 5.4 us, and row 5274's decode plan took 27 slices where 13 ran its walk and merge 136 us
+    against 162 (M-NA-50b-a100)."""
     width = windows.chunk_width(total_slices)
     return float(3 * -(-total_slices // width) * width)
 
 
-def launch_seconds(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
-                   stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
-                   has_initial: bool = False, normalized: bool = False) -> float:
+def priced_launch(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
+                  stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
+                  has_initial: bool = False, normalized: bool = False) -> float:
     """The seconds of one native `merged_padded` launch at its planned block (`_planned_block`), as that
     choice prices it (`cost.launch_seconds`: its programs' waves over the multiprocessors, each wave its
     programs' longest path), on the lowering named where the merge traces (`selection.forced`)."""
@@ -527,7 +529,8 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
                 traced: bool = False, merge: str | None = None) -> cost.Work:
     """One native `merged_padded` launch's device work at `_channel_block`'s chosen block (`_planned_block`,
     row 8779): common-path arithmetic across the grid, valid device traffic with row-stat stores counted once
-    per row (row 8809), span `3 * chunks`, one kernel; its initial state its output where `normalized`
+    per row (row 8809), span `3 * chunks` (a Triton launch's waited path priced a step a slot besides, as
+    measured, `_triton_slot_steps`), one kernel; its initial state its output where `normalized`
     (`template.Initial.normalized`); on the lowering `merge` names where `traced` (a traced merge's own,
     `merged_padded_p`'s `merge`), else the one named here (`selection.forced`)."""
     return _planned_block(algebra.units_of(units), padded, stacked, queries, width, target, has_initial,

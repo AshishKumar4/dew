@@ -36,7 +36,7 @@ from jax.extend import core as jaxpr_core
 from dew.algebra import means
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, emission, merged
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_mosaic, cost, emission, merged
 from dew.nn.kernels.templates.attention import (
     Hooks,
     Initial,
@@ -368,7 +368,7 @@ def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
                    target: generation.GpuTarget, initial: Initial | None) -> float:
     """The seconds of the merge of a split walk's `slices` as its launch's block choice prices it
-    (`merged.launch_seconds`: its programs' waves): the walk's outputs as its launch writes them,
+    (`merged.priced_launch`: its programs' waves): the walk's outputs as its launch writes them,
     `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
     (`attention_mosaic_forward.SplitOutput`). Priced over the whole device at once (`cost.seconds`), a B8
     merge's 512 programs ran as one."""
@@ -379,7 +379,7 @@ def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
     spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    return merged.launch_seconds(spec, padded, stacked, query.shape[1], value.shape[-1], target,
+    return merged.priced_launch(spec, padded, stacked, query.shape[1], value.shape[-1], target,
                                  has_initial=initial is not None,
                                  normalized=initial is not None and initial.normalized)
 
@@ -584,7 +584,8 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     cache, row 7420): `rows` rows of `queries` query positions, `heads` query heads over `kv_heads` key heads
     `width` wide in `dtype`, over `keys` keys of a dense cache or, with `page_size`, of a paged pool's pages
     that long. Each Mosaic launch's work as its emission counts it (`emission.work_of`), the launches in
-    sequence (their spans summed), and a split step's native `merged_padded` launch from `merged.launch_work`
+    sequence (their spans summed, their paths one after another), and a split step's native `merged_padded`
+    launch from `merged.launch_work`
     (leaving unobserved XLA merge work unpriced); None where some launch's work its emission does not
     count."""
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
@@ -628,7 +629,12 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 normalized=equation.params.get("normalized", False), traced=True,
                 merge=equation.params.get("merge")))
     all_launches = launches + merges
-    return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
+    # The launches one after another: their spans summed, and their dependent paths each its longest at the
+    # target's latencies, followed by the next's (`cost.Chain.then`), not the longest of them alone.
+    paths = [max(each.chains, key=lambda chain: cost.chained(Work(chains=(chain,)), target))
+             for each in all_launches if each.chains]
+    return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches),
+                               chains=(functools.reduce(cost.Chain.then, paths),) if paths else ())
 
 @overload
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
