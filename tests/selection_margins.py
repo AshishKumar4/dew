@@ -44,11 +44,12 @@ def routes(config) -> bool:
 
 def selects(config) -> bool:
     """Whether a decoder built from `config` selects discontinuously: a lightning indexer's top-k, the
-    model's own or a layer kind's (DeepSeek V4's compressed sparse attention), Gemma 3n's gaussian top-k
-    or a mixture's routing."""
+    model's own or a layer kind's (DeepSeek V4's compressed sparse attention), MSA's block selection
+    (`dew.nn.block_sparse`), Gemma 3n's gaussian top-k or a mixture's routing."""
     mixers = [config.get("mixer"), *(_read(kind, "mixer") for kind in config.get("kinds", {}).values())]
     sparsities = config.get("activation_sparsity_pattern", ())
-    indexed = any(_read(_read(mixer, "fields") or mixer, "index_topk") for mixer in mixers)
+    indexed = any(_read(_read(mixer, "fields") or mixer, "index_topk")
+                  or _read(_read(mixer, "fields") or mixer, "selection") == "msa" for mixer in mixers)
     return bool(indexed or any(sparsities) or routes(config))
 
 

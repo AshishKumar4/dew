@@ -242,6 +242,23 @@ class MsaIndexer(nn.Module):
         return jnp.where(place[None, :] <= place[:, None], scores, -jnp.inf)
 
 
+def msa_candidates(index_scores: jax.Array, *, block: int = 128, initial: int = 0, local: int = 1
+                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """MSA's blocks as its selection ranks them (`msa_selection`): index scores `[B, G, Q, K]` max-pooled
+    onto blocks of `block` (eq. 6), `[B, G, Q, Kb]`; the earlier blocks each query reaches by a finite
+    score, which it takes by their scores, `[B, G, Q, Kb]`; and the blocks it forces, `[Q, Kb]` (the first
+    `initial` and the `local` ending at its own, each once, those it reaches alone: up to its own), ranked
+    ahead of every score."""
+    pooled = block_maxima(index_scores, None, block)
+    blocks = pooled.shape[-1]
+    queries = pooled.shape[-2]
+    keep = _earlier_blocks(queries, blocks, block) & (pooled > -jnp.inf)
+    own = jnp.arange(queries)[:, None] // block
+    index = jnp.arange(blocks)[None, :]
+    forced = ((index < initial) | ((index > own - local) & (index <= own))) & (index <= own)
+    return pooled, keep & ~forced, forced
+
+
 def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16, initial: int = 0,
                   local: int = 1) -> jax.Array:
     """MSA's selection (arXiv 2606.13392 eq. 7, §A row 59) and MiniMax M3's (§A row 37a): index scores
@@ -253,15 +270,8 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     github.com/dphnAI/sonar, models/minimax_m3/common/ops/index_topk.py: a page's score its tokens' maximum,
     the forced pages prioritized within `topk`)."""
     assert top_k >= 1, "a selection takes a block"
-    pooled = block_maxima(index_scores, None, block)
+    pooled, keep, forced = msa_candidates(index_scores, block=block, initial=initial, local=local)
     blocks = pooled.shape[-1]
-    queries = pooled.shape[-2]
-    keep = _earlier_blocks(queries, blocks, block) & (pooled > -jnp.inf)
-    own = jnp.arange(queries)[:, None] // block
-    index = jnp.arange(blocks)[None, :]
-    # The forced blocks as one mask, each once (the first `initial` and the `local` ending at the query's
-    # own, a query's own counted once however many name it), those it reaches alone: up to its own.
-    forced = ((index < initial) | ((index > own - local) & (index <= own))) & (index <= own)
     # Ranked ahead of every other visible block within the one `top_k`, as M3's index kernels prioritize
     # them: the forced first (lower blocks first), then the rest's top by score (`top_k_selection`), the
     # forced bit ahead of any score, an infinite one too.
@@ -269,7 +279,7 @@ def msa_selection(index_scores: jax.Array, *, block: int = 128, top_k: int = 16,
     slots = min(top_k, blocks)
     first = jax.lax.top_k(forced.astype(jnp.int32), slots, is_stable=True)[1]
     first = jnp.where(jnp.take_along_axis(forced, first, axis=-1), first, -1)
-    ordinary = top_k_selection(pooled, keep & ~forced, slots)
+    ordinary = top_k_selection(pooled, keep, slots)
     both = jnp.concatenate([jnp.broadcast_to(first, ordinary.shape), ordinary], axis=-1)
     chosen = jnp.take_along_axis(both, jnp.argsort(both < 0, axis=-1, stable=True)[..., :slots], axis=-1)
     # Its `top_k` slots whatever its blocks: -1 past those it holds.
@@ -587,11 +597,11 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         """MSA's attention (arXiv 2606.13392 §3): its index branch over the layer's input (`MsaIndexer`, an
         index query head a key head's group beside one shared index key head, the input detached), each
         group's `top_k` blocks of `block` its own forced (`msa_selection`), through the template's indexed
-        form (`selected_attention`). The index scores and selection are sown (`SELECTIONS`), and where an
-        objective trains an indexer its loss per query (`msa_query_kls`, `INDEXER_COLLECTION`), which trains
-        the index branch alone. Over the call's own tokens,
-        a row one document: a right-padded row's trailing padding it reads as keys past the real ones, which
-        causality keeps every real query from (no dense cut to move)."""
+        form (`selected_attention`). Its selection is sown (`SELECTIONS`, `mla.sow_selection`'s record), and
+        where an objective trains an indexer its loss per query (`msa_query_kls`, `INDEXER_COLLECTION`),
+        which trains the index branch alone. Over the call's own tokens, a row one document: a right-padded
+        row's trailing padding it reads as keys past the real ones, which causality keeps every real query
+        from (no dense cut to move)."""
         if append is not None or masking.documents is not None or masking.valid is not None:
             raise ValueError(f"{self.name}: MSA's selection reads a row of one document's real tokens, its "
                              "own: no cache, packed documents or hidden token")
@@ -599,7 +609,11 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                             precision=self.ctx.precision, name="msa_indexer")(hidden)
         selected = msa_selection(scores, block=self.block, top_k=self.top_k)
         if not self.is_initializing():
-            self.sow(SELECTIONS, "msa", {"index_scores": scores, "selected": selected})
+            # Its selection as the gate reads every one (`selection_margins`): each query's blocks by their
+            # pooled scores among those it takes by score, at the slots its forced own block leaves.
+            pooled, taken, _ = msa_candidates(scores, block=self.block)
+            self.sow(SELECTIONS, "selection", {"scores": pooled, "visible": taken,
+                                               "budget": jnp.asarray(min(self.top_k, pooled.shape[-1]) - 1)})
             if self.is_mutable_collection(INDEXER_COLLECTION):
                 # Its indexer's loss per query, as an objective training an indexer reads it
                 # (`IndexerTraining`, `mla.indexer_kl`'s collection).

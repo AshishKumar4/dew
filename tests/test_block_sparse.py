@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import selection_margins
 from attention_oracle import qkv
 from flax import linen as nn
 from reference_error import (
@@ -718,7 +719,9 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
     `selection="msa"`): its index branch's parameters are the model's (`msa_indexer`), it sows its index
     scores and its selection (`SELECTIONS`) and, where an objective trains an indexer, its loss per query
     (`msa_query_kls`, `INDEXER_COLLECTION`; an indexed mixer), and the main loss's
-    gradient leaves the index branch untouched: its input is read detached, the selection taking none."""
+    gradient leaves the index branch untouched: its input is read detached, the selection taking none. Its
+    selection is sown as every selection is (`mla.sow_selection`'s record), which the selection gate reads
+    (`selection_margins`): an MSA decoder's config selects and its margin is finite."""
     model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2,
                                     index_width=8), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
@@ -730,7 +733,11 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
 
     assert named(params, "msa_indexer")
     _, sown = model.apply(params, tokens, mutable=[SELECTIONS, INDEXER_COLLECTION])
-    assert named(sown, "index_scores") and named(sown, "selected")
+    assert named(sown, "scores") and named(sown, "visible") and named(sown, "budget")
+    config = {"mixer": {"fields": {"selection": "msa"}}}
+    assert selection_margins.selects(config)
+    captured = selection_margins.capture(model)(params, tokens)
+    assert np.isfinite(selection_margins.margin(config, captured, "msa"))
     # Its indexer's loss per query, each layer's, where an objective training an indexer opens its
     # collection.
     kls = named(sown, "kl")
@@ -742,20 +749,21 @@ def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_los
 
 def test_an_msa_decoder_of_a_top_of_one_selects_each_querys_own_block_alone():
     """A decoder of block-selected attention by MSA's selection at a top of one (`top_k=1`, row 13527): it
-    builds and runs, each query's one slot its own block (`msa_selection`'s forcing), as it sows it."""
+    builds and runs, sowing a budget of no block past its own, and its selection's one slot is each query's
+    own block (`msa_selection`'s forcing) whatever the scores."""
     model = tiny(mixer=mixers.build("block_sparse_attention", selection="msa", block=4, top_k=1,
                                     index_width=8), dtype="float32")
     tokens = jax.random.randint(jax.random.key(0), (1, 16), 0, VOCAB)
     params = model.init(jax.random.key(1), tokens)
     logits, sown = model.apply(params, tokens, mutable=[SELECTIONS])
     assert np.all(np.isfinite(np.asarray(logits)))
-    selections = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown)[0]
-                  if "selected" in "/".join(str(key) for key in path)]
-    assert selections
-    for selected in selections:
-        first = np.asarray(selected)[..., 0]
-        assert first.shape[-1] == 16
-        np.testing.assert_array_equal(first, np.broadcast_to(np.arange(16) // 4, first.shape))
+    budgets = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown)[0]
+               if "budget" in "/".join(str(key) for key in path)]
+    assert budgets and all(int(budget) == 0 for budget in budgets)
+    scores = jax.random.normal(jax.random.key(2), (1, 2, 16, 16), jnp.float32)
+    scores = jnp.where(jnp.arange(16)[None, :] <= jnp.arange(16)[:, None], scores, -jnp.inf)
+    first = np.asarray(block_sparse.msa_selection(scores, block=4, top_k=1))[..., 0]
+    np.testing.assert_array_equal(first, np.broadcast_to(np.arange(16) // 4, first.shape))
 
 
 def test_an_msa_decoder_refuses_a_logit_softcap():
