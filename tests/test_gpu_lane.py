@@ -1026,6 +1026,11 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
     assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None)}
+    # Its kind kept too: a row's four fields published and read back whole.
+    kinded = [[*fields[0], "flow"]]
+    assert ci.run_keys.baselined("3.12", place, "cls", "token",
+                                 {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": kinded})
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(kinded[0])}
 
 
 @pytest.mark.parametrize("taken", [True, False])

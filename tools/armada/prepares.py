@@ -319,10 +319,13 @@ def record_of(cell: Cell) -> dict:
     return {**record, "identity": identity(record)}
 
 
-def known(cell: Cell, cells: AbstractSet[Cell]) -> bool:
-    """Whether `cells` (a baseline's) holds `cell`: by every field, or, where either side kept no kind (an
-    older record's), by its test, where and label alone; two kinds both stated and different are two cells."""
-    return cell in cells or any(cell[:3] == other[:3] and None in (cell[3], other[3]) for other in cells)
+def knowing(cells: AbstractSet[Cell]) -> Callable[[Cell], bool]:
+    """Whether a baseline's `cells` hold a cell: by every field, or, where either side kept no kind (an older
+    record's), by its test, where and label alone; two kinds both stated and different are two cells. Each
+    answered by a set's lookup, the sets made once a baseline."""
+    placed = {cell[:3] for cell in cells}
+    unkinded = {cell[:3] for cell in cells if cell[3] is None}
+    return lambda cell: cell in cells or cell[:3] in unkinded or (cell[3] is None and cell[:3] in placed)
 
 
 def identity(record: Mapping) -> str:
@@ -348,7 +351,7 @@ def capped_alike(record: Mapping, untried: set[tuple[str, str]]) -> bool:
     """Whether a cell `record` is one main's run left at its prepare's cap (`untried`, the (test, cell label)
     of main's labeled capped flow cells, and of its labeled caps of no known kind, an older baseline's): the
     same test's same labeled flow cell, wherever this run reached it. A site's cap (tests/reference_error.py's
-    labeled Check 1 site) excuses its own cell alone, where it lies (`known`), and no flow cell sharing its
+    labeled Check 1 site) excuses its own cell alone, where it lies (`knowing`), and no flow cell sharing its
     label: the exemption is a cell's, never a site's. Its structured fields, exactly; a reused row's identity
     alone only where it reads one way, the test, " @ ", a where holding no " @ ", then the label (`identity`),
     so no sibling cell and no parameter id that shares a start is taken for it."""
@@ -416,6 +419,7 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
             # older baseline's identities, parsed for its caps as they always were.
             fields = {cell for cell in before if isinstance(cell, tuple)}
+            known = knowing(fields)
             legacy = {cell for cell in before if isinstance(cell, str)}
             untried = {test for test, where, label, _ in fields if where == capped_at and label is None}
             untried_cells = {(test, label) for test, where, label, kind in fields
@@ -428,7 +432,7 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # A record main left so: by its fields where it has them, else (a reused row's identity) rendered.
             rendered = legacy | {identity(record_of(cell)) for cell in fields}
             new = [record for record in judged_
-                   if not (known(cell_of(record), fields) or record["identity"] in legacy if "test" in record
+                   if not (known(cell_of(record)) or record["identity"] in legacy if "test" in record
                            else record["identity"] in rendered)
                    and not skipped_whole(record, untried) and not capped_alike(record, untried_cells)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
