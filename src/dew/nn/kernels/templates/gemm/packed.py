@@ -1,6 +1,6 @@
 """An NVFP4 matrix's stages decoded in the template's mainloop (`mosaic_gpu.gmm`'s `scales`; rows 3621, 3733,
 5387): each 128 depths' sixteen words a column, in the staged order (`formats.staged_rows`), decoded code by
-code by the form's PTX inline (`bits.NVFP4_BFLOAT16_FORM`, `inline_forms`), each code times its block's E4M3
+code by the form's traced reading (`bits.NVFP4_BFLOAT16_FORM`), each code times its block's E4M3
 scale, exactly, into bfloat16: into shared-memory buffers its products read as their matrix (`Decoding`,
 `stage_decoded`), or, the matrix the products' rows (a decode-sized product swapped, `rows_decoded`), into
 the left operand they take from registers, the staged order the warpgroup MMA's fragment, so no decoded stage
@@ -17,7 +17,7 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels.templates import inline_forms, product as product_formats, resources
+from dew.nn.kernels.templates import product as product_formats, resources
 
 NVFP4_GROUP = 128
 """Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
@@ -415,21 +415,23 @@ def lanes(words, scales, interpret: bool, *, layout=None):
         1 / bits.NVFP4_OWED)
     which = jax.lax.broadcasted_iota(jnp.int32, owed.shape, 1)
     for group, group_words in enumerate(words):
-        for code, lane in enumerate(_nvfp4_lanes(loaded(group_words), layout)):
+        for code, lane in enumerate(_nvfp4_lanes(loaded(group_words))):
             # The block's scale a column: its group's code-th, picked from the loaded row by a mask (a
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
             yield group, code, (lane * scale[:, None]).astype(jnp.bfloat16)
 
 
-def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
-    """Dew: the eight codes of each of `words` (uint32, a register tile in `layout`), each code's E2M1 value
+def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
+    """Dew: the eight codes of each of `words` (uint32, a register tile or an array), each code's E2M1 value
     in float32, code by code (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half
     first), each restored by the form's one decoded-value rule (`bits.restored`), so `0.0`, `0.5` and each
-    normal code come out exact. The registers are the form's PTX inline (`inline_forms.registers`, row
-    3733), its `jax.numpy` reading where interpreted (`layout` None), where no inline assembly runs."""
-    form = bits.NVFP4_BFLOAT16_FORM
-    decoded = form.traced(words) if layout is None else inline_forms.registers(form, words, layout)
+    normal code come out exact. The registers are the form's traced reading (`BitForm.traced`), compiled
+    and interpreted alike: its PTX inline (`inline_forms.registers`) ran slower on both GPUs measured, each
+    form its own process and the output bits equal (row 3733): Llama-3-8B's up projection 1.138x at 64 rows
+    and 1.069x at 4096 on a GH200 (M-FS-88), 1.006x to 1.037x on an A100 (M-EM-17), the inline form issuing
+    more of the ALU's instructions at the same stalls."""
+    decoded = bits.NVFP4_BFLOAT16_FORM.traced(words)
     return [bits.restored(half) for register in decoded
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
