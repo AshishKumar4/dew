@@ -366,7 +366,7 @@ def derive_linear_ce(shape: tuple[int, int, int], dtype, target, *, transpose_rh
 
         tile = derivation.derived(tried, rows=aligned_m, depth=aligned_k, width=aligned_v, dtype=dtype,
                                   multiprocessors=multiprocessors, target=target, candidate=candidate,
-                                  launch_of=launch_of, grouped=False, dense=True, ragged=True)
+                                  launch_of=launch_of, grouped=False, dense=True, ragged=True, walked_rows=m)
         if tile is not None:
             return tile
     return None

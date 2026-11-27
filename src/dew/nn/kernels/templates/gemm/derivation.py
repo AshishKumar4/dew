@@ -32,7 +32,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
             programs: int | None = None, outputs: tuple = (), hooked: bool = False,
-            operands: Callable | None = None) -> Tiles | None:
+            operands: Callable | None = None, walked_rows: int | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -49,7 +49,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     `outputs`, the dtypes its tiles store, where the derivation states their staging (`_ring_staged`);
     `hooked`, whether a column-local epilogue's hook computes them, its tile read out a chunk at a time
     (`hooks.ColumnLocal`: its side tiles and outputs a chunk's beside the ring); `operands(tile)`, the
-    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s.
+    launch's operands' bytes and decoded forms its tiles are priced by (`_tile_cost`), else `dtype`'s;
+    `walked_rows`, the rows its launch walks where fewer than `rows` (`linear_ce`'s), which its band reads.
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -112,7 +113,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         most_rows = max(role, rows // 2 // role * role if grouped else axes.whole(rows, role))
         padded = grouped and not dense
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
-                                   multiprocessors=multiprocessors, grouped=padded)
+                                   multiprocessors=multiprocessors, grouped=padded, walked=walked_rows)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded, operands=operands)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
@@ -207,8 +208,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
-    ahead, beside the one consumed and those it keeps in flight); a ring short of that depth, or one its
-    consumers feed at it, deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
+    ahead, beside the one consumed and those it keeps in flight); a column-local epilogue's ring short of
+    that depth, or one its consumers feed at it on a synchronous issuer, deepened where a smaller staging of
+    its outputs leaves room (`_ring_staged`)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
@@ -228,12 +230,15 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
             if outputs and ((tile.stages < busy and hooked and layout.stores_chunks)
-                            or (tile.stages == busy and layout.feeds_itself)):
+                            or (tile.stages == busy and layout.feeds_itself and not layout.in_flight)):
                 # A column-local epilogue's ring short of busy where its outputs stage in chunks (its
                 # outputs and side tiles beside it: the paired backward's pulled launch, three outputs and two
-                # sides, row 1958), or one its consumers feed at its least busy depth, deepened by a smaller
-                # staging of its outputs. An epilogue read out whole is not (the lightning flow's paired
-                # gate/up, three outputs at 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers).
+                # sides, row 1958), or one its consumers feed at its least busy depth on a synchronous issuer
+                # (mma.sync's, row 5634's input gradient), deepened by a smaller staging of its outputs. An
+                # epilogue read out whole is not (the lightning flow's paired gate/up, three outputs at
+                # 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers); nor a fed ring whose products
+                # stay in flight (warpgroup MMA's: a swapped NVFP4 decode at 128 x 64 x 256 ran 1.65x slower
+                # at four stages staged (32, 1) than at three unstaged on a GH200, M-FS-89c/d, row 5874).
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
                                     target=target, programs=programs,
                                     least=mosaic.HOOK_COLUMNS if tile.stages < busy else ACCUMULATOR_COLUMNS)
@@ -400,7 +405,7 @@ def _padded_side(layouts: tuple, consumers: int, role: int, most_rows: int, colu
 
 
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,
-            width: int, multiprocessors: int, grouped: bool) -> Tiles:
+            width: int, multiprocessors: int, grouped: bool, walked: int | None = None) -> Tiles:
     """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
     tiles of one group where its layout's loads multicast and the call's rows (a group's on average, a
     kernel gradient's output rows) hold a tile's, which then read the block they share once (a product's
@@ -409,7 +414,12 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n, grouped=grouped,
-                          cluster=cluster)
+    # The column tiles a cluster's tiles walk (`pricing.tile_columns`: a pair's products both CTAs'; a width
+    # its launch rounds up to them), and the row tiles of the rows the launch walks (`walked`), which its
+    # band reads.
+    columns = block_n * (cluster if layout.pairs_product else 1)
+    row_tiles = -(-(walked or rows) // (block_m * cluster))
+    band = resources.band(multiprocessors * programs, block_m, columns, -(-width // columns),
+                          row_tiles=row_tiles, grouped=grouped, cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
                  programs=programs)
