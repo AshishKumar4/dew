@@ -13,6 +13,7 @@ from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
+import jax
 
 from dew._records import JSON
 from dew.data.compile import fitted
@@ -183,32 +184,64 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     # checkpoint that records none, a fixed-pass run's, any run resumes).
     dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
                and "sampled_passes" not in now else [])
-    return differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
+    # Its numerics compared as they computed (`numerics_differs`), the rest of its record as it reads.
+    if isinstance(saved, dict):
+        saved = {name: value for name, value in saved.items() if name not in ("numerics", "products")}
+    return (differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
+            + numerics_differs(checkpoints.training(step)))
 
 
 def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]",
                                                checkpoints: "Checkpoints", step: int, *,
-                                               numerics_alone: bool = False) -> None:
+                                               numerics_of: JSON | None = None) -> None:
     """Refuse `trainer`'s resume of `checkpoints`' `step` where they compute otherwise
     (`computation_differs`), read under the numerics its steps trace under (`under_numerics`): the
-    trainer's own admission. A configured run takes its numerics' part (`numerics_alone`: the numerics and
-    the precision its products computed at) before it replaces its record (`RunConfig.train`, row 13708),
-    the rest once its start is laid out as the checkpoint's."""
+    trainer's own admission. A configured run takes its numerics' part alone (`numerics_differs` of the
+    step's training record `numerics_of`, read once) before it replaces its record (`RunConfig.train`, row
+    13708), the rest once its start is laid out as the checkpoint's."""
     from dew.training.distributed import under_numerics
 
     with under_numerics(trainer.numerics):
-        if numerics_alone:
-            saved = checkpoints.training(step)
-            now = trainer.phase_passes.training_record(trainer.objective)
-            differs = [] if not isinstance(saved, dict) else _differing(
-                {name: value for name, value in saved.items() if name in ("numerics", "products")},
-                {name: value for name, value in now.items() if name in ("numerics", "products")}, "training")
-        else:
-            differs = computation_differs(trainer, checkpoints, step)
+        differs = (numerics_differs(numerics_of) if numerics_of is not None
+                   else computation_differs(trainer, checkpoints, step))
     if differs:
         raise ValueError(f"the checkpoint at step {step} in {checkpoints.directory} trained another "
                          f"computation ({', '.join(differs)}); resume it with the objective, its settings "
                          "and model it recorded, or train in another directory")
+
+
+def numerics_differs(saved: JSON) -> list[str]:
+    """Where a checkpoint's training record `saved` states numerics other than those its resume computes
+    under where it is read (`numerics_record`): their forms, recipe and outputs, and the precision its
+    products computed at (`products`), whatever precision it declared (row 13708). A record a Dew wrote
+    before it stated `products` states none: its declared precision (`matmul`) is held to the resume's,
+    JAX's own default named either way ("default", `DotAlgorithmPreset.DEFAULT`) as one."""
+    from dew.nn.kernels import generation
+    from dew.training.phase_passes import numerics_record
+
+    numerics = saved.get("numerics") if isinstance(saved, dict) else None
+    if not isinstance(saved, dict) or not isinstance(numerics, dict):
+        return []
+    now = numerics_record()
+    found = _differing({key: value for key, value in numerics.items() if key != "matmul"}, now["numerics"],
+                       "training.numerics")
+    if "products" in saved:
+        return found + _differing(saved["products"], now["products"], "training.products")
+    declared = generation.numerics().matmul
+    if "matmul" in numerics and _declared(numerics["matmul"]) != _declared(declared):
+        found.append("training.numerics.matmul")
+    return found
+
+
+def _declared(matmul: JSON | str | jax.lax.Precision | jax.lax.DotAlgorithmPreset) -> frozenset[str] | None:
+    """A declared product precision's canonical names (`precision_names`), None for JAX's own default."""
+    from dew.nn.precision import precision_names
+
+    name = matmul.name if isinstance(matmul, jax.lax.DotAlgorithmPreset | jax.lax.Precision) else matmul
+    if not isinstance(name, str) or name.lower() == "default":
+        return None
+    return frozenset(precision_names(jax.lax.DotAlgorithmPreset[name] if name in
+                                     jax.lax.DotAlgorithmPreset.__members__ else name))
 
 
 def differing_records(saved: JSON, now: JSON, trained: JSON, training: JSON) -> list[str]:
