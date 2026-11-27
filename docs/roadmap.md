@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010]
 - The kernel challenge's lessons in the templates. [5271]
@@ -52,7 +52,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1459, 1460, 1646]
 - The suite's wall. [5478, 12431, 12433, 12644]
-- SD3's conditioner (the tiny published pipeline with CLIP x2 + T5) encodes drawn prompts with its context 2.23x Diffusers' float32 encode_prompt's RMS error…. [13655]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
@@ -95,7 +94,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 5234, 5235]
 - Released checkpoints judged on GPUs. [1703, 11674]
-- Bit-level synthesis in dew.algebra. [3733]
 - Dew's CI, test cache and compile-ahead tests. [5670]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
