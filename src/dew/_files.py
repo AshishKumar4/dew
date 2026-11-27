@@ -346,7 +346,7 @@ def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
         log.warning("could not remove %s from a save's discarded tree: %s", name, left)
 
 
-def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, grpid: bool,
+def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, grpid: bool | None,
              written: Entries, replacements: Replacements) -> int:
     """Give each entry of `staging` the group and access the tree published from it takes at `directory`,
     as the destination is now, and return the mode its root takes, which its caller sets last.
@@ -378,6 +378,11 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
         setgid = parent.st_mode & stat.S_ISGID
         # The group a folder made in the parent takes now: its own where it is setgid or the filesystem
         # gives an entry its folder's (`grpid`), the publisher's otherwise.
+        if not setgid and grpid is None and parent.st_gid != egid:
+            raise PermissionError(f"{directory} is new in a folder of another group than the publisher's, "
+                                  "which this filesystem gives it or not by a rule no probe of this process "
+                                  "reads: publish it as a user of another group, or set the folder's setgid "
+                                  "bit")
         root = (parent.st_gid if setgid or grpid else egid, (made & ~stat.S_ISGID) | setgid)
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
@@ -397,6 +402,11 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
             # the folder is setgid or the filesystem gives its folder's (`grpid`), the publisher's otherwise,
             # so no folder's group reads a new file its owner did not open to it (trains 1423 and theme 72's
             # reviews); stated, not the one the kernel gave it under the staging's own folders.
+            if not setgid and grpid is None and group != egid:
+                raise PermissionError(f"{entry} is new in a folder of another group than the publisher's, "
+                                      "which this filesystem gives it or not by a rule no probe of this "
+                                      "process reads: publish it as a user of another group, or set the "
+                                      "folder's setgid bit")
             group = group if setgid or grpid else egid
             mode = (stat.S_IMODE(path.lstat().st_mode) & ~stat.S_ISGID) | setgid if kind == "folder" else None
         _grouped(path, group)
@@ -419,21 +429,21 @@ def _grouped(path: Path, group: int | None) -> None:
         os.chown(path, -1, group, follow_symlinks=False)
 
 
-def _keeps_folder_group(parent: Path) -> bool:
+def _keeps_folder_group(parent: Path) -> bool | None:
     """Whether the filesystem at `parent` gives an entry made in a folder that is not setgid that folder's
     group (`grpid`, BSD's rule) rather than its maker's: read off a probe folder made there and removed, its
-    setgid bit cleared and, where it is in the maker's group, given another of the maker's groups, and a
-    folder made in it. A maker of one group alone, whose every folder is in its group, is told no: the
-    maker's group, which both rules give its own folders, and no other's for another's."""
+    setgid bit cleared and, where it is in the maker's group, given another group the maker may give (one
+    of its own, or any where it is root), and a folder made in it. None where no other group is the
+    maker's to give, whose answer no probe reads (`_granted` refuses only where it decides a group)."""
     egid = os.getegid()
-    others = sorted(set(os.getgroups()) - {egid})
+    others = sorted(set(os.getgroups()) - {egid}) or ([egid + 1] if os.geteuid() == 0 else [])
     probe = _beside(parent / "probe", ".group")
     probe.mkdir(0o700)
     try:
         probe.chmod(0o700)
         if probe.stat().st_gid == egid:
             if not others:
-                return False
+                return None
             os.chown(probe, -1, others[0])
         inner = probe / "inner"
         inner.mkdir()
