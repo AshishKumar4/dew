@@ -418,20 +418,19 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
                                   params, encoder.tokenize([empty]))})
     branch = jax.jit(lambda x, t: denoise.convert(x, t, denoise.raw_both(x, t)[1])[0])(latent, times)
 
-    def plain(conditions):
-        denoiser = process.denoiser(loaded.model, variables, conditions)
-        return jax.jit(lambda x, t: denoiser(x, t)[0])(latent, times)
+    # One program over its conditioning, an array tree, which each call below runs.
+    plain = jax.jit(lambda conditions, x, t: process.denoiser(loaded.model, variables, conditions)(x, t)[0])
 
     per_row = encoder.encode(params, encoder.tokenize(
         [dict(empty, guidance=2.0), dict(empty, guidance=6.0)]))
-    direct = plain({"conditioning": per_row})
+    direct = plain({"conditioning": per_row}, latent, times)
     # The guided call runs one model call over the doubled batch, so its
     # reductions are not the two-row call's bit for bit; the value that
     # matters is which guidance each row was walked at, and reading the
     # default instead of the row's own moves the output by far more.
     np.testing.assert_allclose(branch, direct, rtol=2e-5, atol=2e-5)
     default = encoder.encode(params, encoder.tokenize([dict(empty), dict(empty)]))
-    other = plain({"conditioning": default})
+    other = plain({"conditioning": default}, latent, times)
     assert not np.allclose(branch, other, rtol=2e-5, atol=2e-5)
 
     # Dropping every caption leaves the guidance in place, so the loss still

@@ -106,16 +106,31 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
 
 @attending("reference")
 def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
-    """A speculative block's verified stretch replayed into the cache saved before it and recorded into
-    DSpark's windows, its rows keeping three tokens and fewer, drafts its next block as a fresh prefill of
-    each row's history does (row 13317; `speculative_support`), over the recorded cached rows, whose every
-    selection clears the gate's margin."""
+    """One speculative block through `block_step`, its rows keeping four tokens and fewer, its accepted
+    prefix replayed and recorded into DSpark's windows, drafts its next block as a fresh prefill of each
+    row's history does (row 13317; `speculative_support`), over rows drawn from each seed whose every
+    selection, over the prompt and the greedy walk after it, clears the gate's margin
+    (`selection_margins.clearing`): a seed's draw its own however far check 1 draws."""
+    import functools
+
+    import selection_margins
+
     walk = greedy_walk(source.model, source.variables)
+    vocabulary = source.model_config["vocab_size"]
+    selecting = jax.jit(functools.partial(selection_margins.capturing, source.model))
 
     def drawn(seed):
-        return block_draw(walk, ROWS["cached_rows"][seed], 9, 3, np.random.default_rng([0x1331, seed]))
+        rows = np.random.default_rng([0x1331, seed]).integers(0, vocabulary, (2, 16)).astype(np.int32)
+        return block_draw(walk, rows, 9, 3, np.random.default_rng([0x1332, seed]))
 
-    assert_replay_drafts_as_a_prefill(source.model, source.variables, drawn,
+    def clears(inputs):
+        prompts, greedy = inputs[0], inputs[1]
+        _, captured = selecting(source.variables, jnp.asarray(np.concatenate([prompts, greedy], axis=1)))
+        return selection_margins.margin(source.model_config, captured, "a replayed block's row") > (
+            selection_margins.MARGIN)
+
+    assert_replay_drafts_as_a_prefill(source.model, source.variables,
+                                      selection_margins.clearing(drawn, clears),
                                       "DSpark's replayed block's draft", seeds=8, mask_on_host=True)
 
 
