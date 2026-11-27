@@ -12,14 +12,13 @@ from dew.training import MeshSpec
 
 @attending("xla")
 @pytest.mark.shared_setup("sm90_full_tiled_needs")
-def test_a_frontier_lists_each_lighter_rung_the_search_passed_over_that_fits(tmp_path, monkeypatch):
+def test_a_frontier_plan_is_the_lighter_rung_its_jump_compiles_second(tmp_path, monkeypatch):
     """A step given room for itself recomputing all ('full') and for its head tiled recomputing nothing, but
-    not whole recomputing nothing (each measured, `need_ahead`): its search settles a remat rung at its
-    whole head in its fewest compiles, as without its frontier, and the frontier lists, below that plan,
-    each lighter rung the search passed over that fits, the tiled head at no recomputation among them,
-    the run left at its plan; and a plan taken from the
-    record the first left lists the same (row 10817: the cheaper rung was compiled by no search and told no
-    run)."""
+    not whole recomputing nothing (each measured, `need_ahead`): its second compile is the lighter of the
+    two, its head tiled recomputing nothing (`FitSearch.jumped`, the owner's 2026-11-26 ruling), as without
+    its frontier, the run left at that plan, and every rung its frontier lists below it fits; and a plan
+    taken from the record the first left compiles that rung first and lists the same (row 10817: the
+    cheaper rung was compiled by no search and told no run)."""
     from dew.training.ahead import compile_ahead
     from dew.training.memory import recompute_record
 
@@ -35,11 +34,13 @@ def test_a_frontier_lists_each_lighter_rung_the_search_passed_over_that_fits(tmp
     plan = record(compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1),
                                 frontier=True).plan, "plan")
     assert {name: plan[name] for name in rung} == {name: alone[name] for name in rung}
-    assert plan["remat"] is not None and plan["head_tile"] is None, plan["probes"]
-    assert recompute_record(trainer.objective) == plan["remat"] and trainer.objective.head_tile is None
+    probes = listed(plan["probes"], "probes", read=record, what="probes")
+    assert [record(probe, "probe")["fits"] for probe in probes] == [False, True], probes
+    assert plan["remat"] is None and plan["head_tile"] is not None, probes
+    assert recompute_record(trainer.objective) == plan["remat"]
+    assert list(trainer.objective.head_tile or ()) == list(plan["head_tile"])
     lighter = listed(plan["lighter"], "lighter", read=record, what="lighter")
     assert all(entry["fits"] is True for entry in lighter), lighter
-    assert any(entry["remat"] is None and entry["head_tile"] is not None for entry in lighter), lighter
     # A plan taken from the record the first plan left lists the same lighter rungs, its search asking none.
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     warm = record(compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=1,
