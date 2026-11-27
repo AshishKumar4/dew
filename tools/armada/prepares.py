@@ -305,19 +305,24 @@ def cell_of(record: Mapping) -> Cell:
     return (record["test"], record.get("where") or "?", record.get("cell"), record.get("kind"))
 
 
-def record_of(cell: Sequence) -> dict:
-    """The record of cell `cell` (`Cell`, or an older baseline's three fields, its kind unknown), as
-    `unprepared_in` gives one, its `identity` beside it."""
-    test, where, label, kind = (*cell, None) if len(cell) == 3 else cell
+def decoded(kept: Sequence) -> Cell:
+    """A cell as a row or a baseline keeps it (`unprepared_cells`: four fields, or an older record's three,
+    its kind unknown, None), as `Cell`: every reader of a kept cell reads it so, and grades `Cell`s alone."""
+    return (kept[0], kept[1], kept[2], kept[3] if len(kept) == 4 else None)
+
+
+def record_of(cell: Cell) -> dict:
+    """The record of cell `cell` (`Cell`), as `unprepared_in` gives one, its `identity` beside it."""
+    test, where, label, kind = cell
     record = {"test": test, "where": where, **({"cell": label} if label else {}),
               **({"kind": kind} if kind else {})}
     return {**record, "identity": identity(record)}
 
 
 def known(cell: Cell, cells: AbstractSet[Cell]) -> bool:
-    """Whether `cells` (a baseline's) holds `cell`: by every field, or, where the baseline kept no kind, by
-    its test, where and label alone."""
-    return cell in cells or (*cell[:3], None) in cells
+    """Whether `cells` (a baseline's) holds `cell`: by every field, or, where either side kept no kind (an
+    older record's), by its test, where and label alone; two kinds both stated and different are two cells."""
+    return cell in cells or any(cell[:3] == other[:3] and None in (cell[3], other[3]) for other in cells)
 
 
 def identity(record: Mapping) -> str:
@@ -389,7 +394,8 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
         own = unprepared.get(file_of(found["name"]), [])
         # A reused row's cells by their fields where its record keeps them (`unprepared_cells`), else by its
         # identities.
-        held = ([record_of(tuple(cell)) for cell in found["unprepared_cells"]] if "unprepared_cells" in found
+        held = ([record_of(decoded(cell)) for cell in found["unprepared_cells"]]
+                if "unprepared_cells" in found
                 else [{"identity": cell} for cell in found["unprepared"]] if "unprepared" in found
                 else [{**record, "identity": identity(record)} for record in own])
         cells = sorted(record["identity"] for record in held)
@@ -409,7 +415,7 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: Abstr
             # cells by their fields gives main's capped ones so; an older one's identities are read back.
             # Kept apart: main's cells by their fields, compared and read for its caps by field alone, and an
             # older baseline's identities, parsed for its caps as they always were.
-            fields = {(*cell, None) if len(cell) == 3 else cell for cell in before if isinstance(cell, tuple)}
+            fields = {cell for cell in before if isinstance(cell, tuple)}
             legacy = {cell for cell in before if isinstance(cell, str)}
             untried = {test for test, where, label, _ in fields if where == capped_at and label is None}
             untried_cells = {(test, label) for test, where, label, kind in fields
@@ -548,7 +554,7 @@ def cells_of(record: dict | None) -> set[Cell] | set[str] | None:
                 and all(field is None or isinstance(field, str) for field in cell[2:])
                 for cell in kept)):
             raise Unread("a baseline's cells are no list of cells")
-        return {(cell[0], cell[1], cell[2], cell[3] if len(cell) == 4 else None) for cell in kept}
+        return {decoded(cell) for cell in kept}
     kept = record.get("unprepared")
     if not (isinstance(kept, list) and all(isinstance(cell, str) for cell in kept)):
         raise Unread("a baseline's unprepared cells are no list of cells")
