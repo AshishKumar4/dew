@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 13557, 13562, 13588, 13592, 13734, 13740, 13743, 13751]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6010]
 - The kernel challenge's lessons in the templates. [5271]
@@ -26,6 +26,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873, 13489]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
 - Every consumer runs the template's program. [13741]
+- Log-linear bf16 training backward regression. [13750]
 - Low-precision and decode-size GEMMs. [483, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
