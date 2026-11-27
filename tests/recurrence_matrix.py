@@ -142,10 +142,11 @@ def _op(hooks) -> generation.Choice:
 
 
 
-FP32_HEADS = 16
-"""The value heads an fp32 cell draws (`_drawn`): its per-head parameters' gradients (a gate's `log_a` and
-`bias`, a rate) an element a head, which at the draw's two left three fp32 cells' paired ratios unresolved
-within 512 seeds (M-JS-75d); a 16-bit cell's rounding resolves at two."""
+PARAMETER_HEADS = 16
+"""The value heads an fp32 cell and a TPU cell draw (`_drawn`): its per-head parameters' gradients (a
+gate's `log_a` and `bias`, a rate) an element a head, which at the draw's two left three fp32 cells' paired
+ratios unresolved within 512 seeds (M-JS-75d), and a v6e's bf16 rated scan's rate's its reference against
+itself (M-JS-298); a GPU's 16-bit cell's rounding resolves at two."""
 
 
 MODEL_WIDTHS = {"Qwen3.5-27B": {"key_heads": 16, "value_heads": 48, "key_width": 128, "value_width": 128,
@@ -159,10 +160,10 @@ keep a memory a token: two rows over 1,024 tokens asked 40.37 GiB of an A100's 4
 
 def _drawn(case: dict[str, str], seed: int):
     """`case`'s operands from `seed` (`draw`, its queries, keys and values and write gate in the case's
-    dtype; an fp32 cell's over `FP32_HEADS` value heads; a case naming `widths` at a model's,
-    `MODEL_WIDTHS`) and fp32 cotangents of its output and final memory."""
+    dtype; an fp32 cell's and a TPU cell's over `PARAMETER_HEADS` value heads; a case naming `widths` at a
+    model's, `MODEL_WIDTHS`) and fp32 cotangents of its output and final memory."""
     hooks = FORMS[case["form"]]
-    heads = FP32_HEADS if case["dtype"] == "float32" else VALUE_HEADS
+    heads = PARAMETER_HEADS if case["dtype"] == "float32" or case["kernel"] == "tpu" else VALUE_HEADS
     widths = MODEL_WIDTHS[case["widths"]] if "widths" in case else {"value_heads": heads}
     (operands,) = draw(hooks, packed=case["documents"] == "packed", seed=seed, **widths)
     narrow = jnp.dtype(case["dtype"])
@@ -301,7 +302,7 @@ SEEDS = {
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
-cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
+cells over `PARAMETER_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
 took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it, and
 the write gate's on the template (its bf16 training on it since 55cd6a126de) and the rated scan's fp32 one
 (row 7673) its form and dtype's on the portable math's until an H100 sizes it."""
