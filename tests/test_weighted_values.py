@@ -5,6 +5,7 @@ mesh splits the keys (row 13655)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from dew.nn.attention import VALUE_BLOCK, weighted_values
@@ -13,6 +14,7 @@ from dew.nn.precision import sums_in_float64
 EQUATION = '...hqk,...khd->...qhd'
 
 
+@pytest.mark.cpu
 def test_a_sum_across_its_blocks_cancels_exactly_where_the_one_dot_is_one_float64_sum():
     """Under Dew's wide CPU arithmetic, where the one dot is one float64 sum rounded once
     (`sums_in_float64`), a product whose keys cancel across a block's edge keeps what they leave: 1 and 2^-24
@@ -27,14 +29,13 @@ def test_a_sum_across_its_blocks_cancels_exactly_where_the_one_dot_is_one_float6
     assert float(np.asarray(out).ravel()[0]) == 2.0 ** -24
 
 
+@pytest.mark.mesh(devices=3)
 def test_keys_a_mesh_splits_take_the_one_dot():
     """Keys an Explicit mesh axis splits three ways, 66 of them, which no 64-key block divides, summed in fp32
     (`FP32_SUMS`, where a CPU would block them): the product traces as the one dot, split as its value is."""
     from dew.nn.precision import FP32_SUMS
 
-    devices = jax.devices()
-    assert len(devices) >= 3, "the suite's CPU holds a three-device mesh"
-    mesh = jax.sharding.Mesh(np.asarray(devices[:3]), ("keys",), axis_types=(AxisType.Explicit,))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:3]), ("keys",), axis_types=(AxisType.Explicit,))
     weights = jax.ShapeDtypeStruct((1, 2, 5, 66), jnp.float32, sharding=NamedSharding(mesh, PartitionSpec()))
     value = jax.ShapeDtypeStruct((1, 66, 2, 4), jnp.float32,
                                  sharding=NamedSharding(mesh, PartitionSpec(None, "keys", None, None)))
