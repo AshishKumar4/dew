@@ -459,6 +459,14 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     gradient = np.asarray(jax.grad(lambda s: loss(s, farther) * 2.0**126)(far))[0, 0, 1, 1]
     expected = -(2.0**126) * np.exp(-110.0) / (1 + np.exp(-110.0))
     assert_fp32_reduction_bound(gradient, expected, abs(expected), 3)
+    # Teacher logits 0 and -176 against scores 0 and fp32's least: the term fp32's largest e^-176, 1.25e-38,
+    # normal, though the weight's half e^-88 is not (a flushing backend's 0).
+    farthest = jnp.asarray([[[[0.0]], [[-176.0]]]], jnp.float32)
+    largest = float(np.finfo(np.float32).max)
+    spanned = jnp.asarray([[[[0.0, -np.inf], [0.0, -largest]]]], jnp.float32)
+    mass = np.exp(-176.0)
+    terms = np.asarray([mass * np.log(mass), mass * largest])
+    assert_fp32_reduction_bound(np.asarray(loss(spanned, farthest)), terms.sum(), np.abs(terms).sum(), 4)
     invalid = jnp.asarray([[[[0.0]], [[np.nan]]]], jnp.float32)
     uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
     assert np.isnan(float(loss(uniform, invalid)))

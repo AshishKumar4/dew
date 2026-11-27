@@ -330,30 +330,33 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         # Each term at its share of the groups' mean, taken as its product and then divided where the
         # product holds in fp32, its gap divided first where the product passes fp32's range, and its peak's
         # and score's shares apart where the gap itself does: no group's own KL past fp32's range is rounded
-        # before the mean. A weight below fp32's least normal meets them in its halves instead (`scaled`),
+        # before the mean. A weight below fp32's least normal meets them in its quarters instead (`scaled`),
         # so a term its rounded weight would flush keeps its value (a teacher of logits 0 and -110 against
         # scores 0 and -2^126: 1.44e-10, train 1345's F2).
         held = jnp.where(taken, scores, 0)
         gap = peak - held
         tiny = log_target < jnp.log(jnp.finfo(wide).tiny)
 
-        half = jnp.exp(log_target / 2)
+        quarter = jnp.exp(log_target / 4)
 
         def scaled(x):
-            # `target * x / groups` of a weight below fp32's least normal: its weight's halves each a normal
-            # number (e^(L/2), exact halving of its logarithm L), the product formed between them, so neither
-            # rounds to 0 first and each takes one rounding, its derivative alike (between the halves). An
-            # infinite `x` its own signed infinity where a half is 0 (its weight's slope 0 there), where the
-            # product would be 0 * inf.
-            product = ((half * x) * half) / groups
-            return jnp.where(jnp.isinf(x) & (half == 0), jax.lax.stop_gradient(x), product)
+            # `target * x / groups` of a weight below fp32's least normal: its weight's quarters each a normal
+            # number wherever the product is (e^(L/4), an exact quarter of its logarithm L: a normal product
+            # of a finite x holds L above -176, a quarter above -44), multiplied into x one at a time, so none
+            # rounds to 0 first and each takes one rounding, its derivative alike. An infinite `x` its own
+            # signed infinity where a quarter is 0 (its weight's slope 0 there), where the product would be
+            # 0 * inf.
+            product = (((x * quarter) * quarter) * quarter) * quarter / groups
+            return jnp.where(jnp.isinf(x) & (quarter == 0), jax.lax.stop_gradient(x), product)
 
         product = target * gap
         direct = jnp.where(jnp.isfinite(gap),
                            jnp.where(jnp.isfinite(product), product / groups, target * (gap / groups)),
                            target * (peak / groups) - target * (held / groups))
-        halved = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak) - scaled(held))
-        gaps = jnp.where(taken, jnp.where(tiny, halved, direct), 0)
+        # A gap past fp32's range halved before it is scaled (`peak / 2 - held / 2`, finite), so its two
+        # sides' terms cannot flush apart before their normal sum.
+        quartered = jnp.where(jnp.isfinite(gap), scaled(gap), 2 * scaled(peak / 2 - held / 2))
+        gaps = jnp.where(taken, jnp.where(tiny, quartered, direct), 0)
         # The entropy's terms formed as the gaps' are, a tiny weight's between its halves, so equal teacher
         # and student cancel where a flushed weight dropped one side.
         logged_safe = jnp.where(taken, log_target, 0)
