@@ -147,7 +147,8 @@ def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, valu
     ed = dtype if block.out_dtype is None else block.out_dtype
     w = block.epilogue_chunk(family, value_width, dtype, training=residuals, masked=masked) or value_width
     r, live = family.row_registers(block_q, jnp.float32), resources.live_registers
-    hooked = _hook_tiles(block_q, w, *output) if output is not None and block.output_hook else []
+    # The hook's tiles but its input, the finished chunk, which the finish's own three hold.
+    hooked = _hook_tiles(block_q, w, *output)[1:] if output is not None and block.output_hook else []
     fin = live(family, carried, [(block_q, w, jnp.float32)] * 3 + [(block_q, w, ed)] + hooked) + 2 * r
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 

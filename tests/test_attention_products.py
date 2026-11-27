@@ -6,6 +6,7 @@ the Mosaic mainloop interpreted as an H100's and an A100's."""
 import jax
 import jax.numpy as jnp
 import pytest
+from attention_oracle import traced_attention_terms
 from generation_support import INTERPRETS
 from reference_error import assert_as_exact, with_gradients
 
@@ -118,6 +119,21 @@ def test_banded_products_are_on_par_with_their_logits_selected(case, bands, form
                     _draw(products), f"banded products {case} {bands} {form}", seeds=SEEDS)
 
 
+def _banded_terms(spans: template.KeySpans, combine: attention_products.Banded):
+    """The float64 terms of a two-product banded call's output and gradients (`attention_oracle`'s
+    `attention_terms` of the call it lays out, `attention_products.selected`): a row that cancels, a query
+    of one key's dQ among them, held to what it sums, as the template's own backward checks hold it; each
+    copy's key and value terms its product's, the value's copies' summed in quadrature."""
+    def terms(q1, q2, k1, k2, value, dout):
+        query, key, values, laid, _ = attention_products.selected((q1, q2), (k1, k2), value, spans, combine)
+        out, dq, dk, dv = traced_attention_terms(query, key, values, dout, template.dense(laid)[:, None])
+        count = spans.keys
+        return (out, dq[..., :WIDTH], dq[..., WIDTH:], dk[:, :count, :, :WIDTH], dk[:, count:, :, WIDTH:],
+                jnp.sqrt(dv[:, :count] ** 2 + dv[:, count:] ** 2))
+
+    return terms
+
+
 @INTERPRETS
 @pytest.mark.parametrize("form", FORMS)
 @pytest.mark.parametrize("device", ["sm90", "sm80"])
@@ -154,7 +170,8 @@ def test_banded_products_are_on_par_on_the_mosaic_mainloop_interpreted(device, f
         return out, *pull((grads.query.astype(query.dtype), grads.key, grads.value))
 
     assert_as_exact(jax.jit(ours), jax.jit(with_gradients(_banded_reference(spans, combine.bands))), _draw(2),
-                    f"banded products on the Mosaic mainloop {device} {form}", seeds=SEEDS)
+                    f"banded products on the Mosaic mainloop {device} {form}", seeds=SEEDS,
+                    terms=_banded_terms(spans, combine))
 
 
 @pytest.mark.parametrize("bands", [(), (8, 8), (16, 4), (-1,)])
