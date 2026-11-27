@@ -314,7 +314,7 @@ class Defaulted(nn.Module):
 
 
 def test_a_configs_defaults_read_back_as_the_records_it_wrote():
-    """A model config's defaults (`Registered.defaults`) are records, and read back as those records
+    """A model config's defaults (`Bound.defaults`) are records, and read back as those records
     (`JsonRecords`): written and read, or replaced, the config is the one it was, a function's default its
     `{"function": ...}`, never the value it names."""
     from dew.registry import ModelConfig, to_record

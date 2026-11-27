@@ -322,8 +322,8 @@ def validated_run(directory, *, validates: bool, **fields):
 def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_names(tmp_path, monkeypatch):
     """An image run's default metric is CLIP's distance where its data validates: the run trains,
     validates and logs `val/clip_similarity` from the CLIP its metric names, here the committed tiny
-    one, given on the command line (`MetricConfig("clip", {"modelname": ...})`, what the default
-    holds with the published model, which only a download reads). Data with no validation split
+    one, given on the command line (`MetricConfig(functools.partial(CLIPDistance, modelname=...))`, what
+    the default holds with the published model, which only a download reads). Data with no validation split
     builds no default metric and trains."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     # Named as a command line names it: one JSON list of the metrics' records.

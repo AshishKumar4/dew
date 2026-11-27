@@ -82,7 +82,7 @@ def test_an_env_run_saved_and_read_back_is_the_run(run, tmp_path):
 
 def test_an_env_run_parsed_from_its_command_line_holds_its_kinds_own_records():
     """A run parsed from its command line (`EnvRunConfig.cli`) holds each record as its kind's own class,
-    equal to the one a caller builds with the same settings (`Registered.recorded`)."""
+    equal to the one a caller builds with the same settings (`Bound.recorded`)."""
     parsed = EnvRunConfig.cli(["rollout:control", "--rollout.unroll-length", "64"])
     assert type(parsed.rollout) is RolloutConfig
     assert parsed.rollout == RolloutConfig(functools.partial(ControlRollout, unroll_length=64))

@@ -8,7 +8,7 @@ its data a chain (`dew.data.presets.images`, its size and batch) as `default` st
 
 `--pretrained stabilityai/stable-diffusion-3.5-medium preset:none` fine-tunes a
 published pipeline (SD3, Flux, Qwen-Image or a UNet) on its own conditioning,
-autoencoder and convention; a run whose objective is `ObjectiveConfig("flow_grpo")` with
+autoencoder and convention; a run whose objective is `ObjectiveConfig(functools.partial(FlowGRPOObjective))` with
 `--rollout.reward clip_score` trains the model with Flow-GRPO on that reward instead of the
 denoising loss.
 """
