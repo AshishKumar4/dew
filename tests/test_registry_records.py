@@ -739,7 +739,8 @@ def test_a_tuple_of_partials_under_a_union_records_and_builds_as_its_sequence_me
     from dew.registry import ModelConfig
 
     predictor = functools.partial(JepaPredictor, num_layers=2)
-    config = ModelConfig(functools.partial(registry.models[f"{__name__}:Predicting"], predictors=(predictor,)))
+    member = registry.models[f"{__name__}:Predicting"]
+    config = ModelConfig(functools.partial(member, predictors=(predictor,)))
     rebuilt = ModelConfig.from_dict(json.loads(json.dumps(config.record())))
     (built,) = rebuilt.build().predictors
     assert isinstance(built, functools.partial)
