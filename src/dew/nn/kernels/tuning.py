@@ -1480,16 +1480,20 @@ def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
 
 def _store(device_kind: str, picks) -> None:
     """Merge `picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, into the stored
-    picks for that model, one writer at a time, a launch's newer timings replacing its older, the
-    entries this checkout does not read kept as they are (`_read`). The file is replaced whole
-    (`write_atomically`), so no reader on the shared filesystem sees a part of it."""
+    picks for that model, one writer at a time, a launch's newer timings replacing its older. Every other
+    entry is kept as it was written: one this checkout does not read (`_read`), and one it reads, whose
+    derived config is the one its timings were measured beside and whose hooks are their traced keys, which
+    no derivation takes (M-FS-106). The file is replaced whole (`write_atomically`), so no reader on the
+    shared filesystem sees a part of it."""
     path = _cache.kernel_picks_path(device_kind)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with filelock.FileLock(path + '.lock'):
-        stored, foreign = _read(path)
-        merged = {**stored, **_keyed(picks)}
-        written = json.loads(dumps_picks(device_kind, merged.values()))
-        write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
+        ours, foreign = _partitioned(path)
+        fresh = _keyed(picks)
+        kept = {(ba.op, ba.autotuning_cache_key): entry for entry, (ba, _) in ours}
+        written = json.loads(dumps_picks(device_kind, fresh.values()))
+        write_atomically(path, json.dumps({**written, "data": [
+            *(entry for key, entry in kept.items() if key not in fresh), *written["data"], *foreign]}))
 
 
 _VERDICTS: dict[str, dict[str, _records.JSON]] = {}
