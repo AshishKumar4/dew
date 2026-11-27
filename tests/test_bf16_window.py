@@ -776,7 +776,16 @@ def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
         np.testing.assert_array_equal(np.asarray(row), whole[index])
         # The row alone decoded and held, its planes sliced first, never the bank whole (audit 2026-11-27
         # CC04).
-        assert [np.shape(decoded) for _, decoded in leaf.memo] == [(256, 64)]
+        assert [np.shape(decoded) for _, _, decoded in leaf.memo] == [(256, 64)]
+    # A second bank of the same format through the same memo, then the first again: each its own row.
+    other = NvFp4.quantized(jnp.asarray(stacked[::-1].copy()))
+    two = quantization.deferred_packed({quantization.QUANTIZATION: {"a": {"kernel": bank},
+                                                                   "b": {"kernel": other}}})
+    first, second = two["params"]["a"]["kernel"], two["params"]["b"]["kernel"]
+    np.testing.assert_array_equal(np.asarray(second[0]), np.asarray(quantization.packed_values(other))[0])
+    np.testing.assert_array_equal(np.asarray(first[0]), whole[0])
+    # A boolean index adds an axis, as NumPy's does, taking the bank whole.
+    assert np.shape(np.asarray(first[True])) == (1, 2, 256, 64)
 
 
 WINDOW_WITHOUT_CPU = """

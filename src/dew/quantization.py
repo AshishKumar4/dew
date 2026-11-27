@@ -846,7 +846,9 @@ class PackedDecode:
         rows: list[int] = []
         for at, index in enumerate(self.index):
             taken = index if isinstance(index, tuple) else (index,)
-            whole = all(isinstance(each, int | np.integer) for each in taken)
+            # A boolean (an int to Python) adds an axis, as NumPy reads it, left to the decoded value.
+            whole = all(isinstance(each, int | np.integer) and not isinstance(each, bool | np.bool_)
+                        for each in taken)
             if not whole or len(rows) + len(taken) > lead:
                 return tuple(rows), self.index[at:]
             rows.extend(int(each) for each in taken)
@@ -856,9 +858,8 @@ class PackedDecode:
         from dew._coordination import read_home
         from dew.nn.kernels.formats import NvFp4
 
-        key = (self.leaf, rows)
-        if self.memo and self.memo[0][0] == key:
-            return self.memo[0][1]
+        if self.memo and self.memo[0][0] is self.leaf and self.memo[0][1] == rows:
+            return self.memo[0][2]
         # The last row's decode released before this one's is made.
         self.memo.clear()
         # The row sliced from each plane where it lives, then read home on this host, a pool's shards
@@ -867,7 +868,7 @@ class PackedDecode:
         with _decoding():
             decoded = np.asarray(packed_values(home) if isinstance(home, NvFp4)
                                  else home.admitted().decoded())
-        self.memo[:] = [(key, decoded)]
+        self.memo[:] = [(self.leaf, rows, decoded)]
         return decoded
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
