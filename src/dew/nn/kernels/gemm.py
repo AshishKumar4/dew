@@ -167,11 +167,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
     gradient chained in one accumulator, each kernel gradient its own; no kernels joined, no output split (row
     6794, M-EM-59i); with no other part (`_gemm_refused`). `selected`, a caller's route of the forward
     (`side_by_side`'s), runs as found."""
-    if isinstance(rhs, Bf16Window) and not _window_takes(lhs, compute, precision):
-        # A window multiplies bf16 rows' exact products alone (`window_product`): any other math the call
-        # asks of its weights is their decoded matrix's ordinary product's, its encoding checked first as the
-        # window's product checks it (a traced one's at its trace's caller).
-        rhs = (rhs if isinstance(rhs.form, jax.core.Tracer) else rhs.checked()).decoded()
+    rhs = _window_served(lhs, rhs, compute, precision)
     if isinstance(rhs, PACKED_FORMATS):
         return _packed_gemm(lhs, rhs, group_sizes, epilogue=epilogue, out_dtype=out_dtype, layer=layer,
                             gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
@@ -184,8 +180,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | TernaryWeights | Bf16Window,
                   prologue=before, lhs=lhs,
                   beside=beside and (before, after, paired, gather, scatter, applied, compute, layer,
                                      out_dtypes, *named))
-    straight = compute is not None
-    compute = jnp.dtype(lhs.dtype if compute is None else compute)
+    straight, compute = compute is not None, jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
     before = _prologued(before, prologue_jvp)
     paired = None if paired is None else _grouped(lhs, paired, group_sizes, layer)[0]
@@ -360,6 +355,15 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
     if applied is not None and (prologue is None or (applied.shape, applied.dtype) != (lhs.shape, expected)):
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
                          f"{expected}, not {applied.shape} {applied.dtype}")
+
+def _window_served(lhs, rhs, compute, precision):
+    """`gemm`'s matrix: a `Bf16Window` the call's math is its product's (`_window_takes`), else its decoded
+    matrix, whose ordinary product computes what the call asks of its weights, its encoding checked first as
+    the window's product checks it (a traced one's at its trace's caller); any other matrix as it is."""
+    if not isinstance(rhs, Bf16Window) or _window_takes(lhs, compute, precision):
+        return rhs
+    return (rhs if isinstance(rhs.form, jax.core.Tracer) else rhs.checked()).decoded()
+
 
 def _window_takes(lhs, compute, precision) -> bool:
     """Whether a `Bf16Window`'s product (`window_product`: its rows rounded to bf16, each product exact,
