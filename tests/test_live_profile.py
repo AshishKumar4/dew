@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from dew.nn.protocols import COPIES_SCOPE, HEAD_SCOPE, WHOLE_LOGITS, RecomputeStatement
 from dew.training.live_buffers import LiveInterval
 from dew.training.memory import Held, LiveProfile, LiveSet
-from dew.training.planning import Rung, priced
+from dew.training.planning import FitSearch, Rung, priced
 
 FORWARD = "jit(step)/jvp(Model)/dew_rung/dot_general"
 BACKWARD = "jit(step)/transpose(jvp(Model))/dot_general"
@@ -251,4 +251,16 @@ def test_a_compiles_residuals_are_read_by_its_backward_where_it_holds_them():
     # and released before its end.
     assert any(buffer.until is not None and buffer.start + 1 < buffer.until < buffer.end
                for buffer in residuals)
+
+
+def test_a_searchs_places_hold_each_rungs_copy_free_form_beside_it():
+    """The places a search reads past a start reading narrow copies, the jump's and the frontier's alike
+    (`FitSearch.placed`): its copy-only release, then each rung of the ladder and its form without the
+    copies beside it, so a plan the jump admits copy-free (a tiled head without its copies) is one the
+    frontier lists lighter rungs below (train 1409: the frontier's order held the start's release alone, a
+    copy-free tile in none of it, its frontier then empty). A start reading none places its rungs alone."""
+    tile = rung(tile=(16, 128))
+    assert FitSearch.placed(START, [tile]) == [rung(narrow=False), tile, rung(tile=(16, 128), narrow=False)]
+    copy_free = rung(tile=(16, 128), narrow=False)
+    assert FitSearch.placed(rung(narrow=False), [copy_free]) == [copy_free]
 
