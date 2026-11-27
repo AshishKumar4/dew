@@ -1490,7 +1490,7 @@ class RunConfig:
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.
             validation=validation if suites is None else suites or None, summaries=self.val_summaries)
-        if skipped is not None and fitted.validation and lowering is None:
+        if skipped is not None and fitted["validation"] and lowering is None:
             # A run that validates and would preview there records the preview it skips, and why.
             summary = {**(summary or {}), "preview": {"skipped": skipped}}
         if isinstance(lowering, AheadTarget):
