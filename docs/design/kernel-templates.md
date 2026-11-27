@@ -551,7 +551,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 14 | temperature | score hook | HEAD or QUERY param | |
 | 15 | any pointwise score hook | score hook | traced callable + typed params (`hooks.Hook`) | Identity is its traced-program fingerprint (§4). |
 | 16 | custom_vjp hooks | hook backward | `jax.vjp` of the callable in the backward kernel | Honours the hook's own custom_vjp. |
-| 16a | Piecewise attention: two Q/K pairs selected by token distance, `s = q1·k1` where `|i − j| ≤ w`, else `q2·k2`, one V | structure + two declared score products | a tile wholly within distance w takes only the first product, one wholly beyond it only the second (the window form's full and partial classes, #3), and a tile the boundary cuts takes both and selects by coordinates in `modify`; the backward gives dq1, dk1 from the near entries' cotangents and dq2, dk2 from the far ones' | ⚑ The design declares one score product a step; this needs a step's score products declared as a list with their combine: a sum (absorbed MLA, #25) or a selection by coordinates (here). Comparator: FlagAttention's `piecewise_attention`, forward and backward. |
+| 16a | Piecewise attention: two Q/K pairs selected by token distance, `s = q1·k1` where `|i − j| ≤ w`, else `q2·k2`, one V | structure: products selected by bands of distance | `attention_products.Banded((w,))`: one call of the template over the keys once a product side by side, product p's copy holding its own columns of the keys' width (`[0 | k_p | 0]`) beside the queries side by side (`[q1 | q2]`), each query's spans its band's keys of each copy: a walk steps a copy's tiles where its band reaches them, both where a band's edge cuts a tile (the full and partial classes, #3), one softmax across them, every form and mainloop the template's own; the backward's copies' gradients sum back (dq1, dk1 from the near entries, dq2, dk2 from the far ones, dV both). Bands increase, so the products' keys are disjoint and cover every key; a hook reading key indices, a band parameter and the prologues are refused | Built (`templates/attention_products.py`). A visited tile's logits cost the products' summed width and the keys' copies their bytes; one walk holding both products' operands (a second query tile and key ring resident, a dQ and dK accumulator a product in the backward: three at width 128 past a 64 x 64 tile on two consumers' registers) is the open lever. Comparator: FlagAttention's `piecewise_attention`, forward and backward. |
 
 #### Softmax state
 
@@ -723,7 +723,7 @@ The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its 
 ### ⚑ Signature additions still open (attention)
 
 - INT8 operands with per-block scales in the product declaration, and a K pre-pass for SageAttention's smoothing (#46a). Open.
-- A step's score products as a declared list with their combine (sum or selection by coordinates), for piecewise attention (#16a) and absorbed MLA (#25). Open.
+- A step's score products as a declared list with their combine (`attention_products`): a sum (absorbed MLA, #25), the products side by side along their width (`SUM`); a selection by bands of distance (piecewise attention, #16a, `Banded`), the keys once a product side by side along the keys, each copy its product's columns. Built. A second product feeding its own accumulator (Parallax, #54): open.
 
 ## Appendix B. Coverage: linear recurrence
 
