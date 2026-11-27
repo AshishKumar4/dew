@@ -340,9 +340,28 @@ def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
 
 
 def _dot_precisions(fn, *args) -> list:
-    """The precision every dot of `fn`'s program states, its nested programs' too (`programs.equations`)."""
+    """The precision every product of `fn`'s program states (a dot's, a ragged dot's), its nested programs'
+    too (`programs.equations`)."""
     return [eqn.params["precision"] for eqn in programs.equations(jax.make_jaxpr(fn)(*args).jaxpr)
-            if eqn.primitive is jax.lax.dot_general_p]
+            if eqn.primitive.name in ("dot_general", "ragged_dot_general")]
+
+
+def test_a_grouped_window_products_value_and_tangent_state_one_algorithm():
+    """A grouped window product (`window_product`, its XLA route) under a run's `F16_F16_F32`, its precision
+    omitted, states that algorithm in its value's product and in its tangent's (row 13704): the value's no
+    longer forced to the default where the tangent's took the run's (bf16 rows of 2^-30 would read 2^-30
+    and a zero tangent on a CUDA device)."""
+    kernel = jnp.zeros((2, 128, 64), jnp.bfloat16).at[:, 0, 0].set(1.0)
+    window = Bf16Window.of(kernel).checked()
+    sizes = jnp.asarray([2, 2], jnp.int32)
+    x = jnp.full((4, 128), 2.0 ** -30, jnp.bfloat16)
+
+    def value_and_tangent(x):
+        return jax.jvp(lambda x: gemm.window_product(x, window, sizes, out_dtype=jnp.float32), (x,), (x,))
+
+    with jax.default_matmul_precision("F16_F16_F32"):
+        found = _dot_precisions(value_and_tangent, x)
+    assert len(found) >= 2 and all(each == jax.lax.DotAlgorithmPreset.F16_F16_F32 for each in found), found
 
 
 @pytest.mark.parametrize(("run", "stated", "algorithm"),
