@@ -339,14 +339,16 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
 
         quarter = jnp.exp(log_target / 4)
 
-        def scaled(x):
+        def scaled(x, factor=1.0):
             # `target * x / groups` of a weight below fp32's least normal: its weight's quarters each a normal
             # number wherever the product is (e^(L/4), an exact quarter of its logarithm L: a normal product
             # of a finite x holds L above -176, a quarter above -44), multiplied into x one at a time, so none
             # rounds to 0 first and each takes one rounding, its derivative alike. An infinite `x` its own
             # signed infinity where a quarter is 0 (its weight's slope 0 there), where the product would be
             # 0 * inf.
-            product = (((x * quarter) * quarter) * quarter) * quarter / groups
+            # A `factor` (2, a halved gap's) taken into the last quarter, inside the chain, so neither the
+            # product nor its transpose rounds or overflows apart from it.
+            product = (((x * quarter) * quarter) * quarter) * (factor * quarter) / groups
             return jnp.where(jnp.isinf(x) & (quarter == 0), jax.lax.stop_gradient(x), product)
 
         product = target * gap
@@ -355,7 +357,7 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
                            target * (peak / groups) - target * (held / groups))
         # A gap past fp32's range halved before it is scaled (`peak / 2 - held / 2`, finite), so its two
         # sides' terms cannot flush apart before their normal sum.
-        quartered = jnp.where(jnp.isfinite(gap), scaled(gap), 2 * scaled(peak / 2 - held / 2))
+        quartered = jnp.where(jnp.isfinite(gap), scaled(gap), scaled(peak / 2 - held / 2, 2.0))
         gaps = jnp.where(taken, jnp.where(tiny, quartered, direct), 0)
         # The entropy's terms formed as the gaps' are, a tiny weight's between its halves, so equal teacher
         # and student cancel where a flushed weight dropped one side.

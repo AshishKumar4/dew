@@ -467,6 +467,18 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     mass = np.exp(-176.0)
     terms = np.asarray([mass * np.log(mass), mass * largest])
     assert_fp32_reduction_bound(np.asarray(loss(spanned, farthest)), terms.sum(), np.abs(terms).sum(), 4)
+    # Teacher logits 0 and -176.5 against scores fp32's largest and least, a gap past fp32's range: the
+    # term 2 F e^-176.5 normal though its halved gap's is not; and teacher 0 and -110 under a cotangent of
+    # 2^127, the low score's cotangent -2^127 e^-110 normal, the factor of the halved gap inside the chain.
+    farther_still = jnp.asarray([[[[0.0]], [[-176.5]]]], jnp.float32)
+    spanning = jnp.asarray([[[[0.0, -np.inf], [largest, -largest]]]], jnp.float32)
+    mass = np.exp(-176.5)
+    terms = np.asarray([mass * np.log(mass), mass * 2.0 * largest])
+    found = np.asarray(loss(spanning, farther_still))
+    assert_fp32_reduction_bound(found, terms.sum(), np.abs(terms).sum(), 4)
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther) * 2.0**127)(spanning))[0, 0, 1, 1]
+    expected = -(2.0**127) * np.exp(-110.0) / (1 + np.exp(-110.0))
+    assert_fp32_reduction_bound(gradient, expected, abs(expected), 4)
     invalid = jnp.asarray([[[[0.0]], [[np.nan]]]], jnp.float32)
     uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
     assert np.isnan(float(loss(uniform, invalid)))
