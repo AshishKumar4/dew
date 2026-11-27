@@ -212,7 +212,7 @@ def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]
                          "and model it recorded, or train in another directory")
 
 
-def products_stated(training: JSON) -> JSON:
+def products_stated(training: JSON | None) -> JSON:
     """A checkpoint's training record with the precision its products computed at (`products`), as this Dew
     records it (`numerics_record`), where it states one: a step a Dew wrote before it recorded `products`
     states its numerics' declared `matmul`, the precision its products computed at where it names one

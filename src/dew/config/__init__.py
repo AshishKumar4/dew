@@ -1652,7 +1652,7 @@ class RunConfig:
 
             step = resumed_step(built, resume)
             record = None if step is None else self._saved_record(checkpoints.directory, checkpoints)
-            if record is not None:
+            if record is not None and step is not None:
                 self.check_resume(record)
                 resumed["record"] = record
                 training = checkpoints.training(step)
