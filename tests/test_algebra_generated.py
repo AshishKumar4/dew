@@ -3,9 +3,11 @@ docs/design/algebra.md §6.11): under the default choice the written math runs a
 "generated" a declared case runs the generated body, bit for bit its module's, and any other call the written
 math, its reason counted."""
 
+import generated_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from dew.algebra import component_cases_derived, generated
 from dew.nn.kernels import generation, recurrence_algebra
@@ -98,20 +100,8 @@ def test_the_generated_merge_takes_an_empty_slice_as_its_identity():
     assert not np.any(merges[2].total)
 
 
-def test_the_backward_skip_and_step_lift_run_their_generated_bodies_where_declared():
-    """The selective scan's subnormal-step lift and the recurrence skip's pullback, at their declared cases,
-    run the generated bodies bit for bit, each counted."""
-    rng = np.random.default_rng(2)
-    skip, dy, step = (np.float32(rng.standard_normal()), rng.standard_normal(64).astype(np.float32),
-                      np.abs(rng.standard_normal(64)).astype(np.float32) * np.float32(2.0 ** -110))
-    out_grad, values = (rng.standard_normal((8, 4, 32)).astype(np.float32) for _ in range(2))
-    scale = rng.standard_normal((4, 1)).astype(np.float32)
-    with generation.chosen(generated="generated"), generation.assumed("sm90"), generated.taken() as counts:
-        lifted = recurrence_algebra.selective_dx_scale(skip, dy, step)
-        skipped = recurrence_algebra.skipped_back(out_grad, values, scale)
-    assert counts == {("dew.algebra.component_cases.selective_dx_scale", generated.GENERATED): 1,
-                      ("dew.algebra.component_cases.skipped_back", generated.GENERATED): 1}
-    for found, expected in zip((*lifted, *skipped),
-                               (*component_cases_derived.selective_dx_scale(skip, dy, step),
-                                *component_cases_derived.skipped_back(out_grad, values, scale)), strict=True):
-        np.testing.assert_array_equal(found, expected)
+@pytest.mark.parametrize("case", generated_matrix.CASES, ids="-".join)
+def test_each_generated_site_is_on_par_with_its_written_body(case):
+    """The generated bodies' matrix cells (tests/generated_matrix.py) on the CPU, as their generation."""
+    with generation.assumed(case[0]):
+        generated_matrix.a_generated_body_is_on_par(case)
