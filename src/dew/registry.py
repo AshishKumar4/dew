@@ -51,16 +51,7 @@ import sys
 import types
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import (
-    Callable,
-    Collection,
-    Iterable,
-    Iterator,
-    Mapping,
-    MutableMapping,
-    MutableSequence,
-    Sequence,
-)
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -1248,9 +1239,10 @@ def _unread_partial(value: Configured, annotation: Annotation) -> functools.part
         types_ = entry_types(_flattened(annotation), len(value))
     except ValueError:
         types_ = [None] * len(value)
-    entries: Iterable[Configured] = value.values() if isinstance(value, Mapping) else value
+    entries = value.values() if isinstance(value, Mapping) else value
+    # A held argument's entries are the configured values it was given (a record mapping's among them).
     return next((found for entry, held in zip(entries, types_, strict=True)
-                 if (found := _unread_partial(entry, held)) is not None), None)
+                 if (found := _unread_partial(typing.cast(Configured, entry), held)) is not None), None)
 
 
 def _argument_type(member: type | Callable[..., Configured], name: str) -> Annotation:
