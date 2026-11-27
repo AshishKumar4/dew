@@ -241,7 +241,7 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             raise FileExistsError(f"{directory} is no directory of its own, which an export replaces")
         return directory.stat()
 
-    if directory.name.startswith(PUBLISHING_LOCK):
+    if directory.name.casefold().startswith(PUBLISHING_LOCK):
         raise ValueError(f"{directory} is named as Dew's publishers' locks are: export under another name")
     working = Path(os.getcwd())
     if working == directory or directory in working.parents:
@@ -454,15 +454,16 @@ def _publishing(lock_path: Path) -> Iterator[None]:
 
 
 def _lock_path(directory: Path) -> Path:
-    """The lock file of `directory`'s publication (`_publishing`), named by a digest of its name
-    (`PUBLISHING_LOCK`), so publishers of one release name it alike: in a folder that takes two spellings of
-    a name for one entry (a case-folding or normalizing filesystem, `_folds_names`), of its name decomposed
-    and case-folded, as those filesystems fold it (row 13744). Read before a publication writes anything,
-    as the folder's other probe is (`_made_mode`)."""
-    name = directory.name
+    """The lock file of `directory`'s publication (`_publishing`, `PUBLISHING_LOCK`), so publishers of one
+    release take one lock: named by a digest of its name, which a name as long as the filesystem allows fits;
+    in a folder that takes two spellings of a name for one entry (a case-folding or normalizing filesystem,
+    `_folds_names`), by the name itself, which that filesystem folds as it folds the release's, whatever its
+    rules (ext4's ignorable code points among them), two spellings of one release one lock and two releases
+    two (row 13744); a name too long for the prefix is refused there as the filesystem refuses it. Read
+    before a publication writes anything, as the folder's other probe is (`_made_mode`)."""
     if _folds_names(directory.parent):
-        name = unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
-    return directory.parent / (PUBLISHING_LOCK + hashlib.sha256(os.fsencode(name)).hexdigest()[:16])
+        return directory.parent / (PUBLISHING_LOCK + directory.name)
+    return directory.parent / (PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16])
 
 
 def _folds_names(folder: Path) -> bool:

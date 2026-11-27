@@ -664,7 +664,8 @@ def test_a_partial_is_recorded_only_where_its_field_reads_one_back():
             to_record(value, annotation)
     # Under the partial its field declares, or its Optional, it is the class record that reads back.
     bound = functools.partial(JepaPredictor, num_layers=1)
-    for annotation in (functools.partial[JepaPredictor], functools.partial[JepaPredictor] | None):
+    for annotation in (functools.partial[JepaPredictor], functools.partial[JepaPredictor] | None,
+                       _Predictor | None):
         record = to_record(bound, annotation)
         assert isinstance(record, dict) and record["class"] == import_path(JepaPredictor)
         again = from_record(annotation, record)
