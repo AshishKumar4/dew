@@ -141,9 +141,8 @@ def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) ->
     if held is None or held.replays(pending):
         return held is not None
     if read and held.fill is not None and (count := occupied(held)):
-        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches or "
-                         "statistics of other shapes than the step's, which it cannot replay or pool: resume "
-                         "from a step that closed its window, or with the Dew that wrote it")
+        raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
+                         f"other shapes than the step's, which it cannot replay")
     return False
 
 
@@ -155,15 +154,14 @@ def _laid_alike(held, compiled) -> bool:
         for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
 
 
-def refuse_unread_window(held: Accumulation | None, pending: Accumulation | None, *, staged: bool = False
-                         ) -> None:
-    """Refuse a held window a step compiled for `pending`'s shapes cannot continue, by its shapes alone:
-    one pooling other statistics (`Accumulation.pools`), at any stage, or, outside a ramp's stages (whose
-    boundaries change a window's batch shapes, `staged`), replaying other batches (`replays`). In a run
-    only a resumed window, a checkpoint's, which keeps one only while it holds microbatches, can: pooled
-    by an earlier Dew (an objective whose statistics gained a term since: an indexer's KL beside its
-    prediction, row 13705), whose sums no step of this one continues."""
-    if held is not None and (not held.pools(pending) or (not staged and not held.replays(pending))):
+def refuse_unpooled(held: Accumulation | None, pending: Accumulation) -> None:
+    """Refuse a held window pooling other statistics than a step tracing `pending`'s shapes pools
+    (`Accumulation.pools`), by its shapes alone, whatever it holds: in a run only a resumed one, a
+    checkpoint's, which keeps a window only while it holds microbatches, can, pooled by an earlier Dew (an
+    objective whose statistics gained a term since: an indexer's KL beside its prediction, row 13705),
+    whose sums no step of this one continues. A window replaying other batches is the step's to replace
+    (`kept_window`)."""
+    if held is not None and not held.pools(pending):
         raise ValueError("the state's accumulation window holds batches or statistics of other shapes than "
                          "the step's, which it cannot replay or pool: resume from a step that closed its "
                          "window, or with the Dew that wrote it")

@@ -719,26 +719,20 @@ def test_a_run_places_no_training_batch_while_it_evaluates():
 # Sharding invariants at every fsdp width
 # --------------------------------------------------------------------------
 
-def test_a_window_pooling_other_statistics_is_refused_by_its_shapes():
-    """A window an earlier Dew saved, its statistics pooling fewer leaves than the step now traces (an
-    indexer's KL beside its prediction, row 13705), is no window the step reads (`Accumulation.replays`),
-    refused by its shapes alone (`refuse_unread_window`) whatever it holds, its occupancy unread (a
-    checkpoint keeps a window only while it holds microbatches), in a ramped run as in any."""
-    from dew.state import Accumulation, refuse_unread_window
-
-    def window(statistics: int, rows: int = 2) -> Accumulation:
-        pooled = tuple(jax.ShapeDtypeStruct((), jnp.float32) for _ in range(statistics))
-        return Accumulation(gradient=None, mass=None, statistics=pooled, effects=(), qk_stats=None,
-                            batches={"x": jax.ShapeDtypeStruct((rows, 4), jnp.float32)}, variables=None,
-                            attempts=None, fill=jax.ShapeDtypeStruct((), jnp.int32))
-
-    traced = window(4)
-    refuse_unread_window(window(4), traced)
-    refuse_unread_window(None, traced)
+def test_a_window_pooling_other_statistics_is_refused_as_the_step_compiles():
+    """A held window pooling other statistics than the step traces, its batches laid out alike (a window an
+    earlier Dew saved, before its objective's statistics gained a term: an indexer's KL beside its
+    prediction, row 13705), is refused as the step over it compiles (`empty_window`'s `refuse_unpooled`),
+    by its shapes alone, not reused and failing the step's pooling; the window as the step pools it is
+    taken."""
+    trainer = make_accumulating(accumulation=4)
+    batch = next(batches())
+    state = trainer.initial_state()
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    window = state.window
+    assert window is not None
+    stale = state.with_window(dataclasses.replace(window, statistics=(*window.statistics,
+                                                                       window.statistics[0])))
     with pytest.raises(ValueError):
-        refuse_unread_window(window(2), traced)
-    # In a ramped run, whose stage boundaries change a window's batch shapes, other batches are its
-    # boundary's to rebuild; other statistics are refused at any stage, a resume inside one among them.
-    refuse_unread_window(window(4, rows=3), traced, staged=True)
-    with pytest.raises(ValueError):
-        refuse_unread_window(window(2), traced, staged=True)
+        make_accumulating(accumulation=4).compile(stale, batch)
+    make_accumulating(accumulation=4).compile(state, batch)
