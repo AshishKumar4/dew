@@ -599,8 +599,9 @@ def to_record(value, annotation) -> JSON:
         # argument, read against the member's own annotation, `Bound.read`): any other field's reader builds
         # what such a record names, or refuses a function's, so the partial is refused here.
         if annotation is not None and not _admits_partial(annotation, value):
-            raise Unrecordable(f"{value!r} is held where {annotation!r} is declared, whose record reads back "
-                               "no bound member: declare the field functools.partial[...]")
+            raise Unrecordable(f"{value!r} is held where {annotation!r} is declared, whose record reads it "
+                               "back as no bound member: a field declaring functools.partial of a kind its "
+                               "member is reads one")
         if value.args:
             raise Unrecordable(f"{value!r} binds arguments by position, which a record names none of")
         return {"class": import_path(value.func), "fields": argument_records(value.func, value.keywords)}
@@ -2164,7 +2165,8 @@ class Bound(ABC):
                      if isinstance(value, functools.partial | Mapping | list | tuple) else None)
             if found is not None:
                 raise Unrecordable(f"{self.name}'s {name} holds {found!r}, which its annotation reads back "
-                                   "as no bound member: declare it functools.partial[...]")
+                                   "as no bound member: an argument declaring functools.partial of a kind its "
+                                   "member is reads one")
         with recording():
             # Each written as held, against no parameter's annotation, as the record held them before
             # (`JsonDict`): a recorded kind's records again as they are, and a world model's views named
