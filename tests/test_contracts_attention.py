@@ -75,6 +75,14 @@ def test_a_heads_sinks_hold_every_order(edge):
                           f"a head's sinks {edge}", plain_fn=plain)
 
 
+FUSED = {implementation: functools.partial(attention.scaled_dot_product_attention,
+                                           implementation=implementation)
+         for implementation in ("template", "tpu")}
+"""Each fused route as one function the module holds, so its orders' programs
+(`contract_support._mesh_program`, made once a function and an order) compile once across its cases' edges and
+order sets, none held per case."""
+
+
 @pytest.mark.parametrize(("implementation", "edge", "taken"),
                          list(itertools.product(("template", "tpu"), EDGES, ORDER_SETS)))
 def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken):
@@ -84,9 +92,7 @@ def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken)
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
     float32's ends. Each order set a case of its own (`ORDER_SETS`; row 12781: the template's every order in
     one case took 212 to 346 s at unit operands, its interpreted kernel run at each order and draw)."""
-    def fused(query, key, value):
-        return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
-
+    fused = FUSED[implementation]
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
                           f"{implementation} attention {edge} ({taken})", truth_fn=plain_attention,
                           plain_fn=plain_attention, taking=ORDER_SETS[taken])
