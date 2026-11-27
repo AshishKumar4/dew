@@ -25,6 +25,7 @@ import logging
 import sys
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from pathlib import Path
+from types import ModuleType
 
 import jax
 import jax.numpy as jnp
@@ -33,8 +34,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import parity
-from dew.algebra import _component_sharing, error, printed, rules
-from dew.algebra import _generated
+from dew.algebra import _component_sharing, _generated, error, printed, rules
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -51,8 +51,7 @@ TESTS = "tests/test_algebra_generate.py"
 written module what generation writes (`--check`)."""
 
 DECLARING = ("dew.algebra.acceptance", "dew.algebra.attention_cases", "dew.algebra.format_cases",
-             "dew.algebra.recurrence_cases",
-             "dew.sampling.guidance_cases")
+             "dew.algebra.recurrence_cases", "dew.sampling.guidance_cases")
 """Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
@@ -135,19 +134,12 @@ class SurrogateBodies:
     cases: tuple[tuple[tuple, SurrogateCase], ...]
     """Each case beside its static arguments, as pairs: a mapping would join `0.0` and `-0.0`, or `True` and
     `1`, before `_exact_key` reads them."""
+    _keyed: dict[Hashable, SurrogateCase] = dataclasses.field(init=False, repr=False, compare=False)
+    """Each case by its static arguments' exact key (`_exact_key`)."""
 
-    def declared(self, module: str) -> SurrogateBodies:
-        """Register both bodies under the same static-argument and tangent-activity declaration."""
-        for _, case in self.cases:
-            declare(module, case.name, case.forward)
-            for inactive, form in case.tangents.items():
-                declare(module, case.tangent_name(inactive), form)
-        return self
-
-    @functools.cached_property
-    def _keyed(self) -> dict[Hashable, SurrogateCase]:
-        """Each case by its static arguments' exact key (`_exact_key`); two cases of one key, or one of none
-        (an unhashable argument), refused."""
+    def __post_init__(self):
+        # Checked whole before any registration (`declared`): one exact static key a case, hashable, and a
+        # name of its own for each body, so no case is registered half or over another.
         keyed: dict[Hashable, SurrogateCase] = {}
         for fixed, case in self.cases:
             key = _exact_key(fixed)
@@ -156,15 +148,29 @@ class SurrogateBodies:
             if key in keyed:
                 raise ValueError(f"surrogate cases {keyed[key].name} and {case.name}: one key, {fixed!r}")
             keyed[key] = case
-        return keyed
+        names = [name for _, case in self.cases
+                 for name in (case.name, *map(case.tangent_name, case.tangents))]
+        if len(set(names)) != len(names):
+            raise ValueError(f"surrogate cases share a body's name: {sorted(names)}")
+        object.__setattr__(self, "_keyed", keyed)
+
+    def declared(self, module: str) -> SurrogateBodies:
+        """Register each case's forward and tangent bodies, each under its own name (`declare`)."""
+        for _, case in self.cases:
+            declare(module, case.name, case.forward)
+            for inactive, form in case.tangents.items():
+                declare(module, case.tangent_name(inactive), form)
+        return self
 
     def _case(self, fixed: tuple) -> SurrogateCase | None:
         # Static arguments of no exact key (an unhashable one) match no declared case: the written body runs.
         key = _exact_key(fixed)
         return None if key is None else self._keyed.get(key)
 
-    def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
-        """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
+    def assembled(self, emitted: ModuleType, *, policy: str = "default", target: str = "sm90"):
+        """Opt into the generated module `emitted`'s cases, using the original surrogate rule's argument and
+        value dependency: a call whose case its table holds (`_generated.found`, one lookup) runs that form,
+        any other the written rule."""
         from jax.custom_derivatives import SymbolicZero
 
         from dew.nn.derivatives import contracted, surrogate
@@ -177,8 +183,9 @@ class SurrogateBodies:
             case = self._case(fixed)
             dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
             if (case is not None and (flat := _case_leaves(case, dynamic)) is not None
-                    and _case_admitted(case.forward.cases, flat, policy, target)):
-                return case.restore(emitted(case.name)(*flat, policy=policy, target=target))
+                    and (form := _generated.found(_generated.table(emitted, case.name), flat, policy,
+                                                  target)) is not None):
+                return case.restore(form(*flat))
             return self.forward(*values)
 
         def tangent(*values):
@@ -192,9 +199,10 @@ class SurrogateBodies:
             if component is not None and (flat := _case_leaves(case, primals)) is not None:
                 active = tuple(leaf for leaf in leaves if not isinstance(leaf, SymbolicZero))
                 operands = (*flat, *active, *jax.tree.leaves(value))
-                if _case_admitted(component.cases, operands, policy, target):
-                    run = emitted(case.tangent_name(inactive))
-                    return case.restore(run(*operands, policy=policy, target=target))
+                name = case.tangent_name(inactive)
+                if (form := _generated.found(_generated.table(emitted, name), operands, policy,
+                                             target)) is not None:
+                    return case.restore(form(*operands))
             return self.tangent(*values)
 
         return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
@@ -202,7 +210,8 @@ class SurrogateBodies:
                       symbolic_zeros=self.symbolic_zeros))
 
 
-_BITS = (float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128, jnp.bfloat16)
+_BITS = (float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128,
+         np.dtype(jnp.bfloat16).type)
 """The number types `_exact_key` reads by their bytes: these exactly (by identity, never by a type's hash), a
 subclass keeping its own equality."""
 _PADDED = (np.longdouble, np.clongdouble)
@@ -240,15 +249,6 @@ def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
     return tuple(leaves) if tree == case.input_tree[0] else None
 
 
-def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:
-    if policy not in cases.policies or target not in cases.targets:
-        return False
-    if _generated.refused(operands) is not None:
-        return False
-    key = case_of(operands)
-    return any(case_of(shapes) == key for shapes in cases.operands)
-
-
 @dataclasses.dataclass(frozen=True)
 class Generated:
     """A generated module: the declarations it holds, its path, the suite that holds it (`TESTS`), the rule
@@ -267,8 +267,12 @@ DECLARATIONS: dict[str, StableForm | ComponentForm] = {}
 
 def declare[Form: (StableForm, ComponentForm)](module: str, name: str, form: Form) -> Form:
     """`form` registered under its declaring `module` and `name`, generated into `<module>_derived.py` as a
-    function of that name."""
-    DECLARATIONS[f"{module}.{name}"] = form
+    function of that name; a name already declared another form refused, never overwritten."""
+    qualified = f"{module}.{name}"
+    if (held := DECLARATIONS.get(qualified)) is not None and held is not form:
+        raise ValueError(f"{qualified} is declared twice: each form, and each surrogate case's static "
+                         "arguments and tangent activity, needs a name of its own")
+    DECLARATIONS[qualified] = form
     return form
 
 
@@ -428,10 +432,12 @@ def _bodies(chosen: Sequence[_Chosen]):
     return bodies, active
 
 
-SHARED = "dew.algebra.shared_derived"
-"""The generated module of the component helpers every generated module shares (`_component_sharing`): one
-helper wherever a span recurs, in one declaring module or across several, so a module splits along its own
-seams without writing a helper twice."""
+def _shared() -> str:
+    """The generated module of the component helpers every generated module shares (`_component_sharing`),
+    `shared_derived` in the first declaring module's package (`DECLARING`, `dew.algebra.shared_derived`): one
+    helper wherever a span recurs, in one declaring module or across several, so a module splits along its
+    own seams without writing a helper twice."""
+    return f"{DECLARING[0].rsplit('.', 1)[0]}.shared_derived"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -535,7 +541,7 @@ def _helper_reads(sources: Iterable[str | printed.Body | printed.Call],
 def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitted: _Emitted,
              factored: Mapping[str, printed.Body]) -> tuple[str, str]:
     """The generated module's text: its header, each chosen form printed (`printed.source`), the shared
-    helpers it calls imported (`SHARED`), and each declaration's function, which picks its form by policy,
+    helpers it calls imported (`_shared`), and each declaration's function, which picks its form by policy,
     target and its operands' shapes and dtypes; and the same module with those helpers written in place of
     their import, which admission loads before the helpers' module is written (`_admit_components`)."""
     body = _rendered(emitted.bodies)
@@ -544,7 +550,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
         own = [found for found in chosen if found.name == name]
         single = own[0].single
         policy, target = own[0].policy, own[0].target
-        table = f"_{name}_forms"
+        table = _generated.table_name(name)
         body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
         for found in own:
             operands = _runs(repr(operand) for operand in case_of(found.operands))
@@ -566,9 +572,9 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
     reads = _helper_reads([*emitted.bodies.values(), *emitted.bound.values()], factored)
     imports = printed.imports("\n".join(body))
     if reads:
-        one = f"from {SHARED} import {', '.join(reads)}"
+        one = f"from {_shared()} import {', '.join(reads)}"
         lines = [one] if len(one) <= printed.WIDTH else [
-            f"from {SHARED} import (", *(f"    {name}," for name in reads), ")"]
+            f"from {_shared()} import (", *(f"    {name}," for name in reads), ")"]
         # Within Dew's section, in module order: after `dew.algebra`'s own, before `dew.nn`'s.
         at = next((index for index, line in enumerate(imports) if line.startswith("from dew.nn")),
                   len(imports))
@@ -633,16 +639,18 @@ def _path(module: str) -> Path:
 
 def generate(*, check: bool = False) -> tuple[Generated, ...]:
     """Every declaring module's declarations generated into its module, all together (their components share
-    one helper module, `SHARED`), or, with `check`, regenerated in memory and compared: raises where a
+    one helper module, `_shared`), or, with `check`, regenerated in memory and compared: raises where a
     written module is not what generation writes."""
     for module in DECLARING:
         importlib.import_module(module)
     if not DECLARATIONS:
         raise ValueError(f"no declarations: none of {DECLARING} declared a stable form here (a registry "
                          f"other than the declaring modules' own reads none)")
+    # The declaring modules' own declarations alone: one another module's import made writes nothing.
     by_module: dict[str, list[str]] = {}
     for qualified in sorted(DECLARATIONS):
-        by_module.setdefault(qualified.rsplit(".", 1)[0], []).append(qualified)
+        if (module := qualified.rsplit(".", 1)[0]) in DECLARING:
+            by_module.setdefault(module, []).append(qualified)
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
     found = {module: [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
              for module, declared in by_module.items()}
@@ -653,8 +661,8 @@ def generate(*, check: bool = False) -> tuple[Generated, ...]:
         _admit_components(module, found[module], admitted)
     made, stale = [], []
     writes = [(_path(module), text, tuple(by_module[module])) for module, (text, _) in texts.items()]
-    shared_path = Path(__file__).with_name(f"{SHARED.rsplit('.', 1)[1]}.py")
-    writes.append((shared_path, _helpers_written(factored), ()))
+    package = _path(DECLARING[0]).parent
+    writes.append((package / f"{_shared().rsplit('.', 1)[1]}.py", _helpers_written(factored), ()))
     for path, text, declared in writes:
         if check:
             written = path.read_text() if path.exists() else ""

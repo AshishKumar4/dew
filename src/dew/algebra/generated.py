@@ -76,7 +76,7 @@ def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable |
     derived = _derived(module)
     policy = "accurate" if generation.numerics().forms == "accurate" else "default"
     key = (policy, generation.device_generation(), _generated.case_of(tuple(operands)))
-    if key not in getattr(derived, f"_{name}_forms"):
+    if key not in _generated.table(derived, name):
         _counted(qualified, f"no declared case {key}")
         return None
     _counted(qualified, GENERATED)

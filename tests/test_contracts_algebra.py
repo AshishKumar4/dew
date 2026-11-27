@@ -8,22 +8,32 @@ import numpy as np
 import pytest
 from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 
-from dew.algebra import means, scan, windows
+from dew.algebra import _generated, means, scan, windows
+
+
+class _Recorded:
+    """A generated module whose forms record each call by their body's name (`taken`): a test holds a composed
+    surrogate to have run its generated bodies, not the written ones its declaration falls back to."""
+
+    def __init__(self, module, tables: dict | None = None):
+        self.taken: list[str] = []
+        self._module, self._tables = module, tables
+
+    def __getattr__(self, attribute):
+        held = self._tables[attribute] if self._tables is not None else getattr(self._module, attribute)
+        name = attribute.removeprefix("_").removesuffix("_forms")
+
+        def recorded(form):
+            def run(*operands):
+                self.taken.append(name)
+                return form(*operands)
+            return run
+        return {key: recorded(form) for key, form in held.items()}
 
 
 def _recorded(module):
-    """`module`'s generated bodies by name, each call of one recorded: a test holds a composed surrogate to
-    have run its generated bodies, not the written ones its declaration falls back to."""
-    taken: list[str] = []
-
-    def emitted(name):
-        body = getattr(module, name)
-
-        def run(*operands, **options):
-            taken.append(name)
-            return body(*operands, **options)
-        return run
-    return emitted, taken
+    emitted = _Recorded(module)
+    return emitted, emitted.taken
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
@@ -236,12 +246,12 @@ def test_a_surrogate_case_keys_its_static_arguments_exactly():
         ((0.0,), declared_case("plus")), ((frozenset({1}),), declared_case("member")),
         ((named,), declared_case("named"))))
 
-    def emitted(name):
-        def body(*operands, policy, target):
-            del policy, target
-            return operands[0] + 1 if not name.endswith("_tangent") else operands[1]
-        return body
-
+    key = ("default", "sm90", _generated.case_of((jnp.zeros((4,), jnp.float32),)))
+    tangent_key = ("default", "sm90", _generated.case_of((jnp.zeros((4,), jnp.float32),) * 3))
+    emitted = _Recorded(None, {
+        _generated.table_name(name): {key: lambda x: (x + 1,)} for name in ("plus", "member", "named")} | {
+        _generated.table_name(f"{name}_tangent"): {tangent_key: lambda x, dx, value: (dx,)}
+        for name in ("plus", "member", "named")})
     composed = surrogate.assembled(emitted)
     x = jnp.zeros((4,), jnp.float32)
     for shift, value, slope in ((0.0, 1.0, 1.0), (frozenset({1}), 1.0, 1.0), (named, 1.0, 1.0),
@@ -259,17 +269,21 @@ def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
     type is unhashable is keyed by its own hash. Two cases of one key are refused at the first lookup."""
     from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase, _exact_key
 
+    def unhashable(*_):
+        raise TypeError("an unhashable type")
+
     class Unhashable(type):
-        __hash__ = None  # pyright: ignore[reportAssignmentType]
+        __hash__ = unhashable
 
     class Odd(metaclass=Unhashable):
         pass
 
     nan = np.float64("nan")
     payload = np.frombuffer(np.uint64(0x7FF8000000000001).tobytes(), np.float64)[0]
+    bfloat16 = np.dtype(jnp.bfloat16).type
     distinct = [0.0, -0.0, nan, -nan, payload, 1, 1.0, True, np.float32(1), np.float16(1), np.longdouble(1),
-                np.longdouble(-0.0), np.longdouble(0.0), np.complex64(1), jnp.bfloat16(1), (1, (2.0,)),
-                (1, (-2.0,)), frozenset({1})]
+                np.longdouble(-0.0), np.longdouble(0.0), np.complex64(1), bfloat16(1), bfloat16(-0.0),
+                (1, (2.0,)), (1, (-2.0,)), frozenset({1})]
     keys = [_exact_key(value) for value in distinct]
     assert None not in keys and len(set(keys)) == len(keys)
     assert _exact_key(float("nan")) == _exact_key(float("nan")) and _exact_key((0.0,)) == _exact_key((0.0,))
@@ -281,7 +295,10 @@ def test_a_surrogate_static_key_tells_apart_exactly_what_differs():
     operand = jax.ShapeDtypeStruct((4,), jnp.float32)
     form = ComponentForm(lambda x: x, lambda x: x, Cases(((operand,),), lambda seed, operands: operands, 1))
     case = SurrogateCase("twin", form, {}, output_tree=(jax.tree.structure(0),))
-    twice = SurrogateBodies(lambda x, shift: x, lambda *values: values[-2][0], (1,), symbolic_zeros=False,
-                            cases=(((nan,), case), ((np.float64("nan"),), case)))
-    with pytest.raises(ValueError, match="one key"):
-        twice.assembled(lambda name: form.function)(jnp.zeros(4), nan)
+    with pytest.raises(ValueError):
+        SurrogateBodies(lambda x, shift: x, lambda *values: values[-2][0], (1,), symbolic_zeros=False,
+                        cases=(((nan,), case), ((np.float64("nan"),), case)))
+    twin = SurrogateCase("twin", form, {}, output_tree=(jax.tree.structure(0),))
+    with pytest.raises(ValueError):
+        SurrogateBodies(lambda x, shift: x, lambda *values: values[-2][0], (1,), symbolic_zeros=False,
+                        cases=(((2.0,), case), ((3.0,), twin)))

@@ -7,8 +7,10 @@ error decides (`dew.algebra.acceptance`)."""
 import dataclasses
 import functools
 import importlib
+import os
 import subprocess
 import sys
+import types
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +19,16 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, attention_cases, error, format_cases, generate, printed, recurrence_cases
+from dew.algebra import (
+    _generated,
+    acceptance,
+    attention_cases,
+    error,
+    format_cases,
+    generate,
+    printed,
+    recurrence_cases,
+)
 from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
@@ -44,13 +55,48 @@ def test_the_written_modules_are_what_generation_writes(on_its_platform):
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
-def test_the_command_checks_the_declaring_modules_own_declarations(on_its_platform):
-    """A fresh CLI process checks every installed generated module, discovering the declarations itself."""
-    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check"],
-                          check=False, capture_output=True, text=True)
-    assert done.returncode == 0, done.stderr
-    assert any(line.startswith("checked ") and line.endswith("/guidance_cases_derived.py")
-               for line in done.stderr.splitlines())
+_ISOLATED = """
+from dew.algebra.generate import ComponentForm, declare, float32_cases
+
+
+def _affine(x):
+    return x * 2 + 1
+
+
+AFFINE = declare(__name__, "affine", ComponentForm(_affine, _affine, float32_cases(((8,),))))
+"""
+
+_COMMAND = "import sys; from dew.algebra import generate; generate.DECLARING = ('isolated.cases',); " \
+           "sys.exit(generate.main(sys.argv[1:]))"
+
+
+def test_the_command_refuses_a_stale_module_and_generation_repairs_it(tmp_path, on_its_platform):
+    """A fresh CLI process over one small declaring module of its own (`DECLARING` named alone): `--check`
+    refuses its missing and then its stale generated module without writing either, and generation writes
+    the module and its shared helpers, which `--check` then holds as written."""
+    package = tmp_path / "isolated"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "cases.py").write_text(_ISOLATED)
+    derived, shared = package / "cases_derived.py", package / "shared_derived.py"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(tmp_path), os.environ.get("PYTHONPATH", "")])}
+
+    def command(*arguments):
+        return subprocess.run([sys.executable, "-c", _COMMAND, *arguments], check=False, capture_output=True,
+                              text=True, env=env)
+
+    refused = command("--check")
+    assert refused.returncode != 0
+    assert not derived.exists() and not shared.exists()
+    written = command()
+    assert written.returncode == 0, written.stderr
+    assert "def affine(" in derived.read_text() and shared.exists()
+    held = command("--check")
+    assert held.returncode == 0, held.stderr
+    derived.write_text(derived.read_text().replace("def affine(", "def affine_stale("))
+    stale = derived.read_text()
+    assert command("--check").returncode != 0 and derived.read_text() == stale
+    assert command().returncode == 0 and command("--check").returncode == 0
 
 
 @pytest.mark.parametrize(("name", "policy"), FORMS, ids=[f"{name}-{policy}" for name, policy in FORMS])
@@ -355,7 +401,7 @@ def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
         return precision._rounded_tangent(dtype_of(spec), primals, directions, value)
 
     paired = dataclasses.replace(format_cases.ROUNDED, forward=forward, tangent=tangent)
-    composed = paired.assembled(lambda name: getattr(emitted, name))
+    composed = paired.assembled(emitted)
     options = {"dtype": jnp.bfloat16}
     x = jnp.full((16, 32), 1.003, jnp.float32)
     dx = jnp.full_like(x, 1.007)
@@ -406,19 +452,19 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
                                   input_tree=(jax.tree.structure(({"x": tile, "y": tile},)),),
                                   output_tree=(jax.tree.structure({"difference": tile, "sum": tile}),))
     declared = generate.SurrogateBodies(value, tangent, (), symbolic_zeros=True, cases=(((), case),))
-    reachable = {}
-    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
-        _, body, _ = generate._component(component, component.cases.operands[0], "default", "sm90", name)
-        reachable[name] = printed.loaded(body.render("form"), "form")
-
     called = set()
+    tables = {}
+    for name, component in ((case.name, forward), (case.tangent_name((1,)), active)):
+        operands = component.cases.operands[0]
+        _, body, _ = generate._component(component, operands, "default", "sm90", name)
+        loaded = printed.loaded(body.render("form"), "form")
 
-    def emitted(name):
-        fn = reachable[name]
-        called.add(fn)
-        return lambda *operands, policy, target: fn(*operands)
+        def form(*values, name=name, loaded=loaded):
+            called.add(name)
+            return loaded(*values)
+        tables[_generated.table_name(name)] = {("default", "sm90", _generated.case_of(operands)): form}
 
-    composed = declared.assembled(emitted)
+    composed = declared.assembled(types.SimpleNamespace(**tables))
     x = np.arange(8, dtype=np.float32)
     y = np.full_like(x, 3.5)
     dx = np.full_like(x, 2.25)
@@ -431,7 +477,7 @@ def test_a_partial_symbolic_zero_uses_its_generated_tangent_and_the_original_val
     np.testing.assert_array_equal(primal["sum"], x + y)
     np.testing.assert_array_equal(direction["difference"], (x - y) * dx)
     np.testing.assert_array_equal(direction["sum"], (x + y) * dx)
-    assert called == set(reachable.values())
+    assert called == {case.name, case.tangent_name((1,))}
 
     # The tangent key is valid at this size, but the forward fallback returns a different PyTree.
     called.clear()
@@ -587,3 +633,16 @@ def test_the_chooser_measures_each_pair_of_distinct_programs_once():
     assert len(set(pairs)) == len(pairs)
     proposed = [program(candidate.function) for candidate in choice.candidates]
     assert len(set(proposed)) == len(proposed)
+
+
+def test_a_name_declared_twice_is_refused_and_keeps_its_first_form():
+    """Two forms of one declared name are refused, the first kept (`generate.declare`): a second surrogate
+    case of one body name over the first ran the second's form for both. Declared under a module no
+    generation writes (`DECLARING` names none of it)."""
+    first, second = (generate.ComponentForm(fn, fn, generate.float32_cases(((8,),)))
+                     for fn in (lambda x: 2 * x, lambda x: 3 * x))
+    generate.declare(__name__, "gain", first)
+    assert generate.declare(__name__, "gain", first) is first
+    with pytest.raises(ValueError):
+        generate.declare(__name__, "gain", second)
+    assert generate.DECLARATIONS[f"{__name__}.gain"] is first
