@@ -212,7 +212,7 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     inference reads. Returns the task, its stepped state and the batch."""
     import optax
 
-    from dew.training import Checkpoints, Trainer
+    from dew.training import Trainer
 
     task = config.build()
     batch = batch(task) if callable(batch) else batch
@@ -220,11 +220,18 @@ def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
     # Placed as a run places it, its init one program rather than each of its operations apart.
     state, _, _ = trainer.place()
     state, *_ = trainer.compile(state, batch)(state, batch)
+    _saved_run(config, task, state, 1, directory)
+    return task, state, batch
+
+
+def _saved_run(config, task, state, step: int, directory) -> None:
+    """`state` saved as `config`'s run in `directory` at `step`, with the record its task's inference reads."""
+    from dew.training import Checkpoints
+
     checkpoints = Checkpoints(str(directory))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
+    checkpoints.save(step, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(directory))
-    return task, state, batch
 
 
 def saved_unstepped(config, directory):
@@ -233,16 +240,13 @@ def saved_unstepped(config, directory):
     the record its inference reads: a saved run that compiles no step. Returns the task and that state."""
     import optax
 
-    from dew.training import Checkpoints, Trainer
+    from dew.training import Trainer
 
     task = config.build()
     state, _, _ = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3)).place()
     state = state.replace(variables={**state.variables,
                                      "params": moved(state.variables["params"], jax.random.key(3), 0.02)})
-    checkpoints = Checkpoints(str(directory))
-    checkpoints.save(0, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(directory))
+    _saved_run(config, task, state, 0, directory)
     return task, state
 
 

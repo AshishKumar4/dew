@@ -34,10 +34,11 @@ COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
 questions stream through a filter, whose count no read states before it ends, so its epoch is a pass
 over its source examples, which it counts ahead (`Loader.pass_examples`)."""
 
-EXAMPLES = {"lm": 2, "decision": 8, "diffusion": 16, "jepa": 16}
-"""Examples a run of each kind reads in a few steps: an LM's example is a document, many windows long;
-the other kinds' are a batch's rows, a decision run's one batch, each of its steps seconds on a CPU (row
-13576: two and four steps beside its two epochs' runs took 124 s)."""
+EXAMPLES = {"lm": (2, 4), "decision": (8, 32), "diffusion": (16, 32), "jepa": (16, 32)}
+"""The examples two runs of each kind read in a few steps, the second a multiple of the first: an LM's
+example is a document, many windows long; the other kinds' are a batch's rows. A decision run reads one
+batch, its steps seconds on a CPU (row 13576), then four, past its 25 source examples into a second pass,
+which an example bound repeats its source for (`bounds`)."""
 
 GLOBAL_ORDER = {"lm", "diffusion", "jepa"}
 """The kinds whose training data is compiled to one global record order, which a batch ramp cuts
@@ -135,7 +136,8 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
 def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     """A run of two epochs ends at twice the step one epoch ends at (`epochs`), where the kind's data
     states its record count, and consumes twice the source examples one epoch does where it states none,
-    an epoch a pass over them (row 1902); one of twice the examples ends at twice the step (`examples`)."""
+    an epoch a pass over them (row 1902); one of a multiple of the examples ends at that multiple of the
+    step (`examples`), and consumes them where they are source examples, past a pass of them."""
     if kind in COUNTED_RECORDS:
         once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
         twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
@@ -146,9 +148,13 @@ def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
                                      **{"trainer.epochs": epochs}))
             return int(logged[max(logged)]["train/examples_consumed"])
         assert consumed(2) == 2 * consumed(1) > 0
-    few = saved(trained(kind, tmp_path, "few", **{"trainer.examples": EXAMPLES[kind]}))[-1]
-    assert saved(trained(kind, tmp_path, "more",
-                         **{"trainer.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
+    examples, more = EXAMPLES[kind]
+    few = saved(trained(kind, tmp_path, "few", **{"trainer.examples": examples}))[-1]
+    longer = trained(kind, tmp_path, "more", **{"trainer.examples": more})
+    assert saved(longer)[-1] == more // examples * few
+    if kind not in COUNTED_RECORDS:
+        logged = scalars(longer)
+        assert int(logged[max(logged)]["train/examples_consumed"]) == more
 
 
 @attending("xla")
