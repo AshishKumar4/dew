@@ -126,12 +126,42 @@ def _scaled_value(product: jax.Array, factor: jax.Array) -> jax.Array:
                     factor)
 
 
+def _linear_scaled(tangent: jax.Array, factor: jax.Array) -> jax.Array:
+    """`tangent * factor` rounded once as `scaled_exactly` rounds it (a subnormal factor's product formed
+    among the normals on a flushing platform, `lowered_product`: `2**126 * 2**-127` is 0.5, row 13703),
+    linear in `tangent`, its transpose the cotangent times the same factor alike (`generation.linear_map`),
+    its derivative in `factor` `scaled_exactly`'s own (the mixed term a higher order meets). The moving
+    operand is widened to fp32 before it is broadcast to the factor's shape and made to vary where it does,
+    so the transposes of that broadcast and that variation sum fp32 cotangents, rounded once to the
+    tangent's own dtype after (train 1362's review: a bf16 product over fp32 factors `[256, -255.5]` sums
+    0.5, not the 0 of each term rounded first)."""
+
+    def apply(factor, moving):
+        return scaled_exactly(moving, factor)
+
+    def pullback(factor, cotangent):
+        # Placed as the moving operand is on an Explicit mesh (a replicated tangent's cotangent gathered from
+        # a split scale's product), as the plain multiply's transpose places it.
+        pulled = scaled_exactly(cotangent.astype(jnp.float32), factor)
+        if placed.mesh.explicit_axes and jax.typeof(pulled).sharding.spec != placed.spec:
+            pulled = jax.sharding.reshard(pulled, placed.spec)
+        return pulled
+
+    factor = jnp.asarray(factor, jnp.float32)
+    wide = jnp.asarray(tangent).astype(jnp.float32)
+    moving = varying_like(jnp.broadcast_to(wide, jnp.broadcast_shapes(jnp.shape(wide), jnp.shape(factor))),
+                          factor)
+    placed = jax.typeof(moving).sharding
+    return generation.linear_map(apply, pullback, factor, moving)
+
+
 def _scaled_tangent(primals, tangents):
     (product, factor), (d_product, d_factor) = primals, tangents
     value = scaled_exactly(product, factor)
     # Each perturbed operand's term alone (`_Transpose.tangent`'s rule): a factor held still meets no
-    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero.
-    terms = [*(() if isinstance(d_product, SymbolicZero) else (d_product.astype(jnp.float32) * factor,)),
+    # cotangent of its own, so an infinite one gives no NaN, nor an absent term a lost negative zero; the
+    # product's term range-safe in a subnormal factor (`_linear_scaled`).
+    terms = [*(() if isinstance(d_product, SymbolicZero) else (_linear_scaled(d_product, factor),)),
              *(() if isinstance(d_factor, SymbolicZero) else (product.astype(jnp.float32) * d_factor,))]
     if not terms:
         return value, jnp.zeros_like(value)
@@ -195,7 +225,7 @@ class _Transpose:
     def value(self, cotangent, scale, ran, routed):
         """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
         finite, the moved one's (`moved`)."""
-        plain = self.summed(*self.pulled(cotangent * scale, ran))
+        plain = self.summed(*self.pulled(scaled_exactly(cotangent, scale), ran))
         if 0 in self.shape or cotangent.shape[-1] == 0:
             # No row, no depth or no column: the plain transpose's empty or zero gradient is the whole of it.
             return plain
@@ -362,7 +392,7 @@ class _Transpose:
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
         operand alone (a scale held still meets no cotangent of its own: an infinite one is no NaN)."""
         (cotangent, scale), (d_cotangent, d_scale) = primals, tangents
-        terms = [*(() if isinstance(d_cotangent, SymbolicZero) else (d_cotangent * scale,)),
+        terms = [*(() if isinstance(d_cotangent, SymbolicZero) else (_linear_scaled(d_cotangent, scale),)),
                  *(() if isinstance(d_scale, SymbolicZero) else (cotangent * d_scale,))]
         value = self.declared(cotangent, scale, ran, routed)
         if not terms:
