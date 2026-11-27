@@ -35,9 +35,10 @@ if TYPE_CHECKING:
     from google.protobuf.descriptor_pool import DescriptorPool
     from google.protobuf.message import Message
 
-XLA_COMMIT = "2b26bc3432b9e01ba65a66ce2a858031b8a63e8d"
+XLA_COMMIT = "d867969800d4a8fd045505eabc65e1e66f30794f"
 """The openxla/xla commit whose xla/xla_data.proto, xla/service/metrics.proto and xla/service/hlo.proto
-`xla_protos.binpb` describes (tools/xla_protos.py)."""
+`xla_protos.binpb` describes (tools/xla_protos.py): the one the pinned jaxlib was built from, which a pin's
+change regenerates it at."""
 
 
 class HloModule(Protocol):
