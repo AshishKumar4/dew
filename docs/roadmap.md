@@ -64,7 +64,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - A single process driving two H100s (Mesh fsdp=2, CUDA 12, driver 570.148.08, NCCL_RUNTIME_CONNECT=0, Dew's default XLA_FLAGS) deadlocks at the first execution…. [12714]
-- Qualify generated Algebra components for production use. [3272]
 - Euler over a FlowMatch source schedule (SD3's FlowMatchEulerDiscreteScheduler files) rounds worse than Diffusers' own x + dt v under check 1. [13654]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
