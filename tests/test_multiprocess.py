@@ -2230,7 +2230,8 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     where its batch lacks a field, or where its listing has not yet seen the
     newest checkpoint a resume reads, every process refuses with the cause,
     rather than one raising alone while its peers enter a step or a restore
-    it never joins. Streams that run out at the same step on every process
+    it never joins, and a preview process 0's tracker alone would take is
+    refused on both. Streams that run out at the same step on every process
     end the run there."""
     reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
                        run_dir=str(tmp_path / "runs"))
@@ -2258,6 +2259,9 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         assert report["eof"]["refused"] == {"type": "StreamsEnded", "phase": "training read", "named": 1}
         newest = {"type": "PoolDiffers", "phase": "newest checkpoint", "named": 1}
         assert report["stale"] == {"refused": newest, "restored": None}, report
+        # A preview process 0's tracker alone would take, of a model that cannot sample, every process
+        # refuses before any enters its checkpoint's agreement.
+        assert report["preview"]["refused"] == own, report
 
 
 
