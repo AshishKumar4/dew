@@ -305,3 +305,68 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             np.testing.assert_array_equal(outs[1], outs[0])
         else:
             assert outs[1] is outs[0]
+
+
+def test_a_windowed_dense_the_recipe_takes_runs_the_recipes_product():
+    """A bfloat16 Dense whose kernel `bf16_windows` stores as its window, in a role the run's FP8 recipe
+    takes (whole 128-wide blocks, the feed-forward's), computes the recipe's product of its kernel bit for
+    bit, as the layer over its kernel does: a row holding 1 and 2^-20 in one block, whose small coordinate a
+    unit weight alone reads, rounds that coordinate to zero in E4M3 where the window's exact product keeps
+    it (row 13699)."""
+    from dew.nn.kernels import generation
+    from dew.nn.precision import FP8, projection_role
+
+    kernel = np.zeros((128, 128), jnp.bfloat16)
+    kernel[1, 0] = 1.0
+    x = np.zeros((4, 128), jnp.bfloat16)
+    x[:, 0], x[:, 1] = 1.0, 2.0 ** -20
+    layer = Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False)
+    variables = {"params": {"kernel": jnp.asarray(kernel)}}
+    windowed = quantization.bf16_windows(variables, sites=[""])
+    with generation.run_precision(FP8), projection_role("mlp"):
+        plain, served = (np.asarray(jax.jit(layer.apply)(held, jnp.asarray(x))).view(np.uint16)
+                         for held in (variables, windowed))
+    np.testing.assert_array_equal(served, plain)
+
+
+def test_a_windowed_dense_with_an_fp32_bias_keeps_its_declared_tangent():
+    """A bfloat16 Dense with its bias stored fp32, its kernel a window: its tangent is Dense's own, each
+    direction's product rounded to bfloat16 before the bias's direction joins it (`dense._widened`), bit
+    for bit the layer's over its kernel: a column `[1, 2^-8, 0, ...]`, an input direction `[1, 1, 0, ...]`
+    and a bias direction -1 give 0, where an fp32 sum of the products gives 2^-8 (row 13701)."""
+    kernel = np.zeros((128, 64), jnp.bfloat16)
+    kernel[0, 0], kernel[1, 0] = 1.0, 2.0 ** -8
+    layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    params = {"kernel": jnp.asarray(kernel), "bias": jnp.zeros((64,), jnp.float32)}
+    windowed = quantization.bf16_windows({"params": params}, sites=[""])
+    x = jnp.ones((2, 128), jnp.bfloat16)
+    direction = jnp.zeros((2, 128), jnp.bfloat16).at[:, :2].set(1.0)
+    bias_direction = jnp.full((64,), -1.0, jnp.float32)
+
+    def tangent(variables):
+        def run(inputs, bias):
+            held = {**variables, "params": {**variables["params"], "bias": bias}}
+            return layer.apply(held, inputs)
+
+        _, out = jax.jvp(run, (x, params["bias"]), (direction, bias_direction))
+        return np.asarray(out, np.float32)
+
+    plain, served = tangent({"params": params}), tangent(windowed)
+    np.testing.assert_array_equal(served.view(np.uint32), plain.view(np.uint32))
+    assert plain[0, 0] == 0.0
+
+
+@pytest.mark.distributed
+def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
+    """A `[256, 256]` kernel split by its columns across two processes' devices, which no process holds
+    whole: `bf16_windows` encodes each column's window where it lives, each process's planes its own
+    columns' window, decoded its own columns' bits again (row 13702: it read the whole kernel on each
+    process, which JAX refuses for a value lying on other processes' devices)."""
+    from pathlib import Path
+
+    from process_support import run_pool
+
+    worker = Path(__file__).with_name("bf16_window_worker.py")
+    for report in run_pool("width_split", tmp_path / "pool", 2, devices=2, script=worker):
+        assert report["planes"] and all(report["planes"]), report
+        assert report["decoded"] and all(report["decoded"]), report
