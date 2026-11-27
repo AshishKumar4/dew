@@ -1688,10 +1688,10 @@ class RunConfig:
                 return resume_admitted(built, dataset, step)
 
         # Its saved position read here once, which the fit's stream restores as read (`Trainer._fit`).
-        data = agreed("run data", check_data)
-        if data is None:
+        position = agreed("run data", check_data)
+        if position is None:
             return Resumed(step, numerics_admitted=numerics, read=False)
-        return Resumed(step, *data, numerics_admitted=numerics)
+        return Resumed(step, *position, numerics_admitted=numerics)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,

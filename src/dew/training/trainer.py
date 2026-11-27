@@ -1657,21 +1657,23 @@ class Trainer(Generic[Loss, Effects]):
         (`Checkpoints.position`), none where its plan changed and the run resumes relaxed (what changed its
         `differs`); a position saved for other shares is none of this run's to read."""
         seeded = run.resumed
-        if seeded is None or not seeded.read:
-            # The step a configured run admitted (`_fit`), its position read here where it read none.
-            checkpoints = self.checkpoints
-            step = resumed_step(self, resume) if seeded is None else seeded.step
-            position, differs = None, ()
-            if checkpoints is not None and step is not None:
-                try:
-                    position = checkpoints.position(step, DataPartition.of(self.device_mesh))
-                except PlanChanged as changed:
-                    if self.data_resume == "exact":
-                        raise
-                    differs = tuple(changed.differs)
-            run.resumed = Resumed(step, position, differs,
-                                  numerics_admitted=seeded is not None and seeded.numerics_admitted)
-        return run.resumed
+        if seeded is not None and seeded.read:
+            return seeded
+        # The step a configured run admitted (`_fit`), its position read here where it read none.
+        checkpoints = self.checkpoints
+        step = resumed_step(self, resume) if seeded is None else seeded.step
+        position, differs = None, ()
+        if checkpoints is not None and step is not None:
+            try:
+                position = checkpoints.position(step, DataPartition.of(self.device_mesh))
+            except PlanChanged as changed:
+                if self.data_resume == "exact":
+                    raise
+                differs = tuple(changed.differs)
+        resumed = Resumed(step, position, differs,
+                          numerics_admitted=seeded is not None and seeded.numerics_admitted)
+        run.resumed = resumed
+        return resumed
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
