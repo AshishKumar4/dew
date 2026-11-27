@@ -260,7 +260,7 @@ def test_an_nvfp4_bank_writes_back_every_code_its_scales_decode_unchanged():
     denominator = np.ones(2, np.float32)
     stored = {name: codes, name + '_scale': scale, name + '_amax': amax,
               name + '_outer_scale_denominator': denominator}
-    codec = inkling2_experts(stored)
+    codec = inkling2_experts(stored, {name: 'float32'})
     values = np.asarray(codec.decode(stored, name), np.float32)
     assert values[0, 0, 0] == 0 and values[0, 0, 16] == np.float32(3 * 2.0 ** -149)
     written = codec.encode(name, values)
@@ -280,14 +280,15 @@ def test_an_nvfp4_bank_writes_back_every_code_its_scales_decode_unchanged():
             name + '_outer_scale_denominator': np.ones(1, np.float32)}
     nearby = np.zeros((1, 1, 16), np.float32)
     nearby[0, 0, 0] = np.float32(1.125 + tiny)
-    assert inkling2_experts(near).encode(name, nearby)[name][0, 0, 0] == 0x01
+    assert inkling2_experts(near, {name: 'float32'}).encode(name, nearby)[name][0, 0, 0] == 0x01
 
 
 def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from():
-    """Inkling 2's MXFP8 writer compares each value in the dtype its load kept it in: a code whose decode
+    """Inkling 2's MXFP8 writer compares each value against its code's decode as the load kept it, in the
+    dtype the load decoded the bank into, whatever dtype the export hands it in: a code whose decode
     `2^-136` (E4M3's `2^-9` under E8M0's `2^-127`) a bfloat16 load holds as 0 writes back as the code it
-    was loaded from, not as a fresh 0 (train 1370's review F2), and a value its training changed takes its
-    nearest code."""
+    was loaded from, not as a fresh 0, from the bfloat16 tree and from that tree widened to float32 (train
+    1370's review F2, train 1379's P-F3), and a value its training changed takes its nearest code."""
     import ml_dtypes
 
     from dew.interop.codecs import inkling2_experts
@@ -297,14 +298,40 @@ def test_an_mxfp8_bank_held_in_bfloat16_writes_back_the_codes_it_was_loaded_from
     codes[0, 0] = ml_dtypes.float8_e4m3fn(2.0 ** -9)
     exponents = np.asarray([[[0], [127]]], np.uint8)
     stored = {name: codes, name + '_scale': exponents}
-    codec = inkling2_experts(stored)
+    codec = inkling2_experts(stored, {name: 'bfloat16'})
     decoded = np.asarray(codec.decode(stored, name), np.float32)
     assert decoded[0, 0, 0] == np.float32(2.0 ** -136)
     held = decoded.astype(ml_dtypes.bfloat16)
     assert held[0, 0, 0] == 0
-    np.testing.assert_array_equal(codec.encode(name, held)[name].view(np.uint8), codes.view(np.uint8))
+    for tree in (held, held.astype(np.float32)):
+        np.testing.assert_array_equal(codec.encode(name, tree)[name].view(np.uint8), codes.view(np.uint8))
     changed = held.copy()
     changed[0, 1, 0] = ml_dtypes.bfloat16(2.0)
     written = codec.encode(name, changed)[name]
     assert written[0, 1, 0] == ml_dtypes.float8_e4m3fn(2.0)
     assert (written.view(np.uint8) != codes.view(np.uint8)).sum() == 1
+
+
+@pytest.mark.parametrize('widened', [False, True], ids=['bfloat16', 'widened to float32'])
+def test_a_bfloat16_load_of_quantized_banks_saves_them_as_stored(tmp_path, widened):
+    """The quantized release loaded in bfloat16 and saved from its tree as loaded, or from that tree
+    widened to float32 (an export writes each leaf in the dtype it is handed), writes its expert banks back
+    as it stored them, codes and scales bit for bit: each value told apart from its load's in the dtype the
+    load decoded it into (`Pretrained.quantized_dtypes`, train 1379's P-F3)."""
+    from dew.interop.safetensors_io import read_file
+
+    loaded = Pretrained.load(FIXTURES / 'inkling2-tiny-nvfp4', dtype='float32', param_dtype='bfloat16')
+    assert loaded.quantized_dtypes and set(loaded.quantized_dtypes.values()) == {'bfloat16'}
+    def wide(leaf):
+        return np.asarray(leaf, np.float32) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    variables = jax.tree.map(wide, loaded.variables) if widened else loaded.variables
+    loaded.save(tmp_path, variables=variables)
+    written = {name: value for file in tmp_path.glob('model*.safetensors')
+               for name, value in read_file(file)[0].items()}
+    source = release_tensors('inkling2-tiny-nvfp4')
+    banks = [name for name in source if '.experts.' in name]
+    assert banks
+    for name in banks:
+        held = (written[name].dtype, written[name].tobytes())
+        assert held == (source[name].dtype, source[name].tobytes()), name
