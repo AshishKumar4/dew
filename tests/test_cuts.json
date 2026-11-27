@@ -343,7 +343,7 @@
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-documents-window-valid-places-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-full-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-lengths-accurate]",
-"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-two-sided-window-default]",
+"tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-two-sided-window-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-valid-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-valid-fused-shared-keys]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_over_every_call_form_interpreted[sm90-widest-window-accurate]",
@@ -356,7 +356,7 @@
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[row-indexed-sm80-default]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[sinks-sm80-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[sinks-sm90-default]",
-"tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[softcap-sm90-default]",
+"tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[softcap-sm90-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[temperature-sm90-accurate]",
 "tests/test_attention_mosaic.py::test_the_backward_is_on_par_under_every_score_hook_interpreted[tile-bias-sm90-accurate]",
 "tests/test_attention_mosaic.py::test_the_forward_is_on_par_at_head_widths_interpreted[128-64-sm80]",
@@ -865,6 +865,9 @@
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
 ],
+"tests/test_block_sparse.py": [
+"tests/test_block_sparse.py::test_attention_over_a_groups_selection_holds_check_1_against_its_dense_mask"
+],
 "tests/test_block_visibility.py": [
 "tests/test_block_visibility.py::test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names"
 ],
@@ -1005,7 +1008,8 @@
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
 ],
 "tests/test_code_digest.py": [
-"tests/test_code_digest.py::test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else"
+"tests/test_code_digest.py::test_a_rung_records_code_is_its_step_its_objective_and_its_models_and_none_else",
+"tests/test_code_digest.py::test_a_slotted_instance_of_a_class_of_dews_is_walked_by_its_slots"
 ],
 "tests/test_compile_ahead.py": [
 "tests/test_compile_ahead.py::test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once",
@@ -2430,8 +2434,8 @@
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm80-256-gqa-8-4-causal-plain-two-bfloat16-fast-combination18]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm80-64-gqa-8-4-documents-softcap-two-float32-accurate-combination5]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm90-128-gqa-8-2-causal-key-bias-two-float32-fast-combination12]",
-"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm90-64-gqa-8-4-causal-key-bias-two-bfloat16-fast-combination16]",
-"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention_kernels-a kernels training step is on par: sm90-triton-128-gqa-8-2-full-float32-combination21]",
+"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[attention-a routes training step is on par: sm90-64-gqa-8-4-documents-tile-bias-two-bfloat16-fast-combination11]",
+"tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[channel_walk-a channel walks training step is on par: sm90-diagonal_scan-bfloat16-one-combination47]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[narrow_copies-a narrow copy training run is on par: sm90-float16-plain-split-combination139]",
 "tests/test_kernel_matrix.py::test_a_declared_cell_is_a_combination_its_route_serves[short_conv-a short convs training step is on par: sm90-0.8b-bfloat16-one-combination202]",
 "tests/test_kernel_matrix.py::test_a_familys_cells_cover_every_pair_of_axis_values_its_route_offers[attention]",
@@ -3030,6 +3034,9 @@
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[bfloat16-repeated]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float32-distinct]",
 "tests/test_norm_swiglu.py::test_seam_and_product_run_per_shard_as_on_one_device[fsdp]"
+],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-flat_map]"
 ],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
@@ -4048,8 +4055,8 @@
 "tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[block_sparse_attention-plain-copies]",
 "tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[block_sparse_attention-plain-no copies]",
 "tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[lightning_attention-plain-copies]",
-"tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[lightning_attention-plain-no copies]",
-"tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[mla-plain-copies]"
+"tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[mla-plain-copies]",
+"tests/test_step_memory_1.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[mla-plain-no copies]"
 ],
 "tests/test_step_memory_2.py": [
 "tests/test_step_memory_2.py::test_a_trainer_steps_backward_holds_no_layers_cotangents_past_its_layer[attention-biases-no copies]",
