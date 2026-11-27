@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import importlib
 import logging
 from collections.abc import Callable, Iterator, Sequence
+from types import ModuleType
 
 import jax
 import jax.numpy as jnp
@@ -68,7 +68,7 @@ def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable |
         _counted(qualified, "another static program")
         return None
     module, name = qualified.rsplit(".", 1)
-    derived = importlib.import_module(f"{module}_derived")
+    derived = _derived(module)
     forms = getattr(derived, f"_{name}_forms")
     policy = "accurate" if generation.numerics().forms == "accurate" else "default"
     typed = [jax.ShapeDtypeStruct(np.shape(operand), jnp.result_type(operand)) for operand in operands]
@@ -79,3 +79,13 @@ def body(qualified: str, operands: Sequence, *, when: bool = True) -> Callable |
     _counted(qualified, GENERATED)
     function = getattr(derived, name)
     return lambda *values: function(*values, policy=key[0], target=key[1])
+
+
+def _derived(module: str) -> ModuleType:
+    """The generated module of the declaring `module`, imported where named (a static import, which a code
+    digest reads: `dew._code`); a module no site's component is declared in has none here."""
+    if module == "dew.algebra.component_cases":
+        from dew.algebra import component_cases_derived
+
+        return component_cases_derived
+    raise ValueError(f"no generated module of {module!r} serves a site")

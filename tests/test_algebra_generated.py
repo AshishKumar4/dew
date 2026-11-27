@@ -3,9 +3,11 @@ docs/design/algebra.md §6.11): under the default choice the written math runs a
 "generated" a declared case runs the generated body, bit for bit its module's, and any other call the written
 math, its reason counted."""
 
+import generated_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from dew.algebra import component_cases_derived, generated
 from dew.nn.kernels import generation, recurrence_algebra
@@ -96,3 +98,10 @@ def test_the_generated_merge_takes_an_empty_slice_as_its_identity():
         np.testing.assert_array_equal(merged.total, state.total)
     assert np.all(np.isfinite(merges[2].acc)) and not np.any(merges[2].acc)
     assert not np.any(merges[2].total)
+
+
+@pytest.mark.parametrize("case", generated_matrix.CASES, ids="-".join)
+def test_each_generated_site_is_on_par_with_its_written_body(case):
+    """The generated bodies' matrix cells (tests/generated_matrix.py) on the CPU, as their generation."""
+    with generation.assumed(case[0]):
+        generated_matrix.a_generated_body_is_on_par(case)
