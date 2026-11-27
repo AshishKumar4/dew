@@ -1656,10 +1656,11 @@ class RunConfig:
                 self.check_resume(record)
                 resumed["record"] = record
             if step is not None:
-                # The trainer's admission, under the numerics its steps trace under, before the record is
-                # replaced: a refusal leaves the run's record as it was (row 13708).
+                # The trainer's admission of its numerics, under the numerics its steps trace under (the
+                # run's, then its trainer's own), before the record is replaced: a refusal leaves the run's
+                # record as it was (row 13708).
                 with self.traced():
-                    refuse_other_computation(built, checkpoints, step)
+                    refuse_other_computation(built, checkpoints, step, numerics_alone=True)
 
         def check_data() -> None:
             from dew.training.startup import resume_admitted

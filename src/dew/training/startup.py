@@ -187,11 +187,24 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
 
 
 def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]",
-                                               checkpoints: "Checkpoints", step: int) -> None:
+                                               checkpoints: "Checkpoints", step: int, *,
+                                               numerics_alone: bool = False) -> None:
     """Refuse `trainer`'s resume of `checkpoints`' `step` where they compute otherwise
-    (`computation_differs`), read under the numerics its steps trace under: the trainer's own admission,
-    which a configured run takes before it replaces its record (`RunConfig.train`, row 13708)."""
-    differs = computation_differs(trainer, checkpoints, step)
+    (`computation_differs`), read under the numerics its steps trace under (`under_numerics`): the
+    trainer's own admission. A configured run takes its numerics' part (`numerics_alone`: the numerics and
+    the precision its products computed at) before it replaces its record (`RunConfig.train`, row 13708),
+    the rest once its start is laid out as the checkpoint's."""
+    from dew.training.distributed import under_numerics
+
+    with under_numerics(trainer.numerics):
+        if numerics_alone:
+            saved = checkpoints.training(step)
+            now = trainer.phase_passes.training_record(trainer.objective)
+            differs = ([] if not isinstance(saved, dict) else
+                       [found for name in ("numerics", "products") if name in saved
+                        for found in _differing(saved[name], now[name], f"training.{name}")])
+        else:
+            differs = computation_differs(trainer, checkpoints, step)
     if differs:
         raise ValueError(f"the checkpoint at step {step} in {checkpoints.directory} trained another "
                          f"computation ({', '.join(differs)}); resume it with the objective, its settings "
