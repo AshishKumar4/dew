@@ -267,6 +267,136 @@ def _tokens(length: int, where, values):
         jnp.asarray(values).reshape(-1, 1, 1))
 
 
+@pytest.mark.parametrize(("key", "value", "vanished", "gated", "decayed", "nan"), [
+    (np.nan, 1.0, [], [], True, True), (np.nan, 1.0, [130], [], True, False),
+    (np.nan, 1.0, [1], [], True, False), (np.nan, 1.0, [1], [], False, False),
+    (1.0, np.nan, [1], [], False, False), (1.0, np.inf, [], [1], True, True)],
+    ids=["a NaN key through a live span", "a NaN key through a vanished token in its span",
+         "a NaN key cut by a vanished token after it in its chunk", "the same under no decay",
+         "a NaN value cut by a vanished token after it in its chunk",
+         "an infinite value under a NaN gate after it in its chunk"])
+def test_a_bf16_levels_nan_input_reads_nan_through_a_live_span_alone(key, value, vanished, gated, decayed,
+                                                                      nan):
+    """A bf16 level-8 read (193 tokens) at token 192 of token 0's key and value (a unit query), its span
+    holding four live decays of -80 where `decayed` (tokens 128 to 131; its prefix -320, past every finite
+    fp32 value) and a vanished token at each of `vanished`: NaN through a live span, as the chunked
+    reference's (`scan.spread`: a NaN read reads NaN), where the levels' mask of an overflowed memory zeroed
+    it (audit 2026-11-27 K02), and a NaN gate at each of `gated` alike (an infinite value under it, its write
+    a NaN decay's, not an overflow's; a head review); zero through a vanished token, in its span or after
+    token 0 in its chunk, as the recurrence selects it out, where a NaN key or value cut from its chunk's
+    end times its zero write was NaN (train 1416's review)."""
+    weights = jnp.zeros((1, 193, 1, levels(193)), jnp.float32).at[0, 192, 0, 8].set(1.0)
+    g = jnp.zeros((1, 193, 1), jnp.float32).at[0, 128:132].set(-80.0 if decayed else 0.0)
+    for token in vanished:
+        g = g.at[0, token].set(-jnp.inf)
+    for token in gated:
+        g = g.at[0, token].set(jnp.nan)
+    out = log_linear_attention(_tokens(193, [192], [1.0]), _tokens(193, [0], [key]),
+                               _tokens(193, [0], [value]), g, weights, scale=1.0)
+    found = np.asarray(out, np.float32)[0, 192, 0, 0]
+    assert np.isnan(found) if nan else found == 0, found
+
+
+def test_a_bf16_levels_nan_key_reads_nan_for_its_live_value_heads_alone():
+    """Two value heads of one key head, a bf16 level-8 read (193 tokens) at token 192 of token 0's NaN key
+    against unit values, four decays of -80 at tokens 128 to 131, the first head's token 1 vanished: zero for
+    the first, its reset cutting the key out of its write, and NaN for the second, which reads it live, the
+    keys shared by both heads' memories (a value head's keys formed apart for its mask took a GH200's
+    forward from 1.10 to 3.15 ms, M-JS-317b)."""
+    weights = jnp.zeros((1, 193, 2, levels(193)), jnp.float32).at[0, 192, :, 8].set(1.0)
+    g = jnp.zeros((1, 193, 2), jnp.float32).at[0, 128:132].set(-80.0).at[0, 1, 0].set(-jnp.inf)
+    values = jnp.zeros((1, 193, 2, 1), jnp.bfloat16).at[0, 0].set(1.0)
+    out = log_linear_attention(_tokens(193, [192], [1.0]), _tokens(193, [0], [jnp.nan]), values, g, weights,
+                               scale=1.0)
+    found = np.asarray(out, np.float32)[0, 192, :, 0]
+    assert found[0] == 0 and np.isnan(found[1]), found
+
+
+def test_a_bf16_levels_nan_weight_reads_nan_under_its_spent_decay():
+    """A bf16 level-8 read (200 tokens) at token 196 of token 0's unit key and value by a unit query whose
+    level-8 weight is NaN (its own level's pairs alone, the within's finite), five live decays of -80 at
+    tokens 192 to 196 in its chunk before it (its local decay -400, past every finite fp32 value, no token
+    vanished): NaN, a NaN reader's read kept as a NaN input's, where the levels' mask of a non-finite read
+    under a spent decay zeroed it (audit 2026-11-27 K02), its NaN-ness taken from the query's entries and
+    its weight, no level reducing its value heads' readers (M-JS-318)."""
+    weights = jnp.zeros((1, 200, 1, levels(200)), jnp.float32).at[0, 196, 0, 8].set(jnp.nan)
+    g = jnp.zeros((1, 200, 1), jnp.float32).at[0, 192:197].set(-80.0)
+    unit = _tokens(200, [0], [1.0])
+    out = log_linear_attention(_tokens(200, [196], [1.0]), unit, unit, g, weights, scale=1.0)
+    assert np.isnan(np.asarray(out, np.float32)[0, 196, 0, 0]), out
+
+
+def test_a_bf16_levels_nan_key_leaves_a_reset_reads_key_gradients_finite():
+    """A bf16 level-7 read (65 tokens) at token 64, itself vanished, of token 0's NaN key and token 1's unit
+    key against a unit value at token 0: its output zero, and its gradient by token 1's key zero, the NaN
+    the key's head reads injected after the memory's product, where written into the product's operand the
+    reset's zero cotangent met it, NaN (train 1431's review)."""
+    weights = jnp.zeros((1, 65, 1, levels(65)), jnp.float32).at[0, 64, 0, 7].set(1.0)
+    g = jnp.zeros((1, 65, 1), jnp.float32).at[0, 64].set(-jnp.inf)
+    keys = _tokens(65, [0, 1], [jnp.nan, 1.0])
+
+    def read(keys):
+        out = log_linear_attention(_tokens(65, [64], [1.0]), keys, _tokens(65, [0], [1.0]), g, weights,
+                                   scale=1.0)
+        return out[0, 64, 0, 0].astype(jnp.float32)
+
+    found, gradient = jax.value_and_grad(read)(keys)
+    assert found == 0, found
+    assert np.asarray(gradient, np.float32)[0, 1, 0, 0] == 0, gradient
+
+
+@pytest.mark.parametrize(("overflowed", "gates"), [(False, (64, 68, -80.0)), (True, (67, 68, -1.0))],
+                         ids=["spent decays", "a live decay over an overflowed dot"])
+def test_a_bf16_levels_nan_key_leaves_a_later_resets_decay_gradients_finite(overflowed, gates):
+    """Level-7 bf16 reads (69 tokens) at tokens 67 and 68 of token 0's NaN key against a unit value, decays
+    `gates` (from, to, each) before token 68, vanished: token 68's output zero and its gradient by token 67's
+    decay zero (token 68's output depends on none of it), token 67's keyed read no operand of its decay and
+    its NaN set after it, where set before it the decay's pullback multiplied token 67's zero cotangent by it,
+    NaN (train 1441's review); and with token 1's key and value 2^70 and 1 under token 67's query 2^70, its
+    dot overflowed beside the NaN key's (`2^140`) under a live decay, `0 * inf` (a head review)."""
+    weights = jnp.zeros((1, 69, 1, levels(69)), jnp.float32).at[0, 67:69, 0, 7].set(1.0)
+    big = 2.0 ** 70 if overflowed else 1.0
+    queries = _tokens(69, [67, 68], [big, 1.0])
+    keys = _tokens(69, [0, 1], [jnp.nan, big]) if overflowed else _tokens(69, [0], [jnp.nan])
+    values = _tokens(69, [0, 1], [1.0, 1.0]) if overflowed else _tokens(69, [0], [1.0])
+
+    def read(g):
+        out = log_linear_attention(queries, keys, values, g, weights, scale=1.0)
+        return out[0, 68, 0, 0].astype(jnp.float32)
+
+    start, stop, decay = gates
+    g = jnp.zeros((1, 69, 1), jnp.float32).at[0, start:stop].set(decay).at[0, 68].set(-jnp.inf)
+    found, gradient = jax.value_and_grad(read)(g)
+    assert found == 0, found
+    assert np.asarray(gradient, np.float32)[0, 67, 0] == 0, gradient
+
+
+def test_a_bf16_levels_vanished_token_dominates_a_nan_gate_in_its_span():
+    """A bf16 level-9 read (260 tokens) at token 259 of token 0's unit key and value, a NaN gate at 128 and a
+    vanished token at 192 in the span between, decays of -80 at 256 to 259: zero, the vanished token
+    selecting the read out whatever the NaN, where the pyramid's whole decays summed `NaN + -inf` to NaN,
+    the reset lost and the NaN read at token 259 (train 1423's review)."""
+    weights = jnp.zeros((1, 260, 1, levels(260)), jnp.float32).at[0, 259, 0, 9].set(1.0)
+    g = (jnp.zeros((1, 260, 1), jnp.float32).at[0, 128].set(jnp.nan).at[0, 192].set(-jnp.inf)
+         .at[0, 256:260].set(-80.0))
+    unit = _tokens(260, [0], [1.0])
+    out = log_linear_attention(_tokens(260, [259], [1.0]), unit, unit, g, weights, scale=1.0)
+    assert np.asarray(out, np.float32)[0, 259, 0, 0] == 0, out
+
+
+def test_a_bf16_levels_overflowed_memory_read_by_a_zero_query_under_a_spent_decay_reads_zero():
+    """A bf16 level-7 read (68 tokens) at token 67 by a zero query of token 0's key and value of 2^70 (its
+    memory 2^140, past fp32's range), its chunk's decays of -80 at tokens 64 to 67 (its read's -320, past
+    every finite value): zero, the zero reader times the overflowed memory's NaN an overflow's, discarded
+    under its spent decay as an overflowed read is, where a mask of infinities alone kept it (train 1416's
+    review)."""
+    weights = jnp.zeros((1, 68, 1, levels(68)), jnp.float32).at[0, 67, 0, 7].set(1.0)
+    g = jnp.zeros((1, 68, 1), jnp.float32).at[0, 64:68].set(-80.0)
+    large = _tokens(68, [0], [2.0 ** 70])
+    out = log_linear_attention(jnp.zeros_like(large), large, large, g, weights, scale=1.0)
+    assert np.asarray(out, np.float32)[0, 67, 0, 0] == 0, out
+
+
 def test_a_bf16_calls_within_and_level_reads_are_summed_before_their_scale_as_flas():
     """A bf16 call whose token 64 reads its own key of 2^100 (level 0) and token 0's of -2^100 (level 7),
     unit values, at a scale of 2^30 reads zero, the within and the levels' reads summed before the scale
@@ -349,6 +479,22 @@ def test_a_bf16_levels_read_whose_decay_keeps_no_finite_value_reads_zero(length,
     out, pull = jax.vjp(call, _tokens(length, [length - 1], [query]), _tokens(length, [0], [key]), g)
     np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
     assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
+
+
+def test_a_bf16_levels_infinite_key_under_a_spent_prefix_reads_zero():
+    """A bf16 level-9 read (321 tokens) at token 320 by a unit query weighed 1 of token 0's infinite key
+    against a value of 1, four live decays of -80 at tokens 256 to 259 (its prefix -320, past every finite
+    fp32 value; its own chunk's decay zero): zero, the infinite key's NaN-ness an overflow's, cleared past
+    a decay that keeps no finite value as an overflowed memory is (`log_linear._dropped`), where injected
+    after the product it read NaN (train 1431's head review); a NaN key there reads NaN."""
+    weights = jnp.zeros((1, 321, 1, levels(321)), jnp.float32).at[0, 320, 0, 9].set(1.0)
+    g = jnp.zeros((1, 321, 1), jnp.float32).at[0, 256:260].set(-80.0)
+    unit = _tokens(321, [0], [1.0])
+    for key, expected_nan in ((jnp.inf, False), (jnp.nan, True)):
+        out = log_linear_attention(_tokens(321, [320], [1.0]), _tokens(321, [0], [key]), unit, g, weights,
+                                   scale=1.0)
+        found = np.asarray(out, np.float32)[0, 320, 0, 0]
+        assert np.isnan(found) if expected_nan else found == 0, (key, found)
 
 
 @pytest.mark.parametrize(("query", "key", "cotangent", "decay", "kept"), [
