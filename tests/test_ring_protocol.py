@@ -909,6 +909,35 @@ def test_an_emitted_copy_of_a_slots_first_rows_holds_their_reads_alone(rows, ref
     assert bool(ring_protocol.cp_async_violations(events)) == refused
 
 
+@pytest.mark.parametrize(("view", "within", "refused"),
+                         [((0, 8), 2, False), ((0, 8), (2, 6), False), ((8, 16), 1, True),
+                          ((4, 12), 3, False), ((4, 12), 4, True)],
+                         ids=["a-row-of-the-copied-view", "rows-of-the-copied-view", "a-row-of-the-next-view",
+                              "the-last-copied-row-of-an-offset-view", "the-next-row-of-an-offset-view"])
+def test_a_read_through_a_nested_view_is_held_at_the_rows_it_reads(view, within, refused):
+    """A cp.async copy of a 16-row slot's first 8 rows, committed and waited for (`programs`), then a read
+    through a view of the slot's rows and an index within it (`ring.at[0, lo:hi][i]`): held where the rows it
+    reads, the view's offset composed onto the slot's, are copied (row 2, rows 2:6, row 7 of a view from 4)
+    and refused where they are not (row 9 of a view from 8, row 8 of a view from 4), though every one of
+    them shares the copy's alias location, the slot (`cp_async_violations`, `_extent`)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source_gmem, out_gmem):
+        def scoped(ring):
+            plgpu.copy_gmem_to_smem(source_gmem.at[0:8], ring.at[0, 0:8], None)
+            plgpu.wait_gmem_to_smem(0)
+            viewed = ring.at[0, view[0]:view[1]]
+            read = viewed[within] if isinstance(within, int) else viewed[within[0]:within[1]][0]
+            out_gmem[0] = read[0].astype(jnp.float32)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, 16, 64), jnp.bfloat16))
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((16, 64), jnp.bfloat16), threads=1)
+    assert bool(ring_protocol.cp_async_violations(events)) == refused
+
+
 @pytest.mark.parametrize(("rows", "refused"),
                          [((2, 3), False), ((0, 8), False), ((8, 9), True), ((0, 16), True)],
                          ids=["a-copied-row", "the-copied-rows", "the-next-row", "the-slot-whole"])

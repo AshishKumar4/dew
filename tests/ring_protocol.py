@@ -296,39 +296,59 @@ def _slot_extent(ref, treedef, leaves) -> "tuple | frozenset[tuple] | None":
 def _extent(ref, transforms) -> "tuple | frozenset[tuple] | None":
     """The memory an access through `transforms` touches exactly, where one such tuple states it: the ref,
     each leading index that is one value, then at most one contiguous range of the next axis,
-    `(start, stop)`, the axes past it whole (a slot's first rows); nothing where it selects none. None where
-    none states it: a gather, a strided or open slice, or an index past a range, past an axis taken whole
-    within its indexer or past an axis that moved; the alias location (`_located`), which widens a partial
-    slice to its prefix, states more."""
+    `(start, stop)`, the axes past it whole (a slot's first rows); nothing where it selects none. Each
+    indexer's indices are its view's, composed onto the ref's axes (a view of a slot's first rows, then
+    its third row: the slot's row 2). None where none states it: a gather, a strided or open slice, an
+    index past an axis that moved, or the composed axes no such prefix (an index past a range or past an
+    axis whole); the alias location (`_located`), which widens a partial slice to its prefix, states more."""
     transforms = list(transforms or ())
     if any(_selects_none(transform) for transform in transforms):
         return frozenset()
     if any(_gathering(transform) for transform in transforms):
         return None
-    found: list = []
-    closed = False  # a range taken, or an axis moved: every later index whole
+    taken: dict[int, int | tuple[int, int]] = {}  # each indexed axis of the ref: one entry, or a range
+    view: list[int] | None = None  # the ref's axes the view's are, in order
+    rank, moved = 0, False
     for transform in transforms:
         indices = getattr(transform, "indices", None)
         if indices is None:
-            closed = closed or _moves_axes(transform)
+            moved = moved or _moves_axes(transform)
             continue
-        shape, kept = getattr(transform, "shape", None), False
-        for axis, index in enumerate(indices):
-            if index is None:
-                return None
+        shape = getattr(transform, "shape", None)
+        if shape is None:
+            return None
+        if view is None:
+            rank, view = len(shape), list(range(len(shape)))
+        if len(indices) != len(view):
+            # Indices of another rank than the view's (a transform between reshaped it): unmapped.
+            return None
+        kept = []
+        for axis, index, extent in zip(view, indices, shape, strict=True):
             sliced = hasattr(index, "start")
-            if sliced and (index.start is None or getattr(index, "stride", 1) != 1 or shape is None):
+            if index is None or (sliced and (index.start is None or getattr(index, "stride", 1) != 1)):
                 return None
             start = int(np.asarray(index.start if sliced else index))
-            if sliced and start == 0 and index.size == shape[axis]:
-                # Taken whole: kept, the next indexer's first axis where every later one here is whole too.
-                kept = True
+            if sliced and start == 0 and index.size == extent:
+                kept.append(axis)
                 continue
-            if closed or kept:
+            if moved:
                 return None
-            found.append((start, start + index.size) if sliced else start)
-            closed = sliced
-    return (ref.name, *found)
+            offset = taken[axis][0] if isinstance(taken.get(axis), tuple) else 0
+            if sliced:
+                taken[axis] = (offset + start, offset + start + index.size)
+                kept.append(axis)
+            else:
+                taken[axis] = offset + start
+        view = kept
+    found: list = []
+    for axis in range(rank):
+        if axis not in taken:
+            break
+        found.append(taken[axis])
+        if isinstance(taken[axis], tuple):
+            break
+    # An axis indexed past the prefix (past a range, or past one whole): no such tuple states it.
+    return None if len(taken) > len(found) else (ref.name, *found)
 
 
 def _located(ref, transforms) -> "tuple | frozenset[tuple]":
