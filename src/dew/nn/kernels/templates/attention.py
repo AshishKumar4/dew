@@ -283,7 +283,7 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         # The query's document's keys within the window's places run together in document order, since
         # their places never decrease along it, and their first and last key indices bound the span.
         before, after = window_sides(causal, sliding_window)
-        query_places, key_places = _widened(positions)
+        query_places, key_places = widened_places(positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
         start, end = _narrowed(start, end, order, run_lo, run_hi, ordered,
@@ -378,7 +378,7 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     by_places, windowed, positions = narrowings
     if windowed is not None:
         before, after = windowed
-        query_places, key_places = _widened(positions)
+        query_places, key_places = widened_places(positions)
         by_places = [*by_places, (key_places, moved_places(query_places, -before),
                                   moved_places(query_places, after))]
     start, end = _within_runs(runs, start, end, keys, by_places)
@@ -468,7 +468,7 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
     return jax.lax.associative_scan(least, (places, ends), reverse=True, axis=1)[0]
 
 
-def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+def widened_places(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
     """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
     (`moved_places`): a bound past the narrower one's range is still a place the other may hold. A signed
     and an unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside

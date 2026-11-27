@@ -327,6 +327,32 @@ def test_parallax_holds_its_correction_at_a_scale_a_16_bit_gradient_would_round_
     np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
 
 
+def test_parallax_holds_a_correction_whose_scaled_gradient_passes_fp32s_least():
+    """Parallax in fp32 at a logit scale of 2^-120, zero logits, a second query of 1 against second keys of
+    -1 and 1 and values of -2^-40 and 2^-40: its output -2^-40 exactly, where the scale times it, 2^-160,
+    passes fp32's least subnormal."""
+    spans = template.spans(2, 2, 1)
+    zeros = jnp.zeros((1, 2, 1, 8), jnp.float32)
+    second = zeros.at[..., 0].set(1.0)
+    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-1.0, 1.0]))
+    value = jnp.broadcast_to(jnp.asarray([-(2.0**-40), 2.0**-40])[None, :, None, None], (1, 2, 1, 8))
+    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-120)
+    np.testing.assert_array_equal(np.asarray(out), np.full((1, 2, 1, 8), -(2.0**-40), np.float32))
+
+
+def test_a_banded_call_moves_a_narrow_place_past_its_dtypes_range():
+    """A query placed at 127 (int8) over 129 keys, a near band of 1: keys 126, 127 and 128 are the near
+    product's, where the edge 129 saturated at int8's 127 and left 127 and 128 out."""
+    spans = template.spans(1, 129, 1)
+    operand = jnp.zeros((1, 1, KV_HEADS, WIDTH), jnp.bfloat16)
+    keys = jnp.zeros((1, 129, KV_HEADS, WIDTH), jnp.bfloat16)
+    laid = attention_products.selected((operand,) * 2, (keys,) * 2, keys, spans,
+                                       attention_products.Banded((1,)),
+                                       places=jnp.asarray([[127]], jnp.int8))[3]
+    near = np.asarray(template.dense(laid))[0, 0, :129]
+    np.testing.assert_array_equal(np.flatnonzero(near), [126, 127, 128])
+
+
 def test_a_banded_call_keeps_a_querys_place_in_its_own_dtype():
     """A query placed at 2^32 (int64) over two keys, a near band of 0: both keys are the far product's, the
     place's distance from each past int32's range, where an int32 place wrapped to 0 and took key 0 near."""

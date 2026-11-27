@@ -46,6 +46,7 @@ from dew.nn.kernels.templates.attention import (
     kind_of,
     logit_scale,
     moved_places,
+    widened_places,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.hooks import Hook, Side
@@ -177,33 +178,42 @@ def parallax(query: jax.Array, second: jax.Array, key: jax.Array, second_key: ja
 
 def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *, scale: float,
                       natural) -> jax.Array:
-    """`parallax`'s value on the template's kernels: the softmax's output and its dQ along `second / scale`,
-    one forward and one backward of the call the module's docstring lays out (`jax.vjp` of the route). The
-    backward takes its accurate products and D about each query's anchor from its split sums whatever the
-    call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast form's
-    `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in fp16
-    gave a mean of 8192). The call runs in fp32 whatever its operands' dtype, so its dQ (`scale Σ a (t - τ)
-    v`) holds in fp32's range and the scale leaves it there: a 16-bit dQ rounded it away at a small scale
-    (fp16 at 2^-26 gave 0 for -1), and the mainloops round dQ to the query's dtype. Its cost, an fp32
-    call's (the parts' products on a GPU), is the formula's price until one walk forms it natively."""
+    """`parallax`'s value on the template's kernels: the softmax's output and its correction along the
+    second query, one forward and one backward of the call the module's docstring lays out (`jax.vjp` of
+    the route). The backward takes its accurate products and D about each query's anchor from its split sums
+    whatever the call's form: D here is `τ`, the second product's mean, which a rounded output's (the fast
+    form's `rowsum(dO ⊙ O)`) moved by the second keys' rounding, not their spread (keys of 8192 and 8200 in
+    fp16 gave a mean of 8192). The call runs in fp32 at a logit scale of 1, its scale taken into its
+    queries and keys before it (`_scale_split`), so its dQ is the correction itself, `Σ a (t - τ) v`, no
+    scale multiplied in and divided out: at a scale of 2^-120 a correction of 2^-40 was 2^-160 in dQ, past
+    fp32's least, and at a 16-bit dQ smaller scales rounded it away. Its cost, an fp32 call's (the parts'
+    products on a GPU), is the formula's price until one walk forms it natively."""
     width = query.shape[-1]
     wide = jnp.float32
-    laid_query = jnp.concatenate([query, jnp.zeros((*query.shape[:-1], value.shape[-1]), query.dtype)],
-                                 -1).astype(wide)
-    laid_key = jnp.concatenate([key, value], axis=-1).astype(wide)
+    on_query, on_key = _scale_split(scale)
+    laid_query = jnp.concatenate([query.astype(wide) * on_query,
+                                  jnp.zeros((*query.shape[:-1], value.shape[-1]), wide)], -1)
+    laid_key = jnp.concatenate([key.astype(wide) * on_key, value.astype(wide)], axis=-1)
     laid_value = jnp.concatenate([second_key, value], axis=-1).astype(wide)
 
     def attended(laid_query):
-        return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
+        return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=1.0, natural=natural,
                                       accurate=True)
 
     out, pull = jax.vjp(attended, laid_query)
-    cotangent = jnp.concatenate([second.astype(out.dtype),
-                                 jnp.zeros((*out.shape[:-1], value.shape[-1]), out.dtype)], axis=-1)
+    cotangent = jnp.concatenate([second.astype(wide), jnp.zeros((*out.shape[:-1], value.shape[-1]), wide)],
+                                axis=-1)
     (moved,) = pull(cotangent)
     softmax = out[..., second_key.shape[-1]:].astype(wide)
-    along = moved[..., width:].astype(wide) / jnp.asarray(scale, wide)
-    return (softmax - along).astype(query.dtype)
+    return (softmax - moved[..., width:].astype(wide)).astype(query.dtype)
+
+
+def _scale_split(scale: float) -> tuple[float, float]:
+    """A logit scale as its query's factor and its key's, `on_query * on_key == scale` exactly: the query's
+    the power of two nearest the scale's square root, the key's the rest, so neither moves its operands far
+    from their range where the scale is far from 1."""
+    on_query = 2.0 ** round(math.log2(scale) / 2)
+    return on_query, scale / on_query
 
 
 def _parallax_formula(query, second, key, second_key, value, spans: KeySpans, *, scale: float) -> jax.Array:
@@ -261,6 +271,9 @@ def _banded_spans(spans: KeySpans, combine: Banded, places: jax.Array | None) ->
              if places is None else jnp.asarray(places))[..., None]
     if not jnp.issubdtype(place.dtype, jnp.integer):
         raise ValueError(f"a query's place is an integer, not {place.dtype}")
+    # In a dtype that holds the keys' exclusive end too, the window's rule (`widened_places`), so an edge
+    # moved past a narrow place's range still reaches the keys (an int8 place of 127 over 129 keys).
+    place, _ = widened_places((place, jnp.asarray(count, jnp.int32)))
 
     def within(lo, hi):
         # Each run's keys within `[lo, hi)` of the query's place, empty where none.
