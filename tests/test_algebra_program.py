@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from egglog import EGraph
 from reference_error import assert_as_exact, assert_computes_the_oracle, equations
 from test_algebra import cheaper_spliced, count_above, rows, traces_cheaper, two_sums
 
@@ -213,7 +214,8 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
 
     lx, ly, _ = draw(0, length=257)
     region = terms.region(jax.make_jaxpr(together)(x, y, s, lx, ly))
-    graph, _, (short, long) = program.graphed(region)
+    graph = EGraph()
+    _, (short, long) = program.graphed(region, graph)
     assert graph.check_bool(algebra.rules.exact_int8_product(short))
     assert not graph.check_bool(algebra.rules.exact_int8_product(long))
 
@@ -224,7 +226,8 @@ def test_a_transposed_byte_product_lifts_its_scale_only_with_exact_integer_accum
     x_shape, y_shape, s_shape = (jax.ShapeDtypeStruct(a.shape, a.dtype) for a in (x, y, s))
     with jax.sharding.use_abstract_mesh(mesh):
         placed = jax.make_jaxpr(plain)(x_shape, y_shape, s_shape)
-    graph, _, (placed_dot,) = program.graphed(terms.region(placed))
+    graph = EGraph()
+    _, (placed_dot,) = program.graphed(terms.region(placed), graph)
     assert not graph.check_bool(algebra.rules.exact_int8_product(placed_dot))
 
     # Warm the shape-identical windows in both orders. Only the dot enters the local scope.
@@ -309,7 +312,8 @@ def test_a_scale_lifted_past_a_product_is_priced_at_its_shape():
     closed = jax.make_jaxpr(lambda x, y, s: (x * s[:, None]) @ y)(*rows(1, (64, 32), (32, 16), (64,)))
     # Operands of declared magnitudes, so the lift's products stay under the program's reach (`dominated`).
     region = terms.region(closed, {0: 1.0, 1: 1.0, 2: 1.0})
-    graph, _, _ = program.graphed(region)
+    graph = EGraph()
+    program.graphed(region, graph)
     done = program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
     assert done.fired["linear"] > 0
     scale = terms.Term.leaf(i64(2))
@@ -375,7 +379,8 @@ def test_a_factored_product_is_admitted_only_under_the_reach(name):
     held = {}
     for scale in (1.0, largest):
         region = terms.region(closed, {0: 1.0, 1: 1.0, 2: scale})
-        graph, _, (root,) = program.graphed(region)
+        graph = EGraph()
+        _, (root,) = program.graphed(region, graph)
         program.saturate(graph, region, (algebra.rules.RULES["linear"],), algebra.SATURATION)
         factored = factored_of(root, graph) if name == "a row scale out of a product" else factored_of(root)
         held[scale] = graph.check_bool(eq(root).to(factored))
@@ -409,7 +414,8 @@ def test_a_quotient_reads_the_reciprocal_its_program_holds_only_where_its_diviso
     program_of = REUSED[name][0 if floored else 1]
     closed = jax.make_jaxpr(program_of)(*rows(1, (64, 32), (64, 32)))
     region = terms.region(closed, {0: 4.0, 1: 4.0} if bounded else {0: 4.0})
-    graph, _, (quotient, reciprocal) = program.graphed(region)
+    graph = EGraph()
+    _, (quotient, reciprocal) = program.graphed(region, graph)
     program.saturate(graph, region, (algebra.rules.RULES["reuse"],), algebra.SATURATION)
     product = terms.Term.leaf(i64(0)).binary("mul", reciprocal, i64(region.stock["mul"]))
     assert graph.check_bool(eq(quotient).to(product)) == admitted
@@ -449,7 +455,8 @@ def test_two_negations_are_an_identity_in_the_float32_window(dtype, folds):
 
     closed = jax.make_jaxpr(twice)(jax.ShapeDtypeStruct((8,), dtype))
     region = terms.region(closed)
-    graph, _, (result,) = program.graphed(region)
+    graph = EGraph()
+    _, (result,) = program.graphed(region, graph)
     program.saturate(graph, region, (algebra.rules.RULES["identities"],), algebra.SATURATION)
     assert graph.check_bool(eq(result).to(terms.Term.leaf(i64(0)))) is folds
 
@@ -674,10 +681,7 @@ def test_a_clamp_is_priced_as_a_maximum_and_a_minimum_of_its_operand_read_once()
     own, its output read again and none of its arithmetic counted (row 7286)."""
     def priced(fn):
         region = terms.region(jax.make_jaxpr(fn)(jnp.ones((64, 128), jnp.float32)))
-        graph, bundle, _ = program.graphed(region)
-        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
-        return price.work
+        return written_price(region, cost.fused(cost.target("sm90"))).work
 
     plain = priced(jnp.tanh)
     clamped = priced(lambda x: jax.lax.clamp(np.float32(-0.5), jnp.tanh(x), np.float32(0.5)))
@@ -1530,6 +1534,42 @@ exponential alone, registers a rule set (one that rewrites an exponential to its
 them again."""
 
 
+def written_price(region: terms.Region, schedule) -> cost.Seconds:
+    """`region`'s price as written under `schedule` (`cost.model`): the greedy extraction of its e-graph, no
+    rule run on it."""
+    graph = EGraph()
+    bundle, _ = program.graphed(region, graph)
+    return graph.extract(bundle, include_cost=True, extractor="greedy-dag",
+                         cost_model=cost.model(region, schedule))[1]
+
+
+def test_a_fresh_graph_holds_nothing_another_block_added():
+    """A saturation's e-graph (`program.fresh_graph`) holds no term an earlier block added, whether that block
+    returned or raised with a level of its own still pushed, and a block opened within another holds none of
+    the outer one's, which keeps its own."""
+    from egglog import String, i64
+
+    from dew.algebra import rules
+
+    marker = terms.Term.leaf(i64(7)).unary(String("neg"), i64(0))
+    with program.fresh_graph(rules.FACTS) as graph:
+        graph.register(marker)
+        assert graph.check_bool(marker)
+    with program.fresh_graph(rules.FACTS) as graph:
+        assert not graph.check_bool(marker)
+    with pytest.raises(RuntimeError), program.fresh_graph(rules.FACTS) as graph:
+        graph.register(marker)
+        graph.push()
+        raise RuntimeError("a block that raised")
+    with program.fresh_graph(rules.FACTS) as graph:
+        assert not graph.check_bool(marker)
+    with program.fresh_graph(rules.FACTS) as outer:
+        outer.register(marker)
+        with program.fresh_graph(rules.FACTS) as inner:
+            assert inner is not outer and not inner.check_bool(marker)
+        assert outer.check_bool(marker)
+
+
 def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_after_it():
     """A window's and a body's rewrite are kept by everything their derivation reads, the rule sets the
     registry admits among them: a set registered after a program was rewritten (a user extending the
@@ -1603,10 +1643,7 @@ def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
 
         a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
         region = terms.region(jax.make_jaxpr(contracted)(a, b))
-        graph, bundle, _ = program.graphed(region)
-        _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                                 cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
-        return price.work
+        return written_price(region, cost.fused(cost.target("sm90"))).work
 
     narrow, wide = priced(jnp.bfloat16), priced(jnp.float32)
     assert (wide.device_bytes, wide.shared_bytes) == (2 * 64 * 64 * 4, 2 * 64 * 64 * 4)
@@ -1622,9 +1659,7 @@ def test_a_functions_work_is_the_units_the_kernels_counter_names(function, expon
     erf and an expm1 on the CUDA cores (XLA's polynomial; CUDA's expm1f, FMAs alone), where the algebra's
     own table charged all four as exponentials (base review 05bd9f77b F2)."""
     region = terms.region(jax.make_jaxpr(function)(jnp.ones((64, 64), jnp.float32)))
-    graph, bundle, _ = program.graphed(region)
-    _, price = graph.extract(bundle, include_cost=True, extractor="greedy-dag",
-                             cost_model=cost.model(region, cost.fused(cost.target("sm90"))))
+    price = written_price(region, cost.fused(cost.target("sm90")))
     assert price.work.exponentials == exponentials, price.work
 
 

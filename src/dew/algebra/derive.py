@@ -896,10 +896,22 @@ def _derived_afresh(declaration: Reduction, names: tuple[str, ...], walked_axes:
                     region: terms.Region, admitted: tuple[rules.Rules, ...], saturation: program.Saturation,
                     began: float) -> _Forms:
     """The forms of `region`, `declaration` traced (`closed`) at one tile, derived by saturation and
-    extraction (`_derived`'s, where no store holds them)."""
-    graph = EGraph()
-    _register(graph, region, closed, names, walked_axes)
+    extraction (`_derived`'s, where no store holds them), on a fresh e-graph whose rule sets, the ones its
+    saturations run, are declared once a thread (`program.fresh_graph`)."""
     walking = WALKING if declaration.rescale is None else WALKING_SCALED
+    decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
+    with program.fresh_graph(walking, PLAIN, rules.FACTS, SHAPES, FLOORED, decoupled.ruleset,
+                             *(sets.ruleset for sets in admitted)) as graph:
+        return _derived_on(graph, declaration, names, walked_axes, closed, region, admitted, saturation,
+                           began, walking, decoupled)
+
+
+def _derived_on(graph: EGraph, declaration: Reduction, names: tuple[str, ...],
+                walked_axes: Mapping[str, int], closed, region: terms.Region,
+                admitted: tuple[rules.Rules, ...], saturation: program.Saturation, began: float,
+                walking: Ruleset, decoupled: rules.Rules) -> _Forms:
+    """`_derived_afresh`'s forms, derived on `graph`."""
+    _register(graph, region, closed, names, walked_axes)
     graph.run(walking.saturate())
     _register_local_opaques(graph, region, walking)
     graph.run(PLAIN.saturate())
@@ -930,7 +942,6 @@ def _derived_afresh(declaration: Reduction, names: tuple[str, ...], walked_axes:
     _, before = extract.cheapest(graph, declared, cost.model(region, schedule))
     floors = _floors(graph, region, reductions)
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate(), FLOORED.saturate())
-    decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
     _decoupled_through(graph, region, facts, decoupled)
     saturated = program.saturate(graph, region, (*admitted, decoupled),
                                  saturation, facts)
