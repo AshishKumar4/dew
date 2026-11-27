@@ -215,9 +215,9 @@ def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]
 def numerics_differs(saved: JSON | None, now: Mapping[str, JSON] | None = None) -> list[str]:
     """Where a checkpoint's training record `saved` states numerics other than those its resume computes
     under where it is read (`now`, else `numerics_record`'s): their forms, recipe and outputs, and the
-    precision its products computed at (`products`), whatever precision it declared (row 13708). A record a Dew wrote
-    before it stated `products` states none: its declared precision (`matmul`) is held to the resume's,
-    JAX's own default named either way ("default", `DotAlgorithmPreset.DEFAULT`) as one."""
+    precision its products computed at (`products`), whatever precision it declared (row 13708). A record a
+    Dew wrote before it stated `products` states none: its declared precision (`matmul`) is held to the
+    resume's, JAX's own default named either way ("default", `DotAlgorithmPreset.DEFAULT`) as one."""
     from dew.nn.kernels import generation
     from dew.training.phase_passes import numerics_record
 

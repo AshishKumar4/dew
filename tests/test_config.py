@@ -493,7 +493,7 @@ def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_it
     with jax.default_matmul_precision("highest"):
         run(2).train(Regression(), dataset(val=val_batches()), name="weights")
     held = Checkpoints(str(tmp_path / "weights"))
-    assert held.best() is not None and held.latest() is None
+    assert held.best is not None and held.latest is None
     record = (tmp_path / "weights" / RUN_FILE).read_bytes()
     with jax.default_matmul_precision("high"), pytest.raises(ValueError):
         run(3).train(Regression(), dataset(val=val_batches()), name="weights")
