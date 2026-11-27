@@ -336,8 +336,8 @@ fitted to them, and a rule set ships only with measured receipts.
   less; where a stage refuses or does not pay, the product is weighed with fewer (without its prologue,
   without its epilogue, alone), the stage left as the program wrote it, so a refused consumer leaves no
   product a plain dot (row 8996); so a plain JAX program compiled through Dew runs the templates its products
-  match (row 3450). A search that weighs a region's variants itself (row 9038's whole-layer search) reads them
-  through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
+  match (row 3450). A search that weighs a region's variants itself (row 9038's whole-layer search) reads them,
+  over one `fusion.Index` a body, through `fusion.regions` (each product region as the pass finds it, before `fused_program` sets aside those an
   attention or recurrence region holds), `fusion.fewer` (every region of fewer of its stages, the region itself
   not among them, in the order the pass weighs them, one walk with it), `fusion.analyzed` (the analysis the pass
   weighs a region by) and `fusion.product_form` (a product's form). A

@@ -1019,17 +1019,18 @@ def test_a_regions_variants_are_each_weighed_alone():
         jax.ShapeDtypeStruct((512, 256), jnp.bfloat16), jax.ShapeDtypeStruct((256, 256), jnp.bfloat16))
     program = jax.make_jaxpr(scaled_projection_plus)(*shapes).jaxpr
     (product,) = (place for place, equation in enumerate(program.eqns) if fusion.product_form(equation))
-    (region,) = fusion.regions(program)
+    index = fusion.Index(program)
+    (region,) = fusion.regions(index)
     assert product in region.places and region.prologue and max(region.places) > product
-    variants = fusion.fewer(program, region)
+    variants = fusion.fewer(index, region)
     # Breadth first, as `fused_program` weighs them: each stage dropped alone, then both.
     assert [(bool(found.prologue), max(found.places) > product) for found in variants] == [
         (False, True), (True, False), (False, False)]
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         for found in (region, *variants):
-            weighed = fusion.analyzed(program, found)
+            weighed = fusion.analyzed(index, found)
             assert product in found.places and weighed.launch is not None
             assert (weighed.prologue is not None) == bool(found.prologue), found
             assert (weighed.epilogue is not None) == (max(found.places) > product), found
-        epilogue_alone = fusion.analyzed(program, variants[0])
+        epilogue_alone = fusion.analyzed(index, variants[0])
     assert epilogue_alone.fused_seconds > 0 and epilogue_alone.unfused_seconds > 0, epilogue_alone
