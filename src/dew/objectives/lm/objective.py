@@ -170,9 +170,11 @@ class IndexerTraining:
       selected keys alone trains the indexer, whose inputs are detached so that
       neither loss reaches the other's weights.
 
-    `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`). The
-    reference sets the indexer's pace with its learning rate: 1e-3 for the 1000
-    warm-up steps and 7.3e-6 for the sparse stage.
+    `weight` scales the KL term (MaxText's `indexer_loss_scaling_factor`), the KL
+    per counted query, which the loss adds beside the cross entropy per counted
+    target, each over its own count (row 13705). The reference sets the
+    indexer's pace with its learning rate: 1e-3 for the 1000 warm-up steps and
+    7.3e-6 for the sparse stage.
 
     MSA's index branch (block-selected attention, `selection="msa"`, arXiv
     2606.13392) trains in the sparse phase alone, by the same KL over the
@@ -477,9 +479,8 @@ the level moved (`CARRIED`)."""
 class _Scored(NamedTuple):
     """One scoring of a batch (`LMObjective._scored_loss`): the loss's statistics and reports, the
     token scores they came from, and each token's share of the prediction's total, `[B, seq_len]`,
-    before its row's weight: its counted cross entropy and z-loss, the prediction depths' terms at
-    the position that predicts them and the indexer's KL at its query, each weighted as the total
-    weighs it."""
+    before its row's weight: its counted cross entropy and z-loss and the prediction depths' terms at
+    the position that predicts them, each weighted as the total weighs it."""
 
     statistics: Ratio | RoutedStatistics
     aux: Aux[Variables]
@@ -1750,10 +1751,10 @@ class LMObjective(TokenScorer):
                      step: Step) -> tuple[Ratio | RoutedStatistics, jax.Array] | None:
         """The loss's statistics, scored as `loss` scores them (its mode, its draws, its configured
         terms), with each token's share of the prediction's total, `[B, seq_len]`: its counted cross
-        entropy and z-loss, the prediction depths' terms at the position that predicts them, and the
-        indexer's KL at its query, each weighted as the total weighs it. The router terms of a routed
-        decoder are statistics of their own. None in an indexer's warm-up, whose KL is no token's
-        prediction: its whole statistics credit every unit."""
+        entropy and z-loss and the prediction depths' terms at the position that predicts them, each
+        weighted as the total weighs it. The router terms of a routed decoder and an indexer's KL are
+        statistics of their own mass (`RoutedStatistics`). None in an indexer's warm-up, whose KL is no
+        token's prediction: its whole statistics credit every unit."""
         if self._warmup:
             return None
         scored = self._scored_loss(variables, batch, step, train=step.training)
@@ -1874,19 +1875,16 @@ class LMObjective(TokenScorer):
                 shares(depth_losses, depth_weights) for depth_losses, depth_weights, _ in depths)
             reported["mtp_ce"] = Ratio(mtp_total, mass)
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
+        indexed = None
         if self.indexer is not None:
-            # The KL shares the cross entropy's denominator, as the depths
-            # do, so one Ratio carries the step: the queries counted differ
-            # from the targets only by the documents' last tokens. The
-            # report is the KL per counted query, the paper's quantity.
+            # The KL per counted query, the paper's quantity, which the loss weighs by its own count: the
+            # queries a step reads, every real token's, not the targets its role counts (row 13705: one
+            # assistant target among a hundred queries weighed the KL a hundredfold). A term of its own
+            # mass, beside the prediction (`RoutedStatistics.auxiliary`), no token's share of it (`units`).
             assert kls is not None, "an indexer's scores hold its KL"
             total, queries = self._indexer_term(kls, prepared, batch)
-            counted = _indexer_kls(kls)
-            kl_queries = self._query_weights(prepared, width)
-            units = units + self.indexer.weight / len(counted) * sum(
-                shares(kl, kl_queries[:, :kl.shape[1]]) for kl in counted)
             reported["indexer_kl"] = Ratio(total, queries)
-            prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
+            indexed = Ratio(self.indexer.weight * total, queries)
         statistics: Ratio | RoutedStatistics = prediction
         effects = None
         if balance is not None:
@@ -1895,6 +1893,9 @@ class LMObjective(TokenScorer):
             statistics, effects, metrics = balance.compose(
                 params, prediction, routing or {}, batch, queries, prepared.token_fields)
             reported.update(metrics)
+        if indexed is not None:
+            statistics = (RoutedStatistics(statistics, auxiliary=(indexed,)) if isinstance(statistics, Ratio)
+                          else dataclasses.replace(statistics, auxiliary=(*statistics.auxiliary, indexed)))
         if scores.moved is not None:
             # What a carried level moved (a run that carries it, `Adapted.moved`), beside the router counts,
             # which an update sums and carries on.

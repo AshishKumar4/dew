@@ -328,12 +328,15 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                    for weight, high, low in zip(weights, jax.tree.leaves(above), jax.tree.leaves(below),
                                                 strict=True)
                    if jnp.issubdtype(jnp.result_type(high), jnp.inexact)]
-        whole = sum(changes[1:], changes[0])
+        # The other statistics' change summed by itself, never the whole's less the first's, which a first
+        # change many times larger would round away (an indexer's KL beside a cross entropy, row 13705).
+        rest = sum(changes[1:], jnp.zeros_like(changes[0]))
+        whole = changes[0] + rest
         if shared_above is None or shared_below is None:
             return whole, None, whole
         first = jnp.asarray(weights[0], shared_above.dtype)
         units = first * (shared_above - shared_below)
-        return whole, units, whole - changes[0]
+        return whole, units, rest
 
     def _sited(self, estimating, variables, batch, step, sites: list[Site], cotangent,
                flat: dict[Path, jax.Array]) -> dict[Path, jax.Array]:

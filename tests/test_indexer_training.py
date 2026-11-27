@@ -13,6 +13,7 @@ and the main model's apart, and a packed batch scores its documents as it
 would alone. Everything runs at fp32 on CPU.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -476,10 +477,10 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
 
 def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tmp_path, monkeypatch):
     """An MSA decoder refuses generation (`generation_refusal`), so its objective's preview cannot sample
-    (`preview_refusal`): a fit asked to preview it is refused before it starts, and a configured run that
-    would preview by default at its validation, a tracker's, validates without sampling, its run record
-    saying why (`RunConfig.skipped_preview`); the same run of a model that samples records no skip (train
-    1345's review F6)."""
+    (`preview_refusal`): a fit asked to preview it at a validation of batches is refused before it starts, one
+    with no such validation trains, and a configured run that would preview by default at its validation, a
+    tracker's, validates without sampling, its run record saying why (`RunConfig.skipped_preview`); the same
+    run of a model that samples records no skip (train 1345's review F6)."""
     import wandb
     from test_mixers import tiny
     from test_publish import TrackedRun
@@ -515,6 +516,8 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tm
                     validation=validation())
     assert not any(isinstance(artifact, FitStarted) for _, artifact in tracker.artifacts)
     assert not tracker.scalars
+    # With no split of batches to validate, where a preview would sample, the same fit trains.
+    assert int(trainer.fit(data(), steps=1, preview=True).step) == 1
 
     def recorded(model, name: str, *, validated: str) -> dict:
         """The summary a tracked run records, validating its split by `validation=` ("given"), as its data's
@@ -539,6 +542,104 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tm
     assert "preview" not in recorded(refusing, "refusing-unvalidated", validated="none")
     sampling = tiny(dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
     assert "preview" not in recorded(sampling, "sampling", validated="given")
+
+
+def test_an_msa_index_branch_trains_by_its_kl_per_query_whatever_targets_the_role_counts():
+    """MSA's index branch trains by its KL per counted query (`IndexerTraining.weight` times that ratio),
+    a term of its own mass beside the cross entropy per counted target: a role that counts one target of
+    each row moves the branch exactly as one that counts every target does, the same queries read
+    (row 13705: the KL summed into the cross entropy's numerator was weighed by the targets counted, a
+    hundredfold for one target among a hundred queries)."""
+    from test_mixers import tiny
+
+    from dew.data.chat import ROLES_KEY, Role
+    from dew.registry import mixers
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    objective = LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=1.0),
+                            loss_role=Role.ASSISTANT)
+    params = nn.unbox(objective.init(jax.random.key(0)))
+    tokens = token_batch()["text"]
+    every = np.full(tokens.shape, int(Role.ASSISTANT), np.int32)
+    one = np.full(tokens.shape, int(Role.USER), np.int32)
+    one[:, -1] = int(Role.ASSISTANT)
+
+    def branch(roles) -> tuple[list[np.ndarray], float]:
+        batch = {"text": tokens, ROLES_KEY: jnp.asarray(roles)}
+        (_, aux), grads = jax.value_and_grad(lambda p: objective.scalar_loss(p, batch, step_at()),
+                                             has_aux=True)(params)
+        found = [np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(grads["params"])
+                 if "msa_indexer" in jax.tree_util.keystr(path)]
+        return found, float(aux.metrics["indexer_kl"])
+
+    (all_targets, kl), (one_target, kl_again) = branch(every), branch(one)
+    assert kl == kl_again and any(leaf.any() for leaf in all_targets)
+    for left, right in zip(all_targets, one_target, strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
+def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
+    """A step split into two parts of unequal query counts (its rows alternate full and padded, and a split
+    takes alternate rows: `dew.training.distributed.microbatch`, so one part holds the padded rows) pools the
+    indexer's KL as one term of its own mass: each part's KL total and query count beside its prediction's,
+    which the step sums leaf by leaf (`dew.training.transaction`), so it updates every parameter, the index
+    branch's among them, as the unsplit step does over the same rows, held to the whole update computed in
+    float64 by the same model in float64 by check 1 (row 13705: an average of the parts' means weighs the
+    padded part's queries up)."""
+    from rl_split_support import prepare_split_whole_steps
+
+    from dew.objectives.routing import RoutedStatistics
+
+    objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
+    rate = 0.5
+
+    def packed(seed: int) -> list:
+        tokens = np.random.default_rng([seed, 13705]).integers(1, VOCAB, size=(4, SEQ + 1))
+        return [packed_row(row if index % 2 == 0 else row[:6]) for index, row in enumerate(tokens)]
+
+    def rows(seed: int) -> dict:
+        return packed_batch(packed(seed))
+
+    template = rows(0)
+    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
+        objective, rate, jax.random.key(3), template, template)
+
+    def draw(seed: int):
+        params = nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"]
+        batch = rows(seed)
+        def stepped(step, start):
+            held = dataclasses.replace(start, variables={**start.variables, "params": params})
+            return step(jax.tree.map(jnp.copy, held), batch)[0].variables["params"]
+
+        moved = [stepped(*pair) for pair in ((split_step, split_start), (whole_step, whole_start))]
+        return params, batch, *moved
+
+    wide = LMObjective(deepseek_stack(4, dtype="float64"), SEQ, indexer=IndexerTraining("sparse"))
+
+    def whole_update(params, batch, _split, _whole):
+        step = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0), None,
+                    committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                    example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
+        grads = jax.grad(lambda p: wide.scalar_loss({**whole_start.variables, "params": p}, batch,
+                                                    step)[0])(params)
+        return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
+
+    params, _, split_moved, _ = draw(0)
+    # The parts' query masses as the split takes them, alternate rows: unequal.
+    def queries(start: int) -> float:
+        stats = objective.loss({"params": params}, packed_batch(packed(0)[start::2]), step_at())[0]
+        assert isinstance(stats, RoutedStatistics)
+        return float(stats.auxiliary[0].mass)
+
+    assert queries(0) > queries(1) > 0
+    # The index branch moves, its KL's gradient reaching it through the split step.
+    assert any(np.any(np.asarray(after) != np.asarray(before))
+               for (path, after), before in zip(jax.tree_util.tree_leaves_with_path(split_moved),
+                                                jax.tree.leaves(params), strict=True)
+               if INDEXER in jax.tree_util.keystr(path))
+    assert_as_exact(lambda _p, _b, split, _w: split, lambda _p, _b, _s, whole: whole, draw,
+                    "an indexer's split update", seeds=8, truth_fn=whole_update)
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
