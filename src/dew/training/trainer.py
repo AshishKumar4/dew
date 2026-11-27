@@ -183,7 +183,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, computation_differs, resumed_step, run_data
+from dew.training.startup import Startup, refuse_other_computation, resumed_step, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -913,11 +913,7 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints._rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        differs = computation_differs(self, checkpoints, resume)
-        if differs:
-            raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
-                             f"computation ({', '.join(differs)}); resume it with the objective, its "
-                             "settings and model it recorded, or train in another directory")
+        refuse_other_computation(self, checkpoints, resume)
         # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
         wrote = checkpoints.environment(resume)
         if wrote is not None:

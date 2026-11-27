@@ -925,12 +925,15 @@ class RunConfig:
             raise ValueError(f"the run's model names {self.model.name}, and the source this "
                              f"{type(self).__name__} starts from decides its architecture; name none")
 
-    def check_resume(self, saved: Mapping[str, object]) -> None:
+    def check_resume(self, saved: Mapping[str, object], *, numerics_stated: bool = False) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different
         things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
         keeps every shape, so it would otherwise continue the old weights under new semantics. The
         saved fields are read back as this class reads them (`from_dict`), so a field the record
-        predates takes its default, and one it left to its build unresolved takes this build's."""
+        predates takes its default, and one it left to its build unresolved takes this build's. Its
+        `trainer.precision` is held to this one's where the step it resumes states no numerics of its
+        own (`numerics_stated`), which the trainer holds to what they computed instead
+        (`dew.training.startup.numerics_differs`, row 13708)."""
         recorded = self._saved_as(saved)
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
@@ -953,7 +956,7 @@ class RunConfig:
             changed.remove("data_plan_version")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
-        if recorded.trainer.precision != self.trainer.precision:
+        if not numerics_stated and recorded.trainer.precision != self.trainer.precision:
             changed.append("trainer.precision")
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
@@ -1665,12 +1668,27 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
-            from dew.training.startup import resumed_step
+            from dew.training.distributed import under_numerics
+            from dew.training.startup import refuse_other_computation, resumed_step
 
-            if resumed_step(built, resume) is not None and (
-                    record := self._saved_record(checkpoints.directory, checkpoints)) is not None:
-                self.check_resume(record)
+            # Its checkpoint chosen, and a weights-only directory's guard taken (`resumed_step`), under the
+            # numerics its steps trace under, as `fit` takes them.
+            with self.traced(), under_numerics(built.numerics):
+                step = resumed_step(built, resume)
+            if step is None:
+                return
+            training = checkpoints.training(step)
+            record = self._saved_record(checkpoints.directory, checkpoints)
+            if record is not None:
+                self.check_resume(record, numerics_stated=isinstance(training, dict)
+                                  and isinstance(training.get("numerics"), dict))
                 resumed["record"] = record
+            # The trainer's admission of its numerics, under the numerics its steps trace under (the run's,
+            # then its trainer's own), before the record is replaced: a refusal leaves the run's record as it
+            # was (row 13708).
+            if training is not None:
+                with self.traced():
+                    refuse_other_computation(built, checkpoints, step, numerics_of=training)
 
         def check_data() -> None:
             from dew.training.startup import resume_admitted

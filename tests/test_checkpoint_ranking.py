@@ -1196,11 +1196,12 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
 
 def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records_for_inference(tmp_path):
     """A trainer built directly over a directory whose run traced its programs under other numerics than
-    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its outputs
-    in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
-    tree and no loss scale, refuses to resume, an
-    objective that records nothing for inference (no task) among them, as the run's training record holds
-    them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537)."""
+    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "high" not "highest", its accurate
+    forms, its outputs in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other
+    precision), which change no tree and no loss scale, refuses to resume, an objective that records
+    nothing for inference (no task) among them, as the run's training record holds them
+    (`PhasePasses.training_record`); the numerics that trained it resume (row 13537), its products'
+    precision as they computed it, declared or JAX's (row 13708)."""
     import dataclasses
 
     from affine_run import Regression, dataset
@@ -1226,7 +1227,7 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
     assert Stated().inference_record() is None
     trained = Numerics(full, matmul="highest")
     trainer(trained).fit(dataset(), steps=1)
-    for other in (Numerics(full, matmul="default"),
+    for other in (Numerics(full, matmul="high"), Numerics(full, matmul="highest", forms="accurate"),
                   Numerics(dataclasses.replace(full, output="bfloat16"), matmul="highest"), None):
         with pytest.raises(ValueError):
             trainer(other).fit(dataset(), steps=2)
@@ -1237,9 +1238,43 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
         trainer(ambient, "ambient").fit(dataset(), steps=1)
     with pytest.raises(ValueError), jax.default_matmul_precision("default"):
         trainer(ambient, "ambient").fit(dataset(), steps=2)
-    # Under another spelling of the same precision ('float32' is 'highest'), it resumes.
+    # Under another spelling of the same precision ('float32' is 'highest'), it resumes, and so does a resume
+    # that declares the precision its products computed at, which JAX's own setting gave them (row 13708).
     with jax.default_matmul_precision("float32"):
         assert int(trainer(ambient, "ambient").fit(dataset(), steps=2).step) == 2
+    assert int(trainer(Numerics(full, matmul="highest"), "ambient").fit(dataset(), steps=3).step) == 3
+    # A dot algorithm preset of JAX's default leaves JAX's own precision as "default" does: what its
+    # products computed at is JAX's then, refused where that moved.
+    preset = Numerics(full, matmul=jax.lax.DotAlgorithmPreset.DEFAULT)
+    with jax.default_matmul_precision("highest"):
+        trainer(preset, "preset").fit(dataset(), steps=1)
+    with pytest.raises(ValueError), jax.default_matmul_precision("high"):
+        trainer(preset, "preset").fit(dataset(), steps=2)
+    with jax.default_matmul_precision("highest"):
+        assert int(trainer(preset, "preset").fit(dataset(), steps=2).step) == 2
+
+
+def test_a_step_an_earlier_dew_wrote_is_held_to_its_declared_precision():
+    """A checkpoint's training record a Dew wrote before it stated the precision its products computed at
+    (`products`) is held to the precision it declared (`matmul`), JAX's own default spelled either way
+    ("default", `DotAlgorithmPreset.DEFAULT`) as one; one stating `products` is held to those, whatever it
+    declared (row 13708)."""
+    from dew.nn.precision import DTYPE_PRESETS, Numerics
+    from dew.training.distributed import under_numerics
+    from dew.training.phase_passes import numerics_record
+    from dew.training.startup import numerics_differs
+
+    def written(matmul: str) -> dict:
+        return {"numerics": {**numerics_record()["numerics"], "matmul": matmul}}
+
+    full = DTYPE_PRESETS["32-true"]
+    with under_numerics(Numerics(full, matmul="default")):
+        assert numerics_differs(written("default")) == []
+        assert numerics_differs(written("DEFAULT")) == []
+        assert numerics_differs(written("highest")) == ["training.numerics.matmul"]
+    with under_numerics(Numerics(full, matmul="highest")):
+        assert numerics_differs(written("float32")) == []
+        assert numerics_differs({**written("default"), "products": numerics_record()["products"]}) == []
 
 
 def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_its_model_is(tmp_path):

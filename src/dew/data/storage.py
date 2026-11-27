@@ -660,9 +660,13 @@ class Store:
         if not isinstance(hub, HfFileSystem) or pinned_by_url(fs, path):
             return self
         # At the Hub, its transport chain kept in front (`blockcache::hf://...@main/...` is read at the commit
-        # through the same cache): a chain's last link is the store's own URL (row 13554).
-        chain, _, _ = self.url.rpartition("::")
-        return replace(self, url=(chain + "::" if chain else "") + "hf://" + _hub_commit(hub, path)[1])
+        # through the same cache): a chain's last link is the store's own URL (row 13554), its scheme the
+        # Hub filesystem it names, a storage profile's with its credential among them (`privatehub://`,
+        # `_profile`; row 13709).
+        chain, _, last = self.url.rpartition("::")
+        # Its scheme as it is written, the Hub's own where its storage options name the filesystem.
+        scheme = last.split("://", 1)[0] if "://" in last else "hf"
+        return replace(self, url=f"{chain}::" * bool(chain) + f"{scheme}://" + _hub_commit(hub, path)[1])
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
