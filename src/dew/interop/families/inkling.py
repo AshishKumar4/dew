@@ -425,7 +425,7 @@ def _dynamic_taps(record: Mapping[str, object]) -> int | None:
                  if isinstance(value, Mapping) and (taps := _dynamic_taps(value)) is not None), None)
 
 
-_NAMES = MappingProxyType({
+_STACK_NAMES = MappingProxyType({
     'output_query': 'model.llm.attn_res.output_query',
     'output': 'model.llm.output_query',
     'attn_queries': 'model.llm.attn_res.attn_queries.{index}',
@@ -449,16 +449,16 @@ _FIELDS = MappingProxyType({
              'query'),
     'stack': ('queries', 'kv_queries'),
 })
-"""Each field of `_NAMES`' templates: a number, or the words it takes."""
+"""Each field of `_STACK_NAMES`' templates: a number, or the words it takes."""
 
 
 def _named(name: str, **fields: str | int) -> str:
-    """The tensor name `_NAMES[name]` spells with `fields`, each one `_FIELDS` declares."""
+    """The tensor name `_STACK_NAMES[name]` spells with `fields`, each one `_FIELDS` declares."""
     for field, value in fields.items():
         domain = _FIELDS[field]
         if not (str(value).isdigit() if isinstance(domain, str) else value in domain):
             raise ValueError(f"{field}={value!r} is no {name} field: {domain}")
-    return _NAMES[name].format(**fields)
+    return _STACK_NAMES[name].format(**fields)
 
 
 def _pattern(template: str) -> str:
@@ -562,10 +562,11 @@ def _unstored(config: Mapping[str, object]) -> dict[str, np.ndarray]:
     return {_named('query', layer=0, site=site): np.zeros((1, width), np.float32) for site in _sites(first)}
 
 
-_RESERVED = re.compile('|'.join(_pattern(template) for name, template in _NAMES.items() if name != 'taps'))
+_RESERVED = re.compile('|'.join(_pattern(template) for name, template in _STACK_NAMES.items()
+                               if name != 'taps'))
 """The names only `_stacks` and their parts, or `_unstored`, take, whatever the decoder's record, read off
-their one spelling (`_NAMES`): all but a static convolution's taps, which the release stores as they are
-where its convolution is not dynamic."""
+their one spelling (`_STACK_NAMES`): all but a static convolution's taps, which the release stores as they
+are where its convolution is not dynamic."""
 
 _RESTACKED = Restacked(_stacks, _unstored, _RESERVED)
 """Inkling 2's release as `_ROUTES` read it and back, one declaration both ways."""
