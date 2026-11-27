@@ -2273,7 +2273,10 @@ class Trainer(Generic[Loss, Effects]):
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
-        if preview and self.tracker is not None and (refusal := self.objective.preview_refusal()) is not None:
+        # A preview samples where a validation of batches runs (`Evaluation.run`), refused where it would.
+        previewing = preview and self.tracker is not None and any(
+            not episodic(suite.data) for suite in suites.values())
+        if previewing and (refusal := self.objective.preview_refusal()) is not None:
             raise ValueError(f"preview=True samples the model, which refuses generation: {refusal}")
         for name, suite in suites.items():
             if loss and not episodic(suite.data) and all(metric.name != 'loss' for metric in suite.metrics):

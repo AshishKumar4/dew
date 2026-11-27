@@ -476,10 +476,10 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
 
 def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tmp_path, monkeypatch):
     """An MSA decoder refuses generation (`generation_refusal`), so its objective's preview cannot sample
-    (`preview_refusal`): a fit asked to preview it is refused before it starts, and a configured run that
-    would preview by default at its validation, a tracker's, validates without sampling, its run record
-    saying why (`RunConfig.skipped_preview`); the same run of a model that samples records no skip (train
-    1345's review F6)."""
+    (`preview_refusal`): a fit asked to preview it at a validation of batches is refused before it starts, one
+    with no such validation trains, and a configured run that would preview by default at its validation, a
+    tracker's, validates without sampling, its run record saying why (`RunConfig.skipped_preview`); the same
+    run of a model that samples records no skip (train 1345's review F6)."""
     import wandb
     from test_mixers import tiny
     from test_publish import TrackedRun
@@ -515,6 +515,8 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tm
                     validation=validation())
     assert not any(isinstance(artifact, FitStarted) for _, artifact in tracker.artifacts)
     assert not tracker.scalars
+    # With no split of batches to validate, where a preview would sample, the same fit trains.
+    assert int(trainer.fit(data(), steps=1, preview=True).step) == 1
 
     def recorded(model, name: str, *, validated: str) -> dict:
         """The summary a tracked run records, validating its split by `validation=` ("given"), as its data's
