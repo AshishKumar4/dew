@@ -25,7 +25,14 @@ from dew.nn.dense import Dense
 from ..activations import gated_product, silu
 from ..conv import Conv
 from ..norms import rms_normalized
-from ..precision import at_least_fp32, broadcast_summed, compensated_sum, float32_dot_general, float32_einsum
+from ..precision import (
+    at_least_fp32,
+    broadcast_summed,
+    compensated_sum,
+    float32_dot_general,
+    float32_einsum,
+    sums_in_float64,
+)
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
 from .api import LatentNormalization, ModuleAutoEncoder
 
@@ -122,9 +129,18 @@ def linear_attention(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.
     positions left the queries', keys' and values' gradients 1.5-2x Diffusers' error from float64 at 96 to
     16384 positions, as did 4 groups at 4096 and either sum alone grouped (check 1, row 13524). Each sum
     stages its groups' `[heads, width + 1, width]` products: past 4096 positions about an eighth of the
-    queries' size at a 32-wide head, below it sixteen products."""
+    queries' size at a 32-wide head, below it sixteen products. Where a CPU sums float32 products in
+    float64 and rounds once (`precision.sums_in_float64`), each sum is that one sum: a group's partial
+    rounded first would only coarsen it, or overflow where positions cancel past float32's range."""
     batch, positions, heads, width = key.shape
     value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
+    if sums_in_float64(value, key):
+        # Each sum one float64 sum rounded once already (Dew's wide CPU arithmetic, `precision.accumulated`),
+        # which a group's partial rounded to float32 first would only coarsen, or overflow where the
+        # positions cancel past float32's range (train 1387's review).
+        scores = float32_einsum("bngd,bnge->bgde", value, key)
+        attended = float32_einsum("bgde,bnge->bngd", scores, query)
+        return attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)
     groups = max(_FEWEST_GROUPS, -(-positions // _GROUP_POSITIONS))
     padding = ((0, 0), (0, -positions % groups), (0, 0), (0, 0))
 

@@ -232,7 +232,7 @@ def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers(monkey
     import torch
     from arm_forms import as_given
     from diffusers.models.attention_processor import SanaMultiscaleLinearAttention
-    from reference_error import assert_as_exact, seeds_for
+    from reference_error import assert_as_exact
 
     from _dew_torch.precision import float64
     from dew.nn.autoencoders.dc_ae import linear_attention
@@ -275,6 +275,23 @@ def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers(monkey
             return diffusers_run(*inputs, dtype=torch.float64)
 
     reference = as_given(lambda *inputs: diffusers_run(*inputs, dtype=torch.float32))
-    label = "DC-AE linear attention"
-    seeds = seeds_for(reference, draw, label, truth_fn=as_given(truth), dew_fn=dew)
-    assert_as_exact(dew, reference, draw, label, truth_fn=as_given(truth), seeds=seeds)
+    # `seeds_for`'s count at this geometry (probe IG-P13524U, 567ad6bed: green at 8 seeds, the one dot red).
+    assert_as_exact(dew, reference, draw, "DC-AE linear attention", truth_fn=as_given(truth), seeds=8)
+
+
+def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_arithmetic():
+    """Under the suite's wide CPU arithmetic, where each float32 product sums in float64 and rounds once
+    (`precision.sums_in_float64`), DC-AE's linear attention takes each sum over its positions whole: values
+    `2^27, 2^27, -2^27, -2^26` under keys of `2^100` leave `2^26 * 2^100` over the keys' sum `2^106`,
+    `2^20` exactly, where a first group's `2^128` rounded to float32 alone overflowed to infinity (train
+    1387's review)."""
+    from dew.nn.autoencoders.dc_ae import linear_attention
+    from dew.nn.precision import sums_in_float64
+
+    query = jnp.ones((1, 64, 1, 1), jnp.float32)
+    key = jnp.full((1, 64, 1, 1), 2.0 ** 100, jnp.float32)
+    value = np.zeros((1, 64, 1, 1), np.float32)
+    value[0, [0, 1, 4, 5], 0, 0] = (2.0 ** 27, 2.0 ** 27, -2.0 ** 27, -2.0 ** 26)
+    assert sums_in_float64(key, key), "the suite runs wide CPU arithmetic"
+    attended = jax.jit(linear_attention)(query, key, jnp.asarray(value))
+    np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))
