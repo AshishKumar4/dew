@@ -21,9 +21,8 @@ import importlib
 import importlib.metadata
 import importlib.util
 import itertools
-import logging
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -32,13 +31,12 @@ from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import parity
-from dew.algebra import _component_sharing, error, printed, rules
+from dew.algebra import _component_sharing, error, printed, rules, terms
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
 
-_log = logging.getLogger(__name__)
 
 POLICIES = ("default", "accurate")
 """The precision policies a declaration is generated for (§1.5): under default numerics a candidate is
@@ -124,13 +122,16 @@ class SurrogateBodies:
                 declare(module, case.tangent_name(inactive), form)
         return self
 
+    @functools.cached_property
+    def _keyed(self) -> dict[Hashable, SurrogateCase]:
+        """Each case by its static arguments' structural key (`terms.parameter_key`): a float by its bits,
+        so `-0.0` and `0.0`, equal as Python values, are two keys."""
+        return {terms.parameter_key(fixed): case for fixed, case in self.cases.items()}
+
     def _case(self, fixed: tuple) -> SurrogateCase | None:
-        # JAX permits written nondifferentiable arguments that cannot key a generated case.
-        try:
-            return self.cases.get(fixed)
-        except TypeError:
-            _log.debug("a surrogate's unhashable static arguments use its written body")
-            return None
+        # A static argument no structural key states (unhashable, or held by identity) matches no declared
+        # case, whose key is by value: its written body runs.
+        return self._keyed.get(terms.parameter_key(fixed))
 
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
         """Opt into emitted cases using the original surrogate rule's argument and value dependency."""

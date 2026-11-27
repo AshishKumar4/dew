@@ -167,3 +167,46 @@ def test_a_normal_draw_is_read_where_a_gpu_parts_prepare_places_its_calls(dtype)
             for mine, theirs in zip(drawn, expected, strict=True):
                 bits = np.uint16 if mine.itemsize == 2 else np.uint32
                 np.testing.assert_array_equal(mine.view(bits), theirs.view(bits))
+
+
+def test_a_surrogate_case_declared_at_positive_zero_leaves_negative_zero_to_its_written_body():
+    """A generated surrogate case is keyed by its static arguments' bits (`terms.parameter_key`): `-0.0`,
+    equal to `0.0` as a Python value, is no `0.0` case, so its primal and its tangent run the written body."""
+    from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase
+
+    def offset(x, shift):
+        return x + jnp.copysign(1.0, shift)
+
+    def offset_tangent(shift, primals, tangents, value):
+        del shift, primals, value
+        return tangents[0]
+
+    def cases(count):
+        operand = jax.ShapeDtypeStruct((4,), jnp.float32)
+        return Cases(((operand,) * count,), lambda seed, operands: operands, seeds=1, policies=("default",))
+
+    def passed(x, dx, value):
+        return dx
+
+    declared = SurrogateBodies(offset, offset_tangent, (1,), symbolic_zeros=False, cases={
+        (0.0,): SurrogateCase("plus", ComponentForm(lambda x: x + 1, lambda x: x + 1, cases(1)),
+                              {(): ComponentForm(passed, passed, cases(3))},
+                              output_tree=(jax.tree.structure(0),))})
+    taken = []
+
+    def emitted(name):
+        def body(*operands, policy, target):
+            del policy, target
+            taken.append(name)
+            return operands[0] + 1 if name == "plus" else operands[1]
+        return body
+
+    composed = declared.assembled(emitted)
+    x = jnp.zeros((4,), jnp.float32)
+    for shift, expected, names in ((0.0, 1.0, ["plus", "plus_tangent"]), (-0.0, -1.0, [])):
+        taken.clear()
+        primal, tangent = jax.jvp(lambda value, shift=shift: composed(value, shift), (x,),
+                                  (jnp.ones_like(x),))
+        np.testing.assert_array_equal(primal, np.full(4, expected, np.float32))
+        np.testing.assert_array_equal(tangent, np.ones(4, np.float32))
+        assert taken == names
