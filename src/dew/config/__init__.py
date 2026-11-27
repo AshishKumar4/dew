@@ -850,8 +850,10 @@ class RunConfig:
                 node = _within(node, group, unset.get(group))
             node[field] = value
         chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
-        # Built once, every field of the point in place, so its checks read the run it describes.
-        return dataclasses.replace(type(self).from_dict(record), **chains)
+        # Built once, every field of the point in place, so its checks read the run it describes: a live
+        # record, strict within a saved run's reading too (`_records.reading_saved`).
+        with _records.reading_saved(False):
+            return dataclasses.replace(type(self).from_dict(record), **chains)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.

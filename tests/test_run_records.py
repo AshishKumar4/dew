@@ -248,6 +248,10 @@ def test_a_live_run_record_naming_the_retired_choice_is_refused():
             RunConfig.read(record)
         saved = {**kernels, "generated": "generated"}
         assert from_record(Kernels, saved) == from_record(Kernels, kernels)
+        # A run's override of its kernels' section is a live record too.
+        assert RunConfig().override({"diagnostics.kernels": kernels}).diagnostics.kernels == Kernels()
+        with pytest.raises(ValueError):
+            RunConfig().override({"diagnostics.kernels": saved})
 
 
 @dataclasses.dataclass(frozen=True)
