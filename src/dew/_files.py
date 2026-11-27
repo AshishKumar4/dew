@@ -357,9 +357,8 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, hel
     An entry that replaces earlier ones (`replacements`) takes their group, which they share (one they do
     not, or one this process cannot give, refused, as `chown` refuses it, before anything moves), and the
     access every one of them allowed, so a component's private weights in a group of their own stay so
-    (trains 1406, 1407 and 1414's reviews); any other the group a new entry in its folder takes, the
-    folder's where it is setgid, else the one the kernel gave it, and a new folder the setgid bit of its
-    own. Each folder's mode is set after its entries'."""
+    (trains 1406, 1407 and 1414's reviews); any other its folder's group as the folder publishes, and a new
+    folder the setgid bit of its own. Each folder's mode is set after its entries'."""
     earlier: dict[Path, tuple[int, int]] = {}
     for entries, replaced in replacements:
         if not replaced:
@@ -387,12 +386,12 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, hel
         root = (parent.st_gid if setgid else None, (made & ~stat.S_ISGID) | setgid)
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
-    if setgid_before and not root[1] & stat.S_ISGID:
-        # The staging's entries took a setgid folder's group as they were made, which the folder they
-        # publish into gives no longer, and which group its new entries take instead (the publisher's, or
-        # the folder's on a `grpid` mount) no stat says: refused rather than published in a group no
-        # longer given (theme 72's review).
-        raise PermissionError(f"{directory} or its parent cleared its setgid bit while this save was "
+    if held_at is None and setgid_before and not root[1] & stat.S_ISGID:
+        # A new tree's staging took its setgid parent's group as it was made, which a folder made there
+        # takes no longer, and which group it does take instead (the publisher's, or the parent's on a
+        # `grpid` mount) no stat says: refused rather than published in a group no longer given (theme
+        # 72's review).
+        raise PermissionError(f"{directory.parent} cleared its setgid bit while {directory.name} was "
                               "written, whose files took its group: save again")
     _grouped(staging, root[0])
     # Each folder's group and setgid bit as published, its entries following it (a folder before them).
@@ -406,8 +405,10 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, hel
         if entry in earlier:
             group, mode = earlier[entry]
         else:
-            # A new entry its folder's group where the folder is setgid, else the one the kernel gave it.
-            group = group if setgid else None
+            # A new entry its folder's group as the folder publishes, whatever the mount's rule for an entry
+            # made in a folder that is not setgid (the folder's on `grpid`, the maker's otherwise), which a
+            # folder's mode changed under the staging makes no stat state (theme 72's review): a component's
+            # new files in the group its earlier ones held.
             mode = (stat.S_IMODE(path.lstat().st_mode) & ~stat.S_ISGID) | setgid if kind == "folder" else None
         _grouped(path, group)
         if kind == "folder":
