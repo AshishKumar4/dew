@@ -14,8 +14,9 @@ from generation_support import lowers
 from kernel_compile import compile_mosaic_kernels
 
 from dew import quantization
+from dew.nn import programs
 from dew.nn.dense import Dense
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window
 
 
@@ -305,3 +306,97 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             np.testing.assert_array_equal(outs[1], outs[0])
         else:
             assert outs[1] is outs[0]
+
+
+@pytest.mark.parametrize(("compute", "rounded"), [(jnp.float32, False), (jnp.bfloat16, True)],
+                         ids=["fp32 compute", "bf16 compute"])
+def test_gemm_over_a_window_computes_in_its_calls_dtype(compute, rounded):
+    """`gemm.gemm` over a bfloat16 window computes in its call's `compute` (row 13686): fp32 rows of
+    1 + 2^-9 under fp32 compute keep their low bit (the decoded kernel's ordinary product), under bf16
+    compute read as 1 (the window's product), each output its exact oracle: its kernel sixteenths of small
+    integers, every sum exact in float32 (testing.md's oracle rule)."""
+    rng = np.random.default_rng(13686)
+    kernel = (rng.integers(-64, 64, (128, 64)) / 16.0).astype(np.float64)
+    x = np.full((8, 128), 1 + 2.0 ** -9)
+    window = Bf16Window.of(jnp.asarray(kernel, jnp.bfloat16)).checked()
+    served = gemm.gemm(jnp.asarray(x, jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)
+    oracle = (np.ones_like(x) if rounded else x) @ kernel
+    np.testing.assert_array_equal(np.asarray(served, np.float64), oracle)
+
+
+def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
+    """`gemm.gemm` over a bfloat16 window asked above the default precision into fp32 (its partial sums
+    promoted, `templates.product.declared`) takes the ordinary product's launch summing exactly, on a
+    Hopper's template (interpreted): the window's own launch promotes none (row 13686)."""
+    kernel = jnp.asarray(_drawn((256, 64)), jnp.bfloat16)
+    window = Bf16Window.of(jnp.where(jnp.isfinite(kernel), kernel, 0).astype(jnp.bfloat16)).checked()
+    rows = jax.ShapeDtypeStruct((128, 256), jnp.bfloat16)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          jax.default_matmul_precision("highest"), tuning.seen() as seen):
+        jax.eval_shape(lambda x: gemm.gemm(x, window, None, out_dtype=jnp.float32, interpret_on_cpu=True),
+                       rows)
+    assert [call.arguments["exact_sums"] for _, call in seen.taken
+            if isinstance(call.op, grouped_matmul.MosaicGmm) and call.arguments["interpret"]] == [True]
+
+
+def _dot_precisions(fn, *args) -> list:
+    """The precision every dot of `fn`'s program states, its nested programs' too (`programs.equations`)."""
+    return [eqn.params["precision"] for eqn in programs.equations(jax.make_jaxpr(fn)(*args).jaxpr)
+            if eqn.primitive is jax.lax.dot_general_p]
+
+
+def test_a_grouped_window_products_value_and_tangent_state_one_algorithm():
+    """A grouped window product (`window_product`, its XLA route) under a run's `F16_F16_F32`, its precision
+    omitted, states that algorithm in its value's ragged dot and in its tangent's (row 13704): the value's no
+    longer forced to the default where the tangent's took the run's (bf16 rows of 2^-30 would read 2^-30
+    and a zero tangent on a CUDA device)."""
+    kernel = jnp.zeros((2, 128, 64), jnp.bfloat16).at[:, 0, 0].set(1.0)
+    window = Bf16Window.of(kernel).checked()
+    sizes = jnp.asarray([2, 2], jnp.int32)
+    x = jnp.full((4, 128), 2.0 ** -30, jnp.bfloat16)
+
+    def value_and_tangent(x):
+        return jax.jvp(lambda x: gemm.window_product(x, window, sizes, out_dtype=jnp.float32), (x,), (x,))
+
+    with jax.default_matmul_precision("F16_F16_F32"):
+        program = jax.make_jaxpr(value_and_tangent)(x).jaxpr
+    found = [eqn.params["precision"] for eqn in programs.equations(program)
+             if eqn.primitive.name == "ragged_dot_general"]
+    # The value's ragged dot and its tangent's state the run's algorithm; none states the default instead.
+    default = jax.lax.Precision.DEFAULT
+    assert found.count(jax.lax.DotAlgorithmPreset.F16_F16_F32) == 2, found
+    assert not any(each in (None, default, (default, default)) for each in found), found
+
+
+@pytest.mark.parametrize(("run", "stated", "algorithm"),
+                         [("F16_F16_F32", None, jax.lax.DotAlgorithmPreset.F16_F16_F32),
+                          ("F16_F16_F32", jax.lax.Precision.DEFAULT, None),
+                          ("F32_F32_F32", jax.lax.Precision.DEFAULT, None)],
+                         ids=["omitted: the run's narrowing algorithm", "the default over a narrowing run",
+                              "the default over a whole run"])
+def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(run, stated, algorithm):
+    """`gemm.gemm` over a bfloat16 window of bf16 rows under a run's algorithm states to XLA the algorithm
+    the call declares (row 13686's review): the run's where the call states no precision, none where it
+    states the default (its level overriding the run's, a narrowing one's or a whole one a TPU does not
+    run), on its decoded fallback (the window's own dot reads the run's)."""
+    kernel = jnp.zeros((128, 64), jnp.bfloat16).at[0, 0].set(1.0)
+    x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
+    with jax.default_matmul_precision(run):
+        found = _dot_precisions(lambda x: gemm.gemm(x, Bf16Window.of(kernel).checked(), None,
+                                                    out_dtype=jnp.float32, precision=stated), x)
+    algorithms = {each for each in found
+                  if isinstance(each, jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm)}
+    assert found and algorithms == ({algorithm} if algorithm else set()), found
+
+
+@pytest.mark.parametrize("compute", [jnp.bfloat16, jnp.float32], ids=["window", "decoded"])
+def test_gemm_over_a_window_of_another_encoding_is_refused(compute):
+    """A window whose form a later write made another encoder's is refused by `gemm.gemm` at its product,
+    on the window's own route (bf16 compute at the default precision, `window_product`) and on its decoded
+    fallback (fp32 compute, `Bf16Window.decoded`) alike, its words never read through this form's decode
+    (row 13686's review)."""
+    kernel = jnp.asarray((np.arange(128 * 64).reshape(128, 64) % 7 - 3) / 4.0, jnp.bfloat16)
+    window = Bf16Window.of(kernel)
+    np.asarray(window.form).reshape(-1)[0] ^= 1
+    with jax.default_matmul_precision("default"), pytest.raises(ValueError):
+        gemm.gemm(jnp.ones((4, 128), jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)

@@ -31,6 +31,15 @@ class MosaicWindowPackedGmm(grouped_quantized.MosaicWordPackedGmm):
 WINDOW = gemm.word_packed_op("window", WINDOW_ROW, "M-NG-49")
 
 
+def admitted(window: Bf16Window) -> Bf16Window:
+    """`window` where its form is this Dew's encoder's, checked where it is concrete (`Bf16Window.checked`;
+    a traced one's is row 13700's): the one entry every product of a window passes, its own launch's and the
+    decoded matrix's (`gemm.gemm`'s fallback) alike."""
+    if not isinstance(window.form, Tracer):
+        window.checked()
+    return window
+
+
 def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | None = None, *,
                    out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs @ window` for a lossless bfloat16 window (`formats.Bf16Window`, row 5387: `[depth, width]`
@@ -38,8 +47,7 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     a decoded weight (its stored bits again) exact, summed in fp32 and rounded once to `out_dtype` (`lhs`'s
     where None); decoded a stage at a time in the GEMM mainloop where the selector takes it (`WINDOW`), else
     the decoded matrix's XLA dot (`xla_products.decoded_dot`). Frozen: its gradient is the rows' alone."""
-    if not isinstance(window.form, Tracer):
-        window.checked()
+    admitted(window)
     dense = group_sizes is None
     if (dense and len(window.shape) != 2) or (not dense and len(window.shape) != 3):
         raise ValueError(f"window_product weight rank mismatch for dense={dense}: {window.shape}")
