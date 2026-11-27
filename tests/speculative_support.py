@@ -141,6 +141,11 @@ def assert_replay_drafts_as_a_prefill(model, params, draw, label: str, *, seeds:
             return wide(*inputs)
 
     assert_as_exact(replayed, dew_path(fresh), draw, label, seeds=seeds, truth_fn=truth)
+    # The next token each arm's logits choose, the same one: check 1 holds integers by their distance.
+    for seed in range(seeds):
+        inputs = draw(seed)
+        chosen = [np.asarray(arm(*inputs)["next"]) for arm in (replayed, fresh)]
+        np.testing.assert_array_equal(*chosen, err_msg=f"{label}, seed {seed}")
 
 
 def greedy_walk(model, params):

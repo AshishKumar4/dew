@@ -94,6 +94,7 @@ from .precision import (
     configured_precision,
     exact_products,
     float32_einsum,
+    sums_in_float64,
 )
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
@@ -591,17 +592,24 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
 
     `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU under
     Dew's tests sums an fp32 one in float64 and rounds once (`precision.accumulated`).
-    A CPU's fp32 product over more keys than `VALUE_BLOCK` sums each block of
-    keys apart and joins the blocks' sums once, compensated (`compensated_sum`):
-    one dot over a T5 encoder's 256 keys rounded its long fp32 sum 2.2 times as
-    far from float64 as torch's CPU attention, which sums keys in blocks (row
-    13655); an accelerator's product, and a 16-bit one, is the one dot.
+    A CPU's fp32 product over more keys than `VALUE_BLOCK`, summed in fp32, sums
+    each block of keys apart and joins the blocks' sums once, compensated
+    (`compensated_sum`): one dot over a T5 encoder's 256 keys rounded its long
+    fp32 sum 2.2 times as far from float64 as torch's CPU attention, which sums
+    keys in blocks (row 13655). The one dot stays where its sum is already one
+    float64 sum rounded once (`precision.sums_in_float64`), on an accelerator,
+    for a 16-bit product, and where a mesh's Explicit axes split the keys (a
+    block of them need not divide the split).
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
     keys = value.shape[-3]
-    if value.dtype != jnp.float32 or keys <= VALUE_BLOCK:
+    split = [jax.typeof(value).sharding.spec, jax.typeof(weights).sharding.spec]
+    keys_split = any(len(spec) > axis and spec[axis] is not None
+                     for spec, axis in zip(split, (value.ndim - 3, weights.ndim - 1), strict=True))
+    if (value.dtype != jnp.float32 or keys <= VALUE_BLOCK or keys_split
+            or sums_in_float64(weights, value)):
         return float32_einsum(equation, weights, value, precision=precision)
 
     def whole(weights, value):

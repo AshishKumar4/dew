@@ -789,6 +789,13 @@ def _sums_in_float64(*operands) -> bool:
     return _wide_cpu_products(*operands) and jax.config.jax_default_matmul_precision != FP32_SUMS
 
 
+def sums_in_float64(*operands) -> bool:
+    """Whether a CPU takes these operands' product as one sum in float64, rounded once (`accumulated`):
+    Dew's wide CPU arithmetic's float32 products, in no scope that states fp32 sums (`FP32_SUMS`). A product
+    that sums them otherwise in fp32 (any other process or scope) reads this to choose its own order."""
+    return _sums_in_float64(*operands)
+
+
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, counts: int = 0) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
