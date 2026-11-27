@@ -459,6 +459,11 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     farther = jnp.asarray([[[[0.0]], [[-110.0]]]], jnp.float32)
     infinite = jnp.asarray([[[[0.0, -np.inf], [0.0, -np.inf]]]], jnp.float32)
     assert float(loss(infinite, farther)) == np.inf
+    # Teacher logits 0 and fp32's lowest, its log-mass finite (-fp32.max): the infinitely low score's KL
+    # +inf, its mass kept in its logarithm (`mla.indexer_log_target`'s running largest log-mass, where a
+    # power of two of it overflowed and the key read no mass, a KL of 0).
+    extreme = jnp.asarray([[[[0.0]], [[np.finfo(np.float32).min]]]], jnp.float32)
+    assert float(loss(infinite, extreme)) == np.inf
     gradient = np.asarray(jax.grad(lambda s: loss(s, farther))(infinite))[0, 0, 1]
     np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
     far = jnp.asarray([[[[0.0, -np.inf], [0.0, -(2.0**126)]]]], jnp.float32)

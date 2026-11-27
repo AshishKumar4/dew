@@ -783,3 +783,38 @@ def test_the_warmup_trains_through_the_trainer():
     assert float(before) == float(aux.metrics["indexer_kl"])
     assert float(optax.tree.norm(grads[FROZEN])) == 0
     assert float(optax.tree.norm(grads["params"])) > 0
+
+
+@pytest.mark.parametrize("order", ["rising", "falling"])
+def test_the_indexer_target_sums_its_heads_in_either_order(order):
+    """The indexer's teacher's log-mass (`mla.indexer_log_target`) of three heads over two keys whose
+    masses lie several binary exponents apart, each key's largest arriving last (`rising`) or first: its
+    masses within an fp32 reduction's bound of float64's sums of the heads' softmaxes, each head's
+    contribution kept through its running largest's raises (audit 2026-11-27 K04, one pass)."""
+    from reference_error import assert_fp32_reduction_bound
+
+    from dew.nn import mla
+
+    logits = np.asarray([[0.0, -3.0], [-6.0, 0.0], [-1.0, -2.5]])
+    logits = logits if order == "rising" else logits[::-1]
+    heads = logits.shape[0]
+    query = jnp.ones((1, 1, heads, 1), jnp.float32)
+    key = jnp.asarray(logits.T, jnp.float32)[None, :, :, None]
+    masses = np.exp(np.asarray(mla.indexer_log_target(query, key, jnp.ones((1, 1, 2), bool), 1.0)[0, 0],
+                               np.float64))
+    shifted = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    truth = (shifted / shifted.sum(axis=-1, keepdims=True)).sum(axis=0)
+    assert_fp32_reduction_bound(masses, truth, truth, heads * 2)
+
+
+def test_the_indexer_target_keeps_a_finite_log_mass_far_below_zero():
+    """One head over two keys of logits 0 and fp32's lowest: the teacher's log-masses 0 and fp32's lowest,
+    finite (`mla.indexer_log_target`'s running largest log-mass), where a power of two of the second
+    overflowed and read -inf (audit 2026-11-27 K04's review)."""
+    from dew.nn import mla
+
+    lowest = np.finfo(np.float32).min
+    query = jnp.ones((1, 1, 1, 1), jnp.float32)
+    key = jnp.asarray([0.0, lowest], jnp.float32)[None, :, None, None]
+    target = np.asarray(mla.indexer_log_target(query, key, jnp.ones((1, 1, 2), bool), 1.0))[0, 0]
+    np.testing.assert_array_equal(target, [0.0, lowest])
