@@ -110,32 +110,29 @@ def test_a_rungs_splits_are_asked_as_each_miss_computes(fitting, first, computed
 
 
 def test_every_process_gathers_the_split_asked_after_each_miss():
-    """The split asked after a miss is the latest any process computes (`FitSearch.after`): every process
-    gathers at every miss, its own compile read or not (a compile XLA refused for memory, or one whose
-    memory this process states none of), so their rounds stay in step; past the last split none is asked
-    and none gathers."""
+    """The split asked after a miss is the latest any process computes, read as fitting only where every
+    process computes it so (`FitSearch.forecast`); past the last split none is asked."""
     from types import SimpleNamespace
 
     from dew.training.memory import MemoryMiss
     from dew.training.planning import FitSearch
 
-    gathered = []
-
-    def gather(value):
-        gathered.append(value)
-        return [value, 2]
-
-    def search(misses):
-        return SimpleNamespace(misses=misses, rung=lambda: "rung", gather=gather)
+    def search(misses, others):
+        return SimpleNamespace(misses=misses, rung=lambda: "rung", gather=lambda mine: [mine, *others])
 
     candidates = [1, 2, 4, 8]
-    # This process read nothing of its miss and asks the next; another computes four, which all ask.
-    assert FitSearch.after(search({}), candidates, 0) == 2 and gathered == [1]
-    assert FitSearch.after(search({("rung", 1): MemoryMiss(1, 90, 50, 1)}), candidates, 0) == 2
-    assert gathered == [1, 2]
-    assert FitSearch.after(search({}), candidates, 3) is None and gathered == [1, 2]
+    # This process read nothing of its miss; another computes split two's index fitting: all ask it, none
+    # reads it as fitting.
+    assert FitSearch.forecast(search({}, [[1, True]]), candidates, 0) == (1, False)
+    # Its own figures read split four (index 2) fitting, a quarter of 90 freeing 67.5 of the 50 short;
+    # another reads it so too, and every process reads it as fitting; one reading none takes it not so.
+    fitting = {("rung", 1): MemoryMiss(1, 90, 50, 1)}
+    assert FitSearch.forecast(search(fitting, [[2, True]]), candidates, 0) == (2, True)
+    assert FitSearch.forecast(search(fitting, [[3, False]]), candidates, 0) == (3, False)
+    assert FitSearch.forecast(search({}, []), candidates, 3) == (None, False)
     # A miss whose figures leave no split above it room asks the finest, XLA's compile the judge of it.
-    assert FitSearch.after(search({("rung", 1): MemoryMiss(1, 30, 50, 1)}), candidates, 0) == 3
+    starved = {("rung", 1): MemoryMiss(1, 30, 50, 1)}
+    assert FitSearch.forecast(search(starved, []), candidates, 0) == (3, False)
 
 
 def test_every_process_keeps_or_drops_the_narrow_copies_together():

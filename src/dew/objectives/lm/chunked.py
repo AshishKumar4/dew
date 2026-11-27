@@ -41,6 +41,7 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 from jax.sharding import PartitionSpec as P
 
@@ -76,6 +77,8 @@ from dew.nn.precision import (
     widened_reduction,
 )
 from dew.nn.protocols import (
+    HEAD_SCOPE,
+    WHOLE_LOGITS,
     AffineHead,
     HiddenStates,
     Lacks,
@@ -705,8 +708,13 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
-    raw = _whole_logits(flat, table.astype(operands), precision)
-    logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
+    # The whole logits under the whole head's name (`HEAD_SCOPE`), the product itself named too
+    # (`WHOLE_LOGITS`): what a tiled head holds a tile of alone, where the table's cast, its per-token
+    # results and its gradients are its own as much as this head's.
+    table = table.astype(operands)
+    with jax.named_scope(HEAD_SCOPE):
+        raw = checkpoint_name(_whole_logits(flat, table, precision), WHOLE_LOGITS)
+        logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
@@ -753,7 +761,8 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, the head's gradient accumulated in fp32 once, and an fp32 head's
-    state gradient over the tiled head's column tiles (`_state_product`)."""
+    state gradient over the tiled head's column tiles (`_state_product`); the
+    logits and their cotangent under the whole head's name (`HEAD_SCOPE`)."""
     del predict
     raw, (peaks, masses, rests) = saved
     hidden, table, targets, excluded, softcap, columns = operands
@@ -761,12 +770,14 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    logits, pullback = _capped(_widened(raw), softcap, columns, temperature)
+    with jax.named_scope(HEAD_SCOPE):
+        logits, pullback = _capped(_widened(raw), softcap, columns, temperature)
+        d_logits = _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
+                                      loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
     d_states, d_table, d_cap, d_columns = _head_backward(
-        pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
-                                     loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
-        table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
+        pullback, d_logits, table.astype(operands), hidden.reshape(-1, features).astype(operands), precision,
+        work, width)
     d_states, (d_table, d_cap, d_columns) = with_gradients_formed(
         d_states.reshape(hidden.shape).astype(hidden.dtype), (d_table.astype(table.dtype), d_cap, d_columns))
     return d_states, d_table, zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns

@@ -31,7 +31,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import jax
@@ -73,6 +73,11 @@ class LiveBuffer:
     dims: tuple[frozenset[tuple[int, int]] | None, ...] = ()
 
 
+UNPLACED = -1
+"""A use's position where its trace states none (`LiveInterval.uses`): a reader with no event and none
+reading through it."""
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class LiveInterval(LiveBuffer):
     """A buffer of a compile's allocation over the part of a heap simulation's schedule it lives in.
@@ -80,7 +85,9 @@ class LiveInterval(LiveBuffer):
     Besides `LiveBuffer`'s: `allocation`, the buffer allocation it is assigned to; `trace`, the heap
     simulation that orders it (its index among the assignment's `heap_simulator_traces`): positions compare
     within one trace alone (an allocation simulated per computation has one each, their positions each from 0;
-    the pages of one heap each a copy of its one trace, their positions alike). `whole` says whether that
+    the pages of one heap each a copy of its one trace, their positions alike). `timeline` is the first trace
+    whose events its trace's repeat: a heap's pages share one, their buffers live together at each position,
+    and traces of different timelines order their positions apart. `whole` says whether that
     simulation's schedule is the whole module's (XLA:GPU's), a while body's buffers within its loop's span, or
     one computation's. `complete` says whether every buffer its allocation is assigned lies in one of its
     simulations: XLA places some in an allocation unsimulated (temporary heaps reused, or combined), so a
@@ -97,6 +104,12 @@ class LiveInterval(LiveBuffer):
 
     allocation: int
     trace: int
+    timeline: int
+    uses: tuple[tuple[int, str], ...] = ()
+    """The positions of its trace by which each instruction reading the value it holds has run (its last
+    event there), each with that instruction's `op_name`: what its value is read by and when, a tuple's
+    element through the getter that takes it out, a view's readers through the view; `UNPLACED` where a
+    reader's position is stated nowhere."""
     whole: bool
     complete: bool
     start: int
@@ -156,10 +169,14 @@ class Assignment:
         self.instructions = {instruction.id: instruction for computation in compiled.computations
                              for instruction in computation.instructions}
         self.computations = {computation.id: computation for computation in compiled.computations}
+        self.computation_of = {instruction.id: computation.name for computation in compiled.computations
+                               for instruction in computation.instructions}
         self.descended = provenance(compiled, argument)
         # Each logical buffer's other positions, as XLA's must-alias analysis states them: a loop state's
         # buffer's among them, at the while's output.
         self.aliases: dict[int, list[Any]] = {}
+        # Each instruction's readers (`used`), built where an interval is read.
+        self.readers: dict[int, list[Any]] | None = None
         for alias in self.proto.buffer_aliases:
             self.aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
         self.types = hlo.pool().FindEnumTypeByName("xla.PrimitiveType")
@@ -197,7 +214,11 @@ class Assignment:
         complete = {allocation: set(sizes) <= traced.get(allocation, set())
                     for allocation, sizes in assigned.items()}
         found = []
+        # A heap's pages each copy one trace's events: the first trace of each sequence of events names it.
+        timelines: dict[tuple, int] = {}
         for trace, simulated in enumerate(self.proto.heap_simulator_traces):
+            timeline = timelines.setdefault(tuple((step.kind, step.buffer_id, step.share_with_canonical_id)
+                                                  for step in simulated.events), trace)
             # Each buffer's storage, as first allocated: a share names the buffer it shares, itself perhaps
             # sharing another's, freed or not.
             storages: dict[int, int] = {}
@@ -212,16 +233,61 @@ class Assignment:
                 storages[step.buffer_id] = storages.get(shared, shared) if sharing else int(step.buffer_id)
                 opened[step.buffer_id] = position
             spans += [(buffer, start, len(simulated.events)) for buffer, start in opened.items()]
+            # Where each instruction runs in this trace: its last output's placing (`ALLOC`, `SHARE_WITH`); a
+            # `FREE` names the producer of the value dying, not the instruction running there.
+            ran: dict[tuple[str, str], int] = {}
+            for position, step in enumerate(simulated.events):
+                if step.kind != kinds["FREE"]:
+                    ran[(step.computation_name, step.instruction_name)] = position
             allocation = simulated.buffer_allocation_index
             sizes = assigned.get(allocation, {})
             charged = _charged(simulated.events, sizes, kinds)
             found += [LiveInterval(**{**described, "bytes": sizes[buffer]}, allocation=allocation,
-                                   trace=trace, whole=simulated.whole_module_simulation,
+                                   trace=trace, timeline=timeline, whole=simulated.whole_module_simulation,
                                    complete=complete[allocation], start=start, end=end, buffer=buffer,
-                                   storage=storages[buffer], charged=buffer in charged)
+                                   storage=storages[buffer], charged=buffer in charged,
+                                   uses=self.used(buffer, ran))
                       for buffer, start, end in spans
                       if buffer in sizes and (described := self.described(buffer, allocation)) is not None]
         return tuple(found)
+
+    def used(self, buffer_id: int, ran: Mapping[tuple[str, str], int]) -> tuple[tuple[int, str], ...]:
+        """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
+        buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
+        element's through the getter of its index; a reader the trace states no event of is none of them."""
+        readers = self.readers
+        if readers is None:
+            # Each instruction's readers, built where an interval is read alone.
+            readers = self.readers = {}
+            for instruction in self.instructions.values():
+                for operand in instruction.operand_ids:
+                    readers.setdefault(operand, []).append(instruction)
+        buffer = self.buffers[buffer_id]
+        index = tuple(buffer.defined_at.shape_index)
+        found: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        reading = [(reader, index) for reader in readers.get(buffer.defined_at.instruction_id, ())]
+        while reading:
+            reader, within = reading.pop()
+            if reader.id in seen:
+                continue
+            seen.add(reader.id)
+            if within and reader.opcode == "get-tuple-element":
+                if reader.tuple_index == within[0]:
+                    reading += [(next_, within[1:]) for next_ in readers.get(reader.id, ())]
+                continue
+            key = (self.computation_of[reader.id], reader.name)
+            if key in ran:
+                found.append((ran[key], reader.metadata.op_name))
+            elif readers.get(reader.id):
+                # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
+                # the value through it.
+                reading += [(next_, ()) for next_ in readers.get(reader.id, ())]
+            else:
+                # Read where the trace states no position (`UNPLACED`).
+                found.append((UNPLACED, reader.metadata.op_name))
+        return tuple(sorted(found))
+
 
     def described(self, buffer_id: int, allocation: int) -> dict | None:
         """`LiveBuffer`'s fields of logical buffer `buffer_id` of `allocation`; None for a constant's or a
