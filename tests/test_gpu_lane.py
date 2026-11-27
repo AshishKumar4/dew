@@ -305,12 +305,13 @@ def test_a_flows_deferred_cell_is_read_unprepared_and_a_row_left_no_time_is_stal
         for cell in cells:
             truths_ahead.reasoned(store / name / record, test, "tests/test_gpu_vae.py:9",
                                   f"{cell or 'a site'}: lowered", cell)
-    found = ci.prepares.unprepared_in(tmp_path, (ci.tier_wire().UNPREPARED, ci.tier_wire().DEFERRED),
-                                      ci.grading.owning)
-    # The flow's two cells deferred at one line are each their own.
-    assert sorted(ci.prepares.identity(record) for record in found["tests/test_gpu_vae.py"]) == [
-        f"{encodes} @ tests/test_gpu_vae.py:9", f"{flow} @ tests/test_gpu_vae.py:9 [one]",
-        f"{flow} @ tests/test_gpu_vae.py:9 [two]"]
+    found = ci.prepares.unprepared_in(
+        tmp_path, {ci.tier_wire().UNPREPARED: "site", ci.tier_wire().DEFERRED: "flow"}, ci.grading.owning)
+    # The flow's two cells deferred at one line are each their own, each of its record's kind.
+    records = found["tests/test_gpu_vae.py"]
+    assert sorted((ci.prepares.identity(record), record["kind"]) for record in records) == [
+        (f"{encodes} @ tests/test_gpu_vae.py:9", "site"), (f"{flow} @ tests/test_gpu_vae.py:9 [one]", "flow"),
+        (f"{flow} @ tests/test_gpu_vae.py:9 [two]", "flow")]
     out = tmp_path / "verdict.json"
     assert ci.prepares.run(ci, "3.12", ["prepare:tests/test_gpu_vae.py"], "@prepare-sm90", out, 1.0,
                            "off") == 3
@@ -961,7 +962,7 @@ def test_a_whole_cut_of_fields_and_older_identities_is_read_and_graded_apart(ci,
     monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "head")
     monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
     found = ci.prepares.before(ci, "3.12", "tests/test_gpu_a.py", "@prepare-sm90", time.monotonic() + 600)
-    assert found == {tuple(lookalike), older}
+    assert found == {(*lookalike, None), older}
     reached = {"test": "tests/test_gpu_a.py::test_flow[p]", "where": "a site", "error": "e",
                "cell": "q @ a site [c"}
     other = {"test": "tests/test_gpu_a.py::test_other", "where": "x", "error": "e"}
@@ -991,7 +992,7 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     fields = [["tests/test_gpu_a.py::t[p] @ " + ci.tier_wire().CAPPED + " [q", "a site", "c"]]
     assert ci.run_keys.baselined("3.12", place, "cls", "token",
                                  {"exitCode": 0, "unprepared": ["a @ x"], "unprepared_cells": fields})
-    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {tuple(fields[0])}
+    assert ci.prepares.cells_of(json.loads(stored[baseline])) == {(*fields[0], None)}
 
 
 @pytest.mark.parametrize("taken", [True, False])
