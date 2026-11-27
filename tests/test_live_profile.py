@@ -77,13 +77,16 @@ def test_a_residual_is_a_forward_value_live_into_the_backward():
     """Read off a compile's intervals, a forward's value freed before the backward makes its first buffer
     is its own scratch, which a rung recomputing the forward makes again, and frees none of the peak; one
     made before it and live past it is a residual the rung drops; a forward replayed after the backward
-    began (a resident transaction's) makes scratch a rung makes again too."""
+    began is scratch unless its own pullback reads it while it holds it (a resident transaction's), and a
+    read past its interval is another call's, none of its own."""
     profile = LiveProfile.of((interval(30, 0, 3, 0), interval(20, 3, 6, 1),
-                              interval(25, 4, 6, 2, op_name=BACKWARD), interval(5, 5, 7, 3)), frozenset())
+                              interval(25, 4, 6, 2, op_name=BACKWARD),
+                              interval(5, 5, 7, 3, uses=((9, BACKWARD),)),
+                              interval(8, 5, 9, 4, uses=((8, BACKWARD),))), frozenset())
     assert profile is not None
-    assert [buffer.residual for buffer in profile.held] == [False, True, False, False]
-    assert profile.most == 50
-    assert profile.frees(lambda op_name, names: True) == 50 - 30
+    assert [buffer.residual for buffer in profile.held] == [False, True, False, False, True]
+    assert profile.most == 58
+    assert profile.frees(lambda op_name, names: True) == 58 - 38
 
 
 def test_a_recomputed_residual_is_held_through_its_forwards_last_read():

@@ -979,14 +979,27 @@ class LiveProfile:
         whole = [interval for interval in intervals if interval.whole and interval.kind != "parameter"]
         if not whole or len({interval.timeline for interval in whole}) > 1:
             return None
+        backward = min((interval.start for interval in whole if backward_made(interval.op_name)),
+                       default=None)
+
+        def within(interval: LiveInterval) -> list[tuple[int, str]]:
+            # Its reads while it holds the value: a read past its interval is another call of the
+            # computation reading it (a conditional's branch, a loop's body), whose events repeat.
+            return [(position, op_name) for position, op_name in interval.uses
+                    if position == UNPLACED or interval.start <= position <= interval.end]
+
         def residual(interval: LiveInterval) -> bool:
-            # A forward value its own backward reads; one with a read placed nowhere stays charged whole.
+            # A forward value live into the backward: held across the backward's first buffer, or read by a
+            # backward while it holds it (a replayed forward's value its own pullback reads).
             return (interval.role != "workspace" and forward_made(interval.op_name)
-                    and any(backward_made(op_name) for _, op_name in interval.uses)
-                    and all(position != UNPLACED for position, _ in interval.uses))
+                    and ((backward is not None and interval.start < backward < interval.end)
+                         or any(backward_made(op_name) for _, op_name in within(interval))))
 
         def until(interval: LiveInterval) -> int:
-            read = [position for position, op_name in interval.uses if forward_made(op_name)]
+            # Past its forward's last read of it; to its end where a forward read is placed nowhere.
+            read = [position for position, op_name in within(interval) if forward_made(op_name)]
+            if UNPLACED in read:
+                return interval.end
             return max(read, default=interval.start) + 1
 
         return LiveProfile(tuple(

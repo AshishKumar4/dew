@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import json
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -176,6 +175,8 @@ class Assignment:
         # Each logical buffer's other positions, as XLA's must-alias analysis states them: a loop state's
         # buffer's among them, at the while's output.
         self.aliases: dict[int, list[Any]] = {}
+        # Each instruction's readers (`used`), built where an interval is read.
+        self.readers: dict[int, list[Any]] | None = None
         for alias in self.proto.buffer_aliases:
             self.aliases.setdefault(alias.source_buffer_id, []).append(alias.location)
         self.types = hlo.pool().FindEnumTypeByName("xla.PrimitiveType")
@@ -253,11 +254,18 @@ class Assignment:
         """Where in a trace (`ran`: each instruction's position in it) the instructions reading logical
         buffer `buffer_id`'s value run, with their `op_name`s: its defining instruction's readers, a tuple
         element's through the getter of its index; a reader the trace states no event of is none of them."""
+        readers = self.readers
+        if readers is None:
+            # Each instruction's readers, built where an interval is read alone.
+            readers = self.readers = {}
+            for instruction in self.instructions.values():
+                for operand in instruction.operand_ids:
+                    readers.setdefault(operand, []).append(instruction)
         buffer = self.buffers[buffer_id]
         index = tuple(buffer.defined_at.shape_index)
         found: list[tuple[int, str]] = []
         seen: set[int] = set()
-        reading = [(reader, index) for reader in self.readers.get(buffer.defined_at.instruction_id, ())]
+        reading = [(reader, index) for reader in readers.get(buffer.defined_at.instruction_id, ())]
         while reading:
             reader, within = reading.pop()
             if reader.id in seen:
@@ -265,29 +273,20 @@ class Assignment:
             seen.add(reader.id)
             if within and reader.opcode == "get-tuple-element":
                 if reader.tuple_index == within[0]:
-                    reading += [(next_, within[1:]) for next_ in self.readers.get(reader.id, ())]
+                    reading += [(next_, within[1:]) for next_ in readers.get(reader.id, ())]
                 continue
             key = (self.computation_of[reader.id], reader.name)
             if key in ran:
                 found.append((ran[key], reader.metadata.op_name))
-            elif self.readers.get(reader.id):
+            elif readers.get(reader.id):
                 # A reader the trace places no buffer for (a view of its operand, a bitcast): its readers read
                 # the value through it.
-                reading += [(next_, ()) for next_ in self.readers.get(reader.id, ())]
+                reading += [(next_, ()) for next_ in readers.get(reader.id, ())]
             else:
                 # Read where the trace states no position (`UNPLACED`).
                 found.append((UNPLACED, reader.metadata.op_name))
         return tuple(sorted(found))
 
-    @functools.cached_property
-    def readers(self) -> dict[int, list[Any]]:
-        """Each instruction's readers, in the computation that holds it (`used`'s index, read where an
-        interval is)."""
-        readers: dict[int, list[Any]] = {}
-        for instruction in self.instructions.values():
-            for operand in instruction.operand_ids:
-                readers.setdefault(operand, []).append(instruction)
-        return readers
 
     def described(self, buffer_id: int, allocation: int) -> dict | None:
         """`LiveBuffer`'s fields of logical buffer `buffer_id` of `allocation`; None for a constant's or a
