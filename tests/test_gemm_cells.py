@@ -105,26 +105,24 @@ def test_a_generation_no_receipt_timed_runs_the_template():
             assert _route(_dense_case("sm103", made, (2560, 9216), 24576)) == "mosaic", made
 
 
-@pytest.mark.parametrize("generation_name, held", [("sm80", False), ("sm90", True), ("sm100", True)])
-def test_an_fp32_products_tf32_template_launch_rounds_its_operands(generation_name, held):
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100"])
+def test_an_fp32_products_tf32_template_launch_rounds_its_operands(generation_name):
     """A dense fp32 input gradient at the default precision (TF32 products, `product.declared`) of a 4B
     projection: the template's launch derives a tile on a family that rounds each fp32 operand to TF32 to
-    nearest first (`Family.rounds_tf32`), as XLA's TF32 product does, never on warpgroup MMA, which reads
-    it unrounded; and where the device's own issuer takes no rounded TF32 operand (an H100's warpgroup MMA,
-    a B200's tcgen05), the selector runs XLA's product (`TF32_HELD`, row 13735: a GH200's fp32 SSD flow's
-    train gradients 3.0 times XLA's error), an A100's held by no TF32 requirement."""
+    nearest first (`Family.rounds_tf32`: mma.sync's), as XLA's TF32 product does, on an A100 its own issuer
+    and on an H100 and a B200 their mma.sync bundle, never warpgroup MMA or tcgen05, which read it unrounded
+    (row 13735: a GH200's fp32 SSD flow's train gradients 3.0 times XLA's error on warpgroup MMA)."""
     from dew.nn.kernels.templates.gemm import pricing
 
     case = _dense_case(generation_name, grouped_cells.Made.INPUT_GRADIENT, (2560, 9216), 4096,
                        dtype=jnp.float32, stored=jnp.float32, precision=jax.lax.Precision.DEFAULT)
-    assert case.tf32 and case.product.refusal is None, case.product
+    assert case.product.refusal is None, case.product
     launch, ba = case.call.bound[grouped_matmul.MosaicGmm.name]
     with generation.assumed(generation_name):
         derived = launch.derived(ba, case.call.target)
-        route = selection.decided(grouped_matmul.GROUPED, case)
-    assert derived is None or pricing.family_of(derived, jnp.float32).rounds_tf32, derived
-    code = None if route.refusal is None else route.refusal.code
-    assert (route.kernel, code) == ("xla", "tf32") if held else code != "tf32", route
+    assert derived is not None, generation_name
+    family = pricing.family_of(derived, jnp.float32, case.call.target)
+    assert family.takes_tf32 and family.rounds_tf32, (derived, family.name)
 
 
 def test_a_pinned_split_runs_only_where_its_partials_fit_the_workspace():
