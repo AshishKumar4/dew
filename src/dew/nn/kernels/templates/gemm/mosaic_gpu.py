@@ -187,8 +187,11 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
 
     def words(across: int) -> dict:
         if packed_format is not None:
-            group = packing.packed_group_depth(packed_format)
-            return {f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // group)}
+            # Its blocks of sixteen words a column, and its meta halves where its format reads them.
+            meta = ({'scales': ((across, block_k // 16), jnp.uint16)}
+                    if packing.weight_format(packed_format).meta else {})
+            return {**{f'words_{q}': ((across, 16), jnp.uint32)
+                       for q in range(packing.packed_blocks(packed_format, block_k))}, **meta}
         return {**{f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // 128)},
                 'scales': ((across, block_k // 16), jnp.float8_e4m3fn)}
 
@@ -1422,8 +1425,8 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                if name == 'matrix' and chained_matrices is not None
                else (matrix_block(gmem), matrix_step))
         for name, gmem in matrix_gmems.items() if not (packed_rows and name == 'scales')}
-    groups_of = tiles.block_k // (packing.packed_group_depth(packed_format)
-                                  if packed_format is not None else 128)
+    groups_of = (packing.packed_blocks(packed_format, tiles.block_k) if packed_format is not None
+                 else tiles.block_k // 128)
     rows_views = {'rows': lhs_view, **({} if joined is None else {JOINED: (row_block(joined), row_step)})}
     if packed_rows:
         scales_view = ({} if packed_format is not None
@@ -1431,14 +1434,12 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         rows_views = {**{f'words_{q}': (lhs_gmem.at[rows], lambda j, q=q: (0, groups_of * (first + j) + q))
                          for q in range(groups_of)}, **scales_view}
     elif 'scales' in matrix_gmems or packed_format is not None:
-        # A packed matrix's words, a stream for each group of depths of a step (128 NVFP4, 256 ternary):
-        # step j's group q, sixteen words a column at the tile's columns.
-        step_groups = tiles.block_k // (packing.packed_group_depth(packed_format)
-                                        if packed_format is not None
-                                        else 128)
+        # A packed matrix's words, a stream for each block of sixteen words a column of a step (a 128-deep
+        # group's NVFP4, a 256-deep one's ternary, three of a 128-deep window group's): step j's block q at
+        # the tile's columns.
         words = matrices.pop('matrix')[0]
-        matrices |= {f'words_{q}': (words, lambda j, q=q: (0, step_groups * (first + j) + q))
-                     for q in range(step_groups)}
+        matrices |= {f'words_{q}': (words, lambda j, q=q: (0, groups_of * (first + j) + q))
+                     for q in range(groups_of)}
     if scale_gmems is not None:
         # Its rows' scales and its matrix's columns', a step's row of each (`step_scales`): the rows' at the
         row_scales, column_scales = scale_gmems
@@ -1571,7 +1572,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         rows_layout = None if interpret or not family.budgets_registers else family.layout
         if packed_format is not None:
             words = [slots[f'words_{q}'].at[mine_rows]
-                     for q in range(block_k // packing.packed_group_depth(packed_format))]
+                     for q in range(packing.packed_blocks(packed_format, block_k))]
             left = packing.rows_decoded(words, None, interpret, layout=rows_layout, fmt=packed_format)
         else:
             words = [slots[f'words_{q}'].at[mine_rows] for q in range(slots['scales'].shape[1] // 8)]

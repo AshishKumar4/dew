@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import types
 
 import jax
 import jax.numpy as jnp
@@ -143,6 +144,38 @@ def test_a_ternary_product_at_its_ranges_edges_keeps_ieees_value(quantize, entri
                 jnp.asarray(rows, jnp.bfloat16), weights)
         np.testing.assert_array_equal(np.asarray(got, np.float32).view(np.uint32),
                                       expected.view(np.uint32), err_msg=f"interpret={interpret}")
+
+
+@pytest.mark.parametrize("quantize", [True, False], ids=["int8 rows", "bf16 rows"])
+def test_a_subnormal_scale_survives_a_program_traced_for_a_gpu_and_lowered_for_a_cpu(quantize, monkeypatch):
+    """A ternary product at a subnormal scale (`2**-127`, a row of one) traced where its scale's module reads
+    the context placed on a GPU (`generation.placed_platform`, a CUDA host's) and lowered for a CPU, which
+    flushes subnormals:
+    it returns `2**-127`, the lowered platform choosing the scale's software arm (`factored.flushing`, row
+    13569), not the traced one's multiply."""
+    values = np.zeros((256, 2), np.float32)
+    values[0] = (1.0, -1.0)
+    weights = formats.TernaryWeights.of(values, scale=np.float32(2.0 ** -127))
+    rows = np.zeros((1, 256), np.float32)
+    rows[0, 0] = 1.0
+    rows = jnp.asarray(rows, jnp.bfloat16)
+
+    def product(rows):
+        return gemm.ternary_weight_product(rows, weights, quantize_activations=quantize,
+                                           out_dtype=jnp.float32)
+
+    # The scale's module reads its context placed on a GPU (a CUDA host's trace), every other one the host's.
+    from dew.nn.kernels.templates.gemm import factored
+
+    on_gpu = types.SimpleNamespace(**{name: getattr(generation, name) for name in dir(generation)
+                                      if not name.startswith("__")})
+    on_gpu.placed_platform = lambda: "gpu"
+    with monkeypatch.context() as placed:
+        placed.setattr(factored, "generation", on_gpu)
+        lowered = jax.jit(product).trace(rows).lower(lowering_platforms=("cpu",))
+    got = np.asarray(lowered.compile()(rows), np.float32)
+    np.testing.assert_array_equal(got.view(np.uint32),
+                                  np.asarray([[2.0 ** -127, -2.0 ** -127]], np.float32).view(np.uint32))
 
 
 def test_ternary_weight_product_holds_check_1_on_both_routes():
