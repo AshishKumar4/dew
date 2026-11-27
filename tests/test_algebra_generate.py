@@ -17,7 +17,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew import algebra
-from dew.algebra import acceptance, component_cases, error, format_cases, generate, printed
+from dew.algebra import acceptance, attention_cases, error, format_cases, generate, printed, recurrence_cases
 from dew.sampling import guidance_cases
 
 FORMS = [(name, policy) for name, form in generate.DECLARATIONS.items() for policy in form.cases.policies]
@@ -44,11 +44,9 @@ def test_the_written_modules_are_what_generation_writes(on_its_platform):
     assert {name for found in made for name in found.declarations} == set(generate.DECLARATIONS)
 
 
-@pytest.mark.parametrize("named", [False, True], ids=["discovered", "qualified"])
-def test_the_command_checks_the_declaring_modules_own_declarations(named, on_its_platform):
-    """A fresh CLI checks every installed artifact, even without explicit declaration names."""
-    names = sorted(generate.DECLARATIONS) if named else []
-    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check", *names],
+def test_the_command_checks_the_declaring_modules_own_declarations(on_its_platform):
+    """A fresh CLI process checks every installed generated module, discovering the declarations itself."""
+    done = subprocess.run([sys.executable, "-m", "dew.algebra.generate", "--check"],
                           check=False, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
     assert any(line.startswith("checked ") and line.endswith("/guidance_cases_derived.py")
@@ -88,7 +86,7 @@ def test_new_template_components_certify_every_primitive_on_the_cpu(name, arm, o
     from certified import assert_certified
 
     qualified = name if "." in name else next(
-        f"{module.__name__}.{name}" for module in (component_cases, format_cases)
+        f"{module.__name__}.{name}" for module in (attention_cases, format_cases, recurrence_cases)
         if f"{module.__name__}.{name}" in generate.DECLARATIONS)
     declaration = generate.DECLARATIONS[qualified]
     for policy in declaration.cases.policies:
@@ -196,9 +194,9 @@ def test_a_component_preserves_one_result_convention_across_cases():
 
 
 def test_generated_query_cotangents_default_to_the_accurate_small_weight_order():
-    from dew.algebra.component_cases_derived import queries_cotangent
+    from dew.algebra.attention_cases_derived import queries_cotangent
 
-    cases = component_cases.QUERIES_COTANGENT.cases
+    cases = attention_cases.QUERIES_COTANGENT.cases
     inputs = cases.draw(1, cases.operands[0])
     _, weights, cotangents = jax.jit(queries_cotangent)(*inputs)
     assert weights[0, 1] == 0
@@ -207,7 +205,7 @@ def test_generated_query_cotangents_default_to_the_accurate_small_weight_order()
 
 
 def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
-    from dew.algebra.component_cases_derived import online_softmax_step, split_kv_merge
+    from dew.algebra.attention_cases_derived import online_softmax_step, split_kv_merge
 
     def empty(logits, values):
         rows = logits.shape[0]
@@ -222,14 +220,14 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
 
     def split(left, left_values, right, right_values):
         start = empty(left, left_values)
-        first = component_cases._online_truth(*start, left, left_values)
-        second = component_cases._online_truth(*start, right, right_values)
-        return component_cases._split_kv_truth(*first, *second)
+        first = attention_cases._online_truth(*start, left, left_values)
+        second = attention_cases._online_truth(*start, right, right_values)
+        return attention_cases._split_kv_truth(*first, *second)
 
     def whole(left, left_values, right, right_values):
         logits = jnp.concatenate((left, right), axis=1)
         values = jnp.concatenate((left_values, right_values), axis=0)
-        return component_cases._online_truth(*empty(logits, values), logits, values)
+        return attention_cases._online_truth(*empty(logits, values), logits, values)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -245,7 +243,7 @@ def test_generated_online_tiles_and_split_merge_compute_the_same_full_row():
 
 
 def _generated_inverse(system):
-    from dew.algebra.component_cases_derived import chunk_solve_level
+    from dew.algebra.recurrence_cases_derived import chunk_solve_level
 
     size = system.shape[0]
     place = jnp.arange(size)
@@ -259,22 +257,22 @@ def _generated_inverse(system):
 
 @pytest.mark.parametrize(("size", "columns"), [(16, 32), (32, 32), (64, 64)])
 def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_system(size, columns):
-    from dew.algebra.component_cases_derived import chunk_weighted
+    from dew.algebra.recurrence_cases_derived import chunk_weighted
     from dew.nn.kernels import recurrence_algebra
 
     def generated(system, values, strengths):
         return chunk_weighted(_generated_inverse(system), values, strengths)
 
     def written(system, values, strengths):
-        lower = recurrence_algebra.solved(system, component_cases._carry_product)
-        return component_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
+        lower = recurrence_algebra.solved(system, recurrence_cases._carry_product)
+        return recurrence_cases.CHUNK_WEIGHTED.function(lower, values, strengths)
 
     def truth(system, values, strengths):
         rhs = values * strengths[:, None]
         return jax.lax.linalg.triangular_solve(system, rhs, left_side=True, lower=True, unit_diagonal=True)
 
     def draw(seed):
-        system = component_cases._chunk_system(seed, size)
+        system = recurrence_cases._chunk_system(seed, size)
         rng = np.random.default_rng(seed)
         rhs = rng.uniform(-0.25, 0.25, (size, columns)).astype(np.float32)
         strength = rng.uniform(0.125, 0.5, size).astype(np.float32)
@@ -287,15 +285,15 @@ def test_the_generated_chunk_solve_and_application_satisfy_the_same_triangular_s
 
 @pytest.mark.parametrize("size", [16, 32, 64])
 def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
-    from dew.algebra.component_cases_derived import chunk_inverse_pullback
+    from dew.algebra.recurrence_cases_derived import chunk_inverse_pullback
     from dew.nn.kernels import recurrence_algebra
 
     def generated(system, cotangent):
         return chunk_inverse_pullback(_generated_inverse(system), cotangent)
 
     def written(system, cotangent):
-        lower = recurrence_algebra.solved(system, component_cases._carry_product)
-        return component_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
+        lower = recurrence_algebra.solved(system, recurrence_cases._carry_product)
+        return recurrence_cases.CHUNK_INVERSE_PULLBACK.function(lower, cotangent)
 
     def truth(system, cotangent):
         identity = jnp.eye(size, dtype=system.dtype)
@@ -320,14 +318,14 @@ def test_generated_inverse_adjoint_transposes_the_same_triangular_system(size):
 
 
 def test_generated_value_gradient_accumulates_two_query_tiles():
-    from dew.algebra.component_cases_derived import values_gradient
+    from dew.algebra.attention_cases_derived import values_gradient
 
     def generated(scores, cotangent, peak, total):
         return (values_gradient(scores[:32], cotangent[:32], peak[:32], total[:32])
                 + values_gradient(scores[32:], cotangent[32:], peak[32:], total[32:]))
 
     def written(scores, cotangent, peak, total):
-        return component_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
+        return attention_cases.VALUES_GRADIENT.function(scores, cotangent, peak, total)
 
     def truth(scores, cotangent, peak, total):
         keep = jnp.isfinite(peak)
@@ -335,7 +333,7 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
         return weights.T @ (cotangent / jnp.where(total > 0, total, 1)[:, None])
 
     def draw(seed):
-        case = component_cases.VALUES_GRADIENT.cases
+        case = attention_cases.VALUES_GRADIENT.cases
         left = case.draw(seed, case.operands[0])
         right = case.draw(seed + 19, case.operands[0])
         return tuple(np.concatenate((x, y)) for x, y in zip(left, right, strict=True))
@@ -344,7 +342,7 @@ def test_generated_value_gradient_accumulates_two_query_tiles():
 
 
 def test_an_unhashable_static_surrogate_case_uses_the_written_primal_and_jvp():
-    from dew.algebra import component_cases_derived as emitted
+    from dew.algebra import format_cases_derived as emitted
     from dew.nn import precision
 
     def dtype_of(spec):

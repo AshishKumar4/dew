@@ -2442,7 +2442,7 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
         operands = (*_rows(first)[:3], *_rows(second)[:3])
         declared = (all(state.scale is None and state.low is None for state in (first, second))
                     and _stated(spec, first)[0] == _stated(GENERATED_MERGE, first)[0])
-        if body := generated.body("dew.algebra.component_cases.split_kv_merge", operands, when=declared):
+        if body := generated.body("dew.algebra.attention_cases.split_kv_merge", operands, when=declared):
             made = Partial(**dict(zip(("acc", "m", "total"), body(*operands), strict=True)))
             return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), made)
     # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf

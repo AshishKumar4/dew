@@ -525,10 +525,10 @@ def test_the_recurrence_matrix_holds_on_this_gpu():
 def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
     from jax.experimental.pallas import mosaic_gpu as plgpu
 
-    from dew.algebra import component_cases, component_cases_derived
+    from dew.algebra import recurrence_cases, recurrence_cases_derived
     from dew.nn.kernels.templates import bundles
 
-    form = component_cases.SCORES
+    form = recurrence_cases.SCORES
     assert bundles.of("sm90", jnp.bfloat16) is not None
     shape = (64, 64)
 
@@ -556,7 +556,7 @@ def test_the_generated_recurrence_score_tile_holds_on_the_gpu():
         rng = np.random.default_rng(seed)
         return tuple(rng.uniform(-0.5, 0.5, dims).astype(np.float32) for dims in (shape, shape, (64,)))
 
-    assert_as_exact(call(component_cases_derived.scores), call(form.function), draw,
+    assert_as_exact(call(recurrence_cases_derived.scores), call(form.function), draw,
                     "Mosaic recurrence scores, generated or traced", seeds=8, truth_fn=jax.jit(form.truth))
 
 

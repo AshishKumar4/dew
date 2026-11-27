@@ -475,14 +475,45 @@ class Forked:
                 laid(0, jnp.where(held, lasts, length), jnp.asarray(self.stores, jnp.int32)),
                 laid(0, began, numbers))
 
+    # A forked row's segment plan, which both portable walks read (`recurrence_forked.forked_steps`,
+    # `dew.nn.mixers.mamba._forked_row`): a segment a document's tokens within one chunk, in token order.
+
+    @staticmethod
+    def segment_origins(loads: jax.Array, documents: int) -> jax.Array:
+        """A forked row's segments' first token places in token order, from its tokens' table slots laid a
+        chunk at a time (`loads` `[NC, C]`, `tokens`' first): each chunk's first token and each document's;
+        past the row's segments a sentinel past its tokens (`NC C`), to one place past their most (the
+        chunks and the documents), so each segment's end is the next origin."""
+        chunks, count = loads.shape
+        marks = ((loads >= 0) | (jnp.arange(count) == 0)).reshape(-1)
+        return jnp.nonzero(marks, size=chunks + documents + 1, fill_value=chunks * count)[0]
+
+    @staticmethod
+    def segment_span(first, after, chunks: int, count: int) -> tuple:
+        """The segment from token place `first` up to `after` (the next of `segment_origins`) of a row of
+        `chunks` chunks of `count` tokens: its chunk and its first and last token places within it; a
+        sentinel's (past the row's tokens) its last chunk's first token on."""
+        chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
+        through = jnp.where(after // count == chunk, after % count - 1, count - 1)
+        return chunk, origin, through
+
+    @staticmethod
+    def most_segments(loads: jax.Array) -> jax.Array:
+        """The most segments any row (and head) of `loads` `[..., NC, C]` walks (`segment_origins`'): each
+        chunk's first token and each document's. A walk skips its steps past them, the bound taken
+        outside the rows' map so the skip is a branch, not a select."""
+        marks = (loads >= 0) | (jnp.arange(loads.shape[-1]) == 0)
+        return jnp.max(jnp.sum(marks, axis=(-2, -1)))
+
 
 @dataclasses.dataclass(frozen=True)
 class AlignedDocuments:
-    """A forked call's documents laid from chunks' edges (`Forked`, its walks — Mamba-1's portable scan and
-    the turned recurrence's adjoint): each document's tokens moved past the tokens before it to the next
-    multiple of the chunk, the slots between tokens zero (leaving the memory as it was), so a walk takes up
-    each document's memory at its first chunk's edge and leaves its final at its last chunk's. At most
-    `chunk - 1` slots a document, against a row of the call's length were each document laid out apart."""
+    """A forked call's documents laid from chunks' edges (`Forked`; the turned recurrence's adjoint's walk,
+    `templates.recurrence.turned`, where Mamba-1's portable scan walks its documents in place): each
+    document's tokens moved past the tokens before it to the next multiple of the chunk, the slots between
+    tokens zero (leaving the memory as it was), so a walk takes up each document's memory at its first
+    chunk's edge and leaves its final at its last chunk's. At most `chunk - 1` slots a document, against a
+    row of the call's length were each document laid out apart."""
 
     slots: jax.Array
     """Each token's slot on the aligned grid `[B, S]`."""

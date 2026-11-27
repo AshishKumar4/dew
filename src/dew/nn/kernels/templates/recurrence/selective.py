@@ -198,18 +198,20 @@ class Documents:
                              self.scan.interpret, smem=smem)
 
 
-def token_stage(h: list, rates: list, bs, t, step, value, kept) -> list:
-    """Each state's update by the token `t` of the selective scan (`algebra.selective_token`) after its
-    decay (`algebra.selective_decay`): `h` and `rates` a list a state, `bs` the chunk's B rows, `kept` the
-    token's document mask or None. The algebra's generated stage where the run asks for it and the token's
-    case is declared (`dew.algebra.generated.body`)."""
+def token_stage(h: list, rates: list, b_of: Callable[[int], jax.Array], step, value, kept) -> list:
+    """Each state's update by a token of the selective scan (`algebra.selective_token`) after its decay
+    (`algebra.selective_decay`): `h` and `rates` a list a state, `b_of(n)` state `n`'s B at the token (a
+    scalar), `kept` the token's document mask or None. The algebra's generated stage where the run asks for
+    it and the token's case is declared (`dew.algebra.generated.body`), its B read once either way."""
+    loaded = None
     if generated.enabled():
-        b = [bs[t, n].astype(jnp.float32) for n in range(len(h))]
-        operands = (*h, *rates, *b, step, value, *(() if kept is None else (kept,)))
-        if body := generated.body("dew.algebra.component_cases.selective_token", operands):
+        loaded = [b_of(n) for n in range(len(h))]
+        operands = (*h, *rates, *loaded, step, value, *(() if kept is None else (kept,)))
+        if body := generated.body("dew.algebra.recurrence_cases.selective_token", operands):
             return list(body(*operands))
-    return algebra.selective_token(h, [algebra.selective_decay(step, rate, kept) for rate in rates],
-                                   step * value, [bs[t, n].astype(jnp.float32) for n in range(len(h))])
+    decays = [algebra.selective_decay(step, rate, kept) for rate in rates]
+    return algebra.selective_token(h, decays, step * value,
+                                   [b_of(n) for n in range(len(h))] if loaded is None else loaded)
 
 
 @tuning.lowered_once(("scan",))
@@ -289,7 +291,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan, table: tuple = (
                         step_ = dts[t, :].astype(jnp.float32)
                         value = xs[t, :].astype(jnp.float32)
                         kept = None if resets is None else 1.0 - resets[t, 0].astype(jnp.float32)
-                        h = token_stage(h, rates, bs, t, step_, value, kept)
+                        h = token_stage(h, rates, lambda n: bs[t, n].astype(jnp.float32), step_, value, kept)
                         c = [cs[t, n].astype(jnp.float32) for n in range(states)]
                         read = algebra.selective_read(h, c, skip, value)
                         out_smem[t, :] = read.astype(out_smem.dtype)

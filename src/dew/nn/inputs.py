@@ -1322,30 +1322,50 @@ class RowPlan:
         """Return one key per placed row, folded from `key` by global row index.
 
         A pool of processes therefore draws the same values as one process does
-        for the same rows. On a mesh, `key` may be replicated over several
-        processes; the keys are folded from this process's copy on one device
-        and then sharded to their devices.
+        for the same rows. On a mesh the rows fold on the mesh itself, each device
+        its own rows from its process's key, so the fold runs under a mesh in
+        context as every other program of the request does (row 13493).
         """
         sharding = self.sharding
-        # A request key replicated over a multi-process mesh is not addressable,
-        # and folding it would hand `make_array_from_process_local_data` rows this
-        # process cannot place. Every replica holds the same key data, so the rows
-        # fold from this process's first replica, on its one device, and are sliced
-        # from there to their devices. Folded on every device of a replicated key,
-        # they went through the host to be split, because jax reshards a
-        # multi-device array whose shards hold no target slice by reading it.
-        local = key if sharding is None else key.addressable_data(0)
         start = self.process * self.rows
-        indices = jax.device_put(np.arange(start, start + self.count, dtype=np.uint32), local.sharding)
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
+        indices = np.arange(start, start + self.count, dtype=np.uint32)
         if sharding is None:
-            return row_keys
-        sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
-        return jax.random.wrap_key_data(sharded, impl=jax.random.key_impl(key))
+            return jax.vmap(lambda row: jax.random.fold_in(key, row))(jax.device_put(indices, key.sharding))
+        # Each process's rows fold from its own root (processes may hold different seeds, which a request
+        # does not agree on): each row shard's device holds its process's root's words, put there from the
+        # root's own device with no computation outside the fold (none runs on one device under the mesh in
+        # context) and no host read, and the fold repeats each shard's root over its rows.
+        from dew.nn.kernels.options import program
+
+        words = jax.random.key_data(key.addressable_data(0))
+        mesh = self.mesh
+        assert mesh is not None
+        shards = math.prod(mesh.shape[axis] for axis in request_axes(mesh))
+        laid = (shards * words.shape[0], *words.shape[1:])
+        roots = jax.make_array_from_single_device_arrays(laid, sharding, [
+            jax.device_put(words, device) for device in sharding.addressable_devices_indices_map(laid)])
+        placed = jax.make_array_from_process_local_data(sharding, indices)
+        return program(_row_keys, static_argnames=("impl", "mesh"), out_shardings=sharding)(
+            roots, placed, impl=jax.random.key_impl(key), mesh=mesh)
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
         return host_rows(leaf, self.rows)
+
+
+def _row_keys(roots: jax.Array, rows: jax.Array, impl, mesh: jax.sharding.Mesh) -> jax.Array:
+    """Each row's root key folded by its index in `rows` (`RowPlan.keys`): `roots` the key data of `impl`
+    for each of the row shards in turn, stacked along its first axis. Each shard's device wraps its own
+    root and folds its own rows (`jax.shard_map` over the rows' axes), so no reshape moves a sharded axis,
+    Auto or Explicit, and the key data keeps its own shape."""
+    spec = jax.sharding.PartitionSpec(request_axes(mesh))
+
+    def folded(root, own):
+        key = jax.random.wrap_key_data(root, impl=impl)
+        return jax.random.key_data(jax.vmap(lambda row: jax.random.fold_in(key, row))(own))
+
+    words = jax.shard_map(folded, mesh=mesh, in_specs=(spec, spec), out_specs=spec)(roots, rows)
+    return jax.random.wrap_key_data(words, impl=impl)
 
 
 @dataclass(frozen=True)

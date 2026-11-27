@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from speculative_support import assert_replay_drafts_as_a_prefill, block_draw
 
 from dew.batch import coordinates as laid_out
 from dew.interop import Pretrained
@@ -133,6 +134,56 @@ def test_a_cached_draft_after_a_partly_accepted_block_is_on_par_with_its_whole_c
                     lambda seed: (variables, draw(seed)), 'Inkling 2 cached draft', seeds=8, truth_fn=truth)
 
 
+@attending('reference')
+def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
+    """A speculative block's verified stretch replayed into the cache saved before it and recorded into the
+    Markov drafter's windows, its rows keeping four tokens and fewer, drafts its next block as a fresh
+    prefill of each row's history does (row 13317; `speculative_support`)."""
+    def drawn(seed):
+        return block_draw(draw(seed)['input_ids'], 20, 4, np.random.default_rng([0x1331, seed]))
+
+    assert_replay_drafts_as_a_prefill(source.model, source.variables, drawn,
+                                      "Inkling 2's replayed block's draft", seeds=8)
+
+
+def test_a_local_draft_layer_caches_its_window_alone(source):
+    """A local draft layer's cached context holds its window's places alone (row 13541): its stores are
+    `window` slots long where a global layer's hold the decoder's capacity, as the cached draft after a
+    context longer than its window matches the uncached one (`cached`, 40 places over a window of 16)."""
+    model, variables = source.model, source.variables
+    _, opened = model.apply(variables, SHAPE[0], method='init_draft_cache', mutable=['cache'])
+    drafter = opened['cache']['block_drafter']
+    spec = RELEASE['mtp_config']
+    for index in range(spec['num_hidden_layers']):
+        held = drafter[f'layers_{index}']['self_attn']['held_context']
+        lengths = {held[name].shape[1] for name in ('cached_key', 'cached_value')}
+        expected = spec['sliding_window_size'] if index in spec['local_layer_ids'] else model.max_seq_len
+        assert lengths == {expected}, (index, {name: leaf.shape for name, leaf in held.items()})
+
+
+def test_a_local_draft_layers_window_is_its_own_under_a_paged_target(source):
+    """A target whose cache is paged (pages of 64 slots) opens its draft's cache as the pages it names for
+    its global layers and a window's ring unpaged for its local ones, of 16 slots no page divides (row
+    13541): the cached draft is opened and drafts."""
+    import dataclasses
+
+    from dew.nn.kv_cache import KVCache
+
+    model = source.model.clone(kv_cache=dataclasses.replace(source.model.kv_cache or KVCache(), page_size=64))
+    _, opened = model.apply(source.variables, SHAPE[0], method='init_draft_cache', mutable=['cache'])
+    spec = RELEASE['mtp_config']
+    for index in spec['local_layer_ids']:
+        held = opened['cache']['block_drafter'][f'layers_{index}']['self_attn']['held_context']
+        assert held['cached_key'].shape[1] == spec['sliding_window_size']
+    inputs = draw(0)
+    context = context_of(model, source.variables, inputs['input_ids'])
+    _, written = model.apply({**source.variables, 'cache': opened['cache']}, context, None, method='draft',
+                             mutable=['cache'])
+    drafted = model.apply({**source.variables, 'cache': written['cache']}, None, inputs['anchor'],
+                          method='draft', mutable=['cache'])[0]
+    assert np.all(np.isfinite(np.asarray(drafted.logits)))
+
+
 def test_a_count_of_passes_is_refused_where_the_taps_are_recorded(source):
     """A forward recording the draft's taps over fewer passes than the loop's (`loop_passes`) is refused:
     its taps name visits in the loop's order, which a skipped pass would leave zeros in place of."""
@@ -152,6 +203,54 @@ def test_a_load_keeping_no_prediction_depths_reads_no_draft(tmp_path):
 
 
 @attending('reference')
+def test_the_markov_heads_packed_projection_writes_its_live_kernels(source):
+    """The Markov head's `rnn_proj` an export writes packs its step's and its context's live kernels back
+    (`Packed`, row 13538): one weight of each changed, the written tensor is the release's with exactly those
+    two entries changed, at the step's columns (the first 2r) and the context's (after them), its bias the
+    context's."""
+    from safetensors.numpy import load_file
+
+    # The loader's own layouts of the packed tensors (`decoder_bindings`), which an export writes.
+    layouts = {layout.name: layout for layout in source.weight_layouts}
+    head = source.variables['params']['block_drafter']['markov_head']
+    rank = RELEASE['mtp_config']['markov_rank']
+    step = {'kernel': head['rnn_step']['kernel'].at[1, 2].add(1.0)}
+    context = {**head['rnn_context'], 'kernel': head['rnn_context']['kernel'].at[3, 4].add(1.0)}
+    drafter = {**source.variables['params']['block_drafter'],
+               'markov_head': {**head, 'rnn_step': step, 'rnn_context': context}}
+    changed = {**source.variables, 'params': {**source.variables['params'], 'block_drafter': drafter}}
+    given = load_file(TINY / 'mtp.safetensors')
+    expected = np.asarray(given['markov_head.rnn_proj.weight'], np.float32).copy()
+    expected[2, 1] += 1.0
+    expected[4, 2 * rank + 3] += 1.0
+    weight, bias = (layouts[f'mtp.markov_head.rnn_proj.{leaf}'] for leaf in ('weight', 'bias'))
+    np.testing.assert_array_equal(np.asarray(weight.export(changed), np.float32), expected)
+    np.testing.assert_array_equal(np.asarray(bias.export(changed), np.float32),
+                                  np.asarray(given['markov_head.rnn_proj.bias'], np.float32))
+
+
+def test_a_release_writes_each_sidecars_tensors_to_its_own_file(tmp_path):
+    """A release whose family keeps more of its tensors beside its weights (`Placed.sidecars`, Inkling 2's
+    `mtp.safetensors`) writes each sidecar's tensors to its own file under their own names, the prefix
+    off, none of them in the root's shards, as a load reads them back (`sources.with_sidecars`) (row
+    13538); the rest in the shards as before."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.releases import Placed, ReleasePlan
+
+    trunk, head = np.arange(6, dtype=np.float32).reshape(2, 3), np.arange(4, dtype=np.float32)
+    tensors = {'model.weight': trunk, 'mtp.fuse_weight': head}
+    plan = ReleasePlan(Placed({'': ({'model_type': 'tiny'}, tensors)}, sidecars={'mtp.safetensors': 'mtp.'}))
+    plan.write(tmp_path)
+    side = load_file(tmp_path / 'mtp.safetensors')
+    assert list(side) == ['fuse_weight']
+    np.testing.assert_array_equal(side['fuse_weight'], head)
+    shards = {name: tensor for path in tmp_path.glob('model*.safetensors') for name, tensor in
+              load_file(path).items()}
+    assert list(shards) == ['model.weight']
+    np.testing.assert_array_equal(shards['model.weight'], trunk)
+
+
 def test_speculative_decoding_with_its_draft_emits_the_greedy_walk(source):
     """At zero temperature every rejected draft is replaced by the target's own token, so Speculative
     decoding with the draft's blocks emits the greedy walk, a left-padded row included."""

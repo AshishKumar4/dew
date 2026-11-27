@@ -15,7 +15,7 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.custom_derivatives import SymbolicZero
 
-from ..derivatives import Protected, contracted, declared_tangent
+from ..derivatives import KernelGlue, Protected, contracted, declared_tangent
 from ..precision import accumulated, at_least_fp32, rounded_operand, scaled_partial
 from . import generation
 from .templates.product import SCALE_DEPTH, eight
@@ -440,3 +440,36 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
 portable_projection = contracted("test_a_portable_grouped_projection_holds_every_order")(
     declared_tangent(Protected(), _portable_projection, _portable_projection_jvp,
                      nondiff_argnums=(3, 4, 5), symbolic_zeros=True))
+
+
+def decoded_dot(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None) -> jax.Array:
+    """A packed matrix's decoded product as XLA's own dot: bf16 `rows` times its decoded `matrix`, summed in
+    fp32, dense (XLA's dot at the configured precision, its transpose too) or grouped by `group_sizes`
+    (`_decoded_ragged_dot`); no nested `gemm`, whose native transpose of an fp32 cotangent may round it."""
+    if group_sizes is None:
+        return jax.lax.dot(rows, matrix, preferred_element_type=jnp.float32)
+    return _decoded_ragged_dot(rows, matrix, group_sizes)
+
+
+def _ragged_value(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    return xla_ragged_dot(rows, matrix, group_sizes, preferred_element_type=jnp.float32)
+
+
+def _ragged_tangent(primals, tangents):
+    rows, matrix, group_sizes = primals
+    d_rows = tangents[0]
+    # The rows' direction whole, widening the matrix beside it, at the configured precision, which reverse
+    # mode transposes into the whole cotangent's product (`xla_ragged_dot` multiplies two 16-bit operands at
+    # the default alone, which a TPU's kernel takes at no other); frozen, the matrix moves nothing.
+    tangent = (jnp.zeros((rows.shape[0], matrix.shape[-1]), jnp.float32) if isinstance(d_rows, SymbolicZero)
+               else xla_ragged_dot(d_rows.astype(jnp.float32), matrix, group_sizes,
+                                                precision=jax.config.jax_default_matmul_precision,
+                                                preferred_element_type=jnp.float32))
+    return _decoded_ragged_dot(rows, matrix, group_sizes), tangent
+
+
+_decoded_ragged_dot = contracted("test_a_window_product_holds_every_order")(
+    declared_tangent(KernelGlue(), _ragged_value, _ragged_tangent, symbolic_zeros=True))
+"""`decoded_dot`'s grouped product: `xla_ragged_dot` (every backend's ragged dot alike, the rows
+past the groups masked), its rows' tangent the ragged dot of the whole fp32 direction at the configured
+precision, whose transpose multiplies the whole cotangent; frozen, its matrix takes none."""

@@ -727,7 +727,7 @@ def scores_tile(products, decays, scales, apart: int = 0) -> jax.Array:
     """The scores tile's algebra over a chunk's products, their decays and the key columns' scales, its
     declaration's derived forms (`derived_tile("scores", apart)`, `scores_of`); the algebra's generated and
     checked body of a tile read with its own writes, where the run asks for it (`_generated_body`)."""
-    if not apart and (generated := _generated_body("scores", (products, decays, scales))) is not None:
+    if (generated := _generated_body("scores", (products, decays, scales), when=not apart)) is not None:
         return generated(products, decays, scales)
     return derived_tile("scores", apart).mapped({"products": products, "decays": decays, "scales": scales})
 
@@ -1468,12 +1468,13 @@ def system_gradient(lower, keys: TileLoad, columns: int, values: TileLoad, block
     return jnp.where(strict, d_l * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
 
 
-def _generated_body(name: str, operands: tuple):
+def _generated_body(name: str, operands: tuple, *, when: bool = True):
     """The algebra's generated and checked body of this module's component `name` for a call over `operands`
-    where the run asks for it (`dew.algebra.generated.body`); None, the written math to run, otherwise."""
+    where the run asks for it and `when` holds (`dew.algebra.generated.body`); None, the written math to
+    run, otherwise."""
     from dew.algebra import generated
 
-    return generated.body(f"dew.algebra.component_cases.{name}", operands)
+    return generated.body(f"dew.algebra.recurrence_cases.{name}", operands, when=when)
 
 
 def selective_decay(step, rate, kept=None):

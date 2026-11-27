@@ -5,7 +5,7 @@ admits chosen (`dew.algebra.error.choose`, §1.5) under each policy, priced for 
 written beside the declaring module as ordinary Python (`<module>_derived.py`, `printed.source`). The
 generated module uses only `dew.algebra._generated` for case dispatch, not the registry, rules or
 extractor. Its header names the declarations, rule sets, receipts and egglog version.
-`python -m dew.algebra.generate [names] [--check]`; `--check` regenerates in memory and fails
+`python -m dew.algebra.generate [--check]`; `--check` regenerates in memory and fails
 where a written module differs, which tests/test_algebra_generate.py runs on every train.
 
 A declaration's choice is the platform's that measures it: the draws are seeded and fixed, so generation is
@@ -22,9 +22,8 @@ import importlib.metadata
 import importlib.util
 import itertools
 import logging
-import re
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -50,7 +49,8 @@ TESTS = "tests/test_algebra_generate.py"
 """The suite every generated module is held by: its forms on par with their declarations (check 1) and the
 written module what generation writes (`--check`)."""
 
-DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases", "dew.algebra.format_cases",
+DECLARING = ("dew.algebra.acceptance", "dew.algebra.attention_cases", "dew.algebra.format_cases",
+             "dew.algebra.recurrence_cases",
              "dew.sampling.guidance_cases")
 """Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
@@ -141,13 +141,18 @@ class SurrogateBodies:
                 declare(module, case.tangent_name(inactive), form)
         return self
 
+    @functools.cached_property
+    def _keyed(self) -> dict[Hashable, SurrogateCase]:
+        """Each case by its static arguments' exact key (`_exact_key`)."""
+        keyed = {_exact_key(fixed): case for fixed, case in self.cases.items()}
+        if None in keyed:
+            raise ValueError("a surrogate case's static arguments must be hashable")
+        return keyed
+
     def _case(self, fixed: tuple) -> SurrogateCase | None:
-        # JAX permits written nondifferentiable arguments that cannot key a generated case.
-        try:
-            return self.cases.get(fixed)
-        except TypeError:
-            _log.debug("a surrogate's unhashable static arguments use its written body")
-            return None
+        # Static arguments of no exact key (an unhashable one) match no declared case: the written body runs.
+        key = _exact_key(fixed)
+        return None if key is None else self._keyed.get(key)
 
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
         """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
@@ -186,6 +191,29 @@ class SurrogateBodies:
         return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
             surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
                       symbolic_zeros=self.symbolic_zeros))
+
+
+_BITS = frozenset({float, complex, np.float16, np.float32, np.float64, np.complex64, np.complex128})
+"""The number types `_exact_key` reads by their bytes: these exactly, a subclass keeping its own equality."""
+
+
+def _exact_key(value) -> Hashable | None:
+    """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
+    of `_BITS` by its type and bytes (`-0.0` no `0.0`, each NaN its own sign and payload), a plain tuple by
+    its parts, any other hashable value by its type and itself (its own equality: a callable by identity, a
+    subclass by its own). None where it is unhashable, which no declared case is."""
+    kind = type(value)
+    if kind in _BITS:
+        return kind, np.asarray(value).tobytes()
+    if kind is tuple:
+        parts = tuple(_exact_key(part) for part in value)
+        return None if None in parts else (kind, parts)
+    try:
+        hash(value)
+    except TypeError:
+        _log.debug("a surrogate's unhashable static argument %s keys no case: its written body runs", kind)
+        return None
+    return kind, value
 
 
 def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
@@ -463,10 +491,32 @@ def _helpers_written(factored: Mapping[str, printed.Body]) -> str:
                       *printed.imports("\n".join(body)), *body]) + "\n"
 
 
-def _helper_reads(body: Sequence[str], factored: Mapping[str, printed.Body]) -> list[str]:
-    """The shared helpers `body`'s lines call, in their module's order."""
-    text = "\n".join(body)
-    return [name for name in factored if re.search(rf"(?<![\w.]){name}\b", text)]
+def _helper_reads(sources: Iterable[str | printed.Body | printed.Call],
+                  factored: Mapping[str, printed.Body]) -> list[str]:
+    """The shared helpers `sources` (bodies and bound table calls) call, read off their typed calls, in the
+    helpers' module's order. A body of printed text (a compensated form's) shares nothing."""
+    found: set[str] = set()
+
+    def visit(value) -> None:
+        if isinstance(value, printed.Call):
+            if isinstance(value.callee, str) and value.callee in factored:
+                found.add(value.callee)
+            for part in (*value.operands, *(operand for _, operand in value.keywords)):
+                visit(part)
+        elif isinstance(value, printed.StaticTuple):
+            for part in value.values:
+                visit(part)
+
+    for source in sources:
+        if isinstance(source, printed.Body):
+            for statement in source.statements:
+                if isinstance(statement, printed.Binding):
+                    visit(statement.value)
+            for output in source.outputs:
+                visit(output)
+        elif isinstance(source, printed.Call):
+            visit(source)
+    return [name for name in factored if name in found]
 
 
 def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitted: _Emitted,
@@ -500,7 +550,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str], emitt
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]
     header = _header(f"from {module}", names)
-    reads = _helper_reads(body, factored)
+    reads = _helper_reads([*emitted.bodies.values(), *emitted.bound.values()], factored)
     imports = printed.imports("\n".join(body))
     if reads:
         one = f"from {SHARED} import {', '.join(reads)}"
@@ -523,7 +573,7 @@ def _closure(names: Sequence[str], factored: Mapping[str, printed.Body]) -> list
         if (name := pending.pop()) in held:
             continue
         held.add(name)
-        pending += _helper_reads(_rendered({name: factored[name]}), factored)
+        pending += _helper_reads([factored[name]], factored)
     return [name for name in factored if name in held]
 
 
@@ -568,25 +618,18 @@ def _path(module: str) -> Path:
     return origin.with_name(f"{origin.stem}_derived.py")
 
 
-def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]:
-    """Each declaring module's declarations (`names`, every one where None) generated into its module, or,
-    with `check`, regenerated in memory and compared: raises where a written module is not what generation
-    writes."""
+def generate(*, check: bool = False) -> tuple[Generated, ...]:
+    """Every declaring module's declarations generated into its module, all together (their components share
+    one helper module, `SHARED`), or, with `check`, regenerated in memory and compared: raises where a
+    written module is not what generation writes."""
     for module in DECLARING:
         importlib.import_module(module)
     if not DECLARATIONS:
         raise ValueError(f"no declarations: none of {DECLARING} declared a stable form here (a registry "
                          f"other than the declaring modules' own reads none)")
-    chosen = sorted(names or DECLARATIONS)
-    unknown = [name for name in chosen if name not in DECLARATIONS]
-    if unknown:
-        raise ValueError(f"no declaration {unknown}; declared: {sorted(DECLARATIONS)}")
     by_module: dict[str, list[str]] = {}
-    for qualified in chosen:
+    for qualified in sorted(DECLARATIONS):
         by_module.setdefault(qualified.rsplit(".", 1)[0], []).append(qualified)
-    if names is not None and set(chosen) != set(DECLARATIONS):
-        raise ValueError("every declaration generates together: their components share one helper module "
-                         f"({SHARED})")
     sets = tuple(found.name for found in rules.admitted(accurate=False, dev=True))
     found = {module: [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
              for module, declared in by_module.items()}
@@ -615,12 +658,11 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """The generator's command: generate the named declarations (every one where none), or `--check`."""
+    """The generator's command: generate every declaration, or `--check`."""
     parser = argparse.ArgumentParser(prog="python -m dew.algebra.generate", description=__doc__)
-    parser.add_argument("names", nargs="*", help="declarations to generate, by module and name")
     parser.add_argument("--check", action="store_true", help="regenerate in memory and compare")
     arguments = parser.parse_args(argv)
-    for found in generate(arguments.names or None, check=arguments.check):
+    for found in generate(check=arguments.check):
         sys.stderr.write(f"{'checked' if arguments.check else 'wrote'} {found.module}\n")
     return 0
 

@@ -44,58 +44,46 @@ from dew.algebra import _generated
 from dew.algebra.shared_derived import (
     shared_component_4,
     shared_component_13,
-    shared_component_19,
-    shared_component_20,
-    shared_component_25,
+    shared_component_15,
+    shared_component_18,
+    shared_component_23,
+    shared_component_24,
     shared_component_27,
-    shared_component_29,
-    shared_component_35,
-    shared_component_40,
-    shared_component_44,
+    shared_component_30,
+    shared_component_32,
+    shared_component_37,
+    shared_component_43,
     shared_component_45,
+    shared_component_46,
     shared_component_47,
-    shared_component_48,
-    shared_component_49,
 )
 
 
 def _decode_e4m3_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.shift_right_logical_p.bind(v2, np.array(3, dtype=jnp.dtype('uint32')))
-    v4 = lax.and_p.bind(v3, np.array(15, dtype=jnp.dtype('uint32')))
-    v5 = lax.and_p.bind(v2, np.array(7, dtype=jnp.dtype('uint32')))
-    v7, v13, v14 = shared_component_35(
-        v2, v4, v5, lax.shift_right_logical_p, 7, jnp.dtype('uint32'), lax.shift_left_p, 31, 120, 23, 20,
+    v2, v4, v7, v13, v14 = shared_component_27(
+        x1, jnp.dtype('uint32'), lax.shift_right_logical_p, 3, 15, 7, 7, lax.shift_left_p, 31, 120, 23, 20,
         jnp.dtype('float32'))
     v15 = lax.mul_p.bind(
         v14, np.array(float.fromhex('0x1.0000000000000p-9'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = shared_component_44(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
-    v22 = lax.gt_p.bind(v21, np.array(126, dtype=jnp.dtype('uint32')))
-    v23 = lax.ne_p.bind(v7, np.array(0, dtype=jnp.dtype('uint32')))
-    v29, = shared_component_29(
-        v23, v22, v20, jnp.dtype('uint32'), lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
+    v20, v21 = shared_component_37(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
+    v29, = shared_component_32(
+        v21, v7, v20, 126, jnp.dtype('uint32'), 0, lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
     return (v29,)
 
 
 def _decode_e5m2_0(x1):
-    v2 = lax.convert_element_type_p.bind(x1, new_dtype=jnp.dtype('uint32'), weak_type=False, sharding=None)
-    v3 = lax.shift_right_logical_p.bind(v2, np.array(2, dtype=jnp.dtype('uint32')))
-    v4 = lax.and_p.bind(v3, np.array(31, dtype=jnp.dtype('uint32')))
-    v5 = lax.and_p.bind(v2, np.array(3, dtype=jnp.dtype('uint32')))
-    v7, v13, v14 = shared_component_35(
-        v2, v4, v5, lax.shift_right_logical_p, 7, jnp.dtype('uint32'), lax.shift_left_p, 31, 112, 23, 21,
+    v2, v4, v7, v13, v14 = shared_component_27(
+        x1, jnp.dtype('uint32'), lax.shift_right_logical_p, 2, 31, 3, 7, lax.shift_left_p, 31, 112, 23, 21,
         jnp.dtype('float32'))
     v15 = lax.mul_p.bind(
         v14, np.array(float.fromhex('0x1.0000000000000p-16'), dtype=jnp.dtype('float32')), out_dtype=None)
-    v20, v21 = shared_component_44(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
+    v20, v21 = shared_component_37(v4, v7, v15, v13, v2, 0, jnp.dtype('uint32'), 127)
     v22 = lax.or_p.bind(v7, np.array(2139095040, dtype=jnp.dtype('uint32')))
     v23 = lax.bitcast_convert_type_p.bind(v22, new_dtype=jnp.dtype('float32'))
     v24 = lax.eq_p.bind(v21, np.array(124, dtype=jnp.dtype('uint32')))
     v25 = lax.select_n_p.bind(v24, v20, v23)
-    v26 = lax.gt_p.bind(v21, np.array(124, dtype=jnp.dtype('uint32')))
-    v27 = lax.ne_p.bind(v7, np.array(0, dtype=jnp.dtype('uint32')))
-    v33, = shared_component_29(
-        v27, v26, v25, jnp.dtype('uint32'), lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
+    v33, = shared_component_32(
+        v21, v7, v25, 124, jnp.dtype('uint32'), 0, lax.shift_left_p, 31, 2143289344, jnp.dtype('float32'))
     return (v33,)
 
 
@@ -120,7 +108,7 @@ def _e8m0_decode_0(x1):
     v13 = lax.not_p.bind(v4)
     v14 = lax.not_p.bind(v10)
     v15 = lax.and_p.bind(v13, v14)
-    v33, = shared_component_27(v15, v11, v12, v10, v4)
+    v33, = shared_component_24(v15, v11, v12, v10, v4)
     v34 = lax.bitcast_convert_type_p.bind(v33, new_dtype=jnp.dtype('float32'))
     v35 = lax.bitcast_convert_type_p.bind(v34, new_dtype=jnp.dtype('uint32'))
     return (v35,)
@@ -136,7 +124,7 @@ def _e8m0_exponents_0(x1):
 
 
 def _fp8_epilogue_0(x1):
-    v2, v23, v215 = shared_component_13(
+    v2, v23, v215 = shared_component_15(
         x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (32, 1, 128), (2,), (x1.shape[0], 1, x1.shape[1]),
         (0, 1), (32, 128), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607,
         jnp.dtype('int32'), 127, 0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648,
@@ -145,7 +133,7 @@ def _fp8_epilogue_0(x1):
 
 
 def _fp8_epilogue_1(x1):
-    v2, v23, v215 = shared_component_13(
+    v2, v23, v215 = shared_component_15(
         x1, jnp.dtype('bfloat16'), jnp.dtype('float32'), (64, 2, 128), (2,), (x1.shape[0], 2, 128), (0, 1),
         (64, 256), jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, 8388607, jnp.dtype('int32'), 127,
         0, (x1.shape[0], x1.shape[1]), (), lax.shift_left_p, 254, 2147483648, jnp.dtype('uint8'),
@@ -194,7 +182,7 @@ def _gemm_partial_scale_0(x1, x2, x3):
 
 
 def _mxfp8_block_decode_0(x1, x2):
-    v130, = shared_component_47(
+    v130, = shared_component_45(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
         jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
@@ -203,7 +191,7 @@ def _mxfp8_block_decode_0(x1, x2):
 
 
 def _mxfp8_block_decode_1(x1, x2):
-    v130, = shared_component_47(
+    v130, = shared_component_45(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
         jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), ())
@@ -211,7 +199,7 @@ def _mxfp8_block_decode_1(x1, x2):
 
 
 def _mxfp8_block_decode_bf16_0(x1, x2):
-    v132, = shared_component_45(
+    v132, = shared_component_43(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], x1.shape[0]), (0, 1), (32, 256), jnp.dtype('float8_e4m3fn'),
         jnp.dtype('float32'), jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p,
@@ -220,7 +208,7 @@ def _mxfp8_block_decode_bf16_0(x1, x2):
 
 
 def _mxfp8_block_decode_bf16_1(x1, x2):
-    v132, = shared_component_45(
+    v132, = shared_component_43(
         x2, x1, jnp.dtype('float8_e8m0fnu'), jnp.dtype('uint8'), jnp.dtype('int32'),
         (x1.shape[0], x2.shape[1], 32), (0, 1), (64, 128), jnp.dtype('float8_e4m3fn'), jnp.dtype('float32'),
         jnp.dtype('uint32'), lax.shift_right_logical_p, lax.shift_left_p, (x1.shape[0], x1.shape[1]), (), 16,
@@ -230,40 +218,14 @@ def _mxfp8_block_decode_bf16_1(x1, x2):
 
 def _mxfp8_scale_0(x1):
     v2 = lax.bitcast_convert_type_p.bind(x1, new_dtype=jnp.dtype('float32'))
-    v19, v25 = shared_component_19(
-        v2, jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, jnp.dtype('int32'), 127, 8, 0,
+    v19, v25 = shared_component_13(
+        v2, jnp.dtype('uint32'), lax.shift_right_logical_p, 23, 255, jnp.dtype('int32'), 127, 8, -127, 0,
         (x1.shape[0], x1.shape[1]), ())
     return (v19, v25)
 
 
-def _nvfp4_block_decode_0(x1, x2):
-    v311, v384 = shared_component_40(
-        x1, x2, (1, 0), (64, 8, 8), jnp.dtype('uint32'), (8,), (1, 1, 8), (2,), lax.shift_left_p,
-        (x1.shape[0], 8), (), jnp.dtype('uint8'), jnp.dtype('float8_e4m3fn'), lax.shift_right_logical_p,
-        jnp.dtype('uint16'), (64, 64), jnp.dtype('float32'), jnp.dtype('int32'),
-        (x2.shape[0], 16, x1.shape[0]), (0, 2))
-    v385 = lax.reshape_p.bind(v384, new_sizes=(64, 64), dimensions=None, sharding=None)
-    v386 = lax.mul_p.bind(v311, v385, out_dtype=None)
-    v387 = lax.convert_element_type_p.bind(
-        v386, new_dtype=jnp.dtype('bfloat16'), weak_type=False, sharding=None)
-    return (v387,)
-
-
-def _nvfp4_block_decode_1(x1, x2):
-    v311, v384 = shared_component_40(
-        x1, x2, (1, 0), (32, 16, 8), jnp.dtype('uint32'), (x2.shape[0],), (1, 1, x2.shape[0]), (2,),
-        lax.shift_left_p, (x1.shape[1], 16), (), jnp.dtype('uint8'), jnp.dtype('float8_e4m3fn'),
-        lax.shift_right_logical_p, jnp.dtype('uint16'), (32, 128), jnp.dtype('float32'), jnp.dtype('int32'),
-        (x2.shape[0], 16, x1.shape[1]), (0, 2))
-    v385 = lax.reshape_p.bind(v384, new_sizes=(128, 32), dimensions=None, sharding=None)
-    v386 = lax.mul_p.bind(v311, v385, out_dtype=None)
-    v387 = lax.convert_element_type_p.bind(
-        v386, new_dtype=jnp.dtype('bfloat16'), weak_type=False, sharding=None)
-    return (v387,)
-
-
 def _nvfp4_scale_0(x1):
-    v71, = shared_component_20(
+    v71, = shared_component_18(
         x1, jnp.dtype('uint32'), lax.shift_right_logical_p, 3, lax.shift_left_p, 20, 27, 2280652800,
         jnp.dtype('float32'), jnp.dtype('int32'), 127, 128, 0, 31, 2143289344)
     v72 = lax.bitcast_convert_type_p.bind(v71, new_dtype=jnp.dtype('uint32'))
@@ -343,13 +305,13 @@ _encode_e2m1_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1086324736, p9=2139095040, p10=23, p11=4294967170, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=23, p20=22, p24=7, p25=3),
+        p6=(16, 128), p7=(), p8=0, p12=1086324736, p16=2139095040, p22=23, p26=4294967170,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=23, p36=22, p47=32, p53=7, p62=3),
     ('default', 'sm90', (((32, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1086324736, p9=2139095040, p10=23, p11=4294967170, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=23, p20=22, p24=7, p25=3),
+        p6=(32, 128), p7=(), p8=0, p12=1086324736, p16=2139095040, p22=23, p26=4294967170,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=23, p36=22, p47=32, p53=7, p62=3),
 }
 
 
@@ -362,13 +324,13 @@ _encode_e4m3_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1138753536, p9=2139095040, p10=23, p11=4294967176, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=21, p20=20, p24=127, p25=7),
+        p6=(16, 128), p7=(), p8=0, p12=1138753536, p16=2139095040, p22=23, p26=4294967176,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=21, p36=20, p47=32, p53=127, p62=7),
     ('default', 'sm90', (((32, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1138753536, p9=2139095040, p10=23, p11=4294967176, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=21, p20=20, p24=127, p25=7),
+        p6=(32, 128), p7=(), p8=0, p12=1138753536, p16=2139095040, p22=23, p26=4294967176,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=21, p36=20, p47=32, p53=127, p62=7),
 }
 
 
@@ -381,13 +343,13 @@ _encode_e5m2_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(16, 128), p6=(), p7=0, p8=1197473792, p9=2139095040, p10=23, p11=4294967184, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=22, p20=21, p24=127, p25=7),
+        p6=(16, 128), p7=(), p8=0, p12=1197473792, p16=2139095040, p22=23, p26=4294967184,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=22, p36=21, p47=32, p53=127, p62=7),
     ('default', 'sm90', (((32, 128), 'uint32'),)):
         functools.partial(
         shared_component_4, p0=lax.shift_right_logical_p, p2=31, p3=jnp.dtype('uint32'), p4=2147483647,
-        p5=(32, 128), p6=(), p7=0, p8=1197473792, p9=2139095040, p10=23, p11=4294967184, p12=8388607, p13=1,
-        p14=jnp.dtype('int32'), p15=lax.shift_left_p, p18=22, p20=21, p24=127, p25=7),
+        p6=(32, 128), p7=(), p8=0, p12=1197473792, p16=2139095040, p22=23, p26=4294967184,
+        p31=jnp.dtype('int32'), p32=lax.shift_left_p, p34=22, p36=21, p47=32, p53=127, p62=7),
 }
 
 
@@ -451,16 +413,16 @@ def mxfp8_block_decode_bf16(*operands, policy: str = 'default', target: str = 's
 _mxfp8_epilogue_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((32, 128), 'float32'),)):
         functools.partial(
-        shared_component_25, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p14=(32, 128), p15=(),
-        p16=127, p17=lax.shift_left_p, p18=23, p19=jnp.dtype('float32'), p33=jnp.dtype('uint8'),
-        p34=jnp.dtype('float8_e4m3fn'), p35=jnp.dtype('float8_e8m0fnu')),
+        shared_component_23, p1=(32, 4, 32), p2=(2,), p3=(32, 4, 32), p4=(0, 1), p5=(32, 128),
+        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p15=(32, 128), p16=(),
+        p17=127, p20=lax.shift_left_p, p21=23, p23=jnp.dtype('float32'), p43=jnp.dtype('uint8'),
+        p44=jnp.dtype('float8_e4m3fn'), p46=jnp.dtype('float8_e8m0fnu')),
     ('default', 'sm90', (((64, 128), 'float32'),)):
         functools.partial(
-        shared_component_25, p1=(64, 4, 32), p2=(2,), p3=(64, 4, 32), p4=(0, 1), p5=(64, 128),
-        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p14=(64, 128), p15=(),
-        p16=127, p17=lax.shift_left_p, p18=23, p19=jnp.dtype('float32'), p33=jnp.dtype('uint8'),
-        p34=jnp.dtype('float8_e4m3fn'), p35=jnp.dtype('float8_e8m0fnu')),
+        shared_component_23, p1=(64, 4, 32), p2=(2,), p3=(64, 4, 32), p4=(0, 1), p5=(64, 128),
+        p6=jnp.dtype('uint32'), p7=lax.shift_right_logical_p, p10=jnp.dtype('int32'), p15=(64, 128), p16=(),
+        p17=127, p20=lax.shift_left_p, p21=23, p23=jnp.dtype('float32'), p43=jnp.dtype('uint8'),
+        p44=jnp.dtype('float8_e4m3fn'), p46=jnp.dtype('float8_e8m0fnu')),
 }
 
 
@@ -484,9 +446,18 @@ def mxfp8_scale(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _nvfp4_block_decode_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((64, 64), 'uint32'), ((4, 64), 'uint8'))):
-        _nvfp4_block_decode_0,
+        functools.partial(
+        shared_component_30, p1=(1, 0), p2=(64, 8, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
+        p8=lax.shift_left_p, p10=(64, 8), p11=(), p12=jnp.dtype('uint8'), p14=jnp.dtype('float8_e4m3fn'),
+        p16=lax.shift_right_logical_p, p23=jnp.dtype('uint16'), p24=(64, 64), p26=jnp.dtype('float32'),
+        p27=jnp.dtype('int32'), p43=(4, 16, 64), p44=(0, 2), p45=(64, 64), p46=jnp.dtype('bfloat16')),
     ('default', 'sm90', (((128, 32), 'uint32'), ((8, 32), 'uint8'))):
-        _nvfp4_block_decode_1,
+        functools.partial(
+        shared_component_30, p1=(1, 0), p2=(32, 16, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8),
+        p7=(2,), p8=lax.shift_left_p, p10=(32, 16), p11=(), p12=jnp.dtype('uint8'),
+        p14=jnp.dtype('float8_e4m3fn'), p16=lax.shift_right_logical_p, p23=jnp.dtype('uint16'), p24=(32, 128),
+        p26=jnp.dtype('float32'), p27=jnp.dtype('int32'), p43=(8, 16, 32), p44=(0, 2), p45=(128, 32),
+        p46=jnp.dtype('bfloat16')),
 }
 
 
@@ -498,14 +469,14 @@ def nvfp4_block_decode(*operands, policy: str = 'default', target: str = 'sm90')
 _nvfp4_payload_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 32), 'uint32'),)):
         functools.partial(
-        shared_component_49, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
-        p8=lax.shift_left_p, p10=(32, 2), p11=(), p12=jnp.dtype('uint8'), p15=lax.shift_right_logical_p,
-        p20=jnp.dtype('uint16'), p21=(32, 16), p23=jnp.dtype('float32'), p24=jnp.dtype('int32')),
+        shared_component_46, p1=(1, 0), p2=(32, 2, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
+        p8=lax.shift_left_p, p10=(32, 2), p11=(), p12=jnp.dtype('uint8'), p14=lax.shift_right_logical_p,
+        p21=jnp.dtype('uint16'), p22=(32, 16), p24=jnp.dtype('float32'), p25=jnp.dtype('int32')),
     ('default', 'sm90', (((32, 64), 'uint32'),)):
         functools.partial(
-        shared_component_49, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
-        p8=lax.shift_left_p, p10=(64, 4), p11=(), p12=jnp.dtype('uint8'), p15=lax.shift_right_logical_p,
-        p20=jnp.dtype('uint16'), p21=(64, 32), p23=jnp.dtype('float32'), p24=jnp.dtype('int32')),
+        shared_component_46, p1=(1, 0), p2=(64, 4, 8), p3=jnp.dtype('uint32'), p4=(8,), p6=(1, 1, 8), p7=(2,),
+        p8=lax.shift_left_p, p10=(64, 4), p11=(), p12=jnp.dtype('uint8'), p14=lax.shift_right_logical_p,
+        p21=jnp.dtype('uint16'), p22=(64, 32), p24=jnp.dtype('float32'), p25=jnp.dtype('int32')),
 }
 
 
@@ -559,9 +530,9 @@ def quantized_ste_tangent(*operands, policy: str = 'default', target: str = 'sm9
 
 _rounded_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(shared_component_48, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(shared_component_48, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_47, p1=jnp.dtype('bfloat16'), p2=jnp.dtype('float32')),
 }
 
 
@@ -572,9 +543,9 @@ def rounded(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _rounded_fp16_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (((16, 32), 'float32'),)):
-        functools.partial(shared_component_48, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
     ('default', 'sm90', (((8, 64), 'float32'),)):
-        functools.partial(shared_component_48, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
+        functools.partial(shared_component_47, p1=jnp.dtype('float16'), p2=jnp.dtype('float32')),
 }
 
 

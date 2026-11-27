@@ -7,9 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
-- Generated components share one helper module across declaring modules, so the numeric formats'
-  components are declared on their own (`dew.algebra.format_cases`). Add checked NVFP4 block decode and
-  the recurrence skip's pullback; production dispatch is unchanged.
+- Generated components share one helper module across declaring modules, so each family's components are
+  declared on their own (`dew.algebra.attention_cases`, `format_cases`, `recurrence_cases`). Add checked
+  NVFP4 block decode and the recurrence skip's pullback; production dispatch is unchanged.
 - `generation.chosen(generated="generated")` runs the algebra's checked generated bodies in place of the
   selective scan's decay, token stage, readout, step lift and adjoint, the skip's and gated values'
   pullbacks, the key memory decay, the scores tile and the split-KV merge where a call's case is declared,

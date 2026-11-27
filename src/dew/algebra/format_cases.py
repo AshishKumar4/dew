@@ -176,12 +176,13 @@ def _nvfp4_scale_draw(seed, operands):
 
 
 def _nvfp4_payload(codes):
-    return bits.nvfp4_codes(bits.packed(codes.T, bits.E2M1).T)
+    # The decoded codes' float32 words: compared as words, a negative zero (code 8) is no positive one.
+    return jax.lax.bitcast_convert_type(bits.nvfp4_codes(bits.packed(codes.T, bits.E2M1).T), jnp.uint32)
 
 
 def _nvfp4_payload_truth(codes):
-    values = jnp.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], jnp.float64)[codes & 7]
-    return jnp.where(codes & 8 != 0, -values, values)
+    values = jnp.asarray(np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32).view(np.uint32))
+    return values[codes & 7] | ((codes & 8) << 28)
 
 
 def _nvfp4_payload_draw(seed, operands):

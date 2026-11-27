@@ -46,6 +46,7 @@ from dew.interop.decoder_parts import (
     KindFields,
     Leaves,
     MixtureFields,
+    Packed,
     WrapperFields,
     context_lengths,
     record_float,
@@ -370,6 +371,24 @@ def _draft_kept(config: Mapping[str, object], kept: int) -> dict:
     return {'mtp_config': None} if kept == 0 and config.get('mtp_config') else {}
 
 
+def _rnn_widths(config: Mapping[str, object]) -> tuple[int, int]:
+    """The Markov head's `rnn_proj` columns: its step's (the state and the token before's embedding, 2r)
+    then its context's (a place's states and the carried taps, 2D), as vLLM's head splits them."""
+    draft = _records.record(config['block_draft'], 'block_draft')
+    rank = _records.integer(draft['markov_rank'], 'markov_rank')
+    return 2 * rank, 2 * _records.integer(config['emb_features'], 'emb_features')
+
+
+_PACKED = (
+    Packed('markov_head.rnn_proj.weight', ('markov_head.rnn_step.weight', 'markov_head.rnn_context.weight'),
+           -1, widths=_rnn_widths),
+    Packed('markov_head.rnn_proj.bias', ('markov_head.rnn_context.bias',), 0),
+)
+"""The draft's packed tensors (its `mtp.safetensors`), split as a load reads them and packed back as an
+export writes them (row 13538): the Markov head's `rnn_proj` `[3r, 2r + 2D]` its step's and its
+context's columns, its bias the context's alone."""
+
+
 def _drafting(config: Config, slots: Mapping[str, str]) -> bool:
     """Whether the record carries the block drafter the draft's tensors fill."""
     return isinstance(config.get('block_draft'), Mapping)
@@ -453,14 +472,6 @@ def _inkling2_prepare(tensors: Mapping[str, Stored],
             for expert in range(value.shape[0]):
                 prepared[f'{stem}.{expert}.gate_proj.weight'] = value[expert, 0::2]
                 prepared[f'{stem}.{expert}.up_proj.weight'] = value[expert, 1::2]
-        elif name == f'{DRAFT}markov_head.rnn_proj.weight':
-            # `[3r, 2r + 2D]`: the step's columns (the state and the token before's embedding), then the
-            # context's (a place's states and the carried taps), as vLLM's head splits them.
-            rank = value.shape[0] // 3
-            prepared[f'{DRAFT}markov_head.rnn_step.weight'] = value[:, :2 * rank]
-            prepared[f'{DRAFT}markov_head.rnn_context.weight'] = value[:, 2 * rank:]
-        elif name == f'{DRAFT}markov_head.rnn_proj.bias':
-            prepared[f'{DRAFT}markov_head.rnn_context.bias'] = value
         elif name.endswith('.mlp.experts.w2_weight'):
             for expert in range(value.shape[0]):
                 prepared[f'{stem}.{expert}.down_proj.weight'] = value[expert]
@@ -527,6 +538,7 @@ INKLING2 = DecoderFamily(
     'Inkling2LoopForConditionalGeneration',
     routes=_ROUTES,
     prepare=_inkling2_prepare,
+    packed=_PACKED,
     sidecars=lambda config: {'mtp.safetensors': DRAFT} if config.get('mtp_config') else {},
     whole_drafter=_draft_kept,
     preserve_source_layout=True,

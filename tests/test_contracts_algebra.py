@@ -11,19 +11,37 @@ from contract_support import EDGES, ORDER_SETS, assert_contract, normal_draw
 from dew.algebra import means, scan, windows
 
 
+def _recorded(module):
+    """`module`'s generated bodies by name, each call of one recorded: a test holds a composed surrogate to
+    have run its generated bodies, not the written ones its declaration falls back to."""
+    taken: list[str] = []
+
+    def emitted(name):
+        body = getattr(module, name)
+
+        def run(*operands, **options):
+            taken.append(name)
+            return body(*operands, **options)
+        return run
+    return emitted, taken
+
+
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
-    from dew.algebra import format_cases, format_cases_derived as emitted
+    from dew.algebra import format_cases, format_cases_derived
     from dew.nn import precision
 
-    composed = format_cases.ROUNDED.assembled(lambda name: getattr(emitted, name))
+    emitted, taken = _recorded(format_cases_derived)
+    composed = format_cases.ROUNDED.assembled(emitted)
 
     def rounded(value):
         return composed(value, dtype=dtype)
 
     gradient = jax.grad(lambda x: jnp.sum(rounded(x) ** 2))
+    name = "rounded" if dtype == jnp.bfloat16 else "rounded_fp16"
 
-    for shape in ((16, 32), (3, 5)):  # generated geometry and the written fallback
+    for shape, generated in (((16, 32), True), ((3, 5), False)):  # generated geometry, the written fallback
+        taken.clear()
         x = np.full(shape, 1.003, np.float32)
         dx = np.full_like(x, 1.007)
         primal, direction = jax.jit(lambda x, dx: jax.jvp(rounded, (x,), (dx,)))(x, dx)
@@ -33,13 +51,20 @@ def test_generated_rounded_bodies_keep_the_written_surrogate_law(dtype):
         np.testing.assert_array_equal(pullback(jnp.asarray(dx))[0], dx)
         _, higher = jax.jit(lambda x, dx: jax.jvp(gradient, (x,), (dx,)))(x, dx)
         np.testing.assert_array_equal(higher, 2 * dx)
+        assert ({name, f"{name}_tangent"} <= set(taken)) if generated else not taken, taken
+    taken.clear()
+    x, dx, cotangent = normal_draw(6110, (16, 32), (16, 32), (16, 32))
+    assert_contract(rounded, (x,), (dx,), cotangent, f"the generated {name} surrogate",
+                    plain_fn=lambda value: precision.rounded_operand(value, dtype))
+    assert name in taken
 
 
 def test_generated_quantized_straight_through_holds_signed_zero_and_higher_orders():
-    from dew.algebra import format_cases, format_cases_derived as emitted
+    from dew.algebra import format_cases, format_cases_derived
     from dew.nn import fake_quant
 
-    composed = format_cases.QUANTIZED_STE.assembled(lambda name: getattr(emitted, name))
+    emitted, taken = _recorded(format_cases_derived)
+    composed = format_cases.QUANTIZED_STE.assembled(emitted)
     x = jnp.full((16, 32), 7.0, jnp.float32)
     stored = jnp.full(x.shape, -0.0, jnp.bfloat16)
     tangent = jnp.full_like(x, 3)
@@ -52,12 +77,14 @@ def test_generated_quantized_straight_through_holds_signed_zero_and_higher_order
     gradient = jax.grad(lambda arg: jnp.square(composed(arg, stored)).sum())
     _, higher = jax.jvp(gradient, (x,), (tangent,))
     np.testing.assert_array_equal(higher, 2 * tangent)
+    assert {"quantized_ste", "quantized_ste_tangent"} <= set(taken), taken
 
 
 def test_generated_guidance_preserves_the_scale_direction_at_both_endpoints():
-    from dew.sampling import guidance_cases, guidance_cases_derived as emitted
+    from dew.sampling import guidance_cases, guidance_cases_derived
 
-    composed = guidance_cases.GUIDED.assembled(lambda name: getattr(emitted, name))
+    emitted, taken = _recorded(guidance_cases_derived)
+    composed = guidance_cases.GUIDED.assembled(emitted)
     c = jnp.full((16, 64), 3.0, jnp.float32)
     u = jnp.full_like(c, 1)
     weight = jnp.broadcast_to(jnp.arange(16, dtype=jnp.float32)[:, None] % 2, (16, 1))
@@ -73,6 +100,7 @@ def test_generated_guidance_preserves_the_scale_direction_at_both_endpoints():
         return jax.jvp(lambda w: gradient(c, w), (weight,), (jnp.ones_like(weight),))[1]
 
     np.testing.assert_array_equal(higher(composed), jnp.ones_like(c))
+    assert taken and all(name.startswith("guided") for name in taken), taken
 
 
 def _plain(outputs, totals, anchors):
@@ -167,3 +195,58 @@ def test_a_normal_draw_is_read_where_a_gpu_parts_prepare_places_its_calls(dtype)
             for mine, theirs in zip(drawn, expected, strict=True):
                 bits = np.uint16 if mine.itemsize == 2 else np.uint32
                 np.testing.assert_array_equal(mine.view(bits), theirs.view(bits))
+
+
+def test_a_surrogate_case_keys_its_static_arguments_exactly():
+    """A generated surrogate case is keyed by its static arguments exactly (`generate._exact_key`): `-0.0`,
+    equal to `0.0` as a Python value, is no `0.0` case; a set, unhashable, is no `frozenset` case; a tuple
+    subclass equal only to itself is no case of another with its contents; and a list holding itself keys
+    none: each runs the written primal and tangent, which differ from the declared bodies'."""
+    from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, SurrogateCase
+
+    def written(x, shift):
+        return x + jnp.copysign(1.0, shift if isinstance(shift, float) else -1.0)
+
+    def written_tangent(shift, primals, tangents, value):
+        del primals, value
+        return tangents[0] * jnp.copysign(2.0, shift if isinstance(shift, float) else -1.0)
+
+    def cases(count):
+        operand = jax.ShapeDtypeStruct((4,), jnp.float32)
+        return Cases(((operand,) * count,), lambda seed, operands: operands, seeds=1, policies=("default",))
+
+    def declared_case(name):
+        return SurrogateCase(name, ComponentForm(lambda x: x + 1, lambda x: x + 1, cases(1)),
+                             {(): ComponentForm(lambda x, dx, value: dx, lambda x, dx, value: dx, cases(3))},
+                             output_tree=(jax.tree.structure(0),))
+
+    class Held(list):
+        """A list no pytree registry knows, which reaches the surrogate whole, holding itself."""
+
+    class Named(tuple):
+        """A tuple equal only to itself."""
+
+        __eq__ = object.__eq__
+        __hash__ = object.__hash__
+
+    cyclic = Held()
+    cyclic.append(cyclic)
+    named = Named((1,))
+    surrogate = SurrogateBodies(written, written_tangent, (1,), symbolic_zeros=False, cases={
+        (0.0,): declared_case("plus"), (frozenset({1}),): declared_case("member"),
+        (named,): declared_case("named")})
+
+    def emitted(name):
+        def body(*operands, policy, target):
+            del policy, target
+            return operands[0] + 1 if not name.endswith("_tangent") else operands[1]
+        return body
+
+    composed = surrogate.assembled(emitted)
+    x = jnp.zeros((4,), jnp.float32)
+    for shift, value, slope in ((0.0, 1.0, 1.0), (frozenset({1}), 1.0, 1.0), (named, 1.0, 1.0),
+                                (-0.0, -1.0, -2.0), ({1}, -1.0, -2.0), (Named((1,)), -1.0, -2.0),
+                                (cyclic, -1.0, -2.0)):
+        primal, tangent = jax.jvp(lambda arg, shift=shift: composed(arg, shift), (x,), (jnp.ones_like(x),))
+        np.testing.assert_array_equal(primal, np.full(4, value, np.float32))
+        np.testing.assert_array_equal(tangent, np.full(4, slope, np.float32))

@@ -796,11 +796,12 @@ def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, va
 @pytest.mark.parametrize("case", IRREGULAR)
 def test_the_backward_walks_many_key_tiles(case):
     """The irregular calls (`IRREGULAR`) at 32-key tiles, a softcap, sinks and ALiBi, fp32: the first
-    pass's maximum and anchor move across key tiles. Interpreted on CPU at 32-key tiles, `(97, 129)` walks
-    4 irregular query tiles over 5 irregular key tiles (full, diagonal, skipped, and 1-element remainder
-    tiles) across all 64 draws within the train CI wall budget (row 10133); on GPU, the full `IRREGULAR`
-    shape runs."""
-    call = IRREGULAR[case] if ON_GPU else {**IRREGULAR[case], "shape": (97, 129)}
+    pass's maximum and anchor move across key tiles. At `(97, 129)` it walks 4 irregular query tiles over 5
+    irregular key tiles (full, diagonal, skipped, and 1-element remainder tiles), interpreted on a CPU
+    across all 64 draws within the train CI wall budget (row 10133), and on a GPU too: an A100 tier's
+    prepare compiling it at the full `IRREGULAR` shape stalled past its 6770 s deadline inside XLA's compile
+    (rows 13581-13583)."""
+    call = {**IRREGULAR[case], "shape": (97, 129)}
     check_backward(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[0])
 
 

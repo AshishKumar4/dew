@@ -1374,33 +1374,32 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 
 ### 6.11 The generator
 
-The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components
-(`ComponentForm`, rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV
-merge, the backward's overlapped weight and dropped anchored cotangent phases in both tile orientations,
-the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
-pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
-solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
-the selective scan's packed and unpacked decay. A paired surrogate declaration checks both BF16 and
-FP16 rounded-operand bodies and preserves their written higher-order rule. Other cases cover the masked
-softcap hook and its slope, projected sink state,
-document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
-Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
-witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload.
-The forward walk emits the pure weights and rescale in either layout without owning its dot;
+The registry covers stable forms (`StableForm`, rows 9035 and 9037) and flat components (`ComponentForm`,
+rows 6109 and 6110). Attention pilots cover the unscaled online step and split-KV merge, the backward's
+overlapped weight and dropped anchored cotangent phases in both tile orientations, the accurate query
+cotangent, the key-first weight consumer and the value-gradient tile. Recurrence pilots cover scores,
+compensated prefix differences, chunk carry and reverse carry, the strict-lower solver's doubling, weighted
+value application and inverse adjoint, KDA's memory-decay cotangent, and the selective scan's packed and
+unpacked decay. A paired surrogate declaration checks both BF16 and FP16 rounded-operand bodies and
+preserves their written higher-order rule. Other cases cover the masked softcap hook and its slope,
+projected sink state, document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band,
+the selective adjoint, Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8
+epilogues. Exact byte witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4
+packed payload. The forward walk emits the pure weights and rescale in either layout without owning its dot;
 finalization reads the walk's existing named slots. The straight-through quantizer and classifier-free
 guidance have separately checked value and tangent bodies. Independent code witnesses cover the portable
-saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone
-E8M0 decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including
-signed zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's
-readout uses its written balanced tree over the named per-state values. The MX block read covers every E8M0
-byte's exponent, and the MXFP8 block decode's portable scale application lands all E4M3 codes under all
-scale bytes in each draw in FP32 and BF16 with one rounding, subnormals and signed NaNs included. The
-selective scan's token stage composes its per-state decay and update as the template steps it; its
-backward's subnormal-step lift and one state's turn of the tangent sums are checked as the block's loop
-takes them. NVFP4's block decode lands all codes and all finite E4M3 scale bytes of each draw in BF16, and
-the recurrence skip's pullback is checked beside the gated values'. Both written and generated components check their primitives on the CPU; an FP8 code's exact
-widening to FP32 is the one FP8 conversion check 2 admits.
-Production still uses the written bodies (row 3272).
+saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone E8M0
+decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including signed
+zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's readout uses
+its written balanced tree over the named per-state values. The MX block read covers every E8M0 byte's
+exponent, and the MXFP8 block decode's portable scale application lands each E4M3 code and each scale byte
+of every draw in FP32 and BF16 with one rounding, their pairings sampled across the draws, subnormals and
+signed NaNs included. The selective scan's token stage composes its per-state decay and update as the
+template steps it; its backward's subnormal-step lift and one state's turn of the tangent sums are checked
+as the block's loop takes them. NVFP4's block decode lands each code and each finite E4M3 scale byte of
+every draw in BF16, and the recurrence skip's pullback is checked beside the gated values'. Both written and
+generated components check their primitives on the CPU; an FP8 code's exact widening to FP32 is the one FP8
+conversion check 2 admits. Production still uses the written bodies (row 3272).
 
 ```python
 @dataclass(frozen=True)
@@ -1427,7 +1426,7 @@ class StableForm:                     # a numeric function of Dew's own
 DECLARATIONS: dict[str, StableForm | ComponentForm]
 
 def declare(module: str, name: str, form: StableForm | ComponentForm): ...
-def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tuple[Generated, ...]: ...
+def generate(*, check: bool = False) -> tuple[Generated, ...]: ...
 ```
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
@@ -1482,7 +1481,7 @@ the written trace and independent truth. Sharing and case selection add no run-t
   split-KV merge (`attention_algebra._derived_merge`, every walk's and split decode's) are its sites. A
   component's default changes only on its native receipts (M-AL-5).
 
-- `python -m dew.algebra.generate [names] [--check]` traces each declared case. For a stable form it
+- `python -m dew.algebra.generate [--check]` traces every declared case. For a stable form it
   saturates with the dev-time sets, measures error against the declaration at float64 and selects
   by accuracy and price (`dew.algebra.error.choose`). For a component it checks the printed arithmetic
   against the traced form and its declared reference, without searching for an alternative form. The

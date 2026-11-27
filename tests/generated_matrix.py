@@ -2,16 +2,15 @@
 bodies take (`dew.algebra.generated`) run with the choice `generated` named "generated", at its component's
 declared cases, on par with the same site named "written", from its declaration's float64 truth.
 
-The sites are the templates' own functions, each its component's declared function: the selective scan's
-decay, readout, backward step lift and adjoint, plain or at its lifted step
-(`recurrence_algebra.selective_decay`, `selective_read`, `selective_dx_scale`, `selective_adjoint`), the
-recurrence skip's pullback (`skipped_back`), the gated delta rule's value pullback, key memory decay and
-scores tile (`gated_values_back`, `key_memory_decay`, `scores_tile`) and the derived split-KV merge
-(`attention_algebra.merge`); the token stage's declared function composes the written decay and update, so its
-site is called apart (`selective.token_stage`, `SITES`). Every cell asserts the generated body ran
-(`generated.taken`): a site that fell back to its written math would hold check 1 trivially. The cases are
-each component's declared ones (`dew.algebra.component_cases`), keyed by the generation they were generated
-for, the one this family names.
+The sites are the templates' own functions, each its component's declared function or one calling it over the
+flat ABI: the selective scan's decay, token stage, readout, backward step lift and adjoint, plain or at its
+lifted step (`recurrence_algebra.selective_decay`, `selective.token_stage`, `selective_read`,
+`selective_dx_scale`, `selective_adjoint`), the recurrence skip's pullback (`skipped_back`), the gated delta
+rule's value pullback, key memory decay and scores tile (`gated_values_back`, `key_memory_decay`,
+`scores_tile`) and the derived split-KV merge (`attention_algebra.merge`). Every cell asserts the generated
+body ran (`generated.taken`): a site that fell back to its written math would hold check 1 trivially. The
+cases are each component's declared ones (`dew.algebra.attention_cases`, `recurrence_cases`), keyed by the
+generation they were generated for, the one this family names.
 """
 
 import functools
@@ -23,9 +22,8 @@ from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
 
-from dew.algebra import component_cases, generate, generated
+from dew.algebra import attention_cases, generate, generated, recurrence_cases
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.recurrence import selective
 
 CHOICES = frozenset({"generated"})
 """The `generation.CHOICES` entries the cells run: each cell names `generated` both ways."""
@@ -34,24 +32,16 @@ KERNELS = {}
 own choice of their body, which has no kernels to list."""
 
 
-def _token(*operands):
-    """The selective scan's token stage (`selective.token_stage`) over its declared flat operands
-    (`component_cases.selective_token`'s ABI), B's scalars one token's chunk row."""
-    count, kept = divmod(len(operands) - 2, 3)
-    states, rates, b = (list(operands[part * count:(part + 1) * count]) for part in range(3))
-    step, value, *rest = operands[3 * count:]
-    return tuple(selective.token_stage(states, rates, jnp.stack(b)[None], 0, step, value,
-                                       rest[0] if kept else None))
-
-
-SITES = {"selective_token": _token}
-"""A site whose component's declared function is not its own call, by its component's name."""
+def _qualified(site: str) -> str:
+    """The declaration of the site's component, by its declaring module and name."""
+    return next(f"{module.__name__}.{site}" for module in (attention_cases, recurrence_cases)
+                if f"{module.__name__}.{site}" in generate.DECLARATIONS)
 
 
 def supported(case: dict[str, str]) -> bool:
     """Whether the site serves `case` (tests/kernel_matrix.py): its component is declared for the case's
     generation."""
-    declared = generate.DECLARATIONS[f"{component_cases.__name__}.{case['site']}"]
+    declared = generate.DECLARATIONS[_qualified(case["site"])]
     return case["generation"] in declared.cases.targets
 
 
@@ -78,10 +68,10 @@ def a_generated_body_is_on_par(case: tuple[str, ...]) -> None:
     the site named written (check 1) from the declaration's float64 truth, its generated body counted as
     run at every case."""
     named = dict(zip(AXES["generated"], case, strict=True))
-    qualified = f"{component_cases.__name__}.{named['site']}"
+    qualified = _qualified(named["site"])
     form = generate.DECLARATIONS[qualified]
     assert isinstance(form, generate.ComponentForm)
-    site = SITES.get(named["site"], form.function)
+    site = form.function  # Each declared function is its site's own call.
 
     def under(kernel: str):
         def run(*values):

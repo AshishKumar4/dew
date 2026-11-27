@@ -1788,12 +1788,18 @@ def mode_continuations(args) -> dict:
             raise AssertionError("a peer's different canvas count was accepted")
         arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
         assert arrivals.tolist() == list(range(processes))
+    # Row keys from a root each rank holds apart (row 13493): its real rows' key words, folded on the mesh.
+    from dew.nn.inputs import RowPlan, mesh_of
+
+    plan = RowPlan.over(mesh_of(placed), rows)
+    row_keys = plan.host(jax.random.key_data(plan.keys(jax.random.key(100 + rank))))
     return {
         "process_count": processes,
         "spec": str(result.tokens.sharding.spec),
         "global_rows": int(result.tokens.shape[0]),
         "rows": result.rows,
         "rejected": rejected,
+        "row_keys": np.asarray(row_keys).tolist(), "rows_each": rows,
         "tokens": np.asarray(host.tokens).tolist(),
         "lengths": np.asarray(host.lengths).tolist(),
         "terminated": np.asarray(host.terminated).tolist(),
