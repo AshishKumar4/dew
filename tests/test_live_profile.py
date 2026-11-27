@@ -89,20 +89,21 @@ def test_a_residual_is_a_forward_value_live_into_the_backward():
     assert profile.frees(lambda op_name, names: True) == 58 - 38
 
 
-def test_a_recomputed_residual_is_held_through_its_forwards_last_read():
-    """A residual a rung recomputes is made by its forward all the same, and held until the forward last
-    reads it (`LiveInterval.uses`, `Held.until`): where it shares the forward's peak with its scratch,
-    dropping it frees none of that peak, though it is alone in the backward; read last before the scratch,
-    it frees its bytes past its own position."""
+def test_a_replayed_residual_is_held_through_its_forwards_last_read():
+    """A forward replayed after the backward began (a resident transaction's) makes the value its own
+    pullback reads all the same, and a rung recomputing it holds it until that forward last reads it
+    (`LiveInterval.uses`, `Held.until`): where it shares the replay's peak with its scratch, dropping it
+    frees none of that peak; read last before the scratch, it frees the scratch's share of it."""
     def profile(read: int) -> LiveProfile:
-        found = LiveProfile.of((interval(100, 0, 6, 0, uses=((read, FORWARD), (5, BACKWARD))),
-                                interval(70, 1, 3, 1), interval(10, 4, 6, 2, op_name=BACKWARD)), frozenset())
+        found = LiveProfile.of((interval(10, 0, 1, 0, op_name=BACKWARD),
+                                interval(100, 1, 7, 1, uses=((read, FORWARD), (6, BACKWARD))),
+                                interval(70, 2, 4, 2), interval(10, 5, 7, 3, op_name=BACKWARD)), frozenset())
         assert found is not None
         return found
 
-    assert profile(2).most == profile(0).most == 170
-    assert profile(2).frees(lambda op_name, names: True) == 0
-    assert profile(0).frees(lambda op_name, names: True) == 170 - 100
+    assert profile(3).most == profile(1).most == 170
+    assert profile(3).frees(lambda op_name, names: True) == 0
+    assert profile(1).frees(lambda op_name, names: True) == 170 - 100
 
 
 def test_a_heaps_pages_hold_their_buffers_together_and_heaps_apart_read_no_profile():

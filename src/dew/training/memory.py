@@ -996,16 +996,18 @@ class LiveProfile:
                          or any(backward_made(op_name) for _, op_name in within(interval))))
 
         def until(interval: LiveInterval) -> int:
-            # Past its forward's last read of it; to its end where a forward read is placed nowhere. A value
-            # made before the backward begins is read by its forward before then: a read named the
-            # forward's past it is a fusion of the backward's that took a forward op's name.
+            # A value the step's forward made before its backward began is priced dropped whole, as XLA's
+            # remat compiles it: the decoder of the miss-driven witness (tests/test_miss_driven_rungs.py)
+            # frees 210 MB at save_dot_except_mlp, its residuals 219.6 MB whole, 41 MB held through the
+            # last reads their forward's names state (fusions of its backward's take its names). A replayed
+            # forward's value is held through its own forward's last read; to its end where one is placed
+            # nowhere.
+            if backward is not None and interval.start < backward:
+                return interval.start + 1
             read = [position for position, op_name in within(interval) if forward_made(op_name)]
             if UNPLACED in read:
                 return interval.end
-            last = max(read, default=interval.start) + 1
-            if backward is not None and interval.start < backward:
-                return min(last, backward)
-            return last
+            return max(read, default=interval.start) + 1
 
         return LiveProfile(tuple(
             Held(interval.bytes, interval.op_name, tuple(interval.names),
