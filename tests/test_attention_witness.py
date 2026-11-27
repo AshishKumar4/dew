@@ -3,9 +3,9 @@
 enclosures (nulls), full, causal, windowed, over packed documents and capped, and each fault the witness
 exists for refused at its elements: a dropped rescale, a maximum from the wrong tile, sums rounded to bf16
 where the walk holds fp32, a mask off by one key, a window's or the documents' records held as one
-undivided call's, and a cap's read; and the fast backward's gradients inside their enclosures, its faults
-(a wrong scale, a sixty-fourth off, a mask) refused. A GPU's native launches run the same checks in the
-native certificates' flow (tests/test_native_certificates.py)."""
+undivided call's, and a cap's read; and the fast backward's gradients inside their enclosures, capped
+too, its faults (a wrong scale, a sixty-fourth off, a mask, a cap) refused. A GPU's native launches run
+the same checks in the native certificates' flow (tests/test_native_certificates.py)."""
 
 import jax
 import numpy as np

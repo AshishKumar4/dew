@@ -378,8 +378,8 @@ def backward_launched(query, key, value, dout, form: str, *, interpret: bool, si
             for name, x in zip(names, found, strict=True)}
 
 
-def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: Lane | None = None
-                       ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: Lane | None = None,
+                       softcap: float | None = None) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """Each gradient of the fast backward's `records` (`backward_launched`) held elementwise to its
     enclosure under the mask `kept`, from the forward's stored output, maxima and denominators, natural
     units (as the forward's witness holds each state from the stored ones; the attention lane's order,
@@ -391,7 +391,11 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
     anchor: `dP - D` within three fp32 roundings of the row's magnitudes, `D`'s and `D - c`'s sums `gamma`
     of their terms; times the call's whole scale (`grad_scale`) in fp32, cast to bf16; and the gradients
     `dV = bf16(P)ᵀ dO`, `dK = dSᵀ Q`, `dQ = dS K`, each a tensor-core sum over every walked query or key in
-    any order, cast to bf16. For each gradient, the entries held and those inside."""
+    any order, cast to bf16. Under a cap (`softcap`), the logits are recomputed natural as the hook states
+    them, `cap tanh(fp32(s scale) / cap)` (each divide within two steps, `div.full`'s reach; tanh within
+    its lane's reach), their weights `exp2` of their natural units, and each score cotangent times the hook's
+    slope as JAX's vjp of it takes it on ones: `cap`, times `1 - t²` (`one_minus_square`, fused or not),
+    over `cap`. For each gradient, the entries held and those inside."""
     lane = attention_lane() if lane is None else lane
     lane = dataclasses.replace(lane, block=0)
     q, k, v, do = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value, dout))
@@ -406,9 +410,25 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
             peak = fp32(mul(point(records["m"][b, h]), point(LOG2E)), lane)
             total = records["l"][b, h]
             products = dot(point(q[b, :, h]), point(k[b, :, kv].T), lane)
-            logits = mul(products, point(factor))
             below = Iv(-peak.hi[:, None], -peak.lo[:, None])
-            exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
+            if softcap is None:
+                logits = mul(products, point(factor))
+                exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
+                slope = None
+            else:
+                folded = _divided(fp32(mul(products, point(grad_scale)), lane), softcap, lane)
+                bent = tanh(folded, lane)
+                natural = fp32(mul(bent, point(softcap)), lane)
+                logits = mul(natural, point(LOG2E))
+                exponents = hull(fp32(add(logits, below), lane), fp32(add(fp32(logits, lane), below), lane))
+                exponents = hull(exponents, fp32(mul(fp32(add(natural, Iv(-records["m"][b, h][:, None],
+                                                                          -records["m"][b, h][:, None])),
+                                                          lane), point(LOG2E)), lane))
+                square = hull(fp32(add(point(1.0), Iv(*(-x for x in reversed(fp32(mul(bent, bent), lane))))),
+                                   lane),
+                              fp32(mul(fp32(add(point(1.0), Iv(-bent.hi, -bent.lo)), lane),
+                                       fp32(add(point(1.0), bent), lane)), lane))
+                slope = _divided(fp32(mul(point(softcap), square), lane), softcap, lane)
             exponents = Iv(np.where(keeps, np.minimum(exponents.lo, 0.0), 0.0),
                            np.where(keeps, np.minimum(exponents.hi, 0.0), 0.0))
             inverse = np.where(total > 0, 1.0 / np.where(total > 0, total, 1.0), 0.0)
@@ -429,7 +449,10 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
             slack = ((gamma * magnitudes)[:, None]
                      + 3 * unit * (reach + np.abs(delta)[:, None] + 3 * anchor[:, None]))
             differences = Iv(pulled.lo - delta[:, None] - slack, pulled.hi - delta[:, None] + slack)
-            cotangents = fp32(mul(fp32(mul(weights, differences), lane), point(grad_scale)), lane)
+            cotangents = fp32(mul(weights, differences), lane)
+            if slope is not None:
+                cotangents = fp32(mul(cotangents, slope), lane)
+            cotangents = fp32(mul(cotangents, point(grad_scale)), lane)
             cotangents = cast(Iv(np.where(keeps, cotangents.lo, 0.0), np.where(keeps, cotangents.hi, 0.0)),
                               BFLOAT16)
             dv = dot(cast(Iv(weights.lo.T, weights.hi.T), BFLOAT16), point(do[b, :, h]), lane)
@@ -442,9 +465,18 @@ def backward_witnessed(query, key, value, dout, kept, records: dict, *, lane: La
                    np.concatenate([inside.ravel() for _, inside in found])) for name, found in held.items()}
 
 
-BACKWARD_FORMS = ("full", "causal", "window", "documents")
-"""The forms the backward's witness holds: every uncapped one (a capped call's backward takes the score
-hook's derivative, which its enclosure does not state)."""
+def _divided(numerator: Iv, divisor: float, lane: Lane) -> Iv:
+    """An fp32 quotient of fp32 values within `numerator` by the fp32 `divisor`, within two steps of its
+    correctly rounded value (`div.full`'s reach)."""
+    found = fp32(Iv(numerator.lo / divisor, numerator.hi / divisor), lane)
+    lo, hi = found.lo, found.hi
+    for _ in range(2):
+        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
+    return Iv(lo, hi)
+
+
+BACKWARD_FORMS = ("full", "causal", "window", "documents", "capped")
+"""The forms the backward's witness holds: every one (a capped call's its hook's slope too)."""
 
 
 def backward_operands(seed: int):
@@ -465,18 +497,21 @@ def assert_backward_witnessed(seed: int, form: str, *, interpret: bool, lane: La
     records = backward_launched(q, k, v, do, form, interpret=interpret)
     if not interpret and tier_wire.preparing():
         return
-    for name, (rows, inside) in backward_witnessed(q, k, v, do, mask_of(form), records, lane=lane).items():
+    held = backward_witnessed(q, k, v, do, mask_of(form), records, lane=lane, softcap=CAPS.get(form))
+    for name, (rows, inside) in held.items():
         assert rows.any(), name
         assert inside[rows].all(), f"{name}: {int((rows & ~inside).sum())} of {int(rows.sum())} outside"
 
 
 def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None) -> None:
     """Each fault the backward's witness exists for, refused at its elements: dK at twice its scale, dQ and
-    dV a sixty-fourth off, and a causal call's gradients held as a full call's."""
+    dV a sixty-fourth off, a causal call's gradients held as a full call's, and a capped call's as an uncapped
+    one's. Every native program launches before any check (row 9546)."""
     import tier_wire
 
     q, k, v, do = backward_operands(3)
     causal = backward_launched(q, k, v, do, "causal", interpret=interpret, site="faults")
+    capped = backward_launched(q, k, v, do, "capped", interpret=interpret, site="faults")
     if not interpret and tier_wire.preparing():
         return
     mask = mask_of("causal")
@@ -484,4 +519,7 @@ def assert_backward_faults_refused(*, interpret: bool, lane: Lane | None = None)
         held = backward_witnessed(q, k, v, do, mask, dict(causal, **{name: causal[name] * bent}), lane=lane)
         assert refused(held, name), name
     held = backward_witnessed(q, k, v, do, mask_of("full"), causal, lane=lane)
+    assert sum(refused(held, name) for name in ("dq", "dk", "dv"))
+    # A capped call's gradients held as an uncapped call's: the hook's slope read.
+    held = backward_witnessed(q, k, v, do, mask, capped, lane=lane)
     assert sum(refused(held, name) for name in ("dq", "dk", "dv"))

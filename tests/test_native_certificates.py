@@ -19,8 +19,8 @@ each online-softmax state its certify launch stores after a key tile and its out
 step's enclosure on the state before it (`attention_witness`), full, causal, windowed, over packed documents
 and capped, its faults a dropped rescale, a maximum from the wrong tile, sums rounded to bf16, a mask off by
 one key, a window's or the documents' records held as one undivided call's and a cap's read; and its fast
-backward's gradients held to their enclosures from the forward's stored residuals, its faults a wrong
-scale, a sixty-fourth off and a mask."""
+backward's gradients held to their enclosures from the forward's stored residuals, capped too, its faults a
+wrong scale, a sixty-fourth off, a mask and a cap."""
 
 import collections
 import functools
