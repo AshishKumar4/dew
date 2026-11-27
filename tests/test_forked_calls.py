@@ -716,15 +716,18 @@ def test_a_forked_recurrence_holds_its_documents_not_their_bound(layer, depth):
 
 
 @pytest.mark.parametrize("depth", [1, 3], ids=["a state and its questions", "a chain three deep"])
-@pytest.mark.parametrize("bound", [6, 24], ids=["its documents' own bound", "four times it"])
+@pytest.mark.parametrize("bound", [6, 24, 2048], ids=["its documents' own bound", "four times it",
+                                                     "a document a token"])
 def test_mamba1s_forked_scan_holds_no_more_than_its_packed_row(bound, depth):
     """Mamba-1's forked selective scan on the portable walk (`mamba._forked_row`) walks its documents in
     place, each segment's scan checkpointed: its gradient's temporaries on the CPU at most its packed row's
-    (the same six documents, unforked), at its documents' own bound and at four times it (5.9 and 7.3 MB
-    against the packed row's 13.5, where laid from chunks' edges they took 18.8 and 26.8, row 7380). Its
-    walk's trips stay the bound's, each one's residual its derivative's, so they grow with it, where the
-    gated delta net's and the SSD's adjoint walks the table back
-    (`test_a_forked_recurrence_holds_its_documents_not_their_bound`)."""
+    (the same six documents, unforked), at its documents' own bound, at four times it and at a document a
+    token (4.0, 4.0 and 10.5 MB against the packed row's 13.5, where laid from chunks' edges they took 18.8
+    and 26.8, row 7380): its segments' reads laid into the row as they are read and each segment's scan
+    checkpointed over its indices, no trip keeping a chunk's operands, masks or reads (a train review of
+    75faf43ec: stacked a trip each, the row at a document a token held 210.7 MB). Its trips' residuals, each
+    segment's entering states, stay the bound's, where the gated delta net's and the SSD's adjoint walks the
+    table back (`test_a_forked_recurrence_holds_its_documents_not_their_bound`)."""
     forked, packed = (_recurrence_call("Mamba-1", FORKED_LENGTH, 6, given, bound=bound if given else None)
                       for given in (depth, 0))
     temporaries = [_compiled_cost(call, layout, operands, "cpu")[0]
