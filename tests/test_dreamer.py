@@ -798,8 +798,10 @@ def test_an_equal_objective_built_anew_counts_its_update_from_the_first_ones_tra
     assert any(program.kind == "traced" for program in other.programs)
 
 
-DREAMER_SPLIT_SEEDS = 32
-"""Check 1's seeds for Dreamer filled-and-split updates across GRU and TSSM dynamics."""
+DREAMER_SPLIT_SEEDS = 64
+"""Check 1's seeds for Dreamer filled-and-split updates across GRU and TSSM dynamics: both steps' float32
+sums run as their users' do (`summed_as_run`), whose spread over the GRU's value head 32 seeds, and the
+gate's 160, left inconclusive (audit PT02)."""
 
 
 def dreamer_windows(rows: int, seed: int, length: int = 6, obs_size: int = 2, action_size: int = 2,
