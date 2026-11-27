@@ -26,7 +26,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import JepaEncoder, JepaPredictor
 from dew.objectives.jepa.objective import JepaObjective
 from dew.optim import Adam, ScheduleSpec
-from dew.registry import ModelConfig, record_argument
+from dew.registry import ModelConfig, import_path, record_argument
 from dew.sampling import Heun
 from dew.training import LocalTracker, MeshSpec
 
@@ -56,7 +56,7 @@ def test_the_flags_set_a_runs_own_settings_and_none_of_what_it_trains():
         with pytest.raises(SystemExit):
             parse(DiffusionRunConfig, flags, default=default)
     solved = default.override({"objective.solver": {"class": "heun"}})
-    assert type(solved.objective.fields["solver"]) is Heun
+    assert solved.objective.fields["solver"]["class"] == import_path(Heun)
     # The data's settings are its chain's calls', set by name (`dew.data.records.override`).
     chained = dataclasses.replace(config, data=images_of("tfds://oxford_flowers102", 32, batch=16))
     set_ = chained.override({"data.images.size": 64, "data.images.batch": 8})

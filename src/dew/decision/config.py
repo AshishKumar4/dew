@@ -66,7 +66,6 @@ from dew.state import TrainState
 if TYPE_CHECKING:
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import Loader
-    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _data_summary(dataset: Loader) -> Mapping[str, object]:
@@ -99,13 +98,6 @@ def _data_summary(dataset: Loader) -> Mapping[str, object]:
         found["none_of_the_above_declined"] = declined
     return found
 
-
-
-def _transformer() -> functools.partial[CausalTransformer]:
-    """A decision run's model, a causal transformer bound to nothing, read where a run is made."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-
-    return functools.partial(CausalTransformer)
 
 @dataclasses.dataclass(frozen=True)
 class JointShape:
@@ -266,7 +258,7 @@ class DecisionRunConfig(DecoderRunConfig):
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(lr=2.5e-5))
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig(_transformer()))
+        default_factory=DecoderRunConfig.transformer_model)
     pretrained: str = LAYA
     """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
     subfolder: str | None = None

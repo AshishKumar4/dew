@@ -19,6 +19,7 @@ from dew.decision import Choice, Decide, decisions, mixture
 from dew.decision.config import CrossContext, DecisionRunConfig, RowBudgets
 from dew.decision.layout import SegmentLayout, per_question
 from dew.decision.scoring import ScoringRule
+from dew.registry import from_record
 from dew.scores import Summary
 from dew.training import LocalTracker, TrainerAdvanced
 
@@ -57,8 +58,7 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
                                            "fields": {"terms": [[1.0, {"class": "log_loss"}],
                                                                 [0.5, {"class": "brier"}]]}}}))
     assert config.data.facts()["batch"] == 8
-    loss = config.objective.fields["loss"]
-    assert isinstance(loss, ScoringRule) and loss.name == "log_loss+0.5*brier"
+    assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
     run = tmp_path / "runs" / "tickets"
     assert (run / "decide.json").is_file()

@@ -1843,6 +1843,14 @@ class DecoderRunConfig(RunConfig):
     """A saved run's changes to its checkpoint's loop, a choice at a time, as a Dew before the run stated its
     loop whole recorded them (`dew.config.earlier._LoopChange`), which its record alone holds
     (`dew.config.earlier_run`); a run states its `loop`. Carried to 1.0 (ledger 1552)."""
+
+    @staticmethod
+    def transformer_model() -> ModelConfig:
+        """A decoder run's default model, a causal transformer bound to nothing, imported where a run is
+        made (the language-model and decision runs' `model` default)."""
+        from dew.nn.backbones.causal_transformer import CausalTransformer
+
+        return ModelConfig(functools.partial(CausalTransformer))
     passes: Annotated[PassPolicy | None, tyro.conf.Suppress] = None
     """The passes the loop runs each step (`PassPolicy`): one count (an int); one count a phase of the
     run's data (a tuple, `dew.data.phases`, `Trainer`'s `phase_passes`), each phase's step compiled with its

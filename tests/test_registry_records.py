@@ -18,6 +18,7 @@ from dew.config import ObjectiveConfig
 from dew.inputs import Field, InputSpec
 from dew.nn import activations
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.jepa import JepaPredictor
 from dew.objectives.supervised import Supervised
 from dew.registry import Aliases, from_record
 
@@ -558,3 +559,65 @@ def test_a_bound_member_reads_back_as_its_annotation_admits():
     made = functools.partial(decoder, kind="attention")
     for given in (made, to_record(made, functools.partial)):
         assert from_record(functools.partial[CausalTransformer], given).func is decoder
+
+
+@dataclasses.dataclass(frozen=True)
+class _Opened:
+    """A part a member reads only when it is built, which counts each time it is built (a renderer that
+    opens its assets)."""
+
+    assets: str = "scene"
+    built: typing.ClassVar[list[str]] = []
+
+    def __post_init__(self) -> None:
+        self.built.append(self.assets)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Simulated:
+    """An environment of a part it builds (`_Opened`)."""
+
+    renderer: _Opened = _Opened()
+
+
+def test_a_bound_record_holds_its_arguments_until_its_member_is_built():
+    """A bound member holds its arguments as given until it is built (row 12896, train 1412's review): a
+    model's views named by their entries alone, which its environment widens, held as named; and a record
+    naming a part of a recorded kind (an environment's renderer) builds none of it, the record saved again
+    as read, until the environment is built."""
+    from dew.config.env import EnvConfig
+    from dew.objectives.rl.dreamer import WorldModel
+    from dew.registry import ModelConfig, to_record
+
+    named = ModelConfig(functools.partial(WorldModel, reads="image")).with_fields(auxiliary=[["state", 256]])
+    assert named.fields["auxiliary"] == [["state", 256]]
+    _Opened.built.clear()
+    renderer = {"class": "test_registry_records:_Opened", "fields": {"assets": "track"}}
+    record = {"name": "test_registry_records:_Simulated", "fields": {"renderer": renderer}}
+    env = from_record(EnvConfig, record)
+    assert _Opened.built == [] and to_record(env, EnvConfig)["fields"] == record["fields"]
+    assert env.build().renderer.assets == "track" and _Opened.built == ["track"]
+
+
+def test_a_record_naming_no_member_is_its_kinds_default_ones():
+    """A record of a kind with a default member that names none, as an earlier Dew's could, binds that
+    default (row 12896, train 1412's review): a model's the simple DiT, a rollout's Dreamer's."""
+    from dew.config.env import RolloutConfig
+    from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.registry import ModelConfig
+
+    model = ModelConfig.from_dict({"fields": {"patch_size": 2}})
+    assert (model.member, dict(model.fields)) == (SimpleDiT, {"patch_size": 2})
+    assert from_record(RolloutConfig, {"fields": {"batch": 4}}).member is DreamerRollout
+
+
+type _Predictor = functools.partial[JepaPredictor]
+
+
+def test_a_bound_member_reads_back_through_its_alias():
+    """A partial named by a type alias reads back as the partial it names (train 1412's review)."""
+    from dew.registry import to_record
+
+    bound = functools.partial(JepaPredictor, num_layers=4)
+    again = from_record(_Predictor, to_record(bound, _Predictor))
+    assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 4})

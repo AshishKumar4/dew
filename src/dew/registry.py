@@ -840,12 +840,14 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     """
     if dtypes and name == "dtype":
         return resolve_dtype(value)
-    if typing.get_origin(annotation) is functools.partial or annotation is functools.partial:
-        return _bound(value, typing.get_args(annotation))
     if annotation is JSON:
         # Data a record holds as written, whatever it spells (a chat message's `{"function": ...}`).
         return configured(value)
+    # An alias resolved first, so a bound member's alias (`type Predictor = functools.partial[...]`) reads
+    # as the partial it names.
     annotation = resolve_alias(annotation)
+    if typing.get_origin(annotation) is functools.partial or annotation is functools.partial:
+        return _bound(value, typing.get_args(annotation))
     if isinstance(annotation, type) and issubclass(annotation, Enum):
         # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
         return annotation(value)
@@ -1198,7 +1200,8 @@ def _bound(value: object, declared: tuple[Annotation, ...]) -> functools.partial
         raise ValueError(f"a bound member is the record that names it, {{'class': ..., 'fields': {{...}}}}, "
                          f"not {value!r}")
     member = _member(named[0], held or (object,))
-    return _Bound(member, **read_arguments(member, named[1]))
+    # Its arguments held as their records, read where the member is built, as a bound record's are.
+    return _Bound(member, **named[1])
 
 
 def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
@@ -2038,12 +2041,15 @@ class Bound[Member](ABC):
         member = self._member(import_path(self.bound.func))
         keywords = dict(self.bound.keywords)
         if self._recorded:
-            # Refused here, by name, rather than where the run is built or saved: an argument the member
-            # does not take, or a value no record can carry (a lambda).
-            argument_records(member, keywords)
-        given = read_arguments(member, keywords)
-        object.__setattr__(self, "bound", _Bound(member, **given))
-        object.__setattr__(self, "defaults", recorded_defaults(member, given, self.defaults))
+            # Held as their records, as a record writes them, and refused here, by name, rather than where
+            # the run is built or saved: an argument the member does not take, or a value no record can
+            # carry (a lambda). Read, a nested class built, only where the member is built (`arguments`),
+            # so a record that names an environment's renderer opens none of its assets until then.
+            keywords = argument_records(member, keywords)
+        # Held as given otherwise (a model's: a world model's views, named until its environment widens
+        # them, `dew.objectives.rl.run.filled`), read where the member is built.
+        object.__setattr__(self, "bound", _Bound(member, **keywords))
+        object.__setattr__(self, "defaults", recorded_defaults(member, keywords, self.defaults))
 
     @property
     def member(self) -> type | Callable[..., Configured]:
@@ -2057,6 +2063,7 @@ class Bound[Member](ABC):
 
     @property
     def fields(self) -> Mapping[str, Configured]:
+        # The arguments the run states as held: records for a kind that holds records (`_recorded`).
         """The arguments the run states, as the member takes them."""
         return types.MappingProxyType(self.bound.keywords)
 
@@ -2067,9 +2074,14 @@ class Bound[Member](ABC):
 
     @property
     def field_records(self) -> dict[str, JSON]:
-        """The arguments the run states, each as a record holds it (`argument_records`): what a record
-        compares and writes, beside `defaults`."""
-        return argument_records(self.member, self.fields)
+        """The arguments the run states, each as a record holds it: what a record compares and writes,
+        beside `defaults`. A recorded kind's as held (`argument_records`, at construction); another's each
+        recorded as given, read against nothing until its member is built (a world model's views named
+        alone, which its environment widens)."""
+        if self._recorded:
+            return dict(self.fields)
+        with recording():
+            return {name: to_record(value, None) for name, value in self.fields.items()}
 
     def record(self) -> dict[str, JSON]:
         """This record as a run's record holds it: the member's import path (`name`), the arguments the
@@ -2085,11 +2097,14 @@ class Bound[Member](ABC):
         its default; one the kind does not declare raises."""
         own = {field.name for field in dataclasses.fields(cls)} - {"bound"}
         unknown = sorted(set(record) - own - {"name", "fields"})
-        if unknown or "name" not in record:
+        default = next(field for field in dataclasses.fields(cls) if field.name == "bound").default_factory
+        if unknown or ("name" not in record and default is dataclasses.MISSING):
             raise ValueError(f"{cls.__name__} is the record {{'name': ..., 'fields': {{...}}, 'defaults': "
                              f"{{...}}}}; unknown fields {unknown}" + ("" if "name" in record else
                                                                        ", and it names no member"))
-        member = cls._member(text(record["name"], f"{cls.__name__}.name"))
+        # A record naming no member is the kind's default one's, as a record of an earlier Dew's was.
+        member = (cls._member(text(record["name"], f"{cls.__name__}.name")) if "name" in record
+                  else default().func)
         fields = _records.record(record.get("fields") or {}, f"{cls.__name__}.fields")
         settings: dict[str, Any] = {name: _rebuilt(declared_type(cls, name), value, dtypes=dtypes, name=name)
                                     for name, value in record.items() if name in own}

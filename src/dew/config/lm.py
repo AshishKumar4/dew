@@ -37,7 +37,6 @@ from dew.registry import ModelConfig, imported_argument, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl.methods import PromptSettings, RolloutSettings
 
 
@@ -48,13 +47,6 @@ class Tokens(NamedTuple):
     seq_len: int
     packed: bool
 
-
-
-def _transformer() -> functools.partial[CausalTransformer]:
-    """A language model run's model, a causal transformer bound to nothing, read where a run is made."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-
-    return functools.partial(CausalTransformer)
 
 @dataclasses.dataclass(frozen=True)
 class ServedRollout:
@@ -203,7 +195,7 @@ class LMRunConfig(DecoderRunConfig):
     objective it is."""
     # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig(_transformer()))
+        default_factory=DecoderRunConfig.transformer_model)
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(

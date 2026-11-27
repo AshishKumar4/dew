@@ -45,6 +45,7 @@ from dew.registry import (
     ModelConfig,
     dtype_name,
     encoders,
+    from_record,
     metrics,
     models,
     objectives,
@@ -440,10 +441,13 @@ class DiffusionRunConfig(RunConfig):
         from dew.interop.sources import pinned_source
 
         objective = self.objective
-        alignment = objective.fields.get("alignment")
-        if isinstance(alignment, Alignment) and alignment.source is not None:
-            objective = objective.with_fields(
-                alignment=dataclasses.replace(alignment, source=pinned_source(alignment.source)))
+        stated = objective.fields.get("alignment")
+        if isinstance(stated, Mapping):
+            # Held as its record (`ObjectiveConfig` holds records), read to pin its source.
+            alignment = from_record(Alignment, stated)
+            if alignment.source is not None:
+                objective = objective.with_fields(
+                    alignment=dataclasses.replace(alignment, source=pinned_source(alignment.source)))
         pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
         return dataclasses.replace(super().pinned().with_pinned_run(self.pretrained), objective=objective,
                                    pretrained=pretrained)
