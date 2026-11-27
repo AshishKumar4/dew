@@ -154,20 +154,22 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=
     float64 inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads,
     detached as the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9); -inf at a
     key `keep` hides, and over a row that allows none each head's softmax uniform over every key, as the
-    references' masked softmax gives it. `query` `[B, S, H, D]` and `key`
-    `[B, T, H, D]` are the main heads, `scale` the kernel's logit scale. Each head's softmax is its logits
-    less their log-sum-exp over the allowed keys alone, a hidden key no logit at all: given the least finite
-    logit, it tied an allowed key at it and took its share (logits of the least finite twice and of 0 and
-    -128 over one hidden key summed to 0.8 and 0.2 where they are 0.75 and 0.25, train 1345's F1). The
-    heads' masses are summed at each key's largest, one head at a time to keep the footprint at `[B, S, T]`,
-    rounded once (`compensated_add`: plain sums biased the KL upward, 1.67 times MaxText's error from
-    float64), so a key whose every head weighs it below fp32's least normal keeps its mass in its logarithm
-    (a mass of e^-110 rounded to 0 before its product with a student's gap of 2^126, 1.44e-10, train
-    1345's F2). It sums in `dtype` where given (at least fp32), its operands' otherwise. Each head's logits
-    are `scores(q, k)` `[B, S, T]` of its query and keys as given, where the attention it trains toward forms
-    its own otherwise than MaxText's (MSA's: `block_sparse.msa_scores`, the reference path's own); else
-    MaxText's, the query widened and scaled first, at `precision` (the layer's: under an ambient fp16 preset
-    a layer's fp32 logits 4096 and 4097 became 4096 and 4096 in the teacher, row 13706)."""
+    references' masked softmax gives it. `query` `[B, S, H, D]` and `key` `[B, T, H, D]` are the main
+    heads, `scale` the kernel's logit scale. Each head's softmax is its logits less their log-sum-exp over
+    the allowed keys alone, a hidden key no logit at all: given the least finite logit, it tied an allowed
+    key at it and took its share (logits of the least finite twice and of 0 and -128 over one hidden key
+    summed to 0.8 and 0.2 where they are 0.75 and 0.25, train 1345's F1). The heads' masses are summed in
+    one pass, each head's logits and log-softmax formed once (where a pass for the keys' largest took them
+    twice, audit 2026-11-27 K04, row 13996), at each key's running largest log-mass, its sums taken to a
+    raised one, one head at a time to keep the footprint at `[B, S, T]`, compensated (`compensated_add`:
+    plain sums biased the KL upward, 1.67 times MaxText's error from float64), so a key whose every head
+    weighs it below fp32's least normal keeps its mass in its logarithm (a mass of e^-110 rounded to 0
+    before its product with a student's gap of 2^126, 1.44e-10, train 1345's F2). It sums in `dtype` where
+    given (at least fp32), its operands' otherwise. Each head's logits are `scores(q, k)` `[B, S, T]` of
+    its query and keys as given, where the attention it trains toward forms its own otherwise than
+    MaxText's (MSA's: `block_sparse.msa_scores`, the reference path's own); else MaxText's, the query
+    widened and scaled first, at `precision` (the layer's: under an ambient fp16 preset a layer's fp32
+    logits 4096 and 4097 became 4096 and 4096 in the teacher, row 13706)."""
     wide = at_least_fp32(jnp.result_type(query, key) if dtype is None else dtype)
     batch, length, total = query.shape[0], query.shape[1], key.shape[1]
     keep = jnp.broadcast_to(keep, (batch, length, total))
@@ -189,19 +191,23 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=
         spread = jnp.log(jnp.sum(jnp.exp(logits - peak), axis=-1, keepdims=True))
         return logits - peak - spread
 
-    def peak_of(peak, projections):
-        return jnp.maximum(peak, masses(*projections)), None
-
-    least = jnp.full((batch, length, total), -jnp.inf, wide)
-    peak, _ = jax.lax.scan(peak_of, least, (query, key))
-    held = jnp.where(jnp.isfinite(peak), peak, 0)
-
     def head(summed, projections):
-        shared = jnp.exp(masses(*projections) - held)
-        return compensated_add(summed, (shared, jnp.zeros_like(shared))), None
+        # One pass a head: its masses' exponentials at each key's running largest log-mass `M`, the sums
+        # taken to a raised `M` by `e^(M_old - M)`, each term `e^(m - M)` at most 1, so a key whose every head
+        # weighs it below fp32's least normal keeps its mass, and a finite log-mass however far below 0
+        # (`-fp32.max` beside 0) its own.
+        high, low, largest = summed
+        mass = masses(*projections)
+        raised = jnp.maximum(largest, mass)
+        held = jnp.where(jnp.isfinite(raised), raised, 0)
+        kept = jnp.exp(jnp.where(jnp.isfinite(largest), largest - held, -jnp.inf))
+        return (*compensated_add((high * kept, low * kept), (jnp.exp(mass - held), jnp.zeros_like(mass))),
+                raised), None
 
     zeros = jnp.zeros((batch, length, total), wide)
-    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (query, key))
+    (high, low, largest), _ = jax.lax.scan(head, (zeros, zeros, jnp.full_like(zeros, -jnp.inf)),
+                                           (query, key))
+    held = jnp.where(jnp.isfinite(largest), largest, 0)
     # An allowed key's mass however its heads' logits gave it, a NaN's too (an invalid logit surfaces, never
     # read as a hidden key's none).
     return jnp.where(allowed, held + jnp.log(high + low), -jnp.inf)
