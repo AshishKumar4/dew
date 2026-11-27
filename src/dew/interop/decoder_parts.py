@@ -2034,9 +2034,9 @@ class Restacked:
     tensors the map reads, and `unstored` the tensors the map reads that the release stores none of, each
     with the one value it holds; `reserved` matches every name only a stack, its parts or an unstored
     tensor takes, whatever the record. `prepare` splits each stack (one the release lacks refused) and adds
-    the unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from its
-    parts (a part missing refused) and drops the unstored ones once they hold their value; every other
-    tensor passes through both."""
+    the unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from
+    its parts (a part missing, or a reserved name the record stacks none of, refused) and drops the
+    unstored ones once they hold their value; every other tensor passes through both."""
 
     stacks: Callable[[Mapping[str, object]], Sequence[Stacked]]
     unstored: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
