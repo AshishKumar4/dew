@@ -407,38 +407,45 @@ class CompiledTruths:
         return self.read[label]
 
 
-def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int]]:
+def compiled_memory(directory: Path, *, arms: bool = False) -> list[dict[str, int | str]]:
     """Every program of a store's sites (`compiled_truths`, prepared), its truths' or, with `arms`, its
     arms' (`CompiledTruths.compile_site`), as its compile analysed its memory
     (`dew.telemetry.instrumentation.CompiledMemory`, as its fields name it), its sites' record's; none for
     a program whose backend stated none, nor for one compiled for the host's CPU (`compile_site`'s `host`),
     which holds none of the devices' memory, nor for a site calling the host (`CALLS_THE_HOST`), which no
     lowering here can read: the needs filed of its unit are a floor (tools/armada/ci.py's `gpu_needs`), its
-    measured share, its run's, the rest, as for any program whose compile states none."""
+    measured share, its run's, the rest, as for any program whose compile states none. Each names its site
+    and program (`label`, `<site label>: <program>`), which its admission keeps (`admitted_needs`), so a
+    unit's needs say which of its programs asks for what (row 13580: a 40.37 GiB need no file could name)."""
     records = (json.loads(site.read_text()) for site in Path(directory).glob(f"*/{SITE}"))
-    return [memory for record in records
+    return [{**memory, "label": f"{record.get('label')}: {program}"} for record in records
             if record.get("arms", False) == arms and not record.get("host", False)
-            for memory in record.get("memory", {}).values()]
+            for program, memory in record.get("memory", {}).items()]
 
 
-def admitted_needs(arms: Sequence[dict[str, int]], truths: Sequence[dict[str, int]]) -> list[dict[str, int]]:
+def admitted_needs(arms: Sequence[dict[str, int | str]], truths: Sequence[dict[str, int | str]]
+                   ) -> list[dict[str, int | str]]:
     """A run's programs as the allocator admits them (`dew.training.memory.admitted`), each its compile's
     memory (`compiled_memory`'s, `CompiledMemory`'s fields) in the admission's own terms
     (`dew.training.memory.admission`): an arm's alone, a float64 truth's or terms program's with the arms'
     state held beside it (the most any arm takes as arguments, which the run keeps while its truths compute;
     every program's outputs are fetched to the host, `CompiledTruths.called`). A part's worker fits a slot
-    where every program of its units is admitted there (`tier_wire.unit_needs`)."""
+    where every program of its units is admitted there (`tier_wire.unit_needs`). Each admission keeps its
+    program's `label` where it has one (`compiled_memory`'s)."""
     from dew.telemetry.instrumentation import CompiledMemory
     from dew.training.memory import admission
 
-    arms_memory = [CompiledMemory(**memory) for memory in arms]
-    state = max((memory.argument for memory in arms_memory), default=0)
+    def compiled(memory) -> CompiledMemory:
+        return CompiledMemory(**{name: value for name, value in memory.items() if name != "label"})
 
-    def admitted_as(memory: CompiledMemory, held: int) -> dict[str, int]:
-        return dict(zip(("resident", "beside", "temporaries"), admission(memory, held), strict=True))
+    state = max((compiled(memory).argument for memory in arms), default=0)
 
-    return [*(admitted_as(memory, 0) for memory in arms_memory),
-            *(admitted_as(CompiledMemory(**memory), state) for memory in truths)]
+    def admitted_as(memory, held: int) -> dict[str, int | str]:
+        terms = admission(compiled(memory), held)
+        admitted = dict(zip(("resident", "beside", "temporaries"), terms, strict=True))
+        return {**admitted, **({"label": memory["label"]} if "label" in memory else {})}
+
+    return [*(admitted_as(memory, 0) for memory in arms), *(admitted_as(memory, state) for memory in truths)]
 
 
 READ: list[Path] = []

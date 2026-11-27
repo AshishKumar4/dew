@@ -235,7 +235,7 @@ def cotangents(operands: Chunk, seed: int, *, normal: Callable | None = None) ->
             hosted(normal((batch, heads, operands.key.shape[-1], width))))
 
 
-def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
+def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH, rows: int = ROWS,
          value_heads: int = VALUE_HEADS, value_width: int | None = None, key_heads: int = KEY_HEADS,
          key_width: int = KEY_WIDTH, normal: Callable | None = None) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
@@ -256,25 +256,25 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         pairs = rng.permutation(hooks.turns)
         key_order = np.concatenate([np.stack([2 * pairs, 2 * pairs + 1], axis=-1).reshape(-1),
                                     2 * hooks.turns + rng.permutation(key_width - 2 * hooks.turns)])
-        turn = rng.uniform(-3.0, 3.0, (ROWS, length, value_heads, hooks.turns))
+        turn = rng.uniform(-3.0, 3.0, (rows, length, value_heads, hooks.turns))
         turned = {'turn': hosted(turn[..., pairs])}
-    query = normal((ROWS, length, key_heads, key_width))
+    query = normal((rows, length, key_heads, key_width))
     # Unit queries where the hooks declare them (`recurrence.Hooks.unit_queries`, Kimi Linear's l2-normed).
     query = (unit(query) if hooks.unit_queries else query)[..., key_order]
-    key = unit(normal((ROWS, length, key_heads, key_width)))[..., key_order]
-    value = normal((ROWS, length, value_heads, width))[..., value_order]
+    key = unit(normal((rows, length, key_heads, key_width)))[..., key_order]
+    value = normal((rows, length, value_heads, width))[..., value_order]
     vector = hooks.decay == 'vector'
-    log_decay = -softplus(normal((ROWS, length, value_heads) + ((key_width,) if vector else ())) - 1.0)
+    log_decay = -softplus(normal((rows, length, value_heads) + ((key_width,) if vector else ())) - 1.0)
     if vector:
         log_decay = log_decay[..., key_order]
-    written = normal((ROWS, length, value_heads))
+    written = normal((rows, length, value_heads))
     beta = sigmoid(written)
     skip = normal((value_heads,))
-    state = (0.3 * normal((ROWS, value_heads, key_width, width)))[:, :, key_order][..., value_order]
+    state = (0.3 * normal((rows, value_heads, key_width, width)))[:, :, key_order][..., value_order]
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
-        gates = {'gate': hosted(normal((ROWS, length, value_heads))),
+        gates = {'gate': hosted(normal((rows, length, value_heads))),
                  'log_a': hosted(0.5 * normal((value_heads,))), 'bias': hosted(normal((value_heads,)))}
         beta = written
     if hooks.rated:
@@ -283,9 +283,9 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
         gates = {'rate': hosted(-np.exp(0.5 * normal((value_heads,))))}
     epilogue = {}
     if hooks.output is not None:
-        epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
+        epilogue = {'z': hosted(normal((rows, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length)) if packed else None
+    starts = jnp.asarray(marked(PACKED_DOCUMENTS, length))[:rows] if packed else None
     own = {'own': hosted(0.5 * normal((value_heads, key_width))[..., key_order])} if hooks.own_weight else {}
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
