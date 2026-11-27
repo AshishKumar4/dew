@@ -244,7 +244,7 @@ class Interval:
     rollout_seconds: float = 0.0
     rollout_copied: int = 0
     kept_paths: tuple[str, ...] = ()
-    """The leaves of the run's kept state (`dew.training.transaction.checked`) by their paths, in their
+    """The leaves of the run's kept state (`dew.nn.finite.checked`) by their paths, in their
     order, by which a stop names one not finite (`checked_finite`)."""
     skips_nonfinite: bool = False
     """Whether the run drops a step that is not finite, stopping only after `BAD_LOSS_STEPS` in a row: one

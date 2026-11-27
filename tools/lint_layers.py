@@ -61,7 +61,7 @@ LAYERS: Mapping[str, Contract] = {
     # A run's source is loaded as its record states it, so inference reads the run record's own types
     # (`SourceOptions`, dew.config): the contract allows dew.config (row 4268, Serving & RL).
     "inference imports no trainer or front end": Contract(
-        ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io")),
+        ("dew.inference",), (), ("dew.training", "dew._cli", "dew.decision", "dew.io"), closure=True),
     "reinforcement learning imports no trainer": Contract(("dew.rl",), (), ("dew.training",)),
     # An environment run's record is the configuration's (`dew.config.env`), not the objectives' (row 4267).
     "objectives import no trainer, configuration or front end": Contract(
