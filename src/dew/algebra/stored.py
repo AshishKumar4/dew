@@ -7,15 +7,17 @@ A derivation is a pure function of what it reads: its declaration's traced progr
 its numerics' class and limits, the context its forms are priced and traced in (`derive.context`), the rule
 sets it saturates with (by name, each as the source registers it, immutable, `rules.sourced`; a set
 registered at run time stores nothing), the algebra's code (`dew._code.code_digest`) and egglog's and JAX's
-versions. A program's primitives are stated by their names only where a name identifies its primitive
-(`terms.stably_named`); a program holding one it does not is not keyed.
+versions. The program's digest states each primitive by its name, so a program is keyed only where each
+of its primitives, at every depth, is the one JAX binds to that name (`_bound`): a region tells primitives
+apart by identity (`terms.OPERATIONS`), and a user's primitive of a JAX name is not keyed.
 An entry is keyed by all of them (`key`, each part in a canonical form: an unordered collection sorted, a
 structure by its fields), written whole (`dew._files.write_atomically`) and read back exactly: each chosen
 term through the Term language's constructors (`CONSTRUCTORS`, `get_callable_args`), its arguments as their
 literals, a vector as written (egglog writes it typed or not, each a term of its own), each term once in a
 table its forms index (`_Writer`: a term its forms share is written once); the parameters, literals and
 shapes the derivation appended to its region past its trace by their primitive's name and their values'
-types, in their order, the region itself traced afresh. No value is pickled or evaluated. An entry's text
+types, in their order (the shapes it appended, its appended literals' own, `_appended`), the region itself
+traced afresh. No value is pickled or evaluated. An entry's text
 is digested with its name (`_summed`), and one whose digest is not its own is not decoded; an entry is
 checked against the region it extends as it decodes (each value of its kind, each term's leaf, literal,
 parameter and state in range, each state of a side its form reads, each count and part of its forms the
@@ -41,7 +43,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 from egglog import ConvertError, String, Vec, f64, get_callable_args, i64
-from jax.extend.core import Primitive
+from jax.extend.core import Jaxpr, Primitive, primitives
 
 from dew import _code, _files
 from dew._builds import dew_cache_dir
@@ -75,9 +77,11 @@ def directory() -> str:
 def key(closed, sets: Sequence[str], parts: Sequence[object]) -> str | None:
     """The entry's name of a derivation of the traced `closed` saturated with the source's rule sets named
     `sets` (`rules.sourced`), in their order, beside `parts` (everything else it reads, `derive._derived`'s);
-    None where its program (a primitive its name does not identify, `terms.stably_named`), a captured
-    constant (an outer trace's value, or one on a device) or a part is no value a key states by its
-    contents."""
+    None where its program (a primitive its name does not identify, `_bound`), a captured constant (an
+    outer trace's value, or one on a device) or a part is no value a key states by its contents."""
+    if not _bound(closed):
+        _log.info("a derivation not keyed: a primitive its name does not identify")
+        return None
     digest, opaques = terms.jaxpr_digest(closed, in_process=False)
     if opaques or not all(isinstance(const, (np.ndarray, np.generic, bool, int, float))
                           for const in closed.consts):
@@ -126,18 +130,19 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms]) ->
         decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
                            literals=len(region.literals) + len(literals),
                            params=len(region.params) + len(params), states=len(_listed(record["steps"])))
-        shapes = [(decoded(term, sides=()), _extent(extent)) for term, extent in _listed(record["shapes"])]
         made = assembled(record, decoded=decoded, value=_value)
-    except (KeyError, TypeError, ValueError, IndexError, OverflowError, ConvertError) as failed:
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError, RecursionError,
+            ConvertError) as failed:
         # ConvertError: an argument of a sort its constructor does not take; OverflowError: a float past
-        # range.
+        # range; RecursionError: a value nested past Python's depth.
         _invalid(path, failed)
         return None
-    # The region extended once the whole entry has read: one that fails leaves it as traced.
+    # The region extended once the whole entry has read: one that fails leaves it as traced. Each literal a
+    # derivation appends is shaped as it is (`_appended`).
     region.params.extend(params)
-    region.literals.extend(literals)
-    for term, extent in shapes:
-        region.shaped(term, extent)
+    for literal in literals:
+        region.literals.append(literal)
+        region.shaped(Term.literal(i64(len(region.literals) - 1)), np.shape(literal))
     kernel_report.record_stored("hit")
     return made
 
@@ -162,6 +167,7 @@ def stored(name: str, region: terms.Region, params_from: int, literals_from: int
     writer = _Writer()
     try:
         forms = encoded(term=writer.term, maybe=writer.maybe, value=_encoded_value)
+        _appended(region, literals_from, shapes_from)
         record = {"format": FORMAT, "params_from": params_from, "literals_from": literals_from,
                   "shapes_from": shapes_from,
                   # Each parameter in its order: a primitive's parameters bind as traced.
@@ -170,8 +176,6 @@ def stored(name: str, region: terms.Region, params_from: int, literals_from: int
                              for primitive, params in region.params[params_from:]],
                   "literals": [_encoded_value(np.asarray(value))
                                for value in region.literals[literals_from:]],
-                  "shapes": [[writer.term(term), [int(size) for size in extent]]
-                             for term, extent in region.shapes[shapes_from:]],
                   **forms, "terms": writer.table}
         body = json.dumps(record, sort_keys=True)
         os.makedirs(directory(), exist_ok=True)
@@ -181,6 +185,16 @@ def stored(name: str, region: terms.Region, params_from: int, literals_from: int
         kernel_report.record_stored("unstorable")
         return
     kernel_report.record_stored("miss")
+
+
+def _appended(region: terms.Region, literals_from: int, shapes_from: int) -> None:
+    """That the shapes a derivation appended to `region` past `shapes_from` are its literals' appended past
+    `literals_from`, each in its order at its own shape, as a reading replays them (`loaded`); `Unstated`
+    otherwise."""
+    held = [(terms.key(term), tuple(extent)) for term, extent in region.shapes[shapes_from:]]
+    if held != [(terms.key(Term.literal(i64(index))), np.shape(region.literals[index]))
+                for index in range(literals_from, len(region.literals))]:
+        raise Unstated("a derivation's appended shapes are not its appended literals'")
 
 
 def _canonical(value):
@@ -321,8 +335,13 @@ def _argument(kind: str, value):
     if kind == "f" and isinstance(value, str):
         return f64(float.fromhex(value))
     if kind in ("v", "u"):
-        axes = [_argument(*_listed(axis)) for axis in _listed(value)]
-        return Vec[i64](*axes) if kind == "v" else Vec(*axes)
+        # A vector of integers, as `_Writer` writes one; egglog types an untyped one by its first axis.
+        axes = [_listed(axis) for axis in _listed(value)]
+        if not all(len(axis) == 2 and axis[0] == "i" and integral(axis[1]) for axis in axes) or (
+                kind == "u" and not axes):
+            raise ValueError(f"a vector {value!r} of no integers")
+        return Vec[i64](*(i64(axis[1]) for axis in axes)) if kind == "v" else Vec(*(i64(axis[1])
+                                                                                  for axis in axes))
     raise ValueError(f"an argument of no stored kind {kind!r}")
 
 
@@ -360,8 +379,32 @@ def _parameter(entry) -> tuple[Primitive, dict]:
 
 @functools.cache
 def _primitives() -> Mapping[str, Primitive]:
-    """jax.lax's primitives by their names: what a stored parameter names."""
-    return {value.name: value for value in vars(jax.lax).values() if isinstance(value, Primitive)}
+    """JAX's primitives by their names, as `jax.lax` and `jax.extend.core.primitives` bind them, a name two
+    of them share left out: what a program's digest and a stored parameter name."""
+    held: dict[str, dict[int, Primitive]] = {}
+    for module in (jax.lax, primitives):
+        for value in vars(module).values():
+            if isinstance(value, Primitive):
+                held.setdefault(value.name, {})[id(value)] = value
+    return {name: next(iter(found.values())) for name, found in held.items() if len(found) == 1}
+
+
+def _bound(closed: Jaxpr) -> bool:
+    """Whether each primitive of `closed`, and of every program its parameters hold at any depth, is the
+    one JAX binds to its name (`_primitives`)."""
+    pending: list = [closed]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, Jaxpr):
+            for equation in value.jaxpr.eqns:
+                if _primitives().get(equation.primitive.name) is not equation.primitive:
+                    return False
+                pending.extend(equation.params.values())
+        elif isinstance(value, (tuple, list)):
+            pending.extend(value)
+        elif isinstance(value, Mapping):
+            pending.extend(value.values())
+    return True
 
 
 def _primitive_name(primitive) -> str:

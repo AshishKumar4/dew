@@ -1,8 +1,8 @@
 """A template's trace-time derivations stored across processes (`dew.algebra.stored`): a derivation read back
-is the one derived, every term, appended parameter and literal of it (its values the evaluator's of those
-alone); a corrupt entry, or one not its own, is derived afresh
-past; a shared term is written once; a primitive its name does not identify keys nothing; the extractor's
-oracle neither reads nor writes; each outcome is counted (`report.stored`)."""
+is the one derived, every term, appended parameter, literal and shape of it (its values the evaluator's of
+those alone); a corrupt entry, or one not its own, is derived afresh past; a shared term is written once; a
+primitive its name does not identify keys nothing; the extractor's oracle neither reads nor writes; each
+outcome is counted (`report.stored`)."""
 
 import dataclasses
 import functools
@@ -76,14 +76,27 @@ def test_a_stored_derivation_reads_back_as_derived(storing, name):
     assert _terms(read) == _terms(fresh)
     assert (read.floors, read.mapped, read.walked_leaves) == (fresh.floors, fresh.mapped, fresh.walked_leaves)
     assert len(read.region.params) == len(fresh.region.params)
-    assert [(primitive, repr(params)) for primitive, params in read.region.params] == [
-        (primitive, repr(params)) for primitive, params in fresh.region.params]
-    for held, again in zip(fresh.region.literals, read.region.literals, strict=True):
-        np.testing.assert_array_equal(np.asarray(again), np.asarray(held))
+    assert all(primitive is held and _same(params, values) for (primitive, params), (held, values)
+               in zip(read.region.params, fresh.region.params, strict=True))
+    assert _same(read.region.literals, fresh.region.literals)
     # Each term's shape, the ones the derivation appended (a literal of its own) too, as the region reads it.
     assert [(terms.key(term), extent) for term, extent in read.region.shapes] == [
         (terms.key(term), extent) for term, extent in fresh.region.shapes]
     assert all(read.region.shape(term) == extent for term, extent in fresh.region.shapes)
+
+
+def _same(read, held) -> bool:
+    """Whether `read` is `held` of the same types at every depth: an array of its dtype, shape and values."""
+    if type(read) is not type(held):
+        return False
+    if isinstance(held, np.ndarray):
+        return read.dtype == held.dtype and read.shape == held.shape and np.array_equal(read, held,
+                                                                                         equal_nan=True)
+    if isinstance(held, (tuple, list)):
+        return len(read) == len(held) and all(map(_same, read, held))
+    if isinstance(held, dict):
+        return read.keys() == held.keys() and all(_same(read[name], held[name]) for name in held)
+    return bool(read == held) or (read != read and held != held)
 
 
 def _entry():
@@ -123,13 +136,19 @@ def _corrupted(record, corrupt):
         return {**record, "report": [*record["report"][:-1], ["x", "0x1p+99999"]]}
     if corrupt == "a dtype of objects":
         return {**record, "literals": [*record["literals"], ["a", "object", [1], "00"]]}
+    if corrupt == "an untyped empty vector":
+        return {**record, "terms": [*table, ["reduce", [["t", 0], ["s", "add"], ["u", []], ["i", 0]]]],
+                "steps": [len(table), *record["steps"][1:]]}
+    if corrupt == "a finish dropped":
+        return {**record, "finishes": [None for _ in record["finishes"]]}
     raise AssertionError(corrupt)
 
 
 @pytest.mark.parametrize("corrupt", ["unknown constructor", "missing steps", "truncated", "a list",
                                      "a merge's side in a step", "a short part", "unreadable",
                                      "an argument of another sort", "a term of its own", "a float past range",
-                                     "a dtype of objects", "a flipped byte", "another entry's"])
+                                     "a dtype of objects", "an untyped empty vector", "a finish dropped",
+                                     "nested past depth", "a flipped byte", "another entry's"])
 def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
     traced and is derived afresh past, then written whole again."""
@@ -149,6 +168,10 @@ def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
         entry.write_text(f"{stored._summed('another', body)}\n{body}")
     elif corrupt == "a list":
         entry.write_text(f"{stored._summed(entry.stem, '[]')}\n[]")
+    elif corrupt == "nested past depth":
+        nested = "[" * 100_000 + "]" * 100_000
+        body = json.dumps({**record, "literals": None}).replace('"literals": null', f'"literals": {nested}')
+        entry.write_text(f"{stored._summed(entry.stem, body)}\n{body}")
     else:
         _written(entry, _corrupted(record, corrupt))
     again = _derived("walk")
@@ -177,14 +200,14 @@ def test_a_shared_term_is_written_once_and_read_back():
 
 
 def test_a_primitive_its_name_does_not_identify_keys_nothing():
-    """A primitive of a user's own named as one of JAX's is held by identity, which a key does not state:
-    a program holding it is not keyed, as the region reads it apart from JAX's (`terms.OPERATIONS`)."""
+    """A primitive of a user's own named as one of JAX's, which the region reads apart from JAX's by identity
+    (`terms.OPERATIONS`), is no primitive a name states: a program holding it, at any depth, is not keyed."""
     own = jcore.Primitive("exp")
     own.def_abstract_eval(lambda operand: operand)
     operand = np.ones(4, np.float32)
-    assert terms.stably_named(jax.lax.exp_p) and not terms.stably_named(own)
     assert stored.key(jax.make_jaxpr(lambda x: own.bind(x))(operand), (), ()) is None
-    assert stored.key(jax.make_jaxpr(jax.lax.exp)(operand), (), ()) is not None
+    assert stored.key(jax.make_jaxpr(lambda x: jax.jit(own.bind)(x))(operand), (), ()) is None
+    assert stored.key(jax.make_jaxpr(lambda x: jax.jit(jax.lax.exp)(x))(operand), (), ()) is not None
 
 
 def test_a_program_capturing_an_outer_traces_value_has_no_key():
