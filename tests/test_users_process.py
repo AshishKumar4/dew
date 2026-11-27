@@ -21,6 +21,7 @@ import run_kinds
 import test_codec_checkpoints
 import test_host_placement
 import test_run_options
+import test_sd3_source
 from lane_environment import users_process
 from process_support import relayed
 from tool_support import load
@@ -35,12 +36,17 @@ FLOWS = (
     test_codec_checkpoints.test_a_quantized_checkpoint_computes_its_reference,
     # A pool of two processes, whose ranks' output a user's arithmetic makes long (row 5434).
     test_host_placement.test_a_pool_reads_its_own_shards_of_a_host_resident_bank,
+    # A T5 tower's attention over 256 keys summed in fp32, the reference route's in blocks of keys and the
+    # selector's own (row 13655, train 1373's F5).
+    test_sd3_source.test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_reference,
 )
 """The flows, each another file's test function: every case of it runs, each in a child of its own where the
 flow states its cases (`CASES`)."""
 
 CASES = {test_run_options.test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set:
-         tuple(run_kinds.KINDS)}
+         tuple(run_kinds.KINDS),
+         test_sd3_source.test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_reference:
+         ("reference", "auto")}
 """The cases a flow runs one to a child, by their ids: a command-line run of each kind took 141 s together,
 past a group's 120 s (row 5541)."""
 
