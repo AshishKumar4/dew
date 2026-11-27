@@ -29,6 +29,7 @@ import jax
 import numpy as np
 
 from dew.nn.kernels.generation import gpu_target
+from dew.telemetry import hlo
 from dew.telemetry.trace import collective
 
 _cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}
@@ -281,7 +282,7 @@ class _Convolution:
 @dataclass(frozen=True)
 class _Instruction:
     """The parts of one HLO instruction the counts read, as XLA's schema states them
-    (`jax.extend.xla.Instruction`)."""
+    (`dew.telemetry.hlo.Instruction`)."""
 
     op: str
     dims: tuple[int, ...]
@@ -341,15 +342,13 @@ class _Computation:
 def hlo_module(source: str | Iterable[str] | jax.stages.Compiled):
     """The HLO module `source` holds: a compiled executable's optimized one (its first, as JAX's own
     `Compiled.as_text` prints it), or one written as text (an XLA dump, whole or as its lines; a module a
-    test writes), read by XLA's own parser (`jax.extend.xla.module_from_text`). None for an executable
+    test writes), read by XLA's own parser (`dew.telemetry.hlo.module_from_text`). None for an executable
     that holds no module."""
-    from jax.extend import xla
-
     if isinstance(source, jax.stages.Compiled):
         executable = source.runtime_executable()
         modules = [] if executable is None else executable.hlo_modules()
         return modules[0] if modules else None
-    return xla.module_from_text(source if isinstance(source, str) else '\n'.join(source))
+    return hlo.module_from_text(source if isinstance(source, str) else '\n'.join(source))
 
 
 def _integer(literal, element: str) -> int | None:
@@ -366,17 +365,15 @@ def _integer(literal, element: str) -> int | None:
 
 def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, _Computation], str | None]:
     """The module's computations, and the name of its entry computation (`hlo_module`), each instruction
-    read through XLA's own schema (`jax.extend.xla.instructions`), keeping the facts the counts read: of
+    read through XLA's own schema (`dew.telemetry.hlo.instructions`), keeping the facts the counts read: of
     its metadata, which is most of a module, only its traced name. No computations for an executable that
     holds no module."""
-    from jax.extend import xla
-
     module = hlo_module(source)
     computations: dict[str, _Computation] = {}
     entry = None
     if module is None:
         return computations, entry
-    for read in xla.instructions(module):
+    for read in hlo.instructions(module):
         proto = read.proto
         computation = computations.setdefault(read.computation, _Computation())
         if read.entry:

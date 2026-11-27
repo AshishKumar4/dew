@@ -1,7 +1,7 @@
 """A kernel's outputs stated as its operands' axes: the one expression a launch's output shapes and the
 dimensions each descends from are both derived from, so a template cannot state a map that disagrees with the
 shapes it emits, and a buffer its kernel defines reads which operand axes it scales with
-(`jax.stages.Compiled.peak_live`'s `dims`, through its custom call's `OUTPUT_DIMS`). A dimension is a
+(`dew.training.live_buffers.peak_live`'s `dims`, through its custom call's `OUTPUT_DIMS`). A dimension is a
 product of operand axes and constant sizes (`axis`, `Dim.__mul__`), divided or padded by a constant
 (`Dim.__floordiv__`, `Dim.ceil_div`, `Dim.padded`): a packed row of a batch's sequences is the product of
 their axes, a chunk count its sequence's axis over the chunk. An output stated as a plain

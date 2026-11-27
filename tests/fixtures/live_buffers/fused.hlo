@@ -1,0 +1,20 @@
+HloModule m, entry_computation_layout={(f32[2]{0})->(f32[2]{0}, f32[2]{0})}
+
+pair {
+  p = f32[2]{0} parameter(0)
+  n = f32[2]{0} negate(p), metadata={op_name="jit(f)/neg"}
+  x = f32[2]{0} exponential(p), metadata={op_name="jit(f)/exp"}, frontend_attributes={checkpoint_name="grown"}
+  ROOT t = (f32[2]{0}, f32[2]{0}) tuple(n, x)
+}
+
+one {
+  p = f32[2]{0} parameter(0)
+  ROOT s = f32[2]{0} sine(p), metadata={op_name="jit(f)/sin"}
+}
+
+ENTRY e {
+  a = f32[2]{0} parameter(0)
+  f = (f32[2]{0}, f32[2]{0}) fusion(a), kind=kLoop, calls=pair
+  g = f32[2]{0} fusion(a), kind=kLoop, calls=one, metadata={op_name="jit(f)/own"}
+  ROOT r = (f32[2]{0}, f32[2]{0}) tuple(g, g)
+}
