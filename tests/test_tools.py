@@ -12,6 +12,7 @@ compiles on CPU in seconds.
 
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1068,8 +1069,9 @@ def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
 
 
 def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does(tmp_path, capsys):
-    """tools/lint_slop.py run as a script reads its files in a pool of processes, one a processor; its
-    findings, their order and its counts are those main reports reading them in its caller's process."""
+    """tools/lint_slop.py run as a module (`python -m tools.lint_slop`) reads its files in a pool of
+    processes, one a processor; its findings, their order and its counts are those main reports reading them
+    in its caller's process."""
     lint = load("lint_slop")
     (tmp_path / "src" / "sparx").mkdir(parents=True)
     (tmp_path / "tests").mkdir()
@@ -1082,8 +1084,8 @@ def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does
     arguments = ["--root", str(tmp_path), "--package", "sparx"]
     assert lint.main(arguments) == 1
     serial = capsys.readouterr()
-    script = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "lint_slop.py"), *arguments],
-                            capture_output=True, text=True, timeout=300)
+    script = subprocess.run([sys.executable, "-m", "tools.lint_slop", *arguments], capture_output=True,
+                            text=True, env={**os.environ, "PYTHONPATH": str(REPO_ROOT)}, timeout=300)
     assert script.returncode == 1
     assert (script.stdout, script.stderr) == (serial.out, serial.err)
     # One finding a file, eighty files.
