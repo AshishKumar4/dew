@@ -153,7 +153,8 @@ def _online_truth(acc, peak, total, logits, values):
 
 
 def _split_kv_merge(left, left_peak, left_total, right, right_peak, right_total):
-    state = attention_algebra.merge(attention_algebra.GENERATED_MERGE, attention_algebra.Partial(left, left_peak, left_total),
+    state = attention_algebra.merge(attention_algebra.GENERATED_MERGE,
+                                    attention_algebra.Partial(left, left_peak, left_total),
                                     attention_algebra.Partial(right, right_peak, right_total))
     return state.acc, state.m, state.total
 

@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew.algebra import derive, means, windows
+from dew.algebra import derive, generated, means, windows
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
 from dew.nn.kernels import tuning
@@ -1813,10 +1813,7 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
     return others + expand(own, others) * anchor_value.astype(jnp.float32)
 
 
-GENERATED_MERGE = Forward("full", 2, ids=False, scale=0.5, natural=False)
-"""The spec the algebra's generated split-KV merge was traced at (`dew.algebra.component_cases`'s
-`split_kv_merge`): a merge reads a spec's base and forms alone (`_stated`), so every spec stating those as it
-does merges by that body."""
+GENERATED_MERGE = Forward("full", 2, ids=False, scale=0.5, natural=False)  # The generated merge's spec.
 
 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
@@ -2440,17 +2437,12 @@ def _derived_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """`merge` by the derived forms (`_stated`'s), over the states' rows whatever their leading axes
     (`_rows`): a scaled state's sums joined as the template joins them (`_scaled_merge`) over the factors
     the forms evaluate, through the forms' merge hook."""
-    from dew.algebra import generated
-
     leading = first.m.shape
-    if generated.enabled():
-        ones, others = _rows(first), _rows(second)
-        operands = (ones.acc, ones.m, ones.total, others.acc, others.m, others.total)
+    if generated.enabled():  # The generated body where the run asks for it (`generated.body`).
+        operands = (*_rows(first)[:3], *_rows(second)[:3])
         declared = (all(state.scale is None and state.low is None for state in (first, second))
-                    and _stated(spec, ones)[0] == _stated(GENERATED_MERGE, ones)[0])
-        if (body := generated.body("dew.algebra.component_cases.split_kv_merge", operands,
-                                   when=declared)) is not None:
-            # The declared body's results, as `component_cases`' `split_kv_merge` returns them.
+                    and _stated(spec, first)[0] == _stated(GENERATED_MERGE, first)[0])
+        if body := generated.body("dew.algebra.component_cases.split_kv_merge", operands, when=declared):
             made = Partial(**dict(zip(("acc", "m", "total"), body(*operands), strict=True)))
             return jax.tree.map(lambda part: part.reshape(*leading, *part.shape[1:]), made)
     # A state's maximum at the forms' floor (`LEAST`): a residual's row of no key gives it back -inf
