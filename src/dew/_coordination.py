@@ -188,7 +188,7 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
                 for index, whole in zip(indices, gathered, strict=True):
                     leaves[index] = whole
         except BaseException as failure:
-            error = failure
+            error = _unheard(failure)
         agree_process_phase(error, phase=f"{phase} transfer leaves {indices[0]}-{indices[-1]}")
     error = None
     materialized = value
@@ -197,7 +197,7 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
         if held:
             materialized = jax.tree.unflatten(tree, leaves)
     except BaseException as failure:
-        error = failure
+        error = _unheard(failure)
     agree_process_phase(error, phase=f"{phase} tree reconstruction")
     return materialized if held else None
 
@@ -224,7 +224,9 @@ def reading_home(phase: str, *, writes: bool = True) -> Iterator[None]:
     try:
         yield
     except BaseException as failure:
-        if jax.process_count() > 1:
+        # One a round carried already ends every process that took it there: published again, it would
+        # end a pool whose processes all caught it (train 1399's review).
+        if jax.process_count() > 1 and not _heard(failure):
             publish_failure(failure, f"phase {phase}")
         raise
     finally:
@@ -240,9 +242,15 @@ def writes_weights() -> bool:
 def read_home(value) -> np.ndarray:
     """`value` on this host: an array spanning other processes' devices read home by the pool together
     inside `reading_home`, and any other as it is (`np.asarray`), which refuses such an array outside
-    one rather than wait on processes that are not reading it."""
+    one rather than wait on processes that are not reading it. Inside one, an array this process lacks
+    some of whose devices span only part of the pool is refused here (published as the pool's failure)
+    rather than wait on a read its holders never join: they hold it whole and read it as it is, as every
+    process does its own copy on its own devices, which no process can tell from such an array's."""
     phase = _READS_HOME.get()
     if phase is not None and isinstance(value, jax.Array) and not value.is_fully_addressable:
+        if spans_part_of_pool(value.sharding.device_set):
+            raise ValueError(f"{phase} reads an array on a mesh of some of the pool's processes: place it "
+                             "on a mesh of all of them before the pool reads it")
         return np.asarray(collective_host(value, phase=phase))
     return np.asarray(value)
 
@@ -314,6 +322,14 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     return agreed_count(phase, operation, lambda _: True)[0]
 
 
+def agreed_reading[T](operation: Callable[[], T]) -> T:
+    """`operation` agreed by the pool (`agreed`) inside `reading_home`, whose every process runs the same
+    writer, so a writer that commits what it wrote (a release exchanged into place) hears of a process that
+    refused its share before it does; a plain call outside one."""
+    phase = _READS_HOME.get()
+    return operation() if phase is None else agreed(f"{phase}'s writes", operation)
+
+
 def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
     """`stream`'s next item, read on every rank and agreed (`agreed`), or None where it has ended on
     every rank; refused on all of them where it ended on some and not the others."""
@@ -336,7 +352,7 @@ def agreed_reads[T](phase: str, stream: Iterator[T],
     try:
         held = (next(stream, None),)
     except BaseException as failure:
-        error = failure
+        error = _unheard(failure)
     word = json.dumps(None if held is None or held[0] is None else said(held[0]))
     if jax.process_count() == 1:
         if error is not None:
@@ -348,6 +364,23 @@ def agreed_reads[T](phase: str, stream: Iterator[T],
     return held[0], [json.loads(spoken) for spoken in words]
 
 
+def _unheard(failure: BaseException) -> BaseException:
+    """`failure`, an operation's on its way to its agreement, which takes it there; one a round every
+    process took has carried already (a peer's, `PeerFailure`, or this process's own, `HEARD`) raised as it
+    is instead: every process that took that round unwinds as this one does, so a further round would wait
+    for processes gone (train 1383's review F3: a peer's failure heard in a gather's round, then its write
+    agreement taken alone)."""
+    if _heard(failure):
+        raise failure
+    return failure
+
+
+def _heard(failure: BaseException) -> bool:
+    """Whether a round every process took carried `failure` already: a peer's (`PeerFailure`), or this
+    process's own, which its agreement marked (`HEARD`)."""
+    return isinstance(failure, PeerFailure) or bool(vars(failure).get(HEARD))
+
+
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
     """`agreed`, with how many ranks' outcomes `counted` holds for, learned in the same round."""
     held: tuple[T] | None = None
@@ -355,7 +388,7 @@ def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T
     try:
         held = (operation(),)
     except BaseException as failure:
-        error = failure
+        error = _unheard(failure)
     count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
     assert held is not None
     return held[0], count
@@ -377,7 +410,7 @@ def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
     try:
         held = (find(),)
     except BaseException as failure:
-        error = failure
+        error = _unheard(failure)
     if jax.process_count() == 1:
         if error is not None:
             raise error

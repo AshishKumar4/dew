@@ -770,7 +770,11 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     tensors one process writes of the same weights unplaced, byte for byte, though the restored tree's
     key order may place one in another shard; the other writes the release's small files alone, no
     weights. Outside the export's scope the write is refused rather than left waiting on the other
-    process."""
+    process. Exported again from weights on the publisher's devices alone, which the other refuses to
+    read, the publisher hears of it before it exchanges the release into place: the first stays whole.
+    Exported where the publisher can stage none, where its disk fills past its first shard, where its
+    replacement is refused, and failed through two nested agreements, every process hears of it at the same
+    boundary and takes no round after, and the exports after them run as they did (train 1383's F3)."""
     publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
                                  fsdp_size=4, run_dir=str(tmp_path), **({"scan": True} if scan else {}))
     for report in (publisher, reader):
@@ -780,6 +784,14 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     assert publisher["differing"] == {} and len(publisher["release"]) > 10
     assert publisher["alone"] == reader["alone"]
     assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
+    assert (publisher["refusal"], reader["refusal"]) == ("PeerFailure", "ValueError")
+    assert publisher["kept"]
+    assert (publisher["unstaged"], reader["unstaged"]) == ("FileExistsError", "PeerFailure")
+    # A disk full past the publisher's first shard, an exchange that fails, and a failure through two nested
+    # agreements: each heard on the other process at the same boundary, neither left in a round alone.
+    assert (publisher["full"], reader["full"]) == ("OSError", "PeerFailure")
+    assert (publisher["unexchanged"], reader["unexchanged"]) == ("FileExistsError", "PeerFailure")
+    assert (publisher["nested"], reader["nested"]) == ("ValueError", "PeerFailure")
 
 
 @pytest.mark.distributed

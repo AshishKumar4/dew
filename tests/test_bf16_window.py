@@ -393,6 +393,38 @@ def test_a_windowed_source_saves_as_its_kernels_would(tmp_path):
         assert (saved[name].dtype, saved[name].tobytes()) == (tensor.dtype, tensor.tobytes()), name
 
 
+def test_a_windowed_fused_projection_saves_as_its_members_would(tmp_path):
+    """A bfloat16 Llama whose served tree packs its gated MLP's projections into one (`Pretrained.packed`),
+    that packed kernel `bf16_windows` stores as its window, saves the release its unpacked members save,
+    every tensor bit for bit: the export splits the window's deferred decode into its members, each
+    decoded as it is written (`PackedDecode.split`; train 1383's review: the split refused the deferred
+    leaf)."""
+    import torch
+    from flax.traverse_util import flatten_dict
+    from safetensors.numpy import load_file
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    from dew.interop.pretrained import Pretrained
+
+    torch.manual_seed(0)
+    config = LlamaConfig(hidden_size=128, intermediate_size=128, num_hidden_layers=1, num_attention_heads=2,
+                         num_key_value_heads=2, vocab_size=64, mlp_bias=True, torch_dtype="bfloat16")
+    LlamaForCausalLM(config).to(torch.bfloat16).save_pretrained(tmp_path / "source")
+    loaded = Pretrained.load(str(tmp_path / "source"), dtype="bfloat16", param_dtype="bfloat16")
+    packed = loaded.packed()
+    fused = next(path for path in flatten_dict(packed.variables["params"])
+                 if "gate" in "/".join(path) and path[-1] == "kernel")
+    assert np.shape(flatten_dict(packed.variables["params"])[fused])[-1] == 256, fused
+    windowed = quantization.bf16_windows(packed.variables, sites=["/".join(fused[:-1])])
+    assert quantization.QUANTIZATION in windowed
+    loaded.save(tmp_path / "plain")
+    packed.save(tmp_path / "windowed", variables=windowed)
+    plain, saved = (load_file(tmp_path / name / "model.safetensors") for name in ("plain", "windowed"))
+    assert sorted(saved) == sorted(plain)
+    for name, tensor in plain.items():
+        assert (saved[name].dtype, saved[name].tobytes()) == (tensor.dtype, tensor.tobytes()), name
+
+
 def test_a_windowed_dense_the_recipe_takes_runs_the_recipes_product():
     """A bfloat16 Dense whose kernel `bf16_windows` stores as its window, in a role the run's FP8 recipe
     takes (whole 128-wide blocks, the feed-forward's), computes the recipe's product of its kernel bit for
@@ -472,6 +504,13 @@ def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
     # A mesh of process 0's own devices, windowed there alone: no peer's agreement waited on.
     reports = run_pool("own_mesh", tmp_path / "own_mesh", 2, devices=2, script=worker, timeout=300)
     assert [report["decoded"] for report in reports] == [True, None], reports
+    # Read for a pooled export: each process reads the window's planes home together, decoding it whole.
+    # One on a mesh of process 0's devices alone: decoded there, refused on process 1 rather than left
+    # waiting on a read process 0 never joins. Each process's own copy decodes where it is, in a pool's
+    # read or outside one.
+    reports = run_pool("deferred_read", tmp_path / "deferred", 2, devices=2, script=worker)
+    assert reports[0] == {"pool": True, "subset": True, "own": True, "alone": True}, reports
+    assert reports[1] == {"pool": True, "subset": "refused", "own": True, "alone": True}, reports
     # Saved and read back on every process (row 13700): each process's own columns' bits; another encoder's
     # form refused on every process, by the form's check where it reads the digest.
     reports = run_pool("checkpointed", tmp_path / "checkpointed", 2, devices=2, script=worker)
@@ -682,3 +721,44 @@ def test_gemm_over_a_window_of_another_encoding_is_refused(compute):
                 refused()
         np.testing.assert_array_equal(np.asarray(jax.jit(product)(window)), np.asarray(product(window)))
 
+
+def test_an_exports_windows_are_decoded_as_each_is_written():
+    """A save's float tree (`quantization.deferred_packed`) decodes each window as its tensor is read, not
+    when the tree is built: a window another encoder packed is refused only when it is read, a row of a
+    window reads its rows, and the tree decoded now (`decoded_packed`) refuses it at once (train 1369's
+    review: the export held every decoded window before its shards' bound applied)."""
+    kernels = [np.asarray(np.random.default_rng(seed).standard_normal((128, 64)), jnp.bfloat16)
+               for seed in (0, 1)]
+    variables = {"params": {"first": {"kernel": jnp.asarray(kernels[0])},
+                            "second": {"kernel": jnp.asarray(kernels[1])}}}
+    windowed = quantization.bf16_windows(variables, sites=["first", "second"])
+    held = windowed[quantization.QUANTIZATION]
+    foreign = dataclasses.replace(held["second"]["kernel"], form=_flipped(held["second"]["kernel"].form))
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {**held, "second": {"kernel": foreign}}})
+    first, second = tree["params"]["first"]["kernel"], tree["params"]["second"]["kernel"]
+    assert (first.shape, second.shape) == ((128, 64), (128, 64))
+    np.testing.assert_array_equal(np.asarray(first[3]).view(np.uint16), kernels[0][3].view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(first).view(np.uint16), kernels[0].view(np.uint16))
+    with pytest.raises(ValueError):
+        np.asarray(second)
+    with pytest.raises(ValueError):
+        quantization.decoded_packed({quantization.QUANTIZATION: {**held, "second": {"kernel": foreign}}})
+
+
+def test_a_stage_stacked_packed_leaf_reads_as_its_stored_layers_rows():
+    """A packed bank stacked by stage, as a stage-local store holds a run's layers, read for an export
+    (`quantization.deferred_packed`) and cut into its stored layers (`layer_names.array_rows`, which
+    `stored_layers` cuts a stage-local run with), each row decoded as it is read, its values the bank's own
+    row's (train 1399's review: the deferred leaf had no reshape)."""
+    from dew.nn.backbones.layer_names import array_rows
+    from dew.nn.kernels.formats import NvFp4
+
+    stacked = np.random.default_rng(1399).standard_normal((2, 256, 64)).astype(np.float32)
+    bank = NvFp4.quantized(jnp.asarray(stacked))
+    tree = quantization.deferred_packed({quantization.QUANTIZATION: {"stages": {"kernel": bank}}})
+    leaf = tree["params"]["stages"]["kernel"]
+    rows = array_rows(("params", "stages", "kernel"), leaf, (2,))
+    whole = np.asarray(quantization.packed_values(bank))
+    assert [np.shape(row) for row in rows] == [(256, 64), (256, 64)]
+    for index, row in enumerate(rows):
+        np.testing.assert_array_equal(np.asarray(row), whole[index])

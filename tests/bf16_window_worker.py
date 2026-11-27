@@ -171,8 +171,54 @@ def own_mesh(args) -> dict:
     return {"decoded": bool(np.array_equal(decoded, kernel.view(np.uint16)))}
 
 
+def deferred_read(args) -> dict:
+    """A `[256, 256]` window read for an export (`quantization.deferred_packed`) inside the pool's reading
+    scope, as a pooled save reads it: split by its columns across the pool's processes, every process reads
+    its planes home together and decodes the whole kernel's bits; on process 0's devices alone, process 0
+    decodes it where it lives and process 1, which holds none of it, refuses it rather than wait on a read
+    process 0 never joins; and each process's own copy on its own devices decodes where it is, no peer
+    taking part, inside a pool's read or outside one."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew import quantization
+    from dew._coordination import reading_home
+
+    kernel = (np.random.default_rng(13702).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
+
+    def windowed(devices, *, pooled: bool):
+        columns = NamedSharding(Mesh(np.asarray(devices), ("columns",)), PartitionSpec(None, "columns"))
+        placed = (jax.make_array_from_callback(kernel.shape, columns, lambda index: kernel[index],
+                                               dtype=kernel.dtype)
+                  if pooled else jax.device_put(kernel, columns))
+        return quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])
+
+    def read(held) -> bool | str:
+        try:
+            decoded = np.asarray(quantization.deferred_packed(held)["params"]["kernel"])
+        except ValueError:
+            return "refused"
+        return bool(np.array_equal(decoded.view(np.uint16), kernel.view(np.uint16)))
+
+    reports = {}
+    for name, held in (("pool", windowed(jax.devices(), pooled=True)),
+                       ("subset", windowed([device for device in jax.devices() if device.process_index == 0],
+                                           pooled=True)),
+                       ("own", windowed(jax.local_devices(), pooled=False))):
+        with reading_home(f"a pooled save's window, {name}", writes=args.process_id == 0):
+            # A refusal caught inside the scope, so no pool failure is published for it.
+            reports[name] = read(held)
+    # Outside a pool's read, each process decodes a window of its own mesh alone.
+    held = windowed(jax.local_devices(), pooled=False)
+    decoded = np.asarray(quantization.decoded_packed(held)["params"]["kernel"])
+    reports["alone"] = bool(np.array_equal(decoded.view(np.uint16), kernel.view(np.uint16)))
+    return reports
+
+
 MODES = {"width_split": width_split, "depth_split": depth_split, "one_rank": one_rank,
-         "own_device": own_device, "own_mesh": own_mesh, "checkpointed": checkpointed}
+         "own_device": own_device, "own_mesh": own_mesh, "deferred_read": deferred_read,
+         "checkpointed": checkpointed}
 
 
 def main(argv=None) -> None:

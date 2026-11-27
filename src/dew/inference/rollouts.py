@@ -24,6 +24,8 @@ likelihood, which only the trainer's rescoring has.
 
 from __future__ import annotations
 
+import contextlib
+import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -651,8 +653,16 @@ class SafetensorsReload:
         Every process of a pool calls it.
         """
         published = _published(self.source, variables, jnp.dtype(self.dtype))
-        with reading_home("weight export", writes=jax.process_index() == 0):
-            agreed("weight export", lambda: published.save(self.directory))
+        publishes = jax.process_index() == 0
+        with reading_home("weight export", writes=publishes), contextlib.ExitStack() as held:
+            # The pool's other processes read every tensor as the publisher does and write their small files
+            # to a directory discarded, so none touches the live one the engine reads (`pooled_export`): its
+            # making and the save each agreed, so a process that fails at either is heard at the same
+            # boundary, none left waiting in a round alone; its removal fails nothing, so the publication
+            # that follows the save is never cut short behind the release on disk.
+            destination = agreed("weight export scratch", lambda: self.directory if publishes else
+                                 held.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
+            agreed("weight export", lambda: published.save(destination))
 
     def __call__(self, variables: Variables, version: int) -> None:
         self.write(variables)

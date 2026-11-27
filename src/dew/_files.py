@@ -15,11 +15,15 @@ cache keys a source file by.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import fcntl
+import hashlib
 import os
 import secrets
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 
 from etils import epath
@@ -103,13 +107,18 @@ def staged(directory: Path) -> Iterator[Path]:
 
     A `directory` another writer published first is kept, whole, and this
     write dropped: every writer publishes by the one rename. The directory
-    has the mode `mkdir` gives under the umask.
+    is private (mode 0700) while it is written, so no other user reads a
+    file of it before its publication, and takes the mode a folder made
+    beside it takes under the umask when it is published (`_made_mode`).
     """
     directory.parent.mkdir(parents=True, exist_ok=True)
+    # Read before anything is written: a probe made once the write is done could find no inode left.
+    mode = _made_mode(directory.parent)
     staging = _beside(directory, "")
-    staging.mkdir()
+    os.mkdir(staging, 0o700)
     try:
         yield staging
+        staging.chmod(mode)
         published(staging, directory)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -127,6 +136,198 @@ def published(built: Path, directory: Path) -> bool:
         shutil.rmtree(built, ignore_errors=True)
         return False
     return True
+
+
+_RENAME_EXCHANGE = 2
+_AT_FDCWD = -100
+
+
+def exchange_directories(staging: Path, directory: Path) -> None:
+    """Exchange the directories `staging` and `directory` in one call, `staging` then holding the earlier
+    one; refused, both as they were, where the kernel or the filesystem has no such exchange."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        exchange = libc.renameat2
+    except AttributeError:
+        raise OSError(errno.ENOSYS, f"this system exchanges no directories in one call: {directory} is "
+                                    "replaced only so; export into a directory not yet made") from None
+    if exchange(_AT_FDCWD, os.fsencode(staging), _AT_FDCWD, os.fsencode(directory), _RENAME_EXCHANGE):
+        code = ctypes.get_errno()
+        raise OSError(code, f"{directory} could not be exchanged with its new export in one call: "
+                            f"{os.strerror(code)}")
+
+
+Entries = Mapping[Path, str]
+"""A tree's entries (`_entries`): each by its path relative to the tree's root, with its kind, `"file"` (a
+regular file), `"folder"`, `"link"` or `"special"` (a FIFO, a socket, a device)."""
+
+
+@contextlib.contextmanager
+def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Path]], *,
+            exchange: Callable[[Path, Path], None] = exchange_directories) -> Iterator[Path]:
+    """A sibling directory to write the whole of `directory` into, which replaces it when the block ends
+    in one call, so a write that fails at any file leaves the one `directory` held whole and the one
+    that succeeds is put in place whole; removed if the block raises, or if its own setup fails.
+
+    The publication is failure-safe, not a reader's snapshot: a path names the new tree from the exchange
+    on, so a reader that opens a release's files one by one across a save may read files of both; a
+    reader synchronizes with the saves it reads. `directory` is found by its real parent and its own name,
+    a relative one as an absolute one, a final link left the link it is. A `directory` that does not exist
+    yet, or is empty, is put in place by one rename; one that holds anything is exchanged with the new one
+    in one call (Linux's `renameat2(RENAME_EXCHANGE)`), and refused, before anything moves, where the
+    filesystem has no such exchange: two renames would leave the path missing between them. It is
+    replaced only where `foreign` of the new tree's entries, its own (every file, folder and link, at any
+    depth, a link not followed, each with its kind, `_entries`) and its path names none: what it holds that
+    the new one neither writes nor owns, which is named. Refused before anything is written: one that is
+    no directory of its own (a file, a link), one that is the process's working directory or holds it,
+    whose replacement would leave the process in a folder removed, and one named as Dew's publishers'
+    locks are (`PUBLISHING_LOCK`); and one whose tree cannot be read whole, when it is replaced.
+
+    The new tree is made private from its first call (mode 0700), in the group and with the setgid bit
+    of the one it replaces, so what is written in it takes that group, and published with the mode of the
+    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), so a private
+    destination's weights are never readable by others. Dew's publishers of one destination take its
+    validation and replacement in turn (`_publishing`, a lock file of its own beside it), so one cannot
+    validate a tree another then replaces; a writer outside Dew is not excluded.
+    The earlier one is removed once it is out of place. `exchange` is the one call that exchanges the two
+    (`exchange_directories`, Linux's `renameat2`), a filesystem's own, which a test of a filesystem that
+    has none passes in."""
+    directory = _located(Path(directory))
+
+    def existing() -> os.stat_result | None:
+        """`directory`'s own stat where it exists, a directory of its own, else None: anything else
+        there refused."""
+        if not os.path.lexists(directory):
+            return None
+        if directory.is_symlink() or not directory.is_dir():
+            raise FileExistsError(f"{directory} is no directory of its own, which an export replaces")
+        return directory.stat()
+
+    if directory.name.startswith(PUBLISHING_LOCK):
+        raise ValueError(f"{directory} is named as Dew's publishers' locks are: export under another name")
+    working = Path(os.getcwd())
+    if working == directory or directory in working.parents:
+        raise ValueError(f"{directory} is or holds the working directory, which its replacement would "
+                         "leave removed: export from another")
+    # Refused before the block writes anything, and again before the replacement, as the path is then.
+    before = existing()
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    # A new tree's mode read before anything is written: a probe once the write is done could find no
+    # inode left.
+    made = _made_mode(directory.parent)
+    staging = _beside(directory, ".staging")
+    os.mkdir(staging, 0o700)
+    try:
+        if before is not None:
+            # The group and setgid inheritance of the tree it replaces, before anything is written in it.
+            if staging.stat().st_gid != before.st_gid:
+                os.chown(staging, -1, before.st_gid)
+            staging.chmod(0o700 | (stat.S_IMODE(before.st_mode) & stat.S_ISGID))
+        yield staging
+        with _publishing(directory):
+            held_at = existing()
+            if held_at is None:
+                staging.chmod(made)
+                os.rename(staging, directory)
+                return
+            written, held = _entries(staging), _entries(directory)
+            refused = foreign(written, held, directory)
+            if refused:
+                raise FileExistsError(f"{directory} holds {sorted(map(str, refused))}, which the export "
+                                      "would not write: export into an empty directory, or one holding only "
+                                      "an export")
+            staging.chmod(stat.S_IMODE(held_at.st_mode))
+            if held:
+                exchange(staging, directory)
+            else:
+                # An empty directory is replaced by a rename, which every filesystem makes in one step.
+                os.rename(staging, directory)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _made_mode(parent: Path) -> int:
+    """The mode a folder made in `parent` takes under the process's umask, the parent's setgid bit among
+    it: read off one made and removed, the umask read nowhere else, so no other thread's is changed."""
+    probe = _beside(parent / "probe", ".mode")
+    probe.mkdir()
+    try:
+        return stat.S_IMODE(probe.stat().st_mode)
+    finally:
+        probe.rmdir()
+
+
+def _located(directory: Path) -> Path:
+    """`directory` by its real parent and its own name: a relative path made absolute, its parent's links
+    resolved, and a final link left the link it is, which `swapped` refuses; a path ending in `.` or `..`,
+    which names no entry of its own, resolved whole."""
+    absolute = directory.absolute()
+    if absolute.name in ("", ".", ".."):
+        return absolute.resolve()
+    return absolute.parent.resolve() / absolute.name
+
+
+PUBLISHING_LOCK = ".dew-lock-"
+"""The prefix of the file beside a release whose exclusive lock Dew's publishers of it take in turn
+(`_publishing`): `.dew-lock-` and a digest of the release's name, short whatever the name's length, a name
+no release takes (`swapped` refuses one)."""
+
+
+@contextlib.contextmanager
+def _publishing(directory: Path) -> Iterator[None]:
+    """Hold Dew's lock of `directory`'s publication, an exclusive `flock` of its own file beside it (named
+    by a digest of its name, `PUBLISHING_LOCK`), so its publishers validate and replace it one at a time and
+    one destination's publication holds no other's. The file is opened for writing, which an exclusive lock
+    takes on every filesystem (NFS's among them), no link followed to it: an existing one as it is (a
+    sticky folder refuses creating over another user's), else made exclusively, as every file Dew writes is,
+    under the umask, and left in place, the one inode every publisher locks. Whoever the umask lets write
+    beside the release takes its lock; one it does not is refused opening it, not left waiting. The lock is
+    keyed by the destination's name as given, so publishers of one release name it alike: two spellings a
+    case-folding filesystem takes for one entry take two locks."""
+    # Keyed by the name as given: publishers of one release name it alike; two spellings a case-folding
+    # filesystem takes for one entry take two locks (row 13744).
+    name = PUBLISHING_LOCK + hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
+    lock = _lock_file(directory.parent / name)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock)
+
+
+def _lock_file(path: Path) -> int:
+    """The lock file at `path` opened for writing alone, no link followed: made by this call exclusively,
+    with write permission alone (under the umask), so only who may write beside the release locks it; else
+    the one an earlier publication made, which is never removed, opened as it is, never created over (a
+    sticky folder refuses that of another user's file)."""
+    flags = os.O_WRONLY | os.O_NOFOLLOW
+    try:
+        return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o222)
+    except FileExistsError:
+        return os.open(path, flags)
+
+
+def _entries(root: Path) -> dict[Path, str]:
+    """Every entry of the tree at `root` (files, folders, and links of any kind, none followed), each by its
+    path relative to `root`, with its kind (`Entries`); a tree read in part is no inventory of it, so a
+    folder it cannot list fails the walk."""
+    def unread(error: OSError) -> None:
+        raise error
+
+    def kind(path: Path) -> str:
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            return "link"
+        if stat.S_ISDIR(mode):
+            return "folder"
+        return "file" if stat.S_ISREG(mode) else "special"
+
+    entries = {}
+    for here, directories, files in os.walk(root, onerror=unread, followlinks=False):
+        base = Path(here).relative_to(root)
+        for name in (*directories, *files):
+            entries[base / name] = kind(Path(here) / name)
+    return entries
 
 
 def _beside(target: Path, suffix: str) -> Path:

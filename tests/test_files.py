@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from dew._files import published, replacing, staged, write_atomically
+from dew._files import published, replacing, staged, swapped, write_atomically
 
 
 def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(tmp_path):
@@ -119,3 +119,127 @@ def test_every_reader_of_outside_paths_refuses_one_out_of_its_directory_alike(pa
         with pytest.raises(ValueError):
             read()
     assert inside("transformer/config.json") and inside("unet/") and not inside("unet/", directory=False)
+
+
+def _nothing_foreign(written, held, directory):
+    return set()
+
+
+def test_a_relative_destination_is_swapped_into_its_real_parent(tmp_path, monkeypatch):
+    """A destination named relative to the working directory is published as its absolute name would be:
+    its sibling made in its real parent (train 1383's review: `.` made a sibling of an empty name); the
+    working directory itself, or one holding it, is refused."""
+    monkeypatch.chdir(tmp_path)
+    with swapped("release", _nothing_foreign) as staging:
+        (staging / "model.safetensors").write_text("its own")
+    assert (tmp_path / "release" / "model.safetensors").read_text() == "its own"
+    # The working directory itself, or one holding it, is refused before anything is written: its
+    # replacement would leave the process in a folder removed (train 1399's review).
+    (tmp_path / "release" / "inner").mkdir()
+    for working, destination in ((tmp_path / "release", "."), (tmp_path / "release" / "inner", "..")):
+        monkeypatch.chdir(working)
+        with pytest.raises(ValueError), swapped(destination, _nothing_foreign) as staging:
+            (staging / "model.safetensors").write_text("new")
+        assert (tmp_path / "release" / "model.safetensors").read_text() == "its own"
+        assert os.getcwd() == str(working)
+
+
+def test_a_private_destination_stays_private_through_its_staging(tmp_path):
+    """A tree swapped over a `0700` directory is written in a staging no other user reads and takes the
+    destination's mode; one into a directory not yet made takes the mode a new directory takes under the
+    umask (train 1383's review: staging at 0755 exposed weights, and replaced 0700 with 0755)."""
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    (private / "model.safetensors").write_text("old")
+    with swapped(private, _nothing_foreign) as staging:
+        assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+        (staging / "model.safetensors").write_text("new")
+    assert stat.S_IMODE(private.stat().st_mode) == 0o700
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    with swapped(tmp_path / "fresh", _nothing_foreign) as staging:
+        (staging / "model.safetensors").write_text("new")
+    assert stat.S_IMODE((tmp_path / "fresh").stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
+
+
+def test_an_empty_destination_is_replaced_without_an_exchange(tmp_path):
+    """A destination made empty beforehand (a staging `push_to_hub` or a pooled export makes) is replaced by
+    one rename where the filesystem exchanges no directories; one holding a tree is refused there, kept
+    (train 1383's review)."""
+    def no_exchange(staging, directory):
+        raise OSError(38, "this system exchanges no directories in one call")
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with swapped(empty, _nothing_foreign, exchange=no_exchange) as staging:
+        (staging / "model.safetensors").write_text("new")
+    assert (empty / "model.safetensors").read_text() == "new"
+    with pytest.raises(OSError), swapped(empty, _nothing_foreign, exchange=no_exchange) as staging:
+        (staging / "model.safetensors").write_text("newer")
+    assert (empty / "model.safetensors").read_text() == "new"
+
+
+def test_publishers_of_one_destination_validate_and_replace_it_in_turn(tmp_path):
+    """Two Dew publishers of one destination take its validation and replacement one at a time: one held
+    between its validation and its exchange keeps the other from validating the tree it is about to
+    replace (train 1383's review: a publisher's exchange displaced a sidecar another had published after
+    its validation)."""
+    import threading
+
+    from dew._files import exchange_directories
+
+    destination = tmp_path / "release"
+    destination.mkdir()
+    (destination / "model.safetensors").write_text("first")
+    events: list[str] = []
+    paused, resume = threading.Event(), threading.Event()
+
+    def validated(written, held, directory):
+        events.append(f"{threading.current_thread().name} validates")
+        return set()
+
+    def exchanged(staging, directory):
+        if threading.current_thread().name == "first":
+            paused.set()
+            assert resume.wait(30)
+        exchange_directories(staging, directory)
+        events.append(f"{threading.current_thread().name} exchanged")
+
+    def publish(text):
+        with swapped(destination, validated, exchange=exchanged) as staging:
+            (staging / "model.safetensors").write_text(text)
+
+    first = threading.Thread(target=publish, args=("one",), name="first")
+    second = threading.Thread(target=publish, args=("two",), name="second")
+    first.start()
+    assert paused.wait(30)
+    second.start()
+    second.join(1)
+    # The second publisher waits on the first's publication, not validating the tree it replaces.
+    assert second.is_alive() and "second validates" not in events
+    resume.set()
+    first.join(30)
+    second.join(30)
+    assert events.index("first exchanged") < events.index("second validates")
+    assert (destination / "model.safetensors").read_text() == "two"
+
+
+def test_a_release_whose_name_is_the_longest_the_filesystem_allows_is_swapped(tmp_path):
+    """A release named as long as the filesystem allows is staged, locked and published: its publishers'
+    lock is named by a digest of its name, not its name (train 1383's review)."""
+    name = "r" * os.pathconf(tmp_path, "PC_NAME_MAX")
+    with swapped(tmp_path / name, _nothing_foreign) as staging:
+        (staging / "model.safetensors").write_text("new")
+    assert (tmp_path / name / "model.safetensors").read_text() == "new"
+
+
+def test_a_staged_directory_is_private_until_its_publication(tmp_path):
+    """A directory written through `staged` is no other user's to read while it is written (mode 0700) and
+    takes the mode a folder made beside it takes when it is published (train 1399's review: a cache's
+    shards were readable under the staging name as they were written)."""
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    with staged(tmp_path / "release") as staging:
+        assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+        (staging / "model.safetensors").write_text("new")
+    assert stat.S_IMODE((tmp_path / "release").stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)

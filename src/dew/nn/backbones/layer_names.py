@@ -66,10 +66,14 @@ __all__ = ["LAYERS", "any_layer", "group_layers", "group_name", "layer_index"]
 
 
 def array_rows(path, leaf, shape: tuple[int, ...]) -> list:
-    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: its leading `shape` flattened by
-    the leaf's own reshape, so a host array stays on the host and a device array where it is."""
+    """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: each index of its leading `shape`,
+    taken by the leaf's own indexing, so a host array stays on the host, a device array where it is, and a
+    packed leaf an export decodes as it reads it (`quantization.PackedDecode`) decodes each row as it is
+    read (train 1399's review: a reshape it has none of)."""
     del path
-    return list(leaf.reshape((-1, *leaf.shape[len(shape):])))
+    # The leaf's own leading dimensions, so one whose rows are not the declared `shape` fails the cut's
+    # count rather than lose a row.
+    return [leaf[index] for index in np.ndindex(*leaf.shape[:len(shape)])]
 
 
 def stage_count(tree) -> int:
