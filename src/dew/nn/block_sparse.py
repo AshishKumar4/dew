@@ -302,15 +302,15 @@ def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
 
 
 def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, selected: jax.Array, *,
-                  block: int, scale: float) -> jax.Array:
+                  block: int, scale: float, precision=None) -> jax.Array:
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
     objective takes it (the objective's `IndexerTraining`): each group's KL of the index branch's softmax over
     the query's selected tokens from its heads' detached attention there (`mla.indexer_log_target`: their
     softmaxes summed, normalized), averaged over the groups. Its logarithms are taken whole, no epsilon
     (MaxText's, `mla.indexer_kl`'s, caps a token the branch scores far below the attention's at -log(1e-8)
     and stills its gradient), over the selected tokens alone, a token the teacher gives no mass adding
-    nothing. `query`
-    `[B, Q, G * h, D]`, `key` `[B, K, G, D]`, `index_scores` `[B, G, Q, K]`."""
+    nothing. `query` `[B, Q, G * h, D]`, `key` `[B, K, G, D]`, `index_scores` `[B, G, Q, K]`. Its teacher's
+    logits are at `precision`, the attention's own (`mla.indexer_log_target`)."""
     groups, keys = index_scores.shape[1], index_scores.shape[3]
     per = query.shape[2] // groups
     tokens = _selected_tokens(selected, keys, block)
@@ -324,7 +324,7 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         # mass rounded to 0 first weighed it nothing, train 1345's F2).
         logged = jnp.where(keep, indexer_log_target(query[:, :, group * per:(group + 1) * per],
                                                     jnp.repeat(key[:, :, group:group + 1], per, axis=2), keep,
-                                                    scale, dtype=wide), -jnp.inf)
+                                                    scale, dtype=wide, precision=precision), -jnp.inf)
         top = jnp.max(logged, axis=-1, keepdims=True)
         top = jnp.where(jnp.isfinite(top), top, 0)
         shares = jnp.exp(logged - top)
@@ -618,7 +618,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
             # Its indexer's loss per query, as an objective training an indexer reads it
             # (`IndexerTraining`, `mla.indexer_kl`'s collection).
             self.sow(INDEXER_COLLECTION, "kl", msa_query_kls(
-                scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5))
+                scores, query, key, selected, block=self.block, scale=query.shape[-1] ** -0.5,
+                precision=self.ctx.precision))
         return selected_attention(query, key, value, selected, block_runs(key.shape[1], self.block),
                                   dtype=self.ctx.dtype, precision=self.ctx.precision,
                                   force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,

@@ -149,7 +149,7 @@ INDEXER_EPS = 1e-8
 logarithms of the KL."""
 
 
-def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
+def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=None):
     """The log of the indexer's teacher's unnormalized mass per key, `[B, S, T]` at least fp32 (float64 for
     float64 inputs): the main attention's softmaxes over the keys `keep` allows, summed over its heads,
     detached as the references detach it (arXiv 2512.02556 eq. 3; MSA's, arXiv 2606.13392 eq. 9); -inf at a
@@ -163,7 +163,9 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     rounded once (`compensated_add`: plain sums biased the KL upward, 1.67 times MaxText's error from
     float64), so a key whose every head weighs it below fp32's least normal keeps its mass in its logarithm
     (a mass of e^-110 rounded to 0 before its product with a student's gap of 2^126, 1.44e-10, train
-    1345's F2). It sums in `dtype` where given (at least fp32), its operands' otherwise."""
+    1345's F2). It sums in `dtype` where given (at least fp32), its operands' otherwise, its logits at
+    `precision`, the attention's own it trains toward (JAX's configured one where unstated: under an ambient
+    fp16 preset a layer's fp32 logits 4096 and 4097 became 4096 and 4096 in the teacher, row 13706)."""
     wide = at_least_fp32(jnp.result_type(query, key) if dtype is None else dtype)
     batch, length, total = query.shape[0], query.shape[1], key.shape[1]
     keep = jnp.broadcast_to(keep, (batch, length, total))
@@ -175,7 +177,8 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     def masses(q, k):
         # A head's log-softmax over the allowed keys, -inf at the others; over a row that allows none, uniform
         # over every key, as MaxText's and the paper's masked softmax gives it (`allowed`).
-        logits = jnp.where(allowed, jnp.where(seen, float32_einsum('bsd,btd->bst', q, k), 0), -jnp.inf)
+        logits = jnp.where(allowed, jnp.where(seen, float32_einsum('bsd,btd->bst', q, k, precision=precision),
+                                              0), -jnp.inf)
         peak = jnp.max(logits, axis=-1, keepdims=True)
         spread = jnp.log(jnp.sum(jnp.exp(logits - peak), axis=-1, keepdims=True))
         return logits - peak - spread
@@ -198,10 +201,10 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None):
     return jnp.where(allowed, held + jnp.log(high + low), -jnp.inf)
 
 
-def indexer_target(query, key, keep, scale: float, *, dtype=None):
+def indexer_target(query, key, keep, scale: float, *, dtype=None, precision=None):
     """The indexer's teacher's unnormalized mass per key, `[B, S, T]` (`indexer_log_target`'s, taken out of
     its logarithm): 0 at a key `keep` hides."""
-    return jnp.exp(indexer_log_target(query, key, keep, scale, dtype=dtype))
+    return jnp.exp(indexer_log_target(query, key, keep, scale, dtype=dtype, precision=precision))
 
 
 def indexer_kl(scores, query, key, keep, scale: float):
