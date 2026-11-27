@@ -235,7 +235,7 @@ class Pretrained:
     quantized_dtypes: Mapping[str, str | None] = field(default_factory=dict, repr=False)
     """How the load holds each of `quantized_tensors`, every one recorded: the dtype it decoded the weight
     into (its param dtype as resolved), or None for a bank it serves packed, undecoded, which an export
-    decodes exactly in float32 (`quantization.deferred_packed`). An export tells a value left as loaded
+    decodes exactly in float32 (`quantization.packed_values`). An export tells a value left as loaded
     from one its training changed against it, whatever dtype its tree hands the value in
     (`codecs.source_quantization`'s `loaded`)."""
     revision: str | None = None

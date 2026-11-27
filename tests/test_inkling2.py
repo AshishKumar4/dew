@@ -370,3 +370,26 @@ def test_a_zero_whose_sign_training_flipped_takes_the_code_of_its_sign():
     signed[0, 0, 0] = -0.0
     written = inkling2_experts(stored, {nvfp4: 'float32'}).encode(nvfp4, signed)[nvfp4]
     assert written[0, 0, 0] == 0x08 and (written[0, 0, 1:] == 0).all()
+
+
+def test_a_zero_under_a_zero_nvfp4_scale_takes_the_code_of_its_sign():
+    """Under a zero NVFP4 group scale every code decodes to a zero of the code's sign: a loaded `+0` an
+    edit made `-0` takes the negative zero's nibble there too, and a value no zero holds is still refused
+    (train 1389's review)."""
+    import ml_dtypes
+
+    from dew.interop.codecs import inkling2_experts
+
+    name = 'model.llm.layers.2.mlp.experts.gate_up_proj'
+    stored = {name: np.zeros((1, 1, 8), np.uint8),
+              name + '_scale': np.zeros((1, 1, 1), ml_dtypes.float8_e4m3fn),
+              name + '_amax': np.ones(1, np.float32),
+              name + '_outer_scale_denominator': np.ones(1, np.float32)}
+    codec = inkling2_experts(stored, {name: 'float32'})
+    signed = np.zeros((1, 1, 16), np.float32)
+    signed[0, 0, 1] = -0.0
+    written = codec.encode(name, signed)[name]
+    assert written[0, 0, 0] == 0x80 and (written[0, 0, 1:] == 0).all()
+    signed[0, 0, 2] = 1.0
+    with pytest.raises(ValueError):
+        codec.encode(name, signed)

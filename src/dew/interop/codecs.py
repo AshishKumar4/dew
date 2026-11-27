@@ -1976,7 +1976,8 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         raise ValueError(f"{name}: its load recorded no dtype it decoded the bank into, which a value left "
                          "as loaded is told apart in")
     given = np.asarray(weight)
-    # A bank served packed (None) reaches the export decoded exactly in float32 (`deferred_packed`).
+    # A bank served packed (None) reaches the export decoded exactly in float32
+    # (`quantization.packed_values`).
     kept_as = np.dtype(np.float32 if loaded[name] is None else loaded[name])
     # Both sides held exactly in one dtype: float64 where either is, else float32, which holds bfloat16's,
     # float16's and float32's values alike (NumPy joins no two 16-bit floats); no copy where they match.
@@ -1999,14 +2000,20 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
             factor = (np.asarray(amax, np.float32) / np.asarray(denominator, np.float32)).astype(np.float64)
             effective = (np.repeat(np.asarray(scale).astype(np.float64), 16, axis=-1)
                          * factor.reshape(-1, *(1,) * (given.ndim - 1)))
-            if np.any((effective == 0) & ~kept):
+            wide = given.astype(np.float64)
+            # Under a zero scale every code decodes to a zero, of the code's sign times the scale's: a
+            # changed zero takes the code of its own sign so; any other changed value none holds.
+            zeroed = (effective == 0) & ~kept
+            if np.any(zeroed & (wide != 0)):
                 raise ValueError(f"{name} has a zero NVFP4 scale and trained values outside its grid")
-            quotients = np.divide(given.astype(np.float64), effective, out=np.zeros_like(effective),
-                                  where=effective != 0)
+            quotients = np.divide(wide, effective, out=np.zeros_like(effective), where=effective != 0)
             fresh = encode_e2m1(quotients, ties='even')
+            signs = (np.signbit(wide) ^ np.signbit(effective)).astype(np.uint8) << 3
+            fresh_low = np.where(zeroed[..., 0::2], signs[..., 0::2], fresh & 0x0f)
+            fresh_high = np.where(zeroed[..., 1::2], signs[..., 1::2] << 4, fresh & 0xf0)
             # Each byte's half the stored code keeps from the stored byte, the other from the fresh one.
-            low = np.where(kept[..., 0::2], stored & 0x0f, fresh & 0x0f)
-            high = np.where(kept[..., 1::2], stored & 0xf0, fresh & 0xf0)
+            low = np.where(kept[..., 0::2], stored & 0x0f, fresh_low)
+            high = np.where(kept[..., 1::2], stored & 0xf0, fresh_high)
             packed = (low | high).astype(np.uint8)
         return {name: packed.view(np.asarray(original).dtype), name + "_scale": np.asarray(scale),
                 name + "_amax": np.asarray(amax), name + "_outer_scale_denominator": np.asarray(denominator)}
