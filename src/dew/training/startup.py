@@ -179,16 +179,18 @@ def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", ch
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
     a pass count's sampled law among it, row 10783), the numerics its programs ran under among it."""
-    saved, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
+    training, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
     # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
     # checkpoint that records none, a fixed-pass run's, any run resumes).
-    dropped = (["training.sampled_passes"] if isinstance(saved, dict) and "sampled_passes" in saved
+    dropped = (["training.sampled_passes"] if isinstance(training, dict) and "sampled_passes" in training
                and "sampled_passes" not in now else [])
     # Its numerics compared as they computed (`numerics_differs`), the rest of its record as it reads.
-    if isinstance(saved, dict):
-        saved = {name: value for name, value in saved.items() if name not in ("numerics", "products")}
-    return (differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
-            + numerics_differs(checkpoints.training(step)))
+    numerics = ("numerics", "products")
+    saved = ({name: value for name, value in training.items() if name not in numerics}
+             if isinstance(training, dict) else training)
+    rest = {name: value for name, value in now.items() if name not in numerics}
+    return (differing_records(checkpoints.artifact(step), trainer._artifact(), saved, rest) + dropped
+            + numerics_differs(training, {name: now[name] for name in numerics}))
 
 
 def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]",
@@ -210,10 +212,10 @@ def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]
                          "and model it recorded, or train in another directory")
 
 
-def numerics_differs(saved: JSON | None) -> list[str]:
+def numerics_differs(saved: JSON | None, now: Mapping[str, JSON] | None = None) -> list[str]:
     """Where a checkpoint's training record `saved` states numerics other than those its resume computes
-    under where it is read (`numerics_record`): their forms, recipe and outputs, and the precision its
-    products computed at (`products`), whatever precision it declared (row 13708). A record a Dew wrote
+    under where it is read (`now`, else `numerics_record`'s): their forms, recipe and outputs, and the
+    precision its products computed at (`products`), whatever precision it declared (row 13708). A record a Dew wrote
     before it stated `products` states none: its declared precision (`matmul`) is held to the resume's,
     JAX's own default named either way ("default", `DotAlgorithmPreset.DEFAULT`) as one."""
     from dew.nn.kernels import generation
@@ -222,7 +224,7 @@ def numerics_differs(saved: JSON | None) -> list[str]:
     numerics = saved.get("numerics") if isinstance(saved, dict) else None
     if not isinstance(saved, dict) or not isinstance(numerics, dict):
         return []
-    now = numerics_record()
+    now = numerics_record() if now is None else now
     found = _differing({key: value for key, value in numerics.items() if key != "matmul"}, now["numerics"],
                        "training.numerics")
     if "products" in saved:

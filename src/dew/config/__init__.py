@@ -1651,9 +1651,13 @@ class RunConfig:
         resumed: dict[str, Mapping[str, object]] = {}
 
         def check_resumed() -> None:
+            from dew.training.distributed import under_numerics
             from dew.training.startup import refuse_other_computation, resumed_step
 
-            step = resumed_step(built, resume)
+            # Its checkpoint chosen, and a weights-only directory's guard taken (`resumed_step`), under the
+            # numerics its steps trace under, as `fit` takes them.
+            with self.traced(), under_numerics(built.numerics):
+                step = resumed_step(built, resume)
             if step is None:
                 return
             training = checkpoints.training(step)

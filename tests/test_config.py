@@ -466,6 +466,11 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
     assert (tmp_path / "ambient" / RUN_FILE).read_bytes() == record
     with jax.default_matmul_precision("float32"):
         assert int(run(2).train(Regression(), data, name="ambient").step) == 2
+    # Declared otherwise but computing alike ("highest" named where "default" left JAX's "highest"), it
+    # resumes: the precision its products computed at is what a resume is held to (row 13708).
+    with jax.default_matmul_precision("highest"):
+        declared = Numerics(DTYPE_PRESETS["32-true"], matmul="highest")
+        assert int(run(3).train(Regression(), data, name="ambient").step) == 3
 
 
 def test_publishing_requires_a_final_checkpoint_policy():
