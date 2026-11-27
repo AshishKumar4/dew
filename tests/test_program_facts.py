@@ -57,6 +57,58 @@ def test_a_call_is_read_through_its_program_and_a_pure_one_alone_runs_in_its_cal
         programs.scan_body(chosen)
 
 
+def test_each_kind_of_operation_is_known_by_its_object_and_none_by_its_name_alone():
+    """Each kind the analyses read holds JAX's operations of it by their objects, which no attribute of
+    JAX's `Primitive` states (row C44: a fork's attributes broke on JAX 0.12.2), Dew's own added where they
+    are defined; and an operation of a user's under the same name is of no kind."""
+    from dew.nn.conv import _barrier_p
+    from dew.nn.derivatives import marked_call_p
+    from dew.nn.division import correctly_rounded_divide_p
+
+    kinds = {
+        programs.entrywise: (jax.lax.add_p, jax.lax.convert_element_type_p, jax.lax.select_n_p,
+                             primitives.add_jaxvals_p, correctly_rounded_divide_p),
+        programs.positionwise: (jax.lax.exp_p, primitives.random_bits_p, jax.lax.bitcast_convert_type_p,
+                                _barrier_p),
+        programs.rearranges: (jax.lax.reshape_p, jax.lax.gather_p, jax.lax.transpose_p),
+        programs.reduction: (jax.lax.reduce_sum_p, jax.lax.argmax_p),
+        programs.cumulative: (jax.lax.cumsum_p,),
+        programs.scatter: (jax.lax.scatter_add_p,),
+        programs.is_inlined_call: (primitives.jit_p, primitives.remat_p, primitives.custom_jvp_call_p,
+                                   marked_call_p),
+        programs.is_transparent_call: (primitives.jit_p,),
+    }
+    for kind, members in kinds.items():
+        for primitive in members:
+            assert kind(primitive), (kind.__name__, primitive)
+        assert not kind(named(members[0].name, jnp.negative)), kind.__name__
+    # A key's split maps positions and no value's entries; a checkpoint and a marked span are calls that do
+    # more than their programs; a reduction moves no entries.
+    assert not programs.entrywise(primitives.random_split_p)
+    assert not programs.is_transparent_call(primitives.remat_p)
+    assert not programs.is_transparent_call(marked_call_p)
+    assert not programs.rearranges(jax.lax.reduce_sum_p)
+
+
+def test_a_value_tagged_with_xla_metadata_is_read_through_its_tag():
+    """A matmul whose operand `set_xla_metadata` tags reads as the matmul it is: its tag positionwise, so
+    the analyses read through it, its traced work the matmul's two FLOPs a multiply-add (no tag left
+    uncounted), and its causality tokenwise (train 1368's review F3: the tag, defined in JAX's private
+    module alone, fell out of the kinds the fork's attribute had stated)."""
+    from jax.experimental.xla_metadata import set_xla_metadata
+
+    from dew.nn.flops import traced_flops
+
+    def tagged(x, w):
+        # The value-taking form, which binds the tag as an operation of its own.
+        return set_xla_metadata(x, tag="dew") @ w
+
+    jaxpr = jax.make_jaxpr(tagged)(jnp.ones((4, 8)), jnp.ones((8, 16)))
+    tags = [eqn.primitive for eqn in jaxpr.eqns if eqn.primitive.name == "xla_metadata_value"]
+    assert tags and all(programs.positionwise(tag) for tag in tags), [eqn.primitive for eqn in jaxpr.eqns]
+    assert traced_flops(tagged, jnp.ones((4, 8)), jnp.ones((8, 16))) == 2 * 4 * 8 * 16
+
+
 def test_the_algebra_reads_another_librarys_operation_as_a_leaf_whatever_its_name():
     """A user's primitive named `dot_general`, bound with a product's parameters, that squares its second
     operand is no operation of the language: the sum of two of its results over bounded operands stays as

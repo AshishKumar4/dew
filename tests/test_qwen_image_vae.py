@@ -31,7 +31,6 @@ from interop_support import (
     channels_last,
     extract_fixture,
     fixture_arrays,
-    scaled_gap,
 )
 from model_support import attending
 
@@ -81,7 +80,11 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, load
 
 
 @attending("reference")
-@pytest.mark.parametrize("walk", ["encode", "decode"])
+@pytest.mark.parametrize("walk", [
+    "encode",
+    # Its recording's 512 seeds, which check 1's stages draw five times over, past one group's 120 s
+    # (143 s in train 1342): drawn in armada's map tasks.
+    pytest.param("decode", id="decode", marks=pytest.mark.check1_shards(seeds=512, per_task=128))])
 def test_the_posterior_and_the_decode_and_every_gradient_match_the_source(loaded, walk):
     """The posterior's mean and standard deviation of an RGBA image, and the decode of a latent, and
     against drawn probes the gradients of their probed sum in the operand and in every parameter (zero
@@ -106,15 +109,18 @@ def test_the_encode_is_the_posteriors_mean(loaded, reference):
 
 
 def test_a_sampled_latent_is_the_mean_plus_std_times_the_draw(loaded, reference):
+    """An encode given a key draws Diffusers' `DiagonalGaussianDistribution.sample`: the posterior's mean
+    plus its deviation times the key's standard normal draw, in float32, each step rounded as that
+    formula rounds it, so bit for bit; and not its mean."""
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
     image = channels_last(reference["image"])
     key = jax.random.key(7)
     mean, std = posterior(model, params, image)
     sampled = model.apply({"params": params}, image, key, method=model.encode)
-    expected = mean + std * jax.random.normal(key, mean.shape, mean.dtype)
-    assert scaled_gap(sampled, expected) < 1e-6
-    assert scaled_gap(sampled, mean) > 1e-2
+    expected = mean + std * jax.random.normal(key, mean.shape, jnp.float32)
+    np.testing.assert_array_equal(np.asarray(sampled), np.asarray(expected))
+    assert not np.array_equal(np.asarray(sampled), np.asarray(mean))
 
 
 def test_the_decode_clamps_its_pixels(loaded, reference):

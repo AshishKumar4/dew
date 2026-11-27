@@ -21,12 +21,9 @@ import itertools
 import re
 import sys
 from collections.abc import Iterator, Sequence, Set
-from pathlib import Path
 from typing import Protocol, TypeGuard
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes
-import lint_texts as texts
+from tools import lint_scopes as scopes, lint_texts as texts
 
 Found = tuple[int, int, str, str]
 """A finding: its line, column, code and message."""

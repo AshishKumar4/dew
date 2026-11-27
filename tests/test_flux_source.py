@@ -399,9 +399,11 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
         latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
     times = jnp.asarray([500.0, 500.0])
     variables = {"params": loaded.variables["params"]}
-    mixed = loaded.model.apply(variables, latent, times, given)
-    lowered = loaded.model.apply(variables, latent, times,
-                                 encoder.encode(params, encoder.tokenize(same)))
+    # Each call compiled, as a walk and a training step run it: the pipeline's model run eagerly, op by op,
+    # took this test past its group's 120 s (row 13566).
+    apply = jax.jit(loaded.model.apply)
+    mixed = apply(variables, latent, times, given)
+    lowered = apply(variables, latent, times, encoder.encode(params, encoder.tokenize(same)))
     # The first row shares its value with the second run and matches exactly;
     # the second row's own value moves only its own output.
     np.testing.assert_array_equal(mixed[0], lowered[0])
@@ -414,18 +416,22 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     denoise = process.denoiser(loaded.model, variables, {"conditioning": given},
                               {"conditioning": encoder.encode(
                                   params, encoder.tokenize([empty]))})
-    _, raw = denoise.raw_both(latent, times)
-    branch, _ = denoise.convert(latent, times, raw)
+    branch = jax.jit(lambda x, t: denoise.convert(x, t, denoise.raw_both(x, t)[1])[0])(latent, times)
+
+    def plain(conditions):
+        denoiser = process.denoiser(loaded.model, variables, conditions)
+        return jax.jit(lambda x, t: denoiser(x, t)[0])(latent, times)
+
     per_row = encoder.encode(params, encoder.tokenize(
         [dict(empty, guidance=2.0), dict(empty, guidance=6.0)]))
-    direct, _ = process.denoiser(loaded.model, variables, {"conditioning": per_row})(latent, times)
+    direct = plain({"conditioning": per_row})
     # The guided call runs one model call over the doubled batch, so its
     # reductions are not the two-row call's bit for bit; the value that
     # matters is which guidance each row was walked at, and reading the
     # default instead of the row's own moves the output by far more.
     np.testing.assert_allclose(branch, direct, rtol=2e-5, atol=2e-5)
     default = encoder.encode(params, encoder.tokenize([dict(empty), dict(empty)]))
-    other, _ = process.denoiser(loaded.model, variables, {"conditioning": default})(latent, times)
+    other = plain({"conditioning": default})
     assert not np.allclose(branch, other, rtol=2e-5, atol=2e-5)
 
     # Dropping every caption leaves the guidance in place, so the loss still
@@ -438,10 +444,13 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
                      (2, 1, 1, 1))
     step = Step(jnp.asarray(0), jax.random.PRNGKey(11), None)
 
-    def loss(records) -> float:
-        batch = {"image": pixels, **loaded.inputs.tokenize(records)}
+    @jax.jit
+    def compiled_loss(batch):
         value, _ = objective.loss(loaded.variables, batch, step)
-        return float(value.total / value.mass)
+        return value.total / value.mass
+
+    def loss(records) -> float:
+        return float(compiled_loss({"image": pixels, **loaded.inputs.tokenize(records)}))
 
     assert not np.isclose(loss(rows), loss(same), atol=1e-6)
 

@@ -612,12 +612,12 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
     (`formats.Bf16Window`, row 5387) in `QUANTIZATION` at its layer's path, its parameter gone, which its
     Dense serves as it is (`dense.packed_matrix`): 13 bits a weight where 16 were, each weight its bits
     again decoded. A kernel no window holds (a group of more escapes than it stores) is refused by its
-    site's name, as is a named site of no such kernel; frozen, its layer takes no gradient in it."""
-    from dew.nn.kernels.formats import Bf16Window
-
+    site's name, as is a named site of no such kernel; frozen, its layer takes no gradient in it. A kernel
+    resident on devices is encoded where it lives, its planes placed as its columns and depths are
+    (`_resident_window`), so no process reads a value it does not hold (row 13702)."""
     params = flatten_dict(dict(variables.get("params", {})))
     # A kernel boxed with its logical axes (`nn.LogicallyPartitioned`, a Dense's `kernel_axes`) read as its
-    # value: its window's planes are `[width, words]`, which no kernel axes place, so they are whole.
+    # value, its window's planes placed as it is.
     values = {path: meta.unbox(leaf) for path, leaf in params.items() if path[-1] == "kernel"}
     kernels = {path[:-1]: leaf for path, leaf in values.items()
                if isinstance(leaf, (jax.Array, np.ndarray)) and jnp.ndim(leaf) == 2
@@ -625,7 +625,7 @@ def bf16_windows(variables: Variables, *, sites: Sequence[str]) -> Variables:
     named = {tuple(part for part in site.split("/") if part) for site in sites}
     if missing := named - set(kernels):
         raise ValueError(f"no two-axis bfloat16 kernel at {sorted('/'.join(site) for site in missing)}")
-    windows = {(*site, "kernel"): Bf16Window.of(kernels[site], site="/".join(site)) for site in sorted(named)}
+    windows = {(*site, "kernel"): _window(kernels[site], "/".join(site)) for site in sorted(named)}
     held = {**flatten_dict(dict(variables.get(QUANTIZATION, {}))), **windows}
     rest = {path: leaf for path, leaf in params.items() if path not in windows}
     return {**variables, "params": unflatten_dict(rest), QUANTIZATION: unflatten_dict(held)}
@@ -646,6 +646,60 @@ def decoded_bf16_windows(variables: Variables) -> Variables:
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
+def _window(kernel: jax.Array | np.ndarray, site: str):
+    """`kernel`'s lossless window (`Bf16Window.of`): one its process holds whole encoded whole, its planes
+    whole as before; one lying in part on other processes' devices encoded where it lives
+    (`_resident_window`)."""
+    from dew.nn.kernels.formats import Bf16Window
+
+    if isinstance(kernel, jax.Array) and not kernel.is_fully_addressable:
+        return _resident_window(kernel, site)
+    return Bf16Window.of(np.asarray(kernel), site=site)
+
+
+def _resident_window(kernel: jax.Array, site: str):
+    """A resident `[depth, width]` kernel's window encoded where it lives, as `frozen_fp8_leaves` packs one
+    on its resident devices: each distinct shard's columns and whole `WINDOW_GROUP`-deep groups encoded from
+    the shard its process holds (`Bf16Window.of`), each plane `[width, groups * words]` placed on the
+    kernel's devices as its columns are (a column split the planes' rows). A kernel split by its depth is
+    refused by the site's name: its window decodes each column's depths through one permutation across
+    its groups (`Bf16Window.decoded`), which no device holding a part of them can take where it lives; as
+    is a kernel placed by no mesh's names."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.formats import WINDOW_WORDS, Bf16Window, window_form_version
+    from dew.nn.kernels.templates.gemm.packed import WINDOW_GROUP, WINDOW_META_WORDS
+
+    sharding = kernel.sharding
+    if not isinstance(sharding, NamedSharding):
+        raise ValueError(f"{site}'s kernel lies on devices of other processes by no mesh's names: encode "
+                         "it where it lives on a mesh")
+    depth, width = kernel.shape
+    rows, columns = (*sharding.spec, None, None)[:2]
+    # The depth's partition's size: a named axis of one device leaves each column whole.
+    named = (rows,) if isinstance(rows, str) else rows or ()
+    split = math.prod(sharding.mesh.shape[axis] for axis in named)
+    if split > 1:
+        raise ValueError(f"{site}'s kernel is split by its depth ({rows!r}), which its window's decode reads "
+                         "whole for each column: window it split by its columns alone")
+    # The planes placed by the columns alone: a depth name of one device, kept on them, would mark the
+    # axis the window's decode permutes as split (an Explicit one's gather refuses it).
+    planes = NamedSharding(sharding.mesh, PartitionSpec(columns, None))
+    encoded: dict[tuple, Bf16Window] = {}
+    words, meta = [], []
+    for shard in kernel.addressable_shards:
+        key = shard.index[1].indices(width)[:2]
+        if key not in encoded:
+            encoded[key] = Bf16Window.of(np.asarray(shard.data), site=site)
+        words.append(jax.device_put(encoded[key].words, shard.device))
+        meta.append(jax.device_put(encoded[key].meta, shard.device))
+    groups = depth // WINDOW_GROUP
+    return Bf16Window(
+        jax.make_array_from_single_device_arrays((width, groups * WINDOW_WORDS), planes, words),
+        jax.make_array_from_single_device_arrays((width, groups * WINDOW_META_WORDS), planes, meta),
+        window_form_version())
 
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:

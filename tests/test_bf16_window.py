@@ -3,6 +3,7 @@ again decoded, a group past its escapes refused by its site's name, and a Dense 
 kernel (`quantization.bf16_windows`), its variables' kernels back bitwise (`decoded_bf16_windows`)."""
 
 import contextlib
+import dataclasses
 import functools
 
 import jax
@@ -14,8 +15,9 @@ from generation_support import lowers
 from kernel_compile import compile_mosaic_kernels
 
 from dew import quantization
+from dew.nn import programs
 from dew.nn.dense import Dense
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.formats import WINDOW_ESCAPES, Bf16Window
 
 
@@ -305,3 +307,194 @@ def test_a_bf16_dense_stating_a_narrowing_algorithm_served_its_window_computes_a
             np.testing.assert_array_equal(outs[1], outs[0])
         else:
             assert outs[1] is outs[0]
+
+
+def test_a_windowed_dense_the_recipe_takes_runs_the_recipes_product():
+    """A bfloat16 Dense whose kernel `bf16_windows` stores as its window, in a role the run's FP8 recipe
+    takes (whole 128-wide blocks, the feed-forward's), computes the recipe's product of its kernel bit for
+    bit, as the layer over its kernel does: a row holding 1 and 2^-20 in one block, whose small coordinate a
+    unit weight alone reads, rounds that coordinate to zero in E4M3 where the window's exact product keeps
+    it (row 13699)."""
+    from dew.nn.kernels import generation
+    from dew.nn.precision import FP8, projection_role
+
+    kernel = np.zeros((128, 128), jnp.bfloat16)
+    kernel[1, 0] = 1.0
+    x = np.zeros((4, 128), jnp.bfloat16)
+    x[:, 0], x[:, 1] = 1.0, 2.0 ** -20
+    layer = Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False)
+    variables = {"params": {"kernel": jnp.asarray(kernel)}}
+    windowed = quantization.bf16_windows(variables, sites=[""])
+    with generation.run_precision(FP8), projection_role("mlp"):
+        plain, served = (np.asarray(jax.jit(layer.apply)(held, jnp.asarray(x))).view(np.uint16)
+                         for held in (variables, windowed))
+    np.testing.assert_array_equal(served, plain)
+
+
+def test_a_windowed_dense_with_an_fp32_bias_keeps_its_declared_tangent():
+    """A bfloat16 Dense with its bias stored fp32, its kernel a window: its tangent is Dense's own, each
+    direction's product rounded to bfloat16 before the bias's direction joins it (`dense._widened`), bit
+    for bit the layer's over its kernel: a column `[1, 2^-8, 0, ...]`, an input direction `[1, 1, 0, ...]`
+    and a bias direction -1 give 0, where an fp32 sum of the products gives 2^-8 (row 13701)."""
+    kernel = np.zeros((128, 64), jnp.bfloat16)
+    kernel[0, 0], kernel[1, 0] = 1.0, 2.0 ** -8
+    layer = Dense(64, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    params = {"kernel": jnp.asarray(kernel), "bias": jnp.zeros((64,), jnp.float32)}
+    windowed = quantization.bf16_windows({"params": params}, sites=[""])
+    x = jnp.ones((2, 128), jnp.bfloat16)
+    direction = jnp.zeros((2, 128), jnp.bfloat16).at[:, :2].set(1.0)
+    bias_direction = jnp.full((64,), -1.0, jnp.float32)
+
+    def tangent(variables):
+        def run(inputs, bias):
+            held = {**variables, "params": {**variables["params"], "bias": bias}}
+            return layer.apply(held, inputs)
+
+        _, out = jax.jvp(run, (x, params["bias"]), (direction, bias_direction))
+        return np.asarray(out, np.float32)
+
+    plain, served = tangent({"params": params}), tangent(windowed)
+    np.testing.assert_array_equal(served.view(np.uint32), plain.view(np.uint32))
+    assert plain[0, 0] == 0.0
+    # Another encoder's window, its digest not this Dew's, is refused on this path as on the window's own.
+    held = windowed[quantization.QUANTIZATION]["kernel"]
+    foreign = dataclasses.replace(held, form=np.asarray(held.form) ^ np.uint8(1))
+    with pytest.raises(ValueError):
+        tangent({**windowed, quantization.QUANTIZATION: {"kernel": foreign}})
+
+
+@pytest.mark.distributed
+def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
+    """A `[256, 256]` kernel split by its columns across two processes' devices, which no process holds
+    whole: `bf16_windows` encodes each column's window where it lives, each process's planes its own
+    columns' window, decoded its own columns' bits again (row 13702: it read the whole kernel on each
+    process, which JAX refuses for a value lying on other processes' devices)."""
+    from pathlib import Path
+
+    from process_support import run_pool
+
+    worker = Path(__file__).with_name("bf16_window_worker.py")
+    for report in run_pool("width_split", tmp_path / "pool", 2, devices=2, script=worker):
+        assert report["planes"] and all(report["planes"]), report
+        assert report["decoded"] and all(report["decoded"]), report
+    # Split by its depth, a column's groups apart, which its window's decode reads whole: refused.
+    for report in run_pool("depth_split", tmp_path / "depths", 2, devices=2, script=worker):
+        assert report["refused"] == "ValueError", report
+
+
+def test_a_windowed_dense_under_delayed_nvfp4_records_its_rows_largest_magnitude():
+    """A bfloat16 Dense whose kernel is its window, under a delayed-scaling NVFP4 recipe that takes it,
+    reads its amax history and sows its rows' largest magnitude as the layer over its kernel does: its
+    output and its sown amax bit for bit the unpacked layer's (row 13699; review)."""
+    from dew.nn.dense import NVFP4_AMAX
+    from dew.nn.kernels import generation
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics, projection_role
+
+    delayed = Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4",
+                                                                              tensor_scaling="delayed"))
+    rng = np.random.default_rng(13699)
+    x = jnp.asarray(rng.standard_normal((4, 128)), jnp.bfloat16)
+    layer = Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, use_bias=False)
+    with generation.run_precision(delayed), projection_role("mlp"):
+        variables = layer.init(jax.random.key(0), x)
+        windowed = quantization.bf16_windows(variables, sites=[""])
+        runs = [layer.apply(held, x, mutable=[NVFP4_AMAX]) for held in (variables, windowed)]
+    (plain, plain_amax), (served, served_amax) = runs
+    assert jax.tree.leaves(plain_amax), "the unpacked layer sows its rows' largest magnitude"
+    np.testing.assert_array_equal(np.asarray(served).view(np.uint16), np.asarray(plain).view(np.uint16))
+    for sown, own in zip(jax.tree.leaves(served_amax), jax.tree.leaves(plain_amax), strict=True):
+        np.testing.assert_array_equal(np.asarray(sown), np.asarray(own))
+
+
+@pytest.mark.parametrize(("compute", "rounded"), [(jnp.float32, False), (jnp.bfloat16, True)],
+                         ids=["fp32 compute", "bf16 compute"])
+def test_gemm_over_a_window_computes_in_its_calls_dtype(compute, rounded):
+    """`gemm.gemm` over a bfloat16 window computes in its call's `compute` (row 13686): fp32 rows of
+    1 + 2^-9 under fp32 compute keep their low bit (the decoded kernel's ordinary product), under bf16
+    compute read as 1 (the window's product), each output its exact oracle: its kernel sixteenths of small
+    integers, every sum exact in float32 (testing.md's oracle rule)."""
+    rng = np.random.default_rng(13686)
+    kernel = (rng.integers(-64, 64, (128, 64)) / 16.0).astype(np.float64)
+    x = np.full((8, 128), 1 + 2.0 ** -9)
+    window = Bf16Window.of(jnp.asarray(kernel, jnp.bfloat16)).checked()
+    served = gemm.gemm(jnp.asarray(x, jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)
+    oracle = (np.ones_like(x) if rounded else x) @ kernel
+    np.testing.assert_array_equal(np.asarray(served, np.float64), oracle)
+
+
+def test_gemm_over_a_window_sums_exactly_where_its_call_asks():
+    """`gemm.gemm` over a bfloat16 window asked above the default precision into fp32 (its partial sums
+    promoted, `templates.product.declared`) takes the ordinary product's launch summing exactly, on a
+    Hopper's template (interpreted): the window's own launch promotes none (row 13686)."""
+    kernel = jnp.asarray(_drawn((256, 64)), jnp.bfloat16)
+    window = Bf16Window.of(jnp.where(jnp.isfinite(kernel), kernel, 0).astype(jnp.bfloat16)).checked()
+    rows = jax.ShapeDtypeStruct((128, 256), jnp.bfloat16)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          jax.default_matmul_precision("highest"), tuning.seen() as seen):
+        jax.eval_shape(lambda x: gemm.gemm(x, window, None, out_dtype=jnp.float32, interpret_on_cpu=True),
+                       rows)
+    assert [call.arguments["exact_sums"] for _, call in seen.taken
+            if isinstance(call.op, grouped_matmul.MosaicGmm) and call.arguments["interpret"]] == [True]
+
+
+def _dot_precisions(fn, *args) -> list:
+    """The precision every dot of `fn`'s program states, its nested programs' too (`programs.equations`)."""
+    return [eqn.params["precision"] for eqn in programs.equations(jax.make_jaxpr(fn)(*args).jaxpr)
+            if eqn.primitive is jax.lax.dot_general_p]
+
+
+def test_a_grouped_window_products_value_and_tangent_state_one_algorithm():
+    """A grouped window product (`window_product`, its XLA route) under a run's `F16_F16_F32`, its precision
+    omitted, states that algorithm in its value's ragged dot and in its tangent's (row 13704): the value's no
+    longer forced to the default where the tangent's took the run's (bf16 rows of 2^-30 would read 2^-30
+    and a zero tangent on a CUDA device)."""
+    kernel = jnp.zeros((2, 128, 64), jnp.bfloat16).at[:, 0, 0].set(1.0)
+    window = Bf16Window.of(kernel).checked()
+    sizes = jnp.asarray([2, 2], jnp.int32)
+    x = jnp.full((4, 128), 2.0 ** -30, jnp.bfloat16)
+
+    def value_and_tangent(x):
+        return jax.jvp(lambda x: gemm.window_product(x, window, sizes, out_dtype=jnp.float32), (x,), (x,))
+
+    with jax.default_matmul_precision("F16_F16_F32"):
+        program = jax.make_jaxpr(value_and_tangent)(x).jaxpr
+    found = [eqn.params["precision"] for eqn in programs.equations(program)
+             if eqn.primitive.name == "ragged_dot_general"]
+    # The value's ragged dot and its tangent's state the run's algorithm; none states the default instead.
+    default = jax.lax.Precision.DEFAULT
+    assert found.count(jax.lax.DotAlgorithmPreset.F16_F16_F32) == 2, found
+    assert not any(each in (None, default, (default, default)) for each in found), found
+
+
+@pytest.mark.parametrize(("run", "stated", "algorithm"),
+                         [("F16_F16_F32", None, jax.lax.DotAlgorithmPreset.F16_F16_F32),
+                          ("F16_F16_F32", jax.lax.Precision.DEFAULT, None),
+                          ("F32_F32_F32", jax.lax.Precision.DEFAULT, None)],
+                         ids=["omitted: the run's narrowing algorithm", "the default over a narrowing run",
+                              "the default over a whole run"])
+def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(run, stated, algorithm):
+    """`gemm.gemm` over a bfloat16 window of bf16 rows under a run's algorithm states to XLA the algorithm
+    the call declares (row 13686's review): the run's where the call states no precision, none where it
+    states the default (its level overriding the run's, a narrowing one's or a whole one a TPU does not
+    run), on its decoded fallback (the window's own dot reads the run's)."""
+    kernel = jnp.zeros((128, 64), jnp.bfloat16).at[0, 0].set(1.0)
+    x = jnp.full((2, 128), 2.0 ** -30, jnp.bfloat16)
+    with jax.default_matmul_precision(run):
+        found = _dot_precisions(lambda x: gemm.gemm(x, Bf16Window.of(kernel).checked(), None,
+                                                    out_dtype=jnp.float32, precision=stated), x)
+    algorithms = {each for each in found
+                  if isinstance(each, jax.lax.DotAlgorithmPreset | jax.lax.DotAlgorithm)}
+    assert found and algorithms == ({algorithm} if algorithm else set()), found
+
+
+@pytest.mark.parametrize("compute", [jnp.bfloat16, jnp.float32], ids=["window", "decoded"])
+def test_gemm_over_a_window_of_another_encoding_is_refused(compute):
+    """A window whose form a later write made another encoder's is refused by `gemm.gemm` at its product,
+    on the window's own route (bf16 compute at the default precision, `window_product`) and on its decoded
+    fallback (fp32 compute, `Bf16Window.decoded`) alike, its words never read through this form's decode
+    (row 13686's review)."""
+    kernel = jnp.asarray((np.arange(128 * 64).reshape(128, 64) % 7 - 3) / 4.0, jnp.bfloat16)
+    window = Bf16Window.of(kernel)
+    np.asarray(window.form).reshape(-1)[0] ^= 1
+    with jax.default_matmul_precision("default"), pytest.raises(ValueError):
+        gemm.gemm(jnp.ones((4, 128), jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)

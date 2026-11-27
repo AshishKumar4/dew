@@ -13,13 +13,22 @@ import enum
 import functools
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from types import ModuleType
 from typing import NamedTuple, TypeGuard
 
 import jax
 import jax.extend.core as jcore
+import jax.extend.core.primitives as jax_primitives
 import jax.numpy as jnp
 import numpy as np
-from jax._src import config as jax_config, core as jax_core, dtypes, effects as jax_effects, mesh as mesh_lib
+from jax._src import (
+    config as jax_config,
+    core as jax_core,
+    dtypes,
+    effects as jax_effects,
+    mesh as mesh_lib,
+    xla_metadata as jax_xla_metadata,
+)
 from jax._src.interpreters import partial_eval
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
@@ -476,16 +485,117 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
     return equations, [read(value) for value in body.outvars]
 
 
+_LAX = jax.lax
+_EXTENDED = jax_primitives
+_XLA_METADATA = jax_xla_metadata
+
+_KINDS: dict[str, tuple[tuple[ModuleType, tuple[str, ...]], ...]] = {
+    # A call JAX lowers to its program in the caller (`called`): a `jit`'s, an evaluated jaxpr's, a
+    # checkpoint's, a custom derivative's primal and a custom batching rule's.
+    "call": ((_EXTENDED, ("jit_p", "call_p", "remat_p", "custom_jvp_call_p", "custom_vjp_call_p",
+                          "custom_vmap_p")),),
+    # A call that does nothing but its program (`purely_called`): a `jit`'s and an evaluated jaxpr's.
+    "pure call": ((_EXTENDED, ("jit_p", "call_p")),),
+    "entrywise": (
+        (_LAX, ("abs_p", "acos_p", "acosh_p", "add_p", "and_p", "asin_p", "asinh_p", "atan2_p", "atan_p",
+                "atanh_p", "bessel_i0e_p", "bessel_i1e_p", "cbrt_p", "ceil_p", "clamp_p", "clz_p",
+                "complex_p",
+                "conj_p", "convert_element_type_p", "copy_p", "cos_p", "cosh_p", "digamma_p", "div_p", "eq_p",
+                "eq_to_p", "erf_inv_p", "erf_p", "erfc_p", "exp2_p", "exp_p", "expm1_p", "floor_p",
+                "ge_p",
+                "gt_p", "igamma_grad_a_p", "igamma_p", "igammac_p", "imag_p", "integer_pow_p", "is_finite_p",
+                "le_p", "le_to_p", "lgamma_p", "log1p_p", "log2_p", "log_p", "logistic_p", "lt_p", "lt_to_p",
+                "max_p", "min_p", "mul_p", "mulhi_p", "ne_p", "neg_p", "nextafter_p", "not_p",
+                "one_minus_square_p", "or_p", "polygamma_p", "population_count_p", "pow_p", "real_p",
+                "reduce_precision_p", "regularized_incomplete_beta_p", "rem_p", "round_p", "rsqrt_p",
+                "select_n_p", "shift_left_p", "shift_right_arithmetic_p", "shift_right_logical_p", "sign_p",
+                "sin_p", "sinh_p", "sqrt_p", "square_p", "stop_gradient_p", "sub_p", "tan_p", "tanh_p",
+                "xor_p", "zeta_p")),
+        # The sum a derivative adds its terms with, and the counter-based hash a key's bits are drawn by.
+        (_EXTENDED, ("add_jaxvals_p", "threefry2x32_p"))),
+    # Mapped over positions but not entrywise over a value's: a key's operations (a key's data extends its
+    # shape), a bitcast between widths, a polynomial over its coefficients, a staged value.
+    "positionwise": (
+        (_LAX, ("bitcast_convert_type_p", "polynomial_p", "stage_p")),
+        (_EXTENDED, ("random_bits_p", "random_clone_p", "random_fold_in_p", "random_seed_p", "random_split_p",
+                     "random_unwrap_p")),
+        # The identity `jax.experimental.xla_metadata.set_xla_metadata` tags a value with, which JAX
+        # defines in its private module alone and batches as a vectorized operation (train 1368's review).
+        (_XLA_METADATA, ("xla_metadata_value_p",))),
+    "rearranges": ((_LAX, ("broadcast_in_dim_p", "concatenate_p", "copy_p", "dynamic_slice_p",
+                           "dynamic_update_slice_p", "gather_p", "optimization_barrier_p", "pad_p",
+                           "reshape_p", "rev_p", "select_n_p", "slice_p", "sort_p", "split_p", "squeeze_p",
+                           "stack_p", "transpose_p", "unstack_p")),),
+    "reduction": ((_LAX, ("argmax_p", "argmin_p", "reduce_and_p", "reduce_max_p", "reduce_min_p",
+                          "reduce_or_p", "reduce_prod_p", "reduce_sum_p", "reduce_xor_p")),),
+    "cumulative": ((_LAX, ("cumlogsumexp_p", "cummax_p", "cummin_p", "cumprod_p", "cumsum_p")),),
+    "scatter": ((_LAX, ("scatter_add_p", "scatter_max_p", "scatter_min_p", "scatter_mul_p", "scatter_p",
+                        "scatter_sub_p")),),
+}
+"""Each kind of operation the analyses of a program read, by the JAX primitives of it, named where JAX's
+public modules export them (`jax.lax`, `jax.extend.core.primitives`), or where JAX defines one it exports
+nowhere (`set_xla_metadata`'s tag, `jax._src.xla_metadata`), each module imported statically: the one
+statement of what each of JAX's operations is, which no attribute of JAX's own `Primitive` states. A name a
+release does not define is none of its primitives (`_kind`). A primitive of Dew's own is added where it is
+defined (`register_entrywise`, `register_positionwise`, `register_call`); one of another library's or a
+user's is no kind, whatever its name."""
+
+_OWN: dict[str, set[jcore.Primitive]] = {"call": set(), "entrywise": set(), "positionwise": set()}
+"""Dew's own primitives of a kind (`register_entrywise`, `register_positionwise`, `register_call`), stated
+where each is defined."""
+
+
+@functools.cache
+def _kind(kind: str) -> frozenset[jcore.Primitive]:
+    """JAX's primitives of `kind` (`_KINDS`) this release exports, read off each module's own namespace."""
+    return frozenset(primitive for module, names in _KINDS[kind] for name in names
+                     if isinstance(primitive := vars(module).get(name), jcore.Primitive))
+
+
+def _is(kind: str, primitive: jcore.Primitive) -> bool:
+    return primitive in _kind(kind) or primitive in _OWN.get(kind, ())
+
+
+def register_entrywise(primitive: jcore.Primitive) -> jcore.Primitive:
+    """State `primitive`, one of Dew's own, entrywise (`entrywise`) where it is defined; returns it."""
+    _OWN["entrywise"].add(primitive)
+    return primitive
+
+
+def register_positionwise(primitive: jcore.Primitive) -> jcore.Primitive:
+    """State `primitive`, one of Dew's own, positionwise (`positionwise`: JAX batches it by leaving the
+    mapped axis where it found it, `batching.defvectorized`) where it is defined; returns it."""
+    _OWN["positionwise"].add(primitive)
+    return primitive
+
+
+def register_call(primitive: jcore.Primitive) -> jcore.Primitive:
+    """State `primitive`, one of Dew's own, a call JAX lowers to its program in the caller (`called`), and
+    none that does nothing but its program (`purely_called`), where it is defined; returns it."""
+    _OWN["call"].add(primitive)
+    return primitive
+
+
+def is_inlined_call(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` is a call JAX lowers to its program in the caller (`called`)."""
+    return _is("call", primitive)
+
+
+def is_transparent_call(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` is a call that does nothing but its program (`purely_called`)."""
+    return _is("pure call", primitive)
+
+
 def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program `equation` runs on its operands one for one, returning its results, else None: every
     reader of a call through its program reads it here (`dew.training.transaction.gradients_read`, the
-    kernel split's `_inlined`, the float64 terms, the algebra's normal forms). A call
-    is a primitive JAX lowers to its program in the caller, which JAX states where it defines one
-    (`Primitive.inlined_call`): a `jit`'s, which XLA's `CallInliner` inlines (`_pjit_lowering`,
-    jax/_src/pjit.py; `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), an
-    evaluated jaxpr's, a checkpoint's (`_remat_lowering`, jax/_src/ad_checkpoint.py), a custom derivative's
-    primal (`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py), a custom batching rule's
-    (`custom_vmap_p`'s lowering, jax/_src/custom_batching.py) and a marked span
+    kernel split's `_inlined`, the float64 terms, the algebra's normal forms). A call is a primitive JAX
+    lowers to its program in the caller (`is_inlined_call`): a `jit`'s, which XLA's `CallInliner` inlines
+    (`_pjit_lowering`, jax/_src/pjit.py; `GpuCompiler::RunPreSPMDPartitionerPasses`,
+    xla/service/gpu/gpu_compiler.cc), an evaluated jaxpr's, a checkpoint's (`_remat_lowering`,
+    jax/_src/ad_checkpoint.py), a custom derivative's primal (`_custom_jvp_vjp_call_lowering`,
+    jax/_src/custom_derivatives.py), a custom batching rule's (`custom_vmap_p`'s lowering,
+    jax/_src/custom_batching.py) and a marked span
     (`dew.nn.derivatives.marked_call_p`). XLA sees no call: a result that is the program's own parameter is
     its operand's buffer, and one that is a cheap value of another is recomputed where it is read, as it
     would be without the call. Its constants are its own (`consts`); a custom rule's leading constants
@@ -499,9 +609,9 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
 
 
 def _program(primitive: jcore.Primitive, params: Mapping) -> jcore.Jaxpr | None:
-    """The one program a call's primitive (`Primitive.inlined_call`) holds in `params`, None for any other
+    """The one program a call's primitive (`is_inlined_call`) holds in `params`, None for any other
     primitive."""
-    if not primitive.inlined_call:
+    if not is_inlined_call(primitive):
         return None
     found = list(jcore.jaxprs_in_params(params))
     return found[0] if len(found) == 1 else None
@@ -510,12 +620,12 @@ def _program(primitive: jcore.Primitive, params: Mapping) -> jcore.Jaxpr | None:
 def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program `equation` runs (`called`) where its call does nothing else, else None: what a reader that
     runs a call in its caller reads (staging's `flattened`, a template layout's `_call`, torchax's evaluator).
-    JAX states which calls are pure where it defines them (`Primitive.transparent_call`: a `jit`'s and an
-    evaluated jaxpr's; an optax helper's `jit` over a whole tree, `jnp.einsum`'s). A checkpoint's, a custom
+    The pure calls are a `jit`'s and an evaluated jaxpr's (`is_transparent_call`; an optax helper's `jit`
+    over a whole tree, `jnp.einsum`'s). A checkpoint's, a custom
     derivative's and a custom batching rule's call do more than their program, a rule of their own, and a
     marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected span's inside
     no rule touches), so each keeps its rule only as a call."""
-    return called(equation) if equation.primitive.transparent_call else None
+    return called(equation) if is_transparent_call(equation.primitive) else None
 
 
 UNROUNDED: dict[jcore.Primitive, Callable] = {}
@@ -567,22 +677,22 @@ def control_flow(primitive: jcore.Primitive) -> bool:
 
 def entrywise(primitive: jcore.Primitive) -> bool:
     """Whether `primitive`'s every output entry reads its operands' entries at its own index (each operand of
-    the output's shape, or a scalar) and nothing else: what JAX states where it defines an operation
-    (`Primitive.elementwise`: its unary and n-ary operations, a cast, a selection, a clamp, the sum its
-    derivatives add with). The one vocabulary the analyses of a program's entries read (`templates.layout`,
+    the output's shape, or a scalar) and nothing else (`_KINDS`: JAX's unary and n-ary operations, a cast,
+    a selection, a clamp, the sum its derivatives add with; Dew's own `register_entrywise`). The one
+    vocabulary the analyses of a program's entries read (`templates.layout`,
     `dew.interop.sequence_causality`, the algebra's fusion). A primitive of another library's or a user's
     states nothing and is none, whatever its name."""
-    return primitive.elementwise
+    return _is("entrywise", primitive)
 
 
 def positionwise(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` maps over its operands' positions, each output position reading its operands' at
     that position and nothing else, whatever it does within one: an entrywise operation (`entrywise`), and
-    one JAX batches by leaving the mapped axis where it found it, which it states where it registers that
-    rule (`Primitive.positionwise`), so an added axis anywhere changes nothing of it. The operations on PRNG
+    one JAX batches by leaving the mapped axis where it found it (`_KINDS`), so an added axis anywhere changes
+    nothing of it. The operations on PRNG
     keys are such (a key's data extends its shape, and `random_bits` takes the shape it fills past the
     keys'), which are entrywise over a key array's positions and not over a value's."""
-    return primitive.elementwise or primitive.positionwise
+    return entrywise(primitive) or _is("positionwise", primitive)
 
 
 def prng_operation(equation: jcore.JaxprEqn) -> bool:
@@ -599,29 +709,26 @@ def prng_operation(equation: jcore.JaxprEqn) -> bool:
 def rearranges(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` only moves entries, each output entry one operand's entry or a fill, with no
     arithmetic and no rounding (a reshape, a squeeze, a broadcast, a transpose, a reversal, a slice, a
-    gather, a concatenation, a padding, a split): JAX states it where it defines each
-    (`Primitive.rearranges`)."""
-    return primitive.rearranges
+    gather, a concatenation, a padding, a split; `_KINDS`)."""
+    return _is("rearranges", primitive)
 
 
 def reduction(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` reduces the axes its `axes` parameter names (a sum, a product, an extremum or its
-    place, a bitwise fold): JAX states it where it registers a reducer (`Primitive.reduces`)."""
-    return primitive.reduces
+    place, a bitwise fold; `_KINDS`)."""
+    return _is("reduction", primitive)
 
 
 def scatter(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` writes updates into its first operand at indices, replacing or combining (a
-    scatter, and its add, subtract, multiply, minimum and maximum): JAX states it where it registers the
-    scatters' batching (`Primitive.scatters`)."""
-    return primitive.scatters
+    scatter, and its add, subtract, multiply, minimum and maximum; `_KINDS`)."""
+    return _is("scatter", primitive)
 
 
 def cumulative(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` scans along the axis its `axis` parameter names (a cumulative sum, product,
-    extremum or log-sum-exp): JAX states it where it defines the cumulative reductions
-    (`Primitive.cumulative`)."""
-    return primitive.cumulative
+    extremum or log-sum-exp; `_KINDS`)."""
+    return _is("cumulative", primitive)
 
 
 def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:

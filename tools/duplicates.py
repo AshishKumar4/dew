@@ -15,7 +15,7 @@
   by one) declares data, so its constants are read as their values: runs alike in shape that declare
   other data are no copy, and a run copied with its data is one.
 
-    python tools/duplicates.py [--base=REF] [--reading=text|structure] PATH...
+    python -m tools.duplicates [--base=REF] [--reading=text|structure] PATH...
 
 Every copy is printed, and any fails. `--reading` reads one way alone: tools/check.sh runs the two as gates of
 their own (tools/check_gates), side by side, and its `--changed` the structure alone, in seconds.
@@ -48,8 +48,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from forked import forked_map
+from tools.forked import forked_map
 
 if TYPE_CHECKING:
     from pylint.checkers.symilar import LineSet

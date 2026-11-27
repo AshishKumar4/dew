@@ -450,7 +450,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
-   "comparisons": 4,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_qualification.py": {
@@ -490,7 +490,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {

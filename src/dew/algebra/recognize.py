@@ -44,7 +44,15 @@ from dew.algebra.forms import aval
 from dew.nn.derivatives import Protected, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies, control_flow, entrywise, equations, purely_called, read_by
+from dew.nn.programs import (
+    bodies,
+    control_flow,
+    entrywise,
+    equations,
+    is_transparent_call,
+    purely_called,
+    read_by,
+)
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -697,7 +705,7 @@ def _entrywise_eqn(equation: jcore.JaxprEqn) -> bool:
         return False
     bound = _bound(body)
     return bool(bound) and all(
-        entrywise(p) or p.transparent_call or p in _UNIT_LAYOUTS for p in bound)
+        entrywise(p) or is_transparent_call(p) or p in _UNIT_LAYOUTS for p in bound)
 
 
 def _entrywise_places(index: fusion.Index) -> frozenset[int]:

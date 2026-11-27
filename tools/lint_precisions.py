@@ -12,7 +12,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterator, Sequence
 
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 POLICY = ("nn/precision.py", "nn/programs.py")
 """The modules that name a contraction's precision outright: the policy, and the arithmetic catalog beneath
