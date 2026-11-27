@@ -22,7 +22,7 @@ from dew.algebra.printed import (
 )
 
 _MIN_SHARED = 6
-_MIN_WHOLE = 3
+_MIN_WHOLE = 2
 _MAX_SHARED = 64
 _GEOMETRY = frozenset({"shape", "broadcast_dimensions", "new_sizes"})
 _SHIFTS = (lax.shift_left_p, lax.shift_right_logical_p)
@@ -33,12 +33,23 @@ class _Fragment:
 
     def __init__(self):
         self.inputs: dict[Operand, Ref] = {}
+        self.arguments: list[Operand] = []
+        self.separate: set[int] = set()
         self.bound: dict[str, Ref] = {}
 
     def input(self, value: Operand) -> Ref:
         if value not in self.inputs:
-            self.inputs[value] = Ref(f"p{len(self.inputs)}")
+            self.inputs[value] = self.argument(value)
         return self.inputs[value]
+
+    def argument(self, value: Operand) -> Ref:
+        ref = Ref(f"p{len(self.arguments)}")
+        self.arguments.append(value)
+        return ref
+
+    def integer(self, value: int) -> Ref:
+        self.separate.add(len(self.arguments))
+        return self.argument(value)
 
     def operand(self, value: Operand) -> Operand:
         if isinstance(value, Ref):
@@ -72,7 +83,10 @@ class _Fragment:
         if isinstance(raw, Call):
             callee = self.operand(raw.callee) if not isinstance(raw.callee, str) else raw.callee
             assert isinstance(callee, str | Ref | Primitive)
-            arguments = tuple(map(self.operand, raw.operands))
+            # Separate static positions in an already shared call can have the same value in
+            # just one case (e.g. an exponent bias equal to a shift). That need not prevent sharing.
+            arguments = tuple(self.integer(value) if type(value) is int and isinstance(raw.callee, str)
+                              else self.operand(value) for value in raw.operands)
             keywords = tuple((name, self.input(value) if _static_parameter(name, value)
                               else self.operand(value)) for name, value in raw.keywords)
             raw = Call(callee, arguments, keywords)
@@ -107,6 +121,7 @@ class _Copy:
     statements: tuple[Binding, ...]
     arguments: tuple[Operand, ...]
     written: tuple[str, ...]
+    separate: frozenset[int]
 
 
 @dataclasses.dataclass
@@ -126,8 +141,8 @@ class _Span:
         return tuple(self.statements)
 
     def snapshot(self) -> _Copy:
-        return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.inputs),
-                     tuple(self.normal.bound))
+        return _Copy(self.name, self.first, tuple(self.statements), tuple(self.normal.arguments),
+                     tuple(self.normal.bound), frozenset(self.normal.separate))
 
 
 def _spans(bodies: dict[str, Body]) -> list[_Span]:
@@ -207,6 +222,27 @@ def _live(body: Body, start: int) -> set[str]:
     return live
 
 
+def _shared_integer_arguments(copies: tuple[_Copy, ...]) -> dict[str, int]:
+    first = copies[0]
+    fixed = {}
+    for i in first.separate:
+        value = first.arguments[i]
+        if type(value) is not int:
+            continue
+        if all(i in copy.separate and copy.arguments[i] == value for copy in copies[1:]):
+            fixed[f"p{i}"] = value
+    return fixed
+
+
+def _baked_integer(statement: Binding, fixed: dict[str, int]) -> Binding:
+    call = statement.value
+    if not isinstance(call, Call) or not isinstance(call.callee, str):
+        return statement
+    args = tuple(fixed[arg.name] if isinstance(arg, Ref) and arg.name in fixed else arg
+                 for arg in call.operands)
+    return dataclasses.replace(statement, value=dataclasses.replace(call, operands=args))
+
+
 def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[str, Body]:
     """Factor disjoint spans with the same typed operations and preserve their ordered live outputs."""
     forms = dict(source)
@@ -221,24 +257,31 @@ def shared(source: dict[str, Body], *, reserved: Collection[str] = ()) -> dict[s
         while (name := f"_shared_component_{next(numbers)}") in occupied:
             pass
         occupied.add(name)
-        forms[name] = Body(tuple(f"p{i}" for i in range(len(first.arguments))), first.statements,
-                           tuple(Ref(f"v{i}") for i in kept))
+        # Give every helper the dynamic-array prefix the case table can pass directly.
+        fixed = _shared_integer_arguments(copies)
+        remaining = (i for i in range(len(first.arguments)) if f"p{i}" not in fixed)
+        order = sorted(remaining, key=lambda i: not isinstance(first.arguments[i], Ref))
+        outputs = tuple(Ref(f"v{i}") for i in kept)
+        statements = (tuple(_baked_integer(statement, fixed) for statement in first.statements)
+                      if fixed else first.statements)
+        forms[name] = Body(tuple(f"p{i}" for i in order), statements, outputs)
         for found, reads in reversed(tuple(zip(copies, suffixes, strict=True))):
             body = forms[found.name]
             outputs = tuple(found.written[i] if found.written[i] in reads else "_" for i in kept)
-            invoke = Binding(outputs, Call(name, found.arguments), unpack=True)
+            invoke = Binding(outputs, Call(name, tuple(found.arguments[i] for i in order)), unpack=True)
             statements = (*body.statements[:found.first], invoke, *body.statements[found.first + width:])
             forms[found.name] = dataclasses.replace(body, statements=statements)
     return forms
 
 
-def bound_call(body: Body, shared_names: set[str], shapes: tuple[tuple[int, ...], ...]) -> Call | None:
+def bound_call(body: Body, shared_bodies: dict[str, Body],
+               shapes: tuple[tuple[int, ...], ...]) -> Call | None:
     """Bind a tail call's known case arguments directly in the case table."""
     if len(body.statements) != 1 or not isinstance(binding := body.statements[0], Binding):
         return None
     if not isinstance(call := binding.value, Call) or not isinstance(call.callee, str):
         return None
-    if (call.callee not in shared_names or not binding.unpack
+    if (call.callee not in shared_bodies or not binding.unpack
             or body.outputs != tuple(map(Ref, binding.targets))):
         return None
     count = len(body.inputs)
@@ -246,7 +289,8 @@ def bound_call(body: Body, shared_names: set[str], shapes: tuple[tuple[int, ...]
         return None
     sizes = dict(zip(body.inputs, shapes, strict=True))
     fixed = []
-    for position, value in enumerate(call.operands[count:], count):
+    bindings = zip(shared_bodies[call.callee].inputs[count:], call.operands[count:], strict=True)
+    for parameter, value in bindings:
         if any(name not in sizes for name in _reads(value)) or isinstance(value, Ref | Literal | Call):
             return None
         if isinstance(value, Layout):
@@ -254,5 +298,5 @@ def bound_call(body: Body, shared_names: set[str], shapes: tuple[tuple[int, ...]
                                       for dim in value.dimensions))
         elif isinstance(value, Extent):
             value = sizes[value.operand.name][value.axis]
-        fixed.append((f"p{position}", value))
+        fixed.append((parameter, value))
     return Call(call.callee, (), tuple(fixed))

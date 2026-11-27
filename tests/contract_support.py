@@ -261,9 +261,15 @@ def running(label: str, name: str):
         raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
 
 
+def _order_result(order: Callable, result_leaf: Callable | None):
+    result = order()
+    return result if result_leaf is None else result_leaf(result)
+
+
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
                     taking: tuple[str, ...] | None = None, without: tuple[str, ...] = (), draw=None,
-                    seeds: int | None = None, placement: Literal["both", "local", "mesh"] = "both") -> None:
+                    seeds: int | None = None, placement: Literal["both", "local", "mesh"] = "both",
+                    result_leaf: Callable | None = None) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
@@ -285,8 +291,12 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     Each order also runs on training's mesh of two devices (`_on_a_mesh`) by default, as a training step
     runs it (row 7973). A slow case can name the two placements separately: `local` runs only the
     unpartitioned program, `mesh` requires the two-device program. Both use the same finiteness checks
-    against plain and float64 reference arms, and keep the mesh's Check 1 where `draw` gives one."""
+    against plain and float64 reference arms, and keep the mesh's Check 1 where `draw` gives one.
+    `result_leaf` is a named projection of an order's result. It runs after the entire derivative is
+    formed so separate cells can check its leaves without changing directions or cotangents."""
 
+    if result_leaf is not None:
+        label = f"{label}, result leaf {result_leaf.__name__}"
     every = set(orders(fn, primals, direction, cotangent))
     named = {*(taking or ()), *without} - every
     if named:
@@ -297,7 +307,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         raise ValueError(f"{label}: takes no order, {sorted(taking or ())} all left out by {sorted(without)}")
 
     def orders_of(f, *drawn):
-        return {name: order for name, order in orders(f, *drawn).items() if name in taken}
+        return {name: functools.partial(_order_result, order, result_leaf)
+                for name, order in orders(f, *drawn).items() if name in taken}
 
     # Each arm's run of each order, built once for its compile ahead and its run (`_Run`): each order one
     # program, made once a function and an order (`_mesh_program`), so a cell's edges, one shape at three
@@ -309,7 +320,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     in_order = [name for name in orders(fn, *given) if name in taken]
 
     def runs(f, arguments, context, site):
-        return {name: _Run(_mesh_program(f, name), arguments, context, site(name), name) for name in in_order}
+        return {name: _Run(_mesh_program(f, name, result_leaf), arguments, context, site(name), name)
+                for name in in_order}
 
     narrow = {} if placement == "mesh" else runs(fn, given, contextlib.nullcontext, lambda _: label)
     plainly = {} if plain_fn is None else runs(plain_fn, given, contextlib.nullcontext,
@@ -356,7 +368,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     for name, run in narrow.items():
         held(jax.tree.leaves(run()), name, label)
     if mesh is not None:
-        _on_a_mesh(fn, mesh, meshed, truth_fn=truth_fn, draw=draw, seeds=seeds, held=held)
+        _on_a_mesh(fn, mesh, meshed, truth_fn=truth_fn, draw=draw, seeds=seeds, held=held,
+                   result_leaf=result_leaf)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -390,7 +403,7 @@ class _Run:
                        self.name)
 
 
-def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
+def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held, result_leaf: Callable | None) -> None:
     """Each order of `fn` the contract takes (`meshed`, each its run on `mesh`, `_Run`) on training's mesh of
     two of this process's devices (`MeshSpec`'s, its data axis two), its inputs placed on it whole: at the
     cell's own inputs held to the
@@ -423,10 +436,10 @@ def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
         # The same program off the mesh: one of Dew's own paths, an invariance claim (`dew_path`).
         @dew_path
         def off(primals, direction, cotangent, name=name):
-            return orders(fn, primals, direction, cotangent)[name]()
+            return _order_result(orders(fn, primals, direction, cotangent)[name], result_leaf)
 
         def truth(primals, direction, cotangent, name=name):
-            return orders(truth_fn, primals, direction, cotangent)[name]()
+            return _order_result(orders(truth_fn, primals, direction, cotangent)[name], result_leaf)
 
         truth_of = None if truth_fn is None else truth
         count = seeds_for(off, draw, site, truth_fn=truth_of, dew_fn=on) if seeds is None else seeds
@@ -483,12 +496,15 @@ def _compiled_ahead(runs: list[_Run]) -> None:
 
 
 @functools.lru_cache(maxsize=256)
-def _mesh_program(fn, name: str):
+def _mesh_program(fn, name: str, result_leaf: Callable | None):
     """Order `name` of `fn` (`orders`) as one jitted program of its primals, direction and cotangent, made
     once a function and an order: compiled once a shape, each seed's draw and each of a cell's edges (`EDGES`,
     one shape at three scales) running it (rows 9806, 9807, 10132: the convex mean's mesh runs compiled each
     order again at every edge, a third of its cell)."""
-    return jax.jit(lambda primals, direction, cotangent: orders(fn, primals, direction, cotangent)[name]())
+    def applied(primals, direction, cotangent):
+        return _order_result(orders(fn, primals, direction, cotangent)[name], result_leaf)
+
+    return jax.jit(applied)
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}

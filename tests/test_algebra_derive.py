@@ -1360,59 +1360,70 @@ def test_weighted_moments_exclude_nonfinite_zero_weight_samples_without_losing_f
     np.testing.assert_array_equal(moved, [1.5, 3, 8])
 
 
-@pytest.mark.parametrize("mode", ["walk", "merge"])
-def test_chunked_moments_preserves_zero_weight_derivatives_and_extreme_anchors(mode):
-    """Weight JVPs and projected reverse derivatives stay exact, including a zero-mass tile and an
-    opposite-sign anchor whose difference would overflow float32."""
-    from dew.algebra import moments
-
-    def weight_orders(function):
-        @jax.jit
+def _moment_weight_order(function, projection):
+    if projection is None:
         def forward(x, w, dw):
             return jax.jvp(lambda weights: function(x, weights), (w,), (dw,))
 
-        def mean(x, w):
-            return function(x, w)[0].sum()
+        return jax.jit(forward)
 
-        def variance(x, w):
-            return function(x, w)[1].sum()
+    # Discard the other result before reverse AD; a materialized zero would exercise another path.
+    def projected(x, w, dw):
+        return function(x, w)[projection].sum()
 
-        # Stage each projected gradient separately. A materialized zero cotangent would exercise
-        # a different transpose path from discarding the other result before reverse AD.
-        return forward, jax.jit(jax.grad(mean, argnums=1)), jax.jit(jax.grad(variance, argnums=1))
+    return jax.jit(jax.grad(projected, argnums=1))
 
-    forward, mean_grad, variance_grad = weight_orders(moments.weighted_moments)
-    orders = {tile: weight_orders(functools.partial(moments.chunked_moments, tile=tile, mode=mode))
-              for tile in (1, 2)}
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize("tile", [1, 2])
+@pytest.mark.parametrize("projection", [None, 0, 1], ids=["weight-jvp", "mean-vjp", "variance-vjp"])
+def test_chunked_moments_preserves_zero_weight_derivatives(mode, tile, projection):
+    from dew.algebra import moments
+
+    run = _moment_weight_order(functools.partial(moments.chunked_moments, tile=tile, mode=mode), projection)
+    plain = _moment_weight_order(moments.weighted_moments, projection)
     dw = jnp.ones((1, 2), jnp.float32)
     for x_vals, w_vals in (([0.0, 2.0], [1.0, 0.0]), ([10.0, 12.0], [1.0, 0.0]),
                            ([12.0, 10.0], [0.0, 1.0]), ([2.0 ** 70, 2.0 ** 70], [1.0, 0.0]),
                            ([2.0 ** 70, 2.0 ** 70], [0.0, 1.0])):
         x, w = (jnp.asarray([values], jnp.float32) for values in (x_vals, w_vals))
-        expected = jax.tree.leaves((forward(x, w, dw), mean_grad(x, w), variance_grad(x, w)))
-        for run, dm, dv in orders.values():
-            actual = jax.tree.leaves((run(x, w, dw), dm(x, w), dv(x, w)))
-            for found, want in zip(actual, expected, strict=True):
-                assert np.all(np.isfinite(np.asarray(found)))
-                np.testing.assert_array_equal(np.asarray(found), np.asarray(want))
+        actual, expected = jax.tree.leaves(run(x, w, dw)), jax.tree.leaves(plain(x, w, dw))
+        for found, want in zip(actual, expected, strict=True):
+            assert np.all(np.isfinite(np.asarray(found)))
+            np.testing.assert_array_equal(found, want)
 
-    x_zero, w_zero = jnp.asarray([[5.0, 7.0]], jnp.float32), jnp.asarray([[0.0, 0.0]], jnp.float32)
-    for run, dm, dv in orders.values():
-        (m_z, v_z), _ = run(x_zero, w_zero, dw)
-        assert float(m_z[0]) == 0.0 and float(v_z[0]) == 0.0
-        np.testing.assert_array_equal(np.asarray(dm(x_zero, w_zero)), np.asarray(x_zero))
-        np.testing.assert_array_equal(np.asarray(dv(x_zero, w_zero)), np.asarray(x_zero ** 2))
+    x_zero = jnp.asarray([[5.0, 7.0]], jnp.float32)
+    zero = run(x_zero, jnp.zeros_like(x_zero), dw)
+    if projection is None:
+        (mean, variance), _ = zero
+        assert float(mean[0]) == 0.0 and float(variance[0]) == 0.0
+    else:
+        np.testing.assert_array_equal(zero, x_zero if projection == 0 else x_zero ** 2)
 
-    run, _, dv = orders[1]
-    x_three = jnp.asarray([[10.0, 20.0, 30.0]], jnp.float32)
-    w_three = jnp.asarray([[0.0, 0.0, 1.0]], jnp.float32)
-    np.testing.assert_array_equal(np.asarray(dv(x_three, w_three)),
-                                  np.asarray(variance_grad(x_three, w_three)))
+
+@pytest.mark.parametrize("mode", ["walk", "merge"])
+@pytest.mark.parametrize("anchor", ["zero-prefix", "opposite-sign-jvp", "opposite-sign-vjp"])
+def test_chunked_moments_preserves_extreme_anchors(mode, anchor):
+    from dew.algebra import moments
+
+    run = _moment_weight_order(functools.partial(moments.chunked_moments, tile=1, mode=mode),
+                               None if anchor == "opposite-sign-jvp" else 1)
+    if anchor == "zero-prefix":
+        x = jnp.asarray([[10.0, 20.0, 30.0]], jnp.float32)
+        w = jnp.asarray([[0.0, 0.0, 1.0]], jnp.float32)
+        dw = jnp.ones_like(w)
+        plain = _moment_weight_order(moments.weighted_moments, 1)
+        np.testing.assert_array_equal(run(x, w, dw), plain(x, w, dw))
+        return
+
     big = np.float32(2.0 ** 127)
-    x_ext, w_ext = jnp.asarray([[big, -big]], jnp.float32), jnp.asarray([[0.0, 1.0]], jnp.float32)
-    (m_ext, v_ext), _ = run(x_ext, w_ext, dw)
-    assert float(m_ext[0]) == -float(big) and float(v_ext[0]) == 0.0
-    assert float(dv(x_ext, w_ext)[0, 1]) == 0.0
+    x, w = jnp.asarray([[big, -big]], jnp.float32), jnp.asarray([[0.0, 1.0]], jnp.float32)
+    found = run(x, w, jnp.ones_like(w))
+    if anchor == "opposite-sign-jvp":
+        (mean, variance), _ = found
+        assert float(mean[0]) == -float(big) and float(variance[0]) == 0.0
+    else:
+        assert float(found[0, 1]) == 0.0
 
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])
@@ -1804,25 +1815,29 @@ def test_chunked_covariance_retains_small_value_tangent(mode):
 
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])
-def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode):
+@pytest.mark.parametrize("inner", ["weight", "value"])
+def test_a_stationary_weight_direction_cannot_erase_another_samples_tangent(mode, inner):
     from dew.algebra import moments
 
     x = jnp.asarray([[-1.0, 1.0, 0.0]], jnp.float32)
     w = jnp.asarray([[0.5, 0.5, 0.0]], jnp.float32)
     dw = jnp.asarray([[2.0 ** 125, 0.0, 2.0 ** -40]], jnp.float32)
 
-    def directed(x):
-        return jax.jvp(lambda q: moments.chunked_moments(x, q, tile=1, mode=mode)[1], (w,), (dw,))[1]
+    def variance(x, w):
+        return moments.chunked_moments(x, w, tile=1, mode=mode)[1]
 
-    first, second = jax.jvp(directed, (x,), (x,))
-    np.testing.assert_array_equal(first, [-2.0 ** -40])
+    if inner == "weight":
+        def directed(x):
+            return jax.jvp(lambda q: variance(x, q), (w,), (dw,))[1]
+
+        first, second = jax.jvp(directed, (x,), (x,))
+        np.testing.assert_array_equal(first, [-2.0 ** -40])
+    else:
+        def directed(w):
+            return jax.jvp(lambda v: variance(v, w), (x,), (x,))[1]
+
+        _, second = jax.jvp(directed, (w,), (dw,))
     np.testing.assert_array_equal(second, [-2.0 ** -39])
-
-    def value_direction(weight):
-        return jax.jvp(lambda v: moments.chunked_moments(v, weight, tile=1, mode=mode)[1], (x,), (x,))[1]
-
-    _, reversed_second = jax.jvp(value_direction, (w,), (dw,))
-    np.testing.assert_array_equal(reversed_second, second)
 
 
 @pytest.mark.parametrize("mode", ["walk", "merge"])

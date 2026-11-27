@@ -48,7 +48,7 @@ TESTS = "tests/test_algebra_generate.py"
 """The suite every generated module is held by: its forms on par with their declarations (check 1) and the
 written module what generation writes (`--check`)."""
 
-DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases")
+DECLARING = ("dew.algebra.acceptance", "dew.algebra.component_cases", "dew.sampling.guidance_cases")
 """Modules that declare generated functions, imported before generation reads `DECLARATIONS`."""
 
 
@@ -377,9 +377,10 @@ def _shared_cases(bodies: dict[str, str | printed.Body], active: dict[_Chosen, s
     components = {name: body for name, body in bodies.items() if isinstance(body, printed.Body)}
     emitted = _component_sharing.shared(components, reserved=declared)
     shared_names = emitted.keys() - components.keys()
+    shared_bodies = {name: emitted[name] for name in shared_names}
     bound = {}
     for found, name in active.items():
-        args = _component_sharing.bound_call(emitted[name], shared_names,
+        args = _component_sharing.bound_call(emitted[name], shared_bodies,
                                              tuple(arg.shape for arg in found.operands))
         if args is not None:
             bound[found] = args
