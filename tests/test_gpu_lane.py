@@ -402,6 +402,18 @@ def test_a_cell_its_prepares_cap_left_is_named_and_counted_but_reds_no_row(ci):
     assert graded([], before=whole, found=found)["exitCode"] == 0
     for masks in ({ci.prepares.identity(capped)}, {ci.prepares.identity(named)}):
         assert graded([lowered], before=masks)["exitCode"] == 1
+    # A cell main capped (labeled) was never tried there: this run's same cell of that test, reached at its
+    # own site, reds nothing, fresh or reused (train 1355: ten cells train 1352 capped, read as new); its
+    # sibling cell still reds, fresh or reused.
+    reached = {"test": "tests/test_gpu_vae.py::test_flow", "where": "tests/test_gpu_vae.py", "error": "e",
+               "cell": "two"}
+    sibling = {**reached, "cell": "three"}
+    main_capped = {ci.prepares.identity(capped)}
+    assert graded([reached], before=main_capped)["exitCode"] == 0
+    assert graded([reached, sibling], before=main_capped)["new_unprepared"] == [ci.prepares.identity(sibling)]
+    for record, red_ in ((reached, 0), (sibling, 1)):
+        again = {"name": name, "exitCode": 0, "output": "", "unprepared": [ci.prepares.identity(record)]}
+        assert graded([], before=main_capped, found=again)["exitCode"] == red_
     # Parameter ids sharing a start: main skipping test_flow[x] exempts no cell of test_flow[x] @ y] nor of
     # test_flow[x] @ y [z], fresh or reused.
     skipped_x = {ci.prepares.identity({**skipped, "test": "tests/test_gpu_vae.py::test_flow[x]"})}
