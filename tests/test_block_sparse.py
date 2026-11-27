@@ -531,7 +531,7 @@ def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precisi
     """An MSA layer's sown indexer loss (`BlockSparseSelfAttention._msa`, `INDEXER_COLLECTION` open) over a
     query `[1, 0]` and two keys at width 2, blocks of one key, both selected: the float64 KL from its index
     branch's softmax (its sown scores) to the softmax of the logits its attention forms, written out here
-    (the query scaled by 1/sqrt(2) first in its dtype, its product with each key): at a bf16 preset the
+    (the query scaled by 1/sqrt(2) first in its dtype, its fp32 product with each key): at a bf16 preset the
     scaled query bf16's 1/sqrt(2), 0.70703125; at a layer's `highest` under an ambient bf16 preset (row
     13706), and under the run's accurate numerics over a layer's bf16 preset, fp32's, so keys of 4096 and
     4097 stay a logit apart (train 1359's F1). A dropped handoff of the layer's precision or order to its
@@ -567,7 +567,8 @@ def test_an_msa_layers_teacher_is_the_softmax_its_attention_forms(dtype, precisi
     student = np.asarray(next(leaf for path, leaf in jax.tree_util.tree_flatten_with_path(sown[SELECTIONS])[0]
                               if "scores" in jax.tree_util.keystr(path)), np.float64)[0, 0, 1]
     student = np.exp(student - student.max()) / np.exp(student - student.max()).sum()
-    logits = np.asarray([keys[0] * scaled, keys[1] * scaled], np.float64)
+    # Each logit the fp32 product its attention sums: the scaled query times the key, rounded once.
+    logits = np.asarray([np.float32(scaled) * np.float32(k) for k in keys], np.float64)
     teacher = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
     expected = float(np.sum(teacher * (np.log(teacher) - np.log(student))))
     assert_fp32_reduction_bound(found, expected, float(np.sum(np.abs(teacher * np.log(student)))) + 1.0, 8)
