@@ -15,6 +15,7 @@ import numpy as np
 from dew._coordination import read_home
 from dew.batch import Variables, merge, thaw
 from dew.nn.protocols import BankedStacks, StagedStacks
+from dew.nn.sharding import leading_row
 
 LAYERS = "layers_"
 """The prefix of every stack module's name: a layer's `layers_3`, a scanned run's `layers_3_7`."""
@@ -67,13 +68,14 @@ __all__ = ["LAYERS", "any_layer", "group_layers", "group_name", "layer_index"]
 
 def array_rows(path, leaf, shape: tuple[int, ...]) -> list:
     """A stacked leaf's rows, `StackView.layer_form`'s cut for arrays: each index of its leading `shape`,
-    taken by the leaf's own indexing, so a host array stays on the host, a device array where it is, and a
-    packed leaf an export decodes as it reads it (`quantization.PackedDecode`) decodes each row as it is
-    read (train 1399's review: a reshape it has none of)."""
+    taken where it lies (`sharding.leading_row`), so a host array stays on the host, a device array where it
+    is (placed past its stage where an Explicit axis splits it, train 1422's review), and a packed leaf an
+    export decodes as it reads it (`quantization.PackedDecode`) decodes each row as it is read (train
+    1399's review: a reshape it has none of)."""
     del path
     # The leaf's own leading dimensions, so one whose rows are not the declared `shape` fails the cut's
     # count rather than lose a row.
-    return [leaf[index] for index in np.ndindex(*leaf.shape[:len(shape)])]
+    return [leading_row(leaf, index) for index in np.ndindex(*leaf.shape[:len(shape)])]
 
 
 def stage_count(tree) -> int:
@@ -119,16 +121,16 @@ class StoredRow:
         # Each member sliced where the bank lies before it is read home, so a row's members read it home
         # once between them, a member's share each.
         return [Deferred((*self.shape[:-1], width), self.dtype,
-                         functools.partial(lambda start, width: read_home(
-                             self.bank[self.index][..., start:start + width]), int(start), int(width)))
+                         functools.partial(lambda start, width: read_home(leading_row(
+                             self.bank, self.index)[..., start:start + width]), int(start), int(width)))
                 for start, width in zip(starts, widths, strict=True)]
 
     def __jax_array__(self) -> jax.Array:
-        return jax.numpy.asarray(self.bank[self.index])
+        return jax.numpy.asarray(leading_row(self.bank, self.index))
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         del copy
-        held = read_home(self.bank[self.index])
+        held = read_home(leading_row(self.bank, self.index))
         return held if dtype is None else held.astype(dtype)
 
 
