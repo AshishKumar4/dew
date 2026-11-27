@@ -286,22 +286,6 @@ def _selected_tokens(selected: jax.Array, keys: int, block: int) -> jax.Array:
     return chosen & (jnp.arange(keys)[None, :] <= jnp.arange(queries)[:, None])
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
-def _halved_product(x: jax.Array, half: jax.Array, groups: int) -> jax.Array:
-    """`half² x / groups`, formed between the halves (`(half x)(half / groups)`), so a weight `half²` below
-    fp32's least normal flushes neither: an infinite `x` its own signed infinity at any positive weight. Its
-    derivative in `x` is the weight's, `half² / groups` (the weight takes none: the teacher is detached), an
-    infinite `x`'s alike, where the infinity's own slope was 1."""
-    return jnp.where(jnp.isinf(x), x, (half * x) * (half / groups))
-
-
-@_halved_product.defjvp
-def _halved_product_jvp(groups, primals, tangents):
-    x, half = primals
-    x_dot, _ = tangents
-    return _halved_product(x, half, groups), (half * (half / groups)) * x_dot
-
-
 def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, selected: jax.Array, *,
                   block: int, scale: float) -> jax.Array:
     """MSA's indexer loss per query (arXiv 2606.13392 eqs. 9, 10), `[B, Q]`, as latent attention's indexer
@@ -358,8 +342,11 @@ def msa_query_kls(index_scores: jax.Array, query: jax.Array, key: jax.Array, sel
         def scaled(x):
             # `target * x / groups` of a weight below fp32's least normal: its weight's halves each a normal
             # number (e^(L/2), exact halving of its logarithm L), the product formed between them, so neither
-            # rounds to 0 first and each takes one rounding (`_halved_product`).
-            return _halved_product(x, half, groups)
+            # rounds to 0 first and each takes one rounding, its derivative alike (between the halves). An
+            # infinite `x` its own signed infinity where a half is 0 (its weight's slope 0 there), where the
+            # product would be 0 * inf.
+            product = (half * x) * (half / groups)
+            return jnp.where(jnp.isinf(x) & (half == 0), jax.lax.stop_gradient(x), product)
 
         product = target * gap
         direct = jnp.where(jnp.isfinite(gap),

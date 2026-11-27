@@ -434,8 +434,9 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     """MSA's indexer loss (`msa_query_kls`) over two selected tokens whose teacher logits are 0 and -88 (a
     mass below fp32's least normal): its branch scoring them the same, KL 0 within fp32's rounding of its
     terms (88 e^-88, normal), the entropy's tiny term formed as the gap's, where a flushed weight dropped
-    it; scored 0 and -inf, its KL +inf and the low score's gradient the weight's, -e^-88 / 1 (0 in fp32), not
-    the infinity's own slope; a teacher logit of NaN, its KL and gradient NaN, not a finite loss over the
+    it; scored 0 and -inf against logits 0 and -110, its KL +inf and the low score's gradient the weight's
+    (0 in fp32), not the infinity's own slope, and scored -2^126 under a large cotangent, the weight's
+    product normal; a teacher logit of NaN, its KL and gradient NaN, not a finite loss over the
     rest."""
     query = jnp.ones((1, 2, 1, 1), jnp.float32)
     selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
@@ -446,12 +447,18 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     key = jnp.asarray([[[[0.0]], [[-88.0]]]], jnp.float32)
     equal = jnp.asarray([[[[0.0, -np.inf], [0.0, -88.0]]]], jnp.float32)
     assert_fp32_reduction_bound(np.asarray(loss(equal, key)), 0.0, 2 * 88 * np.exp(-88.0), 4)
+    # Teacher logits 0 and -110: scored 0 and -inf, the low score's gradient the weight's, -e^-110, 0 in
+    # fp32, the high score's 1 less its weight's 1, 0; scored 0 and -2^126 under a cotangent of 2^126, the
+    # low score's -2^126 e^-110 (1.44e-10, normal), formed between the weight's halves.
+    farther = jnp.asarray([[[[0.0]], [[-110.0]]]], jnp.float32)
     infinite = jnp.asarray([[[[0.0, -np.inf], [0.0, -np.inf]]]], jnp.float32)
-    assert float(loss(infinite, key)) == np.inf
-    gradient = np.asarray(jax.grad(lambda s: loss(s, key))(infinite))[0, 0, 1]
-    # The high score's: its softmax's 1 less its weight's 1 - e^-88; the low score's the weight's alone.
-    assert_fp32_reduction_bound(gradient[0], np.exp(-88.0), 2.0, 2)
-    assert -2 * np.exp(-88.0) <= gradient[1] <= 0
+    assert float(loss(infinite, farther)) == np.inf
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther))(infinite))[0, 0, 1]
+    np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
+    far = jnp.asarray([[[[0.0, -np.inf], [0.0, -(2.0**126)]]]], jnp.float32)
+    gradient = np.asarray(jax.grad(lambda s: loss(s, farther) * 2.0**126)(far))[0, 0, 1, 1]
+    expected = -(2.0**126) * np.exp(-110.0) / (1 + np.exp(-110.0))
+    assert_fp32_reduction_bound(gradient, expected, abs(expected), 3)
     invalid = jnp.asarray([[[[0.0]], [[np.nan]]]], jnp.float32)
     uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
     assert np.isnan(float(loss(uniform, invalid)))
