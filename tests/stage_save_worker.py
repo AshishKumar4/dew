@@ -18,8 +18,8 @@ def mode_stage_save(args) -> dict:
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
     from dew.checkpoints import Checkpoints
-    from dew.training import MeshSpec
     from dew.nn.finite import finite_flags
+    from dew.training import MeshSpec
 
     # One leaf on each process's devices alone, the second holding a NaN.
     flags = []
