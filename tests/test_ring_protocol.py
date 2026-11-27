@@ -868,6 +868,21 @@ def test_an_asynchronous_landing_aliasing_an_implicit_wait_is_caught():
     assert found.value.kind == "aliased"
 
 
+def test_a_read_past_the_part_of_a_slot_its_landed_copy_wrote_is_refused():
+    """cp.async's checker (`cp_async_violations`) holds a read of a copied ring to the copies that landed:
+    one into part 0 of slot 1, committed and waited for, writes that part alone, so a read of the whole
+    slot, or of its part 1, is refused, and a read of part 0, or of the whole slot after a copy of it whole,
+    held."""
+    def violations(copied: tuple, read: tuple) -> list[str]:
+        return ring_protocol.cp_async_violations([Event("cp_copy", copied), Event("cp_commit"),
+                                                  Event("cp_wait", (), 0), Event("read", read)])
+
+    assert violations(("ring", 1, 0), ("ring", 1, 0)) == []
+    assert violations(("ring", 1), ("ring", 1)) == []
+    for read in (("ring", 1), ("ring", 1, 1), ("ring", None)):
+        assert len(violations(("ring", 1, 0), read)) == 1, read
+
+
 @pytest.mark.parametrize("gathered", [True, False], ids=["gathered", "contiguous"])
 @pytest.mark.parametrize(("stages", "trips"), [(3, 1), (3, 2), (1, 2)],
                          ids=["deep-short", "deep-two", "one-slot"])

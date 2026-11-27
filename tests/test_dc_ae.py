@@ -298,3 +298,18 @@ def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_ar
     with jax.default_device(jax.devices("cpu")[0]):
         attended = jax.jit(linear_attention)(query, key, jnp.asarray(value))
     np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))
+
+
+def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie():
+    """Called eagerly (no jit) on operands committed to the CPU, DC-AE's linear attention takes the CPU's
+    whole sums under wide arithmetic whatever the process's default device, as its jitted call does there
+    (train 1393's review: an accelerator-default process took the grouped sums, a GPU lane's to witness)."""
+    from dew.nn.autoencoders.dc_ae import linear_attention
+
+    cpu = jax.devices("cpu")[0]
+    query = jax.device_put(jnp.ones((1, 64, 1, 1), jnp.float32), cpu)
+    key = jax.device_put(jnp.full((1, 64, 1, 1), 2.0 ** 100, jnp.float32), cpu)
+    value = np.zeros((1, 64, 1, 1), np.float32)
+    value[0, [0, 1, 4, 5], 0, 0] = (2.0 ** 27, 2.0 ** 27, -2.0 ** 27, -2.0 ** 26)
+    attended = linear_attention(query, key, jax.device_put(jnp.asarray(value), cpu))
+    np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))

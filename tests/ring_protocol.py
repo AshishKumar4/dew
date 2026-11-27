@@ -970,9 +970,10 @@ def cp_async_violations(program: list[Event]) -> list[str]:
     `cp.async.wait_group`): a copy pending in the thread's open group until a commit closes it, a wait
     retiring every committed group but its latest `n`, its copies' bytes landed then. Each in program order:
     a copy into memory another pending copy writes (either's bytes may land last); a read or write of memory
-    a pending copy writes (its bytes may land after); a read of a copied ring's memory no landed copy wrote
-    (a slot never filled); and a scope's end with a copy pending into its allocations (its memory another's
-    next)."""
+    a pending copy writes (its bytes may land after); a read of a copied ring's memory the landed copies do
+    not write whole (a slot never filled, or one part of it: each block it reads within one landed copy's
+    location, `_holds`, so a read the parts' copies cover only together is refused, as no walk reads); and a
+    scope's end with a copy pending into its allocations (its memory another's next)."""
     copied = {block[0] for event in program if event.kind == "cp_copy" for block in _each(event.at)}
     open_copies: list = []
     groups: list[list] = []
@@ -995,8 +996,8 @@ def cp_async_violations(program: list[Event]) -> list[str]:
         elif event.kind in ("read", "write") and any(_overlaps(at, event.at) for at in pending):
             found.append(f"event {index}: a {event.kind} of {event.at} while a copy into it is pending")
         elif (event.kind == "read" and {block[0] for block in _each(event.at)} & copied
-              and not any(_overlaps(at, event.at) for at in landed)):
-            found.append(f"event {index}: a read of {event.at}, which no landed copy wrote")
+              and not all(any(_holds(at, block) for at in landed) for block in _each(event.at))):
+            found.append(f"event {index}: a read of {event.at}, which no landed copy wrote whole")
         elif event.kind == "cp_scope_end":
             if left := [at for at in pending if {block[0] for block in _each(at)} & event.argument]:
                 found.append(f"event {index}: its scope ends with copies pending into {left}")
@@ -1613,6 +1614,16 @@ def _overlaps(one: "tuple | frozenset[tuple]", other: "tuple | frozenset[tuple]"
     return bool(one) and bool(other) and one[0] == other[0] and all(
         mine is None or theirs is None or mine == theirs
         for mine, theirs in itertools.zip_longest(one[1:], other[1:]))
+
+
+def _holds(outer: "tuple | frozenset[tuple]", inner: tuple) -> bool:
+    """Whether location `outer` holds all of the block `inner`: one of its blocks the same ref, each of its
+    indices `inner`'s own (none past them: the rest whole, a ref's `None` the ref whole)."""
+    def indices(block: tuple) -> tuple:
+        return () if block[1:] == (None,) else block[1:]
+
+    return any(block[0] == inner[0] and indices(inner)[:len(indices(block))] == indices(block)
+               for block in _each(outer))
 
 
 def _each(location: "tuple | frozenset[tuple]") -> "tuple | frozenset[tuple]":

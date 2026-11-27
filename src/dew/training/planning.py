@@ -1109,7 +1109,10 @@ class FitSearch[LossT, EffectsT]:
         asked next (`after`). Once admission succeeds, no optional alternate policy is compiled."""
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         passed = len(report.passes())
-        split = self.searched(candidates, first)
+        # The search's own stored derivations' lookups, in its context alone (`report.recording`): an ahead
+        # planner's concurrent searches (`ahead`) count theirs apart.
+        with report.recording() as recorded:
+            split = self.searched(candidates, first)
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
@@ -1117,7 +1120,11 @@ class FitSearch[LossT, EffectsT]:
         # Each program the search traced, its whole algebra pass in seconds (`report.passes`), beside the
         # regions' own: what the pass cost this plan's compiles.
         passes: list[JSON] = list(report.passes()[passed:])
-        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
+        # Its stored derivations' lookups by outcome (`report.record_stored`): a miss, an entry that failed to
+        # read or a derivation not stored is a cold derivation's seconds this plan's traces paid.
+        stored: dict[str, JSON] = {str(outcome): count for outcome, count in recorded.stored.items()}
+        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes,
+                        "stored": stored}
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
             raise PlanRefused(self.probes, allocators, candidates, self.unmeasured_lighter(),

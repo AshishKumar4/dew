@@ -339,6 +339,162 @@ def test_a_split_convs_bias_holds_its_orders(edge):
 
 
 @pytest.mark.parametrize("edge", sorted(EDGES))
+def test_scaled_exp_holds_every_order(edge):
+    """`scan.scaled_exp`, a value decayed by `exp` of an exponent at most 0 through split factors, its
+    derivatives declared (`_scaled_exp_tangent`): every order finite wherever float64 is a normal float32 and
+    the plain `value * exp(exponent)` is, at values scaled to the edge and decays from 0 to past fp32's
+    least normal."""
+    value, direction, cotangent = normal_draw(1707, (6,), (6,), (6,), scale=EDGES[edge])
+    exponent = -jnp.asarray([0.0, 0.5, 3.0, 40.0, 90.0, 150.0], jnp.float32)
+    (rate,) = normal_draw(1708, (6,))
+    assert_contract(scan.scaled_exp, (value, exponent), (direction, rate), cotangent, f"scaled exp {edge}",
+                    plain_fn=lambda value, exponent: value * jnp.exp(exponent))
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
+def test_a_decayed_product_holds_every_order(edge):
+    """`scan._decayed`, factors' product times `exp` of an exponent at most 0 landed once as a scaled value's,
+    the derivatives `scaled_exp` declares by it (every one another such product): every order finite
+    wherever float64 is a normal float32 and the plain `a * b * exp(exponent)` is, at factors scaled to the
+    edge and decays from 0 to past fp32's least normal."""
+    left, right, cotangent, along_left, along_right = normal_draw(1709, *[(6,)] * 5, scale=EDGES[edge])
+    exponent = -jnp.asarray([0.0, 0.5, 3.0, 40.0, 90.0, 150.0], jnp.float32)
+    (rate,) = normal_draw(1710, (6,))
+    assert_contract(scan._decayed, (exponent, left, right), (rate, along_left, along_right), cotangent,
+                    f"a decayed product {edge}", plain_fn=lambda exponent, a, b: a * b * jnp.exp(exponent))
+
+
+@pytest.mark.parametrize(("value", "cotangent", "decay"), [(2.0 ** 127, 2.0 ** 127, -90.0),
+                                                          (1.0, 2.0 ** 120, -120.0),
+                                                          (2.0 ** -120, 2.0 ** 100, -25.0),
+                                                          (2.0 ** -120, 2.0 ** 120, -10.0)])
+def test_scaled_exps_exponent_cotangent_is_its_value_and_decay_in_range(value, cotangent, decay):
+    """`scan.scaled_exp`'s exponent cotangent, `cotangent * value * exp(decay)`, in float64's binade wherever
+    that is a normal fp32, its forward and its tangent alike: `2^254 e^-90` (2.4e37), which autodiff through
+    the factors overflowed forming `2^127 * 2^127 e^-87` (train 1379's review K-F2); `2^120 e^-120`
+    (1.0e-16) and `2^-20 e^-25` (1.3e-17), which the cotangent times the decayed value read zero, that value
+    underflowed, and an even split of the decay alone `2^-120 e^-12.5` (train 1383's reviews of 7534dfb59);
+    `e^-10` of 2^-120 by 2^120."""
+    value, decay, cotangent = (jnp.asarray([x], jnp.float32) for x in (value, decay, cotangent))
+    truth = np.frexp(float(value[0]) * float(cotangent[0]) * np.exp(float(decay[0])))[1]
+    pulled = jax.vjp(scan.scaled_exp, value, decay)[1](cotangent)[1]
+    tangent = jax.jvp(scan.scaled_exp, (value, decay), (jnp.zeros_like(value), cotangent))[1]
+    for found in (pulled, tangent):
+        assert np.isfinite(found).all() and (found != 0).all(), found
+        assert np.frexp(np.asarray(found, np.float64))[1][0] == truth, (found, truth)
+
+
+def test_scaled_exps_derivatives_hold_past_an_infinite_decay_and_fp32s_range():
+    """`scan.scaled_exp`'s derivatives at an exponent of -inf, under a value and an exponent direction or
+    cotangent of 2^127 each, and at fp32's most negative exponent under 1 each: zero and finite, no product
+    of the two formed (2^254 times the zero decay was NaN) and no base-two head formed past the cutoff (its
+    overflow's -inf less -inf was NaN); and in float64 at an exponent of -800 under a direction of 2^500,
+    the exponent's tangent `2^500 e^-800` (about 2^-654, a normal float64) in its binade, the decay's power
+    derived from the format and the factors (a cutoff for fp32's three factors clipped it to 2^-524). Head
+    reviews of 96ef59e42 and 34d7afdf7."""
+    for value, decay in ((2.0 ** 127, -np.inf), (1.0, -float(np.finfo(np.float32).max))):
+        value, decay = jnp.asarray([value], jnp.float32), jnp.asarray([decay], jnp.float32)
+        pulled = jax.vjp(scan.scaled_exp, value, decay)[1](value)
+        tangent = jax.jvp(scan.scaled_exp, (value, decay), (jnp.zeros_like(value), value))[1]
+        for found in (*pulled, tangent):
+            np.testing.assert_array_equal(np.asarray(found), np.zeros(1, np.float32))
+    with jax.enable_x64(new_val=True):
+        one, decay = jnp.asarray([1.0], jnp.float64), jnp.asarray([-800.0], jnp.float64)
+        wide = jax.jvp(scan.scaled_exp, (one, decay), (jnp.zeros_like(one), jnp.asarray([2.0 ** 500])))[1]
+        found = np.asarray(wide, np.float64)
+    assert np.isfinite(found).all() and found[0] != 0, found
+    assert np.frexp(found[0])[1] == np.frexp(np.exp(500 * np.log(2.0) - 800.0))[1], found
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16], ids=["fp16", "bf16"])
+def test_scaled_exps_exponent_derivatives_hold_in_16_bit_operands(dtype):
+    """`scan.scaled_exp` of a 16-bit value of 4 decayed by -10, under a unit exponent direction and a unit
+    cotangent: its exponent's tangent and cotangent `4 e^-10` (1.816e-4, a normal fp16) rounded once to the
+    dtype, the decayed product formed in fp32 and narrowed at its end, where fp16's base-two split of the
+    decay overflowed its two-product splitter, NaN (train 1398's review of 9b6609de0)."""
+    value, decay = jnp.asarray([4.0], dtype), jnp.asarray([-10.0], dtype)
+    expected = np.asarray(np.asarray(4.0 * np.exp(-10.0), dtype), np.float64)
+    tangent = jax.jvp(scan.scaled_exp, (value, decay), (jnp.zeros_like(value), jnp.ones_like(decay)))[1]
+    pulled = jax.vjp(scan.scaled_exp, value, decay)[1](jnp.ones_like(value))[1]
+    for found in (tangent, pulled):
+        assert found.dtype == dtype, found
+        np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
+
+
+@pytest.mark.parametrize(("values", "dtype", "expected"), [
+    ((256.0, -255.5), jnp.float32, 0.5), ((2.0 ** 130, -2.0 ** 130 + 2.0 ** 126), jnp.float64, 2.0 ** 126)],
+    ids=["fp32", "float64"])
+def test_scaled_exps_shared_exponent_gradient_sums_its_batch_wide(values, dtype, expected):
+    """`scan.scaled_exp` mapped over values beside one shared bf16 exponent of 0, under unit cotangents: the
+    exponent's gradient their sum, the batch's terms summed in the rule's working dtype (its operands'
+    promoted with fp32) and narrowed once (`_linear_tangent`): fp32's 256 and -255.5 sum to 0.5, where each
+    narrowed first (-255.5 to -256 in bf16) read 0 (train 1398's review of 9b6609de0); float64's 2^130 and
+    -2^130 + 2^126 to 2^126, where each narrowed to fp32 read inf less inf (a head review of 1a11d9ad2)."""
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        held = jnp.asarray(values, dtype)
+
+        def total(exponent):
+            return jnp.sum(jax.vmap(scan.scaled_exp, in_axes=(0, None))(held, exponent))
+
+        found = jax.grad(total)(jnp.asarray(0.0, jnp.bfloat16))
+    assert found.dtype == jnp.bfloat16 and float(found) == expected, found
+
+
+@pytest.mark.mesh
+def test_scaled_exps_cotangents_are_placed_as_their_explicit_operands():
+    """`scan.scaled_exp` of a replicated fp32 value and an exponent split over an Explicit axis of two
+    devices: each operand's gradient placed as the operand is, the value's replicated (`_summed_to`'s
+    placement, as `templates.gemm.factored` places its rows'), where it stayed split as the exponent's
+    product with the cotangent was (train 1398's review of 9b6609de0); and each the unsharded call's."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    values, exponents = jnp.asarray([3.0, 5.0], jnp.float32), jnp.asarray([-1.0, -2.0], jnp.float32)
+
+    def gradients(value, exponent):
+        return jax.grad(lambda value, exponent: jnp.sum(scan.scaled_exp(value, exponent)), argnums=(0, 1))(
+            value, exponent)
+
+    whole = gradients(values, exponents)
+    with jax.set_mesh(mesh):
+        value = jax.device_put(values, NamedSharding(mesh, PartitionSpec()))
+        exponent = jax.device_put(exponents, NamedSharding(mesh, PartitionSpec("data")))
+        found = jax.jit(gradients)(value, exponent)
+    for gradient, operand, plain in zip(found, (value, exponent), whole, strict=True):
+        assert gradient.sharding.is_equivalent_to(operand.sharding, 1), (gradient.sharding, operand.sharding)
+        np.testing.assert_array_equal(np.asarray(gradient), np.asarray(plain))
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize(("values", "exponent", "dtype"), [((3.0, 5.0), -2.0, jnp.float32),
+                                                         ((256.0, -255.5), 0.0, jnp.bfloat16)],
+                         ids=["fp32", "a bf16 exponent"])
+def test_scaled_exps_replicated_exponent_gradient_sums_its_shards(values, exponent, dtype):
+    """`scan.scaled_exp` in a checked `shard_map` over two devices, its fp32 value split across them and its
+    exponent held whole: the exponent's gradient each shard's partial summed over the axis
+    (`sharding.summed_to`) in fp32 and narrowed once, the value times its decay summed in float64 and
+    rounded to the exponent's dtype: where its pullback's unsummed partial was refused by JAX's cotangent
+    check (a head review of 96ef59e42), and where a bf16 exponent's partials were narrowed first, 256 and
+    -255.5 summing to 0, not 0.5 (train 1398's review of 9b6609de0)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), devices=jax.devices()[:2])
+    value = jax.device_put(jnp.asarray(values, jnp.float32), NamedSharding(mesh, PartitionSpec("data")))
+    shared = jax.device_put(jnp.asarray(exponent, dtype), NamedSharding(mesh, PartitionSpec()))
+
+    def local(value, exponent):
+        return jax.lax.psum(jnp.sum(scan.scaled_exp(value, exponent)), "data")
+
+    split = jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec()),
+                          out_specs=PartitionSpec(), check_vma=True)
+    with jax.set_mesh(mesh):
+        found = jax.grad(split, argnums=1)(value, shared)
+    expected = np.asarray(np.sum(np.asarray(values)) * np.exp(exponent), dtype)
+    assert found.dtype == dtype, found
+    np.testing.assert_array_equal(np.asarray(found, np.float64), np.asarray(expected, np.float64))
+
+
+@pytest.mark.parametrize("edge", sorted(EDGES))
 def test_a_convs_bias_holds_every_order(edge):
     """A conv's bias spread over its rows and tokens (`short_conv.conv_bias`: reverse mode one compensated
     sum, row 1710): every order runs, finite wherever float64 is a normal float32 and the plain broadcast

@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import itertools
 import math
+import numbers
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
@@ -60,7 +62,7 @@ from egglog.bindings import EggSmolError
 
 from dew import _cache
 from dew._cache import ALGEBRA, unintercepted
-from dew.algebra import cost, derive_moments, extract, program, rules, terms
+from dew.algebra import cost, derive_moments, extract, program, rules, stored, terms
 from dew.algebra.cost import Work
 from dew.algebra.derive_moments import (
     MOMENT_SSA,
@@ -866,6 +868,35 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     with jax.disable_jit():
         closed = jax.make_jaxpr(unintercepted(inlined(named, ranges=ranges)))(*avals)
     region = terms.region(closed, ranges)
+    admitted = rules.admitted(accurate)
+    # Stored across processes, keyed by everything the forms read (`stored.key`), its sets by their names
+    # where the source registers them all (`rules.sourced`). The extractor's oracle checks the extraction
+    # itself: it derives, and reads and writes no store. Both derive from the one live set of rules.
+    if ALGEBRA.value.checked:
+        return _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
+    name = None if not rules.sourced(admitted) else stored.key(closed, [sets.name for sets in admitted], (
+        names, tuple(sorted(walked_axes.items())),
+        tuple((n, tuple(shapes[n][0]), np.dtype(shapes[n][1]).name) for n in names), accurate,
+        (saturation.growth, saturation.depth), declaration.walked, declaration.exponent,
+        tuple(sorted(declaration.ranges.items())), declaration.exact, declaration.rescale is None, context()))
+    params_from, literals_from, shapes_from = len(region.params), len(region.literals), len(region.shapes)
+    if name is not None and (made := stored.loaded(name, region, functools.partial(
+            _assembled, region=region, closed=closed,
+            walked_leaves=_walked_leaves(closed, names, walked_axes), began=began))) is not None:
+        return made
+    made = _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
+    if name is None:
+        kernel_report.record_stored("unstorable")
+    else:
+        stored.stored(name, made.region, params_from, literals_from, shapes_from, _encoded(made))
+    return made
+
+
+def _derived_afresh(declaration: Reduction, names: tuple[str, ...], walked_axes: Mapping[str, int], closed,
+                    region: terms.Region, admitted: tuple[rules.Rules, ...], saturation: program.Saturation,
+                    began: float) -> _Forms:
+    """The forms of `region`, `declaration` traced (`closed`) at one tile, derived by saturation and
+    extraction (`_derived`'s, where no store holds them)."""
     graph = EGraph()
     _register(graph, region, closed, names, walked_axes)
     walking = WALKING if declaration.rescale is None else WALKING_SCALED
@@ -901,7 +932,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     facts = seq(rules.FACTS.saturate(), SHAPES.saturate(), walking.saturate(), FLOORED.saturate())
     decoupled = DECOUPLED if declaration.rescale is None else DECOUPLED_RESCALED
     _decoupled_through(graph, region, facts, decoupled)
-    saturated = program.saturate(graph, region, (*rules.admitted(accurate), decoupled),
+    saturated = program.saturate(graph, region, (*admitted, decoupled),
                                  saturation, facts)
     # Each step a rule wrote as a mainloop's accumulator or its own addition takes it, its parts extracted
     # with the forms.
@@ -943,17 +974,111 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     steps, merges, finished = chosen[:count], chosen[count:2 * count], iter(chosen[2 * count:])
     finishes = tuple(None if term is None or is_along else next(finished)
                      for term, is_along in zip(outputs, along, strict=True))
-    first = len(closed.consts)
-    walked_leaves = frozenset(first + index for index, name in enumerate(names) if name in walked_axes)
-    for form in finishes:
-        if form is not None and _reads_leaves(form) & walked_leaves:
-            raise Refused("an output reads a walked operand outside every walked reduction")
-    for form in merges:
-        if _reads_leaves(form) & walked_leaves:
-            raise Refused("a merge reads a walked operand: no tile is there to read")
+    walked_leaves = _walked_leaves(closed, names, walked_axes)
+    if (unread := _unread(finishes, merges, walked_leaves)) is not None:
+        raise Refused(unread)
     return _Forms(region, reductions, tuple(steps), tuple(merges), finishes, tuple(along), tuple(outputs),
                   walked_leaves, tuple(closed.consts), report, (*accumulated, *extra_pad),
                   (*added, *extra_pad), (*merged, *extra_pad), floors, anchors, scales)
+
+
+def _walked_leaves(closed, names: tuple[str, ...], walked_axes: Mapping[str, int]) -> frozenset[int]:
+    """The region's leaves the walked operands occupy (`_Forms.walked_leaves`), past its captured
+    constants."""
+    first = len(closed.consts)
+    return frozenset(first + index for index, name in enumerate(names) if name in walked_axes)
+
+
+def _unread(finishes: Sequence[Term | None], merges: Sequence[Term],
+            walked_leaves: frozenset[int]) -> str | None:
+    """Why a finish or a merge reads a walked operand, which no tile holds there; None where none does."""
+    if any(form is not None and _reads_leaves(form) & walked_leaves for form in finishes):
+        return "an output reads a walked operand outside every walked reduction"
+    if any(_reads_leaves(form) & walked_leaves for form in merges):
+        return "a merge reads a walked operand: no tile is there to read"
+    return None
+
+
+_TERMS = ("reductions", "steps", "merges", "anchors", "scales")
+"""The forms' fields of terms (`_Forms`), each a tuple of them."""
+_PARTS = ("accumulated", "added", "merged")
+"""The forms' fields of a reduction's mainloop parts (`_Forms`), each a tuple of a part's terms or None."""
+
+
+def _encoded(made: _Forms) -> Callable[..., Mapping[str, object]]:
+    """`made`'s forms as the store writes them (`stored.stored`), given its codec: each term by `term` (its
+    index in the entry's table), a term or None by `maybe`, a value by `value`; its region traced again on
+    reading."""
+    def encoded(*, term: Callable, maybe: Callable, value: Callable) -> Mapping[str, object]:
+        report = made.report
+        return {**{field: [term(form) for form in getattr(made, field)] for field in _TERMS},
+                "finishes": [maybe(form) for form in made.finishes],
+                **{field: [None if part is None else [maybe(form) for form in part]
+                           for part in getattr(made, field)] for field in _PARTS},
+                "floors": [value(floor) for floor in made.floors],
+                "mapped": list(made.mapped),
+                "report": [report.equations, list(report.admitted), sorted(report.fired.items()),
+                           list(report.limits), report.iterations, report.nodes, report.limited,
+                           value(report.before), value(report.after)]}
+    return encoded
+
+
+def _assembled(record: Mapping, *, decoded: stored._Decoded, value: Callable, region: terms.Region, closed,
+               walked_leaves: frozenset[int], began: float) -> _Forms:
+    """The forms a stored `record` holds (`stored.loaded`) over `region`, `closed`'s region (its appended
+    parameters, literals and terms already decoded beside it): each form by its term's index, reading only
+    the states its form reads (`decoded`'s sides: a region's term none, a step's, a step's parts' and a
+    finish's the walk's own, a merge's and its factors' either walk's), each count, part's arity and report's
+    field the forms state, a finish for each output a tile's walk finishes (none for a literal or a mapped
+    one) and no finish or merge reading a walked operand (`_unread`, of `walked_leaves`), as a derivation
+    holds them (`ValueError` otherwise); its report the derivation's as stored, reused
+    (`AlgebraReport.reused`), its seconds the reading's."""
+    count = len(record["reductions"]) + len(record["anchors"]) + 2 * len(record["scales"])
+    outputs = len(region.outputs)
+    counts = (len(record["steps"]), len(record["merges"]), *(len(record[field]) for field in _PARTS))
+    if (counts != (count,) * 5 or (len(record["finishes"]), len(record["mapped"])) != (outputs, outputs)
+            or len(record["floors"]) != len(record["reductions"])
+            or not all(isinstance(mapped, bool) and not (mapped and output is None)
+                       for mapped, output in zip(record["mapped"], region.outputs, strict=True))):
+        raise ValueError("an entry whose forms' counts are not its region's")
+    equations, admitted, fired, limits, iterations, nodes, limited, before, after = record["report"]
+    if not (all(stored.integral(number) for number in (equations, iterations, nodes, *limits))
+            and len(limits) == 2 and isinstance(limited, bool)
+            and all(isinstance(name, str) for name in admitted)
+            and all(isinstance(name, str) and stored.integral(number) for name, number in fired)):
+        raise ValueError("an entry whose report is not a derivation's")
+    floors = tuple(map(value, record["floors"]))
+    before, after = value(before), value(after)
+    if not all(number is None or isinstance(number, numbers.Real) for number in (*floors, before, after)):
+        raise ValueError("an entry whose floors or costs are not numbers")
+    report = program.AlgebraReport(equations, tuple(admitted), dict(fired), tuple(limits), iterations, nodes,
+                                   limited, before, after, time.perf_counter() - began, reused=True)
+
+    def parts(field: str, sides: tuple[int, ...], arity: int, optional: frozenset[int]) -> tuple:
+        # Each part of a reduction's, None or `arity` terms, the ones `optional` places may be None.
+        made = []
+        for part in record[field]:
+            if part is not None and len(part) != arity:
+                raise ValueError(f"a {field} part of {len(part)} terms, not {arity}")
+            made.append(None if part is None else tuple(
+                decoded.maybe(form, sides=sides) if at in optional else decoded(form, sides=sides)
+                for at, form in enumerate(part)))
+        return tuple(made)
+
+    held = {field: tuple(decoded(form, sides=()) for form in record[field])
+            for field in ("reductions", "anchors", "scales")}
+    merges = tuple(decoded(form, sides=(0, 1)) for form in record["merges"])
+    finishes = tuple(decoded.maybe(form, sides=(0,)) for form in record["finishes"])
+    if any((form is None) != (output is None or mapped)
+           for form, output, mapped in zip(finishes, region.outputs, record["mapped"], strict=True)):
+        raise ValueError("an entry whose finishes are not its outputs'")
+    if (unread := _unread(finishes, merges, walked_leaves)) is not None:
+        raise ValueError(unread)
+    return _Forms(region, held["reductions"], tuple(decoded(form, sides=(0,)) for form in record["steps"]),
+                  merges, finishes, tuple(record["mapped"]), tuple(region.outputs), walked_leaves,
+                  tuple(closed.consts), report, parts("accumulated", (0,), 3, frozenset({0})),
+                  parts("added", (0,), 3, frozenset()), parts("merged", (0, 1), 2, frozenset()),
+                  floors, held["anchors"], held["scales"])
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:

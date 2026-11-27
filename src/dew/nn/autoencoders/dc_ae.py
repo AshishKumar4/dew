@@ -21,6 +21,7 @@ from flax.typing import Dtype
 
 from dew.batch import Variables
 from dew.nn.dense import Dense
+from dew.nn.kernels.xla_products import committed_context
 
 from ..activations import gated_product, silu
 from ..conv import Conv
@@ -144,8 +145,10 @@ def linear_attention(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.
         return attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)
 
     if sums_in_float64(value, key):
-        # Wide only in a CPU's lowering: an accelerator's contractions still sum in float32, grouped.
-        return jax.lax.platform_dependent(query, key, value, cpu=whole, default=_grouped)
+        # Wide only in a CPU's lowering: an accelerator's contractions still sum in float32, grouped; called
+        # eagerly, the platform its committed operands lie on, not the default device's.
+        with committed_context((query, key, value)):
+            return jax.lax.platform_dependent(query, key, value, cpu=whole, default=_grouped)
     return _grouped(query, key, value)
 
 

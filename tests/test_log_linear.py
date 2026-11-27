@@ -329,6 +329,58 @@ def test_a_bf16_levels_memory_cut_across_its_half_joins_as_zero():
     assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
 
 
+@pytest.mark.parametrize(("length", "level", "decayed", "query", "key", "weight"), [
+    (68, 7, (64, 68), 2.0 ** 70, 2.0 ** 70, 1.0), (321, 9, (256, 260), 2.0 ** 127, 1.0, 2.0)],
+    ids=["within its chunk", "before its chunk"])
+def test_a_bf16_levels_read_whose_decay_keeps_no_finite_value_reads_zero(length, level, decayed, query, key,
+                                                                         weight):
+    """A bf16 level's read at the last token of token 0's key against a value of 1, through four live
+    decays of -80 (none vanished alone) within the reader's chunk or before it in its half, reads zero
+    and every gradient stays finite, a decay no finite fp32 survives discarding the read as a vanished one
+    does (`log_linear._dropped`): within its chunk an overflowed read (2^70 by 2^70) times `e^-320` was
+    NaN, and before it a reader of 2^127 weighed 2, overflowed, times its emptied memory (train 1379's
+    review of 515fa30ec, K-F1, and its head review)."""
+    weights = jnp.zeros((1, length, 1, levels(length)), jnp.float32).at[0, length - 1, 0, level].set(weight)
+    g = jnp.zeros((1, length, 1), jnp.float32).at[0, decayed[0]:decayed[1]].set(-80.0)
+
+    def call(q, k, decay):
+        return log_linear_attention(q, k, _tokens(length, [0], [1.0]), decay, weights, scale=1.0)
+
+    out, pull = jax.vjp(call, _tokens(length, [length - 1], [query]), _tokens(length, [0], [key]), g)
+    np.testing.assert_array_equal(np.asarray(out, np.float32), np.zeros(out.shape, np.float32))
+    assert all(np.isfinite(np.asarray(x, np.float32)).all() for x in pull(jnp.ones_like(out)))
+
+
+@pytest.mark.parametrize(("query", "key", "cotangent", "decay"), [
+    (1.0, 2.0 ** 127, 2.0 ** 127, -90.0), (1.0, 1.0, 2.0 ** 120, -120.0),
+    (2.0 ** -60, 2.0 ** -60, 2.0 ** 120, -10.0), (1.0, 2.0 ** -120, 2.0 ** 100, -25.0),
+    (1.0, 2.0 ** 127, 2.0 ** 127, -200.0)])
+def test_a_bf16_levels_decay_gradient_is_in_its_binade(query, key, cotangent, decay):
+    """A bf16 level-7 read (67 tokens) at token 66 of token 0's key against a value of 1, decayed by `decay`
+    over tokens 64 to 66 (a third each, every one live), under `cotangent` there: each of those decays'
+    gradients `cotangent * query * key * exp(decay)`, in float64's binade, the decay's derivative the
+    cotangent and the read decayed together (`scan.scaled_exp`'s declared transpose): `2^254 e^-90`
+    (2.4e37), where autodiff through the decay's factors overflowed (train 1379's review K-F2); `2^120
+    e^-120` (1.0e-16) and `2^-20 e^-25` (1.3e-17, a key of 2^-120 under 2^100), where the cotangent times the
+    decayed read read zero, that read underflowed (train 1383's reviews); `e^-10` of 2^-120 under 2^120; and
+    `2^254 e^-200` (4.0e-11) of a finite read of 2^127 its decay rounds to zero, which a mask of every read
+    under a decay no finite fp32 survives zeroed (train 1398's review of 9b6609de0)."""
+    weights = jnp.zeros((1, 67, 1, levels(67)), jnp.float32).at[0, 66, 0, 7].set(1.0)
+    g = jnp.zeros((1, 67, 1), jnp.float32).at[0, 64:67].set(decay / 3)
+
+    def call(decays):
+        return log_linear_attention(_tokens(67, [66], [query]), _tokens(67, [0], [key]),
+                                    _tokens(67, [0], [1.0]), decays, weights, scale=1.0)
+
+    out, pull = jax.vjp(call, g)
+    (dg,) = pull(_tokens(67, [66], [cotangent]))
+    found = np.asarray(dg, np.float64)[0, 64:67, 0]
+    whole = 3 * float(np.float32(decay / 3))
+    assert np.isfinite(np.asarray(out, np.float32)).all(), out
+    assert np.isfinite(found).all() and (found != 0).all(), dg
+    assert (np.frexp(found)[1] == np.frexp(cotangent * query * key * np.exp(whole))[1]).all(), (found, dg)
+
+
 def test_a_bf16_calls_levels_take_the_recurrence_its_kernel_choice_names():
     """An unpacked bf16 call within `generation.chosen` naming the recurrence's kernel (`gated_delta_rule`,
     as tools/benchmark_recurrence.py's `mosaic` and `xla` arms do) runs each level above a block on that

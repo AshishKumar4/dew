@@ -65,6 +65,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
+from dew.interop.quantized_weights import QuantizedWeight, decoded_weights, weight_records
 from dew.interop.release import load_settings, with_rounding
 from dew.interop.routes import (
     DecoderRoute,
@@ -143,23 +144,6 @@ class Placing(Protocol):
                  axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
 
 
-def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[tuple[str, str], ...],
-                             quantized: tuple[str, ...]) -> None:
-    """Share only aliases verified on original values before codec narrowing.
-
-    A component may mix quantized and unquantized copies, or several MTP
-    copies of a tied head. Each group of spellings the checked pairs join
-    (`alias_groups`) reuses its quantized member's decoded storage: no
-    second cast or weight copy.
-    """
-    for group in decoders.alias_groups(aliases):
-        representative = next((name for name in quantized if name in group), None)
-        if representative is not None:
-            value = tensors[representative]
-            for name in group:
-                tensors[name] = value
-
-
 def on_default_device(variables: Variables, *, cast: Callable[[KeyPath, Leaf], Leaf] | None = None
                       ) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
@@ -217,27 +201,16 @@ class Pretrained:
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
     """The encoder `export` writes through, installed by the route that built the model, or None
     for `weight_layouts`."""
-    quantized_tensors: tuple[str, ...] = ()
+    quantized: Mapping[str, QuantizedWeight] = field(default_factory=dict, repr=False)
+    """Each weight a quantized source stored quantized, by its name, as the load holds it
+    (`QuantizedWeight`): the one record its views (`quantized_tensors`, `quantized_specs`,
+    `quantization_grid`, `quantized_dtypes`) read, and an export writes it back from."""
     quantized_scale_dtype: str | None = None
     """The dtype a quantized source stored its scales in, when its format leaves that to the checkpoint.
 
     DeepSeek-V4's `.scale`, for example, is float8_e8m0fnu, and float32 in the
     Base releases. `save` writes the scales back in this dtype.
     """
-    quantization_grid: Mapping[str, unread.Stored] = field(default_factory=dict, repr=False)
-    """The scales and zeros an integer format (AWQ, GPTQ) encodes a saved weight against.
-
-    They are kept as the source stored them.
-    """
-    quantized_specs: Mapping[str, jax.ShapeDtypeStruct] = field(default_factory=dict, repr=False)
-    """The stored tensors of each of `quantized_tensors` as the source's headers state them: the tensors
-    an export writes the weight back as, known before any is encoded (`SourceQuantization.requantize`)."""
-    quantized_dtypes: Mapping[str, str | None] = field(default_factory=dict, repr=False)
-    """How the load holds each of `quantized_tensors`, every one recorded: the dtype it decoded the weight
-    into (its param dtype as resolved), or None for a bank it serves packed, undecoded, which an export
-    decodes exactly in float32 (`quantization.packed_values`). An export tells a value left as loaded
-    from one its training changed against it, whatever dtype its tree hands the value in
-    (`codecs.source_quantization`'s `loaded`)."""
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was requested.
 
@@ -321,6 +294,26 @@ class Pretrained:
             return task
         return replace(task, precision=task.precision if self.numerics is None else self.numerics,
                        kernels=self.kernels or task.kernels)
+
+    @property
+    def quantized_tensors(self) -> tuple[str, ...]:
+        """The names of the weights the source stored quantized (`quantized`)."""
+        return tuple(sorted(self.quantized))
+
+    @property
+    def quantized_specs(self) -> Mapping[str, jax.ShapeDtypeStruct]:
+        """Every quantized weight's stored tensors as the source's headers state them (`QuantizedWeight`)."""
+        return {part: spec for weight in self.quantized.values() for part, spec in weight.stored.items()}
+
+    @property
+    def quantization_grid(self) -> Mapping[str, unread.Stored]:
+        """The scales and zeros every quantized weight encodes against, as the source stored them."""
+        return {part: held for weight in self.quantized.values() for part, held in weight.grid.items()}
+
+    @property
+    def quantized_dtypes(self) -> Mapping[str, str | None]:
+        """How the load holds each quantized weight (`QuantizedWeight.decoded`)."""
+        return {name: weight.decoded for name, weight in self.quantized.items()}
 
     def packed(self) -> Self:
         """A serving view with packed projections, preserving this bundle's arrays for reuse."""
@@ -835,7 +828,7 @@ class Pretrained:
         recorded no tensors to write back in it."""
         quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype,
                                            grid=self.quantization_grid, loaded=self.quantized_dtypes)
-        if quantization is not None and not self.quantized_tensors:
+        if quantization is not None and not self.quantized:
             raise ValueError(
                 "this source's config declares a quantization_config and the loader recorded "
                 "no quantized tensors to write back in it")
@@ -1741,39 +1734,6 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
     return config, None
 
 
-def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
-             media: bool) -> tuple[Mapping[str, unread.Stored], tuple[str, ...], str | None,
-                                   dict[str, unread.Stored], decoders.Checked,
-                                   Mapping[str, jax.ShapeDtypeStruct], Mapping[str, str | None]]:
-    """The tensors with a quantized source's weights decoded, and what `save`
-    needs to write them back: the quantized names, the scales' dtype and the
-    integer formats' grid; the spellings checked equal before a narrowing
-    cast, which the readers then take as equal (`decoders.Checked`); and the
-    stored tensors of each quantized weight as their headers state them, which
-    an export writes it back as (`SourceQuantization.requantize`), and the
-    dtype each quantized weight was decoded into (`Pretrained.quantized_dtypes`).
-    `media` is whether the loader reads the source as a media wrapper
-    (`media_wrapper`)."""
-    quantization = source_quantization(config)
-    if quantization is None:
-        return tensors, (), None, {}, decoders.NOTHING_CHECKED, {}, {}
-    quantized_tensors, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
-    specs = tensor_specs(tensors)
-    stored = {part: specs[part] for name in quantized_tensors for part in (name, *quantization.partners(name))
-              if part in specs}
-    grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
-            if part in tensors}
-    aliases: tuple[tuple[str, str], ...] = ()
-    if param_dtype != "float32":
-        aliases = decoders.validate_source_aliases(
-            quantization.tensor_names(tensors), partial(quantization.read, tensors, set(quantized_tensors)),
-            config, media=media)
-    tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
-    decoded = {name: str(np.dtype(tensors[name].dtype)) for name in quantized_tensors}
-    _share_quantized_aliases(tensors, aliases, quantized_tensors)
-    return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases), stored, decoded
-
-
 def _folders(config: Mapping[str, object]) -> tuple[str, ...]:
     """The folders of a bundle whose media read their own config and weights
     (`DecoderFamily.wrapper_folders`); none for any other source."""
@@ -2236,11 +2196,8 @@ class _Translated(NamedTuple):
     quantized source back (`_decoded`)."""
 
     built: _Built
-    quantized_tensors: tuple[str, ...]
+    quantized: Mapping[str, QuantizedWeight]
     scale_dtype: str | None
-    grid: dict[str, unread.Stored]
-    stored: Mapping[str, jax.ShapeDtypeStruct]
-    decoded: Mapping[str, str | None]
 
 
 def _translated(config: Mapping[str, object],
@@ -2260,21 +2217,17 @@ def _translated(config: Mapping[str, object],
         # are replaced before any is read (`quantized_loads.with_banks`), the rest read below where the
         # load places none.
         streaming = streaming or bool(banks)
-    tensors, quantized_tensors, scale_dtype, grid, checked, stored, decoded = _decoded(
+    tensors, quantized, scale_dtype, checked = decoded_weights(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     if banks:
-        # The banks are the source's quantized weights, written back as stored, on their codec's grid.
+        # The banks are the source's quantized weights, written back as stored, on their codec's grid,
+        # served packed, undecoded.
         codec = source_quantization(config)
         assert codec is not None, "packed banks are a quantized source's"
-        specs = tensor_specs(given)
-        quantized_tensors = tuple(sorted((*quantized_tensors, *banks)))
-        # Served packed, undecoded: each recorded as such beside the decoded weights.
-        decoded = {**decoded, **dict.fromkeys(banks)}
-        stored = {**stored, **{part: specs[part] for name in banks
-                               for part in (name, *codec.partners(name)) if part in specs}}
-        grid = {**grid, **{part: given[part] for name in banks for part in codec.grid(name) if part in given}}
+        quantized = {**quantized, **weight_records(codec, given, banks, None)}
         scale_dtype = codec.scale_dtype(given)
+    grid = {part: held for weight in quantized.values() for part, held in weight.grid.items()}
     match route:
         case DiffusionGemmaRoute():
             from dew.interop import diffusion_gemma
@@ -2309,8 +2262,7 @@ def _translated(config: Mapping[str, object],
                                  variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
     # A model the source's input scales changed holds none of the checked draw's axes: a bundle draws them.
     axes = built.axes if model is built.model else None
-    return _Translated(built._replace(model=model, variables=variables, axes=axes), quantized_tensors,
-                       scale_dtype, grid, stored, decoded)
+    return _Translated(built._replace(model=model, variables=variables, axes=axes), quantized, scale_dtype)
 
 
 def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
@@ -2470,7 +2422,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                              max_seq_len=max_seq_len, streaming=streaming,
                              packed_weights=packed_weights)
     model, variables, record, built, layouts, retained, export_adapter, drawn = translated.built
-    quantized_tensors, scale_dtype, grid, stored, decoded = translated[1:]
+    quantized, scale_dtype = translated[1:]
     resolved_commit = commit
     if component is None and commit is not None:
         resolved_commit = root.name
@@ -2489,9 +2441,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         return kind(model, placed(variables, axes=axes),
                     processor, config,
                     directory, built, generation_config,
-                    layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                    quantized_scale_dtype=scale_dtype, quantization_grid=grid, quantized_specs=stored,
-                    quantized_dtypes=decoded,
+                    layouts, retained, export_adapter, quantized=quantized, quantized_scale_dtype=scale_dtype,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
