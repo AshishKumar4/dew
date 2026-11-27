@@ -328,12 +328,13 @@ _SAVED: contextvars.ContextVar[bool] = contextvars.ContextVar("reading_saved", d
 
 
 @contextlib.contextmanager
-def reading_saved() -> Iterator[None]:
+def reading_saved(*, saved: bool = True) -> Iterator[None]:
     """Within the block, records are read as saved ones (`saved_fields`): a run's (`RunConfig._from_saved`,
     as `RunConfig.load` and a resume's `_saved_as` read one), whose classes may have lost fields since it was
-    written. Outside it, a record's every
-    field is its class's or refused, as any live configuration's."""
-    token = _SAVED.set(True)
+    written; with `saved` False, as live ones (`RunConfig.read`, within a saved one's reading too), the
+    enclosing reading's mode back past the block. Outside it, a record's every field is its class's or
+    refused, as any live configuration's."""
+    token = _SAVED.set(saved)
     try:
         yield
     finally:
