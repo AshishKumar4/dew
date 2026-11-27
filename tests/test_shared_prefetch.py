@@ -16,12 +16,13 @@ INTERPRETED = plgpu.InterpretGPUParams()
 ROWS, WIDTH, STEPS, CONSUMERS = 64, 64, 4, 2
 
 
-def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPRETED):
+def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPRETED, bounds=jnp.int32):
     """Two consumers sharing one cp.async pipeline walk `segments` of `x`'s `ROWS`-row steps, stated common,
     their bounds traced: each step adds its tile to an fp32 sum, its first row read ahead by the pipeline's
     prefetch; compiled (not `interpret`), its tile's square through the family's fragments
     (`Family.products_across`, `first_fragments`: mma.sync, which the interpreter runs none of). Returns
-    each consumer's sum and the prefetches each ran (`[CONSUMERS]`, counted in global memory as they run)."""
+    each consumer's sum and the prefetches each ran (`[CONSUMERS]`, counted in global memory as they run).
+    Its segments' bounds are `bounds` (an int64 segment's under x64)."""
     family = bundles.named("mma.sync", jnp.bfloat16, None)
 
     def body(x_gmem, sums_gmem, counts_gmem):
@@ -30,7 +31,7 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPR
         counts_gmem[wg] = jnp.int32(0)
 
         def walked(*, streams):
-            first = jnp.int32(0)
+            first = jnp.asarray(0, bounds)
             views = {'x': (x_gmem, lambda j: (j, 0))}
             feed = family.opened(streams, views)
 
@@ -69,15 +70,35 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPR
 
 
 @INTERPRETS
+def test_a_walk_of_int64_bounds_walks_as_one_of_int32():
+    """Interpreted under x64: the same empty, one-step and three-step segments, their bounds int64, prefetch
+    and sum as int32 ones do: the walk's prologue counts its trips in their own dtype."""
+    x = jnp.asarray(np.arange(STEPS * ROWS * WIDTH).reshape(STEPS * ROWS, WIDTH) % 7, jnp.bfloat16)
+    with jax.enable_x64(new_val=True):
+        walked = _prefetched_walk(x, ((0, 0), (0, 1), (1, STEPS)), bounds=jnp.int64)
+        sums, counts = jax.block_until_ready(walked)
+    np.testing.assert_array_equal(np.asarray(counts), [1 + 3] * CONSUMERS)
+    expected = np.asarray(x, np.float32).reshape(STEPS, ROWS, WIDTH).sum(axis=0)
+    for summed in np.asarray(sums):
+        np.testing.assert_array_equal(summed, expected)
+
+
+@INTERPRETS
 def test_a_traced_empty_common_segment_prefetches_nothing():
     """Interpreted: two consumers' common segments, their bounds traced, of no step, one step and three steps
     each prefetch once a step: the first step's as they start, each later one's at the step before's
     boundary, none past the last step (whose slot no copy fills), so the one-step and three-step segments
     prefetch 1 and 3 times; the empty one, its pipeline run over no step, none (Dew's fork at post131, row
     12695: it had prefetched its first slot, which no copy filled). Each consumer's sum is every walked
-    step's tile."""
+    step's tile, and no two consumers' copies or reads race (one consumer stores each slot, both meeting
+    before they read it)."""
+    from jax._src.pallas.mosaic_gpu.interpret import interpret_pallas_call as interpreter
+
     x = jnp.asarray(np.arange(STEPS * ROWS * WIDTH).reshape(STEPS * ROWS, WIDTH) % 7, jnp.bfloat16)
-    sums, counts = _prefetched_walk(x, ((0, 0), (0, 1), (1, STEPS)))
+    # Raced copies are recorded, not raised (`on_race="warn"`), and read once the kernel has run.
+    races = plgpu.InterpretGPUParams(detect_races=True, on_race="warn")
+    sums, counts = jax.block_until_ready(_prefetched_walk(x, ((0, 0), (0, 1), (1, STEPS)), interpret=races))
+    assert not interpreter.get_races().races_found
     np.testing.assert_array_equal(np.asarray(counts), [1 + 3] * CONSUMERS)
     expected = np.asarray(x, np.float32).reshape(STEPS, ROWS, WIDTH).sum(axis=0)
     for summed in np.asarray(sums):

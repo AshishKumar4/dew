@@ -866,3 +866,43 @@ def test_an_asynchronous_landing_aliasing_an_implicit_wait_is_caught():
     with pytest.raises(Violation) as found:
         explore([program], {"B": 1})
     assert found.value.kind == "aliased"
+
+
+@pytest.mark.parametrize("gathered", [True, False], ids=["gathered", "contiguous"])
+@pytest.mark.parametrize(("stages", "trips"), [(3, 1), (3, 2), (1, 2)],
+                         ids=["deep-short", "deep-two", "one-slot"])
+def test_a_cp_async_walk_copies_its_live_trips_and_reads_each_landed(gathered, stages, trips):
+    """An A100's cp.async walk (`mosaic_sm80._streamed`) of `trips` steps known only as it runs (its length
+    read from global memory), `stages` slots deep (fewer trips than slots, or one slot), its rows gathered
+    through a table (`_Gathered`, a group committed every step) or its blocks whole (`_Contiguous`),
+    interpreted as one warpgroup's program (`programs`): it copies each live trip's tile once and nothing
+    for a fill past its last trip, reads each slot only once its copy has landed, and ends its scope with no
+    copy pending into it (`cp_async_violations`)."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    height, width = 16, 64
+
+    def body(count_gmem, source_gmem, table_gmem, out_gmem):
+        pipeline = mosaic_sm80.Pipeline({"a": ((height, width), jnp.bfloat16)}, stages,
+                                        gathered=("a",) if gathered else ())
+        if gathered:
+            rows = {"a": (source_gmem, lambda step: rings.Rows(table_gmem, step * height, (0,), 1))}
+            copier = mosaic_sm80._Gathered(rows, lambda trip: trip)
+        else:
+            copier = mosaic_sm80._Contiguous({"a": (source_gmem, lambda trip: (trip, 0))})
+
+        def step(trip, slots, carried):
+            del trip
+            return carried + slots["a"][0, 0].astype(jnp.float32)
+
+        out_gmem[0] = mosaic_sm80._streamed(pipeline, copier, count_gmem[0], step, jnp.float32(0),
+                                            interpret=False)
+
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((1,), jnp.float32))
+    (events,), _ = programs(kernel, jnp.zeros((1,), jnp.int32), jnp.zeros((4 * height, width), jnp.bfloat16),
+                            jnp.zeros((4 * height,), jnp.int32), threads=1,
+                            known=lambda index, aval: np.asarray([trips], np.int32) if index == 0 else None)
+    assert len([event for event in events if event.kind == "cp_copy"]) == trips
+    assert ring_protocol.cp_async_violations(events) == []

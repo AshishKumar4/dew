@@ -754,7 +754,7 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
     and pages of 16, 4 and 1 keys, the docs' (docs/concepts/inference.md), several to a key tile, its rows
     gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772): an
     H100's by its loading warpgroup's ring, an A100's by its one warpgroup's cp.async copies in its
-    pipeline's groups (`mosaic_sm80._gathered_walk`). Heads 64 wide, and an H100's 128 wide over 16-key
+    pipeline's groups (`mosaic_sm80._Gathered`). Heads 64 wide, and an H100's 128 wide over 16-key
     pages, whose interpreted ring copies a key's row whole into its slot staged where layout inference lays
     it out, its load barrier awaiting those copies (`rings.piece_copies`; counted at a 128-byte swizzle's two
     a row, it awaited arrivals no copy made, row 13656)."""
