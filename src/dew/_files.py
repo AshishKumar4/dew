@@ -438,20 +438,24 @@ def _keeps_folder_group(parent: Path) -> bool | None:
     egid = os.getegid()
     others = sorted(set(os.getgroups()) - {egid}) or ([egid + 1] if os.geteuid() == 0 else [])
     probe = _beside(parent / "probe", ".group")
+    before = parent.stat()
     probe.mkdir(0o700)
     try:
-        held, made = parent.stat(), probe.stat()
-        if not held.st_mode & stat.S_ISGID and held.st_gid != egid:
-            # Made in a folder that is not setgid, of another group than the maker's: its group answers.
-            return made.st_gid == held.st_gid
+        made, after = probe.stat(), parent.stat()
+        if (not made.st_mode & stat.S_ISGID and before.st_gid == after.st_gid != egid
+                and not (before.st_mode | after.st_mode) & stat.S_ISGID):
+            # Made in a folder that was not setgid throughout, of another group than the maker's: its
+            # group answers.
+            return made.st_gid == after.st_gid
         probe.chmod(0o700)
         if made.st_gid == egid:
             if not others:
                 return None
             try:
                 os.chown(probe, -1, others[0])
-            except PermissionError:
-                # A maker whose rights give no other group (root without CAP_CHOWN): no answer read.
+            except OSError:
+                # A maker whose rights give no other group (root without CAP_CHOWN, or in a namespace
+                # mapping none): no answer read.
                 return None
         inner = probe / "inner"
         inner.mkdir()
