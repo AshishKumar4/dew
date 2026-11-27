@@ -1845,7 +1845,7 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
                                      default=decision(tmp_path, drawn=False))
     with pytest.raises(Lowered) as lowered:
         lowering.lower(LowerFor("sm90"))
-    assert program_digest(lowered.value.lowered) == AheadOfTime.load(path).program
+    assert program_digest(lowered.value.lowered, lowered.value.options) == AheadOfTime.load(path).program
 
 
 def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):

@@ -452,13 +452,93 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
     for weight in (0.5, 2.0):
         seen[weight], weighted_main, weighted_ce = gradients(
             LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=weight)))
-        assert weighted_ce == ce and any(leaf.any() for leaf in seen[weight])
+        # Every leaf of the branch takes the term's gradient, its queries' projection and its keys' both.
+        assert weighted_ce == ce and all(leaf.any() for leaf in seen[weight])
         for got, plain_leaf in zip(weighted_main, main, strict=True):
             np.testing.assert_array_equal(got, plain_leaf)
     for heavy, light in zip(seen[2.0], seen[0.5], strict=True):
         np.testing.assert_array_equal(heavy, 4 * light)
     with pytest.raises(ValueError):
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup"))
+    # Through a configured run's step: one update moves the queries' and the keys' projections both.
+    trainer = Trainer(LMObjective(model, SEQ, indexer=IndexerTraining("sparse", weight=1.0)), optax.sgd(1.0),
+                      key=jax.random.key(0))
+    initial = trainer.stored(trainer.place()[0])
+    state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None), steps=1)
+
+    def projections(variables) -> dict[str, np.ndarray]:
+        return {jax.tree_util.keystr(path): np.asarray(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"]) if branch(path)}
+    before, after = projections(initial.variables), projections(state.variables)
+    assert all(any(f"['{name}']" in path for path in before) for name in ("wq", "wk"))
+    assert all((after[name] != before[name]).any() for name in before)
+
+
+def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tmp_path, monkeypatch):
+    """An MSA decoder refuses generation (`generation_refusal`), so its objective's preview cannot sample
+    (`preview_refusal`): a fit asked to preview it is refused before it starts, and a configured run that
+    would preview by default at its validation, a tracker's, validates without sampling, its run record
+    saying why (`RunConfig.skipped_preview`); the same run of a model that samples records no skip (train
+    1345's review F6)."""
+    import wandb
+    from test_mixers import tiny
+    from test_publish import TrackedRun
+
+    from dew.config.lm import LMRunConfig
+    from dew.config.trainer import TrainerConfig
+    from dew.data import from_iter
+    from dew.objectives.lm import Perplexity
+    from dew.objectives.lm.objective import Samples
+    from dew.registry import mixers
+    from dew.telemetry.records import FitStarted
+    from dew.training.tracker import Wandb
+
+    selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
+    refusing = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    samples = Samples(prompt=[1, 2], max_new_tokens=2)
+
+    def held():
+        rng = np.random.default_rng(1)
+        yield from ({"text": row} for row in rng.integers(0, VOCAB, size=(16, SEQ + 1)).astype(np.int32))
+
+    def validation():
+        return {"val": from_iter(held, identity="held").batch(8).read("streamed").workers(0)}
+
+    def data() -> Loader:
+        return Loader(lambda partition: token_batches(), None, batch=8, records=None)
+
+    tracker = RecordingTracker()
+    trainer = Trainer(LMObjective(refusing, SEQ, samples=samples), optax.sgd(1.0), key=jax.random.key(0),
+                      tracker=tracker)
+    with pytest.raises(ValueError):
+        trainer.fit(data(), steps=1, eval_every=1, metrics=(Perplexity(),), preview=True,
+                    validation=validation())
+    assert not any(isinstance(artifact, FitStarted) for _, artifact in tracker.artifacts)
+    assert not tracker.scalars
+
+    def recorded(model, name: str, *, validated: str) -> dict:
+        """The summary a tracked run records, validating its split by `validation=` ("given"), as its data's
+        own `val` split ("implicit"), or none ("none")."""
+        run = TrackedRun()
+        monkeypatch.setattr(wandb, "init", lambda **_: run)
+        config = LMRunConfig(trainer=TrainerConfig(name=name, steps=1, checkpoint_dir=str(tmp_path),
+                                                   log_every=1, eval_every=1, checkpoint_every=None,
+                                                   checkpoint_final=False,
+                                                   wandb=Wandb("dew", offline=True)))
+        loader = (Loader(lambda partition: token_batches(), lambda partition: iter([next(token_batches())]),
+                         batch=8, records=None)
+                  if validated == "implicit" else data())
+        given = {"validation": validation(), "metrics": (Perplexity(),)} if validated == "given" else {}
+        config.train(LMObjective(model, SEQ, samples=samples), loader, name=name, **given)
+        assert any(any(name.startswith("val/") for name in logged) for logged in run.history) == (
+            validated != "none")
+        return run.configuration["run_record"]["summary"]
+
+    for validated in ("given", "implicit"):
+        assert "skipped" in recorded(refusing, f"refusing-{validated}", validated=validated)["preview"]
+    assert "preview" not in recorded(refusing, "refusing-unvalidated", validated="none")
+    sampling = tiny(dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    assert "preview" not in recorded(sampling, "sampling", validated="given")
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

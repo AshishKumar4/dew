@@ -94,9 +94,10 @@ _log = logging.getLogger(__name__)
 
 
 def validation_suites(dataset: Loader, validation: Mapping[str, Split | EvalSuite] | None,
-                      metrics: Sequence[Metric], eval_every: Cadence) -> dict[str, EvalSuite]:
+                      metrics: Sequence[Metric], eval_every: Cadence | str) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
-    resolved: `dataset.val` alone is the one suite `val`."""
+    resolved (a share of the run's length, `str`, as a suite's `every` takes it): `dataset.val` alone is
+    the one suite `val`."""
     if validation is None:
         if metrics and dataset.val is None:
             # Else the metrics would never be scored, and the run would not say so.

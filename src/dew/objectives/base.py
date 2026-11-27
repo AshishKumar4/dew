@@ -2138,6 +2138,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.build_task(self._pipeline_weights(state, ema), processor=processor)
 
+    def preview_refusal(self) -> str | None:
+        """Why this objective's `preview` cannot sample (a model that refuses generation), None where it can:
+        a preview a run asks for is refused before its first step, one it takes by default is skipped,
+        saying why (`dew.config.RunConfig.train`)."""
+        return None
+
     def preview(self, params: Variables, batch: Batch, step: Step, *,
                 scored: Artifacts | None = None) -> Artifacts | None:
         """Return one event's display artifacts, reusing the first batch's scores when given.
