@@ -1065,9 +1065,11 @@ class RunConfig:
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it: a live record, each of whose fields its class
-        holds (a saved run's is read by `load`)."""
+        holds (a saved run's is read by `load`), even where a saved run's decoder
+        reads it (`_records.reading_saved`)."""
         run_class, fields = cls._named(record, trust)
-        return run_class.from_dict(fields)
+        with _records.reading_saved(False):
+            return run_class.from_dict(fields)
 
     @classmethod
     def _named(cls, record: Mapping[str, object],
