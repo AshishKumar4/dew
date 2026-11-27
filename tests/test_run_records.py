@@ -210,13 +210,12 @@ def test_a_kernels_subclass_that_declares_the_retired_name_keeps_it(tmp_path):
 def test_a_kernels_subclass_field_of_the_retired_name_runs_no_choice():
     """A run whose kernel choices are a subclass declaring `generated` as its own field traces with the
     choices `Kernels` declares alone (`Kernels.named`): its own field is no kernel choice."""
-    from dew import _cache
+    from dew.nn.backbones.decoder_stages import scanned
 
     run = RunConfig(diagnostics=dataclasses.replace(
-        RunConfig().diagnostics, kernels=_GeneratedKernels(attention="xla", generated="kept")))
+        RunConfig().diagnostics, kernels=_GeneratedKernels(layer_scan="plain", generated="kept")))
     with run.traced():
-        choices = dict(_cache.KERNEL_CHOICES.value)
-    assert choices.get("attention") == "xla" and "generated" not in choices
+        assert not scanned()
 
 
 def test_a_run_of_before_its_diagnostics_loses_the_retired_choice_it_moves(tmp_path):
@@ -233,11 +232,12 @@ def test_a_live_run_record_naming_the_retired_choice_is_refused():
     """A run record read live (`RunConfig.read`: a recipe's, as `dew train recipe.py` rebuilds it) holds
     each of its fields: one naming the retired choice is refused, as only a saved run's load reads it
     without (`RunConfig.load`)."""
-    held = json.loads(PUBLISHED.read_text())
-    diagnostics = {**held["fields"]["diagnostics"], "kernels": {"attention": "xla", "generated": "generated"}}
-    record = {**held, "fields": {**held["fields"], "diagnostics": diagnostics}}
+    record = json.loads(json.dumps(RunConfig().record()))
+    assert RunConfig.read(record) == RunConfig()
+    kernels = record["fields"]["diagnostics"]["kernels"]
+    record["fields"]["diagnostics"]["kernels"] = {**kernels, "generated": "generated"}
     with pytest.raises(ValueError):
-        RunConfig.read(earlier_run(record))
+        RunConfig.read(record)
 
 
 @dataclasses.dataclass(frozen=True)
