@@ -598,7 +598,7 @@ def to_record(value, annotation) -> JSON:
         # reader reads one back (a field declaring `functools.partial[...]`, `_bound`; or a member's held
         # argument, read against the member's own annotation, `Bound.read`): any other field's reader builds
         # what such a record names, or refuses a function's, so the partial is refused here.
-        if annotation is not None and not _admits_partial(annotation):
+        if annotation is not None and not _admits_partial(annotation, value):
             raise Unrecordable(f"{value!r} is held where {annotation!r} is declared, whose record reads back "
                                "no bound member: declare the field functools.partial[...]")
         if value.args:
@@ -1211,11 +1211,15 @@ def _flattened(annotation: Annotation) -> Annotation:
     return held
 
 
-def _admits_partial(annotation: Annotation) -> bool:
-    """Whether a field declaring `annotation` reads a bound member back from its class record (`_bound`), as
-    its reader flattens it (`_flattened`)."""
+def _admits_partial(annotation: Annotation, partial: functools.partial) -> bool:
+    """Whether a field declaring `annotation` reads `partial` back from its class record (`_bound`), as its
+    reader flattens it (`_flattened`): a partial its declaration takes, binding a member of the kind it
+    names, as the reader checks (`_of_kind`)."""
     held = _flattened(annotation)
-    return held is functools.partial or typing.get_origin(held) is functools.partial
+    if not (held is functools.partial or typing.get_origin(held) is functools.partial):
+        return False
+    kinds = tuple(each for each in typing.get_args(held) if isinstance(each, type) and each is not Any)
+    return not kinds or _of_kind(partial.func, kinds)
 
 
 def _unread_partial(value: Configured, annotation: Annotation) -> functools.partial | None:
@@ -1223,7 +1227,7 @@ def _unread_partial(value: Configured, annotation: Annotation) -> functools.part
     reads back no bound member (`_admits_partial`), each entry against its own type (`entry_types`; an
     entry of no type it states takes none); None where every one reads back."""
     if isinstance(value, functools.partial):
-        return None if _admits_partial(annotation) else value
+        return None if _admits_partial(annotation, value) else value
     if not isinstance(value, Mapping | list | tuple):
         return None
     try:
