@@ -902,7 +902,7 @@ def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
             lowering_platforms=("cuda",))
 
 
-def _columned_case(grouped: bool, rows: int):
+def _columned_case(rows: int, *, grouped: bool):
     """Rows of a call and an NVFP4 matrix (or a bank of two experts with its group sizes) whose tensor scale
     is one a column (`NvFp4.columned`)."""
     rng = np.random.default_rng(13743)
@@ -929,7 +929,7 @@ def test_a_packed_nvfp4_call_finishes_its_scale_in_its_launch_where_it_runs_unsw
     the subnormals `factored`'s own rounding keeps) no launch takes it either."""
 
     def epilogues(rows, *, interpret):
-        spec, matrix, sizes = _columned_case(grouped, rows)
+        spec, matrix, sizes = _columned_case(rows, grouped=grouped)
         with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), tuning.seen() as launched:
             jax.eval_shape(lambda x: gemm.nvfp4_product(x, matrix, sizes, out_dtype=jnp.float32,
                                                         interpret_on_cpu=interpret), spec)
@@ -952,7 +952,7 @@ def test_a_packed_nvfp4_pin_its_finish_cannot_take_keeps_the_plain_launch(interp
     raised (`gemm._packed_finish`: the optional finish bound as its native launch is, row 13743's review)."""
     from dew.nn.kernels.templates import report
 
-    spec, matrix, _ = _columned_case(False, 256)
+    spec, matrix, _ = _columned_case(256, grouped=False)
     launch = grouped_quantized.MosaicPackedGmm()
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
@@ -985,7 +985,7 @@ def test_a_packed_nvfp4_prefill_finishing_its_scale_lowers_for_cuda(gpu, grouped
     """A prefill-sized NVFP4 product named packed whose tensor scale is one a column (a matrix's, a bank's
     of two experts) lowers for CUDA on an A100 and an H100 with its launch's epilogue taking the scale, a
     side each tile reads where it lands (row 13743)."""
-    spec, matrix, sizes = _columned_case(grouped, 256)
+    spec, matrix, sizes = _columned_case(256, grouped=grouped)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh), generation.chosen(nvfp4="packed"),
           tuning.seen() as launched):
