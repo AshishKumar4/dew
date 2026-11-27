@@ -3,9 +3,9 @@
 import dataclasses
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -478,8 +478,8 @@ class Tagged(Counting):
     `restored`, and `on_restore` taken at the first restore."""
 
     tag = "A"
-    restored: list[str] = []
-    on_restore: list = []
+    restored: ClassVar[list[str]] = []
+    on_restore: ClassVar[list[Callable[[], None]]] = []
 
     def get_state(self):
         return json.dumps({"index": self.index, "tag": Tagged.tag}).encode()
@@ -512,7 +512,8 @@ def test_a_configured_resume_reads_its_saved_data_position_once(tmp_path, monkey
     for root, tag in ((tmp_path / "a", "A"), (tmp_path / "b", "B")):
         monkeypatch.setattr(Tagged, "tag", tag)
         run(root, 1).train(Regression(), dataset(Tagged), name="tagged")
-    mine, twin = (Path(Checkpoints(str(root / "tagged")).path(1)) for root in (tmp_path / "a", tmp_path / "b"))
+    mine, twin = (Path(Checkpoints(str(root / "tagged")).path(1))
+                  for root in (tmp_path / "a", tmp_path / "b"))
 
     def replaced() -> None:
         shutil.rmtree(mine)
