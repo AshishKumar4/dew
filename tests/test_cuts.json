@@ -1803,6 +1803,9 @@
 "tests/test_flight.py": [
 "tests/test_flight.py::test_a_step_pays_passes_ends_and_finishes_as_the_race_rules"
 ],
+"tests/test_flow_cells.py": [
+"tests/test_flow_cells.py::test_the_model_widths_recurrence_cells_programs_fit_a_part_of_an_a100"
+],
 "tests/test_flow_grpo.py": [
 "tests/test_flow_grpo.py::test_a_transitions_density_keeps_a_residual_whose_square_overflows",
 "tests/test_flow_grpo.py::test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers",
@@ -2166,7 +2169,7 @@
 "tests/test_in_context_generation.py::test_a_server_draws_what_its_adapting_task_draws"
 ],
 "tests/test_indexer_training.py": [
-"tests/test_indexer_training.py::test_packing_carried_by_the_model_inputs_scores_the_same_kl[warmup-None]"
+"tests/test_indexer_training.py::test_an_indexer_without_a_top_k_leaves_the_attention_dense"
 ],
 "tests/test_inference.py": [
 "tests/test_inference.py::test_a_restored_task_reads_the_training_steps_blank_to_the_bit",
