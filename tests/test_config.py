@@ -475,7 +475,8 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
 
 def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_its_record(tmp_path):
     """A configured run launched into a directory that holds a best checkpoint's weights alone (`Best`'s
-    `weights_only`, no resumable step), which trained under other numerics (JAX's "highest" beneath its
+    `weights_only`, ranked so its first evaluation wins and no resumable step is kept), which trained under
+    other numerics (JAX's "highest" beneath its
     "default", relaunched under "high"), is refused before its record is replaced: the directory's guard is
     taken under the numerics its steps trace under, as `fit` takes it (row 13708)."""
     from affine_run import dataset, val_batches
@@ -487,7 +488,7 @@ def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_it
     def run(steps: int) -> RunConfig:
         return RunConfig(trainer=TrainerConfig(
             steps=steps, checkpoint_dir=str(tmp_path), eval_every=1, checkpoint_every=None,
-            checkpoint_final=False, best=Best("val/loss", weights_only=True),
+            checkpoint_final=False, best=Best("val/loss", mode="max", weights_only=True),
             precision=Numerics(DTYPE_PRESETS["32-true"], matmul="default")))
 
     with jax.default_matmul_precision("highest"):
