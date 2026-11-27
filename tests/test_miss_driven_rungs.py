@@ -1,4 +1,4 @@
-"""A fit search reads its first miss's live set (`jax.stages.Compiled.peak_live`) to choose what it asks
+"""A fit search reads its first miss's live set (`dew.training.live_buffers.peak_live`) to choose what it asks
 next (row 12463): the remat rung whose dropped values cover what the step was short of asked first. A 4B
 decision step on 2 x H100 climbed one rung at a time. Compiled for compile-only H100s on the CPU, never
 run; each search read by the probes its plan or refusal records."""

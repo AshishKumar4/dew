@@ -1,0 +1,90 @@
+HloModule m, entry_computation_layout={(f32[], f32[4,2]{1,0})->f32[4,2]{1,0}}
+
+forwards {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[2]{0} parameter(1)
+  laid = f32[1,2]{1,0} bitcast(row)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, laid, at, zero)
+}
+
+moved {
+  stack = f32[4,4]{1,0} parameter(0)
+  other = f32[4,4]{0,1} bitcast(stack)
+  back = f32[4,4]{1,0} copy(other)
+  row = f32[1,4]{1,0} parameter(1)
+  at = s32[] parameter(2)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,4]{1,0} dynamic-update-slice(back, row, at, zero)
+}
+
+backwards {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[1,2]{1,0} parameter(1)
+  i = s32[] parameter(2)
+  last = s32[] constant(3)
+  at = s32[] subtract(last, i)
+  zero = s32[] constant(0)
+  ROOT put = f32[4,2]{1,0} dynamic-update-slice(stack, row, at, zero)
+}
+
+wrapped {
+  stack = f32[4,2]{1,0} parameter(0)
+  row = f32[2]{0} parameter(1)
+  at = s32[] parameter(2)
+  ROOT put = f32[4,2]{1,0} fusion(stack, row, at), kind=kLoop, calls=forwards
+}
+
+body {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  stack = f32[4,2]{1,0} get-tuple-element(state), index=0
+  back = f32[4,2]{1,0} get-tuple-element(state), index=1
+  matrix = f32[4,2]{1,0} get-tuple-element(state), index=2
+  fixed = f32[4,2]{1,0} get-tuple-element(state), index=3
+  square = f32[4,4]{1,0} get-tuple-element(state), index=4
+  cast = f32[4,2]{1,0} get-tuple-element(state), index=5
+  deferred = f32[4,2]{1,0} get-tuple-element(state), index=6
+  i = s32[] get-tuple-element(state), index=7
+  hidden = f32[2]{0} constant({1, 2}), frontend_attributes={checkpoint_name="hidden"}
+  written = f32[4,2]{1,0} fusion(stack, hidden, i), kind=kLoop, calls=forwards
+  late = f32[1,2]{1,0} constant({{3, 4}}), frontend_attributes={checkpoint_name="late"}
+  reversed = f32[4,2]{1,0} fusion(back, late, i), kind=kLoop, calls=backwards
+  row = f32[1,2]{1,0} constant({{5, 6}}), frontend_attributes={checkpoint_name="row"}
+  zero = s32[] constant(0)
+  over = f32[4,2]{1,0} dynamic-update-slice(matrix, row, zero, zero)
+  pinned = f32[4,2]{1,0} dynamic-update-slice(fixed, row, zero, zero)
+  line = f32[1,4]{1,0} constant({{7, 8, 9, 10}}), frontend_attributes={checkpoint_name="line"}
+  turned = f32[4,4]{1,0} fusion(square, line, i), kind=kLoop, calls=moved
+  counted = s32[] bitcast(i)
+  through = f32[4,2]{1,0} dynamic-update-slice(cast, row, counted, zero)
+  deep = f32[2]{0} constant({7, 8}), frontend_attributes={checkpoint_name="deep"}
+  begun = ((f32[4,2]{1,0}, f32[2]{0}, s32[]), f32[4,2]{1,0}, u32[]) async-start(deferred, deep, i), calls=wrapped
+  ended = f32[4,2]{1,0} async-done(begun)
+  one = s32[] constant(1)
+  next = s32[] add(i, one)
+  ROOT out = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(written, reversed, over, pinned, turned, through, ended, next)
+}
+
+condition {
+  state = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) parameter(0)
+  i = s32[] get-tuple-element(state), index=7
+  bound = s32[] constant(STEPS)
+  ROOT less = pred[] compare(i, bound), direction=LT
+}
+
+ENTRY e {
+  a = f32[] parameter(0)
+  populated = f32[4,2]{1,0} parameter(1)
+  zeros = f32[4,2]{1,0} broadcast(a), dimensions={}
+  unit = f32[] constant(1)
+  ones = f32[4,2]{1,0} broadcast(unit), dimensions={}
+  filled = f32[4,2]{1,0} broadcast(a), dimensions={}
+  spread = f32[4,4]{1,0} broadcast(a), dimensions={}
+  blank = f32[4,2]{1,0} broadcast(a), dimensions={}
+  tardy = f32[4,2]{1,0} broadcast(a), dimensions={}
+  start = s32[] constant(0)
+  init = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) tuple(zeros, ones, populated, filled, spread, blank, tardy, start)
+  loop = (f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, f32[4,4]{1,0}, f32[4,2]{1,0}, f32[4,2]{1,0}, s32[]) while(init), condition=condition, body=body, backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},"known_induction_variable":{"tuple_index":"7"}}
+  ROOT x = f32[4,2]{1,0} get-tuple-element(loop), index=0
+}

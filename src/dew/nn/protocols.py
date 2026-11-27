@@ -976,7 +976,7 @@ def fixed_remat[**Given, Value](function: Callable[Given, Value]) -> Callable[Gi
 @dataclasses.dataclass(frozen=True)
 class RecomputeStatement:
     """What a model's remat rung recomputes in place of keeping it, as a compile's live set names it
-    (`jax.stages.Compiled.peak_live`): within its blocks (`scope`, a part of the `op_name` of each value its
+    (`dew.training.live_buffers.peak_live`): within its blocks (`scope`, a part of the `op_name` of each value its
     blocks' forward makes, `RUNG_SCOPE`), but under a checkpoint no rung sets (`FIXED_SCOPE`), every value
     `save` names none of where its rung keeps names (`save`, a checkpoint policy keeping those alone: the
     unnamed ones too), else only the values it names `recompute` (a rung that recomputes those alone and
