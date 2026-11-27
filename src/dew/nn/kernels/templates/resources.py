@@ -400,7 +400,7 @@ def band(multiprocessors: int, rows: int, columns: int, column_tiles: int, *, ro
     128, their tile alike, M-FS-89c/d, row 5874). The band is a power of two, as its snake's division by
     another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes spilled
     at a band of three, NS4053-1), which the register model does not see. `rows` and `columns` are a
-    cluster tile's extents (`gemm.pricing.tile_rows`, `gemm.pricing.tile_columns`), `row_tiles` and
+    cluster tile's extents (`gemm.pricing.cluster_rows`, `gemm.pricing.cluster_columns`), `row_tiles` and
     `column_tiles` its walk's counts of them; `cluster`, the multiprocessors a cluster's one program spans,
     which divides the wave's `multiprocessors` into its programs."""
     if grouped:

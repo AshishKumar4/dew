@@ -414,13 +414,13 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    tile = Tiles(block_m, block_n, step, 2, 1, warpgroups=consumers, cluster=cluster, family=layout.name,
-                 programs=programs)
     # The cluster tile's extents, the one statement the scheduler, its pricing and its launch read
-    # (`pricing.tile_rows`, `pricing.tile_columns`: a pair's products both CTAs' columns): its band walks
-    # the column tiles of the width its launch rounds up to them and the row tiles of the rows the launch
-    # walks (`walked`).
-    tile_rows, tile_columns = pricing.tile_rows(tile, layout), pricing.tile_columns(tile, layout)
+    # (`pricing.cluster_rows`, `pricing.cluster_columns`: a pair's products both CTAs' columns): its band
+    # walks the column tiles of the width its launch rounds up to them and the row tiles of the rows the
+    # launch walks (`walked`).
+    tile_rows = pricing.cluster_rows(block_m, cluster)
+    tile_columns = pricing.cluster_columns(block_n, cluster, layout)
     band = resources.band(multiprocessors * programs, tile_rows, tile_columns, -(-width // tile_columns),
                           row_tiles=-(-(walked or rows) // tile_rows), grouped=grouped, cluster=cluster)
-    return dataclasses.replace(tile, grid_block_n=band)
+    return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
+                 programs=programs)
