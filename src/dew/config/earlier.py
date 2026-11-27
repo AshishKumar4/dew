@@ -166,13 +166,18 @@ written math, as every run does now."""
 
 def earlier_retired_kernels(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record without the kernel choices Dew retired since (`RETIRED_KERNELS`), named or
-    written None. Carried to 1.0 (ledger 1552)."""
+    written None, whether its kernels are a plain record or a subclass's tagged one (`{"class": ...,
+    "fields": ...}`, the tag kept). Carried to 1.0 (ledger 1552)."""
     found = _kernel_pins(record)
     kernels = None if found is None else found[2].get("kernels")
-    if found is None or not isinstance(kernels, Mapping) or RETIRED_KERNELS.isdisjoint(kernels):
+    if found is None or not isinstance(kernels, Mapping):
         return record
-    return _with_kernels(record, found, {name: value for name, value in kernels.items()
-                                         if name not in RETIRED_KERNELS})
+    tagged = _records.class_record(kernels)
+    choices = tagged[1] if tagged is not None else kernels
+    if RETIRED_KERNELS.isdisjoint(choices):
+        return record
+    kept = {name: value for name, value in choices.items() if name not in RETIRED_KERNELS}
+    return _with_kernels(record, found, kept if tagged is None else {"class": tagged[0], "fields": kept})
 
 
 def _with_kernels(record: Mapping[str, object], found: _Pins, kernels: Mapping[str, object]

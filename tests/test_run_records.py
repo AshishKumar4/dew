@@ -113,16 +113,26 @@ def test_a_run_whose_model_named_its_attention_kernel_runs_it_as_the_runs_own(ke
     assert "attention_impl" not in json.loads(json.dumps(run.record()))["fields"]["model"]["fields"]
 
 
+@dataclasses.dataclass(frozen=True)
+class _TaggedKernels(Kernels):
+    """Kernel choices of a subclass, which a run's record tags with its class."""
+
+
+@pytest.mark.parametrize("tagged", [False, True], ids=["plain", "tagged"])
 @pytest.mark.parametrize("generated", [None, "generated", "written"])
-def test_a_run_saved_with_a_retired_kernel_choice_reads_as_the_run_it_trained(generated):
+def test_a_run_saved_with_a_retired_kernel_choice_reads_as_the_run_it_trained(generated, tagged):
     """The published run as a Dew of rows 3272/6109's opt-in seam saved it, its kernel choices stating the
-    retired `generated` (written None where unset, as a record of its kernels writes each), reads as today's
-    run of the written math, the choice left out (`earlier_retired_kernels`), its other choices kept."""
+    retired `generated` (written None where unset, as a record of its kernels writes each), in a plain
+    record or a subclass's tagged one, reads as today's run of the written math, the choice left out
+    (`earlier_retired_kernels`), its other choices and its class kept."""
     held = json.loads(PUBLISHED.read_text())
-    kernels = {**held["fields"]["diagnostics"]["kernels"], "generated": generated, "attention": "xla"}
+    choices = {**held["fields"]["diagnostics"]["kernels"], "generated": generated, "attention": "xla"}
+    name = f"{_TaggedKernels.__module__}:{_TaggedKernels.__qualname__}"
+    kernels = {"class": name, "fields": choices} if tagged else choices
     diagnostics = {**held["fields"]["diagnostics"], "kernels": kernels}
     run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "diagnostics": diagnostics}}))
-    assert run.diagnostics.kernels == Kernels(attention="xla")
+    assert run.diagnostics.kernels == (_TaggedKernels if tagged else Kernels)(attention="xla")
+    assert type(run.diagnostics.kernels) is (_TaggedKernels if tagged else Kernels)
 
 
 def test_a_run_saved_scanning_its_stack_resumes_scanned():
