@@ -425,8 +425,8 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
         for kernel, dew, plain in calls:
             configs = each_config(kernel, dew, *draw(0))
             assert len(configs) > 1, kernel.__name__
-            for config in configs:
-                with tuning.pinned({kernel: config}):
+            for pin, config in configs:
+                with tuning.pinned({pin: config}):
                     assert_as_exact(dew, jax.jit(plain), draw, f"{kernel.__name__} at {config}", seeds=SEEDS,
                                     truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 

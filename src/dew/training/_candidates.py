@@ -27,7 +27,7 @@ from dew.data.pipeline import DeviceStep
 from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
 from dew.distributed.placement import Placement, Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, gpu_mesh
+from dew.nn.kernels.generation import GpuTarget, assumed, gpu_mesh
 from dew.nn.kernels.options import (
     compiler_options,
     held_context,
@@ -107,7 +107,7 @@ class StepSettings[LossT, EffectsT]:
     inspection: Inspection | None
     microbatches: int
     record: bool
-    lower_for: str | None
+    lower_for: str | GpuTarget | None
     state_mesh: Mesh
     skip_nonfinite: bool = False
     """Whether a step with no loss scale that is not finite is skipped (`TrainerAdvanced(skip_nonfinite=)`),
@@ -495,7 +495,7 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
 
 
 def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], objective: Objective[LossT, EffectsT],
-                                 state: TrainState, batch: Batch, generation: str, narrow: bool,
+                                 state: TrainState, batch: Batch, generation: str | GpuTarget, narrow: bool,
                                  xla_defaults: bool = False
                                  ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one

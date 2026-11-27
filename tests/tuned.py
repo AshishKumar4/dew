@@ -3,6 +3,7 @@ template's launches fit, every variant an opt-in tuning run may time (`KernelOp.
 kernel's float64 gate holds at, and the launches the tuner times (dew.nn.kernels.tuning)."""
 
 import dataclasses
+from collections.abc import Collection
 
 import jax
 
@@ -32,20 +33,33 @@ def fitting(kernel, function, *args) -> list:
 
 
 def each_config(kernel, function, *args) -> list:
-    """Every variant of `kernel` (`KernelOp.variants`) at the keys of the shapes `function(*args)`
-    launches it with as it traces (no lowering, which an interpreter's ordered callbacks refuse), in
-    field order: the configs a tuning run may pick, each of which the kernel's tests hold to the gate
+    """Each pin of `kernel` the gate holds `function(*args)`'s launches of it at, as they trace (no lowering,
+    which an interpreter's ordered callbacks refuse): `(pin, config)`, the pin a launch's key
+    (`tuning.pinned`'s `(kernel, key)`), the config each its launches at that key take or a tuning run times
+    of their variants there (`tuning._candidates`), which each of them may be pinned to and timed at
+    (`tuning._timeable`): every launch's configs at its own key, a config one launch refuses no bar to
+    another's (a forward's tile its transposed gradient spills); in key and field order
     (`configs_by_kernel`'s)."""
-    return configs_by_kernel(function, *args).get(kernel, [])
+    return configs_by_kernel(function, *args, kernels=(kernel,)).get(kernel, [])
 
 
-def configs_by_kernel(function, *args) -> dict:
-    """`each_config` of every kernel `function(*args)` launches, traced once: each launch's type its
-    variants at the keys of the shapes it launches with, in field order."""
-    found: dict = {}
-    for op, ba in _traced(function, *args):
-        found.setdefault(type(op), set()).update(op.keyed(ba).autotuning_configs)
-    return {kernel: sorted(configs, key=dataclasses.astuple) for kernel, configs in found.items()}
+def configs_by_kernel(function, *args, kernels: Collection[type] | None = None) -> dict:
+    """`each_config` of every kernel `function(*args)` launches (of `kernels` alone where named, no other's
+    candidates certified), traced once."""
+    by_key: dict = {}
+    for observed in _traced(function, *args).held():
+        op, keyed = observed
+        if kernels is None or type(op) in kernels:
+            by_key.setdefault((type(op), keyed.autotuning_cache_key), []).append((op, keyed, observed))
+    pins: dict = {}
+    for pin, launches in by_key.items():
+        offered = {observed.config for _, _, observed in launches}.union(
+            *(tuning._candidates(op, keyed) for op, keyed, _ in launches)) - {None}
+        held = [config for config in offered
+                if all(tuning._timeable(op, observed.arguments, config) for op, _, observed in launches)]
+        pins.setdefault(pin[0], []).extend((pin, config) for config in held)
+    return {kernel: sorted(found, key=lambda each: (repr(each[0][1]), dataclasses.astuple(each[1])))
+            for kernel, found in pins.items()}
 
 
 def recorded(function, *args) -> list:

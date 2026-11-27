@@ -61,8 +61,8 @@ import threading
 import time
 import types
 import weakref
-from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
-from typing import ClassVar
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
+from typing import ClassVar, NamedTuple
 
 import filelock
 import jax
@@ -70,7 +70,7 @@ import jax.core
 import jax.numpy as jnp
 import numpy as np
 import tokamax
-from jax._src import config as jax_config
+from jax._src import config as jax_config, mesh as mesh_lib
 from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
@@ -667,14 +667,13 @@ class KernelOp(tokamax.Op):
             return moded(*args, **kwargs)
         ba = self.bind(*args, **kwargs)
         config = self.config
+        collected = keyed = None
         if config is None:
-            if (collected := _cache.KERNEL_SEEN.value) is not None:
-                collected.found.append((self, self.keyed(ba)))
+            collected = _cache.KERNEL_SEEN.value
+            keyed = self.keyed(ba) if collected is not None else None
             config = self.taken(ba)
             if config is None:
                 raise self.exhausted(ba)
-            if collected is not None:
-                collected.found.taken.append((config, ba))
         else:
             config = self.completed(ba, config)
             if not self.pinnable(ba, config):
@@ -683,6 +682,11 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
+            if collected is not None and keyed is not None:
+                # Recorded whole once its config resolves: its key, its config and the launch as its kernels
+                # name it, which `tune` joins to the calls a run may make.
+                collected.found.record((self, keyed), config, ba, report.launch_digest(),
+                                       Placement.current())
             awaiting = report.awaiting()
             if awaiting is None:
                 return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
@@ -874,9 +878,12 @@ class KernelOp(tokamax.Op):
         return set(self.variants(ba))
 
     def pinned(self, ba: tokamax.BoundArguments) -> Hashable | None:
-        """The pin a block holds for this launch (`pinned`), as the launch of `ba` takes it (`completed`);
-        None where none is held."""
+        """The pin a block holds for this launch (`pinned`): its key's (the pin of its kind at its key), else
+        its kind's, as the launch of `ba` takes it (`completed`); None where none is held."""
         pins = dict(_cache.KERNEL_PINS.value)
+        keyed = any(isinstance(pinned, tuple) for pinned in pins)
+        if keyed and (config := pins.get((type(self), self.keyed(ba).autotuning_cache_key))) is not None:
+            return self.completed(ba, config)
         return self.completed(ba, pins[type(self)]) if type(self) in pins else None
 
     def pin_refuses(self, ba: tokamax.BoundArguments) -> bool:
@@ -1152,21 +1159,50 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
 def holdable(value: Hashable | jax.Array) -> bool:
     """Whether a cache may hold `value` without holding an array through it: no array, and no function of
     a closure, bound method or callable object but a dataclass (a hook reading an operand's shape may reach
-    the array its call made), within a partial's arguments, a tuple or a dataclass's fields alike (a static
-    argument is hashable, so no list or dict)."""
-    if isinstance(value, (jax.Array, np.ndarray)) or inspect.ismethod(value):
+    the array its call made), no tracer (a traced ref's among them), no mutable container (a default may
+    hold one, though a static argument is hashable) and no value holding itself (a dataclass a field of
+    its own), within a partial's arguments, a function's defaults (keyword-only ones too), a tuple or
+    frozenset or a dataclass's fields alike."""
+    return _holdable(value, set())
+
+
+def _holdable(value: Hashable | jax.Array, path: set[int]) -> bool:
+    """`holdable` of `value` within the values on the walk's `path`, by identity, those holding it."""
+    if id(value) in path:
+        return False
+    if isinstance(value, (jax.Array, np.ndarray, jax.core.Tracer)) or inspect.ismethod(value):
         return False
     if isinstance(value, functools.partial):
-        return holdable(value.func) and all(map(holdable, (*value.args, *value.keywords.values())))
+        return _held(value, (value.func, *value.args, *value.keywords.values()), path)
     if inspect.isfunction(value):
-        return value.__closure__ is None and all(map(holdable, value.__defaults__ or ()))
-    if isinstance(value, tuple):
-        return all(map(holdable, value))
+        return value.__closure__ is None and _held(
+            value, (*(value.__defaults__ or ()), *(value.__kwdefaults__ or {}).values()), path)
+    if isinstance(value, (list, set, dict, bytearray)):
+        # Mutable: what a cache keyed on it holds may change after, and it may hold itself.
+        return False
+    if isinstance(value, (tuple, frozenset)):
+        return _held(value, value, path)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return all(holdable(getattr(value, field.name)) for field in dataclasses.fields(value))
+        parts = [getattr(value, field.name, _UNSET) for field in dataclasses.fields(value)]
+        # A field left unset (`init=False`, never assigned): no value a cache keys on, the hook run uncached.
+        return not any(part is _UNSET for part in parts) and _held(value, parts, path)
     # Any other callable object (a hook class's instance) may hold an array its call reads, which no check
     # sees; a class is a value.
     return isinstance(value, type) or not callable(value)
+
+
+_UNSET = object()
+"""A dataclass field's value where it holds none (`_holdable`)."""
+
+
+def _held(value: Hashable | jax.Array, parts: Iterable, path: set[int]) -> bool:
+    """Whether each of `value`'s `parts` is holdable (`_holdable`), `value` on the walk's `path` while they
+    are read, as `terms.py`'s walks keep theirs: one set a walk, a sibling's reference no cycle."""
+    path.add(id(value))
+    try:
+        return all(_holdable(part, path) for part in parts)
+    finally:
+        path.discard(id(value))
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
@@ -1272,29 +1308,57 @@ def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
     return op.replace(config=None, vjp=None, **hooks)
 
 
-def _kind(ba: tokamax.BoundArguments) -> str:
-    """The GPU model the launch `ba` is chosen for, as tokamax reads it for its cache lookups: its
-    concrete operands' devices', else the context mesh's (`Trainer.lower_for`'s abstract GPU), else
-    the default device's. A traced or keyed launch (`keyed`) names no device of its own."""
-    from jax.core import Tracer
+class Placement(NamedTuple):
+    """Where a launch traced (`Seen.placed`): the context's abstract mesh, whose GPU model keys its picks
+    (an abstract GPU's, `Trainer.lower_for`'s), and its concrete mesh, whose devices state the GPU's own
+    facts its derivation read (an RTX 4080's 76 multiprocessors, where its catalog model states 58), empty
+    where it traced under none."""
 
-    kinds = {device.device_kind for leaf in jax.tree.leaves(dict(ba.arguments))
-             if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer)
-             for device in leaf.devices()}
-    if len(kinds) > 1:
-        raise ValueError(f"a launch's operands lie on GPUs of several models: {sorted(kinds)}")
-    if kinds:
-        return kinds.pop()
-    device = jax.sharding.get_abstract_mesh().abstract_device
-    return (device or get_default_device()).device_kind
+    abstract: jax.sharding.AbstractMesh
+    concrete: jax.sharding.Mesh
+
+    @classmethod
+    def current(cls) -> Placement:
+        """The context's own."""
+        return cls(jax.sharding.get_abstract_mesh(), mesh_lib.get_concrete_mesh())
+
+
+def _context_kind() -> str:
+    """The GPU model in effect, as tokamax reads a launch's of no concrete operand for its cache: the
+    context's placement's (`_mesh_kind`)."""
+    return _mesh_kind(Placement.current())
+
+
+def _mesh_kind(placed: Placement) -> str:
+    """The GPU model a launch traced at `placed` keys its picks by, as tokamax reads a launch's cache: its
+    abstract mesh's abstract device's (an abstract GPU's, `Trainer.lower_for`'s), else the default device's;
+    its concrete mesh states the GPU's facts alone (`Placement`)."""
+    return (placed.abstract.abstract_device or get_default_device()).device_kind
 
 
 def _pick(ba: tokamax.BoundArguments) -> Timings | None:
-    """The pick tokamax's cache holds for `ba` (its key's shapes), where
-    `ba`'s space holds its fastest config; any other is no pick."""
+    """The pick tokamax's cache holds for `ba` (its key's shapes) for the GPU in effect, read as tokamax
+    reads it (its ignore-cache setting holding none), where `ba`'s space there holds its fastest config;
+    any other is no pick."""
     stored = ba.cached_autotuning_data
     # Dew's own picks alone (`get_autotuning_cache`); tokamax's overlays hold none of Dew's launches.
     return stored if isinstance(stored, Timings) and stored.fastest_config in ba.autotuning_configs else None
+
+
+@contextlib.contextmanager
+def _placed_in(placed: Placement | None) -> Iterator[None]:
+    """The placement `placed` in effect, whose GPU a launch traced at it was chosen for: its picks read, its
+    space and its derived config taken there (`Seen.placed`), its concrete mesh's devices' own facts among
+    them, entered from no mesh but its own (`programs.meshless`: the caller's may be of another size, which
+    JAX refuses to swap for it, or a concrete one whose devices `generation.placed_device` would read first),
+    then its abstract mesh (`jax.sharding.use_abstract_mesh`); an empty one no mesh at all (a launch traced
+    under none, the default device's); the caller's kept where it is None (no launch recorded one)."""
+    if placed is None:
+        yield
+        return
+    concrete = None if placed.concrete.empty else placed.concrete
+    with programs.meshless(concrete), jax.sharding.use_abstract_mesh(placed.abstract):
+        yield
 
 
 def bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
@@ -1332,8 +1396,14 @@ def _candidates(op: KernelOp, ba: tokamax.BoundArguments) -> list[Hashable]:
     serializes its warpgroup MMAs), each certified in turn, as a ladder's rungs are (`KernelOp._climbed`); a
     config certification cannot compile alone stays, its own compile the judge. Uncertified, a spilling config
     was timed, as slow as its spills, and could be chosen."""
-    pinnable = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
-    return [config for config in pinnable if not report.certified(op, ba, op.completed(ba, config))]
+    return [config for config in ba.autotuning_configs if _timeable(op, ba, config)]
+
+
+def _timeable(op: KernelOp, ba: tokamax.BoundArguments, config: Hashable) -> bool:
+    """Whether the tuner may time `config` for `ba`'s launch (`_candidates`): the launch takes it as a pin
+    (`KernelOp.pinnable`), and the GPU's assembler does not refuse it alone (`report.certified`)."""
+    completed = op.completed(ba, config)
+    return op.pinnable(ba, completed) and not report.certified(op, ba, completed)
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
@@ -1640,15 +1710,54 @@ def shapes(value):
                         if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
 
 
-class Seen(list[Launch]):
-    """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
-    `taken`, the config each took as it traced (`KernelOp.taken`: a pin, its own key's pick or its
-    heuristic) and the arguments it took it for (its own shapes, which its heuristic reads), in the
-    same order."""
+class Observed(tuple[KernelOp, tokamax.BoundArguments]):
+    """One launch traced under `seen`: its op and keyed arguments (a `Launch`, as it unpacks and compares),
+    the config it took as it traced (`KernelOp.taken`: a pin, its own key's pick or its heuristic) and the
+    arguments it took it for (its own shapes, which its heuristic reads), its digest as its kernels carry it
+    (`report.launch_digest`), and its placement, whose GPU it was chosen for (`Placement`: a compile-only
+    GPU's, which no launch states once the trace ends)."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.taken: list[tuple[Hashable, tokamax.BoundArguments]] = []
+    config: Hashable
+    arguments: tokamax.BoundArguments
+    digest: str | None
+    placed: Placement
+
+    def __new__(cls, launch: Launch, config: Hashable, arguments: tokamax.BoundArguments, digest: str | None,
+                placed: Placement) -> Observed:
+        observed = super().__new__(cls, launch)
+        observed.config, observed.arguments = config, arguments
+        observed.digest, observed.placed = digest, placed
+        return observed
+
+    def __reduce__(self) -> tuple:
+        """Rebuilt whole in another process (a prepare's record, `arm_store`), its placement's abstract mesh
+        alone: its concrete devices this process's, none of another's."""
+        placed = Placement(self.placed.abstract, mesh_lib.empty_concrete_mesh)
+        return Observed, (tuple(self), self.config, self.arguments, self.digest, placed)
+
+
+class Seen(list[Observed]):
+    """The launches traced under `seen`, each as it was observed (`Observed`), in the order they traced."""
+
+    def record(self, launch: Launch, config: Hashable, arguments: tokamax.BoundArguments,
+               digest: str | None, placed: Placement) -> None:
+        """One launch as it was observed."""
+        self.append(Observed(launch, config, arguments, digest, placed))
+
+    @property
+    def taken(self) -> list[tuple[Hashable, tokamax.BoundArguments]]:
+        """Each launch's config and the arguments it took it for."""
+        return [(observed.config, observed.arguments) for observed in self]
+
+    @property
+    def launched(self) -> list[str | None]:
+        """Each launch's digest."""
+        return [observed.digest for observed in self]
+
+    @property
+    def placed(self) -> list[Placement]:
+        """Each launch's placement."""
+        return [observed.placed for observed in self]
 
     def held(self) -> Seen:
         """These launches as a trace kept past its own keeps them (`dew.algebra.fusion`'s regions, replayed
@@ -1656,10 +1765,10 @@ class Seen(list[Launch]):
         the arguments it was taken for, their arrays as their own shapes and dtypes, so no tracer outlives
         the trace that made it."""
         kept = Seen()
-        kept.extend(self)
-        kept.taken.extend((config, tokamax.BoundArguments(ba.op, {name: shapes(value)
-                                                                 for name, value in ba.arguments.items()}))
-                          for config, ba in self.taken)
+        for observed in self:
+            shaped = tokamax.BoundArguments(observed.arguments.op, {
+                name: shapes(value) for name, value in observed.arguments.arguments.items()})
+            kept.append(Observed(observed, observed.config, shaped, observed.digest, observed.placed))
         return kept
 
 
@@ -1689,7 +1798,6 @@ def noted(found: Seen) -> None:
     no collection is open."""
     if (collected := _cache.KERNEL_SEEN.value) is not None:
         collected.found.extend(found)
-        collected.found.taken.extend(found.taken)
 
 
 def _on_its_tpu() -> bool:
@@ -1705,31 +1813,51 @@ def _on_its_tpu() -> bool:
 
 def tune(lower: Callable[[], jax.stages.Lowered], *,
          measure: bool = False) -> jax.stages.Lowered:
-    """An opt-in tuning run's program (bible §6: off by default): what `lower()`
-    lowers with every launch's config settled across the pool. The
+    """`tuned`'s program: what `lower()` lowers with every launch's config settled across the pool."""
+    return tuned(lower, measure=measure).lowered
+
+
+class Tuned(NamedTuple):
+    """A tuning run's program and what a run of it may launch (`tuned`)."""
+
+    lowered: jax.stages.Lowered
+    reached: Reach | None
+    """The program's reach (`reach`), its last lowering's; None where it is lowered as it is, untuned."""
+
+
+def tuned(lower: Callable[[], jax.stages.Lowered], *, measure: bool = False) -> Tuned:
+    """An opt-in tuning run's program (bible §6: off by default), and what a run of it may launch (its
+    `reach`, its last lowering's, which a caller counting its launches reads rather than lowering it again):
+    what `lower()` lowers with every launch's config settled across the pool. The
     lowering records its launches as it traces them (`seen`); process 0 takes
     its stored pick for each, with `measure` measuring and storing one for a
     launch without where it has its device to itself, and every process takes
     exactly process 0's configs (`_settle`). Where that changes a config the
     lowering traced, it lowers again. A launch without a pick takes its heuristic. A measuring run of a step
-    with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
-    refused (`Untunable`). A GPU that runs Dew's Pallas kernels (`generation.triton_runs`) and a TPU core are
-    tuned alike, each timed as its device reads it (`dew.telemetry.benchmark.device_time`), a TPU's where the
-    trace targets the TPU the process runs on (`_on_its_tpu`); anywhere else (a compile-only TPU's trace on
-    another host) the program is lowered as it is."""
+    no launch of Dew's a run reaches (`_reached`) whose Triton kernels are another library's measures nothing
+    it asked for, and is refused (`Untunable`). A GPU that runs Dew's Pallas kernels
+    (`generation.triton_runs`) and a TPU core are tuned alike, each timed as its device reads it
+    (`dew.telemetry.benchmark.device_time`), a TPU's where the trace targets the TPU the process runs on
+    (`_on_its_tpu`); anywhere else (a compile-only TPU's trace on another host) the program is lowered as it
+    is."""
     if not (generation.triton_runs() or _on_its_tpu()):
-        return lower()
+        return Tuned(lower(), None)
     with reading():
-        tuned = _cache.KERNEL_TUNES.get_global()
+        tunes = _cache.KERNEL_TUNES.get_global()
         with seen() as found:
             lowered = lower()
-        distinct = _distinct(found)
-        if measure and not distinct and (foreign := _foreign_kernels(lowered)):
-            raise Untunable(foreign)
-        _settle(distinct, measure=measure)
-        if _cache.KERNEL_TUNES.get_global() != tuned:
-            lowered = lower()
-    return lowered
+        reached = reach(found, lowered)
+        # Every process the same reach before any returns or raises: one settles only beside its peers.
+        _agreed_reach(reached)
+        if measure and not reached.launches and reached.foreign:
+            raise Untunable(reached.foreign)
+        _settle(reached.launches, measure=measure, placed=_one_gpu(reached.placed))
+        if _cache.KERNEL_TUNES.get_global() != tunes:
+            # A config changed: the program lowered again, its reach its own.
+            with seen() as found:
+                lowered = lower()
+            reached = reach(found, lowered)
+    return Tuned(lowered, reached)
 
 
 TUNED_COMPILERS = ("triton", "mosaic_gpu", "mosaic_tpu")
@@ -1737,18 +1865,70 @@ TUNED_COMPILERS = ("triton", "mosaic_gpu", "mosaic_tpu")
 Mosaic TPU."""
 
 
-def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
-    """The kernels of a compiler the tuner times (`TUNED_COMPILERS`) that a run of `lowered` may launch
-    (`lowered.reached_calls`: none behind a loop of no trips, a conditional's every branch) and no launch of
-    Dew's traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler:
-    another library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
+class Reach(NamedTuple):
+    """What a run of a lowered step may launch (`reach`)."""
+
+    launches: list[Launch]
+    """Each distinct traced launch of Dew's whose kernel a run may reach (`_distinct`), as first traced: the
+    launches `tune` settles and `tools/kernel_picks.py` counts."""
+    foreign: tuple[str, ...]
+    """The kernels a run may reach of a compiler the tuner times (`TUNED_COMPILERS`) that no launch of Dew's
+    traced (no launch's digest on the call, `KernelCall.launched`), each named with its compiler: another
+    library's (tokamax's Triton, JAX's Splash attention on a TPU), outside the tuner."""
+    placed: frozenset[Placement]
+    """The placements the reached launches traced at (`Seen.placed`), at which `tune` settles them."""
+
+
+def reach(found: Seen, lowered: jax.stages.Lowered) -> Reach:
+    """The launches of `found` and the foreign kernels a run of `lowered` may make, read in one walk of its
+    reached calls (`lowered.reached_calls`: none behind a loop of no trips or in a conditional's arm its
+    trace decided against): a call carrying a launch's digest is Dew's (`report.traced`, matched to a traced
+    launch by its identity and config), one carrying none foreign."""
     from dew.nn.kernels.lowered import reached_calls
 
-    return tuple(dict.fromkeys(f"{call.kind}: {call.name}" for call in reached_calls(lowered)
-                               if call.kind in TUNED_COMPILERS and call.launched is None))
+    launched, foreign = set(), {}
+    for call in reached_calls(lowered):
+        # Its digest read once: a Triton or TPU call's parsed from its kernel's name.
+        digest = call.launched
+        if digest is None:
+            if call.kind in TUNED_COMPILERS:
+                foreign[f"{call.kind}: {call.name}"] = None
+        elif (launch := report.traced(digest)) is not None:
+            launched.add((launch.identity, launch.config))
+    reached = [observed for observed in found
+               if observed.digest is not None and (launch := report.traced(observed.digest)) is not None
+               and (launch.identity, launch.config) in launched]
+    return Reach(_distinct(reached), tuple(foreign), frozenset(observed.placed for observed in reached))
 
 
-def _distinct(found: list[Launch]) -> list[Launch]:
+def _agreed_reach(reached: Reach, agree: Callable[[str, Callable[[], list]], list] = _coordination.agreed_same
+                  ) -> None:
+    """Refuse, on every process alike (`_coordination.PoolDiffers`, `agree`'s), a reach the pool's processes
+    do not share: each launch as the store names it (`_launch_json`: its op's whole identity and its
+    arguments, in order), the GPU models its placements name (`_mesh_kind`) and the foreign kernels. A
+    process's cached picks may lower another arm of a decided conditional than its peers', one reaching a
+    launch the others do not, where the one reaching none would return before the settlement its peers wait
+    at (`_settle`'s agreement); a process failing to state its own (a launch no JSON names) fails every
+    process. Agreed, what follows (`_one_gpu`, `Untunable`) raises on every process or none."""
+    agree("a tuning run's reach", lambda: [
+        [_launch_json(ba) for _, ba in reached.launches],
+        sorted({_mesh_kind(placed) for placed in reached.placed}), list(reached.foreign)])
+
+
+def _one_gpu(placed: Collection[Placement]) -> Placement | None:
+    """One of the meshes `placed`, whose launches' GPU it names (`_mesh_kind`): meshes of one GPU model
+    (a region of a step making its axes explicit, `sharding.explicit_over`) are one GPU's; none of none,
+    and several models refused."""
+    by_kind: dict[str, Placement] = {}
+    for mesh in placed:
+        by_kind.setdefault(_mesh_kind(mesh), mesh)
+    if len(by_kind) > 1:
+        raise ValueError(f"a lowering's reached launches were chosen for GPUs of several models: "
+                         f"{sorted(by_kind)}")
+    return next(iter(by_kind.values()), None)
+
+
+def _distinct(found: Sequence[Launch]) -> list[Launch]:
     """Each keyed launch of `found` once, as first traced: a decoder's layers of one shape launch the
     same kernels at the same keys, which one decision, and one measurement, settles."""
     distinct: dict[tuple[tokamax.Op, Hashable], Launch] = {}
@@ -1757,27 +1937,29 @@ def _distinct(found: list[Launch]) -> list[Launch]:
     return list(distinct.values())
 
 
-def _settle(found: list[Launch], *, measure: bool) -> int:
-    """Take process 0's configs for the keyed launches `found` on every process,
-    process 0 measuring a launch without a pick where `measure` and it has its
-    GPU to itself: its picks, and for a launch it has none for the heuristic,
-    which every process launches there and none stores, so the launch stays
-    unmeasured. Each distinct launch is decided, and measured, once. Returns
-    how many still have no pick."""
+def _settle(found: list[Launch], *, measure: bool, placed: Placement | None) -> int:
+    """Take process 0's configs for the keyed launches `found`, traced under the mesh `placed` and chosen
+    for its GPU (`Seen.placed`; a store of another GPU's picks is no pick of theirs), on every process,
+    process 0 measuring a launch without a pick where `measure` and it has its GPU to itself, that GPU (a
+    launch traced for another, a compile-only GPU's, measured on none): its picks, and for a launch it
+    has none for the heuristic, which every process launches there and none stores, so the launch stays
+    unmeasured. Each distinct launch is decided, and measured, once. Returns how many still have no pick."""
     found = _distinct(found)
     if not found:
         return 0
-    kind = _kind(found[0][1])
+    kind = _context_kind() if placed is None else _mesh_kind(placed)
 
     def decided() -> str | None:
         if jax.process_index() != 0:
             return None
         decisions, timed = [], []
         for op, ba in found:
-            if (fastest := _pick(ba)) is not None:
+            with _placed_in(placed):
+                fastest = _pick(ba)
+            if fastest is not None:
                 decisions.append((ba, fastest))
                 continue
-            if measure and _cache.measures_picks():
+            if measure and _cache.measures_picks() and kind == get_default_device().device_kind:
                 timings = _measured(op, ba)
                 if timings.prune_errors():
                     timed.append((ba, timings))
@@ -1785,9 +1967,11 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
                     continue
                 _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
                              type(op).__name__, next(iter(timings.values()), None))
-        if timed:
-            _store(kind, timed)
-        return dumps_picks(kind, decisions)
+        # Each derived config the stored entries carry its GPU's (`_entry`).
+        with _placed_in(placed):
+            if timed:
+                _store(kind, timed)
+            return dumps_picks(kind, decisions)
 
     text = _coordination.broadcast_from_process_zero(_coordination.agreed("settling kernel configs", decided))
     picked = _keyed([(_launch(entry), _timings(entry["timings"])) for entry in json.loads(text)["data"]])
@@ -1797,7 +1981,8 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     def launched() -> list[Hashable]:
         # The configs the launches take, as the trace read them; tokamax's ignore-cache setting keeps
         # the picks None.
-        return [_config(_pick(ba)) for _, ba in found]
+        with _placed_in(placed):
+            return [_config(_pick(ba)) for _, ba in found]
 
     traced = launched()
     for op, ba in found:
@@ -1810,23 +1995,34 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     if any(_coordination.from_every_process(changed)):
         # A program lowered again traces again, with the picks it now reads.
         _cache.KERNEL_TUNES.set_global(_cache.KERNEL_TUNES.get_global() + 1)
-    return sum(_pick(ba) is None for _, ba in found)
+    with _placed_in(placed):
+        return sum(_pick(ba) is None for _, ba in found)
 
 
 @contextlib.contextmanager
-def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
+def pinned(configs: Mapping[type[KernelOp] | tuple[type[KernelOp], Hashable], Hashable]) -> Iterator[None]:
     """Each launch of a kernel `configs` names, traced within, takes that
     config where its space at the launch's key holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
-    and for a lab that times one. An enclosing block's pins of other kinds
-    hold within it too, a kind it pins again taking its own (M-NA-5: a
-    decode's pin of its attention forward dropped a lab's pin of its merged
+    and for a lab that times one. A kernel named with a key (`(kind, key)`, a launch's
+    `autotuning_cache_key`) pins its launch at that key alone, before any pin of its kind: a config one
+    launch of a kind refuses (a forward's tile its transposed gradient spills) is held to the gate at the
+    launch that takes it. An enclosing block's pins of other kinds hold within it too, a kind it pins again
+    taking its own (M-NA-5: a decode's pin of its attention forward dropped a lab's pin of its merged
     launch)."""
     held = {**dict(_cache.KERNEL_PINS.value), **configs}
     # In one order whatever order `configs` names them, so equal pins are one trace context (the head
     # review of row 12169).
-    with _cache.KERNEL_PINS(tuple(sorted(held.items(), key=lambda pin: _named(pin[0])))):
+    with _cache.KERNEL_PINS(tuple(sorted(held.items(), key=lambda pin: _pin_name(pin[0])))):
         yield
+
+
+def _pin_name(pinned: type[KernelOp] | tuple[type[KernelOp], Hashable]) -> str:
+    """A pin's kind's name (`_named`), its key's beside it where it names one (any hashable key, as its
+    `repr` states it)."""
+    if isinstance(pinned, tuple):
+        return f"{_named(pinned[0])} at {pinned[1]!r}"
+    return _named(pinned)
 
 
 @contextlib.contextmanager
@@ -1841,10 +2037,10 @@ def pinned_where_taken[Op: KernelOp](op: Op, ba: tokamax.BoundArguments) -> Iter
     if op.config is not None and not op.pinnable(ba, op.completed(ba, op.config)):
         op = op.replace(config=None)
     kind = type(op)
-    pins = dict(_cache.KERNEL_PINS.value)
-    if kind not in pins or op.pinnable(ba, op.completed(ba, pins[kind])):
+    if (pin := op.pinned(ba)) is None or op.pinnable(ba, pin):
         yield op
         return
-    with _cache.KERNEL_PINS(tuple((pinned_kind, config) for pinned_kind, config in _cache.KERNEL_PINS.value
-                                  if pinned_kind is not kind)):
+    # Its kind's pins set aside, at any key.
+    with _cache.KERNEL_PINS(tuple((pinned, config) for pinned, config in _cache.KERNEL_PINS.value
+                                  if (pinned[0] if isinstance(pinned, tuple) else pinned) is not kind)):
         yield op

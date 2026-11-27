@@ -197,7 +197,7 @@ def _port_holds_check_1(case):
     # it).
     variants = configs_by_kernel(functools.partial(run, 0), inputs)
     if any(len(found) > 1 for found in variants.values()):
-        forms += [pinned({kernel: found[i] for kernel, found in variants.items() if len(found) > i})
+        forms += [pinned(dict(found[i] for found in variants.values() if len(found) > i))
                   for i in range(max(len(found) for found in variants.values()))]
     count = len(forms)
     assert_as_exact(jax.jit(lambda index, arrays: tuple(form(index, arrays) for form in forms)),

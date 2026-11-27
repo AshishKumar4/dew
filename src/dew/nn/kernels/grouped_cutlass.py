@@ -10,11 +10,14 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn import sharding
+from dew.telemetry.instrumentation import LAUNCH
 
 from . import generation
 from .grouped_launch import _GroupedLaunch
+from .templates import report
 from .templates.axes import GROUPS
 from .templates.gemm import tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
@@ -27,10 +30,15 @@ def _cutlass_call(target: int, out: jax.ShapeDtypeStruct, *operands, **attribute
     checked `shard_map` its operands vary alike and its result varies as they do (`sharding.varied_alike`,
     `sharding.computed_from`): an FFI call requires the first and states its result's type as given, so a
     layer's matrices sliced at each device's own layer (`CutlassGmm._fwd`) were typed the same on every
-    device (#3976's review P0)."""
+    device (#3976's review P0). It carries the digest of the launch tracing it (`instrumentation.LAUNCH`),
+    which a tuning run reads its reach by (`tuning.reach`)."""
     name = importlib.import_module('dew_cutlass').TARGETS[target]
     call = jax.ffi.ffi_call(name, sharding.computed_from(out, *operands), vmap_method='sequential')
-    return call(*sharding.varied_alike(operands), **attributes)
+    # Its launch's digest a frontend attribute (`instrumentation.LAUNCH`): its target names no launch.
+    if (digest := report.launch_digest()) is None:
+        return call(*sharding.varied_alike(operands), **attributes)
+    with set_xla_metadata(**{LAUNCH: digest}):
+        return call(*sharding.varied_alike(operands), **attributes)
 
 
 def cutlass_tile(architecture: str, out_dtype) -> tiling.Tiles:

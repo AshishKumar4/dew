@@ -72,9 +72,14 @@ def _register_mosaic_gpu_lowerings() -> None:
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
-    its `name`, which its profile names it by, its body traced as a launch's (`_traced`), its outputs typed
-    as its operands make them (`_typed`); an `out_shape` stating its outputs as its operands' axes
-    (`outputs.Output`) its shapes, its call declaring their dimensions (`outputs.declared`)."""
+    its `name` and the launch tracing it (`report.named`: its digest beside, which its profile names it by
+    and a tuning run reads its launch back by, `tuning._reached`), its body traced as a launch's
+    (`_traced`), its outputs typed as its operands make them (`_typed`); an `out_shape` stating its outputs
+    as its operands' axes (`outputs.Output`) its shapes, its call declaring their dimensions
+    (`outputs.declared`)."""
+    from dew.nn.kernels.templates import report
+
+    name = report.named(name)
     _register_triton_lowerings()
     out_shape = params.get("out_shape")
     traced = _traced(kernel, params.get("interpret"))

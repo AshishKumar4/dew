@@ -536,9 +536,9 @@ def each_config_holds(kernel, functions, draw, labels, seeds):
     # Each config's site its own: a GPU flow's cells share their test's store, which holds one site a label
     # (the norm cells' "y x scale" at every kernel, dtype, row shape and config collided there).
     over = ", ".join(f"{np.shape(leaf)} {np.dtype(leaf.dtype).name}" for leaf in jax.tree.leaves(operands))
-    for config in configs:
+    for pin, config in configs:
         try:
-            with tuning.pinned({kernel: config}):
+            with tuning.pinned({pin: config}):
                 compare(functions, draw, labels, seeds, site=f", {kernel.__name__} at {config} over {over}")
         except AssertionError as error:
             error.add_note(f"{kernel.__name__} at {config}")

@@ -27,6 +27,37 @@ def _named(value):
     return value.name if isinstance(value, jcore.Primitive) else None
 
 
+@pytest.mark.parametrize(("probe", "rounded", "wrong"), [
+    (ic.tanh_reach, np.tanh, np.float32(np.nan)), (ic.tanh_reach, np.tanh, np.float32(1.5)),
+    (ic.exp2_reach, np.exp2, np.float32(np.nan)), (ic.exp2_reach, np.exp2, np.float32(-1.0)),
+    (ic.exp2_reach, np.exp2, np.float32(np.inf))])
+def test_a_reach_probe_refuses_a_result_no_rounding_gives(probe, rounded, wrong):
+    """A lane's tanh or exp2 whose result at zero is no rounding of it (a quiet NaN, a tanh past 1, a negative
+    exp2, an infinite exp2 where 2^0 is 1) is refused before its reach is measured
+    (`interval_certificates.tanh_reach`, `exp2_reach`), never read as two billion grid steps; the function
+    rounded in fp32 is measured."""
+    def lane(x):
+        return np.where(x == 0, wrong, rounded(x).astype(np.float32))
+
+    assert probe(lambda x: rounded(x).astype(np.float32)) <= 1
+    with pytest.raises(ArithmeticError):
+        probe(lane)
+
+
+def test_an_exp2_reach_measures_a_lane_overflowing_where_its_rounding_does():
+    """Over (128, 129), where 2^x rounded in fp32 is infinite (`op_certificates.exp2_rounded`), an exp2
+    overflowing there is exact, its reach measured over the finite results (none), not refused; one finite
+    there, its last fp32 value, is refused (`interval_certificates.exp2_reach`)."""
+    def overflowing(x):
+        with np.errstate(over="ignore"):
+            return np.exp2(x).astype(np.float32)
+
+    assert ic.exp2_reach(overflowing, low=128.0, high=129.0) == 0
+    with pytest.raises(ArithmeticError):
+        ic.exp2_reach(lambda x: np.full(x.shape, np.finfo(np.float32).max, np.float32), low=128.0,
+                      high=129.0)
+
+
 def test_an_operation_is_its_primitive_and_another_bearing_its_name_is_refused():
     """Check 2 knows an operation by its primitive object: one of another library's or a user's that bears
     the name of JAX's `add`, and here even computes a sum, has no contract and is refused, where a lookup by

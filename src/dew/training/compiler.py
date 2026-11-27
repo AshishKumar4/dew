@@ -27,7 +27,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.batches import batch_layout, batch_shardings, batch_signature
 from dew.distributed.placement import Validation, allocated_bytes, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import GpuTarget, assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import (
     OuterProgram,
     abstract_signature,
@@ -1540,7 +1540,7 @@ class StepCompiler[L, E]:
         _log.info("AutoPGLE's profile of a host step's %d trial steps (%d bytes) guided %d of its %d "
                   "accelerator programs", runs, len(profile), len(guided), len(ran))
 
-    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str
+    def _lowered_host(self, stepping: Stepping, state: TrainState, batch: Batch, target: str | GpuTarget
                       ) -> list[tuple[str, jax.stages.Lowered]]:
         """The host step's programs lowered for a GPU of the CUDA `target` this host is not (`lower_for`):
         built as `_compile_host` builds it, under the target's choices (`generation.assumed`) and over an

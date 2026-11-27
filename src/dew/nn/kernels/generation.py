@@ -1166,7 +1166,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
                                memory=memory or target.memory)
 
 
-def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
+def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str | GpuTarget) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`dew.training.ahead.Lowered`;
@@ -1180,8 +1180,9 @@ def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     cores and capability are. A program traced on it lowers with `lowering_platforms=('cuda',)`: JAX resolves
     a `gpu` platform it is not given through the backends this process has."""
     from jax.sharding import AbstractDevice, AbstractMesh
-    target = gpu_target(generation)
-    version = capability(generation)
+    # A generation's canonical GPU, or a target's own SKU (an attached GPU's facts, `gpu_target()`).
+    target = generation if isinstance(generation, GpuTarget) else gpu_target(generation)
+    version = capability(target.generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
     device = AbstractDevice(device_kind=target.device_kind, num_cores=target.multiprocessors, platform='gpu',

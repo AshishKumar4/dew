@@ -15,13 +15,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 import tokamax
-from lane_environment import DETERMINISTIC_OPS
+from lane_environment import DETERMINISTIC_OPS, without_flags
 from process_support import READ_ONLY, fresh, keeping_picks, run_pool
 from reference_error import equations
 from tuned import recorded
 
 from dew.nn.activations import gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
+from dew.nn.kernels.templates import assembled
 from dew.nn.norms import stream_rms_normalized
 from dew.telemetry import compiles
 
@@ -68,7 +69,8 @@ def launches(function, *args) -> dict[str, tuple[tuple[int, ...], int]]:
 def launched(program) -> list[list]:
     """Each Pallas launch of the traced `program` (a closed jaxpr), its sub-programs' included, as
     `[kernel name, grid, warps]`, in the order traced."""
-    return [[str(eqn.params["name"]), list(eqn.params["grid_mapping"].grid),
+    # Each kernel's name less its launch's digest (`report.named`).
+    return [[assembled.kernel_of(str(eqn.params["name"]))[0], list(eqn.params["grid_mapping"].grid),
              eqn.params["compiler_params"].num_warps]
             for eqn in equations(program.jaxpr) if eqn.primitive.name == "pallas_call"]
 
@@ -110,7 +112,7 @@ with tuning.reading():
     # Whether every launch of the step has a stored pick, every process taking process 0's (`_settle`).
     with tuning.seen() as traced:
         step().lower(*operands(15))
-    settled = tuning._settle(list(traced), measure=False) == 0
+    settled = tuning._settle(list(traced), measure=False, placed=traced.placed[0]) == 0
 print(json.dumps([found, settled]))
 """
 
@@ -124,6 +126,59 @@ def test_a_pin_of_another_kind_within_a_pinned_block_keeps_the_blocks_pins():
           tuning.pinned({norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)})):
         nested = launches(step(), *operands(15))
     assert nested["rms_norm_forward"] == ((15,), 1) and nested["swiglu_forward"] == ((1, 1), 8), nested
+
+
+def test_a_pin_at_a_launchs_key_holds_that_launch_alone():
+    """A pin of a kind at a launch's key (`tuning.pinned`'s `(kind, key)`) holds the launch at that key and
+    no other of its kind: the 15-row norm takes it, the 40-row one its own heuristic, as unpinned (a config
+    one launch of a kernel refuses is gated at the launch that takes it, `tests/tuned.each_config`)."""
+    with tuning.seen() as traced:
+        jax.make_jaxpr(step())(*operands(15))
+    key = next(keyed.autotuning_cache_key for op, keyed in traced if type(op) is norm_swiglu.RmsForward)
+    with tuning.pinned({(norm_swiglu.RmsForward, key): norm_swiglu.RowsConfig(1, 1)}):
+        at_key, elsewhere = launches(step(), *operands(15)), launches(step(), *operands(40))
+    assert at_key["rms_norm_forward"] == ((15,), 1) and elsewhere == launches(step(), *operands(40))
+
+
+def test_a_steps_observed_launches_are_rebuilt_whole_in_another_process():
+    """A trace's launches kept past it (`Seen.held`), as a prepare's record keeps them for its GPU run
+    (`arm_store`), pickled and read back: each launch, its config, arguments and digest as observed, its
+    placement's abstract mesh alone (its concrete devices this process's), as a fresh process reads them."""
+    import pickle
+
+    mesh = jax.make_mesh((1,), ("data",), devices=jax.devices("cpu")[:1],
+                         axis_types=(jax.sharding.AxisType.Explicit,))
+    with tuning.seen() as traced, jax.set_mesh(mesh):
+        jax.make_jaxpr(step())(*operands(15))
+    held = traced.held()
+    read = pickle.loads(pickle.dumps(held))
+    assert len(read) == len(held) > 0 and [tuple(observed) for observed in read] == [tuple(o) for o in held]
+    assert read.taken == held.taken and read.launched == held.launched
+    assert [placed.abstract for placed in read.placed] == [placed.abstract for placed in held.placed]
+    assert all(placed.concrete.empty for placed in read.placed)
+    assert not any(placed.concrete.empty for placed in held.placed)
+
+
+def test_a_pools_processes_agree_on_their_reach_as_the_store_names_it():
+    """A tuning run's processes agree on what their lowerings reach before any settles (`_agreed_reach`,
+    through `_coordination.agreed_same`, which refuses a reach that differs, or a process failing to state
+    its own, on every process alike): its launches as the store names them (their ops' whole identities and
+    arguments: another revision of an op names another), their GPU models and the foreign kernels. A launch
+    no JSON names (an object its static) fails as its reach is stated, within the agreement."""
+    with tuning.seen() as traced:
+        jax.make_jaxpr(step())(*operands(15))
+    reached = tuning.Reach(tuning._distinct(list(traced)), ("a foreign kernel",), frozenset(traced.placed))
+    stated = []
+    tuning._agreed_reach(reached, agree=lambda phase, find: stated.append(find()))
+    [(launched, models, foreign)] = stated
+    op, ba = reached.launches[0]
+    revised = tokamax.BoundArguments(op.replace(revision=op.revision + 1), ba.arguments)
+    assert tuning._launch_json(ba) in launched and tuning._launch_json(revised) not in launched
+    assert models == [jax.devices()[0].device_kind] and foreign == ["a foreign kernel"]
+    static = next(name for name in ba.arguments if name not in op.HOOKS)
+    unnamed = tokamax.BoundArguments(op, {**ba.arguments, static: object()})
+    with pytest.raises(TypeError):
+        tuning._agreed_reach(tuning.Reach([(op, unnamed)], (), frozenset()))
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
@@ -320,8 +375,8 @@ def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick
     for process, held in stores.items():
         stored = tuple((keyed(count), tuning.Timings({norm_swiglu.RowsConfig(*config): timing}))
                        for count, config in held.items())
-        (picks / f"process{process}.json").write_text(tuning.dumps_picks(jax.devices()[0].device_kind,
-                                                                         stored))
+        (picks / f"process{process}.json").write_text(tuning.dumps_picks(
+            generation.gpu_target("sm80").device_kind, stored))
     reports = run_pool("settle", tmp_path / "pool", 2, script=Path(__file__).with_name("tuning_worker.py"),
                        cache=tmp_path / "cache", picks=picks, rows=",".join(map(str, rows)))
     assert reports[0] == reports[1]
@@ -372,7 +427,7 @@ stamp = os.stat(path).st_mtime_ns if os.path.exists(path) else None
 with tuning.reading():
     with tuning.seen() as traced:
         step().lower(*operands(int(sys.argv[1])))
-    settled = tuning._settle(list(traced), measure=False) == 0
+    settled = tuning._settle(list(traced), measure=False, placed=traced.placed[0]) == 0
 print(json.dumps([path, stamp, settled, lowered]))
 """
 
@@ -612,18 +667,14 @@ def test_a_checkout_whose_kernel_drops_an_operand_keeps_the_others_picks_of_it(t
     assert (theirs, foreign) == ({json.dumps(["return_residuals", "shift", "x"]): [4, 2]}, 1)
 
 
-def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
-    """`tuning._kind`, read through public jax as tokamax reads a launch's GPU for its cache: a traced
-    launch under a mesh of abstract A100s (`generation.gpu_mesh`, `Trainer.lower_for`) is the A100's,
-    whatever this host is; a concrete one is its operands' device's; neither, the default device's."""
+def test_a_launch_is_chosen_for_the_gpu_its_mesh_names():
+    """`tuning._context_kind`, read through public jax as tokamax reads a launch's GPU for its cache: a launch
+    traced under a mesh of abstract A100s (`generation.gpu_mesh`, `Trainer.lower_for`) is the A100's,
+    whatever this host is; under none, the default device's."""
     mesh = jax.make_mesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Explicit,))
-    shape = jax.ShapeDtypeStruct((8, 64), jnp.bfloat16)
-    keyed = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": shape})
     with jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm80")):
-        assert tuning._kind(keyed) == generation.gpu_target("sm80").device_kind
-    assert tuning._kind(keyed) == jax.devices()[0].device_kind
-    concrete = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": jnp.ones((8, 64), jnp.bfloat16)})
-    assert tuning._kind(concrete) == jax.devices()[0].device_kind
+        assert tuning._context_kind() == generation.gpu_target("sm80").device_kind
+    assert tuning._context_kind() == jax.devices()[0].device_kind
 
 
 class _Holding:
@@ -650,17 +701,100 @@ def _doubled(x):
     return 2 * x
 
 
+def _defaulted(array, *, keyword: bool, listed: bool = False):
+    """A hook function of no closure (each name it reads its own) holding `array` as a default of its own,
+    positional or keyword-only, alone or in a list."""
+    if listed:
+        held = [array]
+
+        def hook(x, *, by=held):
+            return x * by[0].shape[0]
+    elif keyword:
+        def hook(x, *, by=array):
+            return x * by.shape[0]
+    else:
+        def hook(x, by=array):
+            return x * by.shape[0]
+    return hook
+
+
+@dataclasses.dataclass
+class _Options:
+    """A hook's options, a parent among them, which may be the options themselves."""
+
+    factor: float
+    parent: object = None
+
+
+@dataclasses.dataclass
+class _Lazy:
+    """A hook's options, one field set only once it is computed (`init=False`), unset here."""
+
+    factor: float
+    computed: float = dataclasses.field(init=False, repr=False, compare=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class _LazyHook:
+    """A hook object, one field set only once it is computed (`init=False`), unset here."""
+
+    factor: float
+    computed: float = dataclasses.field(init=False, repr=False, compare=False)
+
+    def __call__(self, x):
+        return x * self.factor
+
+
+def _lazily_defaulted():
+    """A hook function of no closure whose keyword-only default leaves a field of its own unset."""
+    options = _Lazy(2.0)
+
+    def hook(x, *, by=options):
+        return x * by.factor
+
+    return hook
+
+
+def _cyclic(*, listed: bool):
+    """A hook function of no closure whose default holds itself: a list holding itself, read by its length,
+    or options whose parent is themselves, read by their factor."""
+    if listed:
+        ring: list = []
+        ring.append(ring)
+
+        def hook(x, *, by=ring):
+            return x * len(by)
+    else:
+        options = _Options(2.0)
+        options.parent = options
+
+        def hook(x, *, by=options):
+            return x * by.factor
+    return hook
+
+
 @pytest.mark.parametrize(("made", "cached", "made_here"),
                          [(lambda: _doubled, True, False), (lambda: _Scaled(2.0), True, True),
-                          (lambda: _Holding(jnp.ones(3)), False, True), (lambda: jnp.tanh, False, False)],
-                         ids=["function", "dataclass", "array-holding-object", "jitted-callable"])
+                          (lambda: _Holding(jnp.ones(3)), False, True), (lambda: jnp.tanh, False, False),
+                          (lambda: _defaulted(jnp.ones(3), keyword=False), False, True),
+                          (lambda: _defaulted(jnp.ones(3), keyword=True), False, True),
+                          (lambda: _defaulted(jnp.ones(3), keyword=True, listed=True), False, True),
+                          (lambda: _cyclic(listed=True), False, True),
+                          (lambda: _cyclic(listed=False), False, True), (_lazily_defaulted, False, True),
+                          (lambda: _LazyHook(2.0), False, True)],
+                         ids=["function", "dataclass", "array-holding-object", "jitted-callable",
+                              "array-default", "array-keyword-default", "listed-array-default",
+                              "cyclic-list-default", "cyclic-dataclass-default", "unset-field-default",
+                              "unset-field-object"])
 def test_a_launch_lowered_once_keeps_its_program_only_for_a_hook_it_may_hold(made, cached, made_here):
     """`tuning.lowered_once` keeps a launch's program for a static hook it may hold (a function of no closure,
     a dataclass of values), holding the hook: its second call traces nothing (JAX's trace events). One that
-    may reach an array (a callable object's attributes, which no check sees, a jitted function's among them)
-    runs the launch itself, and once the caller lets it go nothing the launch kept holds it. Every call
-    computes the hook's value. (Each hook made in the test: an array drawn as the module loads would start
-    JAX's backend before a worker process joins its pool, `tuning_worker`.)"""
+    may reach an array (a callable object's attributes, which no check sees, a jitted function's among them;
+    a function's default, keyword-only or not, alone or in a list; a mutable default, one holding itself, or
+    one leaving a field of its own unset, or such an object itself) runs the launch itself, and once the
+    caller lets it go nothing the launch kept holds it. Every call computes the hook's value. (Each hook
+    made in the test: an array drawn as the module loads would start JAX's backend before a worker process
+    joins its pool, `tuning_worker`.)"""
     hook = made()
 
     @tuning.lowered_once(("hook",))
@@ -727,12 +861,18 @@ def test_a_prepared_hook_pickles_as_its_source_and_is_rebuilt_by_the_constructor
         assert jnp.array_equal(loaded(scores), made(scores))
 
 
+def _foreign(lowered) -> tuple[str, ...]:
+    # The foreign kernels a run of `lowered` may reach, no launch traced (`tuning.reach`).
+    return tuning.reach(tuning.Seen(), lowered).foreign
+
+
 def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_compiler():
     """A TPU step none of whose kernel launches is Dew's, another library's Pallas TPU kernel alone (JAX's
     Splash attention's kind), lowered for a TPU here: a measuring tuning run of it would measure nothing it
-    asked for, so its kernels are named by their compiler (`tuning._foreign_kernels`, which `tune` refuses
+    asked for, so its kernels are named by their compiler (`tuning.reach`'s foreign, which `tune` refuses
     with as `Untunable`), never passed by as a GPU's Triton kernels alone were (row 13534); in a branch of a
-    conditional a run may take as in the step's own flow. The same kernel behind a while loop of no trips (a
+    conditional a run may take as in the step's own flow, not in one its trace decided against (whose arms JAX
+    lowers both). The same kernel behind a while loop of no trips (a
     counted one's, or one whose condition its trace decided false), which no run reaches though JAX lowers
     it, beside a step's own XLA work, names none (row 13559). A step of
     Dew's own Mosaic GPU launches (the attention template's, lowered for an H100) names none: each call
@@ -752,13 +892,19 @@ def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_
     rows = jax.ShapeDtypeStruct((8, 128), jnp.float32)
 
     def foreign_of(fn):
-        return tuning._foreign_kernels(jax.jit(fn).trace(rows).lower(lowering_platforms=("tpu",)))
+        return _foreign(jax.jit(fn).trace(rows).lower(lowering_platforms=("tpu",)))
 
     foreign = foreign_of(step)
     assert foreign and all(name.startswith("mosaic_tpu: ") for name in foreign), foreign
     assert "mosaic_tpu: " in str(tuning.Untunable(foreign))
     # Taken where the data says: a run may take either branch.
     assert foreign_of(lambda x: jax.lax.cond(x[0, 0] > 0, step, lambda y: y + 1, x)) == foreign
+    # A conditional its trace decided (a Python predicate's), both its arms lowered: its selected arm alone.
+    for taken in (False, True):
+        decided = jax.jit(lambda x, taken=taken: jax.lax.cond(taken, step, lambda y: y + 1, x)).trace(
+            rows).lower(lowering_platforms=("tpu",))
+        assert any(call.kind == "mosaic_tpu" for call in kernel_calls(decided, unrun=True))
+        assert _foreign(decided) == (foreign if taken else ())
     # Behind a loop of no trips, a counted one's (from 0 while below 0) or one whose condition its trace
     # decided false, beside the step's own work: lowered all the same, no run launches it. (A fori_loop or
     # scan of no trips JAX lowers no body for at all.)
@@ -769,7 +915,7 @@ def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_
     for never in (counted, lambda x: jax.lax.while_loop(lambda _: False, step, x) * 2 + 1):
         lowered_never = jax.jit(never).trace(rows).lower(lowering_platforms=("tpu",))
         assert any(call.kind == "mosaic_tpu" for call in kernel_calls(lowered_never, unrun=True))
-        assert tuning._foreign_kernels(lowered_never) == ()
+        assert _foreign(lowered_never) == ()
 
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
@@ -778,4 +924,61 @@ def test_a_tpu_step_of_another_librarys_kernels_alone_is_named_untunable_by_its_
                                                                        (1, 512, 2, 64))]
     owned = lowered_for(attended, shapes, "sm90")
     assert any(call.kind == "mosaic_gpu" for call in kernel_calls(owned, unrun=True))
-    assert tuning._foreign_kernels(owned) == ()
+    assert _foreign(owned) == ()
+
+
+def test_a_steps_reach_holds_its_live_launch_and_not_its_dead_one():
+    """A step tracing the fused RMS norm's launch at two shapes, one in its own flow and one in a loop no run
+    enters, reaches the live one alone (`tuning.reach`, what `tune` settles and tools/kernel_picks.py
+    counts), though both traced, and no foreign kernel."""
+    from kernel_compile import live_and_dead, lowered_for
+
+    shapes = [jax.ShapeDtypeStruct((256, 64), jnp.float32), jax.ShapeDtypeStruct((64,), jnp.float32),
+              jax.ShapeDtypeStruct((256, 128), jnp.float32), jax.ShapeDtypeStruct((128,), jnp.float32)]
+    with generation.assumed("sm90"), tuning.seen() as found:
+        lowered = lowered_for(live_and_dead(plain), shapes, "sm90")
+        # The live launch's own step, its key the one a reach holds.
+        with tuning.seen() as alone:
+            lowered_for(plain, shapes[:2], "sm90")
+    reached = tuning.reach(found, lowered)
+    assert len(tuning._distinct(list(found))) == 2 and reached.foreign == ()
+    assert {placed.abstract.abstract_device.device_kind for placed in reached.placed} == {
+        generation.gpu_target("sm90").device_kind}
+    assert [ba.autotuning_cache_key for _, ba in reached.launches] == [
+        ba.autotuning_cache_key for _, ba in tuning._distinct(list(alone))]
+
+
+def test_a_dew_launch_no_run_reaches_leaves_a_steps_foreign_kernels_untunable(monkeypatch):
+    """A measuring tuning run of a step (`tuning.tune`, on an assumed H100) whose Dew launch, the fused RMS
+    norm's Triton kernel (named for its launch by `launches.pallas_call`), is traced only in a loop no run
+    enters, beside another library's Triton kernel the step runs, is refused as the foreign kernel's alone
+    (`Untunable`), where counting every traced launch passed it by (row 13715); the same launch in the step's
+    own flow is reached and the step lowered. Measurement off at the device's boundary (XLA's read-only
+    autotune cache, `dew._cache.measures_picks`)."""
+    from jax.experimental import pallas as pl
+    from kernel_compile import lowered_for
+
+    monkeypatch.setenv("XLA_FLAGS", f"{without_flags(keeping_picks(), READ_ONLY.split('=')[0])} {READ_ONLY}")
+
+    def doubled(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    def foreign(x):
+        return pl.pallas_call(doubled, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+    def unreached(x, scale):
+        held = jax.lax.while_loop(lambda _: False, lambda held: (plain(*held), held[1]), (x, scale))
+        return foreign(held[0])
+
+    def reached(x, scale):
+        return foreign(plain(x, scale))
+
+    shapes = [jax.ShapeDtypeStruct((256, 64), jnp.float32), jax.ShapeDtypeStruct((64,), jnp.float32)]
+    with generation.assumed("sm90"):
+        with pytest.raises(tuning.Untunable):
+            tuning.tune(lambda: lowered_for(unreached, shapes, "sm90"), measure=True)
+        # Its program and its reach, the launch a run makes (`tuning.tuned`), no further lowering to count it.
+        tuned = tuning.tuned(lambda: lowered_for(reached, shapes, "sm90"), measure=True)
+        assert tuned.lowered is not None and len(tuned.reached.launches) == 1 and tuned.reached.foreign
+
+

@@ -630,8 +630,10 @@ def _parameter_key_other(value, kind: type, seen: set[int]) -> Hashable:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         if kind.__eq__ is object.__eq__:
             return "object", _named(kind), _Identity(value)
+        # A field left unset (`init=False`, never assigned) keyed as such, never read.
         return _cycle_guard(value, kind, seen, reject_device=False, build=lambda: (
-            "record", _named(kind), tuple((f.name, _parameter_key(getattr(value, f.name), seen))
+            "record", _named(kind), tuple((f.name, _parameter_key(getattr(value, f.name), seen)
+                                           if hasattr(value, f.name) else (f.name, "unset"))
                                           for f in dataclasses.fields(value))))
     if (boxed := _container_param_key(value, kind, lambda part: _parameter_key(part, seen), seen,
                                       reject_device=False)) is not None:

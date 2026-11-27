@@ -1,6 +1,7 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
 import dataclasses
+import functools
 import json
 import logging
 import math
@@ -215,7 +216,8 @@ def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
     (`tuning.lowered_once`): the kernel report counts the branch of the most stated FLOPs alone, three
     calls of one call's launches, and the FLOP count of the same program counts the same, as a run takes
     one branch of each (the scaled attention forward's kernels beside the common ones,
-    `attention_algebra.may_scale`)."""
+    `attention_algebra.may_scale`); a branch holding a conditional its trace decided is charged that
+    conditional's selected arm, not its largest (row 13714)."""
     from dew.nn.kernels import gemm
     from dew.telemetry.instrumentation import hlo_flops
 
@@ -223,11 +225,13 @@ def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
         return sum(gemm.gemm(x * (index + 1), w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
                    for index in range(count))
 
-    def step(x, w, sizes, taken, inner):
-        def nested():
-            return jax.lax.cond(inner, lambda: calls(x, w, sizes, 2), lambda: calls(x, w, sizes, 3))
+    def nested(outer: int, first: int, second: int):
+        # A conditional of `outer` calls beside one choosing `first` calls or `second` by its `inner`.
+        def step(x, w, sizes, taken, inner):
+            return jax.lax.cond(taken, lambda: calls(x, w, sizes, outer), lambda: jax.lax.cond(
+                inner, lambda: calls(x, w, sizes, first), lambda: calls(x, w, sizes, second)))
 
-        return jax.lax.cond(taken, lambda: calls(x, w, sizes, 1), nested)
+        return step
 
     x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
     sizes, flag = jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((), jnp.bool_)
@@ -239,13 +243,18 @@ def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
             lowered = jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",))
         return lowered, kernel_report(found, lowered).record()
 
-    lowered, record = lowered_report(step, x, w, sizes, flag, flag)
+    lowered, record = lowered_report(nested(1, 2, 3), x, w, sizes, flag, flag)
     _, alone = lowered_report(lambda x, w, sizes: calls(x, w, sizes, 1), x, w, sizes)
     once = templated_calls(alone)
     assert once and templated_calls(record) == {name: 3 * count for name, count in once.items()}
     templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None and flops.hardware == sum(entry["flops"] for entry in templated) > 0
+    # A conditional its trace decided, both its arms lowered, charged its selected arm alone: beside a branch
+    # of two calls, a branch deciding against five for one is the smaller, so the two are counted.
+    decided = False
+    _, record = lowered_report(functools.partial(nested(2, 5, 1), inner=decided), x, w, sizes, flag)
+    assert templated_calls(record) == {name: 2 * count for name, count in once.items()}
 
 
 @pytest.mark.parametrize(("start", "bound", "step", "bits", "signed", "trips"), [
@@ -385,7 +394,7 @@ def test_the_compensated_norm_vjp_lowers_for_both_gpu_generations(generation):
         jax.jit(forward_backward).trace(x, scale, x).lower(lowering_platforms=('cuda',))
 
 
-def _step_lowered(generation: str):
+def _step_lowered(generation: str | GpuTarget):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
@@ -416,6 +425,20 @@ def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
     """A Qwen 3.5 hybrid's training step, its gated delta nets, attention, norms and SwiGLU, lowers on this
     CPU for every GPU Dew's sessions take (`GPUS`): its dry run raises the `Lowered` program."""
     _step_lowered(generation)
+
+
+def test_a_step_lowered_for_a_gpus_own_sku_traces_its_launches_for_that_model():
+    """`lower_for` given a GPU's own target (`gpu_target` of a GH200, as tools/kernel_picks.py gives its
+    attached GPU's) lowers the step for that SKU, not its generation's canonical GPU (an H100): the
+    `Lowered` names its generation, and each launch traced for it is that model's (`tuning.seen`'s
+    placements, `tuning._mesh_kind`), so the tuner measures it on that GPU and stores it under its kind."""
+    from dew.nn.kernels import tuning
+
+    gh200 = gpu_target("NVIDIA GH200 480GB")
+    with tuning.seen() as traced:
+        lowered = _step_lowered(gh200)
+    assert lowered.generation == "sm90" and traced.placed
+    assert {tuning._mesh_kind(placed) for placed in traced.placed} == {gh200.device_kind}
 
 
 @pytest.mark.usefixtures("scanned_stacks")
@@ -471,6 +494,7 @@ def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step(
 
     import dew
     from dew.nn.backbones import CausalTransformer
+    from dew.nn.kernels.templates import assembled
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
     from dew.training._lowering import Lowered
@@ -482,7 +506,9 @@ def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step(
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with dew.kernels.use(rms_norm="pallas"), pytest.raises(Lowered) as lowered:
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
-    assert {"rms_norm_forward", "rms_norm_backward"} <= set(triton_kernels(lowered.value.lowered))
+    # Each kernel's name less its launch's digest (`report.named`).
+    kernels = {assembled.kernel_of(name)[0] for name in triton_kernels(lowered.value.lowered)}
+    assert {"rms_norm_forward", "rms_norm_backward"} <= kernels
 
 
 def test_a_full_remat_runs_check_lowers_its_step_at_each_modules_whole_recomputation():
