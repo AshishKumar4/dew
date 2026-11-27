@@ -23,9 +23,9 @@ def _packed(node) -> bool:
 
 def _record(node) -> bool:
     """Whether `node` is a packed matrix's checkpoint record (`formats.RECORDS`)."""
-    from dew.nn.kernels.formats import RECORDS
+    from dew.nn.kernels.formats import RECORD_TYPES
 
-    return isinstance(node, tuple(record.type for record in RECORDS.values()))
+    return isinstance(node, RECORD_TYPES)
 
 
 def _held_apart(node) -> bool:
@@ -98,7 +98,9 @@ def _unstored(tree, template):
     flat = jax.tree_util.tree_flatten_with_path
     typed = {path: node for path, node in flat(template, is_leaf=_packed)[0] if _packed(node)}
     read = [(path, node) for path, node in flat(tree, is_leaf=_held_apart)[0] if _held_apart(node)]
-    if not read:
+    if not read and jax.process_count() == 1:
+        # A pool's every process agrees though it holds none: another's template may hold one (a partial
+        # mapping restore's supplied bank on one process alone), and the agreement is every process's.
         return tree
 
     def rebuilt() -> dict:

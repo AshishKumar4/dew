@@ -861,6 +861,9 @@ class _Record:
 RECORDS = {cls: _Record.of(cls) for cls in PACKED_FORMATS}
 """Each packed matrix type's checkpoint record (`_Record`), by the type."""
 
+RECORD_TYPES = tuple(record.type for record in RECORDS.values())
+"""Every packed matrix's checkpoint record type (`RECORDS`), a node of a tree a checkpoint holds."""
+
 
 def record_of(matrix, form):
     """Packed `matrix`'s record (`RECORDS`) holding `form` as its digest leaf (an array, or a restore's asked

@@ -373,7 +373,8 @@ _KINDS = (
          beside=lambda value: {"dtype": str(value.dtype)}),
     _Kind("dtype", lambda value: isinstance(value, np.dtype), str,
          lambda stored: _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
-    _Kind("bytes", lambda value: isinstance(value, bytes), bytes.hex, _bytes),
+    # Built-in bytes alone (a packed matrix's form digest): a bytes-valued enum member stays an enum's.
+    _Kind("bytes", lambda value: type(value) is bytes, bytes.hex, _bytes),
     _Kind("enum", lambda value: isinstance(value, enum.Enum), lambda value: _named(type(value)), _enum_member,
          beside=lambda value: {"name": value.name}),
     _Kind("class", lambda value: isinstance(value, type), _named,
