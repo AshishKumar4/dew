@@ -170,7 +170,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's
     layout), its coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query,
     like, slots=slots)`, those riding the queries' stream the slots'). The weights and the score cotangents,
-    their keys as their rows, are dV's and dK's left operands from the registers (`algebra.value_operands`,
+    their keys as their rows, are dV's and dK's left operands from the registers (`algebra.value_weights`,
     `cotangent_product`'s `aᵀ @ b`), issued into `accumulators` in place. The key gradients' sums (`carry`)
     take the pulled cotangents' row sums, and the tile gradients go to `store_tiles(first query, pieces)`,
     `[bk, bq]` each. The consumer takes `part` of each slot's queries (`(first, count)`, `split_queries`; the
@@ -713,7 +713,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
     each; a tile's weights and score cotangents (the algebra's, rows the keys, `_dkv_step`) the transposed
-    products' left operands from the registers (`algebra.value_operands`, `cotangent_product`). Returns the
+    products' left operands from the registers (`algebra.value_weights`, `cotangent_product`). Returns the
     query head's dK and dV `[B, Kp, H, D]` fp32, then each key and tile gradient of the score hook in kind
     order (`DKV_GRADS`: keys `[B, H, Kp]`, tiles `[B, H, Qp, Kp]`, a tile parameter read and its gradient
     written keys first). A key or tile gradient is written by the one program that holds its keys; the

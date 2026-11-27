@@ -283,11 +283,11 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         # The query's document's keys within the window's places run together in document order, since
         # their places never decrease along it, and their first and last key indices bound the span.
         before, after = window_sides(causal, sliding_window)
-        query_places, key_places = _widened(positions)
+        query_places, key_places = widened_places(positions)
         ordered = _least_after(jnp.take_along_axis(key_places, order, axis=1),
                                None if key_ids is None else jnp.take_along_axis(key_ids, order, axis=1))
-        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered, _moved(query_places, -before),
-                               _moved(query_places, after))
+        start, end = _narrowed(start, end, order, run_lo, run_hi, ordered,
+                               moved_places(query_places, -before), moved_places(query_places, after))
     elif sliding_window is not None and positions is None:
         # No two places of the call lie further apart than its queries and keys, so a wider window
         # keeps what that one does, and its bounds stay within int32.
@@ -378,8 +378,9 @@ def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, nar
     by_places, windowed, positions = narrowings
     if windowed is not None:
         before, after = windowed
-        query_places, key_places = _widened(positions)
-        by_places = [*by_places, (key_places, _moved(query_places, -before), _moved(query_places, after))]
+        query_places, key_places = widened_places(positions)
+        by_places = [*by_places, (key_places, moved_places(query_places, -before),
+                                  moved_places(query_places, after))]
     start, end = _within_runs(runs, start, end, keys, by_places)
     place, own, block_groups = blocks
     if block_groups is None:
@@ -467,11 +468,11 @@ def _least_after(places: jax.Array, ids: jax.Array | None) -> jax.Array:
     return jax.lax.associative_scan(least, (places, ends), reverse=True, axis=1)[0]
 
 
-def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
+def widened_places(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Array]:
     """The queries' and keys' places in one integer dtype that holds both, in which a window's bounds move
-    (`_moved`): a bound past the narrower one's range is still a place the other may hold. A signed and an
-    unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside uint32
-    without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
+    (`moved_places`): a bound past the narrower one's range is still a place the other may hold. A signed
+    and an unsigned dtype that no enabled integer dtype holds both of (int64 beside uint64; int32 beside
+    uint32 without x64), whose promotion would leave integers or narrow one, are refused for one dtype."""
     query_places, key_places = (jnp.asarray(places) for places in positions)
     ranges = [jnp.iinfo(places.dtype) for places in (query_places, key_places)]
     least, largest = min(int(bounds.min) for bounds in ranges), max(int(bounds.max) for bounds in ranges)
@@ -484,7 +485,7 @@ def _widened(positions: tuple[jax.Array, jax.Array]) -> tuple[jax.Array, jax.Arr
                      "integer dtype that holds both: pass them in one")
 
 
-def _moved(places: jax.Array, by: int) -> jax.Array:
+def moved_places(places: jax.Array, by: int) -> jax.Array:
     """`places` moved by `by`, exactly, in their own integer dtype, held at its least and largest rather
     than wrapping: a window's bound past either end of the dtype keeps every place on that side. The move
     runs on the places' distances from the dtype's least, unsigned, which hold any shift a window makes."""
@@ -1752,13 +1753,13 @@ def head_width(width: int) -> int:
 
 
 def _padded(param: Side, queries: int, keys: int, value_width: int, *, widened: bool = True) -> jax.Array:
-    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score or output hook
-    (its gradient returns in its own dtype), in its own where not `widened` (a prologue's, which takes it as
-    the reference gives it, `prologued`): zeros past its queries, keys and value width, and a head vector
-    at a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
-    value = param.value
-    if widened and jnp.issubdtype(value.dtype, jnp.floating):
-        value = value.astype(jnp.float32)
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute a score hook (its gradient
+    returns in its own dtype, `kept_value`), in its own where not `widened` (a prologue's, which takes it as
+    the reference gives it, `prologued`; an output hook's, which `attention_algebra.finish` widens as it
+    applies the hook, so a 16-bit gate reaches a kernel at its own bytes, no convert before it: 54 us of a
+    d128 gated forward's 679, M-NA-47): zeros past its queries, keys and value width, and a head vector at
+    a power of two. A width parameter's `value_width` the width it pads to, its prologue's operand's."""
+    value = kept_value(param.value) if widened else param.value
     match kind_of(param):
         case Kind.HEAD:
             return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
@@ -1869,7 +1870,8 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score.sides),
-                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output.sides),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv, widened=False)
+                         for param in hooks.output.sides),
                    queries, keys, table, page, spans.per_span,
                    tuple(_padded(param, padded_q, padded_k, padded_d, widened=False)
                          for param in hooks.query.sides))
@@ -1878,6 +1880,11 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
 def kept_dtype(dtype) -> str:
     """A hook parameter's dtype in the kernels: fp32 for a floating one (`padded_call`), else its own."""
     return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+def kept_value(value: jax.Array) -> jax.Array:
+    """A hook parameter's values as the kernels compute its hook on them, in `kept_dtype`."""
+    return value.astype(kept_dtype(value.dtype))
 
 
 def floating_params(params) -> list[int]:
@@ -2441,7 +2448,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         state, starts, peak, total, mass, delta, low, lost, cotangent,
         functools.partial(shifted, shift=shift[:, :, None]))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
-    # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
+    # shards first and rounds once (`attention_route.attend`'s `operand_dtypes`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
     found = Gradients(dq[:, :queries, :, :width].astype(query.dtype),

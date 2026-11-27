@@ -31,7 +31,6 @@ from typing import Literal, NamedTuple, overload
 import jax
 import jax.numpy as jnp
 from jax.core import ShapedArray
-from jax.extend import core as jaxpr_core
 
 from dew.algebra import means
 from dew.nn import programs
@@ -62,17 +61,15 @@ from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 
 def packable(hooks: Hooks | None) -> bool:
-    """Whether a call's query heads can become its rows (`packed`): no score hook reading a query's place or
-    score parameter (a packed row's place is its pair's, not its query's), and no dropout; a softcap (the
-    scaled logits alone), sinks (an initial state a head), and output hooks admitted by
-    `merged.output_hook_refusal` pack (row 5385)."""
+    """Whether a call's query heads can become its rows (`packed`): no score parameter (a packed row's is
+    its pair's, not its query's) and no dropout; a score hook reads each row's own query's place
+    (`unpacked_places`), a softcap (the scaled logits alone), sinks (an initial state a head), and output
+    hooks admitted by `merged.output_hook_refusal` pack (row 5385)."""
     if hooks is None:
         return True
     if hooks.score.sides or hooks.drop is not None:
         return False
-    if merged.output_hook_refusal(hooks.output) is not None:
-        return False
-    return hooks.score.fn is None or not _reads_places(hooks.score.fn)
+    return merged.output_hook_refusal(hooks.output) is None
 
 
 def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int) -> tuple[Side, ...]:
@@ -107,14 +104,12 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
     return attention_mosaic.streams(rows, target)
 
-def _reads_places(score_mod) -> bool:
-    """Whether `score_mod(s, q_pos, k_pos)` reads its query's place: its traced program uses the argument."""
-    scores = jax.ShapeDtypeStruct((8, 8), jnp.float32)
-    places = jax.ShapeDtypeStruct((8, 8), jnp.int32)
-    traced = jax.make_jaxpr(score_mod)(scores, places, places)
-    used = {var for eqn in traced.jaxpr.eqns for var in eqn.invars if isinstance(var, jaxpr_core.Var)}
-    used |= {var for var in traced.jaxpr.outvars if isinstance(var, jaxpr_core.Var)}
-    return traced.jaxpr.invars[1] in used
+def unpacked_places(score_mod: Callable, group: int, scores, q_pos, k_pos, *params):
+    """`score_mod` on a packed step's rows (`packed`) at each row's own query's place: row `t·G + g` is
+    position `t`'s (`grouped_rows`), so the hook reads `q_pos // G`, whatever tile it is traced at, where a
+    probe of the hook at one shape let one reading its place at another read a pair's row (train 1379's
+    K-F4, row 13741)."""
+    return score_mod(scores, q_pos // group, k_pos, *params)
 
 
 def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | None = None
@@ -529,6 +524,10 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         packed_out = _packed_output_params(hooks.output.sides, heads=query.shape[2], kv_heads=kv_heads)
         whole = dataclasses.replace(hooks, initial=initial,
                                     output=dataclasses.replace(hooks.output, sides=packed_out))
+    if hooks.score.fn is not None and group > 1:
+        # Each packed row's hook at its own query's place (`unpacked_places`).
+        whole = dataclasses.replace(whole, score=dataclasses.replace(
+            whole.score, fn=functools.partial(unpacked_places, hooks.score.fn, group)))
     target = generation.gpu_target()
     # Its merge priced as the step's launch merges: a finished step's under the call's own output hook over
     # its heads (`merged_finished`), an unfinished one's to its state (`merged_split`).
@@ -567,8 +566,8 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if not finished and hooks.output.fn is not None:
         raise ValueError("an unfinished decode step returns a partial state and takes no output hook")
     if not packable(hooks):
-        raise NotImplementedError("the template's decode packs no query-placed score hook, score parameter, "
-                                  "unsupported output parameter or dropout (`packable`)")
+        raise NotImplementedError("the template's decode packs no score parameter, unsupported output "
+                                  "parameter or dropout (`packable`)")
     heads = query.shape[2]
     work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
                                            sources=sources, scales=scales, in_key=in_key, finished=finished)
