@@ -240,7 +240,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     longest = math.ceil(spans.keys / config.block_k) // (2 * min(config.stages, 2))
     # No more slices than four programs a multiprocessor take: past them a slice's programs wait a wave.
     most = min(longest, max(2, 4 * processors // programs))
-    counts = [1 << power for power in range(1, most.bit_length()) if 1 << power <= most]
+    counts = _slice_counts(processors, programs, most)
     # Priced over every key a row holds (`spans.keys`): a call's own intervals (a cache's lengths, its
     # documents) its launches count no work of, their extents its data's (a decode step's every launch
     # priced none, its plan the heuristic's alone: M-NA-27-gh200 at fb6a6daa2).
@@ -283,6 +283,16 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     return single() if found is None else planned(*found, slices)
 
 
+def _slice_counts(processors: int, programs: int, most: int) -> list[int]:
+    """The slice counts a decode plan prices (`_priced_slices`), from 2 to `most`: the powers of two, and
+    the counts whose `programs`-a-slice launch fills whole waves of `processors` at one to four programs a
+    multiprocessor. An A100's B1 over 32768 keys at width 128 walked 113.7 us on 13 slices of K128, its 108
+    multiprocessors' one wave of 8 key heads' programs, where 16 slices of K64 took 140.3 (M-NA-27c-a100)."""
+    waves = (resident * processors // programs for resident in range(1, 5))
+    powers = (1 << power for power in range(1, most.bit_length()))
+    return sorted({count for count in (*powers, *waves) if 2 <= count <= most})
+
+
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
                    counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
                    scales, chosen: Walk, in_key: bool, initial: Initial | None, single_launch: tuple,
@@ -290,7 +300,7 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
     and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
-    hiding each other's issue intervals) and, past one slice, the merge of its slices (`merged.launch_work`,
+    hiding each other's issue intervals) and, past one slice, the merge of its slices (`_merge_seconds`,
     its passes' waited loads: the state form's merge, a proxy of a finished step's, its cast, its heads'
     layout and its output hook aside). Each further count prices the tiles its derived config's walk may
     stream at (`MosaicForward.streamings`), uncertified here; the caller certifies the chosen one at its own
@@ -357,9 +367,11 @@ def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
                    target: generation.GpuTarget, initial: Initial | None) -> float:
-    """The seconds of the merge of a split walk's `slices` (`merged.launch_work`): the walk's outputs as its
-    launch writes them, `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
-    (`attention_mosaic_forward.SplitOutput`)."""
+    """The seconds of the merge of a split walk's `slices` as its launch's block choice prices it
+    (`merged.priced_launch`: its programs' waves): the walk's outputs as its launch writes them,
+    `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
+    (`attention_mosaic_forward.SplitOutput`). Priced over the whole device at once (`cost.seconds`), a B8
+    merge's 512 programs ran as one."""
     family = attention_mosaic.bundle_of(config, query.dtype, target=target)
     rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
     width = attention_mosaic._width(value.shape[-1], family, query.dtype)
@@ -367,10 +379,9 @@ def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
     spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    work = merged.launch_work(spec, padded, stacked, query.shape[1], value.shape[-1], target,
-                              has_initial=initial is not None,
-                              normalized=initial is not None and initial.normalized)
-    return cost.seconds(work, target)
+    return merged.priced_launch(spec, padded, stacked, query.shape[1], value.shape[-1], target,
+                                 has_initial=initial is not None,
+                                 normalized=initial is not None and initial.normalized)
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
@@ -573,7 +584,8 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
     cache, row 7420): `rows` rows of `queries` query positions, `heads` query heads over `kv_heads` key heads
     `width` wide in `dtype`, over `keys` keys of a dense cache or, with `page_size`, of a paged pool's pages
     that long. Each Mosaic launch's work as its emission counts it (`emission.work_of`), the launches in
-    sequence (their spans summed), and a split step's native `merged_padded` launch from `merged.launch_work`
+    sequence (their spans summed, their paths one after another), and a split step's native `merged_padded`
+    launch from `merged.launch_work`
     (leaving unobserved XLA merge work unpriced); None where some launch's work its emission does not
     count."""
     query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
@@ -617,7 +629,15 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 normalized=equation.params.get("normalized", False), traced=True,
                 merge=equation.params.get("merge")))
     all_launches = launches + merges
-    return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
+    # The launches one after another: their counters summed, and the step's dependent path theirs added,
+    # each launch's priced at its own rings (`cost.path`), held as that many in-kernel steps (a launch's
+    # rings are its own: one chain of the launches' copies would wait them through the shallowest).
+    work = dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
+    kernel_step = target.kernel_step_seconds
+    if not kernel_step:
+        return work
+    return dataclasses.replace(work, chains=(cost.Chain(span=sum(cost.path(each, target)
+                                                                 for each in all_launches) / kernel_step),))
 
 @overload
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,

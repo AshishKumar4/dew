@@ -1442,6 +1442,15 @@ def test_an_fp32_decode_steps_programs_are_its_walks_grid_and_its_step_is_on_par
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template fp32 decode of 1024 keys", seeds=SEEDS)
 
 
+def test_an_a100_decode_plan_prices_the_count_of_slices_filling_one_wave():
+    """The slice counts an A100's B1 decode step over 32768 keys at width 128, 32/8 heads, prices
+    (`attention_decode._slice_counts`: 108 multiprocessors, 8 key heads' programs a slice, at most 54): the
+    one filling its one wave, 13, not a power of two (its fastest walk, M-NA-27c-a100), and the powers of
+    two beside it, none past the most it takes."""
+    counts = attention_decode._slice_counts(108, 8, 54)
+    assert {13, 27, 2, 4, 8, 16, 32} <= set(counts) and max(counts) <= 54 and min(counts) >= 2, counts
+
+
 def test_a_decode_plan_takes_the_larger_key_tile_among_plans_priced_alike():
     """Row 5274: among plans priced alike, a decode step takes the fewer slices, then the larger key tile
     (`attention_decode.least_plan`), and a cheaper plan whatever its tile: a GH200's B8 over 4096 keys at
