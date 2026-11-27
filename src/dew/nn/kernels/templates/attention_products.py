@@ -290,6 +290,8 @@ def _copied_hooks(hooks: Hooks, products: int, count: int) -> Hooks:
 def _reads_keys(hook: Hook) -> bool:
     """Whether a score hook `fn(s, q_pos, k_pos, *params)` reads its keys' indices: its traced program uses
     `k_pos`."""
+    if hook.fn is None:
+        return False
     tile = (8, 8)
     params = [jax.ShapeDtypeStruct(() if kind_of(side) is Kind.HEAD else tile, kept_dtype(side.value.dtype))
               for side in hook.sides]
