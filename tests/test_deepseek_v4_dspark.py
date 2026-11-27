@@ -114,7 +114,7 @@ def test_a_replayed_block_drafts_as_a_prefill_of_its_history(source):
         return block_draw(ROWS["cached_rows"][seed], 9, 3, np.random.default_rng([0x1331, seed]))
 
     assert_replay_drafts_as_a_prefill(source.model, source.variables, drawn,
-                                      "DSpark's replayed block's draft", seeds=8)
+                                      "DSpark's replayed block's draft", seeds=8, mask_on_host=True)
 
 
 @attending("reference")

@@ -27,9 +27,11 @@ def _draft(ops, state, first, fed):
     return {f"draft {index}": scores for index, scores in enumerate(logits)}
 
 
-def _arms(model, params):
+def _arms(model, params, *, mask_on_host: bool):
     """The replayed draft and the fresh one (the module doc), each compiled once, over a draw's prompts
-    `[rows, P]`, block stretch `[rows, B]`, each row's kept count of it, first token and fed tokens."""
+    `[rows, P]`, block stretch `[rows, B]`, each row's kept count of it, first token and fed tokens. With
+    `mask_on_host`, the fresh prefill reads its rows' real tokens on the host, as a sparse attention's
+    prefill does (DSpark's), and runs as given; otherwise it is compiled whole."""
     ops = decode_ops(model, params, 0, 0)
 
     @jax.jit
@@ -40,31 +42,41 @@ def _arms(model, params):
         assert seen is not None, "a block drafter's verify returns the states its windows record"
         return _draft(ops, ops.record(following, seen, keep), first, fed)
 
-    # Its rows' real tokens read on the host, as a prompt's mask is (a sparse attention's prefill reads them).
+    def history(prompts, stretch, counts):
+        """Each row's history, the prompt and its kept tokens, left-padded to one width, and its real ones."""
+        xp = np if mask_on_host else jnp
+        joined = xp.concatenate([prompts, stretch], axis=1)
+        source = xp.arange(joined.shape[1])[None, :] - (stretch.shape[1] - xp.asarray(counts)[:, None])
+        valid = source >= 0
+        return xp.where(valid, xp.take_along_axis(joined, xp.maximum(source, 0), axis=1), 0), valid
+
+    def prefilled(ids, valid, first, fed):
+        inputs = ModelInputs(jnp.asarray(ids, jnp.int32), {"attention_mask": jnp.asarray(valid)})
+        return _draft(ops, prefill_state(model, params, inputs, ops)[0], first, fed)
+
+    if not mask_on_host:
+        return replayed, jax.jit(lambda prompts, stretch, counts, first, fed: prefilled(
+            *history(prompts, stretch, counts), first, fed))
     drafted = jax.jit(lambda state, first, fed: _draft(ops, state, first, fed))
 
     @as_given
     def fresh(prompts, stretch, counts, first, fed):
-        # Each row's history, the prompt and its kept tokens, left-padded to one width.
-        joined = np.concatenate([prompts, stretch], axis=1)
-        source = np.arange(joined.shape[1])[None, :] - (stretch.shape[1] - np.asarray(counts)[:, None])
-        valid = source >= 0
-        history = np.where(valid, np.take_along_axis(joined, np.maximum(source, 0), axis=1), 0)
-        inputs = ModelInputs(jnp.asarray(history, jnp.int32), {"attention_mask": jnp.asarray(valid)})
-        state, _ = prefill_state(model, params, inputs, ops)
-        return drafted(state, jnp.asarray(first), jnp.asarray(fed))
+        ids, valid = history(prompts, stretch, counts)
+        inputs = ModelInputs(jnp.asarray(ids, jnp.int32), {"attention_mask": jnp.asarray(valid)})
+        return drafted(prefill_state(model, params, inputs, ops)[0], jnp.asarray(first), jnp.asarray(fed))
 
     return replayed, fresh
 
 
-def assert_replay_drafts_as_a_prefill(model, params, draw, label: str, *, seeds: int) -> None:
+def assert_replay_drafts_as_a_prefill(model, params, draw, label: str, *, seeds: int,
+                                      mask_on_host: bool = False) -> None:
     """The drafter's next draft after a replayed block whose rows kept their own counts (`_arms`' replayed)
     on par with its draft after a fresh prefill of each row's history, from that prefill's float64 run
     (check 1, over `draw`'s prompts, stretches, counts and fed tokens): two of Dew's programs, held so and
     not bit for bit."""
-    replayed, fresh = _arms(model, params)
+    replayed, fresh = _arms(model, params, mask_on_host=mask_on_host)
     with jax.enable_x64(new_val=True):
-        _, wide = _arms(model.clone(dtype=jnp.float64), widened(params))
+        _, wide = _arms(model.clone(dtype=jnp.float64), widened(params), mask_on_host=mask_on_host)
 
     @as_given
     def truth(*inputs):
