@@ -420,3 +420,46 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     assert_export_recomputes(lambda drawn: forward(trained_tree, drawn),
                              lambda wide: consumer.denoiser(export, call, wide=wide), draw,
                              "trained SD3")
+
+
+@attending("reference")
+def test_the_published_t5_tower_over_its_whole_window_is_on_par_with_the_reference(source):
+    """The pipeline's T5 tower in float32 over its prompts' whole 256-token window, every key attended as
+    the pipeline's encode attends them (no mask): its last hidden state on par with transformers' float32
+    encoder from its float64 one over drawn token ids (check 1). One fp32 dot over the 256 keys of its
+    attention's probability-value product rounded 2.2 times as far from float64 as torch's CPU attention,
+    which sums keys in blocks (`attention.weighted_values`, row 13655)."""
+    import torch
+    from transformers import T5EncoderModel
+
+    from _dew_torch.precision import float64, float64_twin
+    from dew.inputs import T5Text
+
+    directory = source / "pipeline" / "text_encoder_3"
+    encoder = T5Text.from_pretrained(str(directory), dtype=jnp.float32)
+    vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
+    narrow = T5EncoderModel.from_pretrained(directory, dtype=torch.float32).eval()
+    wide = float64_twin(narrow)
+
+    def draw(seed):
+        return (np.random.default_rng([0x13655, seed]).integers(2, vocabulary, (2, 256)).astype(np.int32),)
+
+    def transformers(model):
+        def run(ids):
+            with torch.no_grad():
+                states = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64))).last_hidden_state
+            return {"last_hidden_state": states.numpy()}
+        return run
+
+    @as_given
+    def truth(ids):
+        with float64():
+            return transformers(wide)(ids)
+
+    @as_given
+    def ours(ids):
+        tokens = {"input_ids": np.asarray(ids), "attention_mask": np.ones(np.shape(ids), np.int32)}
+        return {"last_hidden_state": np.asarray(encoder.encode(encoder.params, tokens).hidden, np.float32)}
+
+    assert_as_exact(ours, as_given(transformers(narrow)), draw, "SD3's T5 tower over its window", seeds=8,
+                    truth_fn=truth)
