@@ -11,11 +11,21 @@ and writes checkpoints through that table: each imports only what precedes it.
 
 import dataclasses
 import math
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    NamedTuple,
+    NoReturn,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    get_type_hints,
+)
 
 import jax
 import jax.numpy as jnp
@@ -45,7 +55,7 @@ from dew.interop.layouts import (
 )
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
-from dew.interop.unread import Stored, equal, valued
+from dew.interop.unread import Stored, Unread, equal, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1875,6 +1885,229 @@ FUSED_EXPERTS = (Packed('.experts.gate_up_proj', ('.experts.gate_proj', '.expert
                   Packed('.experts.down_proj', ('.experts.down_proj',), -1, (0, 2, 1)))
 
 
+type Step = Transposed | Reversed | Split | Inverted
+"""One invertible step of a `Stacked` view: each declares both of its directions, and whether its forward
+one views what it is given (`views`), which a stored tensor built in place reads."""
+
+
+@dataclass(frozen=True)
+class Transposed:
+    """A view's axes in the order `axes` (`numpy.transpose`); its inverse orders them back."""
+
+    axes: tuple[int, ...]
+    views: ClassVar[bool] = True
+
+    def forward(self, tensor: Stored) -> Stored:
+        return tensor.transpose(self.axes)
+
+    def inverse(self, tensor: Stored) -> Stored:
+        return tensor.transpose(tuple(int(axis) for axis in np.argsort(self.axes)))
+
+
+@dataclass(frozen=True)
+class Reversed:
+    """A view's axis `axis` in reverse order, which is its own inverse."""
+
+    axis: int
+    views: ClassVar[bool] = True
+
+    def forward(self, tensor: Stored) -> Stored:
+        return tensor[(slice(None),) * self.axis + (slice(None, None, -1),)]
+
+    def inverse(self, tensor: Stored) -> Stored:
+        return self.forward(tensor)
+
+
+@dataclass(frozen=True)
+class Split:
+    """A view's axis `axis` as two, runs of `inner` (the whole axis, under a new axis of one, where None);
+    its inverse joins the two back."""
+
+    axis: int
+    inner: int | None = None
+    views: ClassVar[bool] = True
+
+    def forward(self, tensor: Stored) -> Stored:
+        shape = tensor.shape
+        inner = shape[self.axis] if self.inner is None else self.inner
+        if inner < 1 or shape[self.axis] % inner:
+            raise ValueError(f"a {shape} tensor's axis {self.axis} holds no whole runs of {inner}")
+        return tensor.reshape(*shape[:self.axis], shape[self.axis] // inner, inner, *shape[self.axis + 1:])
+
+    def inverse(self, tensor: Stored) -> Stored:
+        shape = tensor.shape
+        return tensor.reshape(*shape[:self.axis], shape[self.axis] * shape[self.axis + 1],
+                              *shape[self.axis + 2:])
+
+
+@dataclass(frozen=True)
+class Inverted:
+    """`step` the other way: a join of two axes as `Inverted(Split(...))`."""
+
+    step: Step
+
+    @property
+    def views(self) -> bool:
+        # Two axes joined are a view only of some strides: a join is taken as a copy.
+        return not isinstance(self.step, Split) and self.step.views
+
+    def forward(self, tensor: Stored) -> Stored:
+        return self.step.inverse(tensor)
+
+    def inverse(self, tensor: Stored) -> Stored:
+        return self.step.forward(tensor)
+
+
+@dataclass(frozen=True)
+class Stacked:
+    """One stored tensor, `name`, holding `parts`, the tensors the path map reads: its `view` (each step
+    in order) holds them stacked on its leading axes, `grid` (one an entry of `parts` where None; none,
+    the view itself the one part, where empty), in row-major order, each of the `shape` the record states
+    where it states one (a part of another refused either way). A load splits the tensor into views of
+    its parts (`split`) and an export stacks them back through each step's inverse (`stacked`), so the one
+    declaration is both directions."""
+
+    name: str
+    parts: tuple[str, ...]
+    view: tuple[Step, ...] = ()
+    grid: tuple[int, ...] | None = None
+    shape: tuple[int, ...] | None = None
+
+    def _shaped(self, shapes: Sequence[tuple[int, ...]]) -> None:
+        """Refuse a part of another shape than the record states."""
+        if self.shape is not None and (wrong := sorted({shape for shape in shapes if shape != self.shape})):
+            raise ValueError(f"{self.name} stacks parts of the shapes {wrong}, not the {self.shape} its "
+                             "record states")
+
+    @property
+    def _grid(self) -> tuple[int, ...]:
+        return (len(self.parts),) if self.grid is None else self.grid
+
+    def split(self, tensor: Stored) -> dict[str, Stored]:
+        """The parts of the stored tensor, views of it where its steps keep one."""
+        for step in self.view:
+            tensor = step.forward(tensor)
+        grid = self._grid
+        if tensor.shape[:len(grid)] != grid or math.prod(grid) != len(self.parts):
+            raise ValueError(f"{self.name} stacks {tensor.shape[:len(grid)]} tensors where its record "
+                             f"stacks {grid}, {list(self.parts)}")
+        parts = dict(zip(self.parts, (tensor[index] for index in np.ndindex(*grid)), strict=True))
+        self._shaped([part.shape for part in parts.values()])
+        return parts
+
+    def stored(self, parts: Sequence[jax.ShapeDtypeStruct]) -> jax.ShapeDtypeStruct:
+        """The stored tensor's shape and dtype, of its parts', in their order, which hold one dtype."""
+        if len(dtypes := {part.dtype for part in parts}) > 1:
+            raise ValueError(f"{self.name} stacks {list(self.parts)} of the dtypes "
+                             f"{sorted(map(str, dtypes))}")
+        self._shaped([part.shape for part in parts])
+        tensor = np.stack([Unread(part.shape, part.dtype) for part in parts])
+        tensor = tensor.reshape(*self._grid, *tensor.shape[1:])
+        for step in reversed(self.view):
+            tensor = step.inverse(tensor)
+        return jax.ShapeDtypeStruct(tensor.shape, parts[0].dtype)
+
+    def stacked(self, read: Callable[[str], np.ndarray], stored: jax.ShapeDtypeStruct) -> Stored:
+        """The stored tensor (`stored`, its shape and dtype) of its parts, each read (`read`) as it is placed:
+        into its place in the one stored tensor where each step's forward views it (`Step.views`), so the
+        stored tensor and one part are held at a time, as an expert bank's are; else stacked, and taken
+        back through the steps' inverses (a join of two axes, which only a copy makes)."""
+        if all(step.views for step in self.view):
+            tensor = np.empty(stored.shape, stored.dtype)
+            placed = tensor
+            for step in self.view:
+                placed = step.forward(placed)
+            for index, part in zip(np.ndindex(*self._grid), self.parts, strict=True):
+                placed[index] = read(part)
+            return tensor
+        stacked = np.stack([read(part) for part in self.parts])
+        stacked = stacked.reshape(*self._grid, *stacked.shape[1:])
+        for step in reversed(self.view):
+            stacked = step.inverse(stacked)
+        return stacked
+
+
+@dataclass(frozen=True)
+class Restacked:
+    """A release's tensors that its path map reads otherwise than they are stored, declared once for both
+    directions by the decoder's record: `stacks` each such stored tensor as the `Stacked` view of the
+    tensors the map reads, and `unstored` the tensors the map reads that the release stores none of, each
+    with the one value it holds; `reserved` matches every name only a stack, its parts or an unstored
+    tensor takes, whatever the record. `prepare` splits each stack (one the release lacks refused) and adds
+    the unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from
+    its parts (a part missing, or a reserved name the record stacks none of, refused) and drops the
+    unstored ones once they hold their value; every other tensor passes through both."""
+
+    stacks: Callable[[Mapping[str, object]], Sequence[Stacked]]
+    unstored: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
+    reserved: re.Pattern[str]
+
+    def prepare(self, tensors: Mapping[str, Stored],
+                config: Mapping[str, object] | None = None) -> dict[str, Stored]:
+        """The release's tensors as its path map reads them."""
+        if config is None:
+            raise ValueError("a release's stacked tensors are placed by its decoder's record")
+        stacks = {stack.name: stack for stack in self.stacks(config)}
+        if missing := sorted(set(stacks) - set(tensors)):
+            raise ValueError(f"the release holds none of {missing}, which its record stacks")
+        read = [(part, value) for name, tensor in tensors.items()
+                for part, value in (stacks[name].split(tensor) if name in stacks else {name: tensor}).items()]
+        prepared: dict[str, Stored] = {}
+        for part, value in (*read, *self.unstored(config).items()):
+            if part in prepared:
+                raise ValueError(f"two of the release's tensors are read as {part}")
+            prepared[part] = value
+        return prepared
+
+    def unprepare(self, tensors: Mapping[str, Stored],
+                  config: Mapping[str, object] | None = None) -> LazyTensors:
+        """The release's tensors from those `prepare` made of them, each built when it is read."""
+        if config is None:
+            raise ValueError("a release's stacked tensors are placed by its decoder's record")
+        specs = tensor_specs(tensors)
+        unstored = self.unstored(config)
+        for name, value in unstored.items():
+            if name not in specs or not np.array_equal(np.asarray(tensors[name]), value):
+                raise ValueError(f"{name} holds {specs.get(name)}, not the value no read of the release "
+                                 "reaches, which it stores none of")
+        owner: dict[str, Stacked] = {}
+        for stack in self.stacks(config):
+            if missing := [part for part in stack.parts if part not in specs]:
+                raise ValueError(f"{stack.name} stacks {missing}, which the tensors miss")
+            for part in stack.parts:
+                if part in owner:
+                    raise ValueError(f"{owner[part].name} and {stack.name} both stack {part}")
+                owner[part] = stack
+        built: dict[str, tuple[jax.ShapeDtypeStruct, Callable[[], Stored]]] = {}
+
+        def take(name: str, spec: jax.ShapeDtypeStruct, build: Callable[[], Stored]) -> None:
+            # A name two of the tensors would be written back under, a stack's or one passed through, refused
+            # whichever comes first.
+            if name in built:
+                raise ValueError(f"two of the prepared tensors write back {name}")
+            built[name] = (spec, build)
+
+        # A tensor under a name only a stack or its part takes (`reserved`), which the record stacks none
+        # of, is no tensor of the release: refused, not written as it is.
+        if stray := sorted(name for name in specs if name not in owner and name not in unstored
+                           and self.reserved.fullmatch(name)):
+            raise ValueError(f"{stray} are named as the release's stacked tensors or their parts, which its "
+                             "record stacks none of")
+        stacked: set[str] = set()
+        for name, spec in specs.items():
+            stack = owner.get(name)
+            if name in unstored or (stack is not None and stack.name in stacked):
+                continue
+            if stack is None:
+                take(name, spec, lambda name=name: tensors[name])
+                continue
+            stacked.add(stack.name)
+            stored = stack.stored([specs[part] for part in stack.parts])
+            take(stack.name, stored, lambda stack=stack, stored=stored: stack.stacked(
+                lambda held: np.asarray(tensors[held]), stored))
+        return LazyTensors({name: spec for name, (spec, _) in built.items()}, lambda name: built[name][1]())
+
+
 class WeightPreparer(Protocol):
     """Checkpoint storage transforms, with translated geometry where layout needs it."""
 
@@ -1984,8 +2217,9 @@ class DecoderFamily:
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
     unprepare: WeightPreparer | None = None
-    """`prepare`'s exact inverse, where a family declares one: the release's tensors, under its own names,
-    from the tensors `prepare` made of them (Inkling 2's renamed, split and reversed ones). A source of the
+    """`prepare`'s exact inverse, where a family declares one, both a `Restacked`'s, one declaration: the
+    release's tensors, under its own names, from the tensors `prepare` made of them (Inkling 2's restacked,
+    split and reversed ones). A source of the
     family binds its tensors as `prepare` made them, and a save writes them through it
     (`Pretrained.export`), so every tensor a load read is written back. Each tensor `prepare` makes is
     consumed, and one missing refused; a tensor `prepare` passed through passes through."""

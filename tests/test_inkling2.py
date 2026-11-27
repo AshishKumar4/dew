@@ -180,6 +180,27 @@ def test_its_prepares_inverse_gives_back_every_tensor_of_the_release():
     touched = {**prepared, query: np.ones_like(prepared[query])}
     with pytest.raises(ValueError):
         INKLING2.unprepare(touched, record)
+    # A prepared tensor under a stored stack's own name, before or after the parts it is stacked from, is a
+    # second tensor written back under it, refused rather than either kept (theme 70's review).
+    stale = {'model.llm.attn_res.output_query': tensors['model.llm.attn_res.output_query']}
+    for twice in ({**stale, **prepared}, {**prepared, **stale}):
+        with pytest.raises(ValueError):
+            INKLING2.unprepare(twice, record)
+    # A query of another width than the decoder's, a layer's or a global layer's three sites', is refused as
+    # it is read, not placed as a wider kernel.
+    width = record['emb_features']
+    for name, wrong in (('model.llm.attn_res.mlp_queries.0', np.zeros(width + 1, np.float32)),
+                        ('model.llm.attn_res.mlp_queries.0', np.zeros(2 * width, np.float32)),
+                        ('model.llm.attn_res.attn_queries.2', np.zeros((3, 2 * width), np.float32))):
+        with pytest.raises(ValueError):
+            INKLING2.prepare({**tensors, name: wrong}, record)
+    # A prepared query site the decoder's geometry has none of (a local layer's key query) is refused, not
+    # written into the release under its prepared name.
+    query = prepared['model.llm.layers.1.attn_query']
+    for stray in ({**prepared, 'model.llm.layers.1.k_query': query},
+                  {**prepared, 'model.llm.attn_res.mlp_queries.999': query[0]}):
+        with pytest.raises(ValueError):
+            INKLING2.unprepare(stray, record)
 
 
 @pytest.mark.parametrize('fixture', ['inkling2-tiny', 'inkling2-tiny-nvfp4'])

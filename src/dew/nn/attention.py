@@ -84,6 +84,7 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import Unlowerable, forced, select, selected
 from .kernels.templates import attention as template, band
+from .kernels.xla_products import committed_context
 from .precision import (
     EXACT_FLOAT32,
     asks_default_precision,
@@ -622,7 +623,10 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
                 for start in range(0, keys, VALUE_BLOCK)]
         return compensated_sum(jnp.stack(sums), (0,))
 
-    return jax.lax.platform_dependent(weights, value, cpu=blocked, default=whole)
+    # Called eagerly, the platform its committed operands lie on, not the default device's (audit 2026-11-27
+    # P07: a CPU-committed product under a CUDA default took the accelerator's one dot).
+    with committed_context((weights, value)):
+        return jax.lax.platform_dependent(weights, value, cpu=blocked, default=whole)
 
 
 VALUE_BLOCK = 64
