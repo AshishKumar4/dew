@@ -301,7 +301,8 @@ def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_ar
 
 
 @pytest.mark.parametrize("default", [
-    "cpu", pytest.param("gpu", marks=[pytest.mark.gpu, pytest.mark.compiles_at_run(
+    pytest.param("cpu", marks=pytest.mark.cpu),
+    pytest.param("gpu", marks=[pytest.mark.gpu, pytest.mark.compiles_at_run(
         reason="an eager call, its programs compiled where it reaches them")])])
 def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie(default):
     """Called eagerly (no jit) on operands committed to the CPU, DC-AE's linear attention takes the CPU's
