@@ -72,7 +72,6 @@ from dew.nn.kernels.templates.attention import (
     walked_initial,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    BlockPlan,
     Tiles,
     TileWalk,
     _block,
@@ -117,7 +116,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     score_stream,
     score_streams,
     score_views,
-    sliced_hook,
     staged_after,
     stages_after_walks,
     stated,
@@ -1599,13 +1597,13 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
 
             kept = state.acc.scaled(ratio)
             out_stage(lambda stage: family.stored((kept,), (out_view,), smem=stage))
-        elif (chunk := BlockPlan(
-                split=False, out_dtype=out_view.dtype, output_hook=hooks.output.fn is not None,
-                pointwise=(sliced := sliced_hook(
-                    hooks.output.fn, kinds_of(hooks.output.sides),
-                    tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides),
-                    tuple(state.acc.shape))) is not None).epilogue_chunk(
+        elif (chunk := (plan := forward_block_plan(
+                state.acc.shape[-1], None, out_view.dtype, has_output_mod=hooks.output.fn is not None,
+                training=False, output=(hooks.output.fn, kinds_of(hooks.output.sides),
+                                        tuple(kept_dtype(side.value.dtype) for side in hooks.output.sides)),
+                rows=state.acc.shape[0])).epilogue_chunk(
                 family, state.acc.shape[-1], out_view.dtype, masked=keep is not None, kept=False)):
+            sliced = plan.sliced()
             # so `state.acc` and `output` fit without spilling (rows 5272, 10864); the output hook, its
             # program at the whole tile replayed on each chunk with its parameters' block of the chunk's
             # columns (`sliced_hook`: a d256 gated forward held whole in one launch, where its whole-width

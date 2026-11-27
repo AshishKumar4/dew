@@ -4,6 +4,7 @@ its own bytes; a hook laid at the whole width keeps the whole-width finish; each
 (check 1)."""
 
 import jax
+import jax.extend.core
 import jax.numpy as jnp
 import pytest
 from generation_support import INTERPRETS
@@ -98,3 +99,80 @@ def test_a_wide_gated_launch_is_on_par_with_its_16_bit_gate_interpreted(device, 
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _wide(queries, width),
                     f"mosaic forward, a {hook} bf16 gate 256 wide", seeds=SEEDS)
+
+
+SPLIT = {"sm90": attention_mosaic.Tiles(64, 64, 2, 2, family="wgmma", columns=128)}
+"""Launches of 128 of the value columns each on an H100's family, pinned: a hook of the whole output runs
+past their joined columns in XLA (`attention_mosaic_program.forward_block_plan`'s split)."""
+
+
+@INTERPRETS
+def test_a_gate_held_to_its_whole_width_runs_past_launches_of_a_block_of_its_columns():
+    """A bf16 gate over a forward 256 wide whose hook holds to that width (it asserts its output's), the
+    forward pinned to launches of 128 value columns each (`SPLIT`): its plan splits the hook out of the
+    kernel to the joined columns before any program of it is traced, so no launch's pricing traces it at a
+    block's 128 columns, where it failed (train 1375's F5); on par with the reference (check 1)."""
+    queries, width = 128, 256
+    spans = template.spans(queries, queries, 1, causal=True)
+
+    def whole(out, gate):
+        assert out.shape[-1] == width, out.shape
+        return _gate(out, gate)
+
+    def ours(query, key, value, gate):
+        hooks = template.Hooks(output=Hook(whole, (Side(gate, template.Kind.OUTPUT),)))
+        with generation.assumed("sm90", interpreted=True), tuning.pinned({attention_mosaic.MosaicForward:
+                                                                            SPLIT["sm90"]}):
+            return attention_mosaic.forward(query, key, value, spans, hooks, interpret=True)
+
+    def reference(query, key, value, gate):
+        return template.reference(query, key, value, spans, _gated(gate))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _wide(queries, width),
+                    "mosaic forward, a whole-width bf16 gate over 128-column launches", seeds=SEEDS)
+
+
+def test_an_output_hooks_epilogue_program_is_the_one_its_runs_numerics_trace():
+    """An output hook whose program reads the run's numerics (`generation.numerics`), traced for a launch's
+    epilogue (`attention_mosaic_program.entrywise_hook`) under the default numerics and then under accurate
+    ones: each run's program its own, held by the context it was traced in, where a cache keyed by the hook
+    and tile alone replayed the first under the second (train 1375's F4)."""
+    from dew.nn.kernels.generation import run_precision
+    from dew.nn.kernels.templates import attention_mosaic_program
+    from dew.nn.precision import ACCURATE
+
+    def hook(out):
+        return out * (2.0 if generation.numerics().forms == "accurate" else 3.0)
+
+    tile = (64, 128)
+    ones = jnp.ones(tile, jnp.float32)
+    default = attention_mosaic_program.entrywise_hook(hook, (), (), tile)
+    with run_precision(ACCURATE):
+        accurate = attention_mosaic_program.entrywise_hook(hook, (), (), tile)
+    (default_out,) = jax.extend.core.jaxpr_as_fun(default)(ones)
+    (accurate_out,) = jax.extend.core.jaxpr_as_fun(accurate)(ones)
+    assert float(default_out[0, 0]) == 3.0 and float(accurate_out[0, 0]) == 2.0
+
+
+def test_two_output_hooks_equal_by_their_fields_keep_their_own_epilogue_programs():
+    """Two frozen dataclass output hooks whose factor no comparison reads (`compare=False`), 2 and 3, equal
+    and of one hash: each one's epilogue program (`attention_mosaic_program.entrywise_hook`) is its own, held
+    by its identity, where a cache keyed by equality replayed the first's for the second (train 1379's
+    K-F5)."""
+    import dataclasses
+
+    from dew.nn.kernels.templates import attention_mosaic_program
+
+    @dataclasses.dataclass(frozen=True)
+    class Scaled:
+        factor: float = dataclasses.field(compare=False)
+
+        def __call__(self, out):
+            return out * self.factor
+
+    tile = (64, 128)
+    ones = jnp.ones(tile, jnp.float32)
+    for factor in (2.0, 3.0):
+        program = attention_mosaic_program.entrywise_hook(Scaled(factor), (), (), tile)
+        (found,) = jax.extend.core.jaxpr_as_fun(program)(ones)
+        assert float(found[0, 0]) == factor

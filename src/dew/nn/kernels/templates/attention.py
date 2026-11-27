@@ -2448,7 +2448,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         state, starts, peak, total, mass, delta, low, lost, cotangent,
         functools.partial(shifted, shift=shift[:, :, None]))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
-    # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
+    # shards first and rounds once (`attention_route.attend`'s `operand_dtypes`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
                               else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
     found = Gradients(dq[:, :queries, :, :width].astype(query.dtype),

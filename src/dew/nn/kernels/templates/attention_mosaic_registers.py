@@ -23,7 +23,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _width,
     bundle_of,
     forward_block_plan,
-    pointwise_tiles,
     powered_in_kernel,
     query_swizzle,
     scopes_products,
@@ -457,14 +456,12 @@ class ForwardRegisters:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         padded_v = _width(self.value_width, family, self.dtype)
         value_width = value_columns(padded_v, columns or tiles.columns)
-        # The hook's program at this candidate's own output tile, as its walk takes it (`sliced_hook`).
-        hooked = None
-        if self.output is not None:
-            hook, kinds, dtypes = self.output
-            hooked = pointwise_tiles(hook, kinds, dtypes, (tiles.block_q, value_width))
+        # The forward's one plan (`forward_block_plan`): a hook its launch keeps traced at this candidate's
+        # own output tile alone, as its walk takes it (`sliced_hook`).
         plan = forward_block_plan(padded_v, columns or tiles.columns, self.out_dtype,
                                   has_output_mod=self.has_output_mod, training=self.residuals,
-                                  pointwise=hooked is not None)
+                                  output=self.output, rows=tiles.block_q)
+        hooked = plan.tile_dtypes if plan.pointwise else None
         return max(before, forward_registers(
             family, tiles, value_width, self.dtype, self.residuals,
             natural=tiles.natural_form or self.natural, params=self.params, width=width, parts=self.parts,

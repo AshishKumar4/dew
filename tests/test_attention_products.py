@@ -300,3 +300,40 @@ def test_a_banded_call_keeps_a_querys_place_in_its_own_dtype():
                                            places=jnp.asarray([[2**32]], jnp.int64))[3]
         seen = np.asarray(template.dense(laid))[0, 0]
     np.testing.assert_array_equal(seen, [False, False, True, True])
+
+
+def test_a_banded_call_keeps_its_queries_and_keys_dtype_beside_narrower_values():
+    """A banded call (`Banded((0,))`) of fp32 queries and keys over bf16 values at the highest precision: one
+    query at place 0 of `[4096, 4097]` against its near key `[1, -1]` has the near logit -1 and its far
+    key's product 0, so the second key weighs `1 / (1 + e^-1)` and its value 1 is the output; the query
+    and keys stay fp32 (`attention_route.attend`'s `operand_dtypes`, the key's and the value's), where
+    narrowing them to the values' bf16 rounded 4097 to 4096 and read 0.5 (train 1379's P-F2)."""
+    spans = template.spans(1, 2, 1)
+    near = jnp.asarray([4096.0, 4097.0], jnp.float32)[None, None, None]
+    near_keys = jnp.asarray([[1.0, -1.0], [0.0, 0.0]], jnp.float32)[None, :, None]
+    far = jnp.zeros((1, 1, 1, 2), jnp.float32)
+    far_keys = jnp.zeros((1, 2, 1, 2), jnp.float32)
+    value = jnp.asarray([0.0, 1.0], jnp.bfloat16)[None, :, None, None]
+    with jax.default_matmul_precision("highest"):
+        out = attention_products.attend((near, far), (near_keys, far_keys), value, spans,
+                                        attention_products.Banded((0,)), places=jnp.asarray([[0]]), scale=1.0)
+    # 0.731 (1 / (1 + e^-1)) told apart from the narrowed call's 0.5 at two decimals.
+    assert round(float(out[0, 0, 0, 0]), 2) == 0.73, out[0, 0, 0, 0]
+
+
+def test_the_mosaic_mainloop_declines_narrow_queries_and_keys_over_wide_values():
+    """A banded call's mix the other way, bf16 queries and keys over fp32 values: the Mosaic forward and
+    backward each decline it (`attention_mosaic_program.mixed_operands`: their rings stage the values in
+    the query's dtype), so the route takes a mainloop that reads each operand in its own (train 1379's
+    P-F2 review)."""
+    spans = template.spans(TOKENS, TOKENS, 1, causal=True)
+    query = jnp.zeros((1, TOKENS, HEADS, WIDTH), jnp.bfloat16)
+    key = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.bfloat16)
+    value = jnp.zeros((1, TOKENS, KV_HEADS, WIDTH), jnp.float32)
+    with generation.assumed("sm90"):
+        assert attention_mosaic.forward_declined(query, key, value, spans, template.Hooks(),
+                                                 residuals=template.Kept.NONE) is not None
+        residuals = attention_mosaic.forward(query, key, value.astype(jnp.bfloat16), spans, template.Hooks(),
+                                             residuals=template.Kept.SPLIT, interpret=True)[1:]
+        assert attention_mosaic.backward_declined(query, key, value, spans, template.Hooks(), query,
+                                                  residuals=tuple(residuals)) is not None

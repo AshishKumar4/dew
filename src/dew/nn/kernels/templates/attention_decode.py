@@ -48,23 +48,20 @@ from dew.nn.kernels.templates.attention import (
     ungrouped_rows,
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME, folded_form
-from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.hooks import NO_HOOK, Side
 
 
 def packable(hooks: Hooks | None) -> bool:
-    """Whether a call's query heads can become its rows (`packed`): no score hook reading a query's place or
-    score parameter (a packed row's place is its pair's, not its query's), and no dropout; a softcap (the
-    scaled logits alone), sinks (an initial state a head), and output hooks admitted by
-    `merged.output_hook_refusal` pack (row 5385)."""
+    """Whether a call's query heads can become its rows (`packed`): no score parameter (a packed row's is
+    its pair's, not its query's) and no dropout; a score hook reads each row's own query's place
+    (`unpacked_places`), a softcap (the scaled logits alone), sinks (an initial state a head), and output
+    hooks admitted by `merged.output_hook_refusal` pack (row 5385)."""
     if hooks is None:
         return True
     if hooks.score.sides or hooks.drop is not None:
         return False
-    if merged.output_hook_refusal(hooks.output) is not None:
-        return False
-    return not score_places(hooks, may=True)[0]
+    return merged.output_hook_refusal(hooks.output) is None
 
 
 def _packed_output_params(params: tuple[Side, ...], *, heads: int, kv_heads: int) -> tuple[Side, ...]:
@@ -98,6 +95,14 @@ def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bo
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
     return attention_mosaic.streams(rows, target)
+
+def unpacked_places(score_mod: Callable, group: int, scores, q_pos, k_pos, *params):
+    """`score_mod` on a packed step's rows (`packed`) at each row's own query's place: row `t·G + g` is
+    position `t`'s (`grouped_rows`), so the hook reads `q_pos // G`, whatever tile it is traced at, where a
+    probe of the hook at one shape let one reading its place at another read a pair's row (train 1379's
+    K-F4, row 13741)."""
+    return score_mod(scores, q_pos // group, k_pos, *params)
+
 
 def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | None = None
            ) -> tuple[jax.Array, KeySpans, Initial | None]:
@@ -445,6 +450,10 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         packed_out = _packed_output_params(hooks.output.sides, heads=query.shape[2], kv_heads=kv_heads)
         whole = dataclasses.replace(hooks, initial=initial,
                                     output=dataclasses.replace(hooks.output, sides=packed_out))
+    if hooks.score.fn is not None and group > 1:
+        # Each packed row's hook at its own query's place (`unpacked_places`).
+        whole = dataclasses.replace(whole, score=dataclasses.replace(
+            whole.score, fn=functools.partial(unpacked_places, hooks.score.fn, group)))
     target = generation.gpu_target()
     planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
                                      table=table, sources=sources, scales=scales, in_key=in_key,
@@ -480,8 +489,8 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     if not finished and hooks.output.fn is not None:
         raise ValueError("an unfinished decode step returns a partial state and takes no output hook")
     if not packable(hooks):
-        raise NotImplementedError("the template's decode packs no query-placed score hook, score parameter, "
-                                  "unsupported output parameter or dropout (`packable`)")
+        raise NotImplementedError("the template's decode packs no score parameter, unsupported output "
+                                  "parameter or dropout (`packable`)")
     heads = query.shape[2]
     work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
                                            sources=sources, scales=scales, in_key=in_key)
@@ -507,7 +516,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 out = launch(rows, key, value, row_spans, whole, residuals=Kept.NONE, scaled=chosen.scaled,
                              bounded=chosen.bounded, masked=hooks.output.fn is None)
             return ungrouped_rows(out, heads)
-        stateless = dataclasses.replace(hooks, initial=None, output=NO_HOOK)
+        stateless = dataclasses.replace(whole, initial=None, output=NO_HOOK)
         with tuning.pinned({attention_mosaic.MosaicForward: at.config}):
             walked_out = launch(rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT,
                                 out_dtype=jnp.float32, splits=at.slices, scaled=chosen.scaled,

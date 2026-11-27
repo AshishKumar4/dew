@@ -1766,3 +1766,27 @@ def test_softcap_and_windowed_decode_compile_spill_free(generation_name, case):
     with generation.assumed(generation_name):
         found = compile_mosaic_kernels([KernelCase(case, lambda: (call, operands))], generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+@pytest.mark.parametrize("finished", [True, False], ids=["finished", "state"])
+def test_a_packed_decode_steps_score_hook_reads_each_rows_own_query_place(finished):
+    """One decode position, two query heads over one key head (packed into two rows, `attention_decode.
+    packed`), zero products over keys 0 and 1 of values 0 and 1, a score hook adding `q_pos · k_pos` on any
+    tile but an 8-by-8 one: each head's row reads its own query's place, 0 (`unpacked_places`), so both
+    weigh their keys alike and read 0.5, where a probe of the hook at 8 by 8 packed it and the second head
+    read its packed row's place 1 and 0.73 (train 1379's K-F4); finished in its launch, and as an unfinished
+    step's state (`finished=False`: its stateless walk and merge, whose hooks dropped the remapping)."""
+    def placed(s, q_pos, k_pos):
+        return s if s.shape == (8, 8) else s + (q_pos * k_pos).astype(s.dtype)
+
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 2, 64), jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, 64), jnp.bfloat16)
+    value = jnp.broadcast_to(jnp.asarray([0.0, 1.0], jnp.bfloat16)[None, :, None, None], (1, 2, 1, 64))
+    with generation.assumed("sm90"):
+        out = attention_decode.attend(query, key, value, spans, template.Hooks(score=Hook(placed, ())),
+                                      interpret=True, finished=finished)
+    # A state's output its normalized `[B, H, T, Dv]` (`Initial.acc`), a finished step's `[B, T, H, Dv]`.
+    read = (np.asarray(out, np.float32)[0, 0, :, 0] if finished
+            else np.asarray(out.acc, np.float32)[0, :, 0, 0])
+    np.testing.assert_array_equal(read, [0.5, 0.5])

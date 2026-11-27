@@ -109,14 +109,15 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
                                       accurate=accurate)
     if not isinstance(combine, Banded):
         raise ValueError(f"a step's products combine by SUM or a Banded selection, not {combine!r}")
-    # The keys' and the value's copies laid out wide and their gradients handed back unrounded
-    # (`attention_route.attend`'s `operand_dtype`), so each sums its copies' and rounds once.
-    dtype = value.dtype
+    # The keys' and the value's copies laid out wide and their gradients handed back unrounded, each
+    # computed in its own dtype (`attention_route.attend`'s `operand_dtypes`), so each sums its copies' and
+    # rounds once; the queries as they come.
+    dtypes = (jnp.result_type(*keys), value.dtype)
     query, key, value, spans, hooks = selected(queries, [key.astype(jnp.float32) for key in keys],
                                                value.astype(jnp.float32), spans, combine, hooks, places)
     scale = queries[0].shape[-1] ** -0.5 if scale is None else scale
     return attention_route.attend(query, key, value, spans, hooks, scale=scale, natural=natural,
-                                  accurate=accurate, operand_dtype=dtype)
+                                  accurate=accurate, operand_dtypes=dtypes)
 
 
 def _paired(queries: Sequence[jax.Array], keys: Sequence[jax.Array]) -> int:
