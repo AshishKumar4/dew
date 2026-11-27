@@ -13,7 +13,7 @@ import optax
 import pytest
 from flax import struct
 from recording import bits
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, dew_path
 from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
@@ -948,6 +948,9 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
         moved = steps.stepped(2, FilledBatch(8).map(real_batch), variables=variables, ema=ema)
         return moved.variables["params"], moved.ema
 
+    # The whole step Dew's own path, under the rewrite its split runs under (`dew_path`): the claim is the
+    # split's invariance.
+    @dew_path
     @as_given
     def whole_arm(variables, ema, real_batch):
         moved = steps.stepped(1, real_batch, variables=variables, ema=ema)
@@ -955,6 +958,14 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
 
     assert_as_exact(split_arm, whole_arm, draw, f"DreamerV3 filled and split update ({dynamics_kind})",
                     seeds=DREAMER_SPLIT_SEEDS, truth_fn=float64_replay(whole_update, compiled=True))
+    # Its imagined returns span past unit scale: the whole step's return bounds moved from the seeded ones
+    # toward their 5th and 95th percentiles at `return_rate`, so the percentiles' span is what the step
+    # added to the seeded span's share it kept.
+    variables, ema, real_batch = draw(0)
+    bounds = steps.stepped(1, real_batch, variables=variables, ema=ema).variables["returns"]
+    moving, seeded = objective.return_rate, float(seeded_returns["high"] - seeded_returns["low"])
+    spread = (float(bounds["high"] - bounds["low"]) - (1 - moving) * seeded) / moving
+    assert spread > 1, spread
 
 
 def test_even_twohot_bins_space_supports_evenly_and_dreamer_validates_bounds_and_compiles_once():

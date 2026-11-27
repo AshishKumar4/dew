@@ -587,6 +587,7 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
     float64 by the same model in float64 by check 1 (row 13705: an average of the parts' means weighs the
     padded part's queries up)."""
     from arm_arithmetic import summed_as_run
+    from arm_forms import dew_path
     from rl_split_support import SplitAndWhole
 
     from dew.objectives.routing import RoutedStatistics
@@ -612,9 +613,10 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
         # A step compiled on the host and run as given (`as_given`), the check's arithmetic its compile's.
         @as_given
         def stepped(params, batch):
-            variables = {**steps.starts[split].variables, "params": params}
-            return steps.stepped(split, batch, variables=variables).variables["params"]
-        return stepped
+            return steps.stepped(split, batch, variables={"params": params}).variables["params"]
+        # The whole step Dew's own path, under the rewrite its split runs under (`dew_path`): the claim is
+        # the split's invariance.
+        return stepped if split == 2 else dew_path(stepped)
 
     wide = LMObjective(deepseek_stack(4, dtype="float64"), SEQ, indexer=IndexerTraining("sparse"))
 

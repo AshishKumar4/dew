@@ -134,35 +134,35 @@ class SplitAndWhole:
         from dew.objectives.base import EXAMPLE_STREAM
 
         mesh = MeshSpec().build(jax.devices()[:1])
-        self.trainers = {}
-        for split in (2, 1):
-            trainer = Trainer(objective, optax.sgd(rate), key=run_key, split=split, checkpoints=None,
-                              tracker=None)
-            trainer.device_mesh = mesh
-            self.trainers[split] = trainer
-        self.templates = {2: filled_template, 1: template}
-        self.starts = {split: trainer.initial_state() for split, trainer in self.trainers.items()}
-        self.whole_start = self.starts[1]
+        self._trainers = {split: Trainer(objective, optax.sgd(rate), key=run_key, split=split, mesh=mesh,
+                                         checkpoints=None, tracker=None) for split in (2, 1)}
+        self._templates = {2: filled_template, 1: template}
+        self._starts = {split: trainer.initial_state() for split, trainer in self._trainers.items()}
+        self.whole_start = self._starts[1]
         self.update_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(
-            self.starts[2].key, EXAMPLE_STREAM), 0), 0)
-        self.steps = {}
+            self._starts[2].key, EXAMPLE_STREAM), 0), 0)
+        self._steps = {}
 
-    def stepped(self, split: int, batch, **fields):
-        """The state after one step at `split` (2 or 1) over `batch` from its start with `fields` replaced
-        (its variables, its EMA), compiled at its first call."""
-        if split not in self.steps:
-            start = self.starts[split]
-            step = self.trainers[split].compile(start, self.templates[split])
+    def stepped(self, split: int, batch, *, variables=None, ema=None):
+        """The state after one step at `split` (2 or 1) over `batch` from its start, the collections of
+        `variables` and the `ema` given in place of its own, compiled at its first call."""
+        if split not in self._steps:
+            start = self._starts[split]
+            step = self._trainers[split].compile(start, self._templates[split])
             if split == 2:
                 # The split start holding the window its step builds, once (its first call's): a call per
                 # seed over it steps alone, building none (an eval_shape of the objective's batch statistics
                 # each, row 7849). A step a window long leaves its window committed, holding no microbatch
                 # (`Accumulation.fill` 0), whose next first microbatch replaces what it left; the start
                 # takes it.
-                ran = step(jax.tree.map(jnp.copy, start), self.templates[split])[0]
+                ran = step(jax.tree.map(jnp.copy, start), self._templates[split])[0]
                 window, size = ran.accumulation, ran.window_size
                 assert window is not None and window.fill is not None and size is not None
                 assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window open"
-                self.starts[split] = start.replace(accumulation=ran.accumulation, window_size=ran.window_size)
-            self.steps[split] = step
-        return self.steps[split](jax.tree.map(jnp.copy, self.starts[split].replace(**fields)), batch)[0]
+                self._starts[split] = start.replace(accumulation=ran.accumulation,
+                                                    window_size=ran.window_size)
+            self._steps[split] = step
+        start = self._starts[split]
+        given = start.replace(variables={**start.variables, **(variables or {})},
+                              ema=start.ema if ema is None else ema)
+        return self._steps[split](jax.tree.map(jnp.copy, given), batch)[0]
