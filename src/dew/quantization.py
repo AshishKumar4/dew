@@ -388,8 +388,8 @@ class LinearProducts(nn.Module):
             # its window (`Bf16Window.admitted`, as every reader of it asks).
             return kernel.admitted().decoded()
         if isinstance(kernel, TernaryWeights):
-            # A BitNet b1.58 matrix's codes times its scale (row 1464).
-            return kernel.decoded(jnp.float32)
+            # A BitNet b1.58 matrix's codes times its scale (row 1464), once the format admits it.
+            return kernel.admitted().decoded(jnp.float32)
         return packed_values(kernel) if isinstance(kernel, NvFp4) else meta.unbox(kernel)
 
     def nonlinear_input(self, name: str, qwix: bool = True, input_scales: bool = True) -> bool:
@@ -665,7 +665,7 @@ def _resident_window(kernel: jax.Array, sharding: jax.sharding.NamedSharding, si
     from jax.sharding import NamedSharding, PartitionSpec, SingleDeviceSharding
 
     from dew._coordination import agreed
-    from dew.nn.kernels.formats import Bf16Window, window_form_version, window_planes
+    from dew.nn.kernels.formats import Bf16Window, window_planes
     from dew.nn.kernels.templates.gemm.packed import WINDOW
 
     depth, width = kernel.shape
@@ -698,8 +698,7 @@ def _resident_window(kernel: jax.Array, sharding: jax.sharding.NamedSharding, si
         jax.make_array_from_single_device_arrays((width, groups * WINDOW.words), planes, words,
                                                  dtype=np.uint32),
         jax.make_array_from_single_device_arrays((width, groups * WINDOW.meta_words), planes, meta,
-                                                 dtype=np.uint32),
-        window_form_version())
+                                                 dtype=np.uint32))
 
 
 def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
@@ -719,8 +718,9 @@ def packed_values(matrix: NvFp4) -> jax.Array:
     11740's review) and an export's (`decoded_packed`)."""
     from dew.algebra.bits import NVFP4_OWED
 
-    return _product_rounded(matrix.decoded(), jnp.asarray(matrix.scale, jnp.float32)[..., None, None],
-                            round(math.log2(NVFP4_OWED)))
+    # Its words read once the format admits them (`NvFp4.admitted`), an export's and a Linear's alike.
+    scale = jnp.asarray(matrix.scale, jnp.float32)[..., None, None]
+    return _product_rounded(matrix.admitted().decoded(), scale, round(math.log2(NVFP4_OWED)))
 
 
 def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Array:

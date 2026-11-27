@@ -43,7 +43,7 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     all_threes = jnp.full((16, 64), jnp.uint32(0xFFFFFFFF))
     np.testing.assert_array_equal(np.asarray(formats.ternary_codes(all_threes, jnp.float32)),
                                   np.zeros((256, 64), np.float32))
-    bad = dataclasses.replace(packed_w, form=np.zeros((8,), np.uint8))
+    bad = dataclasses.replace(packed_w, form=bytes(8))
     with pytest.raises(ValueError):
         bad.checked()
     with pytest.raises(ValueError):

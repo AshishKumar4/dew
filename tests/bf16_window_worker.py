@@ -94,6 +94,48 @@ def one_rank(args) -> dict:
             "shape": list(window.shape)}
 
 
+def checkpointed(args) -> dict:
+    """A `[256, 256]` kernel's window split by its columns across every device of the pool's processes,
+    saved and read back on every process into a template of its shapes and placement (`dew.checkpoints`, row
+    13700): its digest written whole on the pool's mesh beside its words, each process decoding its own
+    columns' bits again; the window saved under another encoder's form refused on every process alike, the
+    process reading it by the form's check (a `ValueError`) and every other by the pool's agreement."""
+    import dataclasses
+
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew import quantization
+    from dew._coordination import PeerFailure
+    from dew.checkpoints import Checkpoints
+
+    kernel = (np.random.default_rng(13700).normal(size=(256, 256)) * 0.02).astype(jnp.bfloat16)
+    columns = NamedSharding(Mesh(np.asarray(jax.devices()), ("columns",)), PartitionSpec(None, "columns"))
+    placed = jax.make_array_from_callback(kernel.shape, columns, lambda index: kernel[index],
+                                          dtype=kernel.dtype)
+    window = quantization.bf16_windows({"params": {"kernel": placed}}, sites=[""])[quantization.QUANTIZATION][
+        "kernel"]
+    template = {"window": jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), window)}
+    reports = {}
+    for name, written in (("own", window), ("foreign", dataclasses.replace(window, form=bytes(8)))):
+        directory = args.out.parent / f"checkpoint-{name}"
+        checkpoints = Checkpoints(str(directory))
+        checkpoints.save(1, {"window": written})
+        checkpoints.wait()
+        try:
+            restored = Checkpoints(str(directory)).restore(template)[0]["window"]
+        except (ValueError, PeerFailure) as error:
+            reports[name] = type(error).__name__
+            continue
+        decoded = jax.jit(lambda held: held.decoded())(restored)
+        reports[name] = [bool(np.array_equal(np.asarray(shard.data).view(np.uint16),
+                                             kernel[shard.index].view(np.uint16)))
+                         for shard in decoded.addressable_shards]
+    return reports
+
+
 def own_device(args) -> dict:
     """Each process's own `[256, 256]` bfloat16 kernel on its default device, an ordinary JAX array of
     none of the pool's meshes: each windowed whole where it is, decoded its bits again."""
@@ -130,7 +172,7 @@ def own_mesh(args) -> dict:
 
 
 MODES = {"width_split": width_split, "depth_split": depth_split, "one_rank": one_rank,
-         "own_device": own_device, "own_mesh": own_mesh}
+         "own_device": own_device, "own_mesh": own_mesh, "checkpointed": checkpointed}
 
 
 def main(argv=None) -> None:

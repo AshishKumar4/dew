@@ -1185,6 +1185,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     made, and elsewhere the layer's bank alone is decoded."""
     if layer is not None and group_sizes is None:
         raise ValueError("a stack of banks' layer is a grouped call's")
+    matrix.admitted()
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_quantized.MosaicPackedGmm()

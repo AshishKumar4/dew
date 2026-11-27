@@ -375,23 +375,37 @@ def test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision():
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((8, 512), 1 / 512, np.float32))
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class _EarlierBank:
+    """An NVFP4 bank as an earlier Dew registered it (`formats.NvFp4` before row 13700): its digest `form` a
+    leaf after its words, scales and scale, the layout its checkpoints hold."""
+
+    words: jax.Array
+    scales: jax.Array
+    scale: jax.Array
+    form: jax.Array
+
+
 def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
-    """`formats.NvFp4` stores the version of the form its words are packed by (`formats.FORM`, the encoder's
-    digest, `bits.BitForm.version`; algebra.md 7.4, row 6101), a stacked bank's each layer, and a checkpoint
-    restore of words another encoder packed is refused (`NvFp4.checked`): written and read back with its
-    version, a bank restores; the same bank stored under another version is refused by name."""
+    """`formats.NvFp4` states the version of the form its words are packed by (`formats.FORM`, the encoder's
+    digest, `bits.BitForm.version`; algebra.md 7.4, row 6101), a stacked bank's one, and a checkpoint holds
+    it beside its words (`formats.stored`); a restore of words another encoder packed is refused
+    (`formats.restored`): written and read back with its version, a bank restores into a template of its
+    shapes alone; the same bank stored under another version is refused by name, read into this Dew's
+    template."""
     from dew.checkpoints import Checkpoints
 
     bank, _ = nvfp4_bank(3, 2, 256, 128)
-    assert bytes(np.asarray(bank.form)).hex() == formats.FORM.tobytes().hex()
+    assert bank.form == formats.FORM
     stacked = jax.tree.map(lambda *layers: jnp.stack(layers), bank, bank)
-    assert bytes(np.asarray(stacked.layer(jnp.int32(1)).form)).hex() == formats.FORM.tobytes().hex()
+    assert stacked.layer(jnp.int32(1)).form == formats.FORM
     reordered = formats.form_version(bits.NVFP4_BFLOAT16_FORM.version,
                                      formats.staged_rows(formats.NVFP4_STAGE)[::-1])
-    assert not np.array_equal(reordered, formats.FORM)
+    assert reordered != formats.FORM
     with pytest.raises(ValueError):
         dataclasses.replace(bank, form=reordered).checked()
-    other = dataclasses.replace(bank, form=np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy())
+    other = dataclasses.replace(bank, form=bytes(8))
     with pytest.raises(ValueError):
         other.checked()
     def template(of):
@@ -404,25 +418,34 @@ def test_a_bank_carries_its_forms_version_and_a_load_refuses_another(tmp_path):
         checkpoints.wait()
         if refused:
             with pytest.raises(ValueError):
-                Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))
+                Checkpoints(str(tmp_path / name)).restore(template({"bank": bank}))
         else:
-            restored = Checkpoints(str(tmp_path / name)).restore(template({"bank": written}))[0]["bank"]
+            restored = Checkpoints(str(tmp_path / name)).restore(template({"bank": bank}))[0]["bank"]
             np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(written.words))
-    if len(jax.devices()) >= 2:
-        # Row 8958: a two-layer bank sharded by layer across two devices with a foreign digest on shard 1
-        # must be refused both locally (`checked()`) and through collective checkpoint restore.
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:2]), ("layers",))
-        by_layer = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("layers"))
-        mixed = jax.tree.map(lambda *layers: jax.device_put(jnp.stack(layers), by_layer), bank, other)
-        with pytest.raises(ValueError):
-            mixed.checked()
-        sharded_ckpt = Checkpoints(str(tmp_path / "sharded_mixed"))
-        sharded_ckpt.save(1, {"bank": mixed})
-        sharded_ckpt.wait()
-        sharded_template = jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=by_layer), {"bank": mixed})
-        with pytest.raises(ValueError):
-            Checkpoints(str(tmp_path / "sharded_mixed")).restore(sharded_template)
+    # A checkpoint an earlier Dew wrote, its digest a leaf of its bank (`_EarlierBank`, the layout it
+    # registered), a stacked bank's a row a layer, layer-sharded across two devices where there are two:
+    # restored into this Dew's stacked bank where every row is this Dew's form, refused where its second
+    # layer's row is another encoder's (row 8958's collective check of the rows each process holds).
+    digest = np.frombuffer(formats.FORM, np.uint8)
+    devices = jax.devices()[:2] if len(jax.devices()) >= 2 else jax.devices()[:1]
+    by_layer = jax.sharding.NamedSharding(jax.sharding.Mesh(np.array(devices), ("layers",)),
+                                          jax.sharding.PartitionSpec("layers"))
+    for name, second, refused in (("earlier", digest, False), ("earlier-mixed", np.zeros(8, np.uint8), True)):
+        earlier = _EarlierBank(*(jax.device_put(np.asarray(field), by_layer)
+                                 for field in (stacked.words, stacked.scales, stacked.scale)),
+                               jax.device_put(np.stack([digest, second]), by_layer))
+        checkpoints = Checkpoints(str(tmp_path / name))
+        checkpoints.save(1, {"bank": earlier})
+        checkpoints.wait()
+        wanted = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=by_layer),
+                              {"bank": stacked})
+        if refused:
+            with pytest.raises(ValueError):
+                Checkpoints(str(tmp_path / name)).restore(wanted)
+        else:
+            restored = Checkpoints(str(tmp_path / name)).restore(wanted)[0]["bank"]
+            assert isinstance(restored, formats.NvFp4) and restored.form == formats.FORM
+            np.testing.assert_array_equal(np.asarray(restored.scales), np.asarray(stacked.scales))
 
 
 @pytest.mark.parametrize("group_sizes", [None, (8, 8)], ids=["matrix", "expert bank"])
@@ -581,8 +604,10 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
 
 
 def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
-    """Checkpoint restore (`dew.checkpoints._packed_checked`) restores a matching `TernaryWeights` bank and
-    refuses a mismatched form version or an invalid scale shape (row 12161)."""
+    """Checkpoint restore (`formats.restored`) restores a matching `TernaryWeights` bank, its words and scale,
+    beside a concrete bank the checkpoint holds none of, kept as supplied; and refuses one stored under
+    another form version, read into this Dew's template (the digest it read refused, not its template's), or
+    one of an invalid scale shape (row 12161)."""
     from dew.checkpoints import Checkpoints
 
     where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
@@ -590,20 +615,26 @@ def test_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
     def template(of):
         return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
 
-    bad_form = np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy()
     good = formats.TernaryWeights.of(np.ones((256, 64), np.float32), scale=2.0)
     ok_ckpt = Checkpoints(str(tmp_path / "ok"))
     ok_ckpt.save(1, {"w": good})
     ok_ckpt.wait()
-    restored = Checkpoints(str(tmp_path / "ok")).restore(template({"w": good}))[0]["w"]
+    # Beside it, a concrete bank the checkpoint holds none of: kept as supplied, as any concrete leaf is.
+    supplied = formats.TernaryWeights.of(np.full((256, 64), -1.0, np.float32), scale=0.5)
+    held = Checkpoints(str(tmp_path / "ok")).restore({**template({"w": good}), "supplied": supplied})[0]
+    restored = held["w"]
     np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(good.words))
-    for tag, bad in (("form", dataclasses.replace(good, form=bad_form)),
-                     ("scale", dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))):
+    np.testing.assert_array_equal(np.asarray(restored.scale), np.asarray(good.scale))
+    assert isinstance(held["supplied"], formats.TernaryWeights), held["supplied"]
+    np.testing.assert_array_equal(np.asarray(held["supplied"].words), np.asarray(supplied.words))
+    bad_form, bad_scale = (dataclasses.replace(good, form=bytes(8)),
+                           dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))
+    for tag, bad, into in (("form", bad_form, good), ("scale", bad_scale, bad_scale)):
         bad_ckpt = Checkpoints(str(tmp_path / tag))
         bad_ckpt.save(1, {"w": bad})
         bad_ckpt.wait()
         with pytest.raises(ValueError):
-            Checkpoints(str(tmp_path / tag)).restore(template({"w": bad}))
+            Checkpoints(str(tmp_path / tag)).restore(template({"w": into}))
 
 
 @INTERPRETS
