@@ -98,7 +98,7 @@ from dew.scores import Summary
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
-from dew.training._fit import FitArguments, validation_suites
+from dew.training._fit import FitArguments
 from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
 from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
@@ -1490,11 +1490,14 @@ class RunConfig:
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.
             validation=validation if suites is None else suites or None, summaries=self.val_summaries)
-        if skipped is not None and lowering is None and any(
-                not episodic(suite.data) for suite in validation_suites(
-                    dataset, fitted["validation"], fitted["metrics"], fitted["eval_every"]).values()):
+        # The splits `fit` validates (`validation_suites`): the compiled suites, else the splits given, else
+        # the data's own `val` where a pass is scheduled or metrics score it.
+        held = ([suite.data for suite in suites.values()] if suites is not None
+                else list(validation.values()) if validation is not None
+                else [dataset.val] if dataset.val is not None and (fitted["eval_every"] or metrics) else [])
+        if skipped is not None and lowering is None and any(not episodic(split) for split in held):
             # A run that validates a batch split, where a preview samples (`Evaluation.run`; a split of
-            # episodes previews none), records the preview it skips, and why: the suites `fit` resolves.
+            # episodes previews none), records the preview it skips, and why.
             summary = {**(summary or {}), "preview": {"skipped": skipped}}
         if isinstance(lowering, AheadTarget):
             raise self.compiled_ahead(objective, dataset, steps, rollout, name, lowering, fitted)
