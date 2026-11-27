@@ -9,11 +9,11 @@ import functools
 import hashlib
 import math
 from collections.abc import Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.core import Tracer
 from jax.custom_derivatives import SymbolicZero
 from jax.typing import DTypeLike
 
@@ -45,40 +45,73 @@ def staged_rows(depth: int) -> np.ndarray:
     code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
     return _staged_rows(depth, packed.NVFP4_GROUP, bits.E2M1.width, packed.nvfp4_staged_depth, "NVFP4")
 
-def form_version(encoder: str, order: np.ndarray) -> np.ndarray:
-    """The 8-byte digest of an `NvFp4` encoding: its bit-form `encoder` (`bits.BitForm.version`) and the
+def form_version(encoder: str, order: np.ndarray) -> bytes:
+    """The 8-byte digest of a packed encoding: its bit-form `encoder` (`bits.BitForm.version`) and the
     staged depth `order` (`staged_rows(NVFP4_STAGE)`). Changing either invalidates stored words."""
-    digest = hashlib.sha256(bytes.fromhex(encoder) + np.asarray(order, "<i4").tobytes()).digest()[:8]
-    return np.frombuffer(digest, np.uint8).copy()
+    return hashlib.sha256(bytes.fromhex(encoder) + np.asarray(order, "<i4").tobytes()).digest()[:8]
 
 
 FORM = form_version(bits.NVFP4_BFLOAT16_FORM.version, staged_rows(NVFP4_STAGE))
 """The version of the form an `NvFp4`'s words are packed by (`form_version`: its encoder's digest and its
-staged depth order, `staged_rows(NVFP4_STAGE)`), as the bytes a matrix stores beside its words
+staged depth order, `staged_rows(NVFP4_STAGE)`), as the bytes a matrix states beside its words
 (`NvFp4.form`): words packed by another encoder or staged order decode wrong by this Dew's form, so a load
 refuses them (`NvFp4.checked`; algebra.md 7.4, rows 6101, 8662)."""
 
-def _checked_form(stored, expected: np.ndarray, label: str, factory: str, *, form=None) -> None:
-    """Verify `stored` (or gathered `form`) matches `expected` across every addressable shard (row 8958)."""
-    target = stored if form is None else form
-    pieces = ([shard.data for shard in target.addressable_shards]
-              if isinstance(target, jax.Array) else [target])
-    found: set[str] = set()
+
+def _checked_form(found: set[bytes], expected: bytes, label: str, factory: str) -> None:
+    """Refuse a packed matrix whose words were packed by a form (`found`, each digest it states) other than
+    this Dew's (`expected`), rows 8958 and 13700."""
+    if found != {expected}:
+        raise ValueError(f"{label} words packed by form version {', '.join(sorted(f.hex() for f in found))}, "
+                         f"where this Dew decodes form version {expected.hex()}: repack them from the source "
+                         f"weights (`{factory}`)")
+
+
+def _digests(stored, size: int) -> set[bytes]:
+    """The digests of a stored `form` leaf this process holds (its shards' rows; a stack's one a layer),
+    each a row of `size` bytes, none where it holds no shard; refused where a shard holds no whole row."""
+    pieces = ([stored] if not isinstance(stored, jax.Array)
+              else jax.device_get([shard.data for shard in stored.addressable_shards]))
+    found: set[bytes] = set()
     for piece in pieces:
         held = np.asarray(piece)
-        if held.ndim == 0 or held.shape[-1] != expected.size:
-            raise ValueError(f"{label} form digest sharded across its {expected.size} bytes "
-                             f"(shard shape {held.shape}); pass the gathered form to checked()")
-        found.update(bytes(row).hex() for row in held.reshape(-1, expected.size))
-    if found != {expected.tobytes().hex()}:
-        raise ValueError(f"{label} words packed by form version {', '.join(sorted(found))}, where this Dew "
-                         f"decodes form version {expected.tobytes().hex()}: repack them from the source "
-                         f"weights (`{factory}`)")
+        if held.ndim == 0 or held.shape[-1] != size or held.size == 0:
+            raise ValueError(f"a form digest of {size} bytes stored as {held.shape}")
+        found.update(bytes(row) for row in held.reshape(-1, size))
+    return found
+
+
+def _form_field(default: bytes):
+    """A packed matrix's `form` field: its encoder's digest, immutable bytes held in its type's tree
+    structure, so a program it enters reads it concrete and its product checks it wherever it runs, traced
+    or not (`checked`; a transformation keeps it unless code replaces it, row 13700). A checkpoint holds it
+    as a leaf of the matrix's record (`stored`)."""
+    return dataclasses.field(default=default, metadata={"static": True})
+
+
+class _Packed:
+    """The form check a packed matrix's types share (`NvFp4`, `TernaryWeights`, `Bf16Window`): `FORM_OF`,
+    this Dew's digest of its encoding, and `FACTORY`, what packs its words."""
+
+    FORM_OF: ClassVar[bytes]
+    FACTORY: ClassVar[str]
+    form: bytes
+
+    def checked(self):
+        """Itself where its words are this Dew's form's (`FORM_OF`), its form a static field's, so under a
+        transformation too; refused otherwise: words another encoder packed read wrong through this form's
+        decode, so they are repacked from the source weights, never decoded."""
+        _checked_form({self.form}, self.FORM_OF, type(self).__name__, self.FACTORY)
+        return self
+
+    def admitted(self):
+        """Itself, checked (`checked`): the one entry every product reading its words passes."""
+        return self.checked()
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class NvFp4:
+class NvFp4(_Packed):
     """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621), K-major, each column's depths
     along its row (as a Dense kernel read transposed): its E2M1 codes eight a uint32 in the GEMM's staged
     depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the `bits.NVFP4_BFLOAT16_FORM` word
@@ -94,18 +127,11 @@ class NvFp4:
     words: jax.Array | np.ndarray
     scales: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
-    form: jax.Array | np.ndarray = dataclasses.field(default_factory=FORM.copy)
-    """The version of the form its words were packed by (`FORM`'s bytes; a stack of banks' one a layer),
-    stored with them, so a checkpoint's words carry the encoder that packed them (`checked`)."""
-
-    def checked(self, form=None) -> "NvFp4":
-        """Itself, where its words are the checked-in form's (`FORM`), every layer's; refused otherwise:
-        words another encoder packed (a checkpoint an earlier Dew wrote) read wrong through this form's
-        decode, so they are repacked from the source weights, never decoded. A local host check of its
-        stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
-        row 8958)."""
-        _checked_form(self.form, FORM, "NVFP4", "NvFp4.of", form=form)
-        return self
+    form: bytes = _form_field(FORM)
+    """The version of the form its words were packed by (`FORM`'s bytes, a stack of banks' one), stored with
+    them, so a checkpoint's words carry the encoder that packed them (`checked`, `stored`)."""
+    FORM_OF: ClassVar[bytes] = FORM
+    FACTORY: ClassVar[str] = "NvFp4.of"
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
@@ -166,19 +192,18 @@ class NvFp4:
         """The logical axes of each of its leaves, in their order, where the matrix it stands for is laid out
         along `axes` (`[..., depth, width]`, any axes before them a bank's or a stack's): its words' and
         block scales' `[..., width, depth / 8 or depth / 16]`, its tensor scales' the leading ones alone,
-        its form's bytes whole on every device. The one statement of how its layout follows the matrix's,
+        its form none (a static field). The one statement of how its layout follows the matrix's,
         which placing a packed bank reads (row 11734). By each leaf's field name, in its fields' order (the
         leaves', as `jax.tree_util.register_dataclass` flattens it)."""
         *leading, depth, width = axes
-        named = {"words": (*leading, width, depth), "scales": (*leading, width, depth),
-                 "scale": tuple(leading), "form": (None,)}
-        return {field.name: named[field.name] for field in dataclasses.fields(NvFp4)}
+        return {"words": (*leading, width, depth), "scales": (*leading, width, depth),
+                "scale": tuple(leading)}
 
     def layer(self, index: jax.Array) -> "NvFp4":
         """A stack of banks' bank at layer `index` (a traced index): its fields led by a layers axis before
         their group axis (a scanned load's stacked banks, row 4861), each field's slice at it."""
         return NvFp4(*(jax.lax.dynamic_index_in_dim(jnp.asarray(field), index, keepdims=False)
-                       for field in (self.words, self.scales, self.scale, self.form)))
+                       for field in (self.words, self.scales, self.scale)), form=self.form)
 
     @property
     def factor(self) -> jax.Array:
@@ -440,7 +465,9 @@ class NvFp4Block:
     @classmethod
     def of(cls, matrix: NvFp4) -> "NvFp4Block":
         """A stored NVFP4 matrix (`NvFp4`, `[depth, width]`, its codes in the packed kernel's staged order)
-        as the block-scaled products read it: `[1, width, depth]`, its depths in their own order."""
+        as the block-scaled products read it: `[1, width, depth]`, its depths in their own order, once its
+        form is this Dew's (`NvFp4.admitted`)."""
+        matrix.admitted()
         return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], jnp.asarray(matrix.scales)[None],
                    jnp.asarray(matrix.scale))
 
@@ -459,9 +486,13 @@ def ternary_staged_rows(depth: int) -> np.ndarray:
     return _staged_rows(depth, packed.TERNARY_GROUP, 2, packed.ternary_staged_depth, "ternary weight")
 
 
-def ternary_form_version() -> np.ndarray:
+def ternary_form_version() -> bytes:
     """8-byte digest identifying the BitNet b1.58 2-bit ternary staging layout (`TernaryWeights`)."""
     return form_version(b"ternary-b158-v1\x00".hex(), ternary_staged_rows(TERNARY_STAGE))
+
+
+TERNARY_FORM = ternary_form_version()
+"""This Dew's ternary encoding's digest (`ternary_form_version`), every `TernaryWeights`' form."""
 
 
 def ternary_packed(codes: jax.Array) -> jax.Array:
@@ -488,14 +519,16 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class TernaryWeights:
+class TernaryWeights(_Packed):
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
-    absmean/per-column/per-group `scale` fp32, and `form` digest."""
+    absmean/per-column/per-group `scale` fp32, and `form` digest (`_form_field`)."""
     words: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
-    form: jax.Array | np.ndarray
+    form: bytes = _form_field(TERNARY_FORM)
     fmt: str = dataclasses.field(metadata={"static": True}, default="ternary")
+    FORM_OF: ClassVar[bytes] = TERNARY_FORM
+    FACTORY: ClassVar[str] = "TernaryWeights.of"
 
     @classmethod
     def of(cls, weights: jax.Array | np.ndarray, *,
@@ -525,7 +558,7 @@ class TernaryWeights:
                           jnp.where(quantized < 0, jnp.uint32(2), jnp.uint32(0)))
         staged = codes[..., ternary_staged_rows(source.shape[-2]), :]
         packed_words = ternary_packed(jnp.swapaxes(staged, -1, -2))
-        return cls(packed_words, scale_arr, ternary_form_version())
+        return cls(packed_words, scale_arr)
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -536,9 +569,9 @@ class TernaryWeights:
         *groups, width, words = self.words.shape
         return (*groups, 16 * words, width)
 
-    def checked(self, form=None) -> "TernaryWeights":
-        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
-        _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
+    def checked(self) -> "TernaryWeights":
+        """Itself, its form this Dew's encoder's (`_Packed.checked`) and its scale's shape its words'."""
+        super().checked()
         scale_checked(jnp.shape(self.scale), self.shape)
         return self
 
@@ -624,7 +657,7 @@ def window_nibble_rows(depth: int, layout: packed.WindowLayout = packed.WINDOW) 
     return _staged_rows(depth, layout.group, 4, layout.nibble_depth, "bfloat16 window")
 
 
-def window_form_version(layout: packed.WindowLayout = packed.WINDOW) -> np.ndarray:
+def window_form_version(layout: packed.WindowLayout = packed.WINDOW) -> bytes:
     """The 8-byte digest of the `Bf16Window` encoding at `layout`: this Dew's served layout's the digest its
     windows have always stored (its encoder's name, `bf16-window-v2`, and both planes' staged orders), so
     every saved window restores; another layout's folds its stored fields in too
@@ -633,6 +666,11 @@ def window_form_version(layout: packed.WindowLayout = packed.WINDOW) -> np.ndarr
     if layout == packed.WINDOW:
         return form_version(b"bf16-window-v2\x00".hex(), order)
     return form_version(b"bf16-window-v3".hex() + layout.fingerprint().hex(), order)
+
+
+WINDOW_FORM = window_form_version()
+"""This Dew's served window encoding's digest (`window_form_version` at `packed.WINDOW`), every
+`Bf16Window`'s form."""
 
 
 def window_planes(weights: jax.Array | np.ndarray, layout: packed.WindowLayout = packed.WINDOW, *,
@@ -719,7 +757,7 @@ def window_weights(words, meta, dtype=jnp.bfloat16,
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class Bf16Window:
+class Bf16Window(_Packed):
     """A frozen bfloat16 matrix `[..., depth, width]` stored lossless in 13 bits a weight (row 5387): each
     column's `packed.WINDOW.group` depths share a base exponent `b`, each weight its sign, its 7 mantissa bits
     and a 4-bit offset `1..15` of its exponent from `b - 1`; offset 0 is a signed zero where its mantissa bits
@@ -729,13 +767,15 @@ class Bf16Window:
     8]` uint32): its bytes (sign and mantissa, or an escape's index), 32 words in two 64-deep blocks of 16
     (`WindowLayout.byte_depth`), then its nibbles, 16 words (`WindowLayout.nibble_depth`); `meta` each group's
     four words `[..., width, depth // 32]` uint32 (its base, its escapes' bits two a word, a zero word);
-    `form` its encoder's digest. Decoded, every weight is its bits again, signed zeros, subnormals, infinities
-    and NaNs among them (`decoded`, `window_bits`)."""
+    `form` its encoder's digest (`_form_field`). Decoded, every weight is its bits again, signed zeros,
+    subnormals, infinities and NaNs among them (`decoded`, `window_bits`)."""
 
     words: jax.Array | np.ndarray
     meta: jax.Array | np.ndarray
-    form: jax.Array | np.ndarray
+    form: bytes = _form_field(WINDOW_FORM)
     fmt: str = dataclasses.field(metadata={"static": True}, default="window")
+    FORM_OF: ClassVar[bytes] = WINDOW_FORM
+    FACTORY: ClassVar[str] = "Bf16Window.of"
 
     @classmethod
     def of(cls, weights: jax.Array | np.ndarray, *, site: str = "a matrix") -> "Bf16Window":
@@ -743,7 +783,7 @@ class Bf16Window:
         host at this Dew's layout (`window_planes`), each group's base its largest normal exponent less 14;
         refused where a group of `site`'s holds more than `WindowLayout.escapes` nonzeros below its window (a
         heavy tail no window of 15 binades holds), its weights then served as they are."""
-        return cls(*window_planes(weights, site=site), window_form_version())
+        return cls(*window_planes(weights, site=site))
 
     @property
     def dtype(self) -> jnp.dtype:
@@ -763,18 +803,6 @@ class Bf16Window:
         halves = jnp.stack([meta & 0xFFFF, meta >> 16], axis=-1).astype(jnp.uint16)
         return halves.reshape(*meta.shape[:-1], 2 * meta.shape[-1])
 
-    def checked(self, form=None) -> "Bf16Window":
-        """Verify the stored `form` (every addressable shard) is this Dew's encoder's."""
-        _checked_form(self.form, window_form_version(), "Bf16Window", "Bf16Window.of", form=form)
-        return self
-
-    def admitted(self) -> "Bf16Window":
-        """The window, its form checked where it is concrete (`checked`; a traced one's is row 13700's): the
-        one entry every product reading its words passes (`window_product`, `gemm`'s and Dense's decoded
-        fallbacks, a recipe's applied kernel), `decoded` itself unchecked (a restore's sharded form)."""
-        if not isinstance(self.form, Tracer):
-            self.checked()
-        return self
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
         """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a
@@ -799,5 +827,87 @@ def window_bits(byte: jax.Array, offset: jax.Array, base: jax.Array, escapes: tu
 
 PACKED_FORMATS = (NvFp4, TernaryWeights, Bf16Window)
 """The packed matrices a variables tree holds in its `QUANTIZATION` collection, a layer's served as its
-codes (`dense.packed_matrix`), each stating its encoder's `form` its `checked` verifies on restore
-(`checkpoints._packed_checked`)."""
+codes (`dense.packed_matrix`), each stating its encoder's `form`, which its products check (`checked`), and
+a checkpoint holding it as its record (`stored`), the digest beside its words that a restore checks
+(`restored`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Record:
+    """A packed matrix type's checkpoint record (`stored`) and the one split of its fields both directions
+    read: its data fields (`leaves`, the matrix's array leaves) and its static ones but its digest
+    (`static`). The record type holds the leaves, then the digest `form` a leaf, then the static fields as
+    its structure, keyed and ordered as the matrix type registered them while its digest was a leaf (before
+    row 13700): every checkpoint, an earlier Dew's too, holds the same leaves at the same paths, and a
+    collection's integrity digest reads the same."""
+
+    type: type
+    leaves: tuple[str, ...]
+    static: tuple[str, ...]
+
+    @classmethod
+    def of(cls, matrix_type) -> "_Record":
+        fields = dataclasses.fields(matrix_type)
+        leaves = tuple(field.name for field in fields if not field.metadata.get("static"))
+        static = tuple(field.name for field in fields
+                       if field.metadata.get("static") and field.name != "form")
+        record = dataclasses.make_dataclass(
+            f"Stored{matrix_type.__name__}",
+            [*((name, object) for name in leaves), ("form", object),
+             *((name, object, dataclasses.field(metadata={"static": True})) for name in static)], frozen=True)
+        return cls(jax.tree_util.register_dataclass(record), leaves, static)
+
+
+RECORDS = {cls: _Record.of(cls) for cls in PACKED_FORMATS}
+"""Each packed matrix type's checkpoint record (`_Record`), by the type."""
+
+RECORD_TYPES = tuple(record.type for record in RECORDS.values())
+"""Every packed matrix's checkpoint record type (`RECORDS`), a node of a tree a checkpoint holds."""
+
+
+def record_of(matrix, form):
+    """Packed `matrix`'s record (`RECORDS`) holding `form` as its digest leaf (an array, or a restore's asked
+    one), `matrix`'s other leaves and static fields its own (`matrix` a restore's template too)."""
+    record = RECORDS[type(matrix)]
+    held = {name: getattr(matrix, name) for name in (*record.leaves, *record.static)}
+    return record.type(**held, form=form)
+
+
+def digest_placement(words) -> jax.sharding.Sharding | None:
+    """Where a packed matrix's digest leaf lies beside its `words` (an array, or a restore's asked one): whole
+    on every device of their mesh where a mesh places them, on their device where one holds them, on this
+    process's first device where none places them; None for host words, whose digest stays on the host."""
+    placed = getattr(words, "sharding", None)
+    if isinstance(placed, jax.sharding.NamedSharding):
+        return jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(),
+                                          memory_kind=placed.memory_kind)
+    if placed is not None:
+        return placed if isinstance(placed, jax.sharding.SingleDeviceSharding) else None
+    return jax.sharding.SingleDeviceSharding(jax.local_devices()[0]) if isinstance(
+        words, jax.ShapeDtypeStruct) else None
+
+
+def stored(matrix):
+    """The record a checkpoint holds of packed `matrix` (`record_of`): its form's bytes its digest leaf, a
+    uint8 array placed beside its words (`digest_placement`; a checkpoint's local tier writes device arrays
+    alone)."""
+    digest = np.frombuffer(matrix.form, np.uint8).copy()
+    placed = digest_placement(matrix.words)
+    if isinstance(placed, jax.sharding.NamedSharding):
+        digest = jax.make_array_from_callback(digest.shape, placed, lambda index: digest[index],
+                                              dtype=np.uint8)
+    elif placed is not None:
+        digest = jax.device_put(digest, placed)
+    return record_of(matrix, digest)
+
+
+def restored(template, record):
+    """The packed matrix of `template`'s type and static fields a checkpoint's `record` (`stored`'s, read
+    back) holds: refused where a row of its digest this process holds (an earlier Dew's stack, a row a
+    layer; none where its words lie on other processes' devices alone) is not this Dew's form, or the matrix
+    fails its own check (`checked`), before any product reads its words."""
+    name = type(template).__name__
+    if found := _digests(record.form, len(template.form)):
+        _checked_form(found, template.FORM_OF, name, template.FACTORY)
+    leaves = {name: getattr(record, name) for name in RECORDS[type(template)].leaves}
+    return dataclasses.replace(template, **leaves).checked()

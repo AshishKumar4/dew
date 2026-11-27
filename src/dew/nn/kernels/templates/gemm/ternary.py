@@ -11,12 +11,11 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
-from jax.core import Tracer
 
 from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
-from dew.nn.kernels.formats import TernaryWeights, scale_checked, scale_factor
+from dew.nn.kernels.formats import TernaryWeights, scale_factor
 from dew.nn.kernels.templates.gemm.factored import factored, int8_epilogue
 from dew.nn.sharding import automatic_axes
 
@@ -73,10 +72,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     decodes staged uint32 ternary words inline in the GEMM mainloop on sm80/sm90 into exact bf16
     `{-1, 0, +1}`, accumulates exact integer products in fp32, applies `(peak / 127) * weights.scale` via
     `precision.twice_scaled`, and rounds once to `out_dtype`."""
-    if not isinstance(weights.form, Tracer):
-        weights.checked()
-    else:
-        scale_checked(jnp.shape(weights.scale), weights.shape)
+    weights.admitted()
     dense = group_sizes is None
     if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
         raise ValueError(f"ternary_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
@@ -95,8 +91,8 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
         mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
     if mosaic:
-        form_bytes, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
-        rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, form_bytes),
+        one = jnp.ones((), jnp.float32)
+        rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, weights.form),
                                           interpret_on_cpu, dense=dense)
         product = contracted("test_a_ternary_weight_product_holds_every_order")(
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))

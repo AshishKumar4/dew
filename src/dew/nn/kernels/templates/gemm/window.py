@@ -58,9 +58,8 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
         case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
         mosaic = selection.select(WINDOW, case).kernel == "mosaic"
     if mosaic:
-        form = jnp.asarray(window.form)
-        rules = gemm._packed_weight_rules(launch, lambda w, m: Bf16Window(w, m, form), interpret_on_cpu,
-                                          dense=dense, finite=False)
+        rules = gemm._packed_weight_rules(launch, lambda w, m: Bf16Window(w, m, window.form),
+                                          interpret_on_cpu, dense=dense, finite=False)
         product = contracted("test_a_window_product_holds_every_order")(
             generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
         operands = (words, sizes, meta)

@@ -86,6 +86,7 @@ from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.checkpoints._integrity import _digest
+from dew.checkpoints._packed import _stored, _stored_template, _unstored
 from dew.checkpoints._payloads import (
     _NEEDS,
     MODEL,
@@ -538,26 +539,6 @@ def _refuse_reshaped(template, stored, where: str) -> None:
         raise ValueError(f"The checkpoint at {where} holds {', '.join(wrong[:6])}"
                          f"{f' and {len(wrong) - 6} more' if len(wrong) > 6 else ''}: restore it into "
                          f"the shapes it was written with.")
-
-
-def _packed_checked(tree) -> None:
-    """Refuse a restored tree holding a packed matrix (`formats.PACKED_FORMATS`) whose form
-    version or scale shape fails `.checked`, gathering forms in one collective (rows 8958, 12161, 5387)."""
-    from dew._coordination import collective_host
-    from dew.nn.kernels.formats import PACKED_FORMATS
-
-    packed = [(jax.tree_util.keystr(path, simple=True, separator="/"), leaf)
-              for path, leaf in jax.tree_util.tree_flatten_with_path(
-                  tree, is_leaf=lambda node: isinstance(node, PACKED_FORMATS))[0]
-              if isinstance(leaf, PACKED_FORMATS)]
-    if not packed:
-        return
-    forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
-    for (name, leaf), form in zip(packed, forms, strict=True):
-        try:
-            leaf.checked(form)
-        except ValueError as error:
-            raise ValueError(f"{name}: {error}") from error
 
 
 def _paths(tree) -> set[str]:
@@ -1502,7 +1483,7 @@ class Checkpoints:
         persistent = self._open()
         self._project()
         if mapping:
-            profiles, state_tree, frozen, deltas = None, dict(state), {}, {}
+            profiles, state_tree, frozen, deltas = None, _stored(dict(state)), {}, {}
             payloads = {ONE_ITEM: state_tree}
         else:
             self._identify_run()
@@ -1706,7 +1687,9 @@ class Checkpoints:
                         f"{path} is gone: the step records its {name} collection there, so the run "
                         f"directory was copied or published without its {FROZEN_STORE}/ directory")
                 stored = dict(_item_metadata(checkpointer.metadata(path)))
-                template = None if templates is None else templates.get(name)
+                # A collection's records' digests asked in the shapes its store holds (`_stored_template`).
+                template = (None if templates is None or name not in templates
+                            else _stored_template(templates[name], stored))
                 # A template may ask for part of the collection, as a bank reader does
                 # one layer of a frozen base; the part is read through the same partial
                 # restore a step's own leaves take, and only a whole read can check the
@@ -1906,9 +1889,9 @@ class Checkpoints:
               rollout: Mapping[str, object] | None = None) -> dict[str, StateLeaf]:
         from dew.state import CHECKPOINTED, without_empty_window
         state = without_empty_window(state)
-        state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
+        state_tree = {name: _stored(getattr(state, name)) for name in CHECKPOINTED}
         if rollout is not None:
-            state_tree['rollout'] = dict(rollout)
+            state_tree['rollout'] = _stored(dict(rollout))
         if saved is not None:
             if share is None:
                 raise ValueError(
@@ -2143,11 +2126,12 @@ class Checkpoints:
             return None
         # A step saved before the rollout held a key holds the rest, which the rollout reads without it.
         held = metadata['rollout']
-        wanted = {'rollout': {key: value for key, value in template.items() if key in held}}
+        typed = {key: value for key, value in template.items() if key in held}
+        wanted = _stored_template({'rollout': typed}, metadata)
         _refuse_reshaped(wanted, metadata, self.source(step))
         restored = self._restored(step, wanted, jax.tree.map(lambda want: _read(want, want.dtype), wanted),
                                   local=from_local)
-        return _placed(dict(restored['rollout']), wanted['rollout'], _keys(snapshot))
+        return _unstored(_placed(dict(restored['rollout']), wanted['rollout'], _keys(snapshot)), typed)
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
@@ -2200,6 +2184,8 @@ class Checkpoints:
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
         template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
+        # Read as the checkpoint holds it, each packed matrix its record, rebuilt once the read is whole.
+        typed, template = template, None if template is None else _stored_template(template, metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
@@ -2260,8 +2246,10 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
+        if typed is not None:
+            named = typed if isinstance(typed, Mapping) else {name: getattr(typed, name) for name in restored}
+            restored = _unstored(restored, {name: named[name] for name in restored})
         restored = _filled(placed, restored, step)
-        _packed_checked(restored)
         return restored, saved
 
     def _host_restored(self, step: int, snapshot, metadata, *, local: bool) -> dict:

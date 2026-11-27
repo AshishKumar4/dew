@@ -88,7 +88,7 @@ def test_a_window_codec_at_another_meta_layout_decodes_in_its_stages_and_reads_a
     # Its digest folds its meta's placement in, not its width alone: another eight-word layout's differs too.
     other = packed.WindowLayout(meta_words=8, base_word=0, escape_words=(1, 2))
     for digest in (formats.window_form_version(), formats.window_form_version(other)):
-        assert not np.array_equal(formats.window_form_version(moved), digest)
+        assert formats.window_form_version(moved) != digest
     with pytest.raises(ValueError):
         Bf16Window(words, meta, formats.window_form_version(moved)).checked()
 
@@ -100,7 +100,7 @@ def test_a_window_saved_before_its_layout_was_a_descriptor_restores():
     fingerprint folded into the served layout's digest refused every saved window)."""
     drawn = _two_steps()
     encoded = Bf16Window.of(drawn)
-    stored = np.asarray([5, 52, 140, 90, 151, 251, 98, 77], np.uint8)
+    stored = bytes([5, 52, 140, 90, 151, 251, 98, 77])
     saved = Bf16Window(encoded.words, encoded.meta, stored).checked()
     np.testing.assert_array_equal(np.asarray(saved.decoded()).view(np.uint16), drawn.view(np.uint16))
 
@@ -147,6 +147,11 @@ def _two_steps(seed: int = 5387) -> np.ndarray:
     second = np.where(finite, (second.astype(np.float32) * np.float32(2.0 ** -20)), 0.0).astype(jnp.bfloat16)
     second[0:3, 5] = np.asarray(2.0 ** -50, jnp.bfloat16)
     return np.concatenate([_drawn((256, 64), seed), second])
+
+
+def _flipped(form: bytes) -> bytes:
+    """`form` with its first bit flipped: another encoder's digest."""
+    return bytes([form[0] ^ 1, *form[1:]])
 
 
 @pytest.mark.parametrize("grouped", [False, True], ids=["dense", "grouped"])
@@ -437,7 +442,7 @@ def test_a_windowed_dense_with_an_fp32_bias_keeps_its_declared_tangent():
     assert plain[0, 0] == 0.0
     # Another encoder's window, its digest not this Dew's, is refused on this path as on the window's own.
     held = windowed[quantization.QUANTIZATION]["kernel"]
-    foreign = dataclasses.replace(held, form=np.asarray(held.form) ^ np.uint8(1))
+    foreign = dataclasses.replace(held, form=_flipped(held.form))
     with pytest.raises(ValueError):
         tangent({**windowed, quantization.QUANTIZATION: {"kernel": foreign}})
 
@@ -467,6 +472,13 @@ def test_a_kernel_no_process_holds_whole_packs_where_its_columns_live(tmp_path):
     # A mesh of process 0's own devices, windowed there alone: no peer's agreement waited on.
     reports = run_pool("own_mesh", tmp_path / "own_mesh", 2, devices=2, script=worker, timeout=300)
     assert [report["decoded"] for report in reports] == [True, None], reports
+    # Saved and read back on every process (row 13700): each process's own columns' bits; another encoder's
+    # form refused on every process, by the form's check where it reads the digest.
+    reports = run_pool("checkpointed", tmp_path / "checkpointed", 2, devices=2, script=worker)
+    for report in reports:
+        assert report["own"] and all(report["own"]), report
+        assert report["foreign"] in ("ValueError", "PeerFailure"), report
+    assert any(report["foreign"] == "ValueError" for report in reports), reports
     # Split by its depth, a column's groups apart, which its window's decode reads whole: refused.
     for report in run_pool("depth_split", tmp_path / "depths", 2, devices=2, script=worker):
         assert report["refused"] == "ValueError", report
@@ -647,12 +659,26 @@ def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(run, s
 
 @pytest.mark.parametrize("compute", [jnp.bfloat16, jnp.float32], ids=["window", "decoded"])
 def test_gemm_over_a_window_of_another_encoding_is_refused(compute):
-    """A window whose form a later write made another encoder's is refused by `gemm.gemm` at its product,
-    on the window's own route (bf16 compute at the default precision, `window_product`) and on its decoded
-    fallback (fp32 compute, `Bf16Window.decoded`) alike, its words never read through this form's decode
-    (row 13686's review)."""
+    """A window of another encoder's form is refused by `gemm.gemm` at its product, on the window's own
+    route (bf16 compute at the default precision, `window_product`) and on its decoded fallback (fp32
+    compute, `Bf16Window.decoded`) alike, its words never read through this form's decode (row 13686's
+    review): called as it is, passed into a jitted program, and forged inside one by a replace of its form
+    (row 13700: a form traced there was checked nowhere); this Dew's window runs in the same program."""
     kernel = jnp.asarray((np.arange(128 * 64).reshape(128, 64) % 7 - 3) / 4.0, jnp.bfloat16)
     window = Bf16Window.of(kernel)
-    np.asarray(window.form).reshape(-1)[0] ^= 1
-    with jax.default_matmul_precision("default"), pytest.raises(ValueError):
-        gemm.gemm(jnp.ones((4, 128), jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)
+    foreign = dataclasses.replace(window, form=_flipped(window.form))
+    rows = jnp.ones((4, 128), jnp.float32)
+
+    def product(window):
+        return gemm.gemm(rows, window, None, out_dtype=jnp.float32, compute=compute)
+
+    def forged(window):
+        return product(dataclasses.replace(window, form=_flipped(window.form)))
+
+    with jax.default_matmul_precision("default"):
+        for refused in (lambda: product(foreign), lambda: jax.jit(product)(foreign),
+                        lambda: jax.jit(forged)(window)):
+            with pytest.raises(ValueError):
+                refused()
+        np.testing.assert_array_equal(np.asarray(jax.jit(product)(window)), np.asarray(product(window)))
+

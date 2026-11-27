@@ -60,6 +60,44 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
                                norm_swiglu.SwigluBackward))
 
 
+@pytest.mark.parametrize("packed", ["window", "nvfp4", "ternary"])
+def test_a_packed_launchs_matrix_and_its_timings_round_trip_through_dews_json(packed):
+    """A packed matrix's launch on an H100 (a bfloat16 window's and a ternary one's named, an NVFP4 matrix's
+    on its declared route), its matrix's form digest a static field of its bound argument (row 13700):
+    written as the picks store writes it (`dumps_picks`: the digest as hex) and read back, the same op at the
+    same key, its config's timing kept, the digest the same bytes (train 1393's review: bytes had no JSON
+    form, and storing any packed launch's timings raised)."""
+    from dew.nn.kernels import formats, gemm
+
+    rng = np.random.default_rng(13700)
+    weights = jnp.asarray(rng.normal(size=(512, 128)) / 8, jnp.bfloat16)
+    rows = jnp.asarray(rng.normal(size=(16, 512)), jnp.bfloat16)
+    matrix = {"window": formats.Bf16Window.of, "nvfp4": formats.NvFp4.quantized,
+              "ternary": formats.TernaryWeights.of}[packed](weights)
+    product = {"window": gemm.window_product, "nvfp4": gemm.nvfp4_product,
+               "ternary": gemm.ternary_weight_product}[packed]
+    # A word-packed matrix's template launch is named (its unforced route refuses it unmeasured).
+    named = {} if packed == "nvfp4" else {"grouped_matmul": "mosaic"}
+
+    def traced(rows):
+        return product(rows, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(**named):
+        # The launches whose bound matrix carries the form digest (a static field of its type).
+        keyed = [ba for ba in recorded(traced, rows)
+                 if any(getattr(value, "form", None) == matrix.form for value in ba.arguments.values())]
+        assert keyed, packed
+        timing = _timed(3.0)
+        configs = {(tuning._identity(ba.op), ba.autotuning_cache_key): ba.heuristics_config for ba in keyed}
+        picks = [(ba, tuning.Timings({ba.heuristics_config: timing})) for ba in keyed]
+        entries = json.loads(tuning.dumps_picks(jax.devices()[0].device_kind, picks))["data"]
+    read = tuning._keyed([(tuning._launch(entry), tuning._timings(entry["timings"])) for entry in entries])
+    assert set(read) == set(configs)
+    for key, (ba, timings) in read.items():
+        assert timings[configs[key]] == timing
+        assert any(getattr(value, "form", None) == matrix.form for value in ba.arguments.values()), ba
+
+
 def _norm_launch_and_two_configs():
     """A norm launch of `test_tuning`'s step, its derived config and another of its space."""
     from test_tuning import operands, step
