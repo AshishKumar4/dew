@@ -772,8 +772,8 @@ def deferred_packed(variables: Variables) -> Variables:
     (`dew.nn.dense.packed_matrix`) decoded float32, an expert bank's `[..., experts, in, out]` (a scanned
     run's banks stacked on its layer axis before their experts) or a Linear's kernel `[..., in, out]`, each
     value its code times its block's scale times its matrix's, exactly (`packed_values`, on this host,
-    `programs.on_host`); a lossless bfloat16 window (`bf16_windows`) its kernel bitwise the one it stored, once its format
-    admits it (`Bf16Window.admitted`, as every reader of it asks)."""
+    `programs.on_host`); a lossless bfloat16 window (`bf16_windows`) its kernel bitwise the one it stored,
+    once its format admits it (`Bf16Window.admitted`, as every reader of it asks)."""
     from dew.nn.kernels.formats import Bf16Window, NvFp4
 
     def packed(leaf) -> bool:
