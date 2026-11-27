@@ -148,14 +148,10 @@ def loaded(name: str, region: terms.Region, assembled: Callable[..., _Forms], *,
         _log.debug("no stored derivation %s: derived afresh", name)
         return None
     try:
-        summed, _, body = text.decode().partition("\n")
-        if summed != _summed(name, body):
-            raise ValueError("an entry whose digest is not its own")
-        record = json.loads(body)
-        if not isinstance(record, dict) or (record.get("format"), record.get("params_from"),
-                                            record.get("literals_from"), record.get("shapes_from")) != (
-                FORMAT, len(region.params), len(region.literals), len(region.shapes)):
-            raise ValueError("an entry of another layout or another trace's region")
+        record = _record(name, text)
+        if (record.get("params_from"), record.get("literals_from"), record.get("shapes_from")) != (
+                len(region.params), len(region.literals), len(region.shapes)):
+            raise ValueError("an entry of another trace's region")
         params = [_parameter(entry) for entry in _listed(record["params"])]
         literals = [_literal(value) for value in _listed(record["literals"])]
         decoded = _decoded(_listed(record["terms"]), leaves=region.leaves,
@@ -200,19 +196,43 @@ def _inventory(region: terms.Region) -> list | None:
             [(primitive.name, params) for primitive, params in region.params]]
 
 
+def _one_directory(first: str, second: str) -> bool:
+    """Whether `first` and `second` are one directory: one path once resolved (whatever either holds now, a
+    directory replaced between two reads among them), or one file where both exist (`os.path.samefile`: two
+    mounts of one). An error reading either but its absence is raised (`stored` counts it unstorable)."""
+    if os.path.realpath(first) == os.path.realpath(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except FileNotFoundError:
+        return False
+
+
 def entry(path: str | os.PathLike) -> bool:
-    """Whether the file at `path` is a store's entry: named by a key, its text this format's and its own
-    (`_summed`), as `loaded` reads one."""
+    """Whether the file at `path` is a store's entry: named by a key, its text its own and this format's
+    (`_record`), as `loaded` reads one."""
     name = os.path.basename(path).removesuffix(".json")
     if not re.fullmatch(r"[0-9a-f]{40}", name) or not os.path.isfile(path):
         return False
     try:
         with open(path, "rb") as file:
-            summed, _, body = file.read().decode().partition("\n")
-        record = json.loads(body)
-    except (OSError, UnicodeDecodeError, ValueError):
+            _record(name, file.read())
+    except (OSError, ValueError, RecursionError):
         return False
-    return summed == _summed(name, body) and isinstance(record, dict) and record.get("format") == FORMAT
+    return True
+
+
+def _record(name: str, text: bytes) -> dict:
+    """The record an entry `name` of `text` holds, its digest checked before its body is parsed (`_summed`: a
+    text not its own is never read) and its format this one's; `ValueError` otherwise (`RecursionError`
+    where a body of its own nests past Python's depth)."""
+    summed, _, body = text.decode().partition("\n")
+    if summed != _summed(name, body):
+        raise ValueError("an entry whose digest is not its own")
+    record = json.loads(body)
+    if not isinstance(record, dict) or record.get("format") != FORMAT:
+        raise ValueError("an entry of another layout")
+    return record
 
 
 def _summed(name: str, body: str) -> str:
@@ -246,7 +266,7 @@ def stored(name: str, region: terms.Region, params_from: int, literals_from: int
                                for value in region.literals[literals_from:]],
                   **forms, "terms": writer.table}
         body = json.dumps(record, sort_keys=True)
-        if os.path.realpath(directory()) == os.path.realpath(shipped()):
+        if _one_directory(directory(), shipped()):
             raise Unstated("Dew's cache is the read-only store (`DEW_DERIVATIONS`), never written")
         os.makedirs(directory(), exist_ok=True)
         _files.write_atomically(os.path.join(directory(), f"{name}.json"), f"{_summed(name, body)}\n{body}")
