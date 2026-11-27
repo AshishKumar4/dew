@@ -448,10 +448,16 @@ from dew.algebra import SATURATION, derive, rules
 from dew.algebra.terms import Term
 from dew.nn.kernels.templates import report
 
+import os
+
+from dew.algebra import stored
+
 forms = derive.derive(held.declared(held.attention), accurate=False, saturation=SATURATION)
 tiles = held.shaped(held.tile_of(held.operands(*held.draw(0)), 0))
 forms.init(tiles)
 first = len(report.rewrites())
+entries = len(os.listdir(stored.directory()))
+looked = dict(report.stored())
 forms.init(tiles)
 again = len(report.rewrites())
 value, root, inner, outer = var("value", Term), var("root", Term), var("inner", i64), var("outer", i64)
@@ -461,28 +467,35 @@ family = rules.RuleFamily("a magnitude's magnitude", (once,), (lambda x: jnp.abs
 rules.register(rules.Rules.declared("registered between", "exact", (family,), "a test's"))
 forms.init(tiles)
 found = report.rewrites()
-print(json.dumps({"first": first, "again": again, "after": len(found), "admitted": list(found[-1].admitted)}))
+print(json.dumps({"first": first, "again": again, "after": len(found), "admitted": list(found[-1].admitted),
+                  "reused": found[-1].reused, "entries": [entries, len(os.listdir(stored.directory()))],
+                  "stored": [looked, dict(report.stored())]}))
 """
 """A process that derives a declaration's forms at a shape twice, registers a rule set, and asks for them
 again."""
 
 
-def test_a_rule_set_registered_after_a_derivation_derives_the_forms_afresh():
+def test_a_rule_set_registered_after_a_derivation_derives_the_forms_afresh(tmp_path):
     """A reduction's forms are kept by what their derivation reads, the rule sets its numerics admit among
     them (they saturate in its e-graph): asked again at the same shapes they are the ones kept, and after a
     set is registered they are derived afresh under it, their report naming it. They were kept by their
     mesh, target, numerics and shapes alone, so a set registered later never reached a shape derived
-    before it."""
+    before it. A process outside the test session, as a run, stores its derivations (`dew.algebra.stored`):
+    one under a set registered at run time is derived afresh with it and stored nowhere (`unstorable`)."""
     import json
     import os
     import subprocess
     import sys
 
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", "XDG_CACHE_HOME": str(tmp_path)}
     done = subprocess.run([sys.executable, "-c", REGISTERED_BETWEEN], capture_output=True, text=True,
-                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+                          check=True, env=env)
     found = json.loads(done.stdout.strip().splitlines()[-1])
     assert found["again"] == found["first"] and found["after"] == found["first"] + 1, found
-    assert "registered between" in found["admitted"]
+    assert "registered between" in found["admitted"] and not found["reused"]
+    before, after = found["stored"]
+    assert after.get("unstorable", 0) == before.get("unstorable", 0) + 1, found
+    assert after.get("miss", 0) == before.get("miss", 0) and found["entries"][0] == found["entries"][1] > 0
 
 
 def test_sums_no_maximum_scales_walk_as_plain_sums():

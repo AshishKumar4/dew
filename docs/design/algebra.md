@@ -1225,7 +1225,31 @@ a derived form replaces a hand-written one only where it states the walk, passes
   numerics, not a candidate: a plain prefix loses about 1e-6 of a deep decay, which no price weighs.
 - A Mosaic launch built from the derived chunk forms' terms is the generator's work (§6.11). Until then the
   Mosaic recurrence takes derived tile algebra inside its own launches.
-- The derived forms run at trace time.
+- The derived forms run at trace time. A template derivation's forms at one tile (`derive._derived`) are
+  stored across processes in Dew's cache (`dew.algebra.stored`), keyed by everything they read: the
+  declaration's traced program (its structural digest and its captured constants), its walked axes, the
+  tile's shapes and dtypes, its numerics' class and limits, the context it is priced and traced in
+  (`derive.context`, in a canonical form), the rule sets it saturates with (by name, each as `rules.py`'s
+  source registers it), the algebra's code and egglog's and JAX's versions. The program's digest states a
+  primitive by its name, so a program is keyed only where each primitive it holds, at every depth, is the
+  one JAX binds to that name (`jax.lax`, `jax.extend.core.primitives`): a region tells primitives apart by
+  identity, and a user's primitive under a JAX name is not keyed. An entry holds each chosen term as the
+  Term language's constructors write it, each distinct term once in a table its forms index (a term shared
+  along a chain is written once, not once per path), and the parameters and literals the derivation
+  appended to its region (each appended literal shaped as it is, which a derivation that appends other
+  shapes is not stored past), the region itself traced again. Its text is digested with its name, and one whose digest is
+  not its own is not decoded; it is checked against that region, each value of its kind and its finishes
+  and merges as a derivation holds them, before any of it is taken, and the region is extended only once
+  all of it has read. One that
+  fails to read is derived afresh past, a program or value the key or codec does not state, or an entry that
+  cannot be written, is not stored, and the extractor's oracle (`Passes.checked`) derives without the store;
+  both derive from the one live set of rules. A registered rule set is immutable once built
+  (`Rules.declared`, from its families' immutable rules): changing a built set's egglog ruleset in place is
+  unsupported, as monkeypatching is, and a set registered at run time stores nothing. Each outcome is
+  counted in the kernel report (`report.stored`) and a plan's kernel record, the plan's search's own
+  (`report.recording`). A cold attention step's 20
+  forms (9 s of 25 s on armada) read back in a fresh process with the store alone warm, the step 15 s, its
+  program the same.
 
 Production derives these forms at trace time (`derive.derive`, `scan.derive_scan`). The component pilots
 in §6.11 emit checked-in cases without replacing the launches. Generating and taking a complete template
