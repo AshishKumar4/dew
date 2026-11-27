@@ -233,11 +233,12 @@ class Assignment:
                 storages[step.buffer_id] = storages.get(shared, shared) if sharing else int(step.buffer_id)
                 opened[step.buffer_id] = position
             spans += [(buffer, start, len(simulated.events)) for buffer, start in opened.items()]
-            # Where each instruction has run by in this trace: its last event's position (its outputs placed,
-            # the buffers it read last freed).
+            # Where each instruction runs in this trace: its last output's placing (`ALLOC`, `SHARE_WITH`); a
+            # `FREE` names the producer of the value dying, not the instruction running there.
             ran: dict[tuple[str, str], int] = {}
             for position, step in enumerate(simulated.events):
-                ran[(step.computation_name, step.instruction_name)] = position
+                if step.kind != kinds["FREE"]:
+                    ran[(step.computation_name, step.instruction_name)] = position
             allocation = simulated.buffer_allocation_index
             sizes = assigned.get(allocation, {})
             charged = _charged(simulated.events, sizes, kinds)

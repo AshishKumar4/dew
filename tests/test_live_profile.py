@@ -89,6 +89,23 @@ def test_a_residual_is_a_forward_value_live_into_the_backward():
     assert profile.frees(lambda op_name, names: True) == 58 - 38
 
 
+def test_a_residual_is_held_through_its_forwards_reads_before_the_backward():
+    """A residual a rung recomputes is made and read by its forward all the same: held through its forward's
+    last read before the backward began (`LiveInterval.uses`, `Held.until`), where it shares the forward's
+    peak with its scratch dropping it frees none of that peak; read last before the scratch, it frees the
+    scratch's share of it; a read named the forward's at or past the backward's start is the backward's."""
+    def profile(read: int) -> LiveProfile:
+        found = LiveProfile.of((interval(100, 0, 6, 0, uses=((read, FORWARD), (5, BACKWARD))),
+                                interval(70, 1, 3, 1), interval(10, 4, 6, 2, op_name=BACKWARD)), frozenset())
+        assert found is not None
+        return found
+
+    assert profile(2).most == profile(0).most == profile(4).most == 170
+    assert profile(2).frees(lambda op_name, names: True) == 0
+    assert profile(0).frees(lambda op_name, names: True) == 170 - 100
+    assert profile(4).frees(lambda op_name, names: True) == 170 - 100
+
+
 def test_a_replayed_residual_is_held_through_its_forwards_last_read():
     """A forward replayed after the backward began (a resident transaction's) makes the value its own
     pullback reads all the same, and a rung recomputing it holds it until that forward last reads it
@@ -206,4 +223,6 @@ def test_a_compiles_residuals_are_read_by_its_backward_where_it_holds_them():
     assert residuals
     for buffer in residuals:
         assert buffer.until is not None and buffer.start < buffer.until <= buffer.end, buffer
+    # Its forward's reads decoded off the assignment: some residual is held past its own placing.
+    assert any(buffer.until is not None and buffer.until > buffer.start + 1 for buffer in residuals)
 
