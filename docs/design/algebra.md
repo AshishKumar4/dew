@@ -168,10 +168,10 @@ glue is (ยง6.2), reorderings over its values held by the dominance rule alone (ย
     a combined XLA round trip can hide this by deleting both casts. Narrow subnormals remain as
     written until preservation is known for every lowering; a bfloat16 subnormal is subnormal in float32
     too. A reciprocal square root's form and a magnitude's magnitude remain XLA's simplifier's.
-  - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set stays
-    dev-only until a changed default-route executable has a native receipt (row 9777; M-AL-2). The
-    compile-only default-route SimpleDiT-B comparison changes the optimized HLO; it is not a timing
-    or native accuracy receipt. An equal term is one e-class and extraction prices a shared
+  - **reuse** (`reuse`, `reorders`, row 9035): a value the forward already computed. The set is
+    dev-only: on the GH200's default-route SimpleDiT-B step (M-AL-2, row 9777) it changes the native
+    program and holds check 1, but its device time is within the A/A's spread, so it buys no speed for
+    the reordering it costs. An equal term is one e-class and extraction prices a shared
     one once, so a value written twice is read once without a rule. The rules relate a new value to another
     the program holds or hoist a division past a broadcast or square root: a quotient by a value whose
     reciprocal the program holds, `a / y` as `a (1/y)`, also for a held `integer_pow(y, -1)` and
