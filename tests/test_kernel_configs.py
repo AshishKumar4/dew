@@ -1441,6 +1441,35 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+@pytest.mark.parametrize("rows", [1, 16, 64])
+@pytest.mark.parametrize(("site", "depth", "width"), [("q/o", 4096, 4096), ("up", 4096, 14336),
+                                                      ("down", 14336, 4096)])
+def test_a_hoppers_nvfp4_decode_tile_bands_its_columns_and_stages_unrestaged(site, depth, width, rows):
+    """Llama-3-8B's NVFP4 projections at a decode step's rows on an H100, the selector's route (traced,
+    `tuning.seen`): an unswapped tile's planar snake bands every column tile a wave reaches (its one row
+    tile spanned, `resources.band`: 64 column tiles a band at q/o and down, 128 of up's 224), as the parent
+    of row 5874 did where the balanced band of 8 ran 2x slower (M-FS-89c/d); a swapped one's fed ring stays
+    at its least busy depth, its outputs unrestaged (warpgroup MMA's fed ring ran 1.65x slower restaged
+    to four stages at (32, 1), M-FS-89c/d)."""
+    from dew.nn.kernels import formats, gemm, tuning
+
+    del site
+    matrix = jax.ShapeDtypeStruct((width, depth // 8), jnp.uint32)
+    held = formats.NvFp4(matrix, jax.ShapeDtypeStruct((width, depth // 16), jnp.float8_e4m3fn),
+                         jax.ShapeDtypeStruct((), jnp.float32))
+    with generation.assumed("sm90"), tuning.seen() as launches:
+        jax.eval_shape(lambda lhs, held: gemm.nvfp4_product(lhs, held, out_dtype=jnp.bfloat16),
+                       jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), held)
+    tiles = [config for config, _ in launches.taken if isinstance(config, tiling.Tiles)]
+    assert tiles, launches.taken
+    for tile in tiles:
+        if tile.swapped:
+            assert tile.staging is None, tile
+        else:
+            columns = width // tile.block_n
+            assert tile.grid_block_n == 1 << (min(columns, 132).bit_length() - 1), tile
+
+
 def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     """An NVFP4 projection at a decode step's 16 rows on a compile-only H100, no kernel named
     (`gemm.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix decoded once a

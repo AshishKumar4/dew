@@ -207,8 +207,9 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
-    ahead, beside the one consumed and those it keeps in flight); a ring short of that depth, or one its
-    consumers feed at it, deepened where a smaller staging of its outputs leaves room (`_ring_staged`)."""
+    ahead, beside the one consumed and those it keeps in flight); a column-local epilogue's ring short of
+    that depth, or one its consumers feed at it on a synchronous issuer, deepened where a smaller staging of
+    its outputs leaves room (`_ring_staged`)."""
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
@@ -228,12 +229,15 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
             if outputs and ((tile.stages < busy and hooked and layout.stores_chunks)
-                            or (tile.stages == busy and layout.feeds_itself)):
+                            or (tile.stages == busy and layout.feeds_itself and not layout.in_flight)):
                 # A column-local epilogue's ring short of busy where its outputs stage in chunks (its
                 # outputs and side tiles beside it: the paired backward's pulled launch, three outputs and two
-                # sides, row 1958), or one its consumers feed at its least busy depth, deepened by a smaller
-                # staging of its outputs. An epilogue read out whole is not (the lightning flow's paired
-                # gate/up, three outputs at 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers).
+                # sides, row 1958), or one its consumers feed at its least busy depth on a synchronous issuer
+                # (mma.sync's, row 5634's input gradient), deepened by a smaller staging of its outputs. An
+                # epilogue read out whole is not (the lightning flow's paired gate/up, three outputs at
+                # 128 x 128 staged (64, 1), spilled 64 bytes at 168 registers); nor a fed ring whose products
+                # stay in flight (warpgroup MMA's: a swapped NVFP4 decode at 128 x 64 x 256 ran 1.65x slower
+                # at four stages staged (32, 1) than at three unstaged on a GH200, M-FS-89c/d, row 5874).
                 tile = _ring_staged(tile, layout, outputs, candidate=candidate, launch_of=launch_of,
                                     target=target, programs=programs,
                                     least=mosaic.HOOK_COLUMNS if tile.stages < busy else ACCUMULATOR_COLUMNS)
@@ -409,7 +413,7 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     2-SM MMA) runs every tile on its pair."""
     multicast = consumers > 1 and rows >= block_m
     cluster = layout.cluster if layout.pairs_product or multicast else 1
-    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n, grouped=grouped,
-                          cluster=cluster)
+    band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
+                          row_tiles=-(-rows // (block_m * cluster)), grouped=grouped, cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
                  programs=programs)
