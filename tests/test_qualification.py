@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from check1_wire import LATER, QUALIFY
-from reference_error import StaleSeeds, as_given, assert_as_exact, seeds_for
+from reference_error import StaleSeeds, as_given, as_recorded, assert_as_exact, seeds_for
 from truths_ahead import compiled_truths
 
 from dew.parity import SIZING_FROM
@@ -160,3 +160,23 @@ def test_a_compiled_sites_run_draws_its_second_stage_from_its_programs(tmp_path,
     with compiled_truths(programs, prepare=False, stamp="here"):
         assert_as_exact(dew, reference, draw, LABEL, seeds=64, truth_fn=truth)
     assert not asks.exists() and max(seeds) >= 64
+
+
+def test_a_judged_recording_beside_a_compiled_reference_prepares_no_sizing_draw(monkeypatch, tmp_path):
+    """A site whose Dew arm is a recording without pilots (a judged recording, `as_recorded`) beside a
+    reference its prepare compiles prepares under `QUALIFY` at its verdict's draws alone: the pair's pilot
+    budget, none, leaves it unsized there as its qualification leaves it (train 1430's review: the prepare
+    read the reference's budget alone and drew a sizing seed the recording does not hold)."""
+    _, _, truth, live = site()
+
+    def recorded_draw(seed):
+        # A recording's draws: its verdict's seeds alone, none from SIZING_FROM on (tests/recordings.py).
+        if seed >= SIZING_FROM:
+            raise AssertionError(f"seed {seed} is past the recording's draws")
+        return live(seed)
+
+    dew = as_recorded(as_given(lambda x, w: np.asarray(jnp.dot(x, w))))
+    monkeypatch.setenv(QUALIFY, str(tmp_path / "qualified.jsonl"))
+    with compiled_truths(tmp_path / "store", prepare=True, stamp="here"):
+        assert_as_exact(dew, lambda x, w: jnp.dot(x[::-1], w[::-1]), recorded_draw, LABEL, seeds=16,
+                        truth_fn=truth)
