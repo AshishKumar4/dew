@@ -136,7 +136,7 @@ def _banded_terms(spans: template.KeySpans, combine: attention_products.Banded):
         # so `attention_terms`' scale at the laid width is the products' (`SCALE`), the query's terms back.
         count = spans.keys
         apart = jnp.abs(jnp.arange(q1.shape[1])[:, None] - jnp.arange(count)[None, :])
-        near = apart <= combine.bands[0]
+        near = jnp.searchsorted(jnp.asarray(combine.bands), apart, side="left") == 0
         seen = template.dense(spans)
         keep = jnp.concatenate([seen & near, seen & ~near], axis=-1)[:, None]
         lift = (2 * WIDTH) ** 0.5 * SCALE

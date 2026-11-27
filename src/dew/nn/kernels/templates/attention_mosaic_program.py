@@ -1993,8 +1993,7 @@ def _entrywise_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, 
     closed = None
     with contextlib.suppress(TypeError, ValueError):  # a hook of another tile's shape traces at none of this
         closed = jax.make_jaxpr(hook)(jax.ShapeDtypeStruct(tile, jnp.float32), *params)
-    held = (closed is not None and all(np.ndim(const) == 0 for const in closed.consts)
-            and _acts_by_entry(closed.jaxpr, tile))
+    held = closed is not None and _acts_by_entry(closed.jaxpr, tile)
     return closed if held else None
 
 
@@ -2008,16 +2007,16 @@ def sliced_hook(hook: Callable, kinds: tuple[Kind, ...], dtypes: tuple[str, ...]
         return None
 
     def replay(out, *params):
-        return _replayed(closed.jaxpr, closed.consts, (out, *params), out.shape)[0]
+        return _replayed(closed.jaxpr, (out, *params), out.shape)[0]
 
     return replay
 
 
-def _replayed(jaxpr: jax_core.Jaxpr, consts, arguments, shape: tuple[int, ...]) -> list:
+def _replayed(jaxpr: jax_core.Jaxpr, arguments, shape: tuple[int, ...]) -> list:
     """`jaxpr`'s results on `arguments`, each equation bound as it stands but a scalar's broadcast, which
     takes `shape` (a block of the columns its program was traced at): a call's or a conditional's program
     replayed alike."""
-    values = dict(zip(jaxpr.constvars, consts, strict=True))
+    values = dict(zip(jaxpr.constvars, jaxpr.consts, strict=True))
     values.update(zip(jaxpr.invars, arguments, strict=True))
 
     def read(var):
@@ -2027,7 +2026,7 @@ def _replayed(jaxpr: jax_core.Jaxpr, consts, arguments, shape: tuple[int, ...]) 
         operands = [read(var) for var in eqn.invars]
         body = called(eqn)
         if body is not None:
-            results = _replayed(body, getattr(body, "consts", ()), operands, shape)
+            results = _replayed(body, operands, shape)
         elif eqn.primitive is jax.lax.cond_p:
             index, *rest = operands
             results = jax.lax.switch(index, [functools.partial(_replay_branch, branch, shape)
@@ -2044,7 +2043,7 @@ def _replayed(jaxpr: jax_core.Jaxpr, consts, arguments, shape: tuple[int, ...]) 
 
 def _replay_branch(branch, shape: tuple[int, ...], *operands) -> list:
     """A conditional's branch replayed on `operands` (`_replayed`)."""
-    return _replayed(branch.jaxpr, branch.consts, operands, shape)
+    return _replayed(branch.jaxpr, operands, shape)
 
 
 def _aval(var) -> ShapedArray:
@@ -2057,7 +2056,10 @@ def _aval(var) -> ShapedArray:
 def _acts_by_entry(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
     """Whether every equation of `jaxpr` reads and writes `tile`s and scalars alone, each entrywise
     (`layout.entrywise`: JAX's own statement of its operation, or a scalar's broadcast) or a call or a
-    conditional over programs so (`called`, `branches`)."""
+    conditional over programs so (`called`, `branches`), and every constant it or a program it nests closes
+    over a scalar (an array's is read by place)."""
+    if any(np.ndim(const) != 0 for const in jaxpr.consts):
+        return False
     for eqn in jaxpr.eqns:
         shapes = [tuple(getattr(var.aval, "shape", ())) for var in (*eqn.invars, *eqn.outvars)]
         if any(shape not in ((), tile) for shape in shapes):
