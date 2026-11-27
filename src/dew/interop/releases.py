@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import re
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePath
@@ -71,7 +72,7 @@ def published_release(directory: str | Path, write: Callable[[Path], None], *, f
     in_place = fresh or is_uri(str(directory)) or not writes_weights()
     with contextlib.ExitStack() as staged:
         target = agreed_reading(lambda: root if in_place else staged.enter_context(
-            swapped(root, foreign_entries, replaces=replaced_entries)))
+            swapped(root, refused_entries, replaces=replaced_entries)))
         agreed_reading(lambda: write(target))
         agreed_reading(staged.close)
 
@@ -120,6 +121,25 @@ def replaced_entries(written: Entries, held: Entries) -> Replacements:
     return [*[(entries, held_entries) for entries, held_entries in same_entries(written, held)
               if entries[0] not in sharded],
             *[(group, earlier.get(key, [])) for key, group in shards.items()]]
+
+
+def refused_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
+    """What keeps a release from replacing the tree at `directory`, read under the publication lock
+    (`swapped`'s `foreign`): its foreign entries (`foreign_entries`); and raised, a shard of its weights
+    the earlier tree holds under the same name, which only a save that published while this one was
+    written names alike (each replacement's shards named apart, `save_sharded`), so a reader holding that
+    save's index never opens this one's shards under its names (train 1411's review)."""
+    shards = sorted(entry for entry, kind in written.items()
+                    if kind == "file" and held.get(entry) == "file" and _SHARD.search(entry.name)
+                    and weight_stem(entry.name) is not None)
+    if shards:
+        raise FileExistsError(f"{directory} was published by another save while this one was written, under "
+                              f"its shards' names {list(map(str, shards))}: save again")
+    return foreign_entries(written, held, directory)
+
+
+_SHARD = re.compile(r"-\d{5}-of-\d{5}\.safetensors$")
+"""A weight shard's name's ending, `-00001-of-00002.safetensors`, beside its stem and any token."""
 
 
 def foreign_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
