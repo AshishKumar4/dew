@@ -22,6 +22,7 @@ from dew.algebra.printed import (
 )
 
 _MIN_SHARED = 6
+_MIN_TAIL = _MIN_SHARED - 1
 _MIN_WHOLE = 2
 _MAX_SHARED = 64
 _GEOMETRY = frozenset({"shape", "broadcast_dimensions", "new_sizes"})
@@ -67,8 +68,13 @@ class _Fragment:
         if isinstance(value, Literal) and value.integer is not None:
             original = value.integer
             integer = self.operand(original) if isinstance(original, Ref) else self.input(original)
-            assert isinstance(integer, Ref)
-            return dataclasses.replace(value, integer=integer, data=b"")
+            # Its type an input too, as a cast's: the same bindings over another word or float width.
+            dtype = (self.operand(value.dtype) if isinstance(value.dtype, Ref)
+                     else self.input(np.dtype(value.dtype)))
+            assert isinstance(integer, Ref) and isinstance(dtype, Ref)
+            return dataclasses.replace(value, integer=integer, dtype=dtype, data=b"")
+        if isinstance(value, np.dtype):
+            return self.input(value)
         if isinstance(value, Primitive) and value.value in _SHIFTS:
             return self.input(value)
         return value
@@ -130,6 +136,8 @@ class _Span:
     first: int
     available: int
     whole: bool
+    tail: bool = False
+    """Whether its run ends the body, whose return statement follows its last binding."""
     normal: _Fragment = dataclasses.field(default_factory=_Fragment)
     statements: list[Binding] = dataclasses.field(default_factory=list)
 
@@ -154,9 +162,10 @@ def _spans(bodies: dict[str, Body]) -> list[_Span]:
                 continue
             starts = [index for index, _ in group]
             end = starts[-1] + 1
-            whole = starts[0] == 0 and end == len(body.statements)
-            minimum = _MIN_WHOLE if whole else _MIN_SHARED
-            candidates.extend(_Span(name, start, end - start, whole and start == 0)
+            tail = end == len(body.statements)
+            whole = starts[0] == 0 and tail
+            minimum = _MIN_WHOLE if whole else _MIN_TAIL if tail else _MIN_SHARED
+            candidates.extend(_Span(name, start, end - start, whole and start == 0, tail)
                               for start in starts[:len(starts) - minimum + 1])
     return candidates
 
@@ -187,7 +196,10 @@ def _largest(bodies: dict[str, Body]) -> tuple[_Copy, ...]:
                 continue
             candidates.extend(entries)
             if width < _MIN_SHARED:
-                copies = [span for span in copies if span.whole and span.available == width]
+                # Below a shared span's width, only a whole body, or a run ending one, which its return
+                # statement completes to six statements as rendered.
+                copies = [span for span in copies if span.available == width
+                          and (span.whole or (span.tail and width >= _MIN_TAIL))]
             avoided = width * (len(copies) - 1)
             if avoided > saved:
                 best, saved = tuple(span.snapshot() for span in copies), avoided
@@ -204,8 +216,10 @@ def _reads(value: Operand) -> Iterator[str]:
     elif isinstance(value, Layout):
         for dimension in value.dimensions:
             yield from _reads(dimension)
-    elif isinstance(value, Literal) and isinstance(value.integer, Ref):
-        yield value.integer.name
+    elif isinstance(value, Literal):
+        for part in (value.integer, value.dtype):
+            if isinstance(part, Ref):
+                yield part.name
     elif isinstance(value, Call):
         if isinstance(value.callee, Ref):
             yield value.callee.name

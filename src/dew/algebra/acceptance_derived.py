@@ -48,9 +48,9 @@ def _normalized_values_product_0(x1, x2, x3):
 
 
 _lse_folded_probabilities_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+    ('default', 'sm90', (*(((64, 256), 'float32'),) * 3,)):
         _lse_folded_probabilities_0,
-    ('accurate', 'sm90', (((64, 256), 'float32'), ((64, 256), 'float32'), ((64, 256), 'float32'))):
+    ('accurate', 'sm90', (*(((64, 256), 'float32'),) * 3,)):
         _lse_folded_probabilities_0,
 }
 

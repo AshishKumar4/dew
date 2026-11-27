@@ -23,7 +23,7 @@ import importlib.util
 import itertools
 import logging
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -416,7 +416,7 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
         table = f"_{name}_forms"
         body += ["", "", f"{table}: dict[tuple, Callable[..., tuple]] = {{"]
         for found in own:
-            operands = [repr(operand) for operand in case_of(found.operands)]
+            operands = _runs(repr(operand) for operand in case_of(found.operands))
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
             binding = bound.get(found)
@@ -432,6 +432,12 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]
     return "\n".join([*lines, *printed.imports("\n".join(body)), *body]) + "\n"
+
+
+def _runs(keys: Iterable[str]) -> list[str]:
+    """A case key's operand entries, each run of one repeated entry starred once (`*(key,) * count`)."""
+    return [key if count == 1 else f"*({key},) * {count}"
+            for key, count in ((key, len(list(run))) for key, run in itertools.groupby(keys))]
 
 
 def _single(function: Callable, operands: tuple[jax.ShapeDtypeStruct, ...]) -> bool:

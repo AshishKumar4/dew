@@ -229,7 +229,9 @@ floating-point expressions:
 - **Error is a property of a candidate, not of an e-class.** The forms an e-class holds are equal in ℝ and differ
   in error, and a form's error depends on which form of each operand it reads, so the estimate belongs to a
   concrete candidate: an extracted DAG, every child chosen. Extraction proposes candidates in order of price, and
-  each is measured before it is admitted (§6.5). Error is never an e-class fact.
+  each is measured before it is admitted (§6.5). Each program is proposed once: an extraction that prints as
+  an earlier candidate does (a variant that is the form as written) is the same measurement. Error is never an
+  e-class fact.
 - **Dev time measures each candidate** by sampling: the candidate evaluated in its dtype against the declaration
   at float64 on the gate's drawn and adversarial families (cancellation, wide ranges, near-equal operands, one-key
   rows), as check 1 measures error.
@@ -815,7 +817,8 @@ actual capacity still governs which compiler and training plans fit; it is not c
   reference)` passes, the gate's check of the two against the float64 truth (§1.5): under default numerics
   against the form as written, which is always a candidate. Under accurate numerics the same gate first
   admits candidates against the written form, then compares only those survivors with one another; if none
-  meets every surviving reference, it refuses. Neither mode compares a candidate with itself. Each
+  meets every surviving reference, it refuses. Neither mode compares a program with itself: a proposal whose
+  printed program, or compensated print, is an earlier candidate's is dropped before measurement. Each
   uncompensated candidate precedes every compensated candidate, with each group ordered by seconds where
   the GPU target states its rates. The stable-form generator calls `choose` for each registered
   case, precision policy and target (§6.11).
@@ -1389,8 +1392,13 @@ guidance have separately checked value and tangent bodies. Independent code witn
 saturating FP4 and FP8 encoders (signed zeros, midpoints and their adjacent words), and the standalone
 E8M0 decoder's 256 codes. The portable attention-cache E4M3 and E5M2 decodes check every byte, including
 signed zeros, infinities where represented, and the specified signed quiet NaNs. The selective scan's
-readout uses its written balanced tree over the named per-state values. Both written and generated
-components check their primitives on the CPU.
+readout uses its written balanced tree over the named per-state values. The MX block read covers every E8M0
+byte's exponent, and the MXFP8 block decode's portable scale application lands all E4M3 codes under all
+scale bytes in each draw in FP32 and BF16 with one rounding, subnormals and signed NaNs included. The
+selective scan's token stage composes its per-state decay and update as the template steps it; its
+backward's subnormal-step lift and one state's turn of the tangent sums are checked as the block's loop
+takes them. Both written and generated components check their primitives on the CPU; an FP8 code's exact
+widening to FP32 is the one FP8 conversion check 2 admits.
 Production still uses the written bodies (row 3272).
 
 ```python

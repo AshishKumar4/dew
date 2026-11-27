@@ -77,7 +77,9 @@ def test_each_generated_form_is_on_par_with_its_declaration(name, policy):
                                   "rounded_fp16", "rounded_fp16_tangent", "query_walk_factors",
                                   "key_walk_factors", "walk_output", "quantized_ste", "quantized_ste_tangent",
                                   "encode_e4m3", "encode_e5m2", "encode_e2m1", "e8m0_decode",
-                                  "decode_e4m3", "decode_e5m2", "selective_read",
+                                  "decode_e4m3", "decode_e5m2", "selective_read", "e8m0_exponents",
+                                  "mxfp8_block_decode", "mxfp8_block_decode_bf16", "selective_token",
+                                  "selective_dx_scale", "selective_state_tangent",
                                   f"{guidance_cases.__name__}.guided",
                                   f"{guidance_cases.__name__}.guided_tangent"])
 @pytest.mark.parametrize("arm", ["written", "generated"])
@@ -561,3 +563,26 @@ def test_dvs_normalization_is_proposed_on_either_side_of_its_contraction():
     found = [divides_the_cotangent(candidate) for candidate in choice.candidates]
     assert not found[[candidate.name for candidate in choice.candidates].index("as written")]
     assert any(found)
+
+
+def test_the_chooser_measures_each_pair_of_distinct_programs_once():
+    """§1.5: the log-sum-exp fold's second extraction prints as its form as written does. Under the accurate
+    policy, whose gate is pairwise, no program is compared with itself and no pair is measured twice."""
+    (operands,) = generate.DECLARATIONS[f"{acceptance.__name__}.lse_folded_probabilities"].cases.operands
+    measured = []
+
+    def admits(candidate, reference):
+        measured.append((candidate, reference))
+        return True
+
+    choice = error.choose(acceptance.lse_folded_probabilities, operands, accurate=True,
+                          saturation=algebra.SATURATION, admits=admits)
+
+    def program(function) -> str:
+        return str(jax.make_jaxpr(function)(*operands))
+
+    pairs = [(program(candidate), program(reference)) for candidate, reference in measured]
+    assert pairs and all(candidate != reference for candidate, reference in pairs)
+    assert len(set(pairs)) == len(pairs)
+    proposed = [program(candidate.function) for candidate in choice.candidates]
+    assert len(set(proposed)) == len(proposed)

@@ -88,9 +88,9 @@ def _shared_component_0(p0, p1, p2, p3, p4):
 
 
 _guided_forms: dict[tuple, Callable[..., tuple]] = {
-    ('default', 'sm90', (((16, 64), 'float32'), ((16, 64), 'float32'), ((16, 1), 'float32'))):
+    ('default', 'sm90', (*(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'))):
         _guided_0,
-    ('default', 'sm90', (((32, 128), 'float32'), ((32, 128), 'float32'), ((32, 1), 'float32'))):
+    ('default', 'sm90', (*(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'))):
         _guided_0,
 }
 
@@ -102,12 +102,12 @@ def guided(*operands, policy: str = 'default', target: str = 'sm90'):
 
 _guided_tangent_forms: dict[tuple, Callable[..., tuple]] = {
     ('default', 'sm90', (
-        ((16, 64), 'float32'), ((16, 64), 'float32'), ((16, 1), 'float32'), ((16, 64), 'float32'),
-        ((16, 64), 'float32'), ((16, 1), 'float32'), ((16, 64), 'float32'))):
+        *(((16, 64), 'float32'),) * 2, ((16, 1), 'float32'), *(((16, 64), 'float32'),) * 2,
+        ((16, 1), 'float32'), ((16, 64), 'float32'))):
         _guided_tangent_0,
     ('default', 'sm90', (
-        ((32, 128), 'float32'), ((32, 128), 'float32'), ((32, 1), 'float32'), ((32, 128), 'float32'),
-        ((32, 128), 'float32'), ((32, 1), 'float32'), ((32, 128), 'float32'))):
+        *(((32, 128), 'float32'),) * 2, ((32, 1), 'float32'), *(((32, 128), 'float32'),) * 2,
+        ((32, 1), 'float32'), ((32, 128), 'float32'))):
         _guided_tangent_0,
 }
 

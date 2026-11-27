@@ -13,6 +13,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Generate checked attention walk factors and finish, FP4/FP8 storage encoders, and quantization and
   guidance surrogates without changing production dispatch.
 
+- Add checked MX scale-exponent reads, the MXFP8 block decode's portable scale application to FP32 and
+  BF16, and the selective scan's token update, backward step lift and per-state tangent; production
+  dispatch is unchanged. The dev-time chooser measures each distinct candidate program once.
+
+
 - A generated surrogate now uses its written value and derivative when an unhashable static argument
   cannot select a generated case.
 

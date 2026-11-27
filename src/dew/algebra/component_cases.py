@@ -14,7 +14,7 @@ from dew.algebra.generate import Cases, ComponentForm, SurrogateBodies, Surrogat
 from dew.nn import fake_quant, precision
 from dew.nn.kernels import formats, recurrence_algebra, ssd
 from dew.nn.kernels.recurrence_algebra import apart, derived_tile
-from dew.nn.kernels.templates import attention, attention_algebra, attention_gradient
+from dew.nn.kernels.templates import attention, attention_algebra, attention_gradient, product
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
     derived_from_weights,
@@ -1068,3 +1068,184 @@ SELECTIVE_READ = declare(__name__, "selective_read", ComponentForm(
     _selective_read, _selective_read_truth, dataclasses.replace(
         _cases(((64,),) * 34, ((128,),) * 66),
         draw=_selective_read_draw)))
+
+
+def _e8m0_exponents(raw):
+    return formats.e8m0_exponents(jax.lax.bitcast_convert_type(raw, jnp.float8_e8m0fnu))
+
+
+# The host's decodes (ml_dtypes), neither XLA's conversion nor the portable reader under test.
+_E8M0 = np.arange(256, dtype=np.uint8).view(jnp.float8_e8m0fnu).astype(np.float64)
+_E4M3 = np.arange(256, dtype=np.uint8).view(jnp.float8_e4m3fn).astype(np.float64)
+
+
+def _e8m0_exponents_truth(raw):
+    power = jnp.asarray(_E8M0)[raw]
+    # A byte's power's own binary exponent; the NaN byte flagged, at the binade past the largest, 2^128's.
+    nan = jnp.isnan(power)
+    return jnp.where(nan, 128, jnp.frexp(jnp.where(nan, 1, power))[1] - 1), nan
+
+
+def _mxfp8_block_decode(codes, raw, *, dtype):
+    """`MxFp8.decoded`'s portable body over stored bytes: each block's E8M0 exponent read and repeated over
+    its 32 codes, then applied with one destination rounding (`formats._mxfp8_decoded`)."""
+    exponent, invalid = _e8m0_exponents(raw)
+    exponent, invalid = (jnp.repeat(x, product.MXFP8.depth, axis=-1) for x in (exponent, invalid))
+    value = formats._mxfp8_decoded(jnp.dtype(dtype), jax.lax.bitcast_convert_type(codes, jnp.float8_e4m3fn),
+                                   exponent, invalid)
+    return jax.lax.bitcast_convert_type(value, jnp.dtype(f"uint{jnp.finfo(dtype).bits}"))
+
+
+def _mxfp8_block_decode_truth(codes, raw, *, dtype):
+    limits = jnp.finfo(dtype)
+    word = jnp.dtype(f"uint{limits.bits}")
+    exact = jnp.ldexp(jnp.asarray(_E4M3)[codes],
+                      jnp.repeat(raw.astype(jnp.int32) - 127, product.MXFP8.depth, axis=-1))
+    # Four significant bits: exact at every normal of either format; below them rounded to nearest even
+    # on the least subnormal's grid, past the largest binade an infinity.
+    least = 2.0 ** (limits.minexp - limits.nmant)
+    landed = jnp.where(jnp.abs(exact) < 2.0 ** limits.minexp, jnp.round(exact / least) * least, exact)
+    landed = jnp.where(jnp.abs(exact) >= 2.0 ** limits.maxexp, jnp.copysign(jnp.inf, exact), landed)
+    bits = jax.lax.bitcast_convert_type(landed.astype(dtype), word)
+    # OCP MX: a NaN code keeps its sign at a valid scale; the NaN scale byte is a positive quiet NaN.
+    unscaled = raw == 255
+    held = jnp.repeat(unscaled, product.MXFP8.depth, axis=-1)
+    nan = ((codes & 0x7F) == 0x7F) | held
+    negative = (codes >= 0x80) & ~held
+    quiet = word.type((((1 << limits.nexp) - 1) << limits.nmant) | (1 << (limits.nmant - 1)))
+    return jnp.where(nan, quiet | (negative.astype(word) << word.type(limits.bits - 1)), bits)
+
+
+def _mx_block_draw(seed, operands):
+    codes, raw = operands
+    rng = np.random.default_rng(seed)
+    # All 256 codes and all 256 scale bytes in each draw, the codes shuffled across the blocks by seed.
+    held = np.resize(np.arange(256, dtype=np.uint8), codes.shape[0] * codes.shape[1])
+    rng.shuffle(held)
+    scales = np.roll(np.resize(np.arange(256, dtype=np.uint8), raw.shape[0] * raw.shape[1]), 37 * seed)
+    return held.reshape(codes.shape), scales.reshape(raw.shape)
+
+
+def _mx_block_case(name, dtype):
+    cases = Cases(tuple((jax.ShapeDtypeStruct((rows, product.MXFP8.depth * blocks), jnp.uint8),
+                         jax.ShapeDtypeStruct((rows, blocks), jnp.uint8))
+                        for rows, blocks in ((32, 8), (64, 4))),
+                  _mx_block_draw, seeds=8, policies=("default",))
+    return declare(__name__, name, ComponentForm(functools.partial(_mxfp8_block_decode, dtype=dtype),
+                                                 functools.partial(_mxfp8_block_decode_truth, dtype=dtype),
+                                                 cases))
+
+
+def _selective_token_parts(operands):
+    count, kept = divmod(len(operands) - 2, 3)
+    states, rates, b = (operands[part * count:(part + 1) * count] for part in range(3))
+    step, value, *rest = operands[3 * count:]
+    return list(states), rates, list(b), step, value, rest[0] if kept else None
+
+
+def _selective_token(*operands):
+    """The forward scan's token stage as the template steps it: each state's decay, then its update
+    (`selective.forward`'s `token`). States and rates a channel tile each, B's a scalar each."""
+    states, rates, b, step, value, kept = _selective_token_parts(operands)
+    decays = [recurrence_algebra.selective_decay(step, rate, kept) for rate in rates]
+    return tuple(recurrence_algebra.selective_token(states, decays, step * value, b))
+
+
+def _selective_token_truth(*operands):
+    states, rates, b, step, value, kept = _selective_token_parts(operands)
+    held = 1 if kept is None else kept
+    return tuple(jnp.exp(step * rate) * held * state + step * value * b_n
+                 for state, rate, b_n in zip(states, rates, b, strict=True))
+
+
+def _selective_token_draw(seed, operands):
+    count = (len(operands) - 2) // 3
+    rng = np.random.default_rng(seed)
+    states = [rng.standard_normal(each.shape).astype(np.float32) for each in operands[:count]]
+    rates = [-rng.uniform(0, 2, each.shape).astype(np.float32) for each in operands[count:2 * count]]
+    b = [np.float32(rng.standard_normal()) for _ in range(count)]
+    step = rng.uniform(0, 2, operands[3 * count].shape).astype(np.float32)
+    value = rng.standard_normal(step.shape).astype(np.float32)
+    if seed == 1:
+        # A padded token past a rate float32's base-2 logarithm overflows (row 8491).
+        step[:4] = 0
+        rates[0][:4] = -np.float32(3 * 2.0 ** 126)
+    elif seed == 2:
+        # A step past float32's range in base 2 times a least-normal rate: exp(-3), its write kept finite.
+        step[:4], value[:4] = np.float32(3 * 2.0 ** 126), np.float32(2.0 ** -8)
+        rates[-1][:4] = -np.float32(2.0 ** -126)
+    elif seed == 3:
+        rates[1][:] = 0
+    kept = () if len(operands) == 3 * count + 2 else (np.float32(seed % 2),)
+    return *states, *rates, *b, step, value, *kept
+
+
+def _selective_dx_scale_truth(skip, dy, step):
+    base = skip * dy
+    lifted = (jnp.abs(step) < 2.0 ** -100) & (jnp.abs(base) < 2.0 ** 60)
+    scale = jnp.where(lifted, 2.0 ** 64, 1.0)
+    return base * scale, step * scale, 1 / scale
+
+
+def _selective_dx_scale_draw(seed, operands):
+    skip, dy, step = _arrays(seed, operands)
+    step = np.abs(step)
+    step[1] = 0
+    if seed % 2:
+        # Subnormal and small normal steps the lift raises into the normal range, with `skip dy` small.
+        step[2:10] = np.float32(2.0 ** -140) * np.arange(1, 9, dtype=np.float32)
+        step[10:14] = np.float32(2.0 ** -110)
+        dy[2:6] = 0
+    if seed == 2:
+        # Past the lift's reach: `skip dy` at 2^61, its small steps kept as they are.
+        skip = np.float32(1.5)
+        step[2:6], dy[2:6] = np.float32(2.0 ** -120), np.float32(2.0 ** 61)
+    return skip, dy, step
+
+
+def _selective_state_tangent(dx, ddt, cotangent, before, decay, written, step, value, b, dy, rate, dx_step):
+    """One state's turn of a backward block's state loop (`selective.backward`'s `state`): its `dx` term,
+    taken at the lifted step (`selective_dx_scale`'s `dx_step`), and its step term, added to the block's
+    running sums."""
+    d_value, d_step, *_ = recurrence_algebra.selective_adjoint(
+        cotangent, before, decay, written, step, value, b, dy, rate, dx_step=dx_step)
+    return dx + d_value, ddt + d_step
+
+
+def _selective_state_tangent_truth(dx, ddt, cotangent, before, decay, written, step, value, b, dy, rate,
+                                   dx_step):
+    return (dx + cotangent * b * dx_step,
+            ddt + cotangent * b * value + cotangent * before * decay * rate)
+
+
+def _selective_state_tangent_draw(seed, operands):
+    dx, ddt, cotangent, before, decay, written, step, value, b, dy, rate, dx_step = _arrays(seed, operands)
+    rng = np.random.default_rng(seed)
+    decay = rng.uniform(0, 1, decay.shape).astype(np.float32)
+    step, rate = np.abs(step), -np.abs(rate)
+    decay[0], step[1] = 0, 0
+    dx_step = step.copy()
+    if seed % 2:
+        # A subnormal step's `dx` term taken at its lift, 2^64 times the step, normal.
+        step[2:10] = np.float32(2.0 ** -140) * np.arange(1, 9, dtype=np.float32)
+        dx_step[2:10] = step[2:10] * np.float32(2.0 ** 64)
+    return dx, ddt, cotangent, before, decay, written, step, value, b, dy, rate, dx_step
+
+
+E8M0_EXPONENTS = declare(__name__, "e8m0_exponents", ComponentForm(
+    _e8m0_exponents, _e8m0_exponents_truth, Cases(
+        tuple((jax.ShapeDtypeStruct(shape, jnp.uint8),) for shape in ((32, 8), (64, 8))),
+        _nvfp4_scale_draw, seeds=8, policies=("default",))))
+MXFP8_BLOCK_DECODE = _mx_block_case("mxfp8_block_decode", jnp.float32)
+MXFP8_BLOCK_DECODE_BF16 = _mx_block_case("mxfp8_block_decode_bf16", jnp.bfloat16)
+SELECTIVE_TOKEN = declare(__name__, "selective_token", ComponentForm(
+    _selective_token, _selective_token_truth, dataclasses.replace(
+        _cases(((64,),) * 8 + ((),) * 4 + ((64,),) * 2, ((128,),) * 32 + ((),) * 16 + ((128,),) * 2 + ((),)),
+        draw=_selective_token_draw)))
+SELECTIVE_DX_SCALE = declare(__name__, "selective_dx_scale", ComponentForm(
+    recurrence_algebra.selective_dx_scale, _selective_dx_scale_truth, dataclasses.replace(
+        _cases(((), (64,), (64,)), ((), (128,), (128,))), draw=_selective_dx_scale_draw)))
+SELECTIVE_STATE_TANGENT = declare(__name__, "selective_state_tangent", ComponentForm(
+    _selective_state_tangent, _selective_state_tangent_truth, dataclasses.replace(
+        _cases(*[((positions,),) * 10 + ((),) + ((positions,),) for positions in (64, 128)]),
+        draw=_selective_state_tangent_draw)))
