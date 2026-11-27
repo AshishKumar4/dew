@@ -79,24 +79,21 @@ FUSED = {implementation: functools.partial(attention.scaled_dot_product_attentio
                                            implementation=implementation)
          for implementation in ("template", "tpu")}
 """Each fused route as one function the module holds, so its orders' programs
-(`contract_support._mesh_program`, made once a function and an order) compile once across its cases' edges and
-order sets, none held per case."""
+(`contract_support._mesh_program`, made once a function and an order) compile once across its cases' edges."""
 
 
-@pytest.mark.parametrize(("implementation", "edge", "taken"),
-                         list(itertools.product(FUSED, EDGES, ORDER_SETS)))
-def test_a_fused_attention_kernel_holds_every_order(implementation, edge, taken):
+@pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(FUSED, EDGES)))
+def test_a_fused_attention_kernel_holds_every_order(implementation, edge):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
     (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
-    float32's ends. Each order set a case of its own (`ORDER_SETS`; row 12781: the template's every order in
-    one case took 212 to 346 s at unit operands, its interpreted kernel run at each order and draw)."""
+    float32's ends."""
     fused = FUSED[implementation]
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
-                          f"{implementation} attention {edge} ({taken})", truth_fn=plain_attention,
-                          plain_fn=plain_attention, taking=ORDER_SETS[taken])
-    if implementation == "template" and edge == "near the largest" and taken == "first orders":
+                          f"{implementation} attention {edge}", truth_fn=plain_attention,
+                          plain_fn=plain_attention)
+    if implementation == "template" and edge == "near the largest":
         # Prescaling Q by scale's power of two before the fp32 dot keeps value-only JVP finite at 2^64.
         big = jnp.zeros((1, 2, 1, 64), jnp.float32).at[:, :, :, 0].set(jnp.float32(2.0 ** 64))
         vals = jnp.zeros((1, 2, 1, 64), jnp.float32)
