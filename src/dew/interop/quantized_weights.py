@@ -30,19 +30,20 @@ class QuantizedWeight:
 
 
 def weight_records(codec: SourceQuantization, tensors: Mapping[str, unread.Stored], names: Iterable[str],
-                   decoded: str | None) -> dict[str, QuantizedWeight]:
+                   decoded: Mapping[str, unread.Stored] | None) -> dict[str, QuantizedWeight]:
     """Each of `names`' record as `codec` stores it in `tensors`: its parts the source holds (an optional
-    part, compressed-tensors' act-order index, may be absent), its grid, and the dtype `decoded` it into
-    (None, served packed)."""
+    part, compressed-tensors' act-order index, may be absent), its grid, and the dtype of its decode in
+    `decoded` (None where there is none: served packed)."""
     specs = tensor_specs(tensors)
     return {name: QuantizedWeight(
         {part: specs[part] for part in (name, *codec.partners(name)) if part in specs},
-        {part: tensors[part] for part in codec.grid(name) if part in tensors}, decoded) for name in names}
+        {part: tensors[part] for part in codec.grid(name) if part in tensors},
+        None if decoded is None else str(np.dtype(decoded[name].dtype))) for name in names}
 
 
 def decoded_weights(tensors: Mapping[str, unread.Stored], config: Mapping[str, object], param_dtype: str, *,
-             media: bool) -> tuple[Mapping[str, unread.Stored], dict[str, QuantizedWeight], str | None,
-                                   decoders.Checked]:
+                    media: bool) -> tuple[Mapping[str, unread.Stored], dict[str, QuantizedWeight], str | None,
+                                          decoders.Checked]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: each quantized weight's record (`QuantizedWeight`:
     its stored tensors, its grid and the dtype it was decoded into) and the
@@ -53,17 +54,16 @@ def decoded_weights(tensors: Mapping[str, unread.Stored], config: Mapping[str, o
     if quantization is None:
         return tensors, {}, None, decoders.NOTHING_CHECKED
     names, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
-    stored = weight_records(quantization, tensors, names, None)
     aliases: tuple[tuple[str, str], ...] = ()
     if param_dtype != "float32":
         aliases = decoders.validate_source_aliases(
             quantization.tensor_names(tensors), partial(quantization.read, tensors, set(names)),
             config, media=media)
-    tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
-    quantized = {name: QuantizedWeight(weight.stored, weight.grid, str(np.dtype(tensors[name].dtype)))
-                 for name, weight in stored.items()}
-    _share_quantized_aliases(tensors, aliases, names)
-    return tensors, quantized, scale_dtype, decoders.checked_groups(aliases)
+    # A new mapping: the source's own still holds the stored parts and grid each record states.
+    decoded = quantization.dequantize(tensors, param_dtype=param_dtype)
+    quantized = weight_records(quantization, tensors, names, decoded)
+    _share_quantized_aliases(decoded, aliases, names)
+    return decoded, quantized, scale_dtype, decoders.checked_groups(aliases)
 
 
 def _share_quantized_aliases(tensors: dict[str, unread.Stored], aliases: tuple[tuple[str, str], ...],
