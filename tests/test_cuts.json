@@ -819,11 +819,16 @@
 "tests/test_attention_witness.py": [
 "tests/test_attention_witness.py::test_each_fault_is_refused_at_its_elements",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[capped-accurate]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[causal-accurate]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-accurate]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[documents-fast]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[full-fast]",
-"tests/test_attention_witness.py::test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure[capped]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_backward_lies_in_its_enclosure[window-fast]",
+"tests/test_attention_witness.py::test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure[causal]",
 "tests/test_attention_witness.py::test_each_gradient_of_the_two_launch_backward_lies_in_its_enclosure[full]",
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-causal]",
 "tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[0-window]",
+"tests/test_attention_witness.py::test_each_stored_state_and_the_output_lie_in_their_step_enclosures[1-full]",
 "tests/test_attention_witness.py::test_two_launches_are_held_to_their_own_refined_d",
 "tests/test_attention_witness.py::test_two_launches_of_the_forwards_own_denominator_are_held_by_their_schedule"
 ],
@@ -2751,8 +2756,8 @@
 "tests/test_mesh_axes.py::test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp[fsdp2_sequence2]",
 "tests/test_mesh_axes.py::test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device[delta-net]",
 "tests/test_mesh_axes.py::test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_trains[sequence2]",
-"tests/test_mesh_axes.py::test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation[fused-projections]",
-"tests/test_mesh_axes.py::test_the_tensor_axis_changes_no_value"
+"tests/test_mesh_axes.py::test_cross_attention_spends_communication_only_where_the_sequence_link_pays[indivisible-heads]",
+"tests/test_mesh_axes.py::test_topologies_agree_with_data_parallel"
 ],
 "tests/test_miss_driven_rungs.py": [
 "tests/test_miss_driven_rungs.py::test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_short_of[rows]"
@@ -4287,6 +4292,9 @@
 ],
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
+],
+"tests/test_weighed_check.py": [
+"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
