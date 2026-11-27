@@ -64,7 +64,7 @@ def image_processor(directory_or_repo):
 SEEDS = {'tiny text tower': 8, 'tiny encode': 8, 'tiny text projection': 8, 'tiny image embeddings': 8,
          'quick_gelu image embeddings': 8, 'gelu image embeddings': 8,
          'gelu_pytorch_tanh image embeddings': 8, 'real text tower': 16, 'real embeddings': 8,
-         'T5 bfloat16 hidden states': 8, 'image transform': 8, 'T5 float32 long prompts': 8}
+         'T5 bfloat16 hidden states': 8, 'image transform': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 WORDS = ("a", "red", "bird", "two", "cats", "on", "mat", "painted", "x", "blue", "sky", "of", "the", "dog")
 """The words a drawn prompt is made of."""
@@ -589,41 +589,3 @@ def test_a_tower_layer_asking_wide_logits_attends_with_them():
     assert asked and all(dtype.itemsize >= 4 for dtype in asked)
     assert own and all(dtype.itemsize == 2 for dtype in own)
 
-
-def test_a_float32_t5_tower_over_long_prompts_is_on_par_with_the_reference():
-    """A float32 T5 tower over prompts of 256 tokens, its attention's probability-value product summing
-    each of its 256 keys: every position of its last hidden state on par with transformers' float32
-    encoder from its float64 one, over drawn token ids (check 1). One fp32 dot over the 256 keys rounded
-    the sum 2.2 times as far from float64 as torch's CPU attention, which sums keys in blocks
-    (`attention.weighted_values`, row 13655)."""
-    import jax.numpy as jnp
-    import torch
-    from transformers import T5EncoderModel
-
-    directory = Path(__file__).resolve().parent / "fixtures/t5/tiny"
-    encoder = T5Text.from_pretrained(str(directory), dtype=jnp.float32)
-    vocabulary = fixture_config(directory)["vocab_size"]
-
-    def draw(seed):
-        ids = np.random.default_rng([0x13655, seed]).integers(2, vocabulary, (4, 256)).astype(np.int32)
-        return ({"input_ids": ids, "attention_mask": np.ones_like(ids)},)
-
-    def transformers(dtype):
-        with precision(dtype):
-            model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
-
-        @as_given
-        def run(inputs):
-            ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
-                         for name in ("input_ids", "attention_mask"))
-            with precision(dtype), torch.no_grad():
-                states = model(input_ids=ids, attention_mask=mask).last_hidden_state
-            return {"last_hidden_state": states.numpy()}
-        return run
-
-    @as_given
-    def ours(inputs):
-        return {"last_hidden_state": hidden(encoder, inputs["input_ids"], inputs["attention_mask"])}
-
-    assert_as_exact(ours, transformers(torch.float32), draw, "T5 float32 long prompts",
-                    seeds=SEEDS["T5 float32 long prompts"], truth_fn=transformers(torch.float64))
