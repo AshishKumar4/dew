@@ -29,6 +29,7 @@ none of.
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -384,7 +385,11 @@ def _stacked(loop, element: int, written, instructions,
         put = instructions[computation.root_id]
     if put.opcode != "dynamic-update-slice" or not put.shape.dimensions:
         return None
-    known = json.loads(loop.backend_config or "{}")
+    # A loop's config is XLA's JSON where XLA wrote it, an opaque string where a module's text gave one,
+    # whose loop states no trip count to read: its stack is named by none.
+    known = None
+    with contextlib.suppress(json.JSONDecodeError):
+        known = json.loads(loop.backend_config or "{}")
     if not isinstance(known, dict) or not {"known_trip_count", "known_init_step",
                                            "known_induction_variable"} <= known.keys():
         return None  # Proto3's JSON leaves a zero out, so a missing field is 0.

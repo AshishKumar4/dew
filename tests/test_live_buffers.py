@@ -201,10 +201,16 @@ _LOOP = (FIXTURES / "loop.hlo").read_text()
 """A loop of seven state elements, `STEPS` its trip count (`_loop_names`)."""
 
 
-def _loop_names(steps: int) -> dict[str, tuple[str, ...]]:
-    """The names `Assignment.live` gives each loop state element's buffer of `_LOOP` run for `steps` steps,
-    by the instruction defining it, each buffer at the loop's output too and all live at one peak."""
-    module = module_bytes(_LOOP.replace("STEPS", str(steps)))
+_STATED = ('backend_config={"known_trip_count":{"n":"STEPS"},"known_init_step":{"init":"0","step":"1"},'
+           '"known_induction_variable":{"tuple_index":"7"}}')
+"""The loop's config in `_LOOP`, its trip count `STEPS`."""
+
+
+def _loop_names(steps: int, config: str = _STATED) -> dict[str, tuple[str, ...]]:
+    """The names `Assignment.live` gives each loop state element's buffer of `_LOOP` run for `steps` steps
+    under `config`, by the instruction defining it, each buffer at the loop's output too and all live at one
+    peak."""
+    module = module_bytes(_LOOP.replace(_STATED, config).replace("STEPS", str(steps)))
     defined = instruction_ids(module, "e")
     assignment = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=128)
@@ -225,11 +231,13 @@ def test_a_loops_state_is_named_only_by_a_scans_whole_stack():
     overwrites is not, nor a filled one written at one row, nor a square turned by a bitcast to another
     layout and a copy back before each write, nor one written at the counter passed through any op (a
     bitcast to a signed type of its width may take it negative), nor a stack whose loop runs fewer steps
-    than its rows."""
+    than its rows, nor one of a loop whose config states no trip count."""
     assert _loop_names(4) == {"zeros": ("hidden",), "ones": ("late",), "populated": (), "filled": (),
                               "spread": (), "blank": (), "tardy": ("deep",)}
     assert _loop_names(2) == {"zeros": (), "ones": (), "populated": (), "filled": (), "spread": (),
                               "blank": (), "tardy": ()}
+    # A config XLA's parser holds as an opaque string states no trip count: no stack is named by it.
+    assert _loop_names(4, 'backend_config="opaque"') == _loop_names(2)
 
 
 def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast():

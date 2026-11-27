@@ -527,13 +527,12 @@ def _program_of(fn: Callable) -> jax.stages.Compiled:
 def _module_of(program: jax.stages.Compiled) -> str:
     """The module name `program`'s runs carry in a TPU capture (`tpu_ops`), its executable's module's own
     (`instrumentation.hlo_module`, read typed, never printed)."""
-    from dew.telemetry import hlo
     from dew.telemetry.instrumentation import hlo_module
 
     module = hlo_module(program)
     if module is None:
         raise AmbiguousCapture(f"{program} holds no module")
-    return hlo.module_proto(module).name
+    return module.name
 
 
 @contextlib.contextmanager

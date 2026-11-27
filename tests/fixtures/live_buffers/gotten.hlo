@@ -12,6 +12,5 @@ body {
 
 ENTRY e {
   a = f32[2]{0} parameter(0)
-  f = (f32[2]{0}, f32[2]{0}) fusion(a), kind=kLoop, calls=body
-  ROOT r = (f32[2]{0}, f32[2]{0}) tuple(f, f)
+  ROOT f = (f32[2]{0}, f32[2]{0}) fusion(a), kind=kLoop, calls=body
 }
