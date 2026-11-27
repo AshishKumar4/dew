@@ -17,8 +17,10 @@ from process_support import refusal, serve_mode, worker_parser
 def preview_refusal(args) -> dict:
     """Fits of an objective that cannot sample, validated on a split of batches, with a tracker on process
     0 alone and a checkpointer both share, each ending in its refusal (`refusal`) or the step it trained to:
-    a preview every process asks, one process 0 alone asks, and none (the control, which trains); then one
-    more agreement every process passes, which a rank left in a checkpoint's agreement would block."""
+    a preview every process asks, one process 0 alone asks, and none (the control, which trains), and one
+    every process asks of an objective whose own check refuses it on process 1 alone (train 1421's F1);
+    then one more agreement every process passes, which a rank left in a checkpoint's agreement would
+    block."""
     import jax
     import optax
     from affine_run import FEATURES, Regression
@@ -40,8 +42,14 @@ def preview_refusal(args) -> dict:
 
     rank = jax.process_index()
 
-    def fitted(name: str, *, preview: bool) -> dict:
-        trainer = Trainer(Unsampled(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
+    class Uneven(Regression):
+        """The regression, its preview refused on process 1 alone: a check of the host's own."""
+
+        def preview_refusal(self) -> str | None:
+            return "this process generates nothing" if rank == 1 else None
+
+    def fitted(name: str, *, preview: bool, objective: type[Regression] = Unsampled) -> dict:
+        trainer = Trainer(objective(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
                           checkpoints=Checkpoints(str(Path(args.out).parent / name)),
                           tracker=RecordingTracker() if rank == 0 else None)
         try:
@@ -52,7 +60,8 @@ def preview_refusal(args) -> dict:
         return {"refused": None, "step": int(state.step)}
 
     ended = {"every": fitted("every", preview=True), "zero": fitted("zero", preview=rank == 0),
-             "none": fitted("none", preview=False)}
+             "none": fitted("none", preview=False),
+             "uneven": fitted("uneven", preview=True, objective=Uneven)}
     _coordination.agreed("the pool after its previews", lambda: True)
     return ended
 

@@ -2225,11 +2225,18 @@ def test_a_preview_only_process_zeros_tracker_takes_is_refused_on_every_process(
     """A preview asked of a model that cannot sample, at a validation of batches, with a tracker on process
     0 alone and a checkpointer both share, is refused on both processes before either enters its
     checkpoint's agreement, each with the model's own refusal, whether both ask it or process 0 alone; the
-    same fit asking none trains on both; and both pass the agreement after (audit P02: process 0 refused
-    alone, its peer waiting in the checkpoint's)."""
+    same fit asking none trains on both; one whose objective refuses on process 1 alone is refused on both,
+    process 0 with its peer's (train 1421's F1); and both pass the agreement after (audit P02: process 0
+    refused alone, its peer waiting in the checkpoint's)."""
     reports = run_pool("preview_refusal", tmp_path, 2, devices=4, timeout=300, script=PREVIEW_REFUSAL)
     own = {"refused": {"type": "ValueError", "phase": None, "named": None}, "step": None}
-    assert [{"every": own, "zero": own, "none": {"refused": None, "step": 2}}] * 2 == reports, reports
+    assert [report["every"] for report in reports] == [own, own], reports
+    assert [report["zero"] for report in reports] == [own, own], reports
+    assert [report["none"] for report in reports] == [{"refused": None, "step": 2}] * 2, reports
+    # An objective refusing on process 1 alone: process 1 with its own refusal, process 0 with its peer's,
+    # named, at the fit's preflight (train 1421's F1).
+    peer = {"type": "PeerFailure", "phase": "fit preflight", "named": 1}
+    assert [report["uneven"] for report in reports] == [{"refused": peer, "step": None}, own], reports
 
 
 @pytest.mark.distributed

@@ -1370,8 +1370,11 @@ class Trainer(Generic[Loss, Effects]):
         # refuses it or none does, where one refusing alone would leave its peers at the next collective
         # (audit P02).
         previewed = bool(broadcast_from_process_zero(preview and self.tracker is not None))
-        self._preflight(loader, plateau, suites, previewed=previewed, stated=dataset,
-                        loss=(self.checkpoints is not None or restore_best) and not selection)
+        # Its refusals each rank's own checks make (an objective's preview refusal, its run tokenizer),
+        # agreed: a rank refusing alone leaves its peers at the next collective (train 1421's F1).
+        agreed("fit preflight", functools.partial(
+            self._preflight, loader, plateau, suites, previewed=previewed, stated=dataset,
+            loss=(self.checkpoints is not None or restore_best) and not selection))
         return FitPlan(
             dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
             checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
