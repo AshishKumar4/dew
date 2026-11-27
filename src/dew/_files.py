@@ -15,10 +15,14 @@ cache keys a source file by.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import ctypes
 import errno
 import fcntl
+import functools
 import hashlib
+import logging
+import operator
 import os
 import secrets
 import shutil
@@ -121,7 +125,7 @@ def staged(directory: Path) -> Iterator[Path]:
         staging.chmod(mode)
         published(staging, directory)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        _removed(staging)
 
 
 def published(built: Path, directory: Path) -> bool:
@@ -133,7 +137,7 @@ def published(built: Path, directory: Path) -> bool:
     except OSError:
         if not directory.is_dir():
             raise
-        shutil.rmtree(built, ignore_errors=True)
+        _removed(built)
         return False
     return True
 
@@ -162,9 +166,39 @@ Entries = Mapping[Path, str]
 regular file), `"folder"`, `"link"` or `"special"` (a FIFO, a socket, a device)."""
 
 
+Replacements = list[tuple[list[Path], list[Path]]]
+"""Groups of a new tree's entries, each with the earlier tree's entries they replace together (`swapped`'s
+`replaces`)."""
+
+
+def same_entries(written: Entries, held: Entries) -> Replacements:
+    """Each file and folder `written` where `held` holds the same entry, of the same kind: the earlier entry
+    it replaces (`swapped`'s `replaces`)."""
+    return [([entry], [entry]) for entry, kind in written.items()
+            if kind in ("file", "folder") and held.get(entry) == kind]
+
+
+_STAGED: contextvars.ContextVar[tuple[Path, Path] | None] = contextvars.ContextVar("_STAGED", default=None)
+"""The staging `swapped` is writing and the destination it replaces, while its block runs."""
+
+
+def published_counterpart(path: Path) -> Path | None:
+    """Where `path`, inside the staging `swapped` is writing, lies in the tree the staging replaces; None
+    outside one. A writer that names its files apart from the earlier tree's reads it there
+    (`safetensors_io.save_sharded`)."""
+    staged = _STAGED.get()
+    if staged is None:
+        return None
+    staging, directory = staged
+    absolute = Path(os.path.abspath(path))
+    return directory / absolute.relative_to(staging) if absolute.is_relative_to(staging) else None
+
+
 @contextlib.contextmanager
 def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Path]], *,
-            exchange: Callable[[Path, Path], None] = exchange_directories) -> Iterator[Path]:
+            exchange: Callable[[Path, Path], None] = exchange_directories,
+            replaces: Callable[[Entries, Entries], Replacements] = same_entries
+            ) -> Iterator[Path]:
     """A sibling directory to write the whole of `directory` into, which replaces it when the block ends
     in one call, so a write that fails at any file leaves the one `directory` held whole and the one
     that succeeds is put in place whole; removed if the block raises, or if its own setup fails.
@@ -185,10 +219,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
 
     The new tree is made private from its first call (mode 0700), in the group and with the setgid bit
     of the one it replaces, so what is written in it takes that group, and published with the mode of the
-    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), so a private
-    destination's weights are never readable by others. Dew's publishers of one destination take its
-    validation and replacement in turn (`_publishing`, a lock file of its own beside it), so one cannot
-    validate a tree another then replaces; a writer outside Dew is not excluded.
+    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), each file
+    and folder it writes where the earlier tree held one by that name with that one's mode, so a private
+    destination's weights, or a private file in it, are never readable by others. Dew's publishers of one
+    destination take its validation and replacement in turn (`_publishing`, a lock file of its own beside
+    it), so one cannot validate a tree another then replaces; a writer outside Dew is not excluded.
     The earlier one is removed once it is out of place. `exchange` is the one call that exchanges the two
     (`exchange_directories`, Linux's `renameat2`), a filesystem's own, which a test of a filesystem that
     has none passes in."""
@@ -223,7 +258,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
             if staging.stat().st_gid != before.st_gid:
                 os.chown(staging, -1, before.st_gid)
             staging.chmod(0o700 | (stat.S_IMODE(before.st_mode) & stat.S_ISGID))
-        yield staging
+        staged = _STAGED.set((Path(os.path.abspath(staging)), directory))
+        try:
+            yield staging
+        finally:
+            _STAGED.reset(staged)
         with _publishing(directory):
             held_at = existing()
             if held_at is None:
@@ -236,6 +275,17 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 raise FileExistsError(f"{directory} holds {sorted(map(str, refused))}, which the export "
                                       "would not write: export into an empty directory, or one holding only "
                                       "an export")
+            # Each entry the new tree writes in place of earlier ones (`replaces`: the same entry, or a
+            # release's reshard of its weights) takes the access every one of them allowed, a private file
+            # kept private, a new one its umask's (trains 1406 and 1407's reviews), while the staging is
+            # still private; its own mode last, just before it is put in place.
+            for entries, earlier in replaces(written, held):
+                if earlier:
+                    # The access every earlier entry allowed, read once for the group.
+                    modes = (stat.S_IMODE((directory / each).lstat().st_mode) for each in earlier)
+                    allowed = functools.reduce(operator.and_, modes)
+                    for entry in entries:
+                        (staging / entry).chmod(allowed)
             staging.chmod(stat.S_IMODE(held_at.st_mode))
             if held:
                 exchange(staging, directory)
@@ -243,7 +293,37 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                 # An empty directory is replaced by a rename, which every filesystem makes in one step.
                 os.rename(staging, directory)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        _removed(staging)
+
+
+def _removed(tree: Path) -> None:
+    """Remove `tree`, a tree of a save's own (a staging, the earlier tree an exchange put there, or a build
+    another writer published before), as far as this process may: a folder whose read-only mode keeps an
+    entry in it (one an earlier tree's mode restored) made writable to remove it, where this process owns
+    it, and no other touched, nor any failure raised, so a cleanup neither fails a save already published
+    nor hides the error it unwinds from (train 1407's review). The live tree is never walked."""
+    if not os.path.lexists(tree) or os.path.islink(tree):
+        return
+
+    root = os.path.abspath(tree)
+
+    def retried(remove: Callable[..., None], path: str, failure: BaseException) -> None:
+        # An entry's removal alone retried (no traversal, whose calls take more than a path), and only in a
+        # folder of the tree: its root's own parent, the release's, is never changed.
+        folder = os.path.dirname(os.path.abspath(path))
+        if (remove not in (os.unlink, os.rmdir) or not isinstance(failure, PermissionError)
+                or not (folder == root or folder.startswith(root + os.sep))
+                or os.access(folder, os.W_OK | os.X_OK)):
+            return
+        try:
+            os.chmod(folder, 0o700)
+            remove(path)
+        except OSError as left:
+            # A save's own leftover, named for whoever clears it; the save's outcome is its own.
+            logging.getLogger(__name__).warning("could not remove %s from a save's discarded tree: %s",
+                                                path, left)
+
+    shutil.rmtree(tree, onexc=retried)
 
 
 def _made_mode(parent: Path) -> int:
@@ -304,7 +384,21 @@ def _lock_file(path: Path) -> int:
     try:
         return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o222)
     except FileExistsError:
-        return os.open(path, flags)
+        # Opened without blocking and taken only as a regular file: a FIFO another made there, which an
+        # open for writing would wait on a reader for, is refused (train 1406's review).
+        try:
+            lock = os.open(path, flags | os.O_NONBLOCK)
+        except OSError as refused:
+            if refused.errno != errno.ENXIO:
+                raise
+            raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock") from refused
+    try:
+        if not stat.S_ISREG(os.fstat(lock).st_mode):
+            raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock")
+    except BaseException:
+        os.close(lock)
+        raise
+    return lock
 
 
 def _entries(root: Path) -> dict[Path, str]:

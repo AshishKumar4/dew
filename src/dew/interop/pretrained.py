@@ -1149,13 +1149,16 @@ class PretrainedPipeline(Pretrained):
     def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None,
              max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write each component's tensors and config in the diffusers layout,
-        its weights in shards of at most `max_shard_size` where they exceed it.
+        its weights in shards of at most `max_shard_size` where they exceed it,
+        the whole pipeline one generation: a save that fails at any file leaves
+        the earlier pipeline at `directory` whole (`published_release`).
 
         An adapted bundle's factors are merged into the denoiser's kernels (PEFT's
         `merge_and_unload`), from its variables or a trainer's split of them;
         `adapter.save` writes the factors alone.
         """
         from dew.interop import diffusion
+        from dew.interop.releases import published_release
         from dew.nn.backbones.layer_names import stored_layers
 
         self._quantization()
@@ -1165,7 +1168,10 @@ class PretrainedPipeline(Pretrained):
         values = stored_layers(self.model, self.variables if variables is None else variables, banks=True)
         if self.adapter is not None:
             values = self.adapter.merge(values)
-        diffusion.save_source(self, values, Path(directory), max_shard_size)
+        # The whole pipeline one generation, its index and configs and weights published together, as a
+        # model's release is (`published_release`; train 1406's review: configs written before weights).
+        published_release(directory,
+                          lambda target: diffusion.save_source(self, values, target, max_shard_size))
 
     def _text_encoder(self, needed: str) -> None:
         """Refuse an operation the text encoder's weights take, on a pipeline
