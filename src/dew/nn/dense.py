@@ -188,8 +188,7 @@ def _ruled() -> bool:
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions,
-             bias: Array | None = None, tensor_scale: Array | None = None,
-             formed: projections.FormedInput | None = None) -> jax.Array:
+             bias: Array | None = None, tensor_scale: Array | None = None) -> jax.Array:
     """The layer's product of `inputs` and `kernel` over `dimensions`, plus `bias` where given, shaped to
     broadcast over it (`biased`). The product is its `dot_general_cls` (an interceptor's: a quantized
     product), as flax picks it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the
@@ -201,9 +200,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
     its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`) is the layer's own: the
     template reads no policy from a callable, and the bias is added past it. `tensor_scale`, the rows' under
     a delayed-scaling NVFP4 recipe that takes the product (`history_scale`), which the template's product
-    hands its recipe (`projections.recipe_general`). `formed`, `inputs` formed entrywise from other values
-    (`projections.FormedInput`), which the plain product multiplies as the template's formed operand; every
-    other product multiplies `inputs` as any."""
+    hands its recipe (`projections.recipe_general`)."""
     extents = projections.extents(inputs.shape, kernel.shape, dimensions)
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     if layer.dot_general_cls is not None:
@@ -213,8 +210,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
         refuse_recipe("a wrapper's product (an adapter's, a quantizer's)", *extents)
     elif layer.dot_general in (None, float32_dot_general):
         return projections.dot_general(product, projections.kernel_path(layer))(
-            inputs, kernel, dimensions, precision=layer.precision, bias=bias, tensor_scale=tensor_scale,
-            formed=formed)
+            inputs, kernel, dimensions, precision=layer.precision, bias=bias, tensor_scale=tensor_scale)
     out = product(inputs, kernel, dimensions, precision=layer.precision)
     return out if bias is None else biased(out, bias)
 
@@ -245,15 +241,14 @@ def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, prefer
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
             shaped, stored: Array | None = None, *, taken: Callable | None = None,
-            tensor_scale: Array | None = None, formed: projections.FormedInput | None = None):
+            tensor_scale: Array | None = None):
     """The layer's product of `inputs` and `kernel` over `dimensions` as flax takes it, plus `bias`
     reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
     at fp32, in float64 on a CPU under Dew's tests); where the layer computes in a 16-bit dtype and its
     bias is `stored` at fp32, the product and that bias rounded once (`_rounds_once`). `taken`, where
     given, takes the product, `taken(product)` of `product(inputs, kernel)`, as its caller forms it (a
     joined projection's kernels joined on each device's rows, `dew.nn.joined.joined_dense`; `kernel` then
-    one of them, its dtype the product's), the bias added past it as here. `tensor_scale` and `formed`,
-    `_product`'s, which a product rounded once with its bias takes as any input."""
+    one of them, its dtype the product's), the bias added past it as here. `tensor_scale`, `_product`'s."""
     take = taken or (lambda product: product(inputs, kernel))
     if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
         widened = take(lambda inputs, kernel: _summed(inputs, kernel, dimensions, layer.precision,
@@ -261,7 +256,7 @@ def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dim
         return biased(widened, shaped(stored)).astype(inputs.dtype)
     if taken is None:
         return _product(layer, inputs, kernel, dimensions, None if bias is None else shaped(bias),
-                        tensor_scale, formed)
+                        tensor_scale)
     product = taken(lambda inputs, kernel: _product(layer, inputs, kernel, dimensions,
                                                     tensor_scale=tensor_scale))
     return product if bias is None else biased(product, shaped(bias))
@@ -473,36 +468,16 @@ class _LinearEnvelope(nn.Module):
 class Dense(_LinearEnvelope, nn.Dense):
     """Flax's Dense, its bias added by `biased` (the module docstring). `kernel_axes` are its kernel's
     logical axes, `[inputs, features]`, which its module declares where it builds it, and its bias takes
-    the features' (`declared`); None declares none. A call's `formed` (`projections.FormedInput`) is read
-    only where its `operand` is the call's `inputs` itself: an interceptor handing the layer other inputs
-    (an input quantizer's) leaves it unread."""
+    the features' (`declared`); None declares none."""
 
     kernel_axes: tuple[str | None, ...] | None = None
-
-    @nn.compact
-    def __call__(self, inputs: Array, formed: projections.FormedInput | None = None) -> jax.Array:
-        """The layer of `inputs`. `formed`, where given, states `inputs` formed entrywise from other values
-        (`projections.FormedInput`: a gated MLP's hidden activation), which the layer's plain product
-        multiplies as the template's formed operand, holding the values it was formed from in place of
-        `inputs` for reverse mode (`_product`), under the class's identity rule: the rows its arithmetic
-        multiplies (`_linear`'s, past an envelope) the operand itself."""
-        linear = self._linear if formed is None else functools.partial(self._linear, formed=formed)
-        return self._envelope(linear, inputs)
-
-    @property
-    def reads_formed(self) -> bool:
-        """Whether its call takes `formed` (`protocols.ReadsFormed`): a Dense whose call and arithmetic are
-        this class's own (`__call__`, `_linear`), not ones a subclass computes otherwise."""
-        return type(self)._linear is Dense._linear and type(self).__call__ is Dense.__call__
 
     def product_owned(self) -> bool:
         """Whether a wrapper owns this layer's product (`intercepted`), asked within its own scope, so a
         Qwix rule over its module path answers: what a parent joining it with others reads (`joined`)."""
         return intercepted()
 
-    def _linear(self, inputs: Array, formed: projections.FormedInput | None = None) -> jax.Array:
-        # Read only as the rows it states (an envelope or an interceptor handing other rows leaves it).
-        formed = formed if formed is not None and formed.operand is inputs else None
+    def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]
         axes = self.kernel_axes
         kernel = packed_matrix(self, 'kernel', lambda: self.param(
@@ -517,19 +492,13 @@ class Dense(_LinearEnvelope, nn.Dense):
         bias = (self.param('bias', declared(self.bias_init, None if axes is None else axes[-1:]),
                            (self.features,), self.param_dtype) if self.use_bias else None)
         stored = bias
-        given = None if formed is None else inputs.dtype
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
         # Under a delayed-scaling NVFP4 recipe that takes the product, its rows' scale its amax history's.
         scale = history_scale(self, 'amax_history', kernel.shape)
         if scale is not None:
             recorded(self, 'amax_history', inputs)
-        # The formed input as promoted where flax's promotion keeps its dtype (its values as they are); a
-        # promotion of the layer's own, or to another dtype, leaves it.
-        kept = self.promote_dtype is promote_dtype and inputs.dtype == given
-        formed = dataclasses.replace(formed, operand=inputs) if formed is not None and kept else None
-        return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored, tensor_scale=scale,
-                       formed=formed)
+        return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored, tensor_scale=scale)
 
 
     @nn.nowrap

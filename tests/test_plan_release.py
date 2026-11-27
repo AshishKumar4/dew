@@ -95,11 +95,10 @@ stacks so `ns_group=4` joins half of them and recomputing saves beside the updat
 def muon_lm(remat: str | None = None, **opts) -> Trainer:
     """A four-layer hybrid LM (two scanned runs of two layers) trained by Muon over one microbatch a step
     of two rows: its runs' matrices of one shape are eight stacks its Newton-Schulz joins where `opts` states
-    no group, wide enough beside the rows' activations that the update's iteration holds the step's peak
-    (256 wide: a recomputing rung frees 0.19 MB of it here once a gated MLP holds no hidden product, where at
-    128 it freed 520 bytes); recomputing as `remat` names where given."""
+    no group, wide enough beside the rows' activations that the update's iteration holds the step's peak;
+    recomputing as `remat` names where given."""
     model = CausalTransformer(
-        vocab_size=64, emb_features=256, num_layers=4, num_heads=2, mlp_features=256,
+        vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
         max_seq_len=MUON_SEQ,
         layer_types=("sliding_attention", "sliding_attention", "full_attention", "full_attention"),
         kinds={"sliding_attention": {"window": 4}},
