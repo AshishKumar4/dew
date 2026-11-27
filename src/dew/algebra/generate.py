@@ -27,11 +27,12 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
 from dew import parity
-from dew.algebra import _component_sharing, error, printed, rules, terms
+from dew.algebra import _component_sharing, error, printed, rules
 from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -123,14 +124,16 @@ class SurrogateBodies:
 
     @functools.cached_property
     def _keyed(self) -> dict[Hashable, SurrogateCase]:
-        """Each case by its static arguments' structural key (`terms.parameter_key`): a float by its bits,
-        so `-0.0` and `0.0`, equal as Python values, are two keys."""
-        return {terms.parameter_key(fixed): case for fixed, case in self.cases.items()}
+        """Each case by its static arguments' exact key (`_exact_key`)."""
+        keyed = {_exact_key(fixed): case for fixed, case in self.cases.items()}
+        if None in keyed:
+            raise ValueError("a surrogate case's static arguments must be hashable")
+        return keyed
 
     def _case(self, fixed: tuple) -> SurrogateCase | None:
-        # A static argument no structural key states (unhashable, or held by identity) matches no declared
-        # case, whose key is by value: its written body runs.
-        return self._keyed.get(terms.parameter_key(fixed))
+        # Static arguments of no exact key (an unhashable one) match no declared case: the written body runs.
+        key = _exact_key(fixed)
+        return None if key is None else self._keyed.get(key)
 
     def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
         """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
@@ -169,6 +172,23 @@ class SurrogateBodies:
         return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
             surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
                       symbolic_zeros=self.symbolic_zeros))
+
+
+def _exact_key(value) -> Hashable | None:
+    """`value` as a surrogate's static arguments key it, two values one key only where they are one: a float
+    by its type and bits (`-0.0` no `0.0`, each NaN its own sign and payload), a sequence by its type and
+    parts, any other hashable value by its type and itself (its own equality: a callable by identity). None
+    where any part is unhashable, which no declared case is."""
+    if isinstance(value, (float, complex, np.floating, np.complexfloating)):
+        return type(value), np.asarray(value).tobytes()
+    if isinstance(value, (tuple, list)):
+        parts = tuple(_exact_key(part) for part in value)
+        return None if None in parts else (type(value), parts)
+    try:
+        hash(value)
+    except TypeError:
+        return None
+    return type(value), value
 
 
 def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
