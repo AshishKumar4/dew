@@ -84,20 +84,14 @@ def local_packed(args, *, lost: bool = False) -> dict:
     from dew._coordination import PeerFailure
     from dew.quantization import QUANTIZATION
 
-    def checkpoints_of():
-        made = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir,
-                             local_every=1).checkpoints
-        assert made is not None
-        return made
-
     def saved(step: int, held: dict):
-        # Saved on the local tier alone; where `lost`, process 1's copy then gone, as a replaced host's is,
-        # so its restore reads process 0's replica (`Checkpoints._recovered`).
+        # Saved on the local tier alone, the managers closed after it (`Checkpoints.close`: a closed one
+        # reopens on its next use); where `lost`, process 1's copy then gone, as a replaced host's is, so
+        # its restore reads process 0's replica (`Checkpoints._recovered`).
         written = dataclasses.replace(placed, step=placed.step + step,
                                       variables={**placed.variables, QUANTIZATION: held})
-        writer = checkpoints_of()
-        writer.save_local(step, written, None)
-        writer.wait()
+        with checkpoints:
+            checkpoints.save_local(step, written, None)
         if lost:
             if jax.process_index() == 1:
                 shutil.rmtree(Path(args.local_dir) / "process1")
@@ -105,18 +99,22 @@ def local_packed(args, *, lost: bool = False) -> dict:
         return written
 
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, local_dir=args.local_dir, local_every=1)
+    checkpoints = trainer.checkpoints
+    assert checkpoints is not None
     placed, _, _ = trainer.place()
     packed = _packed(NamedSharding(trainer.device_mesh, PartitionSpec()))
     state = saved(1, packed)
     try:
-        restored, _ = checkpoints_of().restore(_template(state), 1)
+        with checkpoints:
+            restored, _ = checkpoints.restore(_template(state), 1)
     except (ValueError, PeerFailure) as error:
         # Its message beside the refusal's type: a failing assertion shows what refused the read.
         return {"read": {**refusal(error), "message": str(error)}, "foreign": None}
     read = _read(packed, restored.variables[QUANTIZATION])
     saved(2, _foreign(packed))
     try:
-        checkpoints_of().restore(_template(state), 2)
+        with checkpoints:
+            checkpoints.restore(_template(state), 2)
     except (ValueError, PeerFailure) as error:
         return {"read": read, "foreign": refusal(error)}
     return {"read": read, "foreign": None}
