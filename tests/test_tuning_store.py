@@ -295,12 +295,13 @@ def test_a_stored_hooked_launch_is_kept_as_written_and_replaced_by_its_newer_tim
     tuning._store("gpu", [(first, tuning.Timings({1: _timed(2.0), 2: _timed(1.0)}))])
     [written] = tuning._stored(path)
     tuning._store("gpu", [(other, tuning.Timings({1: _timed(1.0)}))])
-    assert tuning._stored(path)[0] == written and len(tuning._stored(path)) == 2
+    assert written in tuning._stored(path) and len(tuning._stored(path)) == 2
     tuning._store("gpu", [(first, tuning.Timings({2: _timed(0.5)}))])
     read, _ = tuning._read(path)
     assert len(tuning._stored(path)) == 2
-    assert {key: timings.fastest_config for (_, key), (_, timings) in read.items()} == {
-        first.autotuning_cache_key: 2, other.autotuning_cache_key: 1}
+    assert {key: {config: timing.median_evaluation_time_ms for config, timing in timings.items()}
+            for (_, key), (_, timings) in read.items()} == {
+        first.autotuning_cache_key: {2: 0.5}, other.autotuning_cache_key: {1: 1.0}}
 
 
 def _hooks() -> list:
