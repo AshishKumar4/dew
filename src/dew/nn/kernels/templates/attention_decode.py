@@ -50,7 +50,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_forward import NATURAL_NAME, folded_form
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.hooks import NO_HOOK, Side
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
 
 
 def packable(hooks: Hooks | None) -> bool:
@@ -182,7 +182,8 @@ def launched(query: jax.Array, value: jax.Array,
 def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
          scale: float | None, target: generation.GpuTarget, table: jax.Array | None = None,
          sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
-         walk: str = "plain", in_key: bool = False, defer_output: bool = False) -> Plan | None:
+         walk: str = "plain", in_key: bool = False, defer_output: bool = False,
+         finished: tuple[Hook, int] | None = None) -> Plan | None:
     """The work list of a packed call (`packed`) under its `hooks` (its initial state among them) on `target`,
     its `walk` (`WALKS`): the forward's derived config at the key tile its memory-bound walk streams at least
     (`MosaicForward.streaming`) and its slices; None where no launch of it derives. Each config is derived
@@ -196,7 +197,9 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
     whole step took 13); where it prices none, as many as keep the device's stream in flight
     (`MosaicForward.streamed`, at most those its residency holds). Each slice writes its fp32 state, which
-    the step merges with the initial state (`merged.merged_split`), at a config derived for them."""
+    the step merges with the initial state (`merged.merged_split`), at a config derived for them; its
+    merge priced as the step's launch runs it (`_merge_seconds`: a finished step's, `finished` the call's
+    output hook and heads, else to its fp32 state)."""
     chosen = WALKS[walk]
     single_hooks = (None if hooks is None else dataclasses.replace(
         hooks, initial=None, output=NO_HOOK)) if defer_output else hooks
@@ -249,7 +252,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
         query, key, value, every, walked, config, counts, scale=scale, target=target, table=table,
         sources=sources, scales=scales, chosen=chosen, in_key=in_key,
         initial=None if hooks is None else hooks.initial,
-        single_launch=(single_hooks, jnp.float32 if defer_output else None), deferred=defer_output)
+        single_launch=(single_hooks, jnp.float32 if defer_output else None), deferred=defer_output,
+        finished=finished)
     if priced is not None:
         slices, tile = priced
         if slices == 1:
@@ -296,7 +300,8 @@ def _slice_counts(processors: int, programs: int, most: int) -> list[int]:
 def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, single: attention_mosaic.Tiles,
                    counts: list[int], *, scale: float | None, target: generation.GpuTarget, table, sources,
                    scales, chosen: Walk, in_key: bool, initial: Initial | None, single_launch: tuple,
-                   deferred: bool = False) -> tuple[int, attention_mosaic.Tiles] | None:
+                   deferred: bool = False, finished: tuple[Hook, int] | None = None
+                   ) -> tuple[int, attention_mosaic.Tiles] | None:
     """The slice count of `counts` (one beside them, at the derived `single` tile as `single_launch`'s hooks
     and written dtype run it, the plan's one-slice launch) and key tile whose step
     the cost model prices least over `spans`: its walk (`MosaicForward.price_config`, its programs' warps
@@ -322,7 +327,8 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
     if deferred:
         # Its finish the merge's past the walk at one slice too (`planned`'s deferral: a resumed state, a hook
         # its packed rows cannot read), a launch of its own.
-        alone += _merge_seconds(query, value, spans, single, 1, target=target, initial=initial)
+        alone += _merge_seconds(query, value, spans, single, 1, target=target, initial=initial,
+                                finished=finished)
     prices = {(1, single): alone}
     for count in counts:
         sliced_op, sliced_ba = bound(splits=count)
@@ -335,7 +341,7 @@ def _priced_slices(query, key, value, spans: KeySpans, hooks: Hooks | None, sing
             if walk is None:
                 return None
             prices[count, tile] = walk + _merge_seconds(query, value, spans, tile, count, target=target,
-                                                        initial=initial)
+                                                        initial=initial, finished=finished)
     return least_plan(prices)
 
 
@@ -366,12 +372,29 @@ def launch_programs(rows: jax.Array, config: attention_mosaic.Tiles) -> int:
 
 
 def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
-                   target: generation.GpuTarget, initial: Initial | None) -> float:
+                   target: generation.GpuTarget, initial: Initial | None,
+                   finished: tuple[Hook, int] | None = None) -> float:
     """The seconds of the merge of a split walk's `slices` as its launch's block choice prices it
     (`merged.priced_launch`: its programs' waves): the walk's outputs as its launch writes them,
     `[B, S, Qp, H, Dvp]` fp32 and their maxima and denominators `[2, B, H, S, Qp]`
-    (`attention_mosaic_forward.SplitOutput`). Priced over the whole device at once (`cost.seconds`), a B8
-    merge's 512 programs ran as one."""
+    (`attention_mosaic_forward.SplitOutput`), merged as the step's launch merges them: a finished step's
+    (`merged_finished`, `finished` its output hook and heads, the call's own, writing the query's dtype), or
+    an unfinished one's to its fp32 state (`merged_split`, `finished` None). Priced over the whole device at
+    once (`cost.seconds`), a B8 merge's 512 programs ran as one."""
+    output, out_heads = (NO_HOOK, None) if finished is None else finished
+    spec, padded, stacked, queries, width = merge_shapes(query, value, spans, config, slices, target=target)
+    return merged.priced_launch(spec, padded, stacked, queries, width, target,
+                                 has_initial=initial is not None,
+                                 normalized=initial is not None and initial.normalized, output=output,
+                                 out_dtype=None if finished is None else query.dtype, out_heads=out_heads)
+
+
+def merge_shapes(query, value, spans: KeySpans, config: attention_mosaic.Tiles, slices: int, *,
+                 target: generation.GpuTarget
+                 ) -> tuple[algebra.Forward, jax.ShapeDtypeStruct, jax.ShapeDtypeStruct, int, int]:
+    """A split walk's merge's operands as its launch lays them out (`_merge_seconds`): its walk's units
+    finished (`algebra.finished_form`), its slices' outputs `[B, S, Qp, H, Dvp]` and maxima and
+    denominators `[2, B, H, S, Qp]` fp32, its queries and its values' width."""
     family = attention_mosaic.bundle_of(config, query.dtype, target=target)
     rows = attention_mosaic._padded(query.shape[1], spans.keys, config)[0]
     width = attention_mosaic._width(value.shape[-1], family, query.dtype)
@@ -379,9 +402,7 @@ def _merge_seconds(query, value, spans: KeySpans, config: attention_mosaic.Tiles
     padded = jax.ShapeDtypeStruct((batch, slices, rows, heads, width), jnp.float32)
     stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, rows), jnp.float32)
     spec = algebra.finished_form(_spec(query, spans, Hooks(), scale=None))
-    return merged.priced_launch(spec, padded, stacked, query.shape[1], value.shape[-1], target,
-                                 has_initial=initial is not None,
-                                 normalized=initial is not None and initial.normalized)
+    return spec, padded, stacked, query.shape[1], value.shape[-1]
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
@@ -445,13 +466,14 @@ def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | Non
 
 def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
             scale: float | None = None, table: jax.Array | None = None, sources: jax.Array | None = None,
-            scales: tuple[jax.Array, jax.Array] | None = None, in_key: bool = False
+            scales: tuple[jax.Array, jax.Array] | None = None, in_key: bool = False, finished: bool = True
             ) -> tuple[Mapping[str, Plan] | None, jax.Array, KeySpans, Hooks]:
     """A decode step's work list as `attend` takes the step (its operands as `attend`'s): its query rows
     packed with their spans and initial state (`packed`), the hooks that read them, and the plan of each walk
     it launches (`launched`, `plan`), None where some walk derives none on the GPU. `attend` launches them; a
     cache's selector asks of the same step's operands whether they derive (`dew.nn.kv_cache._template_tiles`):
-    one planning of one call."""
+    one planning of one call. Its merges priced as the step's launch merges, a `finished` step's output or
+    an unfinished one's state."""
     kv_heads = key.shape[2] if table is None else key.shape[0]
     rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
     group = query.shape[2] // kv_heads
@@ -467,9 +489,12 @@ def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         whole = dataclasses.replace(hooks, initial=initial,
                                     output=dataclasses.replace(hooks.output, sides=packed_out))
     target = generation.gpu_target()
+    # Its merge priced as the step's launch merges: a finished step's under the call's own output hook over
+    # its heads (`merged_finished`), an unfinished one's to its state (`merged_split`).
     planned_walk = functools.partial(plan, rows, key, value, row_spans, whole, scale=scale, target=target,
                                      table=table, sources=sources, scales=scales, in_key=in_key,
-                                     defer_output=defer_merge)
+                                     defer_output=defer_merge,
+                                     finished=(hooks.output, query.shape[2]) if finished else None)
     # values' bounds choose between (`WALKS`), the one fallback of a launch whose scaled walk's registers its
     # unscaled walk's config does not hold (`MosaicForward.decided`).
     plain = planned_walk(walk="plain")
@@ -505,7 +530,7 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                                   "unsupported output parameter or dropout (`packable`)")
     heads = query.shape[2]
     work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
-                                           sources=sources, scales=scales, in_key=in_key)
+                                           sources=sources, scales=scales, in_key=in_key, finished=finished)
     initial = whole.initial
     if work is None:
         raise NotImplementedError(f"the template's decode derives no config on {generation.gpu_target()}")

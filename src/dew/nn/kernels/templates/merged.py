@@ -407,12 +407,19 @@ def _triton_slot_steps(total_slices: int) -> float:
 
 def priced_launch(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
                   stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
-                  has_initial: bool = False, normalized: bool = False) -> float:
+                  has_initial: bool = False, normalized: bool = False, *, output: Hook = NO_HOOK,
+                  out_dtype=None, out_heads: int | None = None) -> float:
     """The seconds of one native `merged_padded` launch at its planned block (`_planned_block`), as that
     choice prices it (`cost.launch_seconds`: its programs' waves over the multiprocessors, each wave its
-    programs' longest path), on the lowering named where the merge traces (`selection.forced`)."""
+    programs' longest path), its signature the launch's own (`merged_finished`'s: its `output` hook and its
+    parameters' layout, the dtype and heads it writes), so the planner takes the lowering, block and
+    epilogue the launch does: a hooked merge Mosaic's on every Mosaic GPU family (`_uses_mosaic`), where
+    priced unhooked an H100's took Pallas Triton's slots (train 1379's K-F3); on the lowering named where
+    the merge traces (`selection.forced`)."""
+    specs = tuple(jax.ShapeDtypeStruct(side.value.shape, side.value.dtype) for side in output.sides)
     _, work, launched = _planned_block(algebra.units_of(units), padded, stacked, queries, width, target,
-                                       has_initial, normalized=normalized,
+                                       has_initial, None, out_dtype, out_heads, output.fn,
+                                       kinds_of(output.sides), specs, normalized,
                                        merge=selection.forced(generation.Choice.MERGE))
     return cost.launch_seconds(work, launched, target)
 
