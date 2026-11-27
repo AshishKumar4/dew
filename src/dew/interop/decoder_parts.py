@@ -2032,15 +2032,15 @@ class Restacked:
     """A release's tensors that its path map reads otherwise than they are stored, declared once for both
     directions by the decoder's record: `stacks` each such stored tensor as the `Stacked` view of the
     tensors the map reads, and `unstored` the tensors the map reads that the release stores none of, each
-    with the one value it holds; `prepared` matches every name the map reads only as a part or unstored,
-    whatever the record. `prepare` splits each stack (one the release lacks refused) and adds the
-    unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from its
+    with the one value it holds; `reserved` matches every name only a stack, its parts or an unstored
+    tensor takes, whatever the record. `prepare` splits each stack (one the release lacks refused) and adds
+    the unstored tensors; `unprepare`, its exact inverse (`DecoderFamily.unprepare`), stacks each back from its
     parts (a part missing refused) and drops the unstored ones once they hold their value; every other
     tensor passes through both."""
 
     stacks: Callable[[Mapping[str, object]], Sequence[Stacked]]
     unstored: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]]
-    prepared: re.Pattern[str]
+    reserved: re.Pattern[str]
 
     def prepare(self, tensors: Mapping[str, Stored],
                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
@@ -2087,11 +2087,11 @@ class Restacked:
                 raise ValueError(f"two of the prepared tensors write back {name}")
             built[name] = (spec, build)
 
-        # A tensor under a name only a stack's part takes (`prepared`), which the record stacks none of, is
-        # no tensor of the release: refused, not written as it is.
+        # A tensor under a name only a stack or its part takes (`reserved`), which the record stacks none
+        # of, is no tensor of the release: refused, not written as it is.
         if stray := sorted(name for name in specs if name not in owner and name not in unstored
-                           and self.prepared.fullmatch(name)):
-            raise ValueError(f"{stray} are named as the parts of the release's stacked tensors, which its "
+                           and self.reserved.fullmatch(name)):
+            raise ValueError(f"{stray} are named as the release's stacked tensors or their parts, which its "
                              "record stacks none of")
         stacked: set[str] = set()
         for name, spec in specs.items():

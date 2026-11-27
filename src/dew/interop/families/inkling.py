@@ -512,13 +512,15 @@ def _unstored(config: Mapping[str, object]) -> dict[str, np.ndarray]:
     return {f'model.llm.layers.0.{site}_query': np.zeros((1, width), np.float32) for site in _sites(first)}
 
 
-_PREPARED = re.compile(
-    r'model\.llm\.(output_query|layers\.\d+\.((attn|k|v|mlp)_query|attn\.[kv]_sconv\.weight_proj'
-    r'|controllers\.(attn|mlp|k|v)\.(query|input_down|message_down|forget|gain)'
-    r'|mlp\.experts\.\d+\.(gate|up|down)_proj\.weight))')
-"""The names `_ROUTES` read only as the parts of `_stacks` or `_unstored`, whatever the decoder's record."""
+_RESERVED = re.compile(
+    r'model\.llm\.(output_query|attn_res\..+|middle_cycle_cross_pass_\w+'
+    r'|layers\.\d+\.((attn|k|v|mlp)_query|attn\.[kv]_sconv\.(weight_proj|static_w)'
+    r'|controllers\.(attn|mlp|k|v)\.(query|input_down|message_down|forget|gain|\w+_weight)'
+    r'|mlp\.experts\.(\d+\.(gate|up|down)_proj\.weight|w(13|2)_weight)))')
+"""The names only `_stacks` and their parts, or `_unstored`, take, whatever the decoder's record: the
+release's stacked tensors' and those `_ROUTES` read of them."""
 
-_RESTACKED = Restacked(_stacks, _unstored, _PREPARED)
+_RESTACKED = Restacked(_stacks, _unstored, _RESERVED)
 """Inkling 2's release as `_ROUTES` read it and back, one declaration both ways."""
 
 

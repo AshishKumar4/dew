@@ -196,9 +196,11 @@ def test_its_prepares_inverse_gives_back_every_tensor_of_the_release():
             INKLING2.prepare({**tensors, name: wrong}, record)
     # A prepared query site the decoder's geometry has none of (a local layer's key query) is refused, not
     # written into the release under its prepared name.
-    stray = {**prepared, 'model.llm.layers.1.k_query': prepared['model.llm.layers.1.attn_query']}
-    with pytest.raises(ValueError):
-        INKLING2.unprepare(stray, record)
+    query = prepared['model.llm.layers.1.attn_query']
+    for stray in ({**prepared, 'model.llm.layers.1.k_query': query},
+                  {**prepared, 'model.llm.attn_res.mlp_queries.999': query[0]}):
+        with pytest.raises(ValueError):
+            INKLING2.unprepare(stray, record)
 
 
 @pytest.mark.parametrize('fixture', ['inkling2-tiny', 'inkling2-tiny-nvfp4'])
