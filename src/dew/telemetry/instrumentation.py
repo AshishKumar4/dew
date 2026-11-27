@@ -94,6 +94,13 @@ def _arrays(shape) -> tuple[tuple[str, tuple[int, ...], int], ...]:
     return ((element, dims, -(-bits * math.prod(dims) // 8)),)
 
 
+def _first_dims(shape) -> tuple[int, ...]:
+    """The dimensions of the first array a result holds (`_arrays`' first), none sized."""
+    while shape.tuple_shapes:
+        shape = shape.tuple_shapes[0]
+    return tuple(shape.dimensions)
+
+
 def _groups(proto) -> tuple[tuple[int, ...], ...]:
     """A collective's device groups, each the positions in the module's device assignment that take part
     together, as XLA's schema states them: listed (`collective_device_list`, or the older
@@ -383,8 +390,12 @@ def _read(source: str | Iterable[str] | jax.stages.Compiled, *, described: bool 
         computation = computations.setdefault(read.computation, _Computation())
         if read.entry:
             entry = read.computation
-        arrays = _arrays(proto.shape)
-        dims = arrays[0][1] if arrays else ()
+        moved = described and collective(read.opcode)
+        sized = moved or read.opcode == 'custom-call'
+        # A count reads the first result array's dimensions and its element type alone (`_first_dims`); the
+        # result's every array is sized where a description, or a custom call's sizes, read it (`_arrays`).
+        arrays = _arrays(proto.shape) if sized else ()
+        dims = arrays[0][1] if arrays else _first_dims(proto.shape)
         element = _element(proto.shape)
         computation.shapes[read.name] = dims
         computation.elements[read.name] = element
@@ -392,8 +403,6 @@ def _read(source: str | Iterable[str] | jax.stages.Compiled, *, described: bool 
         traced = ((sys.intern(f"{metadata.op_name} {metadata.source_file}:{metadata.source_line}"
                               if metadata.source_file else metadata.op_name),)
                   if described and metadata.op_name else ())
-        moved = described and collective(read.opcode)
-        sized = moved or read.opcode == 'custom-call'
         configured = described or read.opcode in ('custom-call', 'while')
         convolution = None
         if proto.HasField('convolution_dimension_numbers'):
