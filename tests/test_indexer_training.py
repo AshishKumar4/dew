@@ -474,13 +474,15 @@ def test_an_msa_decoder_trains_its_index_branch_by_the_indexer_objective_alone()
     assert all((after[name] != before[name]).any() for name in before)
 
 
-def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
+def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped(tmp_path, monkeypatch):
     """An MSA decoder refuses generation (`generation_refusal`), so its objective's preview cannot sample
-    (`preview_refusal`): a run asked to preview it is refused before a step, one that previews nothing
-    validates as any run does, and a configured run that would preview by default, a tracker's, previews
-    nothing, recording why (`RunConfig.skipped_preview`, its summary's), as it records nothing for a model
-    that samples (train 1345's review F6)."""
+    (`preview_refusal`): a fit asked to preview it is refused before it starts, and a configured run that
+    would preview by default at its validation, a tracker's, validates without sampling, its run record
+    saying why (`RunConfig.skipped_preview`); the same run of a model that samples records no skip (train
+    1345's review F6)."""
+    import wandb
     from test_mixers import tiny
+    from test_publish import TrackedRun
 
     from dew.config.lm import LMRunConfig
     from dew.config.trainer import TrainerConfig
@@ -488,33 +490,46 @@ def test_a_preview_of_a_decoder_that_refuses_generation_is_refused_or_skipped():
     from dew.objectives.lm import Perplexity
     from dew.objectives.lm.objective import Samples
     from dew.registry import mixers
+    from dew.telemetry.records import FitStarted
     from dew.training.tracker import Wandb
 
     selected = mixers.build("block_sparse_attention", selection="msa", block=4, top_k=2, index_width=8)
-    model = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
-    objective = LMObjective(model, SEQ, samples=Samples(prompt=[1, 2], max_new_tokens=2))
+    refusing = tiny(mixer=selected, dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB)
+    samples = Samples(prompt=[1, 2], max_new_tokens=2)
 
     def held():
         rng = np.random.default_rng(1)
         yield from ({"text": row} for row in rng.integers(0, VOCAB, size=(16, SEQ + 1)).astype(np.int32))
 
-    def fitted(preview: bool) -> tuple[RecordingTracker, int]:
-        tracker = RecordingTracker()
-        trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.key(0), tracker=tracker)
-        state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None), steps=1,
-                            eval_every=1, log_every=1, metrics=(Perplexity(),), preview=preview,
-                            validation={"val": from_iter(held, identity="held").batch(8).read("streamed")
-                                        .workers(0)})
-        return tracker, int(state.step)
+    def validation():
+        return {"val": from_iter(held, identity="held").batch(8).read("streamed").workers(0)}
 
+    def data() -> Loader:
+        return Loader(lambda partition: token_batches(), None, batch=8, records=None)
+
+    tracker = RecordingTracker()
+    trainer = Trainer(LMObjective(refusing, SEQ, samples=samples), optax.sgd(1.0), key=jax.random.key(0),
+                      tracker=tracker)
     with pytest.raises(ValueError):
-        fitted(preview=True)
-    tracker, steps = fitted(preview=False)
-    assert steps == 1 and any("val/perplexity" in scalars for _, scalars in tracker.scalars)
-    tracked = LMRunConfig(trainer=TrainerConfig(wandb=Wandb(project="dew", offline=True)))
-    assert tracked.skipped_preview(objective) is not None
-    assert tracked.skipped_preview(LMObjective(model, SEQ)) is None
-    assert LMRunConfig().skipped_preview(objective) is None
+        trainer.fit(data(), steps=1, eval_every=1, metrics=(Perplexity(),), preview=True,
+                    validation=validation())
+    assert not any(isinstance(artifact, FitStarted) for _, artifact in tracker.artifacts)
+    assert not tracker.scalars
+
+    def recorded(model, name: str) -> dict:
+        run = TrackedRun()
+        monkeypatch.setattr(wandb, "init", lambda **_: run)
+        config = LMRunConfig(trainer=TrainerConfig(name=name, steps=1, checkpoint_dir=str(tmp_path),
+                                                   log_every=1, eval_every=1, checkpoint_every=None,
+                                                   checkpoint_final=False,
+                                                   wandb=Wandb("dew", offline=True)))
+        config.train(LMObjective(model, SEQ, samples=samples), data(), name=name, validation=validation(),
+                     metrics=(Perplexity(),))
+        assert any("val/perplexity" in logged for logged in run.history)
+        return run.configuration["run_record"]["summary"]
+
+    assert "skipped" in recorded(refusing, "refusing")["preview"]
+    assert "preview" not in recorded(tiny(dtype="float32", max_seq_len=SEQ, vocab_size=VOCAB), "sampling")
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

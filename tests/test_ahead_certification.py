@@ -203,8 +203,10 @@ def test_a_step_compiled_ahead_is_refused_by_a_run_that_compiles_under_other_opt
 
 def test_a_step_saved_with_its_options_apart_from_its_program_is_compiled_again(tmp_path):
     """A step an earlier Dew compiled ahead, its program's fingerprint without its options and the options
-    saved beside it (train 1349's review F7), is refused as it loads, asking for it compiled again: its
-    fingerprint matches a run of the program under no options whatever it compiled under."""
+    saved beside it (train 1349's review F7), is refused as it loads, asking for it compiled again, its step
+    or its sampled step: its fingerprint matches a run of the program under no options whatever it compiled
+    under. The same step saved without them loads."""
+    import dataclasses
     import pickle
 
     import jax
@@ -212,16 +214,28 @@ def test_a_step_saved_with_its_options_apart_from_its_program_is_compiled_again(
     import pytest
 
     from dew.nn.kernels.options import program_digest
-    from dew.training.ahead import AheadOfTime, Executable
+    from dew.training.ahead import AheadOfTime, AheadProgram, Executable
 
     lowered = jax.jit(lambda x: jnp.sin(x) * 2).lower(jnp.ones(4))
-    earlier = AheadOfTime("sm90", 1, {}, program_digest(lowered), Executable(b"", ()), None, 0, 0, 0, 0, 0,
-                          {})
-    object.__setattr__(earlier, "options", {"xla_gpu_enable_triton_gemm": False})
-    path = tmp_path / "earlier.dew-aot"
-    path.write_bytes(pickle.dumps(earlier))
-    with pytest.raises(ValueError):
-        AheadOfTime.load(path)
+    options = {"xla_gpu_enable_triton_gemm": False}
+    sampled = AheadProgram(program_digest(lowered, options), Executable(b"", ()))
+    current = AheadOfTime("sm90", 1, {}, program_digest(lowered, options), Executable(b"", ()), None, 0, 0, 0,
+                          0, 0, {}, plan={"autotuned": True}, sampled=sampled)
+
+    def saved(step: AheadOfTime, name: str):
+        path = tmp_path / f"{name}.dew-aot"
+        path.write_bytes(pickle.dumps(step))
+        return path
+
+    assert AheadOfTime.load(saved(current, "current")) == current
+    earlier = dataclasses.replace(current)
+    object.__setattr__(earlier, "options", options)
+    earlier_sampled = dataclasses.replace(sampled)
+    object.__setattr__(earlier_sampled, "options", options)
+    for step, name in ((earlier, "earlier"),
+                       (dataclasses.replace(current, sampled=earlier_sampled), "sampled")):
+        with pytest.raises(ValueError):
+            AheadOfTime.load(saved(step, name))
 
 
 def test_a_lowerings_program_is_rendered_once_for_its_key_and_every_fingerprint(monkeypatch):

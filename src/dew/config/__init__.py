@@ -1476,8 +1476,7 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        if (skipped := self.skipped_preview(objective)) is not None:
-            summary = {**(summary or {}), "preview": {"skipped": skipped}}
+        skipped = self.skipped_preview(objective)
         # What `fit` is asked for but its resume, which a run compiled ahead compiles its evaluations from.
         fitted = FitArguments(
             # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
@@ -1491,6 +1490,9 @@ class RunConfig:
             cooldowns=trainer.cooldowns,
             # A run that names no metrics and validates no split has no suite to score.
             validation=validation if suites is None else suites or None, summaries=self.val_summaries)
+        if skipped is not None and fitted.validation and lowering is None:
+            # A run that validates and would preview there records the preview it skips, and why.
+            summary = {**(summary or {}), "preview": {"skipped": skipped}}
         if isinstance(lowering, AheadTarget):
             raise self.compiled_ahead(objective, dataset, steps, rollout, name, lowering, fitted)
         lower_for = lowering.generation if isinstance(lowering, LowerFor) else None
