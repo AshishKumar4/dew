@@ -14,6 +14,7 @@ import enum
 import functools
 import hashlib
 import math
+import sys
 import threading
 import types
 import weakref
@@ -918,8 +919,12 @@ def _body_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = True,
                 # Like interned equation contexts, the primitive object is held by every equation.
                 prim_key = _collect_opaque(("object", "primitive", primitive), opaques)
                 primitive_keys[identity] = prim_key
-        else:
+        elif stably_named(primitive):
             prim_key = (_named(type(primitive)), primitive.name)
+        else:
+            # A primitive its name does not identify (one of a user's, or two of JAX's or Dew's sharing its
+            # name) is held by identity: a region tells primitives apart by identity (`OPERATIONS`).
+            prim_key = _collect_opaque(("object", "primitive", primitive), opaques)
         feed((prim_key, params_key, ctx_key, effects_key, len(equation.invars),
               tuple(var_key(var) for var in equation.outvars)))
         for atom in equation.invars:
@@ -1051,6 +1056,33 @@ def opaque(key) -> Hashable:
     if isinstance(key, tuple):
         return tuple(opaque(part) for part in key)
     return key
+
+
+_PACKAGES = ("jax", "jaxlib", "dew")
+"""The packages whose modules' primitives a name identifies (`stably_named`)."""
+_stable: tuple[int, Mapping[str, jcore.Primitive]] = (0, {})
+"""The primitives a name identifies, by name, and how many modules were loaded when they were scanned."""
+
+
+def stably_named(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive`'s name identifies it in every process: it is the one primitive of its name the
+    loaded modules of JAX and Dew hold (`_PACKAGES`), so a structural digest may state it by its class and
+    name. A primitive of another module's, or one whose name two of theirs share, is not; the modules are
+    scanned again where one was loaded since."""
+    global _stable
+    scanned, stable = _stable
+    if stable.get(primitive.name) is primitive or len(sys.modules) == scanned:
+        return stable.get(primitive.name) is primitive
+    loaded = list(sys.modules.items())
+    held: dict[str, dict[int, jcore.Primitive]] = {}
+    for name, module in loaded:
+        if isinstance(module, types.ModuleType) and name.partition(".")[0] in _PACKAGES:
+            for value in list(vars(module).values()):
+                if isinstance(value, jcore.Primitive):
+                    held.setdefault(value.name, {})[id(value)] = value
+    stable = {name: next(iter(found.values())) for name, found in held.items() if len(found) == 1}
+    _stable = (len(loaded), stable)
+    return stable.get(primitive.name) is primitive
 
 
 def _named(kind: type) -> str:

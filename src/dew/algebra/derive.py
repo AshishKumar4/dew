@@ -29,6 +29,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import numbers
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
@@ -878,7 +879,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         tuple((n, tuple(shapes[n][0]), np.dtype(shapes[n][1]).name) for n in names), accurate,
         (saturation.growth, saturation.depth), declaration.walked, declaration.exponent,
         tuple(sorted(declaration.ranges.items())), declaration.exact, declaration.rescale is None, context()))
-    params_from, literals_from = len(region.params), len(region.literals)
+    params_from, literals_from, shapes_from = len(region.params), len(region.literals), len(region.shapes)
     if name is not None and (made := stored.loaded(name, region, functools.partial(
             _assembled, region=region, closed=closed, began=began))) is not None:
         return made
@@ -886,7 +887,7 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     if name is None:
         kernel_report.record_stored("unstorable")
     else:
-        stored.stored(name, made.region, params_from, literals_from, _encoded(made))
+        stored.stored(name, made.region, params_from, literals_from, shapes_from, _encoded(made))
     return made
 
 
@@ -992,8 +993,9 @@ _PARTS = ("accumulated", "added", "merged")
 
 
 def _encoded(made: _Forms) -> Callable[..., Mapping[str, object]]:
-    """`made`'s forms as the store writes them (`stored.stored`), given its codec: each term by `term`, a
-    term or None by `maybe`, a value by `value`; its region traced again on reading."""
+    """`made`'s forms as the store writes them (`stored.stored`), given its codec: each term by `term` (its
+    index in the entry's table), a term or None by `maybe`, a value by `value`; its region traced again on
+    reading."""
     def encoded(*, term: Callable, maybe: Callable, value: Callable) -> Mapping[str, object]:
         report = made.report
         return {**{field: [term(form) for form in getattr(made, field)] for field in _TERMS},
@@ -1011,22 +1013,32 @@ def _encoded(made: _Forms) -> Callable[..., Mapping[str, object]]:
 def _assembled(record: Mapping, *, decoded: stored._Decoded, value: Callable, region: terms.Region, closed,
                began: float) -> _Forms:
     """The forms a stored `record` holds (`stored.loaded`) over `region`, `closed`'s region (its appended
-    parameters and literals already decoded beside it): each term decoded checked against the region and
-    reading only the states its form reads (`decoded`'s sides: a region's term none, a step's, a step's
-    parts' and a finish's the walk's own, a merge's and its factors' either walk's), each count and part's
-    arity the forms state (`ValueError` otherwise); its report the derivation's as stored, reused
+    parameters, literals and terms already decoded beside it): each form by its term's index, reading only
+    the states its form reads (`decoded`'s sides: a region's term none, a step's, a step's parts' and a
+    finish's the walk's own, a merge's and its factors' either walk's), each count, part's arity and report's
+    field the forms state (`ValueError` otherwise); its report the derivation's as stored, reused
     (`AlgebraReport.reused`), its seconds the reading's."""
     count = len(record["reductions"]) + len(record["anchors"]) + 2 * len(record["scales"])
     outputs = len(region.outputs)
     counts = (len(record["steps"]), len(record["merges"]), *(len(record[field]) for field in _PARTS))
     if (counts != (count,) * 5 or (len(record["finishes"]), len(record["mapped"])) != (outputs, outputs)
             or len(record["floors"]) != len(record["reductions"])
-            or not all(0 <= leaf < region.leaves for leaf in record["walked_leaves"])):
+            or not all(stored.integral(leaf) and 0 <= leaf < region.leaves
+                       for leaf in record["walked_leaves"])
+            or not all(isinstance(mapped, bool) for mapped in record["mapped"])):
         raise ValueError("an entry whose forms' counts are not its region's")
     equations, admitted, fired, limits, iterations, nodes, limited, before, after = record["report"]
+    if not (all(stored.integral(number) for number in (equations, iterations, nodes, *limits))
+            and len(limits) == 2 and isinstance(limited, bool)
+            and all(isinstance(name, str) for name in admitted)
+            and all(isinstance(name, str) and stored.integral(number) for name, number in fired)):
+        raise ValueError("an entry whose report is not a derivation's")
+    floors = tuple(map(value, record["floors"]))
+    before, after = value(before), value(after)
+    if not all(number is None or isinstance(number, numbers.Real) for number in (*floors, before, after)):
+        raise ValueError("an entry whose floors or costs are not numbers")
     report = program.AlgebraReport(equations, tuple(admitted), dict(fired), tuple(limits), iterations, nodes,
-                                   limited, value(before), value(after), time.perf_counter() - began,
-                                   reused=True)
+                                   limited, before, after, time.perf_counter() - began, reused=True)
 
     def parts(field: str, sides: tuple[int, ...], arity: int, optional: frozenset[int]) -> tuple:
         # Each part of a reduction's, None or `arity` terms, the ones `optional` places may be None.
@@ -1047,7 +1059,7 @@ def _assembled(record: Mapping, *, decoded: stored._Decoded, value: Callable, re
                   tuple(record["mapped"]), tuple(region.outputs), frozenset(record["walked_leaves"]),
                   tuple(closed.consts), report, parts("accumulated", (0,), 3, frozenset({0})),
                   parts("added", (0,), 3, frozenset()), parts("merged", (0, 1), 2, frozenset()),
-                  tuple(map(value, record["floors"])), held["anchors"], held["scales"])
+                  floors, held["anchors"], held["scales"])
 
 
 def _decoupled_through(graph: EGraph, region: terms.Region, facts: Schedule, decoupled: rules.Rules) -> None:

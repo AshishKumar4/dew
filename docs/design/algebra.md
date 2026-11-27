@@ -1231,15 +1231,22 @@ a derived form replaces a hand-written one only where it states the walk, passes
   declaration's traced program (its structural digest and its captured constants), its walked axes, the
   tile's shapes and dtypes, its numerics' class and limits, the context it is priced and traced in
   (`derive.context`, in a canonical form), the rule sets it saturates with (by name, each as `rules.py`'s
-  source registers it), the algebra's code and egglog's version. An entry holds each chosen term as the Term
-  language's constructors write it and the parameters and literals the derivation appended to its region,
-  the region itself traced again; it is checked against that region before any of it is taken. One that
+  source registers it), the algebra's code and egglog's and JAX's versions. A program's primitives are
+  stated by name only where the name identifies one primitive of JAX's or Dew's modules
+  (`terms.stably_named`); a region tells primitives apart by identity, so a program holding a user's
+  primitive under a JAX name is not keyed. An entry holds each chosen term as the Term language's
+  constructors write it, each distinct term once in a table its forms index (a term shared along a chain
+  is written once, not once per path), and the parameters, literals and shapes the derivation appended to
+  its region, the region itself traced again. Its text is digested with its name, and one whose digest is
+  not its own is not decoded; it is checked against that region, each value of its kind, before any of it
+  is taken, and the region is extended only once all of it has read. One that
   fails to read is derived afresh past, a program or value the key or codec does not state, or an entry that
   cannot be written, is not stored, and the extractor's oracle (`Passes.checked`) derives without the store;
   both derive from the one live set of rules. A registered rule set is immutable once built
   (`Rules.declared`, from its families' immutable rules): changing a built set's egglog ruleset in place is
   unsupported, as monkeypatching is, and a set registered at run time stores nothing. Each outcome is
-  counted in the kernel report (`report.stored`) and a plan's kernel record. A cold attention step's 20
+  counted in the kernel report (`report.stored`) and a plan's kernel record, the plan's search's own
+  (`report.recording`). A cold attention step's 20
   forms (9 s of 25 s on armada) read back in a fresh process with the store alone warm, the step 15 s, its
   program the same.
 

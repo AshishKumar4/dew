@@ -1,7 +1,8 @@
 """A template's trace-time derivations stored across processes (`dew.algebra.stored`): a derivation read back
 is the one derived, every term, appended parameter and literal of it (its values the evaluator's of those
-alone); a corrupt entry is derived afresh past; the
-extractor's oracle neither reads nor writes; each outcome is counted (`report.stored`)."""
+alone); a corrupt entry, or one not its own, is derived afresh
+past; a shared term is written once; a primitive its name does not identify keys nothing; the extractor's
+oracle neither reads nor writes; each outcome is counted (`report.stored`)."""
 
 import dataclasses
 import functools
@@ -16,8 +17,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from egglog import String, i64
+from jax.extend import core as jcore
+
 from dew._cache import ALGEBRA
 from dew.algebra import SATURATION, derive, stored, terms
+from dew.algebra.terms import Term
 from dew.nn.kernels.templates import attention_algebra, attention_backward_algebra, report as kernel_report
 
 
@@ -75,46 +80,111 @@ def test_a_stored_derivation_reads_back_as_derived(storing, name):
         (primitive, repr(params)) for primitive, params in fresh.region.params]
     for held, again in zip(fresh.region.literals, read.region.literals, strict=True):
         np.testing.assert_array_equal(np.asarray(again), np.asarray(held))
+    # Each term's shape, the ones the derivation appended (a literal of its own) too, as the region reads it.
+    assert [(terms.key(term), extent) for term, extent in read.region.shapes] == [
+        (terms.key(term), extent) for term, extent in fresh.region.shapes]
+    assert all(read.region.shape(term) == extent for term, extent in fresh.region.shapes)
+
+
+def _entry():
+    (entry,) = Path(stored.directory()).glob("*.json")
+    summed, _, body = entry.read_text().partition("\n")
+    return entry, summed, json.loads(body)
+
+
+def _written(entry, record):
+    """`record` written as `entry`'s, digested as its own: what the decoder alone checks."""
+    body = json.dumps(record)
+    entry.write_text(f"{stored._summed(entry.stem, body)}\n{body}")
+
+
+def _corrupted(record, corrupt):
+    table = record["terms"]
+    if corrupt == "unknown constructor":
+        return {**record, "terms": [["no such", []], *table[1:]]}
+    if corrupt == "missing steps":
+        return {**record, "steps": []}
+    if corrupt == "a merge's side in a step":
+        # The walk's own state, which a step reads, made the other walk's, which only a merge carries.
+        (state,) = (at for at, entry in enumerate(table) if entry == ["state", [["i", 0], ["i", 0]]])
+        return {**record, "terms": [*table[:state], ["state", [["i", 0], ["i", 1]]], *table[state + 1:]]}
+    if corrupt == "a short part":
+        return {**record, "accumulated": [[] for _ in record["accumulated"]]}
+    if corrupt == "an argument of another sort":
+        # A convert of an integer where its constructor takes a term.
+        return {**record, "terms": [*table, ["convert", [["i", 0], ["i", 0]]]],
+                "steps": [len(table), *record["steps"][1:]]}
+    if corrupt == "a term of its own":
+        at = next(at for at, entry in enumerate(table) if any(kind == "t" for kind, _ in entry[1]))
+        name, arguments = table[at]
+        own = [["t", at] if kind == "t" else [kind, value] for kind, value in arguments]
+        return {**record, "terms": [*table[:at], [name, own], *table[at + 1:]]}
+    if corrupt == "a float past range":
+        return {**record, "report": [*record["report"][:-1], ["x", "0x1p+99999"]]}
+    if corrupt == "a dtype of objects":
+        return {**record, "literals": [*record["literals"], ["a", "object", [1], "00"]]}
+    raise AssertionError(corrupt)
 
 
 @pytest.mark.parametrize("corrupt", ["unknown constructor", "missing steps", "truncated", "a list",
                                      "a merge's side in a step", "a short part", "unreadable",
-                                     "an argument of another sort"])
+                                     "an argument of another sort", "a term of its own", "a float past range",
+                                     "a dtype of objects", "a flipped byte", "another entry's"])
 def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
-    """An entry that fails to read, or whose forms are not its region's, leaves its region as traced and is
-    derived afresh past, then written whole again."""
+    """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
+    traced and is derived afresh past, then written whole again."""
     fresh = _derived("walk")
-    (entry,) = Path(stored.directory()).glob("*.json")
-    record = json.loads(entry.read_text())
-    stepped = json.dumps(record["steps"][0])
-    corrupted = {"unknown constructor": json.dumps({**record, "steps": [["no such", []]]}),
-                 "missing steps": json.dumps({**record, "steps": []}),
-                 "truncated": entry.read_text()[:100], "a list": "[]",
-                 # A step reading the other walk's state, which only a merge carries.
-                 "a merge's side in a step": json.dumps({**record, "steps": [
-                     json.loads(stepped.replace('["state", [["i", 0], ["i", 0]]]',
-                                                '["state", [["i", 0], ["i", 1]]]')),
-                     *record["steps"][1:]]}),
-                 "a short part": json.dumps({**record, "accumulated": [[] for _ in record["accumulated"]]}),
-                 # A convert of an integer where its constructor takes a term.
-                 "an argument of another sort": json.dumps({**record, "steps": [
-                     ["convert", [["i", 0], ["i", 0]]], *record["steps"][1:]]})}
+    entry, summed, record = _entry()
+    text = entry.read_text()
     if corrupt == "unreadable":
         entry.unlink()
         entry.mkdir()  # an entry's path no file
+    elif corrupt == "truncated":
+        entry.write_text(text[:100])
+    elif corrupt == "a flipped byte":
+        at = text.index('"steps"')
+        entry.write_text(text[:at] + text[at:].replace("1", "2", 1))
+    elif corrupt == "another entry's":
+        body = text.partition("\n")[2]
+        entry.write_text(f"{stored._summed('another', body)}\n{body}")
+    elif corrupt == "a list":
+        entry.write_text(f"{stored._summed(entry.stem, '[]')}\n[]")
     else:
-        if corrupt == "a merge's side in a step":
-            assert '["state", [["i", 0], ["i", 0]]]' in stepped
-        entry.write_text(corrupted[corrupt])
+        _written(entry, _corrupted(record, corrupt))
     again = _derived("walk")
     # Derived afresh past it, and written again (a directory in its place: not written, `unstorable`).
     assert storing.stored == ({"miss": 1, "invalid": 1, "unstorable": 1} if corrupt == "unreadable"
                               else {"miss": 2, "invalid": 1})
     assert _terms(again) == _terms(fresh)
     assert len(again.region.params) == len(fresh.region.params)
+    assert len(again.region.shapes) == len(fresh.region.shapes)
     if corrupt != "unreadable":  # a directory in the entry's place is not written over
         assert _terms(_derived("walk")) == _terms(fresh)
         assert storing.stored == {"miss": 2, "invalid": 1, "hit": 1}
+
+
+def test_a_shared_term_is_written_once_and_read_back():
+    """A form whose terms share a term, as egglog holds it once, is written once per distinct term, not
+    once per path to it: a chain of 64 doublings, 2**64 paths, is 65 entries, and reads back as itself."""
+    form = Term.leaf(i64(0))
+    for _ in range(64):
+        form = form.binary(String("add"), form, i64(0))
+    writer = stored._Writer()
+    at = writer.term(form)
+    assert len(writer.table) == 65
+    decoded = stored._decoded(json.loads(json.dumps(writer.table)), leaves=1, literals=0, params=1, states=0)
+    assert terms.key(decoded(at, sides=())) == terms.key(form)
+
+
+def test_a_primitive_its_name_does_not_identify_keys_nothing():
+    """A primitive of a user's own named as one of JAX's is held by identity, which a key does not state:
+    a program holding it is not keyed, as the region reads it apart from JAX's (`terms.OPERATIONS`)."""
+    own = jcore.Primitive("exp")
+    own.def_abstract_eval(lambda operand: operand)
+    operand = np.ones(4, np.float32)
+    assert terms.stably_named(jax.lax.exp_p) and not terms.stably_named(own)
+    assert stored.key(jax.make_jaxpr(lambda x: own.bind(x))(operand), (), ()) is None
+    assert stored.key(jax.make_jaxpr(jax.lax.exp)(operand), (), ()) is not None
 
 
 def test_a_program_capturing_an_outer_traces_value_has_no_key():
@@ -167,7 +237,8 @@ def test_a_derivation_the_codec_does_not_state_is_counted_unstorable(storing):
     def unstated(**codec):
         raise stored.Unstated("a value of no stored kind")
 
-    stored.stored("unstated", made.region, len(made.region.params), len(made.region.literals), unstated)
+    region = made.region
+    stored.stored("unstated", region, len(region.params), len(region.literals), len(region.shapes), unstated)
     assert storing.stored == {"miss": 1, "unstorable": 1}
     assert not (Path(stored.directory()) / "unstated.json").exists()
     with pytest.raises(stored.Unstated):
