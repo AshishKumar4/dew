@@ -28,8 +28,8 @@ none of.
 
 from __future__ import annotations
 
-import dataclasses
 import contextlib
+import dataclasses
 import json
 from collections.abc import Callable
 from typing import Any
@@ -345,8 +345,7 @@ def _aliased_named(locations, instructions, computations):
     return None
 
 
-def _loop_named(loop, element: int, instructions, computations: dict[int, Any]
-                ):
+def _loop_named(loop, element: int, instructions, computations):
     """What while `loop`'s body writes into the whole of its state's `element`: the body's element where it
     is named (the state element is that value); else the row a scan writes into its stacked output each step
     (`_stacked`); None for any other element, a write into part of a buffer naming none of it."""
@@ -556,7 +555,7 @@ def provenance(module, argument: Callable[[int], int | None] | None = None):
 
 
 def _of(instruction, operands, operand_shapes, parameters,
-        called, evaluate: Callable[[Any, dict[int, Any]], Any]):
+        called, evaluate):
     """`instruction`'s provenance from its operands'."""
     opcode, shape = instruction.opcode, instruction.shape
     if opcode == "parameter":
@@ -775,7 +774,7 @@ def _gathered(instruction, operands) -> Dims:
     return tuple(dims)
 
 
-def _loop(initial, called, evaluate: Callable[[Any, dict[int, Any]], Any]):
+def _loop(initial, called, evaluate):
     """A while loop's provenance: its state's, its body's output joined into it until the body adds nothing
     (sets only grow, so it ends)."""
     body = called[0]  # XLA's while names its body first, its condition second.

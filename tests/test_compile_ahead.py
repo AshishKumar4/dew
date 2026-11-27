@@ -1429,7 +1429,7 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh), routes() as taken:
         lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(*shapes).lower()
     assert {route.kernel for route in taken} == {"triton"}
-    targets = {instruction.custom_call_target for instruction in hlo.instructions(lowered.compiler_ir("hlo"))}
+    targets = {read.custom_call_target for read in hlo.instructions(lowered.compiler_ir("hlo"))}
     assert custom_call_targets.TRITON in targets
     lowered.compile()
 
@@ -2089,7 +2089,6 @@ def test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing(tm
     assert at_run.runnable(here) is None
     with pytest.raises(ValueError):
         own.runnable(here)
-
 
 
 def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
