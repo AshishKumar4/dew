@@ -135,6 +135,22 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
         assert len(tuning._read(theirs)[0]) == 1
 
 
+def test_a_stored_entry_of_another_checkouts_timings_is_kept_beside_a_readable_one(tmp_path):
+    """A store holding a readable launch beside an entry whose timings are another checkout's, its arguments
+    no shape a key reads here (a rank-zero row operand): the readable launch read and the other kept as it
+    is (`_read`), its arguments never keyed."""
+    ba, derived, _ = _norm_launch_and_two_configs()
+    [entry] = json.loads(tuning.dumps_picks("gpu", [(ba, tuning.Timings({derived: _timed(1.0)}))]))["data"]
+    row = next(name for name in entry["arguments"] if name in ba.op.ROWS)
+    other = {**entry, "arguments": {**entry["arguments"],
+                                    row: tuning.encoded(jax.ShapeDtypeStruct((), jnp.float32))},
+             "timings": "another checkout's"}
+    path = tmp_path / "gpu.json"
+    path.write_text(json.dumps({"device_kind": "gpu", "data": [entry, other]}))
+    read, foreign = tuning._read(str(path))
+    assert list(read) == [tuning._launch_key(tuning._launch(entry))] and foreign == [other]
+
+
 def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):
     """The tuner's picks feed a maintainer report (bible §6): each stored launch whose fastest config is
     not its derived one names the launch, its derived config and the pick, and their times; a launch
