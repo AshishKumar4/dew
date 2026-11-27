@@ -1377,11 +1377,13 @@ merge, the backward's overlapped weight and dropped anchored cotangent phases in
 the accurate query cotangent, the key-first weight consumer and the value-gradient tile. Recurrence
 pilots cover scores, compensated prefix differences, chunk carry and reverse carry, the strict-lower
 solver's doubling, weighted value application and inverse adjoint, KDA's memory-decay cotangent, and
-the selective scan's packed and unpacked decay. The same writer checks rounded-operand forward and
-tangent bodies. Additional cases cover the masked softcap hook and its slope, projected sink state,
+the selective scan's packed and unpacked decay. A paired surrogate declaration checks both BF16 and
+FP16 rounded-operand bodies and preserves their written higher-order rule. Other cases cover the masked
+softcap hook and its slope, projected sink state,
 document-aware sliding visibility, GDN value pullback, KDA's strict intra-chunk band, the selective adjoint,
-Mamba-SSD chunk forward and pullback, and GEMM partial scaling and blockwise FP8 epilogue. Each case
-has an independent reference. The template component suites check their primitives on the CPU.
+Mamba-SSD chunk forward and pullback, GEMM partial scaling, and FP8 and MXFP8 epilogues. Exact byte
+witnesses also cover the MX scale exponent, all E4M3 block-scale codes and the NVFP4 packed payload.
+Each case has an independent reference. The template component suites check their primitives on the CPU.
 Production still uses the written bodies (row 3272).
 
 ```python
@@ -1414,10 +1416,10 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 
 **Template and surrogate generation (rows 3272, 6109).** A `ComponentForm` names one flat function,
 its independent reference and its cases. The registry emits its traced arithmetic. Matching contiguous
-sequences of primitive binds, literal construction and emitted calls share a generated helper, with
-geometry and logical shift direction bound statically.
-Each caller keeps its own layout and results. Neither sharing nor case selection adds a run-time branch
-to the component's program.
+typed primitive bindings share a helper before source is rendered. Geometry, integer literals and
+logical shift direction are static arguments; callers keep their own layout and live results. The
+generator admits the final emitted entrypoint, including its case dispatch and shared helpers, against
+the written trace and independent truth. Sharing and case selection add no run-time branch to the program.
 
 - **Templates.** A case builds an existing `derive.Reduction` or `scan.Scan` and states the tile's
   operands, static numerics flags, and target. Use the existing derivation to choose state slots and their
@@ -1434,10 +1436,11 @@ to the component's program.
   `dew.nn.derivatives.surrogate`, their separate cases and their nondifferentiable arguments. A tangent
   component traces over primals, active tangents and the original forward value; the case key includes
   static arguments and which tangents are symbolic zeros. Generate each body against its own reference.
-  The existing surrogate wrapper still supplies the value dependency at higher orders and reassembles
-  the original PyTree. Hold tangent linearity and forward/reverse and higher-order behavior through that
-  wrapper. `dew.nn.precision.rounded_operand` is the first consumer: the value preserves its rounding
-  barrier; the derivative remains the input tangent, including after another differentiation.
+  The opt-in assembly uses the existing surrogate wrapper for the value dependency at higher orders and
+  restores the declared output PyTree from the flat body.
+  An unknown static, activity or array case still uses its written body. CPU checks hold both BF16 and
+  FP16 of `dew.nn.precision.rounded_operand`: the value preserves its rounding barrier and its tangent
+  remains the input tangent, including after another differentiation. Production has not switched.
 - **Admission and cutover.** Use the existing `printed.source` and reject effects, unprintable
   primitives, or a changed component's state layout, output tree or placed types. Key by component, target,
   precision policy, operand shapes and dtypes, and only the declared static flags that change its program.
@@ -1700,10 +1703,9 @@ about it is an estimate.
   the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's linear
   form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights would
   store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-
-  order form is checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8
-  steps: no cheaper program within the windows (none found within the search's budgets: windows of at most
-  three inputs, bounded rounds and solver timeouts; not a proof that none exists). The exact portable
-  `formats.MxFp8` decode applies that stored exponent to each code's significand before rounding to
+  order form is checked in. MX's E8M0 scale has an exact seven-instruction form (row 9040), including
+  the 2^-127 and NaN endpoints. It is a standalone decode, not the production MX path: the exact
+  portable `formats.MxFp8` decoder applies the stored exponent to each code before rounding to
   the destination format. A free-layout FP8 weight decoder is not served by sm80's W8A8 GEMM yet
   (row 8548); the sm80 attention-cache path is separate (row 8549).
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3

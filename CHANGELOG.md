@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A generated surrogate now uses its written value and derivative when an unhashable static argument
+  cannot select a generated case.
+
 - Process-local algebra digests write each distinct abstract type once, using its exact encoding.
   Parameter encoding and persistent digest bytes are unchanged.
 

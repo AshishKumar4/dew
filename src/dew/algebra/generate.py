@@ -16,12 +16,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import difflib
+import functools
 import importlib
 import importlib.metadata
 import importlib.util
 import itertools
+import logging
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -35,6 +37,8 @@ from dew.algebra._generated import case_of
 from dew.nn import programs
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
+
+_log = logging.getLogger(__name__)
 
 POLICIES = ("default", "accurate")
 """The precision policies a declaration is generated for (§1.5): under default numerics a candidate is
@@ -79,6 +83,112 @@ class ComponentForm:
     function: Callable
     truth: Callable
     cases: Cases
+
+_Tree = tuple[jax.tree_util.PyTreeDef]
+
+
+@dataclasses.dataclass(frozen=True)
+class SurrogateCase:
+    """One static argument tuple's flat value and tangent bodies, the latter keyed by inactive slots."""
+
+    name: str
+    forward: ComponentForm
+    tangents: Mapping[tuple[int, ...], ComponentForm]
+    output_tree: _Tree
+    input_tree: _Tree | None = None
+
+    def restore(self, flat):
+        leaves = flat if isinstance(flat, tuple) else (flat,)
+        return jax.tree.unflatten(self.output_tree[0], leaves)
+
+    def tangent_name(self, inactive: tuple[int, ...]) -> str:
+        suffix = "_zero_" + "_".join(map(str, inactive)) if inactive else ""
+        return self.name + "_tangent" + suffix
+
+
+@dataclasses.dataclass(frozen=True)
+class SurrogateBodies:
+    """A written surrogate and its opt-in checked body cases. Production keeps using the written rule."""
+
+    forward: Callable
+    tangent: Callable
+    nondiff_argnums: tuple[int, ...]
+    symbolic_zeros: bool
+    cases: Mapping[tuple, SurrogateCase]
+
+    def declared(self, module: str) -> SurrogateBodies:
+        """Register both bodies under the same static-argument and tangent-activity declaration."""
+        for case in self.cases.values():
+            declare(module, case.name, case.forward)
+            for inactive, form in case.tangents.items():
+                declare(module, case.tangent_name(inactive), form)
+        return self
+
+    def _case(self, fixed: tuple) -> SurrogateCase | None:
+        # JAX permits written nondifferentiable arguments that cannot key a generated case.
+        try:
+            return self.cases.get(fixed)
+        except TypeError:
+            _log.debug("a surrogate's unhashable static arguments use its written body")
+            return None
+
+    def assembled(self, emitted: Callable[[str], Callable], *, policy: str = "default", target: str = "sm90"):
+        """Opt into emitted cases using the original surrogate rule's argument and value dependency."""
+        from jax.custom_derivatives import SymbolicZero
+
+        from dew.nn.derivatives import contracted, surrogate
+
+        fixed_at = sorted(self.nondiff_argnums)
+
+        @functools.wraps(self.forward)
+        def forward(*values):
+            fixed = tuple(values[index] for index in fixed_at)
+            case = self._case(fixed)
+            dynamic = tuple(value for index, value in enumerate(values) if index not in fixed_at)
+            if (case is not None and (flat := _case_leaves(case, dynamic)) is not None
+                    and _case_admitted(case.forward.cases, flat, policy, target)):
+                return case.restore(emitted(case.name)(*flat, policy=policy, target=target))
+            return self.forward(*values)
+
+        def tangent(*values):
+            *fixed, primals, directions, value = values
+            case = self._case(tuple(fixed))
+            leaves = jax.tree.leaves(directions, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
+            inactive = tuple(i for i, leaf in enumerate(leaves) if isinstance(leaf, SymbolicZero))
+            if case is None or jax.tree.structure(value) != case.output_tree[0]:
+                return self.tangent(*values)
+            component = case.tangents.get(inactive)
+            if component is not None and (flat := _case_leaves(case, primals)) is not None:
+                active = tuple(leaf for leaf in leaves if not isinstance(leaf, SymbolicZero))
+                operands = (*flat, *active, *jax.tree.leaves(value))
+                if _case_admitted(component.cases, operands, policy, target):
+                    run = emitted(case.tangent_name(inactive))
+                    return case.restore(run(*operands, policy=policy, target=target))
+            return self.tangent(*values)
+
+        return contracted("test_generated_rounded_bodies_keep_the_written_surrogate_law")(
+            surrogate(forward, tangent, nondiff_argnums=self.nondiff_argnums,
+                      symbolic_zeros=self.symbolic_zeros))
+
+
+def _case_leaves(case: SurrogateCase, dynamic: tuple) -> tuple | None:
+    if case.input_tree is None:
+        return dynamic  # The array admission below rejects a nested value in a flat declaration.
+    leaves, tree = jax.tree.flatten(dynamic)
+    return tuple(leaves) if tree == case.input_tree[0] else None
+
+
+def _case_admitted(cases: Cases, operands: tuple, policy: str, target: str) -> bool:
+    if policy not in cases.policies or target not in cases.targets:
+        return False
+    for value in operands:
+        if not hasattr(value, "shape") or not hasattr(value, "dtype"):
+            return False
+        aval = jax.typeof(value)
+        if not isinstance(aval, ShapedArray) or aval.weak_type or not aval.sharding.mesh.empty:
+            return False
+    key = case_of(operands)
+    return any(case_of(shapes) == key for shapes in cases.operands)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -152,9 +262,10 @@ class _Chosen:
     target: str
     case: int
     operands: tuple[jax.ShapeDtypeStruct, ...]
-    body: str = dataclasses.field(hash=False, compare=False)
+    body: str | printed.Body = dataclasses.field(hash=False, compare=False)
     single: bool = dataclasses.field(hash=False, compare=False)
     """Whether the declaration returns one array (its form's one output), else a tuple of them."""
+    written: jcore.Jaxpr | None = dataclasses.field(default=None, hash=False, compare=False)
 
 
 def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
@@ -169,8 +280,9 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
         for case, operands in enumerate(form.cases.operands):
             for policy in form.cases.policies:
                 label = f"{qualified} ({policy}, {target}, {case})"
+                written = None
                 if isinstance(form, ComponentForm):
-                    single, text = _component(form, operands, policy, target, label)
+                    single, text, written = _component(form, operands, policy, target, label)
                 else:
                     gate = admits(form.function, operands, form.cases, label)
                     with algebra.passes(target=target):
@@ -182,7 +294,7 @@ def _chosen(qualified: str, form: StableForm | ComponentForm) -> list[_Chosen]:
                     text, _ = printed.source(closed, "form", compensated=candidate.compensated)
                 if found and found[0].single != single:
                     raise ValueError(f"{label}: a declaration must keep its array or tuple result convention")
-                found.append(_Chosen(name, policy, target, case, operands, text, single))
+                found.append(_Chosen(name, policy, target, case, operands, text, single, written))
     return found
 
 
@@ -194,7 +306,8 @@ def _check_cases(cases: Cases) -> None:
             raise ValueError("a component has duplicate dispatch keys")
 
 
-def _component(form: ComponentForm, operands, policy: str, target: str, label: str) -> tuple[bool, str]:
+def _component(form: ComponentForm, operands, policy: str, target: str, label: str
+               ) -> tuple[bool, printed.Body, jcore.Jaxpr]:
     from dew import algebra
 
     with (algebra.passes(target=target),
@@ -208,19 +321,72 @@ def _component(form: ComponentForm, operands, policy: str, target: str, label: s
     single = _single_result(shaped)
     body = closed.jaxpr
     live = programs.live(body.eqns, body.outvars)
-    text, _ = printed.source(closed.replace(jaxpr=programs.with_equations(body, live)),
-                             "form", borrow_shapes=True)
-    flat, reference = printed.loaded(text, "form"), jcore.jaxpr_as_fun(closed)
+    live_body = closed.replace(jaxpr=programs.with_equations(body, live))
+    flattened, _ = printed.formed(live_body, borrow_shapes=True)
+    return single, flattened, closed
 
-    def arm(fn):
-        def run(*values):
-            output = fn(*values)
+
+def _admit_components(module: str, chosen: Sequence[_Chosen], text: str) -> None:
+    if not any(found.written is not None for found in chosen):
+        return
+    emitted = printed.loaded_module(text, module)
+    for found in chosen:
+        if found.written is None:
+            continue
+        qualified = f"{module}.{found.name}"
+        form = DECLARATIONS[qualified]
+        assert isinstance(form, ComponentForm)
+        label = f"{qualified} ({found.policy}, {found.target}, {found.case})"
+        entry = emitted[found.name]
+        assert callable(entry)
+        candidate = functools.partial(entry, policy=found.policy, target=found.target)
+        reference = jcore.jaxpr_as_fun(found.written)
+        single = found.single
+
+        def written(*values, reference=reference, single=single):
+            output = reference(*values)
             return output[0] if single else tuple(output)
-        return run
 
-    if not admits(form.truth, operands, form.cases, label)(arm(flat), arm(reference)):
-        raise ValueError(f"{label}: the printed component did not pass Check 1")
-    return single, text
+        def flat(*values, candidate=candidate, single=single):
+            value = candidate(*values)
+            return (value,) if single else value
+
+        printed.held(flat, found.written)
+        if not admits(form.truth, found.operands, form.cases, label)(candidate, written):
+            raise ValueError(f"{label}: the emitted entrypoint did not pass Check 1")
+
+
+def _bodies(chosen: Sequence[_Chosen]):
+    active: dict[_Chosen, str] = {}
+    by_body: dict[tuple[str, str | printed.Body], str] = {}
+    bodies: dict[str, str | printed.Body] = {}
+    for found in chosen:
+        key = found.name, found.body
+        if key not in by_body:
+            function = f"_{found.name}_{sum(name == found.name for name, _ in by_body)}"
+            by_body[key] = function
+            bodies[function] = found.body
+        active[found] = by_body[key]
+    return bodies, active
+
+
+def _shared_cases(bodies: dict[str, str | printed.Body], active: dict[_Chosen, str], declared: list[str]):
+    # Stable forms containing compensated bindings do not participate in component sharing.
+    if any(isinstance(body, str) for body in bodies.values()):
+        return bodies, {}
+    components = {name: body for name, body in bodies.items() if isinstance(body, printed.Body)}
+    emitted = _component_sharing.shared(components, reserved=declared)
+    shared_names = emitted.keys() - components.keys()
+    bound = {}
+    for found, name in active.items():
+        args = _component_sharing.bound_call(emitted[name], shared_names,
+                                             tuple(arg.shape for arg in found.operands))
+        if args is not None:
+            bound[found] = args
+    needed = {name for found, name in active.items() if found not in bound}
+    retained: dict[str, str | printed.Body] = {
+        name: body for name, body in emitted.items() if name in shared_names or name in needed}
+    return retained, bound
 
 
 def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> str:
@@ -235,23 +401,13 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
     lines += [f"- {found.name}: {found.receipt}" for found in sets]
     lines = [*_flowed(lines), '"""', ""]
     body: list[str] = []
-    # Each distinct form printed once, named by its declaration and its order there; each policy, target
-    # and case that chose it reads it by that name (`named`).
-    named: dict[_Chosen, str] = {}
-    printed_by: dict[tuple[str, str], str] = {}
-    emitted: dict[str, str] = {}
-    for found in chosen:
-        text = found.body
-        if (found.name, text) not in printed_by:
-            function = f"_{found.name}_{sum(name == found.name for name, _ in printed_by)}"
-            printed_by[found.name, text] = function
-            emitted[function] = text.replace("def form(", f"def {function}(", 1)
-        named[found] = printed_by[found.name, text]
+    bodies, named = _bodies(chosen)
     declared = sorted({found.name for found in chosen})
-    if all(isinstance(DECLARATIONS[name], ComponentForm) for name in names):
-        emitted = _component_sharing.shared(emitted, reserved=declared)
-    for source in emitted.values():
-        body += ["", "", *source.splitlines()]
+    emitted, bound = _shared_cases(bodies, named, declared)
+    for name, source in emitted.items():
+        text = source.render(name) if isinstance(source, printed.Body) else source.replace(
+            "def form(", f"def {name}(", 1)
+        body += ["", "", *text.splitlines()]
     for name in declared:
         own = [found for found in chosen if found.name == name]
         single = own[0].single
@@ -262,7 +418,15 @@ def _written(module: str, chosen: Sequence[_Chosen], names: Sequence[str]) -> st
             operands = [repr(operand) for operand in case_of(found.operands)]
             body += printed.wrapped(f"    ({found.policy!r}, {found.target!r}, (", operands,
                                     ",)):" if len(operands) == 1 else ")):")
-            body.append(f"        {named[found]},")
+            binding = bound.get(found)
+            if binding is None:
+                body.append(f"        {named[found]},")
+            elif not binding.keywords:
+                body.append(f"        {binding.callee},")
+            else:
+                args = [str(binding.callee), *(f"{key}={printed.expression(value)}"
+                                               for key, value in binding.keywords)]
+                body += printed.wrapped("        functools.partial(", args, "),")
         body += ["}", "", "", f"def {name}(*operands, policy: str = {policy!r}, target: str = {target!r}):",
                  f'    """{name}\'s generated form for `policy` and `target` at its operands\' case."""',
                  f"    return _generated.call({table}, operands, policy, target, single={single})"]
@@ -328,6 +492,7 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
             raise ValueError(f"{module}'s module holds every declaration of it: generate them together")
         found = [one for qualified in declared for one in _chosen(qualified, DECLARATIONS[qualified])]
         text, path = _written(module, found, declared), _path(module)
+        _admit_components(module, found, text)
         if check:
             written = path.read_text() if path.exists() else ""
             if written != text:
