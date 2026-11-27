@@ -241,10 +241,10 @@ def test_a_fresh_starts_program_for_a_gpu_draws_through_rolled_loops():
     rounds were unrolled into hash arithmetic, the program's whole compile (row 6740: a 142M DiT's start
     compiled on a GH200 in 23.8 s, 4.9 s rolled, M-MC-13). Its bits are the default lowering's
     (`test_gpu_compile_ahead`'s fresh state on a GPU)."""
-    from jax.extend import xla
     from test_compile_ahead import fine_tune, gpus
 
     from dew.nn.kernels.options import shapes_of
+    from dew.telemetry import hlo
     from dew.training import MeshSpec
     from dew.training.distributed import start_compiled
 
@@ -254,7 +254,7 @@ def test_a_fresh_starts_program_for_a_gpu_draws_through_rolled_loops():
                               start.shardings, trainer.device_mesh)
     # Its optimized module's instructions, read through XLA's own schema.
     (module,) = compiled.runtime_executable().hlo_modules()
-    loops = sum(1 for instruction in xla.instructions(module) if instruction.opcode == "while")
+    loops = sum(1 for instruction in hlo.instructions(module) if instruction.opcode == "while")
     drawn = sum(1 for leaf in jax.tree.leaves(start.abstract.variables["params"]) if leaf.ndim > 1)
     assert loops >= drawn > 0, (loops, drawn)
 

@@ -1670,15 +1670,14 @@ def left_at_run(compiled: jax.stages.Compiled) -> bool:
     """Whether `compiled` holds a cuDNN convolution whose algorithm its compile left to run time (its backend
     config's `algo_id` -1), as every compile without the GPU leaves it (`DEVICELESS_CONVOLUTION_PICKS`):
     an executable compiled ahead that its load must not take (`dew.training.ahead.AheadOfTime.at_run`),
-    each module's instructions read through XLA's own schema (`jax.extend.xla.instructions`) and a call's
+    each module's instructions read through XLA's own schema (`dew.telemetry.hlo.instructions`) and a call's
     kind by the one table of custom call targets (`instrumentation.custom_call_kind`)."""
-    from jax.extend import xla
-
+    from dew.telemetry import hlo
     from dew.telemetry.instrumentation import custom_call_kind
 
     executable = compiled.runtime_executable()
     for module in [] if executable is None else executable.hlo_modules():
-        for read in xla.instructions(module):
+        for read in hlo.instructions(module):
             proto = read.proto
             if read.opcode != "custom-call" or custom_call_kind(proto.custom_call_target) != "convolution":
                 continue

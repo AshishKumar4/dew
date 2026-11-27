@@ -27,7 +27,7 @@ import process_support
 import pytest
 from lane_environment import without_flags
 from generation_support import COMPILES_ON_CPU
-from jax.extend import custom_call_targets, xla
+from jax.extend import custom_call_targets
 from kernel_compile import gate_generations
 from model_support import TINY_DECODER, attending, memory_limited_to
 from token_support import token_rows
@@ -40,6 +40,7 @@ from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig
 from dew.registry import models
+from dew.telemetry import hlo
 from dew.telemetry.compiles import Compiles
 from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.targets import AheadTarget, LowerFor
@@ -1428,7 +1429,7 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh), routes() as taken:
         lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(*shapes).lower()
     assert {route.kernel for route in taken} == {"triton"}
-    targets = {instruction.custom_call_target for instruction in xla.instructions(lowered.compiler_ir("hlo"))}
+    targets = {instruction.custom_call_target for instruction in hlo.instructions(lowered.compiler_ir("hlo"))}
     assert custom_call_targets.TRITON in targets
     lowered.compile()
 
