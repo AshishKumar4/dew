@@ -19,7 +19,7 @@ from low_precision_support import nvfp4
 from dew.algebra import bits
 from dew.nn import fake_quant
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_quantized, tuning
-from dew.nn.kernels.templates.gemm import mosaic_gpu, tiling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, quantized, tiling
 from dew.nn.kernels.templates.hooks import Hook, Side
 
 
@@ -484,7 +484,7 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
 @pytest.mark.parametrize(("minifloat", "out_dtype"),
                          [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)], ids=["e4m3", "e5m2"])
 def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
-    """`gemm.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
+    """`quantized.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
     `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
     consistent with `NvFp4Block` (rows 8547, 12037, 12160)."""
     rng = np.random.default_rng(17)
@@ -494,8 +494,8 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
     words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
     expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        got, scale = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
-        got_s, scale_s = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
+        got, scale = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
+        got_s, scale_s = quantized.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
                                              interpret_on_cpu=True)
     assert isinstance(got, jax.Array) and got.dtype == out_dtype and float(scale) == 1.0
     got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8)
@@ -510,16 +510,16 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
 def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
-    """`gemm.gemm_quantized` lowers FP8 and MXFP8 epilogues with `bits.encode_form`'s inline PTX on sm80
+    """`quantized.gemm_quantized` lowers FP8 and MXFP8 epilogues with `bits.encode_form`'s inline PTX on sm80
     and sm90 (rows 8547, 12037)."""
     x = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
           generation.chosen(grouped_matmul="mosaic")):
-        jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=bits.E4M3)).trace(x, w).lower(
+        jax.jit(lambda a, b: quantized.gemm_quantized(a, b, minifloat=bits.E4M3)).trace(x, w).lower(
             lowering_platforms=("cuda",))
-        jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=formats.MxFp8)).trace(x, w).lower(
+        jax.jit(lambda a, b: quantized.gemm_quantized(a, b, minifloat=formats.MxFp8)).trace(x, w).lower(
             lowering_platforms=("cuda",))
 
 
@@ -567,7 +567,7 @@ def test_e8m0_bit_form_is_exact():
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
 def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str):
-    """`gemm.gemm_quantized` emits `formats.NvFp4Block` and `formats.MxFp8` bitwise matching
+    """`quantized.gemm_quantized` emits `formats.NvFp4Block` and `formats.MxFp8` bitwise matching
     `formats.NvFp4Block.quantized` and `formats.MxFp8.quantized`, and lowers through Mosaic GPU on sm80/sm90
     (rows 8547, 12037)."""
     rng = np.random.default_rng(8547)
@@ -575,7 +575,7 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
     w = jnp.asarray(rng.standard_normal((64, 64)) / np.sqrt(64), jnp.bfloat16)
     acc = jax.lax.dot(x, w, preferred_element_type=jnp.float32)
     ref_nv = formats.NvFp4Block.quantized(acc)
-    got_nv = jax.jit(lambda a, b, s: gemm.gemm_quantized(
+    got_nv = jax.jit(lambda a, b, s: quantized.gemm_quantized(
         a, b, minifloat=formats.NvFp4Block, tensor_scale=s))(x, w, ref_nv.scale)
     assert isinstance(got_nv, formats.NvFp4Block)
     np.testing.assert_array_equal(np.asarray(got_nv.codes), np.asarray(ref_nv.codes))
@@ -584,22 +584,22 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
     np.testing.assert_array_equal(np.asarray(got_nv.decoded()), np.asarray(ref_nv.decoded()))
 
     ref_mx = formats.MxFp8.quantized(acc)
-    got_mx = jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=formats.MxFp8))(x, w)
+    got_mx = jax.jit(lambda a, b: quantized.gemm_quantized(a, b, minifloat=formats.MxFp8))(x, w)
     assert isinstance(got_mx, formats.MxFp8)
     np.testing.assert_array_equal(np.asarray(got_mx.codes), np.asarray(ref_mx.codes))
     np.testing.assert_array_equal(np.asarray(got_mx.scales), np.asarray(ref_mx.scales))
     np.testing.assert_array_equal(np.asarray(got_mx.decoded()), np.asarray(ref_mx.decoded()))
     with pytest.raises(ValueError):
-        gemm.gemm_quantized(x, jnp.ones((64, 33), jnp.bfloat16), minifloat=formats.MxFp8)
+        quantized.gemm_quantized(x, jnp.ones((64, 33), jnp.bfloat16), minifloat=formats.MxFp8)
     with pytest.raises(ValueError):
-        gemm.gemm_quantized(x, jnp.ones((64, 24), jnp.bfloat16), minifloat=formats.NvFp4Block)
+        quantized.gemm_quantized(x, jnp.ones((64, 24), jnp.bfloat16), minifloat=formats.NvFp4Block)
     x_s = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     w_s = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     s_s = jax.ShapeDtypeStruct((), jnp.float32)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
           generation.chosen(grouped_matmul="mosaic")):
-        jax.jit(lambda a, b, s: gemm.gemm_quantized(a, b, minifloat=bits.E2M1, tensor_scale=s)).trace(
+        jax.jit(lambda a, b, s: quantized.gemm_quantized(a, b, minifloat=bits.E2M1, tensor_scale=s)).trace(
             x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
 
 
@@ -845,6 +845,41 @@ def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_n
     _, pull = jax.vjp(routed, token)
     (d_none,) = pull(jnp.zeros((0, 128), jnp.float32))
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_column_split_nvfp4_projections_input_gradient_runs_on_an_explicit_mesh():
+    """A dense NVFP4 projection whose matrix an Explicit 'tensor' axis splits by its columns (its words' and
+    scales' leading axis), over replicated rows, jitted: its forward and its rows' gradient, the cotangent
+    split by the same columns, are the product written plainly over its values (`packed_values`), exactly over
+    small integers. The input gradient contracts the columns both its operands split, which JAX asks to be
+    told where it lands (`xla_products.xla_dot` through `sharding.contracted_alike`, row 12225; train 1403's
+    review: the placed call's XLA product raised)."""
+    from jax.sharding import AxisType, PartitionSpec
+
+    rng = np.random.default_rng(14031)
+    codes = jnp.asarray(rng.integers(-2, 3, (512, 128)), jnp.float32)
+    matrix = formats.NvFp4.of(codes, jnp.ones((32, 128), jnp.float8_e4m3fn), jnp.float32(2.0 ** -8))
+    from dew.quantization import packed_values
+
+    values = np.asarray(packed_values(matrix), np.float64)
+    rows = rng.integers(-3, 4, (8, 512)).astype(np.float32)
+    cotangent = rng.integers(-3, 4, (8, 128)).astype(np.float32)
+    mesh = jax.make_mesh((2,), ("tensor",), axis_types=(AxisType.Explicit,))
+
+    @jax.jit
+    def pulled(x, matrix, cotangent):
+        out, pull = jax.vjp(lambda x: gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32), x)
+        return jax.reshard(out, PartitionSpec()), pull(cotangent)[0]
+
+    with jax.set_mesh(mesh):
+        split = PartitionSpec("tensor", None)
+        placed = formats.NvFp4(jax.device_put(matrix.words, split), jax.device_put(matrix.scales, split),
+                               jax.device_put(matrix.scale, PartitionSpec()))
+        out, grad = pulled(jax.device_put(rows, PartitionSpec()), placed,
+                           jax.device_put(cotangent, PartitionSpec(None, "tensor")))
+    np.testing.assert_array_equal(np.asarray(out, np.float64), rows.astype(np.float64) @ values)
+    np.testing.assert_array_equal(np.asarray(grad, np.float64), cotangent.astype(np.float64) @ values.T)
 
 
 @pytest.mark.mesh(devices=2)

@@ -286,8 +286,8 @@ def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, group_sizes=Non
 
     from dew.nn.derivatives import KernelGlue, contracted
     from dew.nn.kernels import generation, xla_products
+    from dew.nn.kernels.templates.gemm import launched_whole
     from dew.nn.precision import at_least_fp32
-    from dew.nn.sharding import automatic_axes
 
     dense = group_sizes is None
     dtype, out_d = pairs[0][0].dtype, jnp.dtype(out_dtype)
@@ -305,7 +305,7 @@ def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, group_sizes=Non
     options = {'interpret_on_cpu': interpret_on_cpu, 'precision': precision, 'transpose_rhs': transpose_rhs,
                'dense': dense, 'first': None, 'gather': None}
     route = launch_route(r0_spec, m0_spec, {'chained': rest_spec}, sizes_spec, out_d, None, options,
-                         whole=not automatic_axes())
+                         whole=launched_whole(pairs, group_sizes))
     if not route:
         return None
     sizes_arg = (jnp.full((1,), r0.shape[0], jnp.int32) if group_sizes is None

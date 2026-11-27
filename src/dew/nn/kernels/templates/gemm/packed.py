@@ -49,13 +49,13 @@ class WindowLayout:
     Its coding is fixed: a weight's byte (its sign and 7 mantissa bits, or an escape's index) and 4-bit
     offset, packed into uint32 words a stage streams in blocks of sixteen, so a group (one nibble block's
     depths) holds two byte blocks of 64 depths and a window of 15 binades, and its escapes two 16-bit values
-    a meta word. Its meta's placement is its choice: `meta_words` words a group, its base at `base_word`,
-    its escapes at `escape_words` (`window_bits` takes four), the rest zero; and a stage decodes `step`
-    depths, a schedule of the kernel's, no part of the stored form (`fingerprint`)."""
+    a meta word, low half first. Its meta's placement is its choice: `meta_words` words a group, its base at
+    `base_word`, its escapes at `escape_words` (`window_bits` takes the two words), the rest zero. Every
+    field is the stored form's (`fingerprint`): the depths a stage decodes are the kernel's schedule, its
+    derivation's (`weight_format`'s steps)."""
     meta_words: int = 4
     base_word: int = 0
     escape_words: tuple[int, ...] = (1, 2)
-    step: int = 256
 
     def __post_init__(self):
         placed = (self.base_word, *self.escape_words)
@@ -64,10 +64,13 @@ class WindowLayout:
             raise ValueError(f"a window's meta places its base and its four escapes on distinct words of its "
                              f"{self.meta_words}, not {placed}")
 
-    group = 16 * 8
-    """The depths a group shares a base and escapes over: a nibble block's (16 words of 8 offsets)."""
-    byte_block = 16 * 4
-    """The depths a byte block holds: 16 words of 4 bytes."""
+    block_words = 16
+    """The uint32 words a block holds a column (a 64-byte row, a stage copy's): each `block_words`-deep slice
+    of a block one code of each word (`byte_depth`, `nibble_depth`, `unpacked`)."""
+    group = block_words * 8
+    """The depths a group shares a base and escapes over: a nibble block's (its words' 8 offsets each)."""
+    byte_block = block_words * 4
+    """The depths a byte block holds: its words' 4 bytes each."""
     binades = 2 ** 4 - 1
     """The binades a group's 4-bit offsets code (offsets 1 to 15, offset 0 a signed zero or an escape)."""
 
@@ -84,12 +87,12 @@ class WindowLayout:
     @property
     def byte_words(self) -> int:
         """The uint32 words a group's bytes hold a column."""
-        return 16 * self.byte_blocks
+        return self.block_words * self.byte_blocks
 
     @property
     def words(self) -> int:
         """The uint32 words a group holds a column: its bytes' then its nibbles' (one block)."""
-        return self.byte_words + 16
+        return self.byte_words + self.block_words
 
     @property
     def weight_bytes(self) -> float:
@@ -110,15 +113,27 @@ class WindowLayout:
         """The depth the byte plane gives word `word`'s byte `code` (`0..3`) of its `byte_block`-deep
         `group`: each byte's sixteen-depth slice holds the group's words in order, as a stage decode reads
         them a lane at a time (`ternary_staged_depth`'s order)."""
-        return self.byte_block * group + 16 * code + word
+        return self.byte_block * group + self.block_words * code + word
 
     def nibble_depth(self, group, word, code):
         """The depth the nibble plane gives word `word`'s nibble `code` (`0..7`) of its `group`."""
-        return self.group * group + 16 * code + word
+        return self.group * group + self.block_words * code + word
+
+    def unpacked(self, words: jax.Array, bits: int) -> jax.Array:
+        """A plane's codes in their depths' order (`byte_depth`'s or `nibble_depth`'s inverse) from its
+        words (`[..., blocks * block_words]` uint32, `32 // bits` codes of `bits` bits a word): a block's
+        word `w` holds its code `c` at depth `block_words * c + w` of the block, so each code's shift of a
+        block's words is its next `block_words` depths, by shifts and reshapes alone (no gather by the
+        staged order, `formats.window_byte_rows`)."""
+        *lead, count = words.shape
+        blocks, codes = count // self.block_words, 32 // bits
+        shifts = (bits * jnp.arange(codes, dtype=jnp.uint32))[:, None]
+        held = (words.reshape(*lead, blocks, 1, self.block_words) >> shifts) & ((1 << bits) - 1)
+        return held.reshape(*lead, blocks * codes * self.block_words)
 
     def fingerprint(self) -> bytes:
         """The stored form's fields as bytes, which the form digest folds in (`formats.window_form_version`):
-        its meta's placement (an encoding of another reads as another's), not its kernel's step."""
+        its meta's placement (an encoding of another reads as another's)."""
         stored = (self.group, self.byte_block, self.meta_words, self.base_word, self.escape_words)
         return repr(stored).encode()
 
@@ -151,8 +166,9 @@ def _decode_window_lanes(blocks: list[jax.Array], meta: jax.Array, group: int, a
     the `s % 4`-th of its `s // 4`-th byte block's words (`WindowLayout.byte_depth`), its offsets the `s`-th
     nibble of its nibble block's (`WindowLayout.nibble_depth`), its group's base and escapes a column each,
     picked from the stage's meta halves (`meta`, `[columns, depth / 16]`, a group's `2 * meta_words`) by a
-    mask (a column slice of a register tile has no layout), each weight's bits `formats.window_bits`' and the
-    lane their bfloat16 (a 16-bit integer's bits, no arithmetic)."""
+    mask (a column slice of a register tile has no layout), its escapes' halves joined into their two words
+    (`window_bits`' escape words), each weight's bits `formats.window_bits`' and the lane their bfloat16 (a
+    16-bit integer's bits, no arithmetic)."""
     from dew.nn.kernels import formats
 
     del active
@@ -164,7 +180,8 @@ def _decode_window_lanes(blocks: list[jax.Array], meta: jax.Array, group: int, a
         picked = jnp.sum(jnp.where(which == 2 * layout.meta_words * group + half, halves, 0), axis=1)
         return picked.astype(jnp.uint32)[:, None]
 
-    base, escapes = column(layout.base_half), tuple(column(half) for half in layout.escape_halves)
+    first, second, third, fourth = (column(half) for half in layout.escape_halves)
+    base, escapes = column(layout.base_half), (first | (second << 16), third | (fourth << 16))
     lanes = []
     for slice_ in range(packed_depth_slices(layout.group)):
         word = bytes_[slice_ // 4]
@@ -222,10 +239,13 @@ def weight_format(name: str, layout: WindowLayout = WINDOW) -> PackedWeightForma
             steps=(TERNARY_STEP,), decode_live=4, decode_lanes=_decode_ternary_lanes)
     if name == "window":
         # A weight's 13 bits; a slice's decode holds its byte and nibble words, its group's base and four
-        # escapes a column, and a weight's bits in flight.
+        # escapes a column, and a weight's bits in flight. A stage decodes two groups: their meta halves fill
+        # the sixteen columns a register tile of them takes in mma.sync's fragment layout, where one group's
+        # eight (or its four words) do not lower ("Cannot cast to layout", compile-only sm80 and sm90).
         return PackedWeightFormat(
-            name="window", group_depth=layout.group, weight_bytes=layout.weight_bytes, steps=(layout.step,),
-            decode_live=10, decode_lanes=functools.partial(_decode_window_lanes, layout=layout),
+            name="window", group_depth=layout.group, weight_bytes=layout.weight_bytes,
+            steps=(2 * layout.group,), decode_live=10,
+            decode_lanes=functools.partial(_decode_window_lanes, layout=layout),
             blocks=layout.words // 16, meta_halves=2 * layout.meta_words)
     raise ValueError(f"unsupported packed weight format {name!r}; expected 'ternary' or 'window'")
 

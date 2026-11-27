@@ -432,3 +432,27 @@ def test_an_mxfp8_group_whose_scale_is_nan_writes_back_as_it_was_loaded():
         held = np.asarray(codec.decode(stored, name), np.float32).astype(np.dtype(dtype))
         assert np.isnan(np.asarray(held, np.float32)[0, 0]).all()
         np.testing.assert_array_equal(codec.encode(name, held)[name].view(np.uint8), codes.view(np.uint8))
+
+
+def test_an_edit_inside_an_mxfp8_group_whose_scale_is_nan_is_refused():
+    """A finite value edited into an MXFP8 group whose E8M0 scale is 0xff, whose every code decodes to NaN,
+    is refused rather than written back as NaN (audit 2026-11-27 P04); the same edit in a finite group is
+    written, and the NaN group left as loaded keeps its codes."""
+    import ml_dtypes
+
+    from dew.interop.codecs import inkling2_experts
+
+    name = 'model.llm.layers.2.mlp.experts.down_proj'
+    codes = np.full((1, 2, 32), 1.0, ml_dtypes.float8_e4m3fn)
+    stored = {name: codes, name + '_scale': np.asarray([[[0xff], [127]]], np.uint8)}
+    codec = inkling2_experts(stored, {name: 'float32'})
+    held = np.asarray(codec.decode(stored, name), np.float32)
+    edited = held.copy()
+    edited[0, 0, 0] = 1.0
+    with pytest.raises(ValueError):
+        codec.encode(name, edited)
+    finite = held.copy()
+    finite[0, 1, 0] = 2.0
+    written = codec.encode(name, finite)[name].view(np.uint8)
+    np.testing.assert_array_equal(written[0, 0], codes.view(np.uint8)[0, 0])
+    assert written[0, 1, 0] == np.asarray(ml_dtypes.float8_e4m3fn(2.0)).view(np.uint8)

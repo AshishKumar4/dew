@@ -1744,8 +1744,9 @@ class LMObjective(TokenScorer):
 
     def fuses_head(self) -> bool:
         """The training loss takes a tiled head's gradient in its forward (`token_scores`' `z_loss`),
-        outside an indexer's warm-up, which scores no head."""
-        return not self._warmup
+        outside an indexer's warm-up, which scores no head, and where it reads no looped decoder's passes
+        apart (`_reads_exits`: their per-token terms the unfused head's), as `loss` decides it."""
+        return not self._warmup and not self._reads_exits(self.model)
 
     def scored_units(self, variables: Variables, batch: Batch,
                      step: Step) -> tuple[Ratio | RoutedStatistics, jax.Array] | None:

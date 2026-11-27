@@ -557,6 +557,12 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     return (out, *finished), maxima.reshape(*maxima.shape[:2], splits, -1) if splits > 1 else maxima, None
 
 
+def inference_query_block(tiles: Tiles) -> int:
+    """The queries an inference launch at `tiles` pads its call to whole multiples of (`padded_call`'s
+    `query_block`): its consumers' tiles, each slice's rows of a split launch (`SplitOutput`)."""
+    return tiles.consumers * tiles.block_q
+
+
 class SplitOutput(NamedTuple):
     """A split inference launch's outputs as its launch wrote them, padded (`_walked_outputs`, row 8775):
     its slices' outputs `[B, S, Qp, H, Dvp]` and stacked maxima and denominators `[2, B, H, S, Qp]`,
@@ -770,7 +776,7 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     # XLA multiplies before the launch (row 5274).
     call = padded_call(query, key, value, spans, hooks,
                        _block(tiles), table, by_position=True,
-                       query_block=tiles.consumers * tiles.block_q if inference else None,
+                       query_block=inference_query_block(tiles) if inference else None,
                        widths=head_width)
     weights = query.dtype if scales is not None else value.dtype
     spec, taken = folded_form(spans.form, spans.keys, ids=spans.query_ids is not None, dtype=query.dtype,

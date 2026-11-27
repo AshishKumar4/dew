@@ -9,14 +9,18 @@ import contextlib
 import contextvars
 import functools
 import math
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax.typing import PrecisionLike
 
 from dew.algebra import bits
 from dew.nn.kernels import launches
 from dew.nn.kernels.templates import inline_forms, product as product_formats
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.formats import MxFp8, NvFp4Block
 
 _EPILOGUE_LAYOUT: contextvars.ContextVar[Any] = contextvars.ContextVar("gemm_epilogue_layout", default=None)
 """Active GPU accumulator register layout while tracing a compiled GEMM epilogue (`encode_tile`)."""
@@ -515,3 +519,56 @@ def declared_all(dtypes: tuple, forms: tuple, splits: int, tile, rows: int, colu
         raise ValueError("an output a form reduces is a call's of no depth split")
     return tuple(tile(dtype) if form is None else declared(dtype, form, rows, columns)
                  for dtype, form in zip(dtypes, forms, strict=True))
+
+
+def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
+                   minifloat: bits.Minifloat | type[MxFp8] | type[NvFp4Block] = bits.E4M3,
+                   tensor_scale: jax.Array | float | None = None,
+                   transpose_rhs: bool = False, precision: PrecisionLike = None,
+                   interpret_on_cpu: bool = False) -> tuple[jax.Array, jax.Array] | MxFp8 | NvFp4Block:
+    """GEMM whose epilogue quantizes fp32 accumulators directly to FP8 `(codes, scale)` (`bits.E4M3`/
+    `bits.E5M2`, dividing by `tensor_scale` on encode so `codes * scale ≈ acc`), block-scaled MXFP8
+    (`formats.MxFp8`, bitwise matching `MxFp8.quantized`), or block-scaled NVFP4 (`bits.E2M1` /
+    `formats.NvFp4Block`, bitwise matching `NvFp4Block.quantized` at `tensor_scale`; rows 8547, 12037,
+    12160)."""
+    from dew.nn.kernels.formats import MxFp8, NvFp4Block
+    from dew.nn.kernels.gemm import gemm
+    from dew.nn.kernels.templates.hooks import Hook, Side
+
+    width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
+    if minifloat in (bits.E4M3, bits.E5M2):
+        assert isinstance(minifloat, bits.Minifloat)
+        out_dtype = minifloat_dtype(minifloat)
+        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
+        sides = (() if tensor_scale is None else (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),))
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=Hook(quantize_epilogue(minifloat), sides),
+                   out_dtype=out_dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, jax.Array)
+        return out, ts
+    if minifloat is MxFp8:
+        if width % product_formats.MXFP8.depth != 0:
+            raise ValueError(f"gemm_quantized(MxFp8) requires width divisible by "
+                             f"{product_formats.MXFP8.depth}, got {width}")
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=Hook(quantize_mxfp8_epilogue()), out_dtype=jnp.float8_e4m3fn,
+                   out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu), precision=precision,
+                   interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, tuple)
+        codes, block_scales = out
+        return MxFp8(codes, block_scales[..., ::32])
+    if minifloat == bits.E2M1 or minifloat is NvFp4Block:
+        if width % product_formats.NVFP4.depth != 0:
+            raise ValueError(
+                f"gemm_quantized(NvFp4Block) requires width divisible by {product_formats.NVFP4.depth}, "
+                f"got {width}")
+        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
+        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
+                   epilogue=Hook(quantize_nvfp4_epilogue(),
+                                 (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),)),
+                   out_dtype=jnp.uint8, out_dtypes=(jnp.uint8, jnp.float8_e4m3fn),
+                   precision=precision, interpret_on_cpu=interpret_on_cpu)
+        assert isinstance(out, tuple)
+        nibbles, block_scales = out
+        return NvFp4Block.encoded(nibbles, block_scales[..., ::16], ts)
+    raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")

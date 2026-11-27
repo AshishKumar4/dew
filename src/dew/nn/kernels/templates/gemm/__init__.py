@@ -5,9 +5,10 @@ from collections.abc import Sequence
 
 import jax
 from jax import numpy as jnp
+from jax.core import Tracer
 
 from dew.nn.kernels.templates.axes import whole
-from dew.nn.sharding import explicit_spec
+from dew.nn.sharding import automatic_axes, explicit_spec
 
 
 def rows_extended(array: jax.Array, axis: int, extent: int) -> jax.Array:
@@ -74,3 +75,30 @@ def scattered(outs, scatter: jax.Array | None):
         return rows_permuted(out, jnp.argsort(scatter))
 
     return jax.tree.map(written, outs)
+
+
+def launched_whole(*operands) -> bool:
+    """Whether a kernel launched on `operands` (arrays or pytrees of them) reads each whole on every device
+    that runs it, as a launch with no partitioning rule does: no mesh axis the context leaves automatic
+    splits them (`sharding.automatic_axes`), and no operand is split across devices by its own type (an
+    Explicit axis of more than one device, `sharding.explicit_spec`; a traced one's Auto axes of more than
+    one device, which its type leaves out of its spec) or, a concrete array, by its sharding.
+    A launch on operands placed so would have XLA gather each whole to every device: a resident window's
+    planes, split by their columns across processes (`quantization._resident_window`), lost their
+    residency on its Mosaic route, or were refused where no process holds them whole (row 13724); XLA's
+    own product partitions them."""
+    if automatic_axes():
+        return False
+    for operand in jax.tree.leaves(operands):
+        placed = explicit_spec(operand)
+        if placed is not None and not placed.is_fully_replicated:
+            return False
+        if isinstance(operand, Tracer):
+            # A jitted argument placed over Auto axes outside the mesh's context: its type keeps the mesh and
+            # leaves the Auto axes out of its spec, so any of more than one device may split it.
+            mesh = jax.typeof(operand).sharding.mesh
+            if any(mesh.shape[name] > 1 for name in mesh.auto_axes):
+                return False
+        elif isinstance(operand, jax.Array) and not operand.sharding.is_fully_replicated:
+            return False
+    return True

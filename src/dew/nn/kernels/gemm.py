@@ -70,6 +70,7 @@ from dew.nn.kernels.templates import product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import (
     epilogue_vjp,
+    launched_whole,
     rows_gathered_wide,
     rows_permuted,
     scattered,
@@ -87,7 +88,7 @@ from dew.nn.kernels.templates.gemm.hooks import (
     held_outputs,
     kept_outputs,
 )
-from dew.nn.kernels.templates.hooks import NO_HOOK, Hook, Side
+from dew.nn.kernels.templates.hooks import NO_HOOK, Hook
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import (
     accumulated,
@@ -98,7 +99,7 @@ from dew.nn.precision import (
     twice_scaled,
 )
 from dew.nn.programs import read_by
-from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
+from dew.nn.sharding import explicit_spec, varying_like
 
 if TYPE_CHECKING:
     from .templates import base
@@ -622,7 +623,7 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
                     and syrk_mod.measured(generation.gpu_target(), flat.shape, op_dtype, transpose=transpose,
                                           out_dtype=out_dtype, polynomial=has_poly))
         case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
-                        no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
+                        no_auto=launched_whole(operand), precision_ok=exact_products(precision, op_dtype),
                         measured=admitted)
         return selection.select(SYRK, case).kernel == 'mosaic'
 
@@ -760,62 +761,11 @@ def symmetric_polynomial(a: jax.Array, coeffs, *, precision: PrecisionLike = Non
     return _symmetric_poly_vjp(a, c.astype(at_least_fp32(a.dtype)), precision, out, interpret_on_cpu)
 
 
-def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
-                   minifloat: bits.Minifloat | type[MxFp8] | type[NvFp4Block] = bits.E4M3,
-                   tensor_scale: jax.Array | float | None = None,
-                   transpose_rhs: bool = False, precision: PrecisionLike = None,
-                   interpret_on_cpu: bool = False) -> tuple[jax.Array, jax.Array] | MxFp8 | NvFp4Block:
-    """GEMM whose epilogue quantizes fp32 accumulators directly to FP8 `(codes, scale)` (`bits.E4M3`/
-    `bits.E5M2`, dividing by `tensor_scale` on encode so `codes * scale ≈ acc`), block-scaled MXFP8
-    (`formats.MxFp8`, bitwise matching `MxFp8.quantized`), or block-scaled NVFP4 (`bits.E2M1` /
-    `formats.NvFp4Block`, bitwise matching `NvFp4Block.quantized` at `tensor_scale`; rows 8547, 12037,
-    12160)."""
-    from .templates.gemm import quantized
-
-    width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-    if minifloat in (bits.E4M3, bits.E5M2):
-        assert isinstance(minifloat, bits.Minifloat)
-        out_dtype = quantized.minifloat_dtype(minifloat)
-        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
-        sides = (() if tensor_scale is None else (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),))
-        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=Hook(quantized.quantize_epilogue(minifloat), sides),
-                   out_dtype=out_dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
-        assert isinstance(out, jax.Array)
-        return out, ts
-    if minifloat is MxFp8:
-        if width % product_of.MXFP8.depth != 0:
-            raise ValueError(
-                f"gemm_quantized(MxFp8) requires width divisible by {product_of.MXFP8.depth}, got {width}")
-        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=Hook(quantized.quantize_mxfp8_epilogue()), out_dtype=jnp.float8_e4m3fn,
-                   out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu), precision=precision,
-                   interpret_on_cpu=interpret_on_cpu)
-        assert isinstance(out, tuple)
-        codes, block_scales = out
-        return MxFp8(codes, block_scales[..., ::32])
-    if minifloat == bits.E2M1 or minifloat is NvFp4Block:
-        if width % product_of.NVFP4.depth != 0:
-            raise ValueError(
-                f"gemm_quantized(NvFp4Block) requires width divisible by {product_of.NVFP4.depth}, "
-                f"got {width}")
-        ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
-        out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=Hook(quantized.quantize_nvfp4_epilogue(),
-                                 (Side(jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),)),
-                   out_dtype=jnp.uint8, out_dtypes=(jnp.uint8, jnp.float8_e4m3fn),
-                   precision=precision, interpret_on_cpu=interpret_on_cpu)
-        assert isinstance(out, tuple)
-        nibbles, block_scales = out
-        return NvFp4Block.encoded(nibbles, block_scales[..., ::16], ts)
-    raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
-
-
 @dataclasses.dataclass(eq=False)
 class WordPackedCase:
     """Facts deciding whether a word-packed matrix's product (`ternary_weight_product`) runs the
     inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned only once the requirements before
-    `launch` take the call."""
+    `launch` take the call; `whole`, whether its launch reads its operands whole (`launched_whole`)."""
     plan: Callable[[], tiling.Tiles | None]
     whole: bool
 
@@ -832,7 +782,8 @@ def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[Wor
         selection.Kernel('mosaic', (
             selection.Requirement(
                 'sharding', lambda case: case.whole,
-                "automatic mesh axes keep decoded XLA outside per-shard launch", row),
+                "a mesh axis or its operands' placement splits them: the decoded matrix's XLA product "
+                "partitions them, which a launch reads whole", row),
             selection.Requirement(
                 'measured', lambda case: False,
                 f"no receipt yet has Mosaic {format_name}-packed beat decoded GEMM (pending {receipt})", row,
@@ -953,6 +904,13 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
                    precision=precision, interpret_on_cpu=interpret_on_cpu, gather=gather)
 
 
+def _gathered(operands: tuple, tables: tuple) -> tuple:
+    """Each of `operands`' rows at its table's entries (`_gemm_t`'s `gather`; None, the operand as it is), by
+    XLA."""
+    return tuple(operand if table is None else operand[table]
+                 for operand, table in zip(operands, tables, strict=True))
+
+
 def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, out_dtype,
             precision: PrecisionLike, interpret_on_cpu: bool, gather: tuple | None = None) -> jax.Array:
     """`gemm_t` of side operands checked (`sides.split`), its groups the call's, each operand multiplied
@@ -962,13 +920,9 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     tables = (None, None) if gather is None else tuple(gather)
 
-    def gathered(lhs, rhs, tables):
-        # Each operand's rows at its table's entries, by XLA.
-        return tuple(operand if table is None else operand[table]
-                     for operand, table in zip((lhs, rhs), tables, strict=True))
-
     def kernel(lhs, rhs, group_sizes, prologue_arrays, tables, *, interpret):
         tabled = any(table is not None for table in tables)
+        whole = launched_whole(lhs, rhs, group_sizes, prologue_arrays, tables)
         # An fp32 product asked above the default precision runs as its operands' bf16 parts (`_in_parts`),
         # each operand's values its own dtype's.
         counts = _part_counts(lhs.dtype, rhs.dtype, precision)
@@ -981,7 +935,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                          sides, tables if tabled else None, out_dtype=jnp.float32,
                                          hooks=hooked, interpret=interpret, promoted=parted.promoted,
                                          dense=dense),
-                parted, whole=not automatic_axes())):
+                parted, whole=whole)):
             def part(left, right, finite, epilogue, prior, axes, dtypes):
                 # A kernel gradient takes no epilogue: the earlier parts' sum is added after. The rows' finite
                 # values are read after their prologue, which rewrites them.
@@ -1006,7 +960,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                                         tables if tabled else None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
-        launch = grouped_matmul.launched(*call, product=product, whole=not automatic_axes())
+        launch = grouped_matmul.launched(*call, product=product, whole=whole)
         # A kernel gradient is one product: no launch takes it apart.
         direct = not interpret and not generation.tpu(generation.gpu_target())
         if callable(launch) and not _UNBUILT.get():
@@ -1017,12 +971,12 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             # No launch reads the rows where they lie (an fp32 call's, which only Mosaic GPU's gathering
             # producer would): the rows gathered first, the grouped launches taking the product, never XLA's
             # ragged dot over every group's matrix (row 5213's, as `_gemm`'s).
-            rows, columns = gathered(lhs, rhs, tables)
+            rows, columns = _gathered((lhs, rhs), tables)
             return kernel(rows, columns, group_sizes, prologue_arrays, (None, None), interpret=interpret)
         return _portable(lhs, rhs, group_sizes, prologue_arrays, tables, direct_bf16=direct)
 
     def _portable(lhs, rhs, group_sizes, prologue_arrays, tables, *, direct_bf16: bool = False):
-        lhs, rhs = gathered(lhs, rhs, tables)
+        lhs, rhs = _gathered((lhs, rhs), tables)
         if prologue is not None:
             sides = hook_sides.rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
             lhs = prologue(lhs, *sides).astype(lhs.dtype)
@@ -1106,7 +1060,7 @@ class PackedRows(enum.Enum):
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
     it on the target (`grouped_quantized.MosaicPackedGmm`), None where it plans none, its `rows`, and whether
-    its operands are whole arrays (`whole`: no mesh XLA places splits them, `automatic_axes`), which the
+    its operands are whole arrays (`whole`: no mesh or placement splits them, `launched_whole`), which the
     packed launch reads one device's of whole."""
 
     tile: tiling.Tiles | None
@@ -1207,7 +1161,8 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
                         spec(first), spec(gather), out_dtype='float32', trans_rhs=False,
                         interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
     tile = _planned(launch, bound)
-    if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
+    case = PackedCase(tile, count, whole=launched_whole(rows, words, scales, sizes, gather, first))
+    if selection.select(NVFP4, case).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
 
         def packed(r, words, scales, sizes, gather, first):
@@ -1729,7 +1684,8 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         # theirs rounded to it, as the product multiplies them.
         holds = jnp.promote_types(rhs.dtype, lhs.dtype) == jnp.dtype(lhs.dtype)
         counts = _part_counts(lhs.dtype, rhs.dtype if holds else lhs.dtype, precision)
-        whole = not automatic_axes()
+        whole = launched_whole(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
+                               scatter, joined, beside, chained)
         if (counts is not None and prologue is None and paired is None and scatter is None and not several
                 and not chained and _parts_launched(*_gemm_call(
                     lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes, None, (), (), epilogue,
@@ -1941,7 +1897,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     wide = at_least_fp32(jnp.result_type(lhs.dtype, operand_dtype,
                                          *(d.dtype for d, _ in reached if wide_rows)))
     rounded, d_operand = wide if wide_rows else operand_dtype, None
-    whole = not automatic_axes()
+    whole = launched_whole(lhs, reached, group_sizes, prologue_arrays, options['first'], options['gather'])
     taken = (None if entrywise
              else _one_launch(reached, group_sizes, operand_dtype, prologue, options, whole=whole))
     if taken is not None:
@@ -2164,7 +2120,8 @@ def _keeps_launch(lhs, rhs, group_sizes, hook, sides: tuple, outs: tuple, summed
                                    precision=options['precision'], dense=options['dense'], paired=None,
                                    first=options['first'], gather=options['gather'], scatter=None,
                                    summed_as=summed_as)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
+        whole = launched_whole(lhs, rhs, group_sizes, after, options['first'], options['gather'])
+        case = grouped_matmul.grouped_case(*call, product=product, whole=whole)
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:
@@ -2225,7 +2182,8 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, options['gather'],
                                         out_dtype=out_dtype, hooks=hooks, interpret=interpret,
                                         promoted=product.promoted, dense=dense)
-        case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
+        case = grouped_matmul.grouped_case(*call, product=product,
+                                           whole=launched_whole(lhs, rhs, sizes, after, options['gather']))
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:

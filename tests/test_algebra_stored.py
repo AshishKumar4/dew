@@ -109,6 +109,19 @@ def _written(entry, record):
     entry.write_text(f"{stored._summed(entry.stem, body)}\n{body}")
 
 
+RETAGGED = {
+    # A walk's step's peak update retagged as a rescale, where the walk's declaration states none (attention's
+    # plain form): over a subtraction's parameters (it would bind a subtraction for the maximum), and over the
+    # walk's own exponential's (refused for the declaration alone). And the accurate form's own rescale, which
+    # its declaration states, over a subtraction's parameters, no exponential's.
+    "a peak retagged a rescale over a subtraction": ("walk", "sub"),
+    "a peak retagged a rescale over its exponential": ("walk", "exp2"),
+    "a rescale reading a subtraction's parameters": ("walk natural", "sub"),
+}
+"""Each rescale corruption: the declaration whose entry it corrupts, and the operation whose parameters the
+rescale reads."""
+
+
 def _corrupted(record, corrupt):
     table = record["terms"]
     if corrupt == "unknown constructor":
@@ -146,6 +159,21 @@ def _corrupted(record, corrupt):
                      if entry[0] == "binary" and entry[1][1] != ["s", terms.RESCALE])
         name, arguments = table[at]
         return {**record, "terms": [*table[:at], [name, [*arguments[:-1], other]], *table[at + 1:]]}
+    if corrupt in RETAGGED:
+        declared, over = RETAGGED[corrupt]
+        if declared == "walk natural":
+            # The walk's own rescale.
+            at = next(at for at, entry in enumerate(table)
+                      if entry[0] == "binary" and entry[1][1] == ["s", terms.RESCALE])
+        else:
+            # The running peak a step updates (a maximum of its state), not the declaration's own maximum.
+            at = next(at for at in record["steps"]
+                      if table[at][0] == "binary" and table[at][1][1] == ["s", "max"])
+        index = next(entry[1][-1] for entry in table
+                     if entry[0] in ("binary", "unary") and entry[1][1] == ["s", over])
+        left, _, right, _ = table[at][1]
+        return {**record, "terms": [*table[:at], ["binary", [left, ["s", terms.RESCALE], right, index]],
+                                    *table[at + 1:]]}
     if corrupt == "a report's admitted sets a string":
         return {**record, "report": [record["report"][0], "sets", *record["report"][2:]]}
     if corrupt == "a finish dropped":
@@ -158,12 +186,13 @@ def _corrupted(record, corrupt):
                                      "an argument of another sort", "a term of its own", "a float past range",
                                      "a dtype of objects", "an untyped empty vector", "a finish dropped",
                                      "a literal no array", "a product of another operation's parameters",
-                                     "a report's admitted sets a string",
+                                     "a report's admitted sets a string", *RETAGGED,
                                      "nested past depth", "a flipped byte", "another entry's"])
 def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     """An entry that fails to read, is not its own, or whose forms are not its region's, leaves its region as
     traced and is derived afresh past, then written whole again."""
-    fresh = _derived("walk")
+    name = RETAGGED[corrupt][0] if corrupt in RETAGGED else "walk"
+    fresh = _derived(name)
     entry, record = _entry()
     text = entry.read_text()
     if corrupt == "unreadable":
@@ -185,7 +214,7 @@ def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
         entry.write_text(f"{stored._summed(entry.stem, body)}\n{body}")
     else:
         _written(entry, _corrupted(record, corrupt))
-    again = _derived("walk")
+    again = _derived(name)
     # Derived afresh past it, and written again (a directory in its place: not written, `unstorable`).
     assert storing.stored == ({"miss": 1, "invalid": 1, "unstorable": 1} if corrupt == "unreadable"
                               else {"miss": 2, "invalid": 1})
@@ -193,7 +222,7 @@ def test_a_corrupt_entry_is_derived_afresh_and_counted(storing, corrupt):
     assert len(again.region.params) == len(fresh.region.params)
     assert len(again.region.shapes) == len(fresh.region.shapes)
     if corrupt != "unreadable":  # a directory in the entry's place is not written over
-        assert _terms(_derived("walk")) == _terms(fresh)
+        assert _terms(_derived(name)) == _terms(fresh)
         assert storing.stored == {"miss": 2, "invalid": 1, "hit": 1}
 
 

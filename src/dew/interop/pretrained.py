@@ -65,7 +65,7 @@ from dew.interop.pipeline_assembly import (
     text_components,
 )
 from dew.interop.processors import Processor, hosts
-from dew.interop.quantized_weights import QuantizedWeight, decoded_weights, weight_records
+from dew.interop.quantized_weights import QuantizedWeight, decoded_weights, stored_grid, weight_records
 from dew.interop.release import load_settings, with_rounding
 from dew.interop.routes import (
     DecoderRoute,
@@ -308,7 +308,7 @@ class Pretrained:
     @property
     def quantization_grid(self) -> Mapping[str, unread.Stored]:
         """The scales and zeros every quantized weight encodes against, as the source stored them."""
-        return {part: held for weight in self.quantized.values() for part, held in weight.grid.items()}
+        return stored_grid(self.quantized)
 
     @property
     def quantized_dtypes(self) -> Mapping[str, str | None]:
@@ -2227,7 +2227,7 @@ def _translated(config: Mapping[str, object],
         assert codec is not None, "packed banks are a quantized source's"
         quantized = {**quantized, **weight_records(codec, given, banks, None)}
         scale_dtype = codec.scale_dtype(given)
-    grid = {part: held for weight in quantized.values() for part, held in weight.grid.items()}
+    grid = stored_grid(quantized)
     match route:
         case DiffusionGemmaRoute():
             from dew.interop import diffusion_gemma

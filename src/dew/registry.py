@@ -2407,6 +2407,13 @@ def built_arguments(member: type | Callable[..., Configured], fields: Mapping[st
             **fields}
 
 
+def _live_record[Value](annotation: type[Value], value: Configured) -> Value:
+    """A command line's record of `annotation`, read live: strict within a saved run's reading too
+    (`_records.reading_saved`)."""
+    with _records.reading_saved(saved=False):
+        return from_record(annotation, value, dtypes=False)
+
+
 def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
     """A field typed `annotation` written as one JSON value on the command
     line, the record a run holds: a tuple of records as a list,
@@ -2425,7 +2432,7 @@ def record_argument[Value](annotation: type[Value]) -> tyro.constructors.Primiti
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="JSON",
-        instance_from_str=lambda given: from_record(annotation, json.loads(given[0]), dtypes=False),
+        instance_from_str=lambda given: _live_record(annotation, json.loads(given[0])),
         is_instance=lambda given: isinstance(given, container),
         str_from_instance=lambda given: [json.dumps(to_record(given, annotation))],
     )

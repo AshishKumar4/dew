@@ -854,9 +854,11 @@ class RunConfig:
             for group in groups:
                 node = _within(node, group, unset.get(group))
             node[field] = value
-        chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
-        # Built once, every field of the point in place, so its checks read the run it describes.
-        return dataclasses.replace(type(self).from_dict(record), **chains)
+        # Built once, every field of the point in place, so its checks read the run it describes: a live
+        # record, its chains' too, strict within a saved run's reading (`_records.reading_saved`).
+        with _records.reading_saved(saved=False):
+            chains = _overridden({name: getattr(self, name) for name in CHAINS}, chained)
+            return dataclasses.replace(type(self).from_dict(record), **chains)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
@@ -1070,9 +1072,11 @@ class RunConfig:
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it: a live record, each of whose fields its class
-        holds (a saved run's is read by `load`)."""
+        holds (a saved run's is read by `load`), even where a saved run's decoder
+        reads it (`_records.reading_saved`)."""
         run_class, fields = cls._named(record, trust)
-        return run_class.from_dict(fields)
+        with _records.reading_saved(saved=False):
+            return run_class.from_dict(fields)
 
     @classmethod
     def _named(cls, record: Mapping[str, object],

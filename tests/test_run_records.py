@@ -237,12 +237,31 @@ def test_a_live_run_record_naming_the_retired_choice_is_refused():
     """A run record read live (`RunConfig.read`: a recipe's, as `dew train recipe.py` rebuilds it) holds
     each of its fields: one naming the retired choice is refused, as only a saved run's load reads it
     without (`RunConfig.load`)."""
+    from dew import _records
+    from dew.registry import from_record, record_argument
+
     record = json.loads(json.dumps(RunConfig().record()))
     assert RunConfig.read(record) == RunConfig()
     kernels = record["fields"]["diagnostics"]["kernels"]
     record["fields"]["diagnostics"]["kernels"] = {**kernels, "generated": "generated"}
     with pytest.raises(ValueError):
         RunConfig.read(record)
+    # Within a saved run's reading too (a saved run's decoder reading a live record), and the saved
+    # reading's mode stands past it.
+    with _records.reading_saved():
+        with pytest.raises(ValueError):
+            RunConfig.read(record)
+        saved = {**kernels, "generated": "generated"}
+        assert from_record(Kernels, saved) == from_record(Kernels, kernels)
+        # A run's override of its kernels' section is a live record too.
+        assert RunConfig().override({"diagnostics.kernels": kernels}).diagnostics.kernels == Kernels()
+        with pytest.raises(ValueError):
+            RunConfig().override({"diagnostics.kernels": saved})
+        # A command line's record of kernel choices (`registry.record_argument`) is one too.
+        flag = record_argument(Kernels)
+        assert flag.instance_from_str([json.dumps(kernels)]) == Kernels()
+        with pytest.raises(ValueError):
+            flag.instance_from_str([json.dumps(saved)])
 
 
 @dataclasses.dataclass(frozen=True)

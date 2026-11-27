@@ -2022,9 +2022,18 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
     kept = unchanged(_decode_inkling2({name: original, name + "_scale": exponents}, name))
     codes = np.asarray(original).view(np.uint8)
     if not kept.all():
+        # A group whose E8M0 scale is 0xff decodes every code of it to NaN, so no other value is one any code
+        # of it holds: an edit to anything but a NaN there is refused, not written back as NaN (audit
+        # 2026-11-27 P04); its untouched values are kept bit for bit above.
         # The fresh codes of a bank its training changed alone: each group of 32 over its own power.
         powers = e8m0_scales(np.asarray(exponents)).astype(np.float64)[..., None]
         grouped = given.astype(np.float64).reshape(*powers.shape[:-1], 32)
+        unscaled = np.isnan(powers)
+        if unscaled.any():
+            edited = ~kept.reshape(grouped.shape) & unscaled & ~np.isnan(grouped)
+            if edited.any():
+                raise ValueError(f"{name} has {int(edited.sum())} values edited in MXFP8 groups whose scale "
+                                 "is NaN (E8M0 0xff), which no code of theirs holds")
         fresh = np.clip(grouped / powers, -E4M3_MAX, E4M3_MAX).astype(ml_dtypes.float8_e4m3fn)
         codes = np.where(kept, codes, fresh.view(np.uint8).reshape(codes.shape))
     return {name: codes.view(ml_dtypes.float8_e4m3fn), name + "_scale": np.asarray(exponents)}

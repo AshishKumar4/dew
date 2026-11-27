@@ -31,11 +31,11 @@ from dew.nn.joined import Projections, projection_requirements, projections_of
 from dew.nn.kernels import gemm, projections
 from dew.nn.kernels.generation import INHERENT, Choice, device_generation, gpu_target
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select
-from dew.nn.kernels.templates.gemm import wide
+from dew.nn.kernels.templates.gemm import launched_whole, wide
 from dew.nn.kernels.templates.gemm.hooks import hook_lowers
 from dew.nn.kernels.templates.hooks import Hook, Side
 from dew.nn.residuals import RECOMPUTED, Residual
-from dew.nn.sharding import automatic_axes, on_shards
+from dew.nn.sharding import on_shards
 
 FUSION_ROW = 'ledger 1958'
 """The row tracking the fused MLP's reach: a projection it does not reproduce, and its receipts."""
@@ -314,7 +314,7 @@ def gated_case(x: jax.Array, projections_: Sequence[nn.Module], activation: str,
         rows=jax.ShapeDtypeStruct(rows, dtype),
         kernels=None if kernels is None else (jax.ShapeDtypeStruct(kernels[0].shape, dtype),
                                               jax.ShapeDtypeStruct(kernels[2].shape, dtype)),
-        whole=placement is not None or not automatic_axes(),
+        whole=placement is not None or launched_whole(x, kernels),
         precision=gate.precision, hook=activations.gated_hook(activation, limit), placement=placement)
 
 
@@ -353,7 +353,9 @@ def grouped_case(rows: jax.Array | jax.ShapeDtypeStruct,
     """The `GatedCase` of a grouped gated expert MLP (`moe.gated_experts`, row 12847) over `rows` in its
     compute dtype and `(gate, down)` expert kernel shapes (`[experts, in, hidden]` / `[experts, hidden, out]`
     or stacked `[layers, experts, ...]` with `layer`, None where unavailable), plus optional `group_sizes`,
-    `gather`, `scatter`, and `layer` launch descriptors."""
+    `gather`, `scatter`, and `layer` launch descriptors. `whole`, whether the launches read their operands
+    whole on every device (`launched_whole`); unnamed, as these describe them, which a caller holding the
+    operands themselves names from theirs (`moe.gated_experts`)."""
     dtype = jnp.dtype(rows.dtype)
     flat_rows = jax.ShapeDtypeStruct((math.prod(rows.shape[:-1]), rows.shape[-1]), dtype)
     typed_kernels = (None if kernels is None else (
@@ -365,7 +367,7 @@ def grouped_case(rows: jax.Array | jax.ShapeDtypeStruct,
         biased=False,
         rows=flat_rows,
         kernels=typed_kernels,
-        whole=not automatic_axes() if whole is None else whole,
+        whole=launched_whole(rows, kernels, group_sizes, gather, scatter) if whole is None else whole,
         precision=precision,
         hook=hook,
         grouped=True,
