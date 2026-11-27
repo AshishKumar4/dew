@@ -353,8 +353,8 @@ def _operated(name: str, values: list, primitive: Primitive, rescaled: frozenset
             raise ValueError(f"a rescale reading {primitive}'s parameters, no exponential of "
                              f"{sorted(rescaled)}")
         return
-    if operation is None or operation not in (terms.operations_written(name, rules.BOUND_AS.get(named, named))
-                                              or ()):
+    bound = None if named is None else rules.BOUND_AS.get(named, named)
+    if operation is None or operation not in (terms.operations_written(name, bound) or ()):
         raise ValueError(f"a {name} {named or ''} reading {primitive}'s parameters")
 
 
