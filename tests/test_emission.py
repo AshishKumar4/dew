@@ -1593,6 +1593,32 @@ def test_launch_seconds_shares_sm_units_overlaps_paths_and_prices_integer_work()
     assert got_path_r2 < got_path_r1, (got_path_r2, got_path_r1)
 
 
+def test_a_serial_launch_adds_its_tensor_and_issue_seconds_under_a_longer_unit():
+    """A serial launch (`cost.launch_seconds`' `serial`: its issue waiting on its products, a step at a
+    time) of one program a multiprocessor is priced at its tensor cores' seconds plus its issue slots', where
+    another launch takes the longer of the two; a third unit's longer seconds (shared memory's) still bound
+    it, serial or not."""
+    target = generation.gpu_target("sm90")
+    programs, launch = target.multiprocessors, target.launch_seconds or 0.0
+    at = cost.rates(target, device=False)
+    assert programs is not None and at.tensor is not None and at.issue is not None and at.shared is not None
+
+    def price(work: Work, *, serial: bool = False) -> float:
+        # Its warps enough that no issue interval waits.
+        return cost.launch_seconds(work, programs, target, warps=64.0, serial=serial)
+
+    flops, shuffles = 4e11, 4e8
+    tensor, issue = (flops / programs) / at.tensor, (shuffles / programs) / at.issue
+    assert 0 < issue < tensor, (issue, tensor)
+    both = Work(flops=flops, shuffles=shuffles, kernels=1.0)
+    assert price(both) == tensor + launch
+    assert price(both, serial=True) == tensor + issue + launch
+    shared_bytes = 1e12
+    shared = (shared_bytes / programs) / at.shared
+    bound = Work(flops=flops, shuffles=shuffles, shared_bytes=shared_bytes, kernels=1.0)
+    assert price(bound, serial=True) == price(bound) == shared + launch
+
+
 @pytest.mark.parametrize("memory", ["global", "shared"])
 def test_an_atomic_add_counts_its_bytes_reduced_where_global_and_an_a100_prices_them(memory):
     """A launch of `SMs + 1` programs, each adding a 64 x 64 fp32 tile into memory an element at a time
