@@ -200,12 +200,13 @@ def head_commit() -> str | None:
 
 
 BASELINES = "DEW_BASELINES"
-"""The commit a task's run with its records off (`ci.RECORDS`) writes its green dry prepares' baselines of
-(`baselines`), named only by the land queue's stale-row pass (ops queue/land.sh, suspect.sh --baselines), which
-runs on the very commit CI graded the rows CI left unrun, so a train that publishes has its baseline whole: its
-stale rows wrote none (row 13049). A suspect's comparisons name none, and read baselines alone: one written
-between two of their lookups would grade the same omission two ways. Written only where it is this checkout's
-commit, keyed by it; the rows are graded against the mainline as ever (`records.MAINLINE`)."""
+"""The commit a task's run with its records off (`ci.RECORDS`) writes its green dry prepares' baselines
+of (`baselines`), named only by the land queue's stale-row pass (ops queue/land.sh, suspect.sh
+--baselines), which runs on the very commit CI graded the rows CI left unrun, so a train that publishes
+has its baseline whole: its stale rows wrote none (row 13049). A suspect's comparisons name none, and read
+baselines alone: one written between two of their lookups would grade the same omission two ways.
+Written only where it is this checkout's commit, keyed by it; the rows are graded against the mainline as
+ever (`records.MAINLINE`)."""
 
 
 def baselines_asked() -> bool:
@@ -434,8 +435,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
-    # Each green dry prepare's baseline first, whatever of its admission to reuse below (record, key, epoch):
-    # a row is named the commit's own only once its baseline is written (`named_at_commit`).
+    # Each green dry prepare's baseline first, whatever of its admission to reuse below (record, key,
+    # epoch): a row is named the commit's own only once its baseline is written (`named_at_commit`).
     unnamed = baselines(python, rows, network, until)
     # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
     executed = followed.recorded(log)

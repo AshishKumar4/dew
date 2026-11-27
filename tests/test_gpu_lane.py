@@ -879,12 +879,12 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
 @pytest.mark.parametrize("asked", ["tested", "another", "none", "refused"])
 def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_own_commit_alone(
         ci, monkeypatch, tmp_path, cache_worker, asked):
-    """A run keeping no record (DEW_RECORDS off, ops queue/suspect.sh) writes its green dry prepare's baseline
-    only where the land queue's stale-row pass names the commit it tests (`run_keys.BASELINES`), keyed by that
-    commit, graded against the mainline it was given, an earlier one: a train's stale prepare row wrote none, so
-    main's baseline stood part-written once it published (row 13049). It writes nothing else, and nothing at all
-    where another commit or none is named (a suspect's comparisons); a baseline the Worker refuses leaves its row
-    stale."""
+    """A run keeping no record (DEW_RECORDS off, ops queue/suspect.sh) writes its green dry prepare's
+    baseline only where the land queue's stale-row pass names the commit it tests (`run_keys.BASELINES`),
+    keyed by that commit, graded against the mainline it was given, an earlier one: a train's stale
+    prepare row wrote none, so main's baseline stood part-written once it published (row 13049). It writes
+    nothing else, and nothing at all where another commit or none is named (a suspect's comparisons); a
+    baseline the Worker refuses leaves its row stale."""
     url, stored, seen = cache_worker
     cached(monkeypatch, url)
     monkeypatch.setenv(ci.RECORDS, "off")
@@ -906,11 +906,13 @@ def test_a_records_off_run_writes_the_baselines_the_stale_row_pass_asks_of_its_o
     [row] = json.loads(out.read_text())["rows"]
     written = set(stored) - before
     if asked == "tested":
-        assert written == {ci.records.baseline_key(head, "3.12", row["name"], ci.run_keys.device_class(False))}
+        held = ci.run_keys.device_class(network=False)
+        assert written == {ci.records.baseline_key(head, "3.12", row["name"], held)}
         assert row["exitCode"] == 0
     else:
         assert written == set()
-        assert (row["exitCode"], row.get("kind")) == ((1, ci.grading.STALE) if asked == "refused" else (0, None))
+        stale = (1, ci.grading.STALE) if asked == "refused" else (0, None)
+        assert (row["exitCode"], row.get("kind")) == stale
 
 
 def test_a_dry_prepares_records_publish_within_its_budget_a_stalled_baseline_leaving_its_row_stale(

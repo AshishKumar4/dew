@@ -1660,10 +1660,11 @@ def kept_records(python: str, rows: list[dict], ran: list[dict], out: Path, file
     if recording:
         log, unrecorded = files
         unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
-        unnamed = run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in, until)
+        unnamed = run_keys.record(python, ran, log, common, network, opened, unlisted, carried, began_in,
+                                  until)
     else:
-        # No record kept (a suspect's run, `RECORDS`), but the baselines the land queue's stale-row pass asks of
-        # the commit it tests (`run_keys.BASELINES`).
+        # No record kept (a suspect's run, `RECORDS`), but the baselines the land queue's stale-row pass
+        # asks of the commit it tests (`run_keys.BASELINES`).
         unnamed = run_keys.baselines(python, ran, network, until) if run_keys.baselines_asked() else set()
     if unnamed:
         out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
