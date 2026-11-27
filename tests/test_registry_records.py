@@ -671,3 +671,31 @@ def test_a_partial_is_recorded_only_where_its_field_reads_one_back():
         again = from_record(annotation, record)
         assert isinstance(again, functools.partial)
         assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 1})
+
+
+def test_a_held_argument_partial_is_recorded_only_where_its_member_reads_one_back():
+    """A model's held argument that is a partial of a function, where the member's field declares a
+    callable (Unet's `activation`), is refused as its record is written: its reader refuses a function's
+    class record (train 1429's review: a bound member's arguments were written against no annotation)."""
+    from dew.nn.activations import cast_rounded
+    from dew.nn.backbones.unet import Unet
+    from dew.registry import ModelConfig, Unrecordable
+
+    held = ModelConfig(functools.partial(Unet, activation=functools.partial(cast_rounded, dtype="bfloat16")))
+    with pytest.raises(Unrecordable):
+        held.record()
+
+
+type _MaybePredictor = _Predictor | None
+
+
+def test_a_partial_under_a_nested_optional_alias_reads_back():
+    """A partial under an Optional of an alias of an Optional of its partial alias reads back as the
+    partial it was, as its reader flattens the nesting (train 1429's review: the writer refused it)."""
+    from dew.registry import to_record
+
+    bound = functools.partial(JepaPredictor, num_layers=2)
+    for annotation in (_MaybePredictor, _MaybePredictor | None):
+        again = from_record(annotation, to_record(bound, annotation))
+        assert isinstance(again, functools.partial)
+        assert (again.func, again.keywords) == (JepaPredictor, {"num_layers": 2})

@@ -598,12 +598,7 @@ def to_record(value, annotation) -> JSON:
         # reader reads one back (a field declaring `functools.partial[...]`, `_bound`; or a member's held
         # argument, read against the member's own annotation, `Bound.read`): any other field's reader builds
         # what such a record names, or refuses a function's, so the partial is refused here.
-        # An Optional looked through, and an alias within it, as its reader looks through them (`_unwrapped`).
-        declared = resolve_alias(_unwrapped(annotation))
-        if typing.get_origin(declared) is typing.Annotated:
-            declared = typing.get_args(declared)[0]
-        if annotation is not None and not (declared is functools.partial
-                                           or typing.get_origin(declared) is functools.partial):
+        if annotation is not None and not _admits_partial(annotation):
             raise Unrecordable(f"{value!r} is held where {annotation!r} is declared, whose record reads back "
                                "no bound member: declare the field functools.partial[...]")
         if value.args:
@@ -1195,6 +1190,34 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
 
 
+def _admits_partial(annotation: Annotation) -> bool:
+    """Whether a field declaring `annotation` reads a bound member back from its class record (`_bound`),
+    flattened as its reader flattens it (`_rebuilt`): an alias resolved, an Annotated's type, and a union of
+    one member besides None that member, each at any depth."""
+    held = resolve_alias(annotation)
+    if typing.get_origin(held) is typing.Annotated:
+        return _admits_partial(typing.get_args(held)[0])
+    if typing.get_origin(held) in (Union, types.UnionType):
+        inner = [member for member in _union_members(held) if member is not type(None)]
+        return len(inner) == 1 and _admits_partial(inner[0])
+    return held is functools.partial or typing.get_origin(held) is functools.partial
+
+
+def _argument_type(member: type | Callable[..., Configured], name: str) -> Annotation:
+    """The annotation `member` declares its argument `name` with, as its record reads that argument
+    (`member_fields`), None where it declares none its module resolves; no default built."""
+    held = record_class(member)
+    if held is not None:
+        return declared_type(held, name)
+    found = parameters(member)[0].get(name)
+    if found is None:
+        return None
+    try:
+        return parameter_type(found[1], name)
+    except ValueError:
+        return None
+
+
 def _bound(value: object, declared: tuple[Annotation, ...]) -> functools.partial:
     """A member bound by keyword (`Bound.bound`) from its class record, `{"class": ..., "fields": {...}}`,
     each field read against the member's own annotation; or the partial given, its arguments as they are.
@@ -1230,7 +1253,9 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     """What `member` builds from a record of its fields, checked as a configured value (`configured`): a
     dataclass built from its fields as a field's own class is (`_construct`, a bound member's record by its
     own shape among them), anything else from its parameters (`_arguments`)."""
-    held = record_class(member)
+    # A bound member's record read by its own shape before any dataclass's fields (`_construct`, the one
+    # dispatch to `Bound.read`): a kind of its own constructor is no dataclass `record_class` names.
+    held = member if isinstance(member, type) and issubclass(member, Bound) else record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
     built = member(**_arguments(member, fields, dtypes=dtypes))
@@ -2094,6 +2119,13 @@ class Bound(ABC):
         beside `defaults`. A recorded kind's as held (`argument_records`, at construction); another's each
         recorded as given, read against nothing until its member is built (a world model's views named
         alone, which its environment widens)."""
+        # A partial held where the member's argument reads none back is refused, as `to_record` refuses it
+        # under a field's annotation (train 1429's review): its record would read back as no partial.
+        for name, value in self.fields.items():
+            if isinstance(value, functools.partial) and not _admits_partial(_argument_type(self.member,
+                                                                                           name)):
+                raise Unrecordable(f"{self.name}'s {name} holds {value!r}, which its annotation reads back "
+                                   "as no bound member: declare it functools.partial[...]")
         with recording():
             # Each written as held, against no parameter's annotation, as the record held them before
             # (`JsonDict`): a recorded kind's records again as they are, and a world model's views named

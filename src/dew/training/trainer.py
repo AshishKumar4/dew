@@ -67,6 +67,7 @@ from dew.held_updates import holds_back, input_held, waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import STAGE_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.dense import NVFP4_HISTORY, NVFP4_PENDING, pending_amax
+from dew.nn.finite import checked
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Compiling, attempting, shapes_of
 from dew.nn.kernels.templates import report
@@ -188,7 +189,6 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
     Transaction,
-    checked,
     loss_scale,
     numerics_read,
     refuse_unpassed_progress,
