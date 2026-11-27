@@ -300,10 +300,16 @@ def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_ar
     np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))
 
 
-def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie():
+@pytest.mark.parametrize("default", [
+    "cpu", pytest.param("gpu", marks=[pytest.mark.gpu, pytest.mark.compiles_at_run(
+        reason="an eager call, its programs compiled where it reaches them")])])
+def test_the_linear_attention_called_eagerly_on_cpu_operands_sums_where_they_lie(default):
     """Called eagerly (no jit) on operands committed to the CPU, DC-AE's linear attention takes the CPU's
-    whole sums under wide arithmetic whatever the process's default device, as its jitted call does there
-    (train 1393's review: an accelerator-default process took the grouped sums, a GPU lane's to witness)."""
+    whole sums under wide arithmetic whatever the process's default device, as its jitted call does there:
+    on the CPU lane, and on a GPU tier, whose default device is the accelerator the bug took (train 1393's
+    review: an accelerator-default process took the grouped sums; train 1403's F7, a scheduled tier to
+    protect it)."""
+    assert jax.default_backend() == default
     from dew.nn.autoencoders.dc_ae import linear_attention
 
     cpu = jax.devices("cpu")[0]
