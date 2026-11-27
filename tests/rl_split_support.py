@@ -1,5 +1,7 @@
 """Shared helpers for control PPO and Dreamer filled-batch, split-step and mid-window resume tests."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -159,10 +161,10 @@ class SplitAndWhole:
                 window, size = ran.accumulation, ran.window_size
                 assert window is not None and window.fill is not None and size is not None
                 assert (int(size), int(window.fill)) == (2, 0), "a step a window long left its window open"
-                self._starts[split] = start.replace(accumulation=ran.accumulation,
-                                                    window_size=ran.window_size)
+                self._starts[split] = dataclasses.replace(start, accumulation=ran.accumulation,
+                                                          window_size=ran.window_size)
             self._steps[split] = step
         start = self._starts[split]
-        given = start.replace(variables={**start.variables, **(variables or {})},
-                              ema=start.ema if ema is None else ema)
+        given = dataclasses.replace(start, variables={**start.variables, **(variables or {})},
+                                    ema=start.ema if ema is None else ema)
         return self._steps[split](jax.tree.map(jnp.copy, given), batch)[0]
