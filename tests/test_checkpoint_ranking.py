@@ -1196,8 +1196,8 @@ def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
 
 def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records_for_inference(tmp_path):
     """A trainer built directly over a directory whose run traced its programs under other numerics than
-    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its outputs
-    in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
+    it runs under (`TrainerAdvanced.numerics`: its unpinned products at "default" not "highest", its accurate
+    forms, its outputs in bfloat16, or none given, JAX's own; numerics at "default" under JAX's other precision), which change no
     tree and no loss scale, refuses to resume, an
     objective that records nothing for inference (no task) among them, as the run's training record holds
     them (`PhasePasses.training_record`); the numerics that trained it resume (row 13537), its products'
@@ -1227,7 +1227,7 @@ def test_a_resume_under_other_numerics_is_refused_whatever_its_objective_records
     assert Stated().inference_record() is None
     trained = Numerics(full, matmul="highest")
     trainer(trained).fit(dataset(), steps=1)
-    for other in (Numerics(full, matmul="default"),
+    for other in (Numerics(full, matmul="default"), Numerics(full, matmul="highest", forms="accurate"),
                   Numerics(dataclasses.replace(full, output="bfloat16"), matmul="highest"), None):
         with pytest.raises(ValueError):
             trainer(other).fit(dataset(), steps=2)

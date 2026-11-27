@@ -182,14 +182,17 @@ class PhasePasses[L, E]:
         from dew.registry import to_record
 
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
-        numerics = to_record(generation.numerics(), Numerics)
+        policy = generation.numerics()
+        numerics = to_record(policy, Numerics)
         # Its declared product precision is no evidence of what its products computed: `products` is.
         if isinstance(numerics, dict):
             numerics.pop("matmul", None)
-        # The precision an unpinned product multiplies at as it is read, resolved (`effective_precision`) and
-        # named canonically (`precision_names`: 'highest' and 'float32' one), none where JAX's is unset:
-        # numerics at "default" leave JAX's own setting, which another context may set otherwise.
-        products: list[JSON] = [*sorted(precision_names(effective_precision(None)))]
+        # The precision an unpinned product multiplies at, resolved: the numerics' own where they name one,
+        # else JAX's as it is read (`effective_precision`), named canonically (`precision_names`: 'highest'
+        # and 'float32' one), none where neither is set: numerics at "default" leave JAX's own setting,
+        # which another context may set otherwise.
+        stated = None if policy.matmul == "default" else policy.matmul
+        products: list[JSON] = [*sorted(precision_names(effective_precision(stated)))]
         return {**objective.training_record(), **sampled, "numerics": numerics, "products": products}
 
     def drawn_cap(self) -> int | None:

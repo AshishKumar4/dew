@@ -362,9 +362,10 @@ def test_a_run_resumes_under_another_remat_or_dropout_and_is_refused_another_com
 
 def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp_path):
     """A run.json saved while the trainer recorded `attention_form` reads back with that form as its
-    precision policy's forms (`dew.config.earlier_run`, ledger 2500), so the run loads and resumes as it
-    trained, and a run under the other form is refused its resume; a configuration written today that
-    names it is refused."""
+    precision policy's forms (`dew.config.earlier_run`, ledger 2500), so the run loads and its record
+    admits its resume as it trained; a configuration written today that names it is refused. The forms a
+    resume computes under are held to the checkpoint's by the trainer's admission, its numerics as they
+    computed (row 13708; tests/test_checkpoint_ranking.py)."""
     record = tmp_path / "record"
     run = lm(tmp_path, drawn=False)
     run.save(str(record))
@@ -375,10 +376,8 @@ def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp
         (record / "run.json").write_text(json.dumps(written))
         loaded = RunConfig.load(str(record))
         assert loaded.trainer.precision.forms == form
-        # It resumes as the run it records, and a run under the other policy is refused its resume.
+        # Its record admits the run it records.
         loaded.check_resume(earlier_run(written))
-    with pytest.raises(ValueError):
-        run.check_resume(earlier_run(written))
     with pytest.raises(ValueError):
         RunConfig.read(written)
 

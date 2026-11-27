@@ -455,7 +455,9 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
         return RunConfig(trainer=TrainerConfig(steps=steps, checkpoint_dir=str(tmp_path), eval_every=None,
                                                checkpoint_every=None, precision=declared))
 
-    data = Loader(lambda partition: batches(), None, None, 8)
+    from affine_run import dataset
+
+    data = dataset()
     with jax.default_matmul_precision("highest"):
         assert int(run(1).train(Regression(), data, name="ambient").step) == 1
     record = (tmp_path / "ambient" / RUN_FILE).read_bytes()
