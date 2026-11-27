@@ -1656,8 +1656,11 @@ class Trainer(Generic[Loss, Effects]):
         process agrees (`resumed_step`) and, where it continues one, this share's saved data position
         (`Checkpoints.position`), none where its plan changed and the run resumes relaxed (what changed its
         `differs`); a position saved for other shares is none of this run's to read."""
-        if run.resumed is None:
-            checkpoints, step = self.checkpoints, resumed_step(self, resume)
+        seeded = run.resumed
+        if seeded is None or not seeded.read:
+            # The step a configured run admitted (`_fit`), its position read here where it read none.
+            checkpoints = self.checkpoints
+            step = resumed_step(self, resume) if seeded is None else seeded.step
             position, differs = None, ()
             if checkpoints is not None and step is not None:
                 try:
@@ -1666,7 +1669,8 @@ class Trainer(Generic[Loss, Effects]):
                     if self.data_resume == "exact":
                         raise
                     differs = tuple(changed.differs)
-            run.resumed = Resumed(step, position, differs)
+            run.resumed = Resumed(step, position, differs,
+                                  numerics_admitted=seeded is not None and seeded.numerics_admitted)
         return run.resumed
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:

@@ -6,7 +6,6 @@ the evaluations' warming."""
 
 import contextlib
 import dataclasses
-import functools
 import logging
 import time
 from collections.abc import Iterator, Mapping
@@ -20,7 +19,7 @@ from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.handed import Handed
 from dew.data.pipeline import Dataset, ObjectiveData
-from dew.data.plan import DataResume
+from dew.data.plan import DataResume, PlanChanged
 from dew.telemetry.instrumentation import count_compilation_cache
 from dew.training._fit import data_resumed
 from dew.training.budget import Horizon, run_steps, run_tokens
@@ -139,19 +138,27 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     (`Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
     the layout's rules, restored and closed (`_fit.data_resumed`). Nothing where it continues no step or
     saved no position; a relaxed resume (`Trainer.data_resume`) refuses no position whose data can start
-    again, the one decision fit makes too (`_fit.data_resumed`). Returns what fit's start reads of it
-    (`Trainer._resumed`): the saved position its stream restores, none where its plan changed, and what
-    changed."""
+    again, the one decision fit makes too (`_fit.data_resumed`). Returns its reading of the saved position
+    as fit's start reads it (`Trainer._resumed`): the position the step saved for this process's share, or
+    none and what changed where that read finds its plan changed."""
     checkpoints = trainer.checkpoints
     if checkpoints is None or step is None:
         return None, ()
+    read: list[tuple[bytes | None, tuple[str, ...]]] = []
+
+    def position() -> bytes | None:
+        try:
+            saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
+        except PlanChanged as changed:
+            read.append((None, tuple(changed.differs)))
+            raise
+        read.append((saved, ()))
+        return saved
+
     # The shares fit reads by, its layout placing the rows, the saved one's among them.
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        position, differs = data_resumed(
-            loader, trainer._stream_partition(),
-            functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
-            resume=trainer.data_resume, step=step)
-    return (None if differs else position), differs
+        data_resumed(loader, trainer._stream_partition(), position, resume=trainer.data_resume, step=step)
+    return read[0] if read else (None, ())
 
 
 def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "Resume") -> int | None:

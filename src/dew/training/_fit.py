@@ -1351,6 +1351,9 @@ class Resumed:
     position: bytes | None = None
     differs: tuple[str, ...] = ()
     numerics_admitted: bool = False
+    read: bool = True
+    """Whether its data's position was read (`position`, `differs`); where not (a configured run holding no
+    record of the run it resumes reads none before its fit), its fit reads it (`Trainer._resumed`)."""
 
 
 @dataclasses.dataclass(frozen=True)
