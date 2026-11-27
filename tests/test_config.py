@@ -3,16 +3,16 @@
 import dataclasses
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import TimingRegression as Regression, batches
+from affine_run import Counting, TimingRegression as Regression, batches
 from diffusion_support import images_of
 from flax import linen as nn
 from model_support import attending
@@ -489,6 +489,58 @@ def test_a_resume_under_another_effective_precision_is_refused_before_its_record
     with jax.default_matmul_precision("highest"):
         declared = Numerics(DTYPE_PRESETS["32-true"], matmul="highest")
         assert int(run(3).train(Regression(), data, name="ambient").step) == 3
+
+
+class Tagged(Counting):
+    """A stream whose saved position carries `tag` beside its count, each restored one's tag kept in
+    `restored`, and `on_restore` taken at the first restore."""
+
+    tag = "A"
+    restored: ClassVar[list[str]] = []
+    on_restore: ClassVar[list[Callable[[], None]]] = []
+
+    def get_state(self):
+        return json.dumps({"index": self.index, "tag": Tagged.tag}).encode()
+
+    def set_state(self, state):
+        held = json.loads(state)
+        Tagged.restored.append(held["tag"])
+        while Tagged.on_restore:
+            Tagged.on_restore.pop()()
+        super().set_state(state)
+
+
+def test_a_configured_resume_reads_its_saved_data_position_once(tmp_path, monkeypatch):
+    """A configured run reads the data position of the step it resumes once, before it replaces its record
+    (its admission, row 13708), and its fit's stream restores that reading: the step's checkpoint replaced,
+    as its admission reads its data, by the same step of a twin run whose position differs only by its tag,
+    the fit restores the position its admission read."""
+    import shutil
+
+    from affine_run import dataset
+
+    from dew.checkpoints import Checkpoints
+
+    def run(root, steps: int) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, checkpoint_dir=str(root), eval_every=None,
+                                               checkpoint_every=None))
+
+    monkeypatch.setattr(Tagged, "restored", [])
+    monkeypatch.setattr(Tagged, "on_restore", [])
+    for root, tag in ((tmp_path / "a", "A"), (tmp_path / "b", "B")):
+        monkeypatch.setattr(Tagged, "tag", tag)
+        run(root, 1).train(Regression(), dataset(Tagged), name="tagged")
+    mine, twin = (Path(Checkpoints(str(root / "tagged")).path(1))
+                  for root in (tmp_path / "a", tmp_path / "b"))
+
+    def replaced() -> None:
+        shutil.rmtree(mine)
+        shutil.copytree(twin, mine)
+
+    Tagged.on_restore.append(replaced)
+    run(tmp_path / "a", 3).train(Regression(), dataset(Tagged), name="tagged")
+    # Restored twice, by its admission and by its fit, each from the position its admission read.
+    assert Tagged.restored == ["A", "A"], Tagged.restored
 
 
 def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_its_record(tmp_path):

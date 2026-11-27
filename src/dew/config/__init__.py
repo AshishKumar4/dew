@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.interop import Pretrained
+    from dew.training._fit import Resumed
     from dew.training.trainer import Trainer
 
 
@@ -1531,10 +1532,10 @@ class RunConfig:
 
             # The whole pool accepts the resume, its data among it, before its record is replaced or its
             # state restored.
-            self._agree_resume(checkpoints, built, dataset, steps)
+            admitted = self._agree_resume(checkpoints, built, dataset)
             agreed("run metadata", record_run)
             with self.traced():
-                state = built.fit(dataset, resume=trainer.resume, **fitted)
+                state = built._fit(dataset, resume=trainer.resume, admitted=admitted, **fitted)
                 if after is not None:
                     after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
@@ -1648,19 +1649,21 @@ class RunConfig:
             self.optim, param_groups=groups)
 
     def _agree_resume[LossT, EffectsT](self, checkpoints: Checkpoints,
-                                       built: "Trainer[LossT, EffectsT]", dataset: Loader,
-                                       steps: int | None) -> None:
-        """Refuse, on every rank and before the run's record is written over what it resumes, a checkpoint
-        of another run under the name or a directory `resume` refuses (`Checkpoints.resumed`,
-        `check_resume`); then, in an agreement of its own, so every rank enters the position's restore
-        only once all accept the record, a saved data position the run's data does not read on from
-        (`resume_admitted`), a changed chain's refusal naming the record it resumes where that holds its
-        chain (`_routed`)."""
-        resume = self.trainer.resume
-        # The record of the run this one resumes, as each rank read it once the pool agreed it.
-        resumed: dict[str, Mapping[str, object]] = {}
+                                       built: "Trainer[LossT, EffectsT]", dataset: Loader) -> "Resumed":
+        """The step the run continues, chosen and admitted once (`Resumed`, which its fit takes as it is,
+        `Trainer._fit`: none of it chosen, its position read or its numerics checked again, row 13708), with
+        its data's saved position as read: refused, on every rank and before
+        the run's record is written over what it resumes, a checkpoint of another run under the name or a
+        directory `resume` refuses (`Checkpoints.resumed`, `check_resume`) or its numerics' other
+        computation (`refuse_other_computation`); then, in an agreement of its own, so every rank enters the
+        position's restore only once all accept the record, a saved data position the run's data does not
+        read on from (`resume_admitted`), a changed chain's refusal naming the record it resumes where that
+        holds its chain (`_routed`)."""
+        from dew.training._fit import Resumed
 
-        def check_resumed() -> None:
+        resume = self.trainer.resume
+
+        def check_resumed() -> tuple[int | None, Mapping[str, object] | None, bool]:
             from dew.training.distributed import under_numerics
             from dew.training.startup import refuse_other_computation, resumed_step
 
@@ -1669,29 +1672,36 @@ class RunConfig:
             with self.traced(), under_numerics(built.numerics):
                 step = resumed_step(built, resume)
             if step is None:
-                return
+                return None, None, False
             training = checkpoints.training(step)
             record = self._saved_record(checkpoints.directory, checkpoints)
             if record is not None:
                 self.check_resume(record, numerics_stated=isinstance(training, dict)
                                   and isinstance(training.get("numerics"), dict))
-                resumed["record"] = record
             # The trainer's admission of its numerics, under the numerics its steps trace under (the run's,
             # then its trainer's own), before the record is replaced: a refusal leaves the run's record as it
             # was (row 13708).
             if training is not None:
                 with self.traced():
                     refuse_other_computation(built, checkpoints, step, numerics_of=training)
+            return step, record, training is not None
 
-        def check_data() -> None:
+        # The record of the run this one resumes, as each rank read it once the pool agreed it.
+        step, record, numerics = agreed("run resume", check_resumed)
+
+        def check_data() -> tuple[bytes | None, tuple[str, ...]] | None:
             from dew.training.startup import resume_admitted
 
-            if "record" in resumed:
-                with _routed(resumed["record"], self.UNSEEDED):
-                    resume_admitted(built, dataset, resume)
+            if record is None:
+                return None
+            with _routed(record, self.UNSEEDED):
+                return resume_admitted(built, dataset, step)
 
-        agreed("run resume", check_resumed)
-        agreed("run data", check_data)
+        # Its saved position read here once, which the fit's stream restores as read (`Trainer._fit`).
+        position = agreed("run data", check_data)
+        if position is None:
+            return Resumed(step, numerics_admitted=numerics, read=False)
+        return Resumed(step, *position, numerics_admitted=numerics)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,

@@ -6,7 +6,6 @@ the evaluations' warming."""
 
 import contextlib
 import dataclasses
-import functools
 import logging
 import time
 from collections.abc import Iterator, Mapping
@@ -20,7 +19,7 @@ from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.handed import Handed
 from dew.data.pipeline import Dataset, ObjectiveData
-from dew.data.plan import DataResume
+from dew.data.plan import DataResume, PlanChanged
 from dew.telemetry.instrumentation import count_compilation_cache
 from dew.training._fit import data_resumed
 from dew.training.budget import Horizon, run_steps, run_tokens
@@ -131,24 +130,35 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
 
 
 def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader: Loader,
-                                     resume: "Resume" = "auto") -> None:
-    """Refuse a resume under `resume` whose saved data position `loader` would not read on from, as
-    `trainer.fit` refuses it where it opens its data, before a run writes anything over what it resumes
-    (`RunConfig.train`): the data fit reads, compiled once as the run reads it (`RunConfig.readied`), the
-    position of this process's share at the step it continues (`Checkpoints.resumed`,
-    `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
+                                     step: int | None) -> tuple[bytes | None, tuple[str, ...]]:
+    """Refuse a resume of `step` (`resumed_step`'s) whose saved data position `loader` would not read on
+    from, as `trainer.fit` refuses it where it opens its data, before a run writes anything over what it
+    resumes (`RunConfig.train`): the data fit reads, compiled once as the run reads it
+    (`RunConfig.readied`), the position of this process's share at the step it continues
+    (`Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
     the layout's rules, restored and closed (`_fit.data_resumed`). Nothing where it continues no step or
     saved no position; a relaxed resume (`Trainer.data_resume`) refuses no position whose data can start
-    again, the one decision fit makes too (`_fit.data_resumed`)."""
+    again, the one decision fit makes too (`_fit.data_resumed`). Returns its reading of the saved position
+    as fit's start reads it (`Trainer._resumed`): the position the step saved for this process's share, or
+    none and what changed where that read finds its plan changed."""
     checkpoints = trainer.checkpoints
-    step = resumed_step(trainer, resume)
     if checkpoints is None or step is None:
-        return
+        return None, ()
+    read: list[tuple[bytes | None, tuple[str, ...]]] = []
+
+    def position() -> bytes | None:
+        try:
+            saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
+        except PlanChanged as changed:
+            read.append((None, tuple(changed.differs)))
+            raise
+        read.append((saved, ()))
+        return saved
+
     # The shares fit reads by, its layout placing the rows, the saved one's among them.
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        data_resumed(loader, trainer._stream_partition(),
-                     functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
-                     resume=trainer.data_resume, step=step)
+        data_resumed(loader, trainer._stream_partition(), position, resume=trainer.data_resume, step=step)
+    return read[0]
 
 
 def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "Resume") -> int | None:
@@ -175,46 +185,49 @@ def resumed_step[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", resume: "
 
 
 def computation_differs[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", checkpoints: "Checkpoints",
-                                         step: int) -> list[str]:
+                                         step: int, *, numerics: bool = True) -> list[str]:
     """Where the computation `checkpoints`' `step` trained and `trainer`'s differ (`differing_records`):
     their inference records and what their steps compute beside the model (`PhasePasses.training_record`,
-    a pass count's sampled law among it, row 10783), the numerics its programs ran under among it."""
+    a pass count's sampled law among it, row 10783), the numerics its programs ran under among it, unless
+    `numerics` is False (its run admitted them already, `refuse_other_computation`)."""
     training, now = checkpoints.training(step), trainer.phase_passes.training_record(trainer.objective)
+    fields = ("numerics", "products")
     # A law the checkpoint records binds a run that draws none: a fixed-pass resume would stop drawing (a
     # checkpoint that records none, a fixed-pass run's, any run resumes).
     dropped = (["training.sampled_passes"] if isinstance(training, dict) and "sampled_passes" in training
                and "sampled_passes" not in now else [])
-    # Its numerics compared as they computed (`numerics_differs`), the rest of its record as it reads.
-    numerics = ("numerics", "products")
-    saved = ({name: value for name, value in training.items() if name not in numerics}
+    # Its numerics compared as they computed (`numerics_differs`, where they are), the rest of its record as
+    # it reads.
+    saved = ({name: value for name, value in training.items() if name not in fields}
              if isinstance(training, dict) else training)
-    rest = {name: value for name, value in now.items() if name not in numerics}
-    return (differing_records(checkpoints.artifact(step), trainer._artifact(), saved, rest) + dropped
-            + numerics_differs(training, {name: now[name] for name in numerics}))
+    return (differing_records(checkpoints.artifact(step), trainer._artifact(), saved, now) + dropped
+            + (numerics_differs(training) if numerics else []))
 
 
 def refuse_other_computation[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]",
                                                checkpoints: "Checkpoints", step: int, *,
-                                               numerics_of: JSON | None = None) -> None:
+                                               numerics_of: JSON | None = None,
+                                               numerics_admitted: bool = False) -> None:
     """Refuse `trainer`'s resume of `checkpoints`' `step` where they compute otherwise
     (`computation_differs`), read under the numerics its steps trace under (`under_numerics`): the
     trainer's own admission. A configured run takes its numerics' part alone (`numerics_differs` of the
     step's training record `numerics_of`, read once) before it replaces its record (`RunConfig.train`, row
-    13708), the rest once its start is laid out as the checkpoint's."""
+    13708), the rest once its start is laid out as the checkpoint's, its numerics then not compared again
+    (`numerics_admitted`)."""
     from dew.training.distributed import under_numerics
 
     with under_numerics(trainer.numerics):
         differs = (numerics_differs(numerics_of) if numerics_of is not None
-                   else computation_differs(trainer, checkpoints, step))
+                   else computation_differs(trainer, checkpoints, step, numerics=not numerics_admitted))
     if differs:
         raise ValueError(f"the checkpoint at step {step} in {checkpoints.directory} trained another "
                          f"computation ({', '.join(differs)}); resume it with the objective, its settings "
                          "and model it recorded, or train in another directory")
 
 
-def numerics_differs(saved: JSON | None, now: Mapping[str, JSON] | None = None) -> list[str]:
+def numerics_differs(saved: JSON | None) -> list[str]:
     """Where a checkpoint's training record `saved` states numerics other than those its resume computes
-    under where it is read (`now`, else `numerics_record`'s): their forms, recipe and outputs, and the
+    under where it is read (`numerics_record`'s): their forms, recipe and outputs, and the
     precision its products computed at (`products`), whatever precision it declared (row 13708). A record a
     Dew wrote before it stated `products` states none: its declared precision (`matmul`) is held to the
     resume's, JAX's own default named either way ("default", `DotAlgorithmPreset.DEFAULT`) as one."""
@@ -224,7 +237,7 @@ def numerics_differs(saved: JSON | None, now: Mapping[str, JSON] | None = None) 
     numerics = saved.get("numerics") if isinstance(saved, dict) else None
     if not isinstance(saved, dict) or not isinstance(numerics, dict):
         return []
-    now = numerics_record() if now is None else now
+    now = numerics_record()
     found = _differing({key: value for key, value in numerics.items() if key != "matmul"}, now["numerics"],
                        "training.numerics")
     if "products" in saved:

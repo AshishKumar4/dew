@@ -1343,11 +1343,18 @@ class Resumed:
     listed the checkpoints and read the position again): the step every process agrees it continues
     (`dew.training.startup.resumed_step`), None for a fresh run, and the saved data position this process's
     share reads on from, None where it saved none or its plan changed under a relaxed resume, which starts
-    the data again (`differs`, what changed)."""
+    the data again (`differs`, what changed). A configured run hands its fit (`Trainer._fit`) the step it
+    chose and admitted before it replaced its record, its data's position read and its numerics compared
+    among what it admitted (`numerics_admitted`; `RunConfig.train`, row 13708), which its start then neither
+    chooses, reads nor checks again."""
 
     step: int | None
     position: bytes | None = None
     differs: tuple[str, ...] = ()
+    numerics_admitted: bool = False
+    read: bool = True
+    """Whether its data's position was read (`position`, `differs`); where not (a configured run holding no
+    record of the run it resumes reads none before its fit), its fit reads it (`Trainer._resumed`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1372,6 +1379,9 @@ class Start:
     kept: bool = False
     """Whether its build is the one its process keeps for the trainer's refits (`traced_draw`'s, under the
     trainer's step key): only such a build's program a refit reads again (`start_build`)."""
+    numerics_admitted: bool = False
+    """Whether its run admitted the numerics of the step it resumes already (`Resumed.numerics_admitted`),
+    which its placing then holds to the rest of the computation alone (`refuse_other_computation`)."""
 
     @property
     def placed_variables(self) -> Variables:

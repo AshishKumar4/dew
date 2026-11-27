@@ -854,7 +854,8 @@ class Trainer(Generic[Loss, Effects]):
                                           self._staging.staged_shapes)
         shardings, validation = self._validated(abstract)
         return Start(initializer, key, abstract, draw.through, draw.built, step, shardings, draw.replay,
-                     validation.device_bytes, kept=stated is not None)
+                     validation.device_bytes, kept=stated is not None,
+                     numerics_admitted=known is not None and known.numerics_admitted)
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -913,7 +914,7 @@ class Trainer(Generic[Loss, Effects]):
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         self._compiler.resume_rung(checkpoints._rung(resume))
         # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
-        refuse_other_computation(self, checkpoints, resume)
+        refuse_other_computation(self, checkpoints, resume, numerics_admitted=start.numerics_admitted)
         # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
         wrote = checkpoints.environment(resume)
         if wrote is not None:
@@ -1193,8 +1194,6 @@ class Trainer(Generic[Loss, Effects]):
             return state
         return dropped(state)
 
-    @numbered
-    @ruled
     def fit(
         self,
         dataset: Dataset | Loader | Handed,
@@ -1255,6 +1254,16 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.training.runtime.ready_process`), as `prepare_process` readies it: a program that never called
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
+        return self._fit(dataset, state=state, resume=resume, **asked)
+
+    @numbered
+    @ruled
+    def _fit(self, dataset: Dataset | Loader | Handed, *, state: TrainState | None = None,
+             resume: Resume = "auto", admitted: Resumed | None = None, **asked: Unpack[FitArguments]
+             ) -> TrainState:
+        """`fit`, continuing where a configured run admitted its resume (`admitted`: the step it chose, its
+        numerics compared and its data's position read before it replaced its record, `RunConfig.train`,
+        row 13708), which its start then neither chooses nor reads again; as `resume` says where None."""
         # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
         # from the plan's first read of the data on.
         # A fatal signal's stacks go to the run's directory for the fit's whole length, its teardown's
@@ -1263,6 +1272,7 @@ class Trainer(Generic[Loss, Effects]):
             self._handed_ahead()
             plan = self._fit_plan(dataset, **asked)
             run = FitRun(time.perf_counter(), plan.startup)
+            run.resumed = admitted
             # Each fit plans its step as the trainer's first did, at the split it was given, so a refit's
             # first step is keyed as that fit's was and reads the step it traced (row 6022); a state that
             # pools a window binds its own split as it compiles (`StepCompiler.compile`).
@@ -1502,7 +1512,7 @@ class Trainer(Generic[Loss, Effects]):
         drops a step not finite whole, a scaled one as its scale backs off or one whose optimizer holds
         updates back (`holds_back`, its groups' inner one under DiLoCo), stops at no single such step."""
         from dew.held_updates import holds_back
-        saved = current if checkpoints is not None and checkpoints.latest is not None else None
+        saved = current if checkpoints is not None and self._continued(run, checkpoints) is not None else None
         skip = self.skip_nonfinite or self.dynamic_scale or holds_back((abstract.inner or abstract).opt_state)
         first = Interval.resumed(run.stop_control, last_saved=saved, kept_paths=leaf_paths(checked(abstract)),
                                  skips_nonfinite=skip)
@@ -1591,8 +1601,9 @@ class Trainer(Generic[Loss, Effects]):
                         initial, lambda staged: self._validated(staged)[0], consumed=True, sources=handed),
                     self._staging.stacked_shapes(initial), None)
         start = streaming.laid_start(self, run, dataset, resume)
-        if checkpoints is not None and checkpoints.latest is not None:
-            run.stop_control = checkpoints.control(checkpoints.latest)
+        # The run's control read off the step it continues, the one its start restores, not one saved since.
+        if checkpoints is not None and start.resume is not None:
+            run.stop_control = checkpoints.control(start.resume)
         if checkpoints is None or start.resume is None:
             def placed(begun: Compiling | None = None) -> tuple[TrainState, Placement[TrainState]]:
                 with attempting(begun):
@@ -1636,23 +1647,34 @@ class Trainer(Generic[Loss, Effects]):
         run.primed = (partition, stream, batch, position, saved)
         return batch
 
+    def _continued(self, run: FitRun, checkpoints: Checkpoints) -> int | None:
+        """The checkpoint step this fit continues: the one it resumed (`_resumed`), else, a run handed its
+        state, the newest its directory holds."""
+        return run.resumed.step if run.resumed is not None else checkpoints.latest
+
     def _resumed(self, run: FitRun, resume: Resume) -> Resumed:
         """What this fit resumes (`Resumed`), read once for its start and kept on `run`: the step every
         process agrees (`resumed_step`) and, where it continues one, this share's saved data position
         (`Checkpoints.position`), none where its plan changed and the run resumes relaxed (what changed its
         `differs`); a position saved for other shares is none of this run's to read."""
-        if run.resumed is None:
-            checkpoints, step = self.checkpoints, resumed_step(self, resume)
-            position, differs = None, ()
-            if checkpoints is not None and step is not None:
-                try:
-                    position = checkpoints.position(step, DataPartition.of(self.device_mesh))
-                except PlanChanged as changed:
-                    if self.data_resume == "exact":
-                        raise
-                    differs = tuple(changed.differs)
-            run.resumed = Resumed(step, position, differs)
-        return run.resumed
+        seeded = run.resumed
+        if seeded is not None and seeded.read:
+            return seeded
+        # The step a configured run admitted (`_fit`), its position read here where it read none.
+        checkpoints = self.checkpoints
+        step = resumed_step(self, resume) if seeded is None else seeded.step
+        position, differs = None, ()
+        if checkpoints is not None and step is not None:
+            try:
+                position = checkpoints.position(step, DataPartition.of(self.device_mesh))
+            except PlanChanged as changed:
+                if self.data_resume == "exact":
+                    raise
+                differs = tuple(changed.differs)
+        resumed = Resumed(step, position, differs,
+                          numerics_admitted=seeded is not None and seeded.numerics_admitted)
+        run.resumed = resumed
+        return resumed
 
     def _declare_input(self, first: Callable[[], Batch]) -> None:
         """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
@@ -1702,7 +1724,7 @@ class Trainer(Generic[Loss, Effects]):
         # the optimizer state's structure.
         check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(abstract)))
         complete = (plan.ended(current, interval.real_tokens, interval.consumed) and checkpoints is not None
-                    and checkpoints.latest is not None and not pending)
+                    and self._continued(run, checkpoints) is not None and not pending)
         # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
         # count's refusal cleared before the prefetch worker counts its first batch.
         run.current = current

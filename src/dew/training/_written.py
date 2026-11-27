@@ -22,6 +22,7 @@ from dew.training._fit import FitRun, _rollout_saved
 from dew.training._lowering import Lowered
 from dew.training.display import goodput
 from dew.training.interval import Interval, Reading, Taken, logged_scalars
+from dew.training.phase_passes import numerics_record
 from dew.training.profiling import reported_window
 
 if TYPE_CHECKING:
@@ -76,7 +77,7 @@ def checkpoint_envelope[L, E](trainer: Trainer[L, E], state: TrainState, positio
     control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(trainer.device_mesh)
     # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
     laid = _Laid(rung={**trainer._compiler.checkpoint_rung(), "host": list(trainer.layout.host)},
-                 training=trainer.phase_passes.training_record(trainer.objective),
+                 training={**trainer.phase_passes.training_record(trainer.objective), **numerics_record()},
                  boxed=trainer._boxed_axes(), held_apart=trainer._staging.apart)
     return {"state": trainer._staging.saved(state), "saved": position, "share": share, "control": control,
             "artifact": trainer._artifact(),
