@@ -75,6 +75,7 @@ from dew.nn.precision import (
     widened_reduction,
 )
 from dew.nn.protocols import (
+    HEAD_SCOPE,
     AffineHead,
     HiddenStates,
     Lacks,
@@ -716,8 +717,11 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
-    raw = _whole_logits(flat, table.astype(operands), precision)
-    logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
+    # The whole logits under the whole head's name (`HEAD_SCOPE`): what a tiled head holds a tile of alone,
+    # where its per-token results and its gradients are its own as much as this head's.
+    with jax.named_scope(HEAD_SCOPE):
+        raw = _whole_logits(flat, table.astype(operands), precision)
+        logits = _without(capped_logits(columns.logits(_widened(raw)), softcap, temperature), 0, excluded)
     log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
@@ -764,7 +768,8 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent as `_logits_cotangent` gives it to both
     products, the head's gradient accumulated in fp32 once, and an fp32 head's
-    state gradient over the tiled head's column tiles (`_state_product`)."""
+    state gradient over the tiled head's column tiles (`_state_product`); the
+    logits and their cotangent under the whole head's name (`HEAD_SCOPE`)."""
     del predict
     raw, (peaks, masses, rests) = saved
     hidden, table, targets, excluded, softcap, columns = operands
@@ -772,12 +777,14 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, save
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     features = table.shape[1]
-    logits, pullback = _capped(_widened(raw), softcap, columns, temperature)
+    with jax.named_scope(HEAD_SCOPE):
+        logits, pullback = _capped(_widened(raw), softcap, columns, temperature)
+        d_logits = _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
+                                      loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
     d_states, d_table, d_cap, d_columns = _head_backward(
-        pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
-                                     loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
-        table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
+        pullback, d_logits, table.astype(operands), hidden.reshape(-1, features).astype(operands), precision,
+        work, width)
     d_states, (d_table, d_cap, d_columns) = with_gradients_formed(
         d_states.reshape(hidden.shape).astype(hidden.dtype), (d_table.astype(table.dtype), d_cap, d_columns))
     return d_states, d_table, zero_from_primal(targets), zero_from_primal(excluded), d_cap, d_columns
@@ -1080,6 +1087,16 @@ def fused_tokens(tokens: int, vocab: int, tile: tuple[int, int] | None = None) -
     `tile`'s tokens and every token."""
     fitting = 1 << max(FUSED_LOGIT_BYTES // (4 * vocab), 1).bit_length() - 1
     return min(tokens, fitting, tokens if tile is None else tile[0])
+
+
+def tile_logits(tokens: int, vocab: int, tile: tuple[int, int], fused: bool) -> int:
+    """The bytes of fp32 logits a tiled head over `tokens` tokens and `vocab` columns holds at once: a fused
+    head's chunk of tokens over the whole vocabulary (`fused_tokens`), an unfused head's `tile` of tokens
+    and columns (`_bounded_head_bwd`), what a fit search prices a head's move from its whole logits by
+    (`dew.training.planning.FitSearch.jumped`)."""
+    if fused:
+        return 4 * fused_tokens(tokens, vocab, tile) * vocab
+    return 4 * min(tile[0], tokens) * min(tile[1], vocab)
 
 
 def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: float = 0.0,

@@ -8,6 +8,7 @@ splits the step's batch until the step fits everywhere
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -40,7 +41,7 @@ from dew.nn.protocols import OffloadsResiduals, Recomputing, TritonGemm
 from dew.objectives.base import Objective, head_fused_of, head_tile_of
 from dew.state import TrainState
 from dew.telemetry.instrumentation import CompiledMemory, compiled_memory
-from dew.training.live_buffers import peak_live
+from dew.training.live_buffers import LiveInterval, assignment_of
 
 _log = logging.getLogger(__name__)
 
@@ -881,17 +882,22 @@ class LiveSet:
     recomputation frees none of): its bytes, the `op_name` of the op that made it and the `checkpoint_name`
     names it carries, which a search reads what a remat rung or a release frees by (`forward_bytes`). A
     workspace is held in `scaled` and `unknown` all the same: it is live at the peak."""
+    profile: LiveProfile | None = None
+    """Its compile's whole schedule (`LiveProfile`), where it was read (`of`'s `profiled`) and its backend
+    states one: what a rung frees of its peak wherever that peak moves (`frees`)."""
 
     @staticmethod
-    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
-        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows; None where
-        the backend states none."""
-        live = peak_live(executable)
-        if live is None:
+    def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]], *,
+           profiled: bool = False) -> LiveSet | None:
+        """The live set of `executable`, `rows` the (argument, axis) pairs of the batch's rows, with its
+        whole schedule where `profiled` (a search reads one for the misses it prices alone: `FitSearch`'s
+        start); None where the backend states none."""
+        read = assignment_of(executable)
+        if read is None:
             return None
         scaled = unknown = 0
         made = []
-        for buffer in live:
+        for buffer in read.live():
             if buffer.kind == "parameter":
                 continue
             if buffer.role != "workspace":
@@ -900,7 +906,8 @@ class LiveSet:
                 unknown += buffer.bytes
             elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
                 scaled += buffer.bytes
-        return LiveSet(scaled, unknown, tuple(made))
+        profile = LiveProfile.of(read.intervals(), rows) if profiled else None
+        return LiveSet(scaled, unknown, tuple(made), profile)
 
     def forward_bytes(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
         """The bytes of the values its step's forward made (its op name's first scope under the step and the
@@ -911,18 +918,135 @@ class LiveSet:
         return sum(size for size, op_name, names in self.made
                    if forward_made(op_name) and dropped(op_name, names))
 
+    def frees(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
+        """What a rung that does not keep the forward's values `dropped` says it does not keep frees of the
+        step's peak: priced over its whole schedule where its compile states it (`LiveProfile.frees`: the
+        peak a rung leaves need not be this one, a 4B decoder's moving from its layers' backward to its head
+        once its activations are recomputed), else those values' bytes at its peak (`forward_bytes`)."""
+        return self.forward_bytes(dropped) if self.profile is None else self.profile.frees(dropped)
+
+
+@dataclasses.dataclass(frozen=True)
+class Held:
+    """One buffer of a compile's schedule as its buffer assignment's heap simulation states it
+    (`dew.training.live_buffers.LiveInterval`): its bytes and shape, the op that made it and its checkpoint
+    names (`LiveSet.made`'s), whether a microbatch's rows scale it (`LiveSet.of`'s provenance), whether it is
+    a residual, the forward's value live into the backward (what a recomputation can drop: a buffer the
+    forward makes and frees within it is made again by a rung recomputing it, and a library call's scratch
+    by any), and the positions [start, end) of the schedule it is live over in the memory of `storage` (its
+    own `buffer` where it took memory of its own; another buffer's where XLA placed it there, an in-place
+    fusion's output over its operand, or a buffer freed before it), of trace `trace` (a heap's page)."""
+
+    bytes: int
+    op_name: str
+    names: tuple[str, ...]
+    scaled: bool
+    residual: bool
+    trace: int
+    start: int
+    end: int
+    buffer: int
+    storage: int
+    shape: tuple[int, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class LiveProfile:
+    """What a compile holds across its whole schedule (`Held`, each buffer's interval of the module-wide
+    simulation): the one reading that prices another rung of the same step, whose peak need not be this
+    one's (a 4B decoder's step peaked in its layers' backward without recomputation and at its head with
+    it), by the buffers that rung would not make (`peak`). A buffer XLA places in its allocation unsimulated
+    (a reused or combined temporary heap) has no interval here, so what the rest's peak falls by (`frees`) is
+    a difference no such buffer enters."""
+
+    held: tuple[Held, ...]
+
+    @staticmethod
+    def of(intervals: Sequence[LiveInterval], rows: frozenset[tuple[int, int]]) -> LiveProfile | None:
+        """The profile of a compile's `intervals` (`dew.training.live_buffers.live_intervals`), `rows` the
+        (argument, axis) pairs of the batch's rows: its buffers not an argument's over the whole module's
+        simulation, each a residual where the forward made it and it lives past the first buffer the backward
+        makes. None where no interval is of a whole module's simulation (a CPU states none), or where they
+        lie on more than one timeline (`LiveInterval.timeline`): heaps XLA simulates apart, whose positions
+        no common clock orders, so no peak of them together is read."""
+        whole = [interval for interval in intervals if interval.whole and interval.kind != "parameter"]
+        if not whole or len({interval.timeline for interval in whole}) > 1:
+            return None
+        backward = min((interval.start for interval in whole if backward_made(interval.op_name)),
+                       default=None)
+        return LiveProfile(tuple(
+            Held(interval.bytes, interval.op_name, tuple(interval.names),
+                 any(dimension is not None and dimension & rows for dimension in interval.dims),
+                 interval.role != "workspace" and forward_made(interval.op_name) and backward is not None
+                 and interval.end > backward, interval.trace, interval.start, interval.end, interval.buffer,
+                 interval.storage, interval.shape)
+            for interval in whole))
+
+    @functools.cached_property
+    def _events(self) -> list[tuple[int, int, int]]:
+        """Each buffer's start and end, in the schedule's order: (position, whether it starts, its index);
+        ends before starts at one position, as an interval is half-open."""
+        return sorted(event for index, buffer in enumerate(self.held)
+                      for event in ((buffer.start, 1, index), (buffer.end, 0, index)))
+
+    @functools.cached_property
+    def most(self) -> int:
+        """Its peak, every buffer kept (`peak`)."""
+        return self.peak()
+
+    def peak(self, kept: Callable[[Held], bool] = lambda buffer: True, split: int = 1) -> int:
+        """The most bytes the schedule holds at any position, of the buffers `kept` keeps: each storage of
+        each trace once, at the most bytes of the buffers kept in it that are live there, a buffer a
+        microbatch's rows scale at its share of `split` (rounded up), as the heap simulation counts the
+        memory it occupies (a storage reused after it was freed held again where a buffer reusing it is
+        live)."""
+        keeps = [kept(buffer) for buffer in self.held]
+        covering: dict[tuple[int, int], collections.Counter[int]] = {}
+        live = most = 0
+        for _, starts, index in self._events:
+            if not keeps[index]:
+                continue
+            buffer = self.held[index]
+            size = -(-buffer.bytes // split) if buffer.scaled else buffer.bytes
+            sizes = covering.setdefault((buffer.trace, buffer.storage), collections.Counter())
+            before = max(sizes, default=0)
+            sizes[size] += 1 if starts else -1
+            if not sizes[size]:
+                del sizes[size]
+            live += max(sizes, default=0) - before
+            most = max(most, live)
+        return most
+
+    def frees(self, dropped: Callable[[str, tuple[str, ...]], bool], split: int = 1) -> int:
+        """What its schedule's peak would fall by at `split` without the residuals (`Held.residual`) that
+        `dropped` says a rung would not keep: the peak of every buffer less the peak of the rest, wherever in
+        the schedule each falls."""
+        def kept(buffer: Held) -> bool:
+            return not (buffer.residual and dropped(buffer.op_name, buffer.names))
+
+        return (self.most if split == 1 else self.peak(split=split)) - self.peak(kept, split)
+
 
 CONTROL_SCOPES = re.compile(r"cond|while|body|body_fun|cond_fun|branch_\d+_fun")
 """The scopes JAX names a step's control flow by in an op's name (`jax.lax.cond`'s branches, a loop's body
 and condition), under which a replayed window's forward stands (`Transaction.step`'s replay)."""
 
 
+def _first_scope(op_name: str) -> str:
+    """The first scope of the op `op_name` names under the step's own and the control flow it runs in
+    (`CONTROL_SCOPES`)."""
+    return next((scope for scope in op_name.split("/")[1:] if not CONTROL_SCOPES.fullmatch(scope)), "")
+
+
 def forward_made(op_name: str) -> bool:
-    """Whether the op `op_name` names was made by a step's forward: its first scope under the step's own and
-    the control flow it runs in (`CONTROL_SCOPES`) a `jvp(`, where a backward's is a `transpose(`."""
-    scopes = op_name.split("/")[1:]
-    first = next((scope for scope in scopes if not CONTROL_SCOPES.fullmatch(scope)), "")
-    return first.startswith("jvp(")
+    """Whether the op `op_name` names was made by a step's forward: its first scope (`_first_scope`) a
+    `jvp(`, where a backward's is a `transpose(` (`backward_made`)."""
+    return _first_scope(op_name).startswith("jvp(")
+
+
+def backward_made(op_name: str) -> bool:
+    """Whether the op `op_name` names was made by a step's backward: its first scope a `transpose(`."""
+    return _first_scope(op_name).startswith("transpose(")
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:

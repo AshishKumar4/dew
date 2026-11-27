@@ -45,6 +45,7 @@ from jax.extend import core
 from dew.batch import FROZEN, Variables, merge, select, under_roots
 from dew.nn.kernels.options import OuterProgram, owned_program
 from dew.nn.programs import branches, called, own_derivative, scan_body
+from dew.nn.protocols import COPIES_SCOPE
 
 
 def _inner(eqn, index: int):
@@ -190,8 +191,9 @@ def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> V
     """The `params` leaves at `paths` cast to their dtypes, nested as in
     `variables` (`compute`'s tree)."""
     chosen = select(variables, lambda path: path[0] == "params" and path[1:] in paths)
-    return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: leaf.astype(paths[tuple(key.key for key in path)[1:]]), chosen)
+    with jax.named_scope(COPIES_SCOPE):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf.astype(paths[tuple(key.key for key in path)[1:]]), chosen)
 
 
 def forward_variables(variables: Variables, compute: Variables | None) -> Variables:

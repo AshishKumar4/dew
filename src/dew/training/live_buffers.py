@@ -80,7 +80,9 @@ class LiveInterval(LiveBuffer):
     Besides `LiveBuffer`'s: `allocation`, the buffer allocation it is assigned to; `trace`, the heap
     simulation that orders it (its index among the assignment's `heap_simulator_traces`): positions compare
     within one trace alone (an allocation simulated per computation has one each, their positions each from 0;
-    the pages of one heap each a copy of its one trace, their positions alike). `whole` says whether that
+    the pages of one heap each a copy of its one trace, their positions alike). `timeline` is the first trace
+    whose events its trace's repeat: a heap's pages share one, their buffers live together at each position,
+    and traces of different timelines order their positions apart. `whole` says whether that
     simulation's schedule is the whole module's (XLA:GPU's), a while body's buffers within its loop's span, or
     one computation's. `complete` says whether every buffer its allocation is assigned lies in one of its
     simulations: XLA places some in an allocation unsimulated (temporary heaps reused, or combined), so a
@@ -97,6 +99,7 @@ class LiveInterval(LiveBuffer):
 
     allocation: int
     trace: int
+    timeline: int
     whole: bool
     complete: bool
     start: int
@@ -197,7 +200,11 @@ class Assignment:
         complete = {allocation: set(sizes) <= traced.get(allocation, set())
                     for allocation, sizes in assigned.items()}
         found = []
+        # A heap's pages each copy one trace's events: the first trace of each sequence of events names it.
+        timelines: dict[tuple, int] = {}
         for trace, simulated in enumerate(self.proto.heap_simulator_traces):
+            timeline = timelines.setdefault(tuple((step.kind, step.buffer_id, step.share_with_canonical_id)
+                                                  for step in simulated.events), trace)
             # Each buffer's storage, as first allocated: a share names the buffer it shares, itself perhaps
             # sharing another's, freed or not.
             storages: dict[int, int] = {}
@@ -216,7 +223,7 @@ class Assignment:
             sizes = assigned.get(allocation, {})
             charged = _charged(simulated.events, sizes, kinds)
             found += [LiveInterval(**{**described, "bytes": sizes[buffer]}, allocation=allocation,
-                                   trace=trace, whole=simulated.whole_module_simulation,
+                                   trace=trace, timeline=timeline, whole=simulated.whole_module_simulation,
                                    complete=complete[allocation], start=start, end=end, buffer=buffer,
                                    storage=storages[buffer], charged=buffer in charged)
                       for buffer, start, end in spans

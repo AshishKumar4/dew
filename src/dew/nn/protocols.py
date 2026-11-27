@@ -952,6 +952,16 @@ class Recomputing(Protocol):
     def restore_recompute(self, record: JSON) -> Self: ...
 
 
+HEAD_SCOPE = "dew_whole_head"
+"""The name scope of a language model head's whole logits and their cotangent (`chunked._whole_head`): the
+buffers a tiled head makes none of, its per-token results and gradients its own as much, which a fit
+search reads off a compile's live intervals by the `op_name` of the op that made each
+(`dew.training.planning.priced`)."""
+
+COPIES_SCOPE = "dew_narrow_copies"
+"""The name scope of a step's narrow copies of its parameters (`dew.training.narrow.narrowed`): the buffers a
+step reading none of them makes none of, read off a compile's live intervals as `HEAD_SCOPE`'s are."""
+
 RUNG_SCOPE = "dew_rung"
 """The name scope each decoder block's forward runs under at every rung, none included (`DecoderBlock`): the
 values a remat rung's checkpoint keeps or recomputes by its policy's names, which a compile's live set tells
