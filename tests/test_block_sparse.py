@@ -222,9 +222,10 @@ def test_a_pooled_selection_takes_each_groups_top_blocks_by_its_indexers_block_m
 def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
     """InfLLM-V2's selection (`infllm_selection`): keys mean-pooled by windows of `kernel` every `stride`,
     each head's softmax over the windows its query reaches whole (no future key moves a score), summed over
-    its group's heads, max-pooled onto blocks by eq. 7, the `top_k` earlier blocks beside the first and the
-    query's own, as written out; with fewer keys than a window, the forced blocks alone."""
-    rows, groups, per, width, block, top_k, kernel, stride = 1, 2, 2, 8, 16, 1, 8, 4
+    its group's heads, max-pooled onto blocks by eq. 7, the first and the query's own and its top earlier
+    blocks, `top_k` in all, as written out, a block no reached window covers no candidate; with fewer keys
+    than a window, the forced blocks alone."""
+    rows, groups, per, width, block, top_k, kernel, stride = 1, 2, 2, 8, 16, 3, 8, 4
     rng = np.random.default_rng(4)
     query = rng.standard_normal((rows, keys, groups, per, width)).astype(np.float32)
     key = rng.standard_normal((rows, keys, groups, width)).astype(np.float32)
@@ -244,9 +245,10 @@ def test_infllm_selects_each_groups_top_blocks_by_its_pooled_keys(keys):
                     logits = pooled[reached] @ query[0, index, group, head] * width ** -0.5
                     shifted = np.exp(logits - logits.max())
                     weights[reached] += shifted / shifted.sum()
-            scores = np.asarray([max(weights[step * j:step * j + span], default=-np.inf)
-                                 if j < own else -np.inf for j in range(-(-keys // block))])
-            assert {int(b) for b in selected[0, group, index] if b >= 0} == _top(scores, top_k, {0, own})
+            scores = np.asarray([max((weights[w] for w in reached if step * j <= w < step * j + span),
+                                     default=-np.inf) if j < own else -np.inf
+                                 for j in range(-(-keys // block))])
+            assert {int(b) for b in selected[0, group, index] if b >= 0} == _top(scores, top_k - 2, {0, own})
 
 
 def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_past_it():
@@ -255,7 +257,7 @@ def test_infllm_attention_attends_densely_below_its_cut_and_over_its_selection_p
     (`infllm_selection`'s), has its output and every gradient on par with the reference attention over that
     selection's dense mask (check 1)."""
     rows, queries, heads, groups, width = 1, 256, 8, 2, 32
-    shape = {"block": 16, "top_k": 3, "kernel": 8, "stride": 4}
+    shape = {"block": 16, "top_k": 5, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
     query, key, value, _ = draw(0)
     short = block_sparse.infllm_attention(query, key, value, **shape)
@@ -488,6 +490,23 @@ def test_msas_indexer_loss_at_a_teachers_tiny_mass_its_invalid_logit_and_an_infi
     assert np.isnan(np.asarray(jax.grad(lambda s: loss(s, invalid))(uniform))[0, 0, 1]).all()
 
 
+def test_infllm_v2s_selection_over_padding_picks_what_its_real_keys_pick():
+    """InfLLM-V2's selection (`infllm_selection`) at blocks of 16, a window of 64 every 16 and one optional
+    pick (`top_k` 3): over a row's 48 real keys no window holds 64, so each query reads its forced blocks
+    alone; the same row padded to 64 keys (`key_valid`), whose one window no real query reaches, picks the
+    same, where the unreached window's weight of 0 made block 1 a candidate and took it (train 1359's
+    F3)."""
+    rng = np.random.default_rng(1359)
+    query = jnp.asarray(rng.standard_normal((1, 64, 2, 8)), jnp.float32)
+    key = jnp.asarray(rng.standard_normal((1, 64, 1, 8)), jnp.float32)
+    shape = {"block": 16, "top_k": 3, "kernel": 64, "stride": 16}
+    real = np.asarray(block_sparse.infllm_selection(query[:, :48], key[:, :48], **shape))
+    valid = jnp.arange(64)[None, :] < 48
+    padded = np.asarray(block_sparse.infllm_selection(query, key, key_valid=valid, **shape))[:, :, :48]
+    for row in np.ndindex(real.shape[:-1]):
+        assert {int(b) for b in real[row] if b >= 0} == {int(b) for b in padded[row] if b >= 0}
+
+
 def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
     """InfLLM-V2's selection (`infllm_selection`) over five blocks of 16 keys, the second block's every key
     hidden (`key_valid`), its real blocks' pooled logits negative: the last query's one optional pick is a
@@ -496,7 +515,7 @@ def test_infllm_v2s_selection_spends_no_pick_on_a_block_of_hidden_keys():
     query = -jnp.ones((rows, keys, 1, width), jnp.float32)
     key = jnp.ones((rows, keys, 1, width), jnp.float32)
     valid = jnp.ones((rows, keys), bool).at[:, 16:32].set(False)
-    picks = block_sparse.infllm_selection(query, key, block=16, top_k=1, kernel=16, stride=16, initial=1,
+    picks = block_sparse.infllm_selection(query, key, block=16, top_k=3, kernel=16, stride=16, initial=1,
                                           local=1, key_valid=valid)
     assert int(picks[0, 0, -1, 0]) in (2, 3)
 
@@ -524,6 +543,25 @@ def test_msas_teacher_takes_the_attentions_precision_not_the_ambient_one():
     with generation.run_precision(ACCURATE):
         found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=1.0,
                                                       precision=score_precision("BF16_BF16_F32")))[0, 1]
+    assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
+
+
+def test_msas_teacher_scales_its_logits_after_their_product_as_the_attention_does():
+    """MSA's indexer loss (`msa_query_kls`) at the narrowing bf16 product preset (`BF16_BF16_F32`) and a logit
+    scale of 2^-0.5: its teacher's logits the product of the query and key, then the scale, 0 and
+    0.70710678 for a query of 1 against keys 0 and 1 (the attention's), its KL against a uniform student the
+    float64 run's of those, where a query scaled before its product rounded to bf16's 0.70703125 (train
+    1359's F1)."""
+    query = jnp.ones((1, 2, 1, 1), jnp.float32)
+    key = jnp.asarray([[[[0.0]], [[1.0]]]], jnp.float32)
+    selected = jnp.zeros((1, 1, 2, 1), jnp.int32)
+    uniform = jnp.zeros((1, 1, 2, 2), jnp.float32)
+    scale = 2.0**-0.5
+    found = np.asarray(block_sparse.msa_query_kls(uniform, query, key, selected, block=2, scale=scale,
+                                                  precision="BF16_BF16_F32"))[0, 1]
+    target = np.exp([0.0, float(np.float32(scale))])
+    target /= target.sum()
+    expected = float(np.sum(target * np.log(target)) + np.log(2.0))
     assert_fp32_reduction_bound(found, expected, 2 * np.log(2.0), 4)
 
 
@@ -578,7 +616,7 @@ def test_infllm_attention_past_its_cut_over_every_block_is_on_par_with_the_dense
     with that call's (check 1), the two branches one function at the cut. An operand laid by the call's
     places (query slots, key runs) is no argument of either branch."""
     rows, queries, heads, groups, width = 1, 128, 8, 2, 32
-    shape = {"block": 16, "top_k": queries // 16, "kernel": 8, "stride": 4}
+    shape = {"block": 16, "top_k": queries // 16 + 2, "kernel": 8, "stride": 4}
     draw = _drawn(rows, queries, heads, groups, width)
 
     def selected(query, key, value):
@@ -604,7 +642,7 @@ def test_infllm_attention_takes_each_rows_cut_at_its_real_keys():
     selection as its tokens do unpadded, its output and gradients on par with theirs (check 1), each row's
     real queries; a head's sinks join both branches (train 1345's F3 and F4)."""
     rows, queries, heads, groups, width = 2, 80, 4, 2, 32
-    shape = {"block": 16, "top_k": 1, "kernel": 8, "stride": 4, "dense_below": 64}
+    shape = {"block": 16, "top_k": 3, "kernel": 8, "stride": 4, "dense_below": 64}
     real = 60
     valid = jnp.arange(queries)[None, :] < jnp.asarray([[real], [queries]])
     sinks = jnp.asarray([0.5, -1.0, 2.0, 0.0], jnp.float32)
@@ -718,7 +756,8 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
     (`infllm_attention`'s dense branch is the plain causal call). Past its cut the mixer runs its selected
     branch, which reads fewer keys than the dense decoder; a block no 16 places divide it refuses. A
     right-padded row (`training.md`'s) it takes, its real queries' logits bitwise as they were whatever token
-    its padding holds (train 1345's F3: it was refused)."""
+    its padding holds (train 1345's F3: it was refused), and one of a single document by its ids alone
+    (train 1359's F2)."""
     infllm = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=4),
                   dtype="float32")
     dense = tiny(mixer=mixers.build("attention"), dtype="float32")
@@ -751,6 +790,14 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
                                                                                     right_padded=True)))
     changed = tokens.at[:, -1].set((tokens[:, -1] + 5) % VOCAB)
     np.testing.assert_array_equal(np.asarray(forward(tokens))[:, :-1], np.asarray(forward(changed))[:, :-1])
+    # A right-padded row of one document by its ids alone (`lm(..., segments=1)`'s: its padding id 0), no
+    # validity stated: taken, its padding read as hidden (train 1359's F2: it was refused), its real
+    # queries' logits as the validity-stated row's.
+    segments = padded.astype(jnp.int32)
+    by_ids = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(
+        segments=segments, max_segments=1, right_padded=True)))
+    np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(by_ids(changed))[:, :-1])
+    np.testing.assert_array_equal(np.asarray(by_ids(tokens))[:, :-1], np.asarray(forward(tokens))[:, :-1])
 
 
 def test_an_msa_decoder_selects_by_its_index_branch_and_trains_it_by_its_own_loss_alone():

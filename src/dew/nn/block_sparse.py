@@ -405,10 +405,16 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     it reaches whole, at the attention's scale `D ** -0.5` (eq. 5, causal), summed over a GQA group's heads
     (eq. 6), max-pooled onto key blocks of `block` over `block / stride` compressed keys every `block /
     stride` and `kernel / stride - 1` more (eq. 7: 5 every 4 at the paper's 64, 32, 16), the `top_k`
-    highest of the earlier blocks beside the first `initial` and the `local` ending at the query's own,
-    forced (eqs. 2, 3). `query` `[B, Q, G * h, D]`, `key` `[B, K, G, D]`; `[B, G, Q, top_k + initial +
-    local]`. Its pooling is `reduce_window`'s, each window a key's or a score's once."""
+    highest of the earlier blocks and the first `initial` and the `local` ending at the query's own,
+    forced, `top_k` blocks in all (eqs. 2, 3; the paper's 64 counting its forced blocks); a block no window
+    the query reaches covers is no candidate. `query` `[B, Q, G * h, D]`, `key` `[B, K, G, D]`; `[B, G, Q,
+    top_k]`. Its pooling is `reduce_window`'s, each window a key's or a score's once, a key `key_valid`
+    `[B, K]` hides pooled as a zero."""
     assert block % stride == 0 and kernel % stride == 0, "InfLLM-V2's pooling takes a stride dividing both"
+    if top_k < initial + local:
+        raise ValueError(f"InfLLM-V2's selection forces each query's first {initial} and {local} ending at "
+                         f"its own, and top_k counts them: a top_k of {initial + local} or more, not {top_k}")
+    optional = top_k - initial - local
     rows, keys, groups, width = key.shape
     queries = query.shape[1]
     query = query.reshape(rows, queries, groups, query.shape[2] // groups, width)
@@ -419,13 +425,13 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
                               own - jnp.arange(local)[None, ::-1]], axis=-1)
     forced = jnp.broadcast_to(jnp.where(forced >= 0, forced, -1), (rows, groups, queries, initial + local))
     windows = (keys - kernel) // stride + 1 if keys >= kernel else 0
-    if top_k == 0:
+    if optional == 0:
         # No pick is optional: the forced blocks alone, no score formed.
         return forced
     if windows == 0:
         # No window holds `kernel` keys: the forced blocks alone.
         nothing = jnp.zeros((rows, groups, queries, blocks), bool)
-        return top_k_selection(jnp.zeros(nothing.shape), nothing, top_k, forced=forced)
+        return top_k_selection(jnp.zeros(nothing.shape), nothing, optional, forced=forced)
     # A hidden key (`key_valid`) pooled as a zero, so no hidden token moves a pick; a window of none but
     # hidden keys scores nothing, and a block of none is no optional pick (the forced ones stand).
     pooled_keys = key.astype(jnp.float32)
@@ -452,7 +458,15 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     padded = jnp.pad(weights, ((0, 0), (0, 0), (0, 0), (0, max(0, (blocks - 1) * step + span - windows))))
     scores = jax.lax.reduce_window(padded, -jnp.inf, jax.lax.max, (1, 1, 1, span), (1, 1, 1, step),
                                    "VALID")[..., :blocks]
-    return top_k_selection(scores, earlier, top_k, forced=forced)
+    # A block no window the query reaches covers is no candidate (its score no weight's: 0 for none, which
+    # took a slot where padding added a window no query reached, train 1359's F3), so padding past a row's
+    # keys never moves its picks.
+    seen = reach if reach.ndim == 2 else reach[:, 0]
+    covered = jnp.pad(jnp.broadcast_to(seen, (*scores.shape[:-1], windows)).astype(jnp.int32),
+                      ((0, 0),) * (scores.ndim - 1) + ((0, max(0, (blocks - 1) * step + span - windows)),))
+    reached = jax.lax.reduce_window(covered, 0, jax.lax.max, (1,) * (scores.ndim - 1) + (span,),
+                                    (1,) * (scores.ndim - 1) + (step,), "VALID")[..., :blocks] > 0
+    return top_k_selection(scores, earlier & reached, optional, forced=forced)
 
 
 INFLLM_DENSE_BELOW = 8192
@@ -469,9 +483,10 @@ def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, bloc
                      scale_logits: bool = False, key_valid: jax.Array | None = None,
                      sinks: jax.Array | None = None) -> jax.Array:
     """InfLLM-V2's attention (kernel-templates.md §A row 60): a call over fewer than `dense_below` keys the
-    plain causal call; a longer one each query's selected blocks (`infllm_selection`: the `top_k` of its
-    earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the `local`
-    ending at its own forced) through the template's indexed form (`selected_attention`), reading those
+    plain causal call; a longer one each query's selected blocks (`infllm_selection`: `top_k` in all, the top
+    of its earlier blocks of `block` by its group's two-window pooled scores, the first `initial` and the
+    `local` ending at its own forced) through the template's indexed form (`selected_attention`), reading
+    those
     blocks' keys alone. `query` `[B, Q, G * h, D]`, `key` and `value` `[B, K, G, D]`, a causal call whose
     queries are its keys, its rows and heads whole: the call's arguments past them its numerics alone
     (`dtype`, `precision`, `force_fp32_for_softmax`, `wide_logits`, `softcap`, `scale_logits`), which both
@@ -589,19 +604,19 @@ class BlockSparseSelfAttention(CausalSelfAttention):
 
     def _infllm(self, query, key, value, masking, append, sinks):
         """InfLLM-V2's attention over the call's own tokens (`infllm_attention`: dense below its cut, its
-        selected blocks of `block`, `top_k` of them, past it), a row one document: its hidden tokens (a
-        right-padded row's, `_causal_implies_right_padding`) it reads as such, pooled as zeros and its cut
-        taken at its real keys' count; a packed row's documents or a cache's slots it refuses. `sinks` join
-        both branches."""
-        if append is not None or masking.documents is not None:
+        selected blocks of `block`, `top_k` of them in all, past it), a row one document: its hidden tokens
+        (a right-padded row's, by its validity or its one document's ids) it reads as such, pooled as zeros
+        and its cut taken at its real keys' count; a packed row's documents or a cache's slots it refuses.
+        `sinks` join both branches."""
+        if append is not None or (masking.documents is not None and masking.max_segments != 1):
             raise ValueError(f"{self.name}: InfLLM-V2's selection reads a row of one document's tokens, its "
                              "own: no cache or packed documents")
-        valid = (None if masking.valid is None
-                 else jnp.broadcast_to(jnp.asarray(masking.valid, bool), key.shape[:2]))
-        # The mixer's `top_k` counts every block a query reads, its own among them, as MoBA's and MSA's
-        # do: InfLLM-V2's first block and its own are forced, its top by score the rest (row 13720).
-        return infllm_attention(query, key, value, block=self.block,
-                                top_k=self.top_k - INFLLM_INITIAL - INFLLM_LOCAL,
+        # A row's real keys: its validity where stated, else its one document's ids, its padding 0 (a
+        # right-padded row of `lm(..., segments=1)`'s, train 1359's F2).
+        real = masking.valid if masking.valid is not None else (
+            None if masking.documents is None else jnp.asarray(masking.documents) != 0)
+        valid = None if real is None else jnp.broadcast_to(jnp.asarray(real, bool), key.shape[:2])
+        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k,
                                 dense_below=self.dense_below, key_valid=valid, sinks=sinks,
                                 dtype=self.ctx.dtype,
                                 precision=self.ctx.precision,
@@ -704,10 +719,10 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")
-        forced = INFLLM_INITIAL + INFLLM_LOCAL
-        if self.selection == "infllm" and self.top_k < forced:
+        if self.selection == "infllm" and self.top_k < INFLLM_INITIAL + INFLLM_LOCAL:
             raise ValueError(f"InfLLM-V2's selection forces each query's first and own blocks, and top_k "
-                             f"counts them: a top_k of {forced} or more, not {self.top_k}")
+                             f"counts them: a top_k of {INFLLM_INITIAL + INFLLM_LOCAL} or more, not "
+                             f"{self.top_k}")
         if self.alibi or self.bidirectional_images or self.bidirectional_blocks:
             raise ValueError("block_sparse_attention adds no ALiBi bias and reads no image or block whole")
         ctx.refuse("block_sparse_attention", {

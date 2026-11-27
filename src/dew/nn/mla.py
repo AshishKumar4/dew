@@ -171,14 +171,17 @@ def indexer_log_target(query, key, keep, scale: float, *, dtype=None, precision=
     keep = jnp.broadcast_to(keep, (batch, length, total))
     seen = jnp.any(keep, axis=-1, keepdims=True)
     allowed = keep | ~seen
-    query = jnp.moveaxis(jax.lax.stop_gradient(query).astype(wide) * scale, 2, 0)
+    query = jnp.moveaxis(jax.lax.stop_gradient(query).astype(wide), 2, 0)
     key = jnp.moveaxis(jax.lax.stop_gradient(key).astype(wide), 2, 0)
 
     def masses(q, k):
         # A head's log-softmax over the allowed keys, -inf at the others; over a row that allows none, uniform
         # over every key, as MaxText's and the paper's masked softmax gives it (`allowed`).
-        logits = jnp.where(allowed, jnp.where(seen, float32_einsum('bsd,btd->bst', q, k, precision=precision),
-                                              0), -jnp.inf)
+        # The attention's logits as it forms them: the product of the query and key at `precision`, then
+        # the scale (a scaled query rounded to a narrowing preset's bf16 before its product, 0.70703125 for
+        # 2^-0.5, train 1359's F1).
+        product = float32_einsum('bsd,btd->bst', q, k, precision=precision) * jnp.asarray(scale, wide)
+        logits = jnp.where(allowed, jnp.where(seen, product, 0), -jnp.inf)
         peak = jnp.max(logits, axis=-1, keepdims=True)
         spread = jnp.log(jnp.sum(jnp.exp(logits - peak), axis=-1, keepdims=True))
         return logits - peak - spread
