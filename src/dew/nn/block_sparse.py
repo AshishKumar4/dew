@@ -390,8 +390,15 @@ INFLLM_STRIDE = 16
 """InfLLM-V2's pooling stride (arXiv 2509.24663 §3.3: windows of 32 keys every 16)."""
 
 
+INFLLM_INITIAL = 1
+"""The leading blocks InfLLM-V2's selection forces every query (arXiv 2509.24663 §3.3)."""
+
+INFLLM_LOCAL = 1
+"""The blocks ending at a query's own that InfLLM-V2's selection forces it."""
+
+
 def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int = 64, kernel: int = 32,
-                     stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1,
+                     stride: int = INFLLM_STRIDE, initial: int = INFLLM_INITIAL, local: int = INFLLM_LOCAL,
                      key_valid: jax.Array | None = None) -> jax.Array:
     """InfLLM-V2's selection (arXiv 2509.24663 §3.3): keys mean-pooled by a window of `kernel` every `stride`
     into compressed keys (eq. 4), each head's softmax of its query against the compressed keys whose window
@@ -445,17 +452,14 @@ def infllm_selection(query: jax.Array, key: jax.Array, *, block: int, top_k: int
     return top_k_selection(scores, earlier, top_k, forced=forced)
 
 
-INFLLM_FORCED = 2
-"""The blocks InfLLM-V2's selection forces a query (`infllm_selection`'s defaults, `initial` and `local` 1
-each): the first and its own."""
-
 INFLLM_DENSE_BELOW = 8192
 """The keys below which InfLLM-V2 attends densely (kernel-templates.md §A row 60), the plain causal call: its
 short calls' path, a selection of 64 blocks of 64 near every key of them anyway."""
 
 
 def infllm_attention(query: jax.Array, key: jax.Array, value: jax.Array, *, block: int = 64, top_k: int = 64,
-                     kernel: int = 32, stride: int = INFLLM_STRIDE, initial: int = 1, local: int = 1,
+                     kernel: int = 32, stride: int = INFLLM_STRIDE, initial: int = INFLLM_INITIAL,
+                     local: int = INFLLM_LOCAL,
                      dense_below: int = INFLLM_DENSE_BELOW, implementation: AttentionImpl = "auto",
                      dtype=None, precision=None, force_fp32_for_softmax: bool = True,
                      wide_logits: bool = False, softcap: float | None = None,
@@ -593,7 +597,8 @@ class BlockSparseSelfAttention(CausalSelfAttention):
                  else jnp.broadcast_to(jnp.asarray(masking.valid, bool), key.shape[:2]))
         # The mixer's `top_k` counts every block a query reads, its own among them, as MoBA's and MSA's
         # do: InfLLM-V2's first block and its own are forced, its top by score the rest (row 13720).
-        return infllm_attention(query, key, value, block=self.block, top_k=self.top_k - INFLLM_FORCED,
+        return infllm_attention(query, key, value, block=self.block,
+                                top_k=self.top_k - INFLLM_INITIAL - INFLLM_LOCAL,
                                 dense_below=self.dense_below, key_valid=valid, sinks=sinks,
                                 dtype=self.ctx.dtype,
                                 precision=self.ctx.precision,
@@ -696,10 +701,10 @@ class BlockSparseAttentionMixer(AttentionMixer):
         if self.block < 1 or self.top_k < 1:
             raise ValueError(f"block_sparse_attention takes a positive block and top_k, got {self.block} and "
                              f"{self.top_k}")
-        if self.selection == "infllm" and self.top_k <= INFLLM_FORCED:
+        forced = INFLLM_INITIAL + INFLLM_LOCAL
+        if self.selection == "infllm" and self.top_k < forced:
             raise ValueError(f"InfLLM-V2's selection forces each query's first and own blocks, and top_k "
-                             f"counts them: one by score takes a top_k of {INFLLM_FORCED + 1} or more, not "
-                             f"{self.top_k}")
+                             f"counts them: a top_k of {forced} or more, not {self.top_k}")
         if self.alibi or self.bidirectional_images or self.bidirectional_blocks:
             raise ValueError("block_sparse_attention adds no ALiBi bias and reads no image or block whole")
         ctx.refuse("block_sparse_attention", {

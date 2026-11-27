@@ -728,7 +728,7 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
                                   np.asarray(dense.apply(params, tokens)))
     # Past its cut (64 keys over a cut of 32), each query reads its selected blocks alone, three in all (its
     # top_k, row 13720): the first, its own and its top one of those between, not the dense decoder's every
-    # key; a top_k of no block past the forced two it refuses.
+    # key; a top_k below the forced two it refuses.
     sparse = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=3,
                                      dense_below=32), dtype="float32")
     selected = np.asarray(sparse.apply(params, tokens))
@@ -737,8 +737,15 @@ def test_an_infllm_decoder_below_its_cut_is_the_dense_decoder():
         tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=4)).init(
             jax.random.key(1), tokens)
     with pytest.raises(ValueError):
-        tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2)).init(
+        tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=1)).init(
             jax.random.key(1), tokens)
+    # A top_k of its forced blocks alone: each query reads its first and own blocks, no other (the 64 keys'
+    # third block, the last query's top by score at a top_k of 3, read by none).
+    forced = tiny(mixer=mixers.build("block_sparse_attention", selection="infllm", block=16, top_k=2,
+                                     dense_below=32), dtype="float32")
+    third = tokens.at[:, 32:48].set((tokens[:, 32:48] + 5) % VOCAB)
+    np.testing.assert_array_equal(np.asarray(forced.apply(params, tokens))[:, 48:],
+                                  np.asarray(forced.apply(params, third))[:, 48:])
     padded = jnp.ones(tokens.shape, bool).at[:, -1].set(False)
     forward = jax.jit(lambda row: sparse.apply(params, row, coordinates=coordinates(valid=padded,
                                                                                     right_padded=True)))
