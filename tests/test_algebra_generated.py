@@ -76,3 +76,23 @@ def test_a_compensated_or_scaled_state_keeps_the_written_merge():
     with generation.chosen(generated="generated"), generation.assumed("sm90"), generated.taken() as counts:
         attention_algebra.merge(attention_algebra.GENERATED_MERGE, scaled, second)
     assert counts == {(MERGE, "another static program"): 1}
+
+
+def test_the_generated_merge_takes_an_empty_slice_as_its_identity():
+    """A slice of no keys (a decode split's empty tail: its maximum -inf, its sums zero) merged either side of
+    a state gives that state back, and two give an empty state, finite: the generated body floors each
+    maximum as the written merge does, so no -inf - -inf reaches its exponentials."""
+    state, _ = _states(32, 64)
+    empty = attention_algebra.Partial(np.zeros((32, 64), np.float32), np.full(32, -np.inf, np.float32),
+                                      np.zeros(32, np.float32))
+    spec = attention_algebra.GENERATED_MERGE
+    with generation.chosen(generated="generated"), generation.assumed("sm90"), generated.taken() as counts:
+        merges = [attention_algebra.merge(spec, empty, state), attention_algebra.merge(spec, state, empty),
+                  attention_algebra.merge(spec, empty, empty)]
+    assert counts == {(MERGE, generated.GENERATED): 3}
+    for merged in merges[:2]:
+        np.testing.assert_array_equal(merged.acc, state.acc)
+        np.testing.assert_array_equal(merged.m, state.m)
+        np.testing.assert_array_equal(merged.total, state.total)
+    assert np.all(np.isfinite(merges[2].acc)) and not np.any(merges[2].acc)
+    assert not np.any(merges[2].total)
