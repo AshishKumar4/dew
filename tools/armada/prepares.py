@@ -307,10 +307,23 @@ def skipped_whole(record: Mapping, untried: set[str]) -> bool:
     and shares a skipped one's start is never taken for it."""
     if "test" in record:
         return record["test"] in untried
-    for test in untried:
-        if record["identity"].startswith(f"{test} @ "):
-            if " @ " not in record["identity"][len(test) + 3:]:
-                return True
+    return any(record["identity"].startswith(f"{test} @ ") and " @ " not in record["identity"][len(test) + 3:]
+               for test in untried)
+
+
+def capped_alike(record: Mapping, untried: set[tuple[str, str]]) -> bool:
+    """Whether a cell `record` is one main's run left at its prepare's cap (`untried`, the (test, cell label)
+    pairs of main's labeled capped cells): the same test's same labeled cell, wherever this run reached it.
+    Its structured test and label, exactly; a reused row's identity alone only where it reads one way, the
+    test, " @ ", a where holding no " @ ", then the label (`identity`), so no sibling cell and no parameter
+    id that shares a start is taken for it."""
+    if "test" in record:
+        return (record["test"], record.get("cell")) in untried
+    for test, cell in untried:
+        named = record["identity"]
+        if (named.startswith(f"{test} @ ") and named.endswith(f" [{cell}]")
+                and " @ " not in named[len(test) + 3:-len(cell) - 3]):
+            return True
     return False
 
 
@@ -336,7 +349,10 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
     time cap left (where `capped_at`, tests/tier_wire.py's `CAPPED`) is named and counted (`capped`, kept
     with a reused row) but judged by neither, and a test main's run skipped whole at its cap (its node id at
     the cap, unlabeled: tests/conftest.py's skip) was never tried there, so this run's cells of it are held
-    to nothing, as main's runs are where main has none; a cell or site main capped exempts no sibling."""
+    to nothing, as main's runs are where main has none. A cell main's run left at its cap (labeled) was
+    never tried there either: this run's same cell of that test, wherever it reached it, is held to nothing
+    (`capped_alike`; 2026-11-27: train 1352 capped ten cells of test_gpu_attention.py's group, and the next
+    uncapped run of it read them as new); it exempts no sibling, nor does a site main capped."""
     judged = []
     for found in rows:
         own = unprepared.get(file_of(found["name"]), [])
@@ -354,8 +370,11 @@ def graded(rows: list[dict], unprepared: Mapping[str, list[dict]], before: set[s
             # alike at main's commit (2026-11-25): no run of main's says how they go.
             whole = f" @ {capped_at}"
             untried = {cell[:-len(whole)] for cell in before if cell.endswith(whole)}
+            labeled = f" @ {capped_at} ["
+            untried_cells = {(cell[:cell.rfind(labeled)], cell[cell.rfind(labeled) + len(labeled):-1])
+                             for cell in before if labeled in cell and cell.endswith("]")}
             new = [record for record in judged_ if record["identity"] not in before
-                   and not skipped_whole(record, untried)]
+                   and not skipped_whole(record, untried) and not capped_alike(record, untried_cells)]
             said = [f"unprepared in its {generation} prepare, which main's did not leave so: "
                     f"{record['identity']}" + (f": {record['error']}" if record.get("error") else "")
                     for record in new]
