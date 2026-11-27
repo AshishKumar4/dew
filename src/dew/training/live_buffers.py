@@ -387,7 +387,7 @@ def _stacked(loop, element: int, written, instructions,
     # A loop's config is XLA's JSON where XLA wrote it, an opaque string where a module's text gave one,
     # whose loop states no trip count to read: its stack is named by none.
     known = None
-    with contextlib.suppress(json.JSONDecodeError):
+    with contextlib.suppress(ValueError):  # JSON's, or bytes no text decodes
         known = json.loads(loop.backend_config or "{}")
     if not isinstance(known, dict) or not {"known_trip_count", "known_init_step",
                                            "known_induction_variable"} <= known.keys():

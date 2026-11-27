@@ -238,6 +238,7 @@ def test_a_loops_state_is_named_only_by_a_scans_whole_stack():
                               "blank": (), "tardy": ()}
     # A config XLA's parser holds as an opaque string states no trip count: no stack is named by it.
     assert _loop_names(4, 'backend_config="opaque"') == _loop_names(2)
+    assert _loop_names(4, 'backend_config="\\377"') == _loop_names(2)
 
 
 def test_a_residual_named_through_reshapes_names_the_buffer_they_bitcast():

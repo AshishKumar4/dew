@@ -45,9 +45,6 @@ class HloModule(Protocol):
     """An HLO module as XLA's bindings hold one (a compiled executable's `hlo_modules()`, a lowering's
     `compiler_ir("hlo")`, `module_from_text`'s)."""
 
-    @property
-    def name(self) -> str: ...
-
     def as_serialized_hlo_module_proto(self) -> bytes: ...
 
 
