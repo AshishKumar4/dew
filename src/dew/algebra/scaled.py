@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import importlib
 import math
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 
 import jax
@@ -183,23 +184,36 @@ MADE: dict[core.Primitive, tuple[Callable, bool]] = {}
 """Every operation of the construct's own (`primitive`), the law's in `dew.algebra.means` among them: its
 value, the function its default lowering runs, and whether it returns several values, by the primitive,
 so a lowering of a launch that runs the construct's functions (a kernel template's) holds each as it is
-made."""
+made. Read whole through `made`."""
 _TRITON_REGISTERED: set[core.Primitive] = set()
 
 
+def made() -> Mapping[core.Primitive, tuple[Callable, bool]]:
+    """Every operation of the construct's own (`MADE`), whatever the process has imported: each module making
+    one (`means`' merge, `ratios`' ratio) imported first. A kernel registers their lowerings from it at its
+    first launch (`dew.nn.kernels.launches`), every one a later kernel reaches among them, so no registry a
+    lowering is keyed by changes once a kernel has lowered (the Pallas Mosaic GPU lowering cache's identity,
+    made again and read by thread timing where a rule was registered at a later launch: row 13752)."""
+    # The modules making the construct's operations beside this one, each as it is imported.
+    importlib.import_module("dew.algebra.means")
+    importlib.import_module("dew.algebra.ratios")
+    return MADE
+
+
 def triton_lowerings() -> None:
-    """Register Pallas Triton lowerings for every primitive in `MADE` not yet registered (row 9794).
-    Called lazily on Pallas launch (`dew.nn.kernels.launches.pallas_call`) so importing `scaled` loads no
-    Pallas Triton lowering machinery."""
-    if len(_TRITON_REGISTERED) == len(MADE):
+    """Register Pallas Triton lowerings for every primitive of the construct (`made`) not yet registered (row
+    9794). Called lazily on Pallas launch (`dew.nn.kernels.launches.pallas_call`) so importing `scaled` loads
+    no Pallas Triton lowering machinery."""
+    operations = made()
+    if len(_TRITON_REGISTERED) == len(operations):
         return
     from jax._src.pallas.triton import lowering as triton_lowering
 
-    for made, (value, several) in MADE.items():
-        if made not in _TRITON_REGISTERED:
-            triton_lowering.register_lowering(made)(triton_lowering.lower_fun(value,
-                                                                              multiple_results=several))
-            _TRITON_REGISTERED.add(made)
+    for operation, (value, several) in operations.items():
+        if operation not in _TRITON_REGISTERED:
+            triton_lowering.register_lowering(operation)(triton_lowering.lower_fun(value,
+                                                                                   multiple_results=several))
+            _TRITON_REGISTERED.add(operation)
 
 
 def _alike(value: Callable) -> Callable:
@@ -223,18 +237,18 @@ def primitive(name: str, value: Callable, typed: Callable, batched: Callable | N
     named), returning `several` values; a derivative and a transpose, where it has them, registered beside
     it (`ratios.ratio_p`). Its parameters are values, held at bind (`_Primitive`); it is recorded with its
     value (`MADE`)."""
-    made = _Primitive(name)
-    made.multiple_results = several
-    made.def_impl(partial(dispatch.apply_primitive, made))
-    made.def_abstract_eval(typed)
-    mlir.register_lowering(made, mlir.lower_fun(_alike(value), multiple_results=several))
+    operation = _Primitive(name)
+    operation.multiple_results = several
+    operation.def_impl(partial(dispatch.apply_primitive, operation))
+    operation.def_abstract_eval(typed)
+    mlir.register_lowering(operation, mlir.lower_fun(_alike(value), multiple_results=several))
     if batched is None:
-        batching.defbroadcasting(made)
-        register_entrywise(made)
+        batching.defbroadcasting(operation)
+        register_entrywise(operation)
     else:
-        batching.primitive_batchers[made] = batched
-    MADE[made] = (value, several)
-    return made
+        batching.primitive_batchers[operation] = batched
+    MADE[operation] = (value, several)
+    return operation
 
 
 def along_axis(bound: Callable[..., core.Primitive]) -> Callable:
