@@ -113,48 +113,67 @@ def enqueued(capture, annotation: str) -> dict[int, set[int]]:
     """The TPU programs a host call enqueued within its event `annotation` (a `jax.profiler.TraceAnnotation`)
     in `capture` (`newest`'s), by device ordinal: each run id its `DoEnqueueProgram`s state, which the
     device's run of it on `XLA Modules` states too. A v5e's XProf links the call to them by its flows: the
-    annotation's thread holds the PJRT C API's execute linkage (its `_pt`/`_p` flow), the runtime's thread
-    the execute that consumes it (its `_ct`/`_c`), and the call's work is that execute's span and, flow by
-    flow, the span of each event consuming a flow an event of it produces, on whatever thread: an enqueue
-    the execute issues itself (M-FS-104) or one a queue's thread issues once its inputs' transfer is done
-    (`tpu::System::Execute` to `=>IssueSequencedEvent`, M-FS-105: an executable taking a tuple index
-    table). No enqueue another call's work holds is the call's. The host's clock is not the device's, so the
-    host's events alone are read by time, each one's stats only once it falls within the annotation."""
-    hosts = [list(line.events) for plane in capture.planes if plane.name.startswith("/host:")
-             for line in plane.lines]
-    spans = [(event.start_ns, event.start_ns + event.duration_ns) for events in hosts for event in events
-             if event.name == annotation]
-    # The events each thread holds within the annotation, each with its stats, read once.
-    during = [[(event, dict(event.stats)) for event in events
-               if any(lo <= event.start_ns <= hi for lo, hi in spans)] for events in hosts]
-    consumers: dict[tuple, list] = {}
-    for thread, events in enumerate(during):
-        for event, stats in events:
-            if "_c" in stats:
-                consumers.setdefault((stats.get("_ct"), stats["_c"]), []).append((thread, event))
-
-    def within(event, outer) -> bool:
-        return outer.start_ns <= event.start_ns and event.start_ns + event.duration_ns <= (
-            outer.start_ns + outer.duration_ns)
-
-    linked = {(stats.get("_pt"), stats["_p"]) for events in during for event, stats in events
-              if event.name == f"{EXECUTE} linkage" and "_p" in stats}
-    work = [(thread, event) for flow in linked for thread, event in consumers.get(flow, ())
+    annotation's own thread holds, within it, the PJRT C API's execute linkage (its `_pt`/`_p` flow), the
+    runtime's thread the execute that consumes it (its `_ct`/`_c`), and the call's work is that execute's
+    span and, flow by flow, the span of each event consuming a flow an event of it produces, on whatever
+    thread: an enqueue the execute issues itself (M-FS-104) or one a queue's thread issues once its inputs'
+    transfer is done (`tpu::System::Execute` to `=>IssueSequencedEvent`, M-FS-105, M-FS-106: an executable
+    taking a tuple index table). Another call's linkage, on another thread, roots none of it. The host's
+    clock is not the device's, so the host's events alone are read by time (`_flows`)."""
+    roots, consumers, marks = _flows(capture, annotation)
+    work = [(thread, event) for flow in roots for thread, event in consumers.get(flow, ())
             if event.name == EXECUTE]
-    followed = set(linked)
+    followed = set(roots)
     found: dict[int, set[int]] = {}
     while work:
         thread, outer = work.pop()
-        for event, stats in during[thread]:
-            if not within(event, outer):
+        for event, produced, run in marks[thread]:
+            if not _within(event, outer):
                 continue
-            device, run = stats.get("device_ordinal"), stats.get("run_id")
-            if event.name == "DoEnqueueProgram" and isinstance(device, int) and isinstance(run, int):
-                found.setdefault(device, set()).add(run)
-            if "_p" in stats and (flow := (stats.get("_pt"), stats["_p"])) not in followed:
-                followed.add(flow)
-                work += consumers.get(flow, ())
+            if run is not None:
+                found.setdefault(run[0], set()).add(run[1])
+            if produced is not None and produced not in followed:
+                followed.add(produced)
+                work += consumers.get(produced, ())
     return found
+
+
+def _within(event, outer) -> bool:
+    return outer.start_ns <= event.start_ns and event.start_ns + event.duration_ns <= (
+        outer.start_ns + outer.duration_ns)
+
+
+def _flows(capture, annotation: str) -> tuple[set, dict[tuple, list], list[list]]:
+    """What `enqueued` walks of the host's events starting within an `annotation` event's time, each one's
+    stats read once: the flows of the execute linkages within the annotation on its own thread (the call's
+    roots), every event consuming a flow by that flow (with its thread's index), and each thread's events
+    that produce a flow or enqueue a run, each `(event, flow or None, (device, run id) or None)`."""
+    threads = [list(line.events) for plane in capture.planes if plane.name.startswith("/host:")
+               for line in plane.lines]
+    annotated = [[event for event in events if event.name == annotation] for events in threads]
+    spans = [(event.start_ns, event.start_ns + event.duration_ns) for events in annotated for event in events]
+    roots: set = set()
+    consumers: dict[tuple, list] = {}
+    marks: list[list] = []
+    for thread, events in enumerate(threads):
+        held = []
+        for event in events:
+            if not any(lo <= event.start_ns <= hi for lo, hi in spans):
+                continue
+            stats = dict(event.stats)
+            if "_c" in stats:
+                consumers.setdefault((stats.get("_ct"), stats["_c"]), []).append((thread, event))
+            produced = (stats.get("_pt"), stats["_p"]) if "_p" in stats else None
+            if produced is not None and event.name == f"{EXECUTE} linkage" and any(
+                    _within(event, outer) for outer in annotated[thread]):
+                roots.add(produced)
+            device, run = stats.get("device_ordinal"), stats.get("run_id")
+            ran = ((device, run) if event.name == "DoEnqueueProgram" and isinstance(device, int)
+                   and isinstance(run, int) else None)
+            if produced is not None or ran is not None:
+                held.append((event, produced, ran))
+        marks.append(held)
+    return roots, consumers, marks
 
 
 def run_of(event: Kernel) -> int | None:

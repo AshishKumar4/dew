@@ -444,12 +444,13 @@ def _tpu_capture(directory, ops, runs, read=None, *, deferred: bool = False):
     module name, start ms, end ms, program id), on its `XLA Modules` line, an event of a program id carrying
     it as XLA's program_id stat and one of None no stat, as a v5e's XProf writes both (M-FS-90: a run's
     program the id its name carries, its ops none); the i-th run's run id i + 1 (its `run_id` stat), and on
-    the host's plane the read's annotation (`READ`) over the PJRT C API's execute linkage, the runtime
-    thread's execute the linkage flows to holding a `DoEnqueueProgram` of each run `read` names by run id
-    (every run where None), and another thread's enqueue of each other run within the annotation's span, as
-    a v5e's XProf ties a call to its runs (M-FS-104); where `deferred`, the execute's enqueues on a queue's
-    thread instead, within the event consuming a flow the execute's `tpu::System::Execute` produces, as an
-    executable taking a tuple index table enqueues once its transfer is done (M-FS-105)."""
+    the host's plane two calls as a v5e's XProf ties each to its runs (M-FS-104): the read's annotation
+    (`READ`) over the PJRT C API's execute linkage on its thread, another call's linkage on another thread
+    within its time, and on the runtime's thread each linkage's execute, the read's enqueueing each run
+    `read` names by run id (every run where None), the other's each other run. Where `deferred`, each
+    execute's system execute flows instead to an issue on one queue's thread holding its enqueues, after
+    the execute has ended, as an executable taking a tuple index table enqueues once its transfer is done
+    (M-FS-105, M-FS-106)."""
     from jax.profiler import ProfileData
 
     names = sorted({name for _, name, *_ in [*ops, *runs]})
@@ -476,20 +477,26 @@ def _tpu_capture(directory, ops, runs, read=None, *, deferred: bool = False):
               for plane, device in enumerate(sorted({device for device, *_ in [*ops, *runs]}), 1)]
     ours = range(1, len(runs) + 1) if read is None else read
 
-    def enqueues(*, mine: bool) -> str:
-        return "".join(event(2, 1.0 + 0.01 * index, 1.001 + 0.01 * index, run_id=index,
+    def enqueues(at: float, *, mine: bool) -> str:
+        return "".join(event(2, at + 0.01 * index, at + 0.001 + 0.01 * index, run_id=index,
                              device_ordinal=runs[index - 1][0])
                        for index in range(1, len(runs) + 1) if (index in ours) == mine)
 
-    # The execute's own enqueues, or its system execute's flow to a queue's issue holding them.
-    executed = (event(5, 0.75, 0.8, _pt=7, _p=9) if deferred else enqueues(mine=True))
-    queued = (event(6, 0.9, 2.0, _ct=7, _c=9) + enqueues(mine=True)) if deferred else ""
+    def call(flow: int, start: float, *, mine: bool) -> tuple[str, str]:
+        # A call's execute, consuming its linkage's flow, and what the queue's thread issues for it.
+        executed = event(4, start, start + 0.15, _ct=14, _c=flow)
+        if not deferred:
+            return executed + enqueues(start + 0.05, mine=mine), ""
+        return (executed + event(5, start + 0.05, start + 0.1, _pt=7, _p=flow + 4),
+                event(6, start + 0.2, start + 0.5, _ct=7, _c=flow + 4) + enqueues(start + 0.25, mine=mine))
+
+    (executes, issues), (theirs, their_issues) = call(5, 0.7, mine=True), call(6, 3.0, mine=False)
     host = ('planes { id: 99 name: "/host:CPU" '
             'lines { id: 1 name: "python3" timestamp_ns: 0 ' + event(1, 0.0, 10.0)
             + event(3, 0.5, 0.6, _pt=14, _p=5) + '} '
-            'lines { id: 2 name: "main" timestamp_ns: 0 ' + event(4, 0.7, 9.0, _ct=14, _c=5) + executed
-            + '} lines { id: 3 name: "foreign" timestamp_ns: 0 ' + enqueues(mine=False) + '} '
-            'lines { id: 4 name: "queue" timestamp_ns: 0 ' + queued + '} '
+            'lines { id: 2 name: "another python" timestamp_ns: 0 ' + event(3, 0.5, 0.6, _pt=14, _p=6) + '} '
+            'lines { id: 3 name: "main" timestamp_ns: 0 ' + executes + theirs + '} '
+            'lines { id: 4 name: "queue" timestamp_ns: 0 ' + issues + their_issues + '} '
             f'event_metadata {{ key: 1 value {{ id: 1 name: "{READ}" }} }} '
             'event_metadata { key: 2 value { id: 2 name: "DoEnqueueProgram" } } '
             'event_metadata { key: 3 value { id: 3 name: "PJRT_LoadedExecutable_Execute linkage" } } '
@@ -522,8 +529,9 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
         ("fusion.1", 0.25), ("custom-call.2", 0.75)]
     assert [op.name for op in tpu_ops(one, {0, 1}, "jit_run", annotation=READ)] == [
         "fusion.1", "custom-call.2", "fusion.9"]
-    # Its enqueue deferred to a queue's thread (a tuple index table's transfer first, M-FS-105): read through
-    # the flow its execute produces, a foreign thread's enqueue beside it still not the call's.
+    # Its enqueue deferred to a queue's thread (a tuple index table's transfer first, M-FS-105), after its
+    # execute has ended: read through the flow its execute produces, the other call's issue on the same
+    # queue still not the call's.
     deferred = tmp_path / "deferred"
     _tpu_capture(deferred, ops, runs, deferred=True)
     assert [op.name for op in tpu_ops(deferred, {0, 1}, "jit_run", annotation=READ)] == [
@@ -532,8 +540,8 @@ def test_a_tpu_call_is_timed_by_its_own_programs_run_on_its_own_devices(tmp_path
     _tpu_capture(deferred_foreign, ops, runs, read=(3,), deferred=True)
     with pytest.raises(NoKernels):
         tpu_ops(deferred_foreign, {0}, "jit_run", annotation=READ)
-    # A same-named executable's run the read's call did not enqueue (another thread's, within the read's
-    # annotation): no run of the call's, though its name is the call's module's.
+    # A same-named executable's run the read's call did not enqueue (another call's, its linkage on another
+    # thread within the read's annotation): no run of the call's, though its name is the call's module's.
     foreign = tmp_path / "foreign"
     _tpu_capture(foreign, ops, runs, read=(3,))
     with pytest.raises(NoKernels):
