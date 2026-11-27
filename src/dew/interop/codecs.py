@@ -2006,14 +2006,13 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
             zeroed = (effective == 0) & ~kept
             if np.any(zeroed & (wide != 0)):
                 raise ValueError(f"{name} has a zero NVFP4 scale and trained values outside its grid")
-            quotients = np.divide(wide, effective, out=np.zeros_like(effective), where=effective != 0)
+            # A zero scale's quotient a zero of the value's sign over the scale's, which the encoder packs.
+            signed = np.where(zeroed & (np.signbit(wide) ^ np.signbit(effective)), -0.0, 0.0)
+            quotients = np.divide(wide, effective, out=signed, where=effective != 0)
             fresh = encode_e2m1(quotients, ties='even')
-            signs = (np.signbit(wide) ^ np.signbit(effective)).astype(np.uint8) << 3
-            fresh_low = np.where(zeroed[..., 0::2], signs[..., 0::2], fresh & 0x0f)
-            fresh_high = np.where(zeroed[..., 1::2], signs[..., 1::2] << 4, fresh & 0xf0)
             # Each byte's half the stored code keeps from the stored byte, the other from the fresh one.
-            low = np.where(kept[..., 0::2], stored & 0x0f, fresh_low)
-            high = np.where(kept[..., 1::2], stored & 0xf0, fresh_high)
+            low = np.where(kept[..., 0::2], stored & 0x0f, fresh & 0x0f)
+            high = np.where(kept[..., 1::2], stored & 0xf0, fresh & 0xf0)
             packed = (low | high).astype(np.uint8)
         return {name: packed.view(np.asarray(original).dtype), name + "_scale": np.asarray(scale),
                 name + "_amax": np.asarray(amax), name + "_outer_scale_denominator": np.asarray(denominator)}
