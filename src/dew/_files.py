@@ -283,9 +283,15 @@ def _removed(tree: Path) -> None:
     if not os.path.lexists(tree) or os.path.islink(tree):
         return
 
-    def retried(remove: Callable[[str], None], path: str, failure: BaseException) -> None:
-        folder = os.path.dirname(path)
-        if not isinstance(failure, PermissionError) or os.access(folder, os.W_OK | os.X_OK):
+    root = os.path.abspath(tree)
+
+    def retried(remove: Callable[..., object], path: str, failure: BaseException) -> None:
+        # An entry's removal alone retried (no traversal, whose calls take more than a path), and only in a
+        # folder of the tree: its root's own parent, the release's, is never changed.
+        folder = os.path.dirname(os.path.abspath(path))
+        if (remove not in (os.unlink, os.rmdir) or not isinstance(failure, PermissionError)
+                or not (folder == root or folder.startswith(root + os.sep))
+                or os.access(folder, os.W_OK | os.X_OK)):
             return
         try:
             os.chmod(folder, 0o700)
