@@ -22,12 +22,17 @@ weigh far more than the decoder's weights: a tile of the logits (a fused head's 
 most of them, and the remat its layers' share."""
 
 
-def decoder(limit: int, remat: str | None = None, tiled: bool = False) -> Trainer:
+def decoder(limit: int, remat: str | None = None, tiled: bool = False, looped: bool = False) -> Trainer:
     """The decoder on a compile-only H100 whose allocator holds `limit` bytes, its step whole, recomputing
-    as its model's `remat` states, its head tiled where `tiled`."""
+    as its model's `remat` states, its head tiled where `tiled`; where `looped`, its middle layers looped
+    twice, the loss weighing each pass's exit alike (`pass_weights="mean"`)."""
+    from dew.nn.backbones.decoder_stack import Loop
+
     model = CausalTransformer(vocab_size=VOCAB, emb_features=128, num_layers=4, num_heads=2, mlp_features=512,
-                              max_seq_len=SEQ, **({} if remat is None else {"remat": remat}))
-    trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                              max_seq_len=SEQ, **({} if remat is None else {"remat": remat}),
+                              **({"loop": Loop(2, layers=(1, 3))} if looped else {}))
+    objective = LMObjective(model, seq_len=SEQ, **({"pass_weights": "mean"} if looped else {}))
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec().build(gpus("sm90", limit=limit)), split=1)
     if tiled:
         trainer.objective.tile_head()
@@ -42,10 +47,10 @@ def searched(trainer: Trainer) -> dict:
 
 
 @functools.cache
-def need(remat: str | None, tiled: bool = False) -> int:
-    """What the step needs at `remat`, its head tiled where `tiled`: a room past all less the headroom its
-    first compile left there."""
-    return ROOMY - searched(decoder(ROOMY, remat, tiled))["probes"][0]["headroom"]
+def need(remat: str | None, tiled: bool = False, looped: bool = False) -> int:
+    """What the step needs at `remat`, its head tiled where `tiled`, its layers looped where `looped`: a
+    room past all less the headroom its first compile left there."""
+    return ROOMY - searched(decoder(ROOMY, remat, tiled, looped))["probes"][0]["headroom"]
 
 
 @pytest.mark.parametrize(("remat", "tiled"), [("minimal", False), ("minimal", True)],
@@ -65,3 +70,16 @@ def test_a_tight_start_compiles_second_a_place_that_fits(tmp_path, monkeypatch, 
     plan = searched(decoder(room))
     probes = plan["probes"]
     assert [probe["fits"] for probe in probes] == [False, True], (probes, plan.get("jump"))
+
+
+def test_a_looped_decoder_reading_its_passes_apart_compiles_second_its_unfused_tile(tmp_path, monkeypatch):
+    """A looped decoder whose loss weighs each pass's exit takes its head's tile unfused, a tile of tokens by
+    columns per pass: on an H100 whose allocator holds what its step needs tiled, its second compile is its
+    tiled head and fits, priced by the tile it takes rather than a fused head's chunk over the whole
+    vocabulary (train 1387's P2)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    room = need(None, tiled=True, looped=True)
+    assert need(None, looped=True) > room
+    probes = searched(decoder(room, looped=True))["probes"]
+    assert [probe["fits"] for probe in probes] == [False, True], probes
+
