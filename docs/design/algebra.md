@@ -246,8 +246,9 @@ as Herbie weighs error against cost for floating-point expressions:
     is ranked, and none may be admitted; a proposal not as exact as the form as written, one past the
     float's range where it is finite, raises no bar).
 - **Among the candidates that meet it,** the generator takes the first in that order (§6.5): the cheapest by
-  time (§1.6) of the uncompensated ones, else the cheapest compensated one. A candidate that misses it is never
-  chosen, however cheap.
+  time (§1.6) of the uncompensated ones, else a compensated one, tried in the price order of the uncompensated
+  forms they compensate (`Candidate.seconds` is the uncompensated form's price). A candidate that misses it is
+  never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
 - **Stable rewrites** come mostly from dev time: `log(1 + x)` to `log1p(x)`, a KL in log space, a compensated or
   widened sum, `a − b` rearranged where `a` and `b` are near-equal sums. Two equal forms whose choice is decided by
