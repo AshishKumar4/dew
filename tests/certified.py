@@ -423,7 +423,7 @@ def _exp2_levels(operands, result, fmt, flushes):
                     np.where(impossible, UNREACHED, levels))
 
 
-def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.ndarray:
+def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None, given=None) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
     Accuracy and Stability of Numerical Algorithms, 2002, §3.1: n terms, at most n - 1 roundings on any
@@ -431,8 +431,12 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     Σ|terms|, in the allowance), plus what underflow loses past that relative bound at each rounding:
     where the lane flushes, a flushed partial's least normal; where it keeps subnormals, half their
     spacing (a product, or a sum carried wider and rounded into `fmt`). An empty sum is the additive
-    identity, +0. `counts`, where given, is each sum's own count of terms, its padding zeros left out (a
-    scatter's, whose elements take different numbers of updates)."""
+    identity, +0. A sum whose terms as given (`given`, the operands before a flushing lane reads them; a
+    lane may hand one term through unread) are exact zeros alone is exactly zero in any order, no rounding
+    below the normal range on its path: +0 where any term is +0 (the identity +0 beside it), -0 or +0 where
+    every term is -0 (whether a reduction starts from its identity or its first term), held exactly before
+    any slack (row 13544). `counts`, where given, is each sum's own count of terms, its padding zeros left
+    out (a scatter's, whose elements take different numbers of updates)."""
     native = np.asarray(native, np.float64)
     count = terms.shape[-1]
     if count == 0:
@@ -440,7 +444,13 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.nd
     error = np.abs(native - exact_sum(terms, -1))
     slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt,
                       underflow(fmt, flushes))
-    return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
+    held = np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
+    if given is None:
+        return held
+    zeros = np.asarray(given, np.float64)
+    negative_only = np.all(np.signbit(zeros), axis=-1)
+    zero_held = (native == 0) & (~np.signbit(native) | negative_only)
+    return np.where(np.all(zeros == 0, axis=-1), zero_held, held)
 
 
 def allowance(magnitude, count: int, fmt: Format, underflow: float):
@@ -998,8 +1008,11 @@ def _reduced_sum(params, operands, result, fmt):
         summed = _wrapping(lambda t: np.sum(t, axis=axes, dtype=np.uint64))
         return _bits(result) == _bits(summed(result, terms))
     flushes = lane().flushes
-    return _terms_hold(result, _flattened(np.moveaxis(_read(terms, flushes), axes,
-                                                     tuple(range(-len(axes), 0))), len(axes)), fmt, flushes)
+
+    def laid(values):
+        return _flattened(np.moveaxis(values, axes, tuple(range(-len(axes), 0))), len(axes))
+
+    return _terms_hold(result, laid(_read(terms, flushes)), fmt, flushes, given=laid(np.asarray(terms)))
 
 
 def _flattened(moved: np.ndarray, reduced: int) -> np.ndarray:
@@ -2271,7 +2284,9 @@ def _held(eqn, operands, results, findings, at) -> None:
 def assert_certified(fn, draw, label: str, *, seeds: int) -> None:
     """Check 2 of the gate: `fn` on `draw(seed)`'s inputs for each of `seeds`, run one primitive at a
     time (`certified`), every element of every equation within its own operation's contract and every
-    primitive covered by one."""
+    primitive covered by one. A count of seeds below one checks nothing and is refused (row 13546)."""
+    if seeds < 1:
+        raise ValueError(f"{label}: Check 2 runs over one seed or more, got {seeds}")
     for seed in range(seeds):
         _, findings = certified(fn, *draw(seed))
         assert not findings, f"{label}, seed {seed}: " + "; ".join(findings[:8])

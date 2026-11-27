@@ -882,14 +882,43 @@ def _truth_rows(truths, terms, *, xp):
     return found
 
 
+def _discrete_errors(reference, truth, xp):
+    """A discrete leaf's errors (integers, booleans), taken in its own representation before the gate's
+    float64 (`_laid`): its values' differences exact, where float64 rounds integers past 2^53 alike and
+    would make two that differ by one agree (row 13543); None for a leaf of floats. Each value is laid in
+    unsigned 64 bits by its order (a signed one's sign bit flipped), its difference the larger less the
+    smaller, which wraps at no extreme, then signed and read in float64 (exact below 2^53). Leaves of
+    signed and unsigned values apart are refused: no one order of 64 bits holds both; a boolean takes the
+    other's."""
+    held, true = xp.asarray(reference), xp.asarray(truth)
+    if not all(xp.issubdtype(leaf.dtype, xp.integer) or leaf.dtype == bool for leaf in (held, true)):
+        return None
+    # A boolean's 0 and 1 hold either order: the other leaf's names it.
+    signed = {bool(xp.issubdtype(leaf.dtype, xp.signedinteger)) for leaf in (held, true)
+              if leaf.dtype != bool} or {False}
+    if len(signed) > 1:
+        raise ValueError(f"a discrete leaf of {held.dtype} against a truth of {true.dtype}: its signed and "
+                         "unsigned values hold no one order to compare")
+
+    def ordered(leaf):
+        if signed == {True}:
+            return leaf.astype(xp.int64).astype(xp.uint64) ^ xp.uint64(1 << 63)
+        return leaf.astype(xp.uint64)
+
+    held, true = ordered(held), ordered(true)
+    apart = (xp.maximum(held, true) - xp.minimum(held, true)).astype(_wide(reference))
+    return xp.where(held >= true, apart, -apart)
+
+
 def _error_rows(references, truths, *, xp):
     """Each reference leaf against its truth: its mean squared error's log (`log_mean_square`), whether
     its every value is finite, and its error's rows' RMS (`_scaled_rms`) and largest share
     (`_largest_share`)."""
     found = []
     for reference, truth in zip(references, truths, strict=True):
+        errors = _discrete_errors(reference, truth, xp)
         values, truth = _laid(reference, xp), _laid(truth, xp)
-        errors = values - truth
+        errors = values - truth if errors is None else errors
         width = _width(truth)
         rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
         truth_rows = truth.reshape(-1, width) if width else xp.zeros((0, 1))
