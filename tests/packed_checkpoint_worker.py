@@ -103,7 +103,11 @@ def local_packed(args, *, lost: bool = False) -> dict:
             shutil.rmtree(Path(args.local_dir) / "process1")
         multihost_utils.sync_global_devices("local copy lost")
         checkpoints = checkpoints_of()
-    restored, _ = checkpoints.restore(_template(state), 1)
+    try:
+        restored, _ = checkpoints.restore(_template(state), 1)
+    except (ValueError, PeerFailure) as error:
+        # Its message beside the refusal's type: a failing assertion shows what refused the read.
+        return {"read": {**refusal(error), "message": str(error)}, "foreign": None}
     read = _read(packed, restored.variables[QUANTIZATION])
     foreign = dataclasses.replace(state, step=state.step + 1,
                                   variables={**placed.variables, QUANTIZATION: _foreign(packed)})
@@ -159,7 +163,8 @@ def stage_packed(args) -> dict:
         try:
             restored, _ = Checkpoints(str(directory)).restore(template, step)
         except (ValueError, PeerFailure) as error:
-            reports[step] = refusal(error)
+            # Its message beside the refusal's type: a failing assertion shows what refused the read.
+            reports[step] = refusal(error) if step == 2 else {**refusal(error), "message": str(error)}
             continue
         reports[step] = _read(packed, restored.variables[QUANTIZATION])
     return {"holds": bool(packed["window"].words.addressable_shards), "read": reports[1],
