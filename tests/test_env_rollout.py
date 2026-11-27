@@ -406,7 +406,7 @@ def test_ppo_filled_and_split_step_updates_as_the_real_minibatch_whole():
     microbatches through `Trainer` updates every parameter as `split=1` on the 6 real sequences does,
     held to the float64 update by check 1."""
     from float64_replay import float64_replay
-    from rl_split_support import prepare_split_whole_steps
+    from rl_split_support import SplitAndWhole
 
     from dew.data.dataset import FilledBatch
     from dew.objectives.base import Step
@@ -416,8 +416,7 @@ def test_ppo_filled_and_split_step_updates_as_the_real_minibatch_whole():
                                     entropy_cost=0.05)
     template = control_sequences(6, 0, length=6, obs_size=3)
     template["raw_action"] = np.random.default_rng(1).normal(size=(6, 6, 2)).astype(np.float32)
-    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
-        objective, rate, jax.random.key(21), template, FilledBatch(8).map(template))
+    steps = SplitAndWhole(objective, rate, jax.random.key(21), template, FilledBatch(8).map(template))
     init_fn = jax.jit(objective.init)
 
     def batch_for(seed: int) -> dict[str, np.ndarray]:
@@ -427,25 +426,23 @@ def test_ppo_filled_and_split_step_updates_as_the_real_minibatch_whole():
         return seq
 
     def draw(seed: int):
-        params = init_fn(jax.random.key(seed))["params"]
-        real_batch = batch_for(seed)
-        filled_batch = FilledBatch(8).map(real_batch)
-        s_state = jax.tree.map(jnp.copy, split_start.replace(variables={"params": params}))
-        w_state = jax.tree.map(jnp.copy, whole_start.replace(variables={"params": params}))
-        moved_split = split_step(s_state, filled_batch)[0].variables["params"]
-        moved_whole = whole_step(w_state, real_batch)[0].variables["params"]
-        return params, real_batch, moved_split, moved_whole
+        return init_fn(jax.random.key(seed))["params"], batch_for(seed)
 
-    def whole_update(params, real_batch, _ms, _mw):
-        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0), None,
-                         committed=jnp.zeros((), jnp.int32), example_key=update_key,
+    def moved_split(params, real_batch):
+        moved = steps.stepped(2, FilledBatch(8).map(real_batch), variables={"params": params})
+        return moved.variables["params"]
+
+    def moved_whole(params, real_batch):
+        return steps.stepped(1, real_batch, variables={"params": params}).variables["params"]
+
+    def whole_update(params, real_batch):
+        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(steps.whole_start.key, 0), None,
+                         committed=jnp.zeros((), jnp.int32), example_key=steps.update_key,
                          example_index=jnp.arange(6, dtype=jnp.int32), example_count=6)
         grads = jax.grad(lambda p: objective.scalar_loss({"params": p}, real_batch, step_info)[0])(params)
         return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
 
-    assert_as_exact(lambda _p, _b, moved_split, _mw: moved_split,
-                    lambda _p, _b, _ms, moved_whole: moved_whole, draw,
-                    "control PPO filled and split update", seeds=8,
+    assert_as_exact(moved_split, moved_whole, draw, "control PPO filled and split update", seeds=8,
                     truth_fn=float64_replay(whole_update, compiled=True))
 
 

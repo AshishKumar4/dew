@@ -898,7 +898,7 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     past unit scale) updates parameters and slow critic EMA as `split=1` on the 6 real windows does,
     held to the float64 update by check 1."""
     from float64_replay import float64_replay
-    from rl_split_support import nudged_tree, prepare_split_whole_steps
+    from rl_split_support import SplitAndWhole, nudged_tree
 
     from dew.averaging import ema_update
     from dew.batch import merge
@@ -913,8 +913,7 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
     objective = DreamerV3Objective(model, imagination=4, return_rate=0.5, slow_decay=slow_decay,
                                    entropy=1e-2, imitation=0.5, smoothness=0.01, slow_targets=True)
     template = dreamer_windows(6, 0, obs_size=obs_size, action_size=action_size)
-    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
-        objective, rate, jax.random.key(33), template, FilledBatch(8).map(template))
+    steps = SplitAndWhole(objective, rate, jax.random.key(33), template, FilledBatch(8).map(template))
     init_fn = jax.jit(objective.init)
     seeded_returns = {"low": jnp.asarray(-5.0, jnp.float32), "high": jnp.asarray(15.0, jnp.float32)}
 
@@ -922,20 +921,12 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
         base_params = init_fn(jax.random.key(seed))["params"]
         variables = {"params": nudged_tree(base_params, seed + 1000, scale=0.6), "returns": seeded_returns}
         ema = {"params": {"value": jax.tree.map(lambda x: x * 0.8, variables["params"]["value"])}}
-        real_batch = dreamer_windows(6, seed, obs_size=obs_size, action_size=action_size)
-        filled_batch = FilledBatch(8).map(real_batch)
-        s_state = jax.tree.map(jnp.copy, split_start.replace(variables=variables, ema=ema))
-        w_state = jax.tree.map(jnp.copy, whole_start.replace(variables=variables, ema=ema))
-        s_next = split_step(s_state, filled_batch)[0]
-        w_next = whole_step(w_state, real_batch)[0]
-        split_out = (s_next.variables["params"], s_next.ema)
-        whole_out = (w_next.variables["params"], w_next.ema)
-        return variables, ema, real_batch, split_out, whole_out
+        return variables, ema, dreamer_windows(6, seed, obs_size=obs_size, action_size=action_size)
 
-    def whole_update(variables, ema, real_batch, _so, _wo):
-        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0),
+    def whole_update(variables, ema, real_batch):
+        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(steps.whole_start.key, 0),
                          merge(variables, ema),
-                         committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                         committed=jnp.zeros((), jnp.int32), example_key=steps.update_key,
                          example_index=jnp.arange(6, dtype=jnp.int32), example_count=6)
         grads = jax.grad(
             lambda p: objective.scalar_loss({**variables, "params": p}, real_batch, step_info)[0]
@@ -944,11 +935,13 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
         ema_next = ema_update(ema, {"params": params_next}, slow_decay)
         return params_next, ema_next
 
-    def split_arm(_v, _e, _b, split_out, _wo):
-        return split_out
+    def split_arm(variables, ema, real_batch):
+        moved = steps.stepped(2, FilledBatch(8).map(real_batch), variables=variables, ema=ema)
+        return moved.variables["params"], moved.ema
 
-    def whole_arm(_v, _e, _b, _so, whole_out):
-        return whole_out
+    def whole_arm(variables, ema, real_batch):
+        moved = steps.stepped(1, real_batch, variables=variables, ema=ema)
+        return moved.variables["params"], moved.ema
 
     assert_as_exact(split_arm, whole_arm, draw, f"DreamerV3 filled and split update ({dynamics_kind})",
                     seeds=DREAMER_SPLIT_SEEDS, truth_fn=float64_replay(whole_update, compiled=True))
