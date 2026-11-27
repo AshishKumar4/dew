@@ -7,7 +7,7 @@ step lift (`recurrence_algebra.selective_decay`, `selective_read`, `selective.to
 `recurrence_algebra.selective_dx_scale`), the recurrence skip's pullback (`skipped_back`) and the derived
 split-KV merge (`attention_algebra.merge`). Every cell asserts the generated body ran (`generated.taken`):
 a site that fell back to its written math would hold check 1 trivially. The cases are each component's declared ones
-(`dew.algebra.component_cases`), keyed by the generation they were generated for, the one this family names.
+(`dew.algebra.component_cases`), keyed by the generation they were generated for, this family's.
 """
 
 import functools
