@@ -23,8 +23,7 @@ import sys
 from collections.abc import Iterator, Sequence, Set
 from typing import Protocol, TypeGuard
 
-from tools import lint_scopes as scopes
-from tools import lint_texts as texts
+from tools import lint_scopes as scopes, lint_texts as texts
 
 Found = tuple[int, int, str, str]
 """A finding: its line, column, code and message."""
