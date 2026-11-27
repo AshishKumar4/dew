@@ -280,8 +280,9 @@ def test_the_linear_attention_and_its_gradients_are_on_par_with_diffusers(monkey
 
 
 def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_arithmetic():
-    """Under the suite's wide CPU arithmetic, where each float32 product sums in float64 and rounds once
-    (`precision.sums_in_float64`), DC-AE's linear attention takes each sum over its positions whole: values
+    """Under the suite's wide CPU arithmetic, where a CPU's float32 products sum in float64 and round once
+    (`precision.sums_in_float64`), DC-AE's linear attention on the CPU takes each sum over its positions
+    whole: values
     `2^27, 2^27, -2^27, -2^26` under keys of `2^100` leave `2^26 * 2^100` over the keys' sum `2^106`,
     `2^20` exactly, where a first group's `2^128` rounded to float32 alone overflowed to infinity (train
     1387's review)."""
@@ -293,5 +294,7 @@ def test_the_linear_attentions_sums_cancel_past_float32s_range_under_wide_cpu_ar
     value = np.zeros((1, 64, 1, 1), np.float32)
     value[0, [0, 1, 4, 5], 0, 0] = (2.0 ** 27, 2.0 ** 27, -2.0 ** 27, -2.0 ** 26)
     assert sums_in_float64(key, key), "the suite runs wide CPU arithmetic"
-    attended = jax.jit(linear_attention)(query, key, jnp.asarray(value))
+    # On the CPU, whose lowering alone sums wide.
+    with jax.default_device(jax.devices("cpu")[0]):
+        attended = jax.jit(linear_attention)(query, key, jnp.asarray(value))
     np.testing.assert_array_equal(np.asarray(attended), np.full((1, 64, 1, 1), 2.0 ** 20, np.float32))

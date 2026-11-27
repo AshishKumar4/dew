@@ -130,17 +130,29 @@ def linear_attention(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.
     16384 positions, as did 4 groups at 4096 and either sum alone grouped (check 1, row 13524). Each sum
     stages its groups' `[heads, width + 1, width]` products: past 4096 positions about an eighth of the
     queries' size at a 32-wide head, below it sixteen products. Where a CPU sums float32 products in
-    float64 and rounds once (`precision.sums_in_float64`), each sum is that one sum: a group's partial
-    rounded first would only coarsen it, or overflow where positions cancel past float32's range."""
-    batch, positions, heads, width = key.shape
+    float64 and rounds once (`precision.sums_in_float64`, in its lowering alone), each sum is that one sum:
+    a group's partial rounded first would only coarsen it, or overflow where positions cancel past
+    float32's range."""
     value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
-    if sums_in_float64(value, key):
+
+    def whole(query, key, value):
         # Each sum one float64 sum rounded once already (Dew's wide CPU arithmetic, `precision.accumulated`),
         # which a group's partial rounded to float32 first would only coarsen, or overflow where the
         # positions cancel past float32's range (train 1387's review).
         scores = float32_einsum("bngd,bnge->bgde", value, key)
         attended = float32_einsum("bgde,bnge->bngd", scores, query)
         return attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)
+
+    if sums_in_float64(value, key):
+        # Wide only in a CPU's lowering: an accelerator's contractions still sum in float32, grouped.
+        return jax.lax.platform_dependent(query, key, value, cpu=whole, default=_grouped)
+    return _grouped(query, key, value)
+
+
+def _grouped(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
+    """`linear_attention`'s sums over the positions in groups met by a compensated sum, `value` past its
+    column of ones."""
+    batch, positions, heads, width = key.shape
     groups = max(_FEWEST_GROUPS, -(-positions // _GROUP_POSITIONS))
     padding = ((0, 0), (0, -positions % groups), (0, 0), (0, 0))
 
