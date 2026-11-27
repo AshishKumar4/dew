@@ -518,7 +518,7 @@ def test_an_index_branchs_kl_pools_by_its_queries_across_a_split_step():
         objective, rate, jax.random.key(3), template, template)
 
     def draw(seed: int):
-        params = jax.jit(objective.init)(jax.random.key(seed))["params"]
+        params = nn.unbox(jax.jit(objective.init)(jax.random.key(seed)))["params"]
         batch = rows(seed)
         moved = [step(jax.tree.map(jnp.copy, start.replace(variables={**start.variables, "params": params})),
                       batch)[0].variables["params"] for step, start in ((split_step, split_start),
