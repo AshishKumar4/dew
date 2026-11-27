@@ -629,14 +629,15 @@ def priced_step(target: generation.GpuTarget, *, rows: int, queries: int, keys: 
                 normalized=equation.params.get("normalized", False), traced=True,
                 merge=equation.params.get("merge")))
     all_launches = launches + merges
-    # The launches one after another: their spans summed, and their dependent paths in sequence
-    # (`cost.Chain.then`), each launch's its longest at the target's latencies, its span's steps
-    # (`cost.path`'s) or one of its chains, not the step's longest alone.
-    paths = [max((cost.Chain(span=each.span), *each.chains),
-                 key=lambda chain: cost.chained(Work(chains=(chain,)), target))
-             for each in all_launches]
-    return dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches),
-                               chains=(functools.reduce(cost.Chain.then, paths),) if paths else ())
+    # The launches one after another: their counters summed, and the step's dependent path theirs added,
+    # each launch's priced at its own rings (`cost.path`), held as that many in-kernel steps (a launch's
+    # rings are its own: one chain of the launches' copies would wait them through the shallowest).
+    work = dataclasses.replace(sum(all_launches, Work()), span=sum(each.span for each in all_launches))
+    step = target.kernel_step_seconds
+    if not step:
+        return work
+    return dataclasses.replace(work, chains=(cost.Chain(span=sum(cost.path(each, target)
+                                                                 for each in all_launches) / step),))
 
 @overload
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,

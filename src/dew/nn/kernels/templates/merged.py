@@ -293,8 +293,8 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     """Full launch work and grid size at `block` channels for the selected backend (`merged_mosaic.launch`
     when `family` is set, else Pallas Triton `_launch`) on the common one-window path
     (`means.merged_state_chunked`): one anchor/hull joining pass plus one window's two dependent passes
-    (`_placing` and `_summing`), for a span of `3 * chunks` steps; a Triton launch's waited path a step a slot
-    besides, its time as measured (`_triton_slot_steps`). Device traffic charges
+    (`_placing` and `_summing`), for a span of `3 * chunks` steps; a Triton launch's path a step a slot beside
+    its copies' waits, its time as measured (`_triton_slot_steps`). Device traffic charges
     `min(width, read_width)` channels per slice on Mosaic GPU (predicated loads) and `read_width` on Triton
     (physical ref bounds), `width` channels for output writes, initial-state reads, and `Kind.OUTPUT` hook
     reads, scalar hook reads per block, and row-stat stores once per row (`c_block == 0`, omitted when
@@ -382,10 +382,12 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     # part's copy latency each, over a program's reads (its blocks read alike) and none of its stores. A
     # GH200's merge at one row, 8 and 16 slices of 64 channels, took 3.84 and 7.10 us (M-NA-20-gh200), its
     # device work priced 1.30 and 1.72 without them (FS-5274-LAT1).
-    waited = cost.Chain(span=0.0 if family is not None else _triton_slot_steps(total_slices),
-                        copies=float(passes), copy_bytes=read_bytes / launched, stages=1)
+    waited = cost.Chain(copies=float(passes), copy_bytes=read_bytes / launched, stages=1)
+    # A Triton launch's measured slope a slot (`_triton_slot_steps`), the copies' path's alternative, not
+    # added to its waits: the launches' measured growth holds both.
+    slots = () if family is not None else (cost.Chain(span=_triton_slot_steps(total_slices)),)
     total = dataclasses.replace(emitted_total, device_bytes=total_device_bytes, span=float(passes),
-                                kernels=1.0, chains=(*emitted_total.chains, waited))
+                                kernels=1.0, chains=(*emitted_total.chains, waited, *slots))
     return total, launched
 
 
@@ -409,12 +411,10 @@ def priced_launch(units: algebra.Forward | windows.Units, padded: jax.ShapeDtype
     """The seconds of one native `merged_padded` launch at its planned block (`_planned_block`), as that
     choice prices it (`cost.launch_seconds`: its programs' waves over the multiprocessors, each wave its
     programs' longest path), on the lowering named where the merge traces (`selection.forced`)."""
-    block, work = _planned_block(algebra.units_of(units), padded, stacked, queries, width, target,
-                                 has_initial, normalized=normalized,
-                                 merge=selection.forced(generation.Choice.MERGE))
-    batch, _, _, heads, _ = padded.shape
-    channels = 1 << (width - 1).bit_length()
-    return cost.launch_seconds(work, batch * queries * heads * (channels // block), target)
+    _, work, launched = _planned_block(algebra.units_of(units), padded, stacked, queries, width, target,
+                                       has_initial, normalized=normalized,
+                                       merge=selection.forced(generation.Choice.MERGE))
+    return cost.launch_seconds(work, launched, target)
 
 
 def _candidate_blocks(width: int, total_slices: int) -> tuple[int, ...]:
@@ -431,7 +431,7 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
                            out_dtype, out_heads: int | None, output_mod: Callable | None,
                            output_kinds: tuple[Kind, ...],
                            output_specs: tuple[jax.ShapeDtypeStruct, ...], mosaic: bool, normalized: bool
-                           ) -> tuple[int, cost.Work]:
+                           ) -> tuple[int, cost.Work, int]:
     _, slices, _, _, _ = padded.shape
     total_slices = slices + int(has_initial)
     family = generation.family(target.generation) if mosaic else None
@@ -448,7 +448,7 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
         return cost.launch_seconds(total, launched, target)
 
     chosen = min(blocks, key=lambda block: (seconds(block), -block))
-    return chosen, candidates[chosen][0]
+    return chosen, *candidates[chosen]
 
 
 def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
@@ -457,8 +457,9 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
                    output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = (),
                    output_specs: tuple[jax.ShapeDtypeStruct, ...] = (), normalized: bool = False,
                    merge: str | None = None
-                   ) -> tuple[int, cost.Work]:
-    """The channels a program of `_kernel` merges and that launch's total device work (`_launch_for_block`),
+                   ) -> tuple[int, cost.Work, int]:
+    """The channels a program of `_kernel` merges, that launch's total device work (`_launch_for_block`) and
+    its programs, which its choice priced it at,
     on the lowering `merge` names (`_uses_mosaic`),
     held through `_cache.holding` (the one owner of what a process derives once and the facts it read, row
     12420) by the call's shapes, the target, the output hook as its epilogue computes it at each candidate
@@ -607,7 +608,7 @@ class MergedPadded(tuning.KernelOp):
         stacked_s = jax.ShapeDtypeStruct(stacked.shape, stacked.dtype)
         init_args, out_args = merged_mosaic.split_extra(extra, self.output_kinds)
         out_specs = tuple(jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in out_args)
-        block, _ = _planned_block(
+        block, *_ = _planned_block(
             self.units, padded_s, stacked_s, self.queries, self.width, generation.gpu_target(),
             bool(init_args), self.raw_scale, self.out_dtype, self.out_heads, self.output_mod,
             self.output_kinds, out_specs, self.normalized, merge="mosaic")
@@ -674,7 +675,7 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
             output_dtypes=out_dtypes, family=family, normalized=normalized)(padded, stacked, tuple(extra))
     padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
                            for operand in (padded, stacked))
-    block, _ = _planned_block(units, padded_s, stacked_s, queries, width, target, bool(init_args),
+    block, *_ = _planned_block(units, padded_s, stacked_s, queries, width, target, bool(init_args),
                               raw_scale, out_dtype, out_heads, output_mod, output_kinds, out_specs,
                               normalized, merge=merge)
     return _launch(
