@@ -807,7 +807,7 @@ class Launch:
     reducing: int = 0
     """The warpgroups whose arithmetic reduces across their warps implicitly, each its share of Mosaic GPU's
     scratch (`launch_kernel`'s `reducing`): an own pairs' launch taking anchored products
-    (`anchored.step`, `anchored.back`), whose guard reduces a tile."""
+    (`anchored.step`), whose guard reduces a tile."""
 
     def deepened(self, stages: int, target: generation.GpuTarget) -> "Launch":
         """This launch as a trace at tiles `stages` deep on `target` records it: its plan at that depth
@@ -1446,7 +1446,7 @@ def fitting_block(call: Call, held: Callable[[int], Held], staged: Callable[[int
 
 def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
               streamed: Callable[[int], dict] | None = None, *, contracted: bool = False,
-              reducing: int = 0, widest: bool = False, after_walks: tuple = ()) -> int:
+              reducing: int = 0, after_walks: tuple = ()) -> int:
     """A launch's key block under a decay a key dimension, whose prefix, decays and gated keys it
     holds a block at a time in fp32: from the widest of the family's depths for 16-bit operands
     (`Family.depths`) down to the narrowest columns a staged operand takes (`key_blocks`: its depth's where
@@ -1458,8 +1458,7 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     H100 at one program a multiprocessor, its schedulers without a warp to issue 64% of its cycles
     (kda-ncu2-h100-bc481d7de). A launch whose roles reduce across their warps implicitly counts their
     `reducing` share of scratch (`resources.Scope.reducing_warpgroups`), and its staging read past its walk
-    (`after_walks`, `launch_kernel`'s) where it has any; one whose work a step is fixed (`widest`: a guard,
-    its factors and its staging a key block) takes the widest block holding a program."""
+    (`after_walks`, `launch_kernel`'s) where it has any."""
     if streamed is None:
         return fitting_block(call, held, staged, call.family.depths(jnp.bfloat16)[0],
                              _key_unit(call, contracted=contracted))
@@ -1468,9 +1467,6 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     # Where no block holds a program, the narrowest, as `fitting_block` falls back: the widest, which the
     # register-unchecked gate compiled, spilled 2784 bytes where the narrowest's need was the question
     # (row 5298, jsf-sm100-redgreen).
-    if widest:
-        return max(key_blocks(call, contracted=contracted),
-                   key=lambda block: (resident(block) > 0, block if resident(block) else -block))
     return max(key_blocks(call, contracted=contracted),
                key=lambda block: (resident(block), block if resident(block) else -block))
 
@@ -1512,7 +1508,7 @@ def key_block_holds(call: Call, held: Callable[[int], Held], staged: Callable[[i
                     streamed: Callable[[int], dict], *, contracted: bool = False, reducing: int = 0) -> bool:
     """Whether a walk under a decay a key dimension holds a program a multiprocessor at any of its key
     blocks (`key_block`'s, `_resident`, its roles' `reducing` share of scratch counted): a launch's form a
-    plan may take only where it does (the KDA backward's anchored own pairs, `anchored.back`)."""
+    plan may take only where it does (the KDA forward's anchored own pairs, `anchored.step`)."""
     return any(_resident(call, held, staged, streamed, block, reducing=reducing)
                for block in key_blocks(call, contracted=contracted))
 
