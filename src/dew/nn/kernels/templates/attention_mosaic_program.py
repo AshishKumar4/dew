@@ -2026,18 +2026,18 @@ def _replayed(jaxpr: jax_core.Jaxpr, arguments, shape: tuple[int, ...]) -> list:
         operands = [read(var) for var in eqn.invars]
         body = called(eqn)
         if body is not None:
-            results = _replayed(body, operands, shape)
+            outputs = _replayed(body, operands, shape)
         elif eqn.primitive is jax.lax.cond_p:
             index, *rest = operands
-            results = jax.lax.switch(index, [functools.partial(_replay_branch, branch, shape)
+            outputs = jax.lax.switch(index, [functools.partial(_replay_branch, branch, shape)
                                              for branch in branches(eqn)], *rest)
         elif eqn.primitive is jax.lax.broadcast_in_dim_p:
             (scalar,) = operands
-            results = [jax.lax.broadcast_in_dim(scalar, shape if eqn.params["shape"] else (), ())]
+            outputs = [jax.lax.broadcast_in_dim(scalar, shape if eqn.params["shape"] else (), ())]
         else:
             bound = eqn.primitive.bind(*operands, **eqn.params)
-            results = bound if eqn.primitive.multiple_results else [bound]
-        values.update(zip(eqn.outvars, results, strict=True))
+            outputs = bound if eqn.primitive.multiple_results else [bound]
+        values.update(zip(eqn.outvars, outputs, strict=True))
     return [read(var) for var in jaxpr.outvars]
 
 
