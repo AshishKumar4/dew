@@ -1256,6 +1256,21 @@ a derived form replaces a hand-written one only where it states the walk, passes
   (`report.recording`). A cold attention step's 20
   forms (9 s of 25 s on armada) read back in a fresh process with the store alone warm, the step 15 s, its
   program the same.
+- A built package ships the entries of the derivations its declared steps' templates request
+  (`tools/derived_catalogue.py`, run as the package is built, its output the package data under
+  `dew/algebra/derived`, never in the tree), so a first process on a fresh install reads them where Dew's
+  cache holds none: Dew's cache is read first, the read-only entries after it (`stored.shipped`: the
+  package's, or a store a site built for its own GPUs and meshes, `DEW_DERIVATIONS`), never written, each
+  through the same checks. A key holds egglog's and JAX's exact builds, so a shipped entry is read only
+  where the package's builds are installed (Linux's patched egglog); elsewhere a derivation is derived
+  afresh. A key states every mesh by its axes' names and types and none of their sizes (`terms.unsized`),
+  beside its region's own interning (each use's parameter slot and the normalized slot table): a
+  derivation reads whether an axis is explicit or manual (a tangent sum's add, an fp32-exact product, a
+  cast's round trip, `terms.unplaced_equation`), never its size, so a step on one device and on eight read
+  one entry. It states the target its forms are priced for (`cost.pricing_key`): the shipped entries,
+  derived for each generation's canonical GPU, are read where a step is priced by the table's facts (a step
+  compiled or lowered ahead for a generation, on any host); a run on its own GPU prices by the facts the
+  driver reports (`generation.runtime_facts`) and derives its first step's forms into its own cache.
 
 Production derives these forms at trace time (`derive.derive`, `scan.derive_scan`). The component pilots
 in §6.11 emit checked-in cases without replacing the launches. Generating and taking a complete template

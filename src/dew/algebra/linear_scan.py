@@ -932,11 +932,12 @@ def _shapes(token_count: int, key_count: int, value_count: int, apart: int, valu
     return ruleset(*found, name="chunk_shapes")
 
 
-@functools.cache
+@functools.lru_cache(maxsize=32)
 def _chunk_rules(corrects: bool, scalar: bool, values_read: bool, apart: int, across: bool, before: bool,
                  erased: bool, tokens: int, keys: int, values: int):
     """A chunk's identities and its values' shapes (`_identities`, `_shapes`), built once for the facts that
-    define them, so a saturation's e-graph declares them once a thread (`program.fresh_graph`)."""
+    define them, so a saturation's e-graph declares them once a thread (`program.fresh_graph`): the latest
+    32 kept, a prepared graph's sets as many as a thread keeps idle and more."""
     return (_identities(corrects, scalar, values_read, apart, across, before, erased)
             | _shapes(tokens, keys, values, apart, values_read))
 

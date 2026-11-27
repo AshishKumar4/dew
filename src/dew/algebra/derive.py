@@ -875,7 +875,8 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
     # itself: it derives, and reads and writes no store. Both derive from the one live set of rules.
     if ALGEBRA.value.checked:
         return _derived_afresh(declaration, names, walked_axes, closed, region, admitted, saturation, began)
-    name = None if not rules.sourced(admitted) else stored.key(closed, [sets.name for sets in admitted], (
+    sourced = [sets.name for sets in admitted]
+    name = None if not rules.sourced(admitted) else stored.key(closed, region, sourced, (
         names, tuple(sorted(walked_axes.items())),
         tuple((n, tuple(shapes[n][0]), np.dtype(shapes[n][1]).name) for n in names), accurate,
         (saturation.growth, saturation.depth), declaration.walked, declaration.exponent,

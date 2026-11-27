@@ -9,6 +9,8 @@ from an equation states its shape (`rules.shape`), which rules read before they 
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -502,16 +504,17 @@ def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.P
 
 
 @functools.lru_cache(maxsize=1 << 16)
-def _abstract_key(value: ShapedArray) -> Hashable:
+def _abstract_key(value: ShapedArray, sized: bool = True) -> Hashable:
     """An abstract value's key (`parameter_key`'s): its shape, dtype, weak type, placement, memory space,
     layout and manual axes, kept for each abstract value (JAX's own value equality and hash), which every
     window's structure reads of its every equation's outputs: a program's few distinct types, keyed once each,
     where each read built the key anew (2.27 million keys of a Qwen3.5-4B start's 40 passes, row 6782). Its
     placement by its partitions and its mesh's axes and memory, not the kind of device the mesh was made of,
-    which a step compiled ahead for a GPU and the run on that GPU share no name of."""
+    which a step compiled ahead for a GPU and the run on that GPU share no name of; its axes' sizes not where
+    it is not `sized` (`unsized`)."""
     sharding, manual = value.sharding, value.manual_axis_type
     mesh = sharding.mesh
-    placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes),
+    placement = (parameter_key(sharding.spec), parameter_key(mesh.axis_sizes if sized else None),
                  parameter_key(mesh.axis_names), parameter_key(mesh.axis_types),
                  parameter_key(sharding.memory_kind))
     # Its dtype by its name, a PRNG key's extended one's too (`key<fry>`).
@@ -560,6 +563,37 @@ def parameter_key(value) -> Hashable:
     return _parameter_key(value, None)
 
 
+def plain_key(value) -> Hashable | None:
+    """`value`'s structural key (`parameter_key`) where it is plain data, the same in every process that holds
+    an equal value; None where it holds an object by identity (an unhashable or an identity-equal one)."""
+    opaques: list[Hashable] = []
+    key = _collect_opaque(parameter_key(value), opaques)
+    return None if opaques else key
+
+
+_SIZED: contextvars.ContextVar[bool] = contextvars.ContextVar("sized", default=True)
+"""Whether a structural key (`parameter_key`, `jaxpr_digest`) states a mesh's axes' sizes and devices; not
+within `unsized`."""
+_UNSIZED_DIGESTS: contextvars.ContextVar[dict[jcore.Jaxpr, tuple[str, tuple[Hashable, ...]]] | None] = (
+    contextvars.ContextVar("unsized_digests", default=None))
+"""The programs' digests within one `unsized` block, each program's once (a body two equations share)."""
+
+
+@contextlib.contextmanager
+def unsized() -> Iterator[None]:
+    """Within the block, a structural key (`parameter_key`, `jaxpr_digest`, every program they reach) states a
+    mesh by its axes' names and types alone, no axis's size and no device: what a derivation reads of its
+    placement (`unplaced_equation`, a tangent sum's add: whether an axis is explicit or manual), so a stored
+    derivation's key (`dew.algebra.stored.key`) is one on a mesh of one device and of eight, beside how its
+    region interns its parameters (`dew.algebra.stored._interned`). Each program's digest once within it."""
+    token, held = _SIZED.set(False), _UNSIZED_DIGESTS.set({})
+    try:
+        yield
+    finally:
+        _SIZED.reset(token)
+        _UNSIZED_DIGESTS.reset(held)
+
+
 def _parameter_key(value, seen: set[int] | None) -> Hashable:
     kind = type(value)
     if value is None or kind in (bool, str, int):
@@ -567,7 +601,7 @@ def _parameter_key(value, seen: set[int] | None) -> Hashable:
     if kind is float:
         return "float", value.hex()
     if kind is ShapedArray:
-        return _abstract_key(value)
+        return _abstract_key(value, _SIZED.get())
     if kind in (tuple, list):
         active = set() if seen is None else seen
         return _cycle_guard(value, kind, active, reject_device=False, build=lambda: (
@@ -604,23 +638,27 @@ def _parameter_key_other(value, kind: type, seen: set[int]) -> Hashable:
         return "dtype", value.name
     if isinstance(value, enum.Enum):
         return "enum", _named(kind), value.name
+    if isinstance(value, np.ndarray) and value.dtype.hasobject:
+        # Its bytes are its objects' addresses.
+        return "object", _named(kind), _Identity(value)
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
         return _array_key(value, kind)
     if isinstance(value, ShapedArray):
-        return _abstract_key(value)
+        return _abstract_key(value, _SIZED.get())
     if value is Layout.AUTO:
         return "layout", "auto"
     if isinstance(value, Layout):
         return ("layout", _parameter_key(value.major_to_minor, seen), _parameter_key(value.tiling, seen),
                 value.sub_byte_element_size_in_bits)
     if isinstance(value, jax.sharding.Mesh):
-        devices = () if value.empty else value.device_ids
+        devices = () if value.empty or not _SIZED.get() else value.device_ids
         return ("mesh", _parameter_key(devices, seen), _parameter_key(value.axis_names, seen),
                 _parameter_key(value.axis_types, seen))
     if isinstance(value, jax.sharding.AbstractMesh):
-        return ("abstract mesh", _parameter_key(value.axis_sizes, seen),
+        sized = _SIZED.get()
+        return ("abstract mesh", _parameter_key(value.axis_sizes if sized else None, seen),
                 _parameter_key(value.axis_names, seen), _parameter_key(value.axis_types, seen),
-                _parameter_key(value.abstract_device, seen))
+                _parameter_key(value.abstract_device if sized else None, seen))
     if isinstance(value, jax.sharding.NamedSharding):
         _, arguments = value.__reduce__()
         return "named sharding", _parameter_key(arguments, seen)
@@ -961,6 +999,12 @@ def jaxpr_digest(jaxpr: jcore.Jaxpr, *, in_process: bool = False) -> tuple[str, 
         sub = _in_process_digest(jaxpr)
         return sub.digest, (sub,)
     inner = jaxpr.jaxpr
+    if (unsized_digests := _UNSIZED_DIGESTS.get()) is not None and not _SIZED.get():
+        # Its meshes by their axes' names and types (`unsized`): kept apart from the sized digests, each
+        # program's once within the block (a body two equations share).
+        if (cached := unsized_digests.get(inner)) is None:
+            cached = unsized_digests[inner] = _body_digest(inner, in_process=False, reject_device=False)
+        return cached
     if (cached := _JAXPR_DIGESTS.get(inner)) is not None:
         return cached
     digest = _body_digest(inner, in_process=False, reject_device=False)
