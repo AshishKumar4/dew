@@ -25,6 +25,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The recurrence suite's wall: every case within CI's group target. [12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12778, 12873, 13489]
 - The recurrence template refuses the gated delta net's training on sm120. [13064]
+- Every consumer runs the template's program. [13741]
 - Low-precision and decode-size GEMMs. [483, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
@@ -51,7 +52,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Models and interop
 
 - Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1457, 1459, 1460, 1646]
-- The suite's wall. [5478, 12431, 12433, 12644]
+- The suite's wall. [5478, 12431, 12433]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548]
 - Looped residuals: InfiLoop on Dory. [1314]
