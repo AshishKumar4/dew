@@ -31,7 +31,8 @@ own choice of their body, which has no kernels to list."""
 def supported(case: dict[str, str]) -> bool:
     """Whether the site serves `case` (tests/kernel_matrix.py): its component is declared for the case's
     generation."""
-    return case["generation"] in generate.DECLARATIONS[f"{component_cases.__name__}.{case['site']}"].cases.targets
+    declared = generate.DECLARATIONS[f"{component_cases.__name__}.{case['site']}"]
+    return case["generation"] in declared.cases.targets
 
 
 CASES = (
