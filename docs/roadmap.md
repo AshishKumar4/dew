@@ -86,7 +86,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## RL and serving
 
 - RL: lossless records, composed methods and real publication. [579, 886, 729, 605]
-- A speculative block's replay into a block drafter's cache (strategies.block_step -> DecodeOps.record, sampling/strategies.py:1127-1138) has no witness. [13317]
 - DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
