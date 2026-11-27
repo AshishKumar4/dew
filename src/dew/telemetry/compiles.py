@@ -4,8 +4,8 @@ programs alone (`executable_only`)."""
 
 import contextlib
 import contextvars
+import inspect
 import threading
-import traceback
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import ClassVar
@@ -210,11 +210,14 @@ class Compiles:
         # A trace names its function bare, a backend compile `jit(<name>)`.
         named = self.name is None or metadata.get("fun_name") in (self.name, f"jit({self.name})")
         if kind in self.COUNTED and named:
-            # The frames walked bare, no source line read for any (`traceback.extract_stack` stats each
-            # frame's file and reads its line: up to 0.9 s a step of compile events, row 5556).
-            frame = next((frame for frame, _ in traceback.walk_stack(None)
-                          if "/jax/" not in (name := frame.f_code.co_filename) and "/jaxlib/" not in name
-                          and name != __file__ and "contextlib" not in name), None)
+            # Its callers' frames walked bare from this one's caller, no source line read for any
+            # (`traceback.extract_stack` stats each frame's file and reads its line: up to 0.9 s a step of
+            # compile events, row 5556); unbounded, whatever `sys.tracebacklimit` limits a traceback to.
+            frame = inspect.currentframe()
+            frame = None if frame is None else frame.f_back
+            while frame is not None and ("/jax/" in (name := frame.f_code.co_filename) or "/jaxlib/" in name
+                                         or name == __file__ or "contextlib" in name):
+                frame = frame.f_back
             where = "?" if frame is None else f"{frame.f_code.co_filename}:{frame.f_lineno}"
             self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where,
                                          threading.current_thread().name, _SPAN.get(), _OWNER.get()))
