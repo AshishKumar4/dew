@@ -185,10 +185,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
 
     The new tree is made private from its first call (mode 0700), in the group and with the setgid bit
     of the one it replaces, so what is written in it takes that group, and published with the mode of the
-    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), so a private
-    destination's weights are never readable by others. Dew's publishers of one destination take its
-    validation and replacement in turn (`_publishing`, a lock file of its own beside it), so one cannot
-    validate a tree another then replaces; a writer outside Dew is not excluded.
+    one it replaces, or the mode a new folder takes beside it under the umask (`_made_mode`), each file
+    and folder it writes where the earlier tree held one by that name with that one's mode, so a private
+    destination's weights, or a private file in it, are never readable by others. Dew's publishers of one
+    destination take its validation and replacement in turn (`_publishing`, a lock file of its own beside
+    it), so one cannot validate a tree another then replaces; a writer outside Dew is not excluded.
     The earlier one is removed once it is out of place. `exchange` is the one call that exchanges the two
     (`exchange_directories`, Linux's `renameat2`), a filesystem's own, which a test of a filesystem that
     has none passes in."""
@@ -237,6 +238,11 @@ def swapped(directory: Path, foreign: Callable[[Entries, Entries, Path], set[Pat
                                       "would not write: export into an empty directory, or one holding only "
                                       "an export")
             staging.chmod(stat.S_IMODE(held_at.st_mode))
+            # Each entry the new tree writes where the earlier one held the same kind takes its access as
+            # held, a private file kept private, a new one its umask's (train 1406's review).
+            for entry, kind in written.items():
+                if kind in ("file", "folder") and held.get(entry) == kind:
+                    (staging / entry).chmod(stat.S_IMODE((directory / entry).lstat().st_mode))
             if held:
                 exchange(staging, directory)
             else:
@@ -304,7 +310,18 @@ def _lock_file(path: Path) -> int:
     try:
         return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o222)
     except FileExistsError:
-        return os.open(path, flags)
+        # Opened without blocking and taken only as a regular file: a FIFO another made there, which an
+        # open for writing would wait on a reader for, is refused (train 1406's review).
+        try:
+            lock = os.open(path, flags | os.O_NONBLOCK)
+        except OSError as refused:
+            if refused.errno != errno.ENXIO:
+                raise
+            raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock") from refused
+    if not stat.S_ISREG(os.fstat(lock).st_mode):
+        os.close(lock)
+        raise FileExistsError(f"{path} is no regular file, which Dew's publishers lock")
+    return lock
 
 
 def _entries(root: Path) -> dict[Path, str]:

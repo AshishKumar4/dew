@@ -792,6 +792,8 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     assert (publisher["full"], reader["full"]) == ("OSError", "PeerFailure")
     assert (publisher["unexchanged"], reader["unexchanged"]) == ("FileExistsError", "PeerFailure")
     assert (publisher["nested"], reader["nested"]) == ("ValueError", "PeerFailure")
+    # A pooled export whose reader cannot make its scratch directory: heard by the publisher in that round.
+    assert (publisher["scratch"], reader["scratch"]) == ("PeerFailure", "FileNotFoundError")
 
 
 @pytest.mark.distributed

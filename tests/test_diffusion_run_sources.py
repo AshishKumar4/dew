@@ -931,3 +931,34 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
     drawn = np.asarray(TextToImage.from_run(str(run))([""], key=0).host().images)
     assert drawn.shape[-3:] == (256, 256, 3) and np.all(np.isfinite(drawn))
 
+
+
+class _Unreadable:
+    """A weight whose storage went away: its spec as held, its values unreadable."""
+
+    def __init__(self, held):
+        self.shape, self.dtype = np.shape(held), np.asarray(held).dtype
+
+    def __array__(self, dtype=None, copy=None):
+        raise OSError("the weights' storage went away")
+
+
+def test_a_pipelines_save_that_fails_leaves_the_earlier_one_whole(pipelines, tmp_path):
+    """A Diffusers pipeline saved over its earlier save, failing at a component's weights, leaves the
+    earlier save whole, byte for byte: its index and configs are published with its weights in one
+    generation (`published_release`; train 1406's review: the configs were written before the weights,
+    new ones beside old weights)."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    source = load_diffusion_source(str(pipelines / "flux" / "pipeline"), dtype="float32", size=(16, 16))
+    target = tmp_path / "export"
+    source.save(target)
+    before = {path.relative_to(target): path.read_bytes() for path in target.rglob("*") if path.is_file()}
+    leaves, tree = jax.tree.flatten(source.variables)
+    leaves[-1] = _Unreadable(leaves[-1])
+    index = {**source.config["model_index"], "dew_saved_again": True}
+    changed = dataclasses.replace(source, config={**source.config, "model_index": index})
+    with pytest.raises(OSError):
+        changed.save(target, variables=jax.tree.unflatten(tree, leaves))
+    after = {path.relative_to(target): path.read_bytes() for path in target.rglob("*") if path.is_file()}
+    assert after == before

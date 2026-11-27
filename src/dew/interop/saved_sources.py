@@ -17,7 +17,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,7 +28,13 @@ from jax.sharding import Mesh
 
 from dew._builds import dew_cache_dir
 from dew._code import whole_digest
-from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
+from dew._coordination import (
+    agreed_reading,
+    agreed_same,
+    from_every_process,
+    reading_home,
+    seen_by_every_process,
+)
 from dew._files import staged, write_atomically
 from dew._records import JSON, json_value, mapped_strings, strings_of
 from dew.checkpoints import RUN_FILE
@@ -439,19 +444,21 @@ def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
     discarded; elsewhere each publishes its own. A `staging` export publishes through `staged`, which
     keeps a release written already; another writes in place, as `dew export` does. Every process
     returns once the release is published (ledgers 2874, 2992)."""
+    from dew.interop.releases import pooled_destination
+
     shared = (jax.process_count() > 1 and len(set(from_every_process(destination.name))) == 1
               and all(seen_by_every_process(str(destination.parent))))
-    if shared and jax.process_index() != 0:
-        with tempfile.TemporaryDirectory() as discarded:
-            export_run(run, discarded, ema=ema, mesh=mesh, layout=layout, publishes=False)
-    elif staging:
-        with staged(destination) as staged_at:
-            # The one publication `staged` makes: the export writes the staging in place.
-            export_run(run, staged_at, ema=ema, mesh=mesh, layout=layout, fresh=True)
-            # A cache release states the saved run it holds, which a run that reads it carries.
-            _write_held(staged_at, run, ema)
-    else:
-        export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
+    publishes = not shared or jax.process_index() == 0
+    # Restored before the writer reads its tensors home, each as the writer reaches it.
+    plan = run_plan(run, ema=ema, mesh=mesh, layout=layout)
+    with (reading_home("saved run export", writes=publishes),
+          pooled_destination(destination, publishes=publishes, stage=staged if staging else None) as target):
+        # A staging's one publication is `staged`'s: the export writes it in place.
+        plan.write(target, fresh=staging and publishes)
+        if staging:
+            # A cache release states the saved run it holds, which a run that reads it carries, in a round
+            # the pool agrees as its others.
+            agreed_reading(lambda: _write_held(target, run, ema) if publishes else None)
     from_every_process(None)  # every process reads the release once it is published
 
 

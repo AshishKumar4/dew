@@ -243,3 +243,34 @@ def test_a_staged_directory_is_private_until_its_publication(tmp_path):
         assert stat.S_IMODE(staging.stat().st_mode) == 0o700
         (staging / "model.safetensors").write_text("new")
     assert stat.S_IMODE((tmp_path / "release").stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
+
+
+def test_a_private_file_stays_private_through_its_replacement(tmp_path):
+    """A release re-exported over one whose weights a user made private (`0600` in a `0755` folder) keeps
+    them private: each file the new tree writes by an earlier one's name takes its mode, a new file its
+    umask's (train 1406's review: the replacement exposed them `0644`)."""
+    release = tmp_path / "release"
+    release.mkdir(mode=0o755)
+    (release / "model.safetensors").write_text("old")
+    (release / "model.safetensors").chmod(0o600)
+    probe = tmp_path / "probe"
+    probe.write_text("")
+    with swapped(release, _nothing_foreign) as staging:
+        (staging / "model.safetensors").write_text("new")
+        (staging / "config.json").write_text("{}")
+    assert stat.S_IMODE((release / "model.safetensors").stat().st_mode) == 0o600
+    assert stat.S_IMODE((release / "config.json").stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
+
+
+def test_a_lock_that_is_no_regular_file_is_refused_without_waiting(tmp_path):
+    """A FIFO where a destination's publication lock is, which an open for writing would wait on a reader
+    for, is refused at once, the destination as it was (train 1406's review)."""
+    import hashlib
+
+    from dew._files import PUBLISHING_LOCK
+
+    release = tmp_path / "release"
+    os.mkfifo(tmp_path / (PUBLISHING_LOCK + hashlib.sha256(b"release").hexdigest()[:16]))
+    with pytest.raises(FileExistsError), swapped(release, _nothing_foreign) as staging:
+        (staging / "model.safetensors").write_text("new")
+    assert not release.exists()

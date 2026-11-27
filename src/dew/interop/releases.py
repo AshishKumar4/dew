@@ -23,7 +23,8 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
-from collections.abc import Callable, Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,68 @@ if TYPE_CHECKING:
 
 type Part = tuple[Mapping[str, object], Mapping[str, np.ndarray]]
 """One folder of a model's release: its config and its tensors by their names there."""
+
+
+def published_release(directory: str | Path, write: Callable[[Path], None], *, fresh: bool = False) -> None:
+    """Publish what `write` writes into the directory it is given as the release at `directory`, the whole
+    release one generation: built in a sibling directory and exchanged with the one `directory` held in one
+    call (`dew._files.swapped`), so a save that fails at any file, a config or a shard, leaves the earlier
+    release whole (row 13730), and a `directory` holding entries no release writes or owns
+    (`foreign_entries`) is refused, those named. A pool's processes agree where each writes, then their
+    writes, then the publisher's replacement, in turn: a process that fails at any of them is heard by the
+    others at the next round any takes, after which none takes another (`_coordination._unheard`). A pool's
+    process that publishes none (`writes_weights`) writes in place, to a destination of its own; a location
+    with a scheme, which has no rename, is written file by file; and a `fresh` directory, one its caller
+    made empty and private for this write alone and publishes itself, is written in place."""
+    root = Path(directory)
+    in_place = fresh or is_uri(str(directory)) or not writes_weights()
+    with contextlib.ExitStack() as staged:
+        target = agreed_reading(
+            lambda: root if in_place else staged.enter_context(swapped(root, foreign_entries)))
+        agreed_reading(lambda: write(target))
+        agreed_reading(staged.close)
+
+
+@contextlib.contextmanager
+def pooled_destination(destination: Path, *, publishes: bool,
+                       stage: Callable[[Path], contextlib.AbstractContextManager[Path]] | None = None
+                       ) -> Iterator[Path]:
+    """The directory this process writes a pool's release into, inside its reading scope
+    (`dew._coordination.reading_home`), every process taking the same rounds: made in one the pool agrees
+    (`agreed_reading`), the publisher's `destination` (or the staging `stage` makes of it), another
+    process's a scratch directory discarded, so none touches the live one; and committed in another as the
+    block ends, the staging published and the scratch removed, its removal failing nothing. A process that
+    fails making its directory, writing, or committing is heard by the others at that boundary, none left
+    waiting in a round alone (train 1406's review). One lifecycle for every pooled release: a saved run's
+    (`saved_sources.pooled_export`) and a rollout's weights (`inference.rollouts.SafetensorsReload`)."""
+    with contextlib.ExitStack() as held:
+        def made() -> Path:
+            if not publishes:
+                return Path(held.enter_context(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
+            return destination if stage is None else held.enter_context(stage(destination))
+
+        yield agreed_reading(made)
+        agreed_reading(held.close)
+
+
+def foreign_entries(written: Entries, held: Entries, directory: Path) -> set[Path]:
+    """What an earlier tree at `directory` holds that a release neither writes, as the same kind of entry,
+    nor owns: an earlier export's weights are files its own only in a folder it writes its own weights of
+    that stem in (`weight_stem`); the release record (`RELEASE_FILE`) its own whether it writes one or drops
+    it (`Release.write`); and the sidecars the earlier release's config declares (`hf_decoders.sidecars`:
+    Inkling 2's draft, which a trunk-only export drops)."""
+    from dew.interop.hf_decoders import sidecars
+
+    stems = {(entry.parent, stem) for entry, kind in written.items()
+             if kind == "file" and (stem := weight_stem(entry.name)) is not None}
+    unmatched = {entry: kind for entry, kind in held.items() if written.get(entry) != kind}
+    loose = {entry for entry, kind in unmatched.items() if kind == "file" and entry != Path(RELEASE_FILE)
+             and (entry.parent, weight_stem(entry.name)) not in stems}
+    # The earlier config read only where a regular file is left to own, and only a regular file: a FIFO or
+    # another special entry is foreign, never opened.
+    if loose and held.get(Path("config.json")) == "file":
+        loose -= set(map(Path, sidecars(json.loads((directory / "config.json").read_text()))))
+    return loose | {entry for entry, kind in unmatched.items() if kind != "file"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,45 +219,14 @@ class ReleasePlan:
         a sibling directory and exchanged with the one `directory` held in one call (`dew._files.swapped`),
         so a save that fails at any file leaves the earlier release whole, never a draft beside another
         generation's trunk (row 13730); a reader that reads across a save synchronizes with it. A
-        `directory` holding files or folders no export writes or owns (`_foreign`), at any depth, is
+        `directory` holding files or folders no export writes or owns (`foreign_entries`), at any depth, is
         refused, those entries named. A pool's process that reads its share and publishes none
         (`writes_weights`) writes the release's small files in place, to a destination of its own
         (`pooled_export` discards one the pool shares), every process agreeing its setup, its writes and
         the publisher's replacement in turn; a location with a scheme, which has no rename, is written file
         by file; and a `fresh` directory, one its caller made empty and private for this write alone, which
         it publishes itself (a cache release's staging, `pooled_export`), is written in place."""
-        root = Path(directory)
-        in_place = fresh or is_uri(str(directory)) or not writes_weights()
-        with contextlib.ExitStack() as staged:
-            # A pool's processes agree where each writes before any reads a tensor home (the publisher's
-            # staging set up, the others' destinations in place), then their writes, then the publisher's
-            # replacement of the earlier release: a process that fails at any of them is heard by the
-            # others at the next round any of them takes, a gather's among them, after which none takes
-            # another (`_coordination._unheard`), and the earlier release stays in place.
-            target = agreed_reading(
-                lambda: root if in_place else staged.enter_context(swapped(root, self._foreign)))
-            agreed_reading(lambda: self._write(target, max_shard_size))
-            agreed_reading(staged.close)
-
-    @staticmethod
-    def _foreign(written: Entries, held: Entries, directory: Path) -> set[Path]:
-        """What an earlier tree at `directory` holds that this release neither writes, as the same kind of
-        entry, nor owns: an earlier export's weights are files its own only in a folder it writes its own
-        weights of that stem in (`weight_stem`); the release record (`RELEASE_FILE`) its own whether it
-        writes one or drops it (`Release.write`); and the sidecars the earlier release's config declares
-        (`hf_decoders.sidecars`: Inkling 2's draft, which a trunk-only export drops)."""
-        from dew.interop.hf_decoders import sidecars
-
-        stems = {(entry.parent, stem) for entry, kind in written.items()
-                 if kind == "file" and (stem := weight_stem(entry.name)) is not None}
-        unmatched = {entry: kind for entry, kind in held.items() if written.get(entry) != kind}
-        loose = {entry for entry, kind in unmatched.items() if kind == "file" and entry != Path(RELEASE_FILE)
-                 and (entry.parent, weight_stem(entry.name)) not in stems}
-        # The earlier config read only where a regular file is left to own, and only a regular file: a FIFO
-        # or another special entry is foreign, never opened.
-        if loose and held.get(Path("config.json")) == "file":
-            loose -= set(map(Path, sidecars(json.loads((directory / "config.json").read_text()))))
-        return loose | {entry for entry, kind in unmatched.items() if kind != "file"}
+        published_release(directory, lambda target: self._write(target, max_shard_size), fresh=fresh)
 
     def _write(self, root: Path, max_shard_size: int | str) -> None:
         from dew.interop.hf_decoders import save_export_assets

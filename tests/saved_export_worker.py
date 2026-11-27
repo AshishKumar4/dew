@@ -182,6 +182,23 @@ def refused_exports(run, destination: Path, restoring, model, variables, extensi
 
     report["nested"] = outcome("two nested agreements",
                                lambda: agreed_reading(lambda: agreed_reading(refused_on_zero)))
+    # A pooled export to a destination the pool shares, the reader's scratch directory unmade (its temporary
+    # folder gone): every process hears of it in the round that makes the directories, the publisher's
+    # failure the reader's, none left waiting in the export's later rounds (train 1406's review).
+    import tempfile
+
+    from dew.interop.saved_sources import pooled_export
+
+    temporary = tempfile.tempdir
+    if rank == 1:
+        tempfile.tempdir = str(destination.parent / "no such folder")
+    try:
+        pooled_export(run, destination.parent / "shared")
+        report["scratch"] = None
+    except (OSError, PeerFailure) as failure:
+        report["scratch"] = type(failure).__name__
+    finally:
+        tempfile.tempdir = temporary
     return report
 
 
