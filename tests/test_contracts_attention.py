@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from attention_oracle import plain_merged
-from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw, order_set
+from contract_support import EDGES, ORDER_SETS, REVERSE_ONLY, assert_drawn_contract, normal_draw
 from reference_error import FEWEST_SEEDS
 
 from dew.nn import attention, kv_cache
@@ -75,21 +75,16 @@ def test_a_heads_sinks_hold_every_order(edge):
                           f"a head's sinks {edge}", plain_fn=plain)
 
 
-FUSED = {implementation: functools.partial(attention.scaled_dot_product_attention,
-                                           implementation=implementation)
-         for implementation in ("template", "tpu")}
-"""Each fused route as one function the module holds, so its orders' programs
-(`contract_support._mesh_program`, made once a function and an order) compile once across its cases' edges."""
-
-
-@pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(FUSED, EDGES)))
+@pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
 def test_a_fused_attention_kernel_holds_every_order(implementation, edge):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
     TPU), each differentiated at every order (`generation.linear_tangent`, row 2654): every order runs
     (forward mode, reverse mode, higher orders, remat, nested jit, scanned), finite wherever float64 is a
     normal float32 and the plain attention formula is, at queries, keys and values whose products near
     float32's ends."""
-    fused = FUSED[implementation]
+    def fused(query, key, value):
+        return attention.scaled_dot_product_attention(query, key, value, implementation=implementation)
+
     assert_drawn_contract(fused, attention_inputs(2657, (1, 128, 2, 64)), EDGES[edge],
                           f"{implementation} attention {edge}", truth_fn=plain_attention,
                           plain_fn=plain_attention)
@@ -238,15 +233,13 @@ def test_a_nudged_quotient_narrows_once_and_keeps_its_tangent():
     assert settled.astype(jnp.float16) == 1.0 and tangent == 1.0
 
 
-@pytest.mark.parametrize("taken", list(ORDER_SETS))
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_sparse_latent_kernel_holds_every_order(edge, taken):
+def test_the_sparse_latent_kernel_holds_every_order(edge):
     """`sparse_selection.templated_context` (the attention template's decode over each query's selected
     latents, its value, interpreted off a GPU), the blocked XLA path's derivatives through
     `generation.linear_tangent`: every order runs in the absorbed queries, the rope queries, the latents and
     the rope heads, finite wherever float64 is a normal float32 and the plain formula, each query's softmax
-    over its selected latents and rope heads, is; a slot naming no key reads nothing. Each order set a case
-    of its own (`ORDER_SETS`; row 12781: every order in one case took 104 to 179 s at unit operands)."""
+    over its selected latents and rope heads, is; a slot naming no key reads nothing."""
     from dew.nn import sparse_selection
 
     shapes = ((1, 3, 2, 32), (1, 3, 2, 32), (1, 3, 32), (1, 3, 32))
@@ -278,9 +271,8 @@ def test_the_sparse_latent_kernel_holds_every_order(edge, taken):
     # to differentiate (same as `template_paged` above); on a GPU, every order including remat runs.
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     with generation.assumed("sm80"):
-        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge} ({taken})",
-                              truth_fn=plain, plain_fn=plain, without=without, seeds=8,
-                              taking=order_set(taken, without))
+        assert_drawn_contract(sparse, inputs, EDGES[edge], f"the sparse latent kernel {edge}",
+                              truth_fn=plain, plain_fn=plain, without=without, seeds=8)
 
 
 @pytest.mark.parametrize("edge", EDGES)
