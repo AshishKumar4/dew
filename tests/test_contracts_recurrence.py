@@ -421,6 +421,118 @@ def test_scaled_exps_exponent_derivatives_hold_in_16_bit_operands(dtype):
         np.testing.assert_array_equal(np.asarray(found, np.float64), expected)
 
 
+@pytest.mark.parametrize(("value", "decay", "dtype"),
+                         [(2.0 ** 40, -40.0, jnp.float32), (2.0 ** 400, -300.0, jnp.float64)],
+                         ids=["fp32", "float64"])
+def test_scaled_exp_of_a_value_wider_than_its_exponent_keeps_its_normal_product(value, decay, dtype):
+    """`scan.scaled_exp` of a value wider than its fp16 exponent: its value `value e^decay` (fp32's 2^40
+    e^-40, float64's 2^400 e^-300) and its value's tangent and cotangent under a unit direction `e^decay`,
+    each a normal number of the value's dtype in float64's binade, the exponent split in the product's
+    dtype: split in fp16 (-9, -9, -22), `e^-22` rounded to an fp16 zero zeroed all three (the 2026-11-27
+    audit's K01); split at fp32's floor, float64's `e^-126` rounded to an fp32 zero (its fix's review)."""
+    with jax.enable_x64(new_val=dtype == jnp.float64):
+        held, power = jnp.asarray([value], dtype), jnp.asarray([decay], jnp.float16)
+        found = scan.scaled_exp(held, power)
+        tangent = jax.jvp(scan.scaled_exp, (held, power), (jnp.ones_like(held), jnp.zeros_like(power)))[1]
+        pulled = jax.vjp(scan.scaled_exp, held, power)[1](jnp.ones_like(held))[0]
+        read = [(got.dtype, np.asarray(got, np.float64)) for got in (found, tangent, pulled)]
+    expected_values = (value * np.exp(decay), np.exp(decay), np.exp(decay))
+    for (kind, got), expected in zip(read, expected_values, strict=True):
+        assert kind == dtype and np.isfinite(got).all() and (got != 0).all(), got
+        assert np.frexp(got)[1][0] == np.frexp(expected)[1], (got, expected)
+
+
+def _strict_16_bit():
+    with jax.numpy_dtype_promotion("strict"):
+        return scan.scaled_exp(jnp.ones(2, jnp.float16), -jnp.ones(2, jnp.float16)), jnp.float16
+
+
+def _weak_pair_across_x64():
+    value, decay = jnp.asarray(1.0), jnp.asarray(0.0)
+    with jax.enable_x64(new_val=True):
+        found = scan.scaled_exp(value, decay)
+    assert jax.typeof(found).weak_type, found
+    return found, jnp.float32
+
+
+def _mixed_weak_pair_across_x64():
+    decay = jnp.asarray(0.0)
+    with jax.enable_x64(new_val=True):
+        found = scan.scaled_exp(jnp.asarray(1.0), decay)
+        assert jax.typeof(found).weak_type and found.dtype == jnp.float64, found
+        return found + jnp.asarray(2.0 ** -9, jnp.bfloat16), jnp.bfloat16
+
+
+def _mixed_weak_pair_on_a_tpu():
+    decay = jnp.asarray(0.0)
+    with jax.enable_x64(new_val=True), generation.assumed("v5e"):
+        found = scan.scaled_exp(jnp.asarray(1.0), decay)
+        assert not jax.typeof(found).weak_type, found
+        return found, jnp.float32
+
+
+def _weak_scalars():
+    decayed = scan.scaled_exp(jnp.asarray(1.0), jnp.asarray(0.0))
+    return decayed + jnp.asarray(2.0 ** -9, jnp.bfloat16), jnp.bfloat16
+
+
+def _weak_exponent_on_a_tpu():
+    with generation.assumed("v5e"):
+        return scan.scaled_exp(jnp.ones(2, jnp.bfloat16), jnp.asarray(-1.0)), jnp.float32
+
+
+def _complex_value_on_a_tpu():
+    with jax.enable_x64(new_val=True), generation.assumed("v5e"):
+        value, decay = jnp.asarray([2.0 ** 400 + 0j], jnp.complex128), jnp.asarray([-300.0], jnp.float64)
+        found = scan.scaled_exp(value, decay)
+        read = np.asarray(found)
+    assert np.frexp(np.real(read))[1][0] == np.frexp(2.0 ** 400 * np.exp(-300.0))[1], read
+    return found, jnp.complex128
+
+
+def _strict_wide_value_on_a_tpu():
+    decay = jnp.asarray(-1.0)
+    with jax.enable_x64(new_val=True), jax.numpy_dtype_promotion("strict"), generation.assumed("v5e"):
+        found = scan.scaled_exp(jnp.ones(1, jnp.float64), decay)
+        assert np.frexp(np.asarray(found))[1][0] == np.frexp(np.exp(-1.0))[1], found
+        return found, jnp.float64
+
+
+def _strict_float64():
+    with jax.enable_x64(new_val=True), jax.numpy_dtype_promotion("strict"):
+        return scan.scaled_exp(jnp.ones(2, jnp.float64), -jnp.ones(2, jnp.float64)), jnp.float64
+
+
+def _weak_integer_value():
+    with jax.enable_x64(new_val=True):
+        found = scan.scaled_exp(jnp.asarray(1), jnp.asarray(-150.0))
+        assert np.asarray(found) != 0 and jax.typeof(found).weak_type, found
+        return found, jnp.float64
+
+
+@pytest.mark.parametrize("typed", [_strict_16_bit, _weak_pair_across_x64, _mixed_weak_pair_across_x64,
+                                   _mixed_weak_pair_on_a_tpu, _weak_scalars, _weak_exponent_on_a_tpu,
+                                   _complex_value_on_a_tpu, _strict_wide_value_on_a_tpu, _strict_float64,
+                                   _weak_integer_value],
+                         ids=lambda typed: typed.__name__.strip("_"))
+def test_scaled_exps_value_is_typed_as_its_operands_product(typed):
+    """`scan.scaled_exp`'s value of the type `value * accurate_exp(exponent)` has, an exponent as wide as its
+    product not cast (K01's fix's head reviews): two fp16 operands and two float64 ones under strict
+    promotion, which a widening by promotion refused; a weak fp32 pair called within x64, weak fp32, which
+    `jnp.result_type` read as float64, and a weak fp32 exponent beside a weak float64 value there, weak
+    float64, which a bf16 addend then rounds to bf16, and on a TPU, whose exponential is a strong fp32, the
+    same pair's strong fp32; weak scalars' weak fp32,
+    which a bf16 addend then rounds to bf16; a bf16 value under a weak exponent where a TPU's exponential is
+    fp32 (`precision.accurate_exp`), fp32; a complex128 value under a float64 exponent there, complex128,
+    `2^400 e^-300` kept, its exponent real (cast to complex, the TPU's exponential took it in fp32, zero);
+    a strong float64 value under a weak fp32 exponent there with strict promotion, float64, its factors
+    promoted by their floor as the parent's, which a probe of the raw exponent refused (fp64 by a TPU's fp32
+    exponential); and a weak integer under a weak float64 exponent, weak float64, `e^-150` kept, which a
+    strong fp32 value rounded to zero."""
+    found, dtype = typed()
+    assert found.dtype == dtype, found
+
+
 @pytest.mark.parametrize(("values", "dtype", "expected"), [
     ((256.0, -255.5), jnp.float32, 0.5), ((2.0 ** 130, -2.0 ** 130 + 2.0 ** 126), jnp.float64, 2.0 ** 126)],
     ids=["fp32", "float64"])
