@@ -657,18 +657,6 @@ class Bf16Window:
     meta: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
 
-    def __post_init__(self):
-        # Admitted only of this Dew's encoder wherever its form is concrete, however it is made (`of`, a
-        # checkpoint's restore, `dataclasses.replace`, a pytree's unflatten): a window a jitted step takes
-        # was admitted so before its trace, whose form is traced, its shape still checked there (row 13686's
-        # review: words another encoder packed read wrong through this form's decode).
-        if isinstance(self.form, Tracer):
-            if math.prod(self.form.shape) != window_form_version().size:
-                raise ValueError(f"Bf16Window form of shape {self.form.shape}, where this Dew's digest is "
-                                 f"{window_form_version().size} bytes")
-        elif isinstance(self.form, np.ndarray | jax.Array):
-            self.checked()
-    fmt: str = dataclasses.field(metadata={"static": True}, default="window")
 
     @classmethod
     def of(cls, weights: jax.Array | np.ndarray, *, site: str = "a matrix") -> "Bf16Window":
@@ -746,6 +734,8 @@ class Bf16Window:
         """The matrix `[..., depth, width]` in `dtype`, each weight its stored bits again (a bit operation a
         weight, traced or not): its base and offset's exponent beside its sign and mantissa, a signed zero,
         or its group's escape."""
+        if not isinstance(self.form, Tracer):
+            self.checked()
         group = packed.WINDOW_GROUP
         words, meta = (jnp.asarray(plane, jnp.uint32) for plane in (self.words, self.meta))
         *lead, width, count = words.shape

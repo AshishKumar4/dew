@@ -11,6 +11,7 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+from jax.core import Tracer
 
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import gemm, generation, grouped_quantized, selection, xla_products
@@ -37,6 +38,8 @@ def window_product(lhs: jax.Array, window: Bf16Window, group_sizes: jax.Array | 
     a decoded weight (its stored bits again) exact, summed in fp32 and rounded once to `out_dtype` (`lhs`'s
     where None); decoded a stage at a time in the GEMM mainloop where the selector takes it (`WINDOW`), else
     the decoded matrix's XLA dot (`xla_products.decoded_dot`). Frozen: its gradient is the rows' alone."""
+    if not isinstance(window.form, Tracer):
+        window.checked()
     dense = group_sizes is None
     if (dense and len(window.shape) != 2) or (not dense and len(window.shape) != 3):
         raise ValueError(f"window_product weight rank mismatch for dense={dense}: {window.shape}")

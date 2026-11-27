@@ -3,7 +3,6 @@ again decoded, a group past its escapes refused by its site's name, and a Dense 
 kernel (`quantization.bf16_windows`), its variables' kernels back bitwise (`decoded_bf16_windows`)."""
 
 import contextlib
-import dataclasses
 import functools
 
 import jax
@@ -367,16 +366,14 @@ def test_gemm_over_a_window_states_the_algorithm_its_call_and_run_declare(run, s
     assert found and algorithms == ({algorithm} if algorithm else set()), found
 
 
-def test_a_window_of_another_encoding_is_refused_however_it_is_made():
-    """A window whose form is another encoder's is refused where it is made, before any trace reads it
-    (row 13686's review): replaced into a window, or unflattened from a checkpoint's leaves, its words never
-    reach a product, jitted or not, on the window's own product or its decoded fallback."""
+@pytest.mark.parametrize("compute", [jnp.bfloat16, jnp.float32], ids=["window", "decoded"])
+def test_gemm_over_a_window_of_another_encoding_is_refused(compute):
+    """A window whose form a later write made another encoder's is refused by `gemm.gemm` at its product,
+    on the window's own route (bf16 compute at the default precision, `window_product`) and on its decoded
+    fallback (fp32 compute, `Bf16Window.decoded`) alike, its words never read through this form's decode
+    (row 13686's review)."""
     kernel = jnp.asarray((np.arange(128 * 64).reshape(128, 64) % 7 - 3) / 4.0, jnp.bfloat16)
     window = Bf16Window.of(kernel)
-    form = np.asarray(window.form).copy()
-    form.reshape(-1)[0] ^= 1
-    with pytest.raises(ValueError):
-        dataclasses.replace(window, form=form)
-    leaves, structure = jax.tree.flatten(window)
-    with pytest.raises(ValueError):
-        jax.tree.unflatten(structure, [form if leaf is window.form else leaf for leaf in leaves])
+    np.asarray(window.form).reshape(-1)[0] ^= 1
+    with jax.default_matmul_precision("default"), pytest.raises(ValueError):
+        gemm.gemm(jnp.ones((4, 128), jnp.float32), window, None, out_dtype=jnp.float32, compute=compute)

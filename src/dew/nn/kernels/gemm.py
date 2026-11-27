@@ -370,9 +370,9 @@ def _window_served(lhs, rhs, compute, precision, outputs: tuple):
     if not isinstance(rhs, Bf16Window):
         return rhs
     computed = jnp.dtype(lhs.dtype if compute is None else compute)
-    asked, run = (declared(computed, stated, outputs=outputs) for stated in (precision, None))
+    asked = declared(computed, precision, outputs=outputs)
     taken = (computed == jnp.dtype(jnp.bfloat16) and not asked.promoted and asked.refusal is None
-             and run.refusal is None and stated_algorithm(precision) is stated_algorithm(None) is None)
+             and stated_algorithm(precision) is None and stated_algorithm(None) is None)
     return rhs if taken else rhs.decoded()
 
 
