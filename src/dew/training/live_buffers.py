@@ -362,13 +362,21 @@ def _charged(events, assigned: dict[int, int], kinds: dict[str, int]) -> set[int
 
 def _read_as(reader, computations) -> tuple[str, ...]:
     """The op names `reader` reads a value as: its own, or a fusion's of none (XLA:GPU's own fusions carry
-    none, `_maker`) each op name its fused computation's instructions carry, which ops of a forward and of
-    a backward both may be (train 1406); ("",) where none carries one."""
+    none, `_maker`) each op name its fused computation's instructions carry, through any fusion of none
+    within it, which ops of a forward and of a backward both may be (train 1406); ("",) where none carries
+    one."""
     if reader.metadata.op_name or reader.opcode != "fusion":
         return (reader.metadata.op_name,)
-    fused = computations[reader.called_computation_ids[0]]
-    named = sorted({each.metadata.op_name for each in fused.instructions if each.metadata.op_name})
-    return tuple(named) or ("",)
+    named: set[str] = set()
+    inside = [computations[reader.called_computation_ids[0]]]
+    while inside:
+        for each in inside.pop().instructions:
+            if each.metadata.op_name:
+                named.add(each.metadata.op_name)
+            elif each.opcode == "fusion":
+                # A fusion within it of no name of its own (XLA's nested GEMM fusions): the ops it fuses.
+                inside.append(computations[each.called_computation_ids[0]])
+    return tuple(sorted(named)) or ("",)
 
 
 def _maker(instruction, index: tuple[int, ...], instructions,

@@ -1290,7 +1290,7 @@ class LogitsWidth(Protocol):
     def logits_width(self) -> int: ...
 
 
-def logits_width(model: StatesVocabulary) -> int:
+def logits_width(model: StatesVocabulary | LogitsWidth) -> int:
     """The width of `model`'s logits: its own where it states one (`LogitsWidth`), else its vocabulary's."""
     return model.logits_width if isinstance(model, LogitsWidth) else model.vocab_size
 

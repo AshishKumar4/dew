@@ -146,6 +146,18 @@ def test_a_fusion_of_no_name_reads_a_value_as_each_op_its_computation_names():
         (1, "jit(f)/exp"), (1, "jit(f)/neg"), (2, "jit(f)/own"))
 
 
+def test_a_fusion_within_a_fusion_reads_a_value_as_the_ops_it_fuses():
+    """A fusion of no name whose computation fuses another of no name (XLA's nested GEMM fusions) reads its
+    operand as the ops the inner one names (review)."""
+    module = module_bytes((FIXTURES / "nested.hlo").read_text())
+    defined = instruction_ids(module, "e")
+    assignment: Any = empty_assignment()
+    assignment.buffer_allocations.add(index=0, size=8)
+    buffer = assignment.logical_buffers.add(id=0, size=8)
+    buffer.defined_at.instruction_id = defined["a"].id
+    assert read(assignment, module).used(0, {("e", "f"): 1}) == ((1, "jit(f)/jvp(g)/neg"),)
+
+
 GOTTEN = (FIXTURES / "gotten.hlo").read_text()
 
 

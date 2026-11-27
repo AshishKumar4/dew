@@ -20,7 +20,7 @@ from typing import ClassVar, Literal
 from flax import linen as nn
 
 from dew.batch import Variables
-from dew.nn.protocols import AffineHead, LogitsWidth, OutputTable, StatesVocabulary, head_table
+from dew.nn.protocols import AffineHead, LogitsWidth, OutputTable, StatesVocabulary, head_table, logits_width
 from dew.objectives.base import Effects, Loss, Objective, ProgramModule
 from dew.objectives.lm.chunked import (
     Terms,
@@ -137,7 +137,8 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     def tiled_logits(self, whole: tuple[int, int], tile: tuple[int, int], fused: bool,
                      itemsize: int) -> int | None:
-        """The bytes of logits, `itemsize` bytes each as the whole head's were, the head tiled at `tile`,
+        """The bytes of logits, `itemsize` bytes each as the whole head's were (a tile's at least float32's),
+        the head tiled at `tile`,
         `fused` or not, holds at once on a device whose whole head held logits of shape `whole` (`[tokens,
         columns]`), by the rules its route takes: a fused head scores a chunk of its tokens over every
         column it scores, the table gathered whole however the whole head's columns were split
@@ -145,17 +146,18 @@ class HeadedObjective(Objective[Loss, Effects]):
         `head_chunks`). The columns a head scores are its logits' width where it scores fewer than its
         table's rows (`LogitsWidth`: Inkling 2's 200058 of 201024), else its vocabulary
         (`StatesVocabulary`). None for a fused head where the model states neither, or where the whole
-        head's columns were a split of them, whose tokens are its vocabulary group's gathered where the
-        fused head scores its own alone: what a fit search prices a head's move from its whole logits by
-        (`dew.training.planning.priced`; train 1406)."""
+        head's columns were a split of them: the whole route gathers its vocabulary group's tokens, where the
+        fused route gathers the table and scores the device's own tokens alone. What a fit search prices a
+        head's move from its whole logits by (`dew.training.planning.priced`; train 1406)."""
         tokens, columns = whole
+        # A tile forms its logits at least in float32 (`_tile_logits`' product), whatever the whole head
+        # held (a single GPU's bf16 logits), a wider type its own.
+        width = max(itemsize, 4)
         if not fused:
-            return itemsize * min(tile[0], tokens) * tile_columns(columns, self.head_chunks, tile[1])
-        scored = (self.model.logits_width if isinstance(self.model, LogitsWidth)
-                  else self.model.vocab_size if isinstance(self.model, StatesVocabulary) else None)
-        if scored != columns:
+            return width * min(tile[0], tokens) * tile_columns(columns, self.head_chunks, tile[1])
+        if not isinstance(self.model, LogitsWidth | StatesVocabulary) or logits_width(self.model) != columns:
             return None
-        return itemsize * fused_tokens(tokens, columns, tile) * columns
+        return width * fused_tokens(tokens, columns, tile) * columns
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.

@@ -202,9 +202,10 @@ def test_a_finer_split_frees_its_rows_share_beside_what_the_place_drops():
 def test_a_heads_tile_holds_what_its_route_holds():
     """A head tiled unfused holds a tile of its tokens by its columns' width over its chunks; fused, a chunk
     of its tokens over every column it scores, its whole logits' bytes a logit (4 at float32, 8 at
-    float64); a fused head whose whole head's columns were a split of what it scores, its tokens then its
-    group's gathered, is priced by none. A head scoring fewer columns than its table's rows (Inkling 2's
-    200058 of 201024, `output_vocab`) is priced at those columns (train 1406)."""
+    float64, never fewer than float32's: a tile forms them so); a fused head whose whole head's columns
+    were a split of what it scores, its tokens then its group's gathered, is priced by none. A head scoring
+    fewer columns than its table's rows (Inkling 2's 200058 of 201024, `output_vocab`) is priced at those
+    columns (train 1406)."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -218,6 +219,8 @@ def test_a_heads_tile_holds_what_its_route_holds():
     assert whole.tiled_logits((4096, 32768), (1024, 8192), fused=False, itemsize=4) == 4 * 1024 * 2048
     assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=True, itemsize=4) == 4 * 1024 * 65536
     assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=True, itemsize=8) == 8 * 1024 * 65536
+    # A tile's logits at least float32's, whatever the whole head held (a single GPU's bf16 logits).
+    assert whole.tiled_logits((4096, 65536), (1024, 8192), fused=False, itemsize=2) == 4 * 1024 * 4096
     assert whole.tiled_logits((4096, 32768), (1024, 8192), fused=True, itemsize=4) is None
     scoring = objective(output_vocab=65000)
     assert scoring.tiled_logits((4096, 65000), (1024, 8192), fused=True, itemsize=4) == 4 * 1024 * 65000
