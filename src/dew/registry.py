@@ -1200,8 +1200,9 @@ def _bound(value: object, declared: tuple[Annotation, ...]) -> functools.partial
         raise ValueError(f"a bound member is the record that names it, {{'class': ..., 'fields': {{...}}}}, "
                          f"not {value!r}")
     member = _member(named[0], held or (object,))
-    # Its arguments held as their records, read where the member is built, as a bound record's are.
-    return _Bound(member, **named[1])
+    # Read here: a partial a caller calls hands its member the arguments it takes (a config's bound member
+    # holds its records until it is built, `Bound.read`).
+    return _Bound(member, **read_arguments(member, named[1]))
 
 
 def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
@@ -2081,6 +2082,9 @@ class Bound[Member](ABC):
         if self._recorded:
             return dict(self.fields)
         with recording():
+            # Each written as held, against no parameter's annotation, as the record held them before
+            # (`JsonDict`): a world model's views named alone, which its environment widens, are no value
+            # of the parameter they become.
             return {name: to_record(value, None) for name, value in self.fields.items()}
 
     def record(self) -> dict[str, JSON]:

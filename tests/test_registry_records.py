@@ -561,42 +561,53 @@ def test_a_bound_member_reads_back_as_its_annotation_admits():
         assert from_record(functools.partial[CausalTransformer], given).func is decoder
 
 
+USER_ENVS = """
+import dataclasses
+from typing import ClassVar
+
+
 @dataclasses.dataclass(frozen=True)
-class _Opened:
-    """A part a member reads only when it is built, which counts each time it is built (a renderer that
-    opens its assets)."""
-
+class Opened:
     assets: str = "scene"
-    built: typing.ClassVar[list[str]] = []
+    built: ClassVar[list[str]] = []
 
-    def __post_init__(self) -> None:
+    def __post_init__(self):
         self.built.append(self.assets)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Simulated:
-    """An environment of a part it builds (`_Opened`)."""
+class Simulated:
+    renderer: Opened = Opened()
+"""
 
-    renderer: _Opened = _Opened()
 
-
-def test_a_bound_record_holds_its_arguments_until_its_member_is_built():
+def test_a_bound_record_holds_its_arguments_until_its_member_is_built(tmp_path):
     """A bound member holds its arguments as given until it is built (row 12896, train 1412's review): a
     model's views named by their entries alone, which its environment widens, held as named; and a record
-    naming a part of a recorded kind (an environment's renderer) builds none of it, the record saved again
-    as read, until the environment is built."""
-    from dew.config.env import EnvConfig
+    naming a part of a recorded kind (a trusted package's environment's renderer, one that opens assets)
+    builds none of it, the record saved again as read, until the environment is built."""
     from dew.objectives.rl.dreamer import WorldModel
-    from dew.registry import ModelConfig, to_record
+    from dew.registry import ModelConfig
 
     named = ModelConfig(functools.partial(WorldModel, reads="image")).with_fields(auxiliary=[["state", 256]])
     assert named.fields["auxiliary"] == [["state", 256]]
-    _Opened.built.clear()
-    renderer = {"class": "test_registry_records:_Opened", "fields": {"assets": "track"}}
-    record = {"name": "test_registry_records:_Simulated", "fields": {"renderer": renderer}}
-    env = from_record(EnvConfig, record)
-    assert _Opened.built == [] and to_record(env, EnvConfig)["fields"] == record["fields"]
-    assert env.build().renderer.assets == "track" and _Opened.built == ["track"]
+    (tmp_path / "users_envs.py").write_text(USER_ENVS)
+    report = json.loads(_ran(tmp_path, """
+import json
+from dew.config.env import EnvConfig
+from dew.registry import from_record, import_trusted, to_record
+import_trusted(None, ("users_envs",))
+import users_envs
+renderer = {"class": "users_envs:Opened", "fields": {"assets": "track"}}
+record = {"name": "users_envs:Simulated", "fields": {"renderer": renderer}}
+env = from_record(EnvConfig, record)
+read = list(users_envs.Opened.built)
+written = to_record(env, EnvConfig)
+built = env.build()
+print(json.dumps({"read": read, "same": written["fields"] == record["fields"],
+                  "built": built.renderer.assets, "opened": users_envs.Opened.built}))
+"""))
+    assert report == {"read": [], "same": True, "built": "track", "opened": ["track"]}, report
 
 
 def test_a_record_naming_no_member_is_its_kinds_default_ones():
