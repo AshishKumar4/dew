@@ -25,7 +25,6 @@ import logging
 import operator
 import os
 import secrets
-import shutil
 import stat
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -297,55 +296,47 @@ def _removed(tree: Path) -> None:
     another writer published before), as far as this process may: a folder whose read-only mode keeps an
     entry in it (one an earlier tree's mode restored) made writable to remove it, where this process owns
     it, and no other touched, nor any failure raised, so a cleanup neither fails a save already published
-    nor hides the error it unwinds from (train 1407's review). The live tree is never walked."""
+    nor hides the error it unwinds from (train 1407's review). The live tree is never walked.
+
+    Walked bottom-up through descriptors (`os.fwalk`, no link followed), each folder's entries removed, and
+    a removal its mode refuses retried, through the very descriptor the walk holds of that folder: a folder
+    or a link put in the tree's place meanwhile is neither changed nor followed (trains 1414 and 1423's
+    reviews). The root's own parent, the release's, is never changed."""
     if not os.path.lexists(tree) or os.path.islink(tree):
         return
+    log = logging.getLogger(__name__)
 
-    root = os.path.abspath(tree)
+    def unread(error: OSError) -> None:
+        log.warning("could not read %s of a save's discarded tree: %s", error.filename, error)
 
-    def retried(remove: Callable[..., None], path: str, failure: BaseException) -> None:
-        # An entry's removal alone retried (no traversal, whose calls take more than a path), and only in a
-        # folder of the tree: its root's own parent, the release's, is never changed. The folder is reached
-        # from the root a component at a time, no link followed, and changed and emptied through that
-        # descriptor, so a link put in the tree's place meanwhile leads nowhere outside it (train 1414's
-        # review).
-        folder = os.path.dirname(os.path.abspath(path))
-        if (remove not in (os.unlink, os.rmdir) or not isinstance(failure, PermissionError)
-                or not (folder == root or folder.startswith(root + os.sep))):
-            return
-        try:
-            opened = _folder(root, os.path.relpath(folder, root))
-            try:
-                held = os.fstat(opened)
-                # Only a folder of this process's own whose mode keeps the entry: no other touched.
-                if held.st_uid != os.geteuid() or held.st_mode & 0o300 == 0o300:
-                    return
-                os.fchmod(opened, 0o700)
-                remove(os.path.basename(path), dir_fd=opened)
-            finally:
-                os.close(opened)
-        except OSError as left:
-            # A save's own leftover, named for whoever clears it; the save's outcome is its own.
-            logging.getLogger(__name__).warning("could not remove %s from a save's discarded tree: %s",
-                                                path, left)
-
-    shutil.rmtree(tree, onexc=retried)
-
-
-def _folder(root: str, relative: str) -> int:
-    """A descriptor of the folder `relative` names below `root`, opened from `root` one component at a time,
-    none a link followed."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    opened = os.open(root, flags)
+    for _, folders, files, held in os.fwalk(tree, topdown=False, onerror=unread, follow_symlinks=False):
+        for name in (*files, *folders):
+            _removed_in(held, name, log)
     try:
-        for name in Path(relative).parts:
-            inner = os.open(name, flags, dir_fd=opened)
-            os.close(opened)
-            opened = inner
-    except BaseException:
-        os.close(opened)
-        raise
-    return opened
+        os.rmdir(tree)
+    except OSError as left:
+        # A save's own leftover, named for whoever clears it; the save's outcome is its own.
+        log.warning("could not remove a save's discarded tree %s: %s", tree, left)
+
+
+def _removed_in(folder: int, name: str, log: logging.Logger) -> None:
+    """Remove the entry `name` of the folder the descriptor `folder` holds (a folder, emptied already, or
+    any other entry, a link not followed), its folder made writable to retry where its mode refuses the
+    removal and this process owns it; a failure logged, not raised."""
+    try:
+        kind = os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode
+        remove = os.rmdir if stat.S_ISDIR(kind) else os.unlink
+        try:
+            remove(name, dir_fd=folder)
+        except PermissionError:
+            held = os.fstat(folder)
+            # Only a folder of this process's own whose mode keeps the entry: no other touched.
+            if held.st_uid != os.geteuid() or held.st_mode & 0o300 == 0o300:
+                raise
+            os.fchmod(folder, 0o700)
+            remove(name, dir_fd=folder)
+    except OSError as left:
+        log.warning("could not remove %s from a save's discarded tree: %s", name, left)
 
 
 def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, made: int, written: Entries,
@@ -359,7 +350,8 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
     not, or one this process cannot give, refused, as `chown` refuses it, before anything moves), and the
     access every one of them allowed, so a component's private weights in a group of their own stay so
     (trains 1406, 1407 and 1414's reviews); any other the group a new entry in its folder takes, the
-    folder's where it is setgid, else this process's own, and a new folder the setgid bit of its own."""
+    folder's where it is setgid, else the one the kernel gave it, and a new folder the setgid bit of its
+    own. Each folder's mode is set after its entries'."""
     earlier: dict[Path, tuple[int, int]] = {}
     for entries, replaced in replacements:
         if not replaced:
@@ -376,35 +368,44 @@ def _granted(staging: Path, directory: Path, held_at: os.stat_result | None, mad
     if held_at is None:
         parent = directory.parent.stat()
         setgid = parent.st_mode & stat.S_ISGID
-        root = (parent.st_gid if setgid else os.getegid(), (made & ~stat.S_ISGID) | setgid)
+        # A setgid parent's group; else the one the kernel gave the staging made there (the parent's on a
+        # `grpid` mount, this process's otherwise), kept (train 1423's review).
+        root = (parent.st_gid if setgid else None, (made & ~stat.S_ISGID) | setgid)
     else:
         root = (held_at.st_gid, stat.S_IMODE(held_at.st_mode))
+    _grouped(staging, root[0])
     # Each folder's group and setgid bit as published, its entries following it (a folder before them).
-    placed = {Path(): (root[0], root[1] & stat.S_ISGID)}
-    _given(staging, root[0], None)
+    placed = {Path(): (staging.lstat().st_gid, root[1] & stat.S_ISGID)}
+    # Each folder's mode, set once every entry below it is: a mode its earlier folder held that keeps even
+    # its owner out (`0055`) set first would refuse its entries' (train 1423's review).
+    folders: list[tuple[Path, int]] = []
     for entry in sorted(written, key=lambda entry: len(entry.parts)):
         path, kind = staging / entry, written[entry]
         group, setgid = placed[entry.parent]
         if entry in earlier:
             group, mode = earlier[entry]
         else:
-            group = group if setgid else os.getegid()
+            # A new entry its folder's group where the folder is setgid, else the one the kernel gave it.
+            group = group if setgid else None
             mode = (stat.S_IMODE(path.lstat().st_mode) & ~stat.S_ISGID) | setgid if kind == "folder" else None
-        _given(path, group, None if kind == "link" else mode)
-        if kind == "folder" and mode is not None:
-            placed[entry] = (group, mode & stat.S_ISGID)
+        _grouped(path, group)
+        if kind == "folder":
+            held = path.lstat()
+            mode = stat.S_IMODE(held.st_mode) if mode is None else mode
+            folders.append((path, mode))
+            placed[entry] = (held.st_gid, mode & stat.S_ISGID)
+        elif kind != "link" and mode is not None and stat.S_IMODE(path.lstat().st_mode) != mode:
+            path.chmod(mode)
+    for path, mode in reversed(folders):
+        if stat.S_IMODE(path.lstat().st_mode) != mode:
+            path.chmod(mode)
     return root[1]
 
 
-def _given(path: Path, group: int, mode: int | None) -> None:
-    """`path` (a link not followed) in `group`, and with `mode` where one is given, changing only what
-    differs: the group first, which a change of resets a file's setgid bit."""
-    held = path.lstat()
-    regrouped = held.st_gid != group
-    if regrouped:
+def _grouped(path: Path, group: int | None) -> None:
+    """`path` (a link not followed) in `group` where it is in another, as it is where None (the kernel's)."""
+    if group is not None and path.lstat().st_gid != group:
         os.chown(path, -1, group, follow_symlinks=False)
-    if mode is not None and (regrouped or stat.S_IMODE(held.st_mode) != mode):
-        path.chmod(mode)
 
 
 def _made_mode(parent: Path) -> int:

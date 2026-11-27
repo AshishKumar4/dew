@@ -363,3 +363,25 @@ def test_a_new_release_takes_the_setgid_its_parent_holds_as_the_lock_finds_it(tm
     published = [destination, *destination.rglob("*")]
     assert {path.lstat().st_gid for path in published} == {other}
     assert destination.stat().st_mode & (destination / "nested").stat().st_mode & stat.S_ISGID
+
+
+def test_a_component_whose_earlier_folder_kept_its_owner_out_is_replaced_its_entries_first(tmp_path):
+    """A release whose component folder's mode kept even its owner out (`0055`), replaced by one that
+    writes that folder: every entry below it takes its access before the folder takes its mode, which would
+    refuse their reads first (train 1423's review), and the folder publishes with that mode."""
+    release = tmp_path / "release"
+    component = release / "text_encoder"
+    component.mkdir(parents=True)
+    (component / "model.safetensors").write_text("old")
+    component.chmod(0o055)
+    try:
+        with swapped(release, _nothing_foreign) as staging:
+            (staging / "text_encoder").mkdir()
+            (staging / "text_encoder" / "model.safetensors").write_text("new")
+            (staging / "text_encoder" / "config.json").write_text("{}")
+        assert stat.S_IMODE(component.stat().st_mode) == 0o055
+    finally:
+        component.chmod(0o755)
+    assert (component / "model.safetensors").read_text() == "new"
+    left = sorted(path.name for path in tmp_path.iterdir() if not path.name.startswith(".dew-lock-"))
+    assert left == ["release"], left
