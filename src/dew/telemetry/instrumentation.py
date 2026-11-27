@@ -391,9 +391,9 @@ def _read(source: str | Iterable[str] | jax.stages.Compiled, *, described: bool 
         if read.entry:
             entry = read.computation
         moved = described and collective(read.opcode)
-        sized = moved or read.opcode == 'custom-call'
-        # A count reads the first result array's dimensions and its element type alone (`_first_dims`); the
-        # result's every array is sized where a description, or a custom call's sizes, read it (`_arrays`).
+        sized = moved or (described and read.opcode == 'custom-call')
+        # A count reads the first result array's dimensions and its element type alone (`_first_dims`); only
+        # a description sizes the result's every array (`_arrays`: a collective's, a custom call's).
         arrays = _arrays(proto.shape) if sized else ()
         dims = arrays[0][1] if arrays else _first_dims(proto.shape)
         element = _element(proto.shape)
