@@ -166,36 +166,56 @@ def _levels_above(query, key, value, g, weights, *, within):
         before = jnp.concatenate([jnp.zeros_like(right[:, :, :1]), jnp.cumsum(right, axis=2)[:, :, :-1]], 2)
         severed = jnp.cumsum(cuts, axis=2) - cuts > 0
         local, inside = halves(entered)[:, :, 1], halves(crossed)[:, :, 1]
-        # A read through a vanished decay, within its chunk or before it in its half, discarded: its reader
-        # zeroed before its product and its read before its decay and after, as the recurrence selects one
-        # out. Masked after the product alone, an overflowed reader's pullback was `0 * inf` (dk, dv at a
-        # query of 2^127 weighed 2 severed by -1000), an overflowed read's decay's derivative too (dg at
-        # 2^70 by 2^70).
-        vanished = inside | severed[..., None, :]
-        # A chunk whose every read is discarded (severed before it, or its first token vanished): its held
+        # A read through a vanished decay (a segment's reset), within its chunk or before it in its half,
+        # discarded: its reader zeroed before its product and its read before its decay and after, as the
+        # recurrence selects one out. Masked after the product alone, an overflowed reader's pullback was
+        # `0 * inf` (dk, dv at a query of 2^127 weighed 2 severed by -1000), an overflowed read's decay's
+        # derivative too (dg at 2^70 by 2^70).
+        reset = inside | severed[..., None, :]
+        # A chunk whose every read is discarded (a reset before it, or its first token vanished): its held
         # memory zero, its decay's operands too, so no pullback meets an overflowed memory's `0 * inf`.
         emptied = by_head(severed | inside[..., 0, :])[..., None, :, None]
+        left = memory[:, 0::2, None]
+        # An overflowed memory, reader or read alone is zeroed where its decay keeps no finite fp32 value
+        # (`_dropped`), its value there every finite one's; a finite one decays as it is, its derivatives
+        # those of its exact product: four live decays of -80 took an overflowed read of 2^70 by 2^70 to
+        # NaN and a reader of 2^128 times its emptied memory too (train 1379's review), and zeroing a
+        # finite read of 2^127 under four decays of -50 lost its decay's gradient 4.0e-11 (train 1398's).
+        spent = emptied | (~jnp.isfinite(left) & by_head(_dropped(before))[..., None, :, None])
         start = by_head(before)[..., None, :, None]
-        held = scan.scaled_exp(jnp.where(emptied, 0.0, memory[:, 0::2, None]), jnp.where(emptied, 0.0, start))
-        held = jnp.where(emptied, 0.0, held).astype(value.dtype)
+        held = scan.scaled_exp(jnp.where(spent, 0.0, left), jnp.where(spent, 0.0, start))
+        held = jnp.where(spent, 0.0, held).astype(value.dtype)
         weight = by_head(halves(chunk_weights[..., level])[:, :, 1])
         readers = halves(queries)[:, :, 1][..., None, :].astype(g.dtype) * weight[..., None]
-        readers = jnp.where(by_head(vanished)[..., None], 0.0, readers).astype(query.dtype)
+        readers = readers.astype(query.dtype)
+        dropping = _dropped(before)[..., None, :] | _dropped(local)
+        unread = by_head(reset)[..., None] | (by_head(dropping)[..., None] & ~jnp.isfinite(readers))
+        readers = jnp.where(unread, 0.0, readers)
         read = jnp.einsum('bnrtgek,bnrgkep->bnrtgep', readers, held, preferred_element_type=jnp.float32)
         read = read.reshape(*read.shape[:4], heads, columns)
-        decayed = scan.scaled_exp(jnp.where(vanished[..., None], 0.0, read),
-                                  jnp.where(vanished, 0.0, local)[..., None])
-        read = jnp.where(vanished[..., None], 0.0, decayed)
+        discarded = reset[..., None] | (_dropped(local)[..., None] & ~jnp.isfinite(read))
+        decayed = scan.scaled_exp(jnp.where(discarded, 0.0, read),
+                                  jnp.where(discarded, 0.0, local[..., None]))
+        read = jnp.where(discarded, 0.0, decayed)
         laid = jnp.stack([jnp.zeros_like(read), read], axis=2)
         out = out + laid.reshape(laid.shape[0], -1, heads, columns)[:, :length]
         # The next level's half blocks: two of these joined, the left decayed across the right, zero where a
         # vanished token in the right cuts it (an overflowed left memory times its zero decay was NaN, a
         # level-8 read at token 128 of 2^70 by 2^70 cut by -1000 at token 64).
         across = by_head(whole[:, 1::2])[:, :, :, None, :, None]
-        gone = jnp.isneginf(across)
+        gone = jnp.isneginf(across) | (~jnp.isfinite(memory[:, 0::2]) & _dropped(across))
         joined = scan.scaled_exp(jnp.where(gone, 0.0, memory[:, 0::2]), jnp.where(gone, 0.0, across))
         memory, whole = jnp.where(gone, 0.0, joined) + memory[:, 1::2], whole[:, 0::2] + whole[:, 1::2]
     return out
+
+
+def _dropped(exponent):
+    """Where a decay `exponent` (natural units, at most 0) keeps no finite fp32 value, the largest decayed by
+    it zero (`scan.scaled_exp`'s factors), -inf (a vanished token) among them: an overflowed read, reader or
+    memory through it is zero, as every finite one's value is, where its product with the zero decay was
+    NaN; a finite one decays as it is."""
+    largest = jnp.full(exponent.shape, jnp.finfo(jnp.float32).max, jnp.float32)
+    return jax.lax.stop_gradient(scan.scaled_exp(largest, exponent)) == 0
 
 
 def _half_decays(exponents, *, to_end: bool):
