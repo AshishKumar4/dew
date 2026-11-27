@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from attention_oracle import traced_attention_terms
 from generation_support import INTERPRETS
-from reference_error import assert_as_exact, assert_fp32_reduction_bound, with_gradients
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_products
@@ -232,54 +232,6 @@ def test_a_banded_call_selects_by_a_querys_explicit_place_however_far():
     np.testing.assert_array_equal(np.asarray(template.dense(laid))[0, 0], [True, True, False, False])
 
 
-def _parallax_reference(spans: template.KeySpans):
-    """Parallax's output as its paper states it (arXiv 2605.29157, §A row 54), over the softmax's weights
-    `p` and the second product's `t` apart: `O1/d1 (1 + d2/d1) - O2/d1`, `O1 = Σ p v`, `d1 = Σ p`,
-    `O2 = Σ (p t) v`, `d2 = Σ p t`, each weight rounded to the value's dtype for its product."""
-    def reference(query, second, key, second_key, value):
-        logits = template.scores(query, key, spans, scale=SCALE)
-        wide = logits.dtype
-        m = jnp.max(logits, axis=-1, keepdims=True)
-        p = jnp.exp(logits - m)
-        seconds = jnp.einsum("bqhd,bkhd->bhqk", second.astype(wide), second_key.astype(wide))
-        weighed = p * seconds
-
-        def summed(weights):
-            return jnp.einsum("bhqk,bkhd->bhqd", weights.astype(value.dtype).astype(wide), value.astype(wide))
-
-        d1, d2 = p.sum(-1, keepdims=True), weighed.sum(-1, keepdims=True)
-        out = summed(p) / d1 * (1 + d2 / d1) - summed(weighed) / d1
-        return jnp.swapaxes(out.astype(query.dtype), 1, 2)
-
-    return reference
-
-
-@pytest.mark.parametrize("form", FORMS)
-@pytest.mark.parametrize("case", ["causal", "full"])
-def test_parallax_is_on_par_with_its_two_accumulators(case, form):
-    """Parallax (§A row 54): a second, unscaled query's product weighing a second accumulator, on the
-    template's route (its kernels' forward and backward, `attention_products.parallax`), causal and full:
-    on par with the paper's two accumulators and denominators (check 1), its output and the gradients of the
-    query, the second query, the keys and the value."""
-    spans = template.spans(TOKENS, TOKENS, 1, causal=case == "causal")
-    natural, accurate = FORMS[form]
-
-    def ours(query, second, key, value):
-        return attention_products.attend((query, second), (key, key), value, spans,
-                                         attention_products.PARALLAX, scale=SCALE, natural=natural,
-                                         accurate=accurate)
-
-    def reference(query, second, key, value):
-        return _parallax_reference(spans)(query, second, key, key, value)
-
-    def draw(seed: int):
-        q1, q2, k1, _, value, dout = _draw(2)(seed)
-        return q1, q2 * 0.125, k1, value, dout
-
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(reference)), draw,
-                    f"parallax {case} {form}", seeds=SEEDS)
-
-
 def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_rounds():
     """A fp16 key bias (a KEY side) on a banded call whose near and far products' bias gradients each pass
     fp16's largest and cancel: uniform logits, values 3 and -3, output cotangents 65504 and -65504; the
@@ -297,79 +249,6 @@ def test_a_banded_calls_16_bit_key_bias_sums_its_copies_gradients_before_it_roun
 
     _, pull = jax.vjp(attended, jnp.zeros((1, 1, 2), jnp.float16))
     assert np.isfinite(np.asarray(pull(dout)[0], np.float32)).all()
-
-
-def test_parallax_holds_a_second_query_past_its_dtypes_range_over_the_scale():
-    """Parallax in fp16 at a logit scale of 1/8, uniform logits, a second query of 16384 against second keys
-    of -2^-14 and 2^-14 (its products -1 and 1, their mean 0) and values -1 and 1: its weights `a (1 + τ -
-    t)` 1 and 0, its output -1 exactly, where the second query over the scale, 131072, passes fp16's
-    largest."""
-    spans = template.spans(2, 2, 1)
-    zeros = jnp.zeros((1, 2, 1, 8), jnp.float16)
-    second = zeros.at[..., 0].set(16384.0)
-    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-(2.0**-14), 2.0**-14]))
-    value = jnp.broadcast_to(jnp.asarray([-1.0, 1.0], jnp.float16)[None, :, None, None], (1, 2, 1, 8))
-    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=0.125)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
-
-
-def test_parallax_holds_its_correction_at_a_scale_a_16_bit_gradient_would_round_away():
-    """Parallax in fp16 at a logit scale of 2^-26, zero logits, a second query of 1 against second keys and
-    values of -1 and 1: its correction 1 (the softmax's 0 less it), -1 exactly, where its dQ, the scale
-    times it, rounded to fp16 was 0."""
-    spans = template.spans(2, 2, 1)
-    zeros = jnp.zeros((1, 2, 1, 8), jnp.float16)
-    second = zeros.at[..., 0].set(1.0)
-    pair = jnp.asarray([-1.0, 1.0], jnp.float16)
-    second_key = zeros.at[0, :, 0, 0].set(pair)
-    value = jnp.broadcast_to(pair[None, :, None, None], (1, 2, 1, 8))
-    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-26)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), -np.ones((1, 2, 1, 8), np.float32))
-
-
-def test_parallax_holds_a_correction_whose_scaled_gradient_passes_fp32s_least():
-    """Parallax in fp32 at a logit scale of 2^-120, zero logits, a second query of 1 against second keys of
-    -1 and 1 and values of -2^-40 and 2^-40: its output -2^-40 exactly, where the scale times it, 2^-160,
-    passes fp32's least subnormal."""
-    spans = template.spans(2, 2, 1)
-    zeros = jnp.zeros((1, 2, 1, 8), jnp.float32)
-    second = zeros.at[..., 0].set(1.0)
-    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-1.0, 1.0]))
-    value = jnp.broadcast_to(jnp.asarray([-(2.0**-40), 2.0**-40])[None, :, None, None], (1, 2, 1, 8))
-    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-120)
-    np.testing.assert_array_equal(np.asarray(out), np.full((1, 2, 1, 8), -(2.0**-40), np.float32))
-
-
-def test_parallax_holds_each_rows_correction_whatever_another_rows_magnitudes():
-    """Parallax in fp32 at a logit scale of 2^-120 over two rows: the first the 2^-40 witness's (second keys
-    -1 and 1, values -2^-40 and 2^-40, its output -2^-40 exactly), the second a second query and values of
-    2^125 over second keys of 0 (its output the softmax's, 2^125): each row's correction its own, where one
-    headroom over every row left the first row's dQ at 2^-160; and a call of no keys, zeros."""
-    spans = template.spans(2, 2, 2)
-    zeros = jnp.zeros((2, 2, 1, 8), jnp.float32)
-    second = zeros.at[0, ..., 0].set(1.0).at[1, ..., 0].set(2.0**125)
-    second_key = zeros.at[0, :, 0, 0].set(jnp.asarray([-1.0, 1.0]))
-    value = jnp.stack([jnp.broadcast_to(jnp.asarray([-(2.0**-40), 2.0**-40])[:, None, None], (2, 1, 8)),
-                       jnp.full((2, 1, 8), 2.0**125)])
-    out = attention_products.parallax(zeros, second, zeros, second_key, value, spans, scale=2.0**-120)
-    np.testing.assert_array_equal(np.asarray(out[0]), np.full((2, 1, 8), -(2.0**-40), np.float32))
-    np.testing.assert_array_equal(np.asarray(out[1]), np.full((2, 1, 8), 2.0**125, np.float32))
-    empty = jnp.zeros((1, 0, 1, 8), jnp.float32)
-    none = attention_products.parallax(zeros[:1], second[:1], empty, empty, empty, template.spans(2, 0, 1))
-    np.testing.assert_array_equal(np.asarray(none), np.zeros((1, 2, 1, 8), np.float32))
-
-
-def test_parallax_forms_its_logits_as_the_route_does_at_a_scale_past_one():
-    """Parallax in fp32 at a logit scale of 4, a query of 2^127 on one column against keys of 0 and 2^-126
-    there, no second query, values 0 and 1: its logits 0 and 8 (the route's own, `scale · q·k`), its output
-    the softmax's, e^8 / (1 + e^8), where the scale split into the query made it infinite."""
-    spans = template.spans(1, 2, 1)
-    query = jnp.zeros((1, 1, 1, 8), jnp.float32).at[..., 0].set(2.0**127)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float32).at[0, 1, 0, 0].set(2.0**-126)
-    value = jnp.broadcast_to(jnp.asarray([0.0, 1.0])[None, :, None, None], (1, 2, 1, 8))
-    out = attention_products.parallax(query, jnp.zeros_like(query), key, key, value, spans, scale=4.0)
-    weight = np.exp(8.0) / (1 + np.exp(8.0))
-    assert_fp32_reduction_bound(np.asarray(out), np.full(out.shape, weight), np.full(out.shape, weight), 4)
 
 
 def test_a_banded_call_takes_an_unsigned_place_without_x64():
@@ -411,17 +290,3 @@ def test_a_banded_call_keeps_a_querys_place_in_its_own_dtype():
                                            places=jnp.asarray([[2**32]], jnp.int64))[3]
         seen = np.asarray(template.dense(laid))[0, 0]
     np.testing.assert_array_equal(seen, [False, False, True, True])
-
-
-def test_parallax_holds_its_second_products_mean_where_a_rounded_output_would_move_it():
-    """Parallax over uniform logits, values all 1 and fp16 second keys 8192 and 8200 (their mean 8196, which
-    fp16 rounds to 8192): its weights `a (1 + τ - t)` sum to 1, so its output is 1, its backward's D the
-    second product's mean about an anchor key, not a rounded output's (the fast form's), which moved it by
-    4."""
-    spans = template.spans(2, 2, 1)
-    query = jnp.zeros((1, 2, 1, 8), jnp.float16)
-    second = jnp.zeros((1, 2, 1, 8), jnp.float16).at[..., 0].set(1.0)
-    second_key = jnp.zeros((1, 2, 1, 8), jnp.float16).at[0, :, 0, 0].set(jnp.asarray([8192.0, 8200.0]))
-    value = jnp.ones((1, 2, 1, 8), jnp.float16)
-    out = attention_products.parallax(query, second, query, second_key, value, spans, scale=1.0)
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.ones((1, 2, 1, 8), np.float32))

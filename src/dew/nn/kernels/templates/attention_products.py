@@ -14,49 +14,31 @@ each combine lowered onto one call of the template, its one softmax over one val
   products' operands, a visited tile's logits cost `len(products)` times the products' width and the keys'
   copies their bytes; the one walk needs a second query tile and key ring resident and, in the backward, a
   dQ and dK accumulator a product (three at width 128 past a 64 x 64 tile on two consumers' registers).
-- `PARALLAX` (Parallax, arXiv 2605.29157): a second, unscaled query's product `t = r·k2ᵀ` weighs a second
-  accumulator beside the softmax's, `p2 = p ∘ t`, the output `O1/d1·(1 + d2/d1) - O2/d1`, which is
-  `Σ_j a_j (1 + τ - t_j) v_j` (`a` the softmax, `τ = Σ_j a_j t_j`): the softmax's output less its derivative
-  along the queries `r / scale`, `Σ_j a_j (t_j - τ) v_j`. That derivative is the template's backward's dQ of
-  one call (`parallax`): its queries `[q | 0]` over keys `[k | v]`, values `[k2 | v]` and the output's
-  cotangent `[r | 0]`, whose score cotangents are `a (r·k2 - r·Σ a k2)`, so its dQ's value columns are
-  `scale Σ_j a_j (t_j - τ) v_j` and its output's are the softmax's: a forward and a backward of the
-  template, every mainloop's and form's. Its derivative is the plain formula's in XLA (`surrogate`); one
-  walk holding the second product and accumulator, and its backward's quadratic term `a t (g - G)` (each
-  entry's two products' product), are the open lever.
 """
 
 import dataclasses
 import itertools
-import math
 from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
 
-from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.templates import attention_route
 from dew.nn.kernels.templates.attention import (
-    REFERENCE_PRECISION,
     Hooks,
     KeySpans,
     Kind,
-    dense,
     kept_value,
     kind_of,
-    logit_scale,
     moved_places,
     widened_places,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import score_places
 from dew.nn.kernels.templates.hooks import Hook, Side
-from dew.nn.precision import float32_einsum
 
 SUM = "sum"
 """The combine summing a step's products (`summed`)."""
 
-PARALLAX = "parallax"
-"""The combine weighing a second accumulator by the second product (`parallax`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,19 +107,8 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
         query, key = summed(queries, keys)
         return attention_route.attend(query, key, value, spans, hooks, scale=scale, natural=natural,
                                       accurate=accurate)
-    if combine == PARALLAX:
-        if hooks is not None:
-            raise ValueError("a parallax call takes no hooks: its second accumulator is weighed by the "
-                             "softmax's own weights")
-        _paired(queries, keys)
-        if len(queries) != 2:
-            raise ValueError(f"a parallax call holds two products, the softmax's and the second's, not "
-                             f"{len(queries)}")
-        # Its value is a forward and a backward of the template, the backward's in its accurate form whatever
-        # `accurate` names (`_parallax_kernels`).
-        return parallax(queries[0], queries[1], keys[0], keys[1], value, spans, scale=scale, natural=natural)
     if not isinstance(combine, Banded):
-        raise ValueError(f"a step's products combine by SUM, a Banded selection or PARALLAX, not {combine!r}")
+        raise ValueError(f"a step's products combine by SUM or a Banded selection, not {combine!r}")
     # The keys' and the value's copies laid out wide and their gradients handed back unrounded
     # (`attention_route.attend`'s `operand_dtype`), so each sums its copies' and rounds once.
     dtype = value.dtype
@@ -146,122 +117,6 @@ def attend(queries: Sequence[jax.Array], keys: Sequence[jax.Array], value: jax.A
     scale = queries[0].shape[-1] ** -0.5 if scale is None else scale
     return attention_route.attend(query, key, value, spans, hooks, scale=scale, natural=natural,
                                   accurate=accurate, operand_dtype=dtype)
-
-
-def parallax(query: jax.Array, second: jax.Array, key: jax.Array, second_key: jax.Array, value: jax.Array,
-             spans: KeySpans, *, scale: float | None = None, natural: bool | None = None) -> jax.Array:
-    """Parallax's attention `[B, Q, H, Dv]` (`PARALLAX`): the softmax of `query` `[B, Q, H, D]` by `key`
-    `[B, K, Hk, D]` over `value` `[B, K, Hk, Dv]` within `spans`, its weights each taken by
-    `1 + τ - t` where `t = second · second_keyᵀ`, unscaled, and `τ` its mean under the weights; on the
-    template's kernels (the module's docstring), differentiable in every operand by the plain formula
-    (`_parallax_formula`). `scale` is `D ** -0.5` by default."""
-    scale = logit_scale(query.shape[-1], scale)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError(f"a parallax call's logit scale is positive and finite, its second product's "
-                         f"derivative taken along the queries over it: {scale}")
-
-    def kernels(query, second, key, second_key, value, spans):
-        return _parallax_kernels(query, second, key, second_key, value, spans, scale=scale, natural=natural)
-
-    def derivative(primals, tangents, out):
-        del out
-        *operands, spans = primals
-
-        def formula(query, second, key, second_key, value):
-            return _parallax_formula(query, second, key, second_key, value, spans, scale=scale)
-
-        return jax.jvp(formula, tuple(operands), tuple(tangents[:-1]))[1]
-
-    rule = contracted("test_parallax_holds_every_order")(surrogate(kernels, derivative))
-    return rule(query, second, key, second_key, value, spans)
-
-
-def _parallax_kernels(query, second, key, second_key, value, spans: KeySpans, *, scale: float,
-                      natural) -> jax.Array:
-    """`parallax`'s value on the template's kernels: the softmax's output and its correction along the
-    second query, one forward and one backward of the call the module's docstring lays out (`jax.vjp` of
-    the route), its logits the route's own arithmetic at `scale`. The backward takes its accurate products
-    and D about each query's anchor from its split sums whatever the call's form: D here is `τ`, the second
-    product's mean, which a rounded output's (the fast form's `rowsum(dO ⊙ O)`) moved by the second keys'
-    rounding, not their spread (keys of 8192 and 8200 in fp16 gave a mean of 8192). The call runs in fp32,
-    and the dQ it gives, `scale Σ a (t - τ) v`, takes the scale's inverse beforehand in the cotangent and
-    the value columns (`_unscaled`), exact powers of two within each one's headroom, so it is the
-    correction itself to a factor of at most √2: at a scale of 2^-120 a correction of 2^-40 was 2^-160,
-    past fp32's least, and at a 16-bit dQ smaller scales rounded it away."""
-    width = query.shape[-1]
-    wide = jnp.float32
-    on_second, on_value, rest = _unscaled(scale, second.astype(wide), value.astype(wide))
-    laid_query = jnp.concatenate([query.astype(wide), jnp.zeros((*query.shape[:-1], value.shape[-1]), wide)],
-                                 -1)
-    laid_key = jnp.concatenate([key.astype(wide), value.astype(wide) * on_value], axis=-1)
-    laid_value = jnp.concatenate([second_key, value], axis=-1).astype(wide)
-
-    def attended(laid_query):
-        return attention_route.attend(laid_query, laid_key, laid_value, spans, scale=scale, natural=natural,
-                                      accurate=True)
-
-    out, pull = jax.vjp(attended, laid_query)
-    cotangent = jnp.concatenate([second.astype(wide) * on_second,
-                                 jnp.zeros((*out.shape[:-1], value.shape[-1]), wide)], axis=-1)
-    (moved,) = pull(cotangent)
-    softmax = out[..., second_key.shape[-1]:].astype(wide)
-    return (softmax - moved[..., width:].astype(wide) / rest).astype(query.dtype)
-
-
-def _unscaled(scale: float, second: jax.Array, value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A logit scale below 1 undone in exact powers of two, so the dQ of `_parallax_kernels` holds its
-    correction itself, not the scale times it: on each query row's cotangent (its second query) within that
-    row's headroom, the rest on the value columns within theirs, each read off the data (a magnitude's
-    exponent from fp32's largest; no magnitude, all of it). Returns the cotangent's factor `[B, Q, H, 1]`,
-    the value columns' and what remains of the scale on each row's dQ, `scale · on_second · on_value`
-    (within √2 of 1 where the headroom holds the inverse). A scale of 1 or more stays on the dQ, which it
-    cannot take below fp32's least."""
-    power = -round(math.log2(scale))
-    room = jnp.finfo(jnp.float32).maxexp - 2
-
-    def exponent(array, axes):
-        largest = jax.lax.stop_gradient(jnp.max(jnp.abs(array), axis=axes, keepdims=True, initial=0.0))
-        return jnp.where(largest > 0, jnp.frexp(largest)[1], 0)
-
-    second_room = room - exponent(second, -1)
-    if power <= 0:
-        on_second, on_value = jnp.zeros_like(second_room), jnp.zeros((), jnp.int32)
-    else:
-        # The values take what the rows that most need it cannot, their headroom permitting; each row's
-        # cotangent the rest, within its own.
-        on_value = jnp.clip(jnp.max(power - second_room, initial=0), 0, room - exponent(value, None))
-        on_second = jnp.clip(power - on_value, 0, second_room)
-    one = jnp.float32(1)
-    # The scale's mantissa (`scale · 2^power`, a Python double within √2 of 1) at the powers left untaken.
-    rest = jnp.ldexp(jnp.float32(scale * 2.0 ** power), on_second + on_value - power)
-    return jnp.ldexp(one, on_second), jnp.ldexp(one, on_value), rest
-
-
-def _parallax_formula(query, second, key, second_key, value, spans: KeySpans, *, scale: float) -> jax.Array:
-    """`parallax` in XLA ops, as the template's reference computes its softmax (`template.reference`): the
-    logits' and the second product's entries fp32, the weights `a (1 + τ - t)` rounded to the value's dtype
-    for their product, the output rounded to the query's dtype; a row that sees no key 0."""
-    batch, queries, heads, _ = query.shape
-    keys, kv_heads = key.shape[1], key.shape[2]
-    wide = jnp.promote_types(query.dtype, jnp.float32)
-
-    def products(left, right):
-        grouped = left.reshape(batch, queries, kv_heads, heads // kv_heads, left.shape[-1])
-        return float32_einsum("bqhgd,bkhd->bhgqk", grouped, right, precision=REFERENCE_PRECISION,
-                              preferred_element_type=wide).reshape(batch, heads, queries, keys)
-
-    seen = dense(spans)[:, None]
-    logits = jnp.where(seen, products(query, key) * jnp.asarray(scale, wide), -jnp.inf)
-    m = jnp.max(logits, axis=-1, initial=-jnp.inf)
-    p = jnp.exp(logits - jnp.where(jnp.isfinite(m), m, 0)[..., None])
-    total = jnp.sum(p, axis=-1, keepdims=True)
-    weights = jnp.where(total > 0, p / jnp.where(total > 0, total, 1), 0)
-    seconds = jnp.where(seen, products(second, second_key), 0)
-    mean = jnp.sum(weights * seconds, axis=-1, keepdims=True)
-    taken = (weights * (1 + mean - seconds)).reshape(batch, kv_heads, heads // kv_heads, queries, keys)
-    out = float32_einsum("bhgqk,bkhd->bhgqd", taken.astype(value.dtype), value, precision=REFERENCE_PRECISION,
-                         preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
-    return jnp.swapaxes(out.astype(query.dtype), 1, 2)
 
 
 def _paired(queries: Sequence[jax.Array], keys: Sequence[jax.Array]) -> int:
