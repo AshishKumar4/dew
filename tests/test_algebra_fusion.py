@@ -482,9 +482,8 @@ def test_a_neighbour_costing_the_launch_a_program_stays_outside_it():
             traced = jax.jit(algebra.rewritten(four_float32_terms, kernels=True)).trace(x, w, *terms)
         fused = [route for route in found if route.choice == "gemm_epilogue" and route.kernel == "fused"]
         assert not fused, [(route.choice, route.kernel) for route in found]
-        programs = [config.programs for config, _ in four.taken]
-        assert programs and programs == [config.programs for config, _ in alone.taken], (four.taken,
-                                                                                         alone.taken)
+        programs = [observed.config.programs for observed in four]
+        assert programs and programs == [observed.config.programs for observed in alone], (four, alone)
         program = traced.jaxpr.jaxpr
         (last,) = (equation for equation in program.eqns if set(equation.outvars) & set(program.outvars))
         assert last.primitive is jax.lax.convert_element_type_p, last.primitive
@@ -809,9 +808,9 @@ def test_a_steps_relowering_writes_the_program_its_first_lowering_wrote():
         for state in (contextlib.nullcontext(), contextlib.nullcontext(), forward_mode_attention()):
             with state, generation.routes() as found, tuning.seen() as launches:
                 made = step.trace(*operands)
-            # Each launch by its op's type and the config it took, paired one to one (`tuning.Seen`).
-            assert [op for op, _ in launches] == [bound.op for _, bound in launches.taken]
-            took = [(type(bound.op).__name__, config) for config, bound in launches.taken]
+            # Each launch by its op's type and the config it took (`tuning.Observed`).
+            assert [observed.op for observed in launches] == [observed.arguments.op for observed in launches]
+            took = [(type(observed.op).__name__, observed.config) for observed in launches]
             lowerings.append((program.structure(made.jaxpr.jaxpr),
                               [(route.choice, route.kernel) for route in found], took))
     cold, warm, other = lowerings

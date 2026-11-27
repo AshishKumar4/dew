@@ -815,14 +815,14 @@ def _route_forward(route, operands: tuple, form: str, *, inference: bool = False
     import jax
 
     (o, final), launches = launched(jax.jit(route), operands, f"inference forward, {form}")
-    [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
-                        zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+    [(bound, tiles)] = [(observed.keyed, observed.config) for observed in launches
+                        if isinstance(observed.op, template.Mosaic)]
     trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
     if trained and not inference:
         trained_forward = jax.jit(lambda *x: jax.vjp(route, *x)[0])
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
-        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
-                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+        [(bound, tiles)] = [(observed.keyed, observed.config) for observed in launches
+                            if isinstance(observed.op, template.Mosaic)]
     return o, final, tiles, trained, bound
 
 
@@ -1630,8 +1630,8 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         native, launches = launched(jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal))), operands,
                                     f"training backward of seed {seed}, delta {delta}, rounded {rounded}")
-        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
-                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+        [(bound, tiles)] = [(observed.keyed, observed.config) for observed in launches
+                            if isinstance(observed.op, template.Mosaic)]
         unit_pairs, decay_bound = bound.arguments.get("unit_pairs", False), bound.arguments.get("decay_bound")
 
         def kept(*x):

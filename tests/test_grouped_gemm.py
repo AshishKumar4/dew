@@ -665,7 +665,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
           tuning.seen() as launches):
         for product, shapes in products(65536, 2048, 1536, 128):
             jax.jit(product).trace(*shapes)
-        for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True):
+        for observed in launches:
+            launch, tile, ba = observed.op, observed.config, observed.arguments
             if not isinstance(launch, grouped_matmul._Mosaic):
                 continue
             assert tile.family == family and tile in launch.fitting(ba, target)
@@ -694,8 +695,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     with tuning.seen() as launches:
         assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
-    mosaic = [(launch, ba, tile) for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True)
-              if isinstance(launch, grouped_matmul._Mosaic)]
+    mosaic = [(observed.op, observed.arguments, observed.config) for observed in launches
+              if isinstance(observed.op, grouped_matmul._Mosaic)]
     with generation.assumed(target):
         assert all(tile == launch.derived(ba, target) for launch, ba, tile in mosaic)
 

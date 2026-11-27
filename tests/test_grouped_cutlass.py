@@ -126,6 +126,6 @@ def test_a_steps_reach_holds_its_live_cutlass_launch_and_not_its_dead_one(monkey
         with tuning.seen() as alone:
             lowered_for(product, shapes[:2], "sm90")
     reached = tuning.reach(found, lowered)
-    assert len(tuning._distinct(list(found))) == 2 and reached.foreign == ()
-    assert [ba.autotuning_cache_key for _, ba in reached.launches] == [
-        ba.autotuning_cache_key for _, ba in tuning._distinct(list(alone))]
+    assert len(tuning._distinct(found)) == 2 and reached.foreign == ()
+    assert [observed.keyed.autotuning_cache_key for observed in reached.launches] == [
+        observed.keyed.autotuning_cache_key for observed in tuning._distinct(alone)]

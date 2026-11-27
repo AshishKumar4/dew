@@ -2232,8 +2232,7 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
                 jax.jit(run).trace(*args)
             with tuning.pinned({launch: legal}), tuning.seen() as launches:
                 jax.jit(run).trace(*args)
-        assert legal in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                         if isinstance(op, launch)}
+        assert legal in {observed.config for observed in launches if isinstance(observed.op, launch)}
 
 
 @pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])

@@ -113,6 +113,11 @@ def _timed(ms):
                                  metadata={})
 
 
+def _merged_pick(kind: str, ba, timings: tuning.Timings) -> None:
+    """`ba` measured at `timings` merged into the store of GPUs of `kind`, its entry as `tune` makes it."""
+    tuning._store(kind, {tuning._launch_key(ba): tuning._entry(ba, timings)})
+
+
 def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     """Picks persist per device, shape and JAX version (bible §6): Pallas lowers a kernel in jax itself,
     which a release moves without jaxlib, so a launch measured under another jax is read by none here,
@@ -125,10 +130,10 @@ def test_a_pick_measured_under_another_jax_is_not_read(tmp_path, monkeypatch):
     ba, derived, other = _norm_launch_and_two_configs()
     with monkeypatch.context() as patched:
         patched.setattr(jax, "__version__", "0.0.0.other")
-        tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
+        _merged_pick("gpu", ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))
         theirs = _cache.kernel_picks_path("gpu")
     assert tuning._read(_cache.kernel_picks_path("gpu")) == ({}, [])
-    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))])
+    _merged_pick("gpu", ba, tuning.Timings({derived: _timed(2.0), other: _timed(1.0)}))
     read, foreign = tuning._read(_cache.kernel_picks_path("gpu"))
     assert len(read) == 1 and foreign == []
     with monkeypatch.context() as patched:
@@ -178,8 +183,8 @@ def _abstractly(mesh: jax.sharding.AbstractMesh) -> tuning.Placement:
 
 def test_a_pick_is_read_for_the_gpu_its_launch_traced_for(tmp_path, monkeypatch):
     """A launch's pick read once its trace has ended, under the mesh it traced in (`tuning._placed_in`,
-    `Seen.placed`), as tokamax reads it: the A100's pick under an abstract A100's mesh, where this process's
-    default device (its CPU, whatever GPU the host holds) holds none."""
+    `Observed.placed`), as tokamax reads it: the A100's pick under an abstract A100's mesh, where this
+    process's default device (its CPU, whatever GPU the host holds) holds none."""
     ba, derived, other = _norm_launch_and_two_configs()
     a100 = generation.gpu_target("sm80").device_kind
     _held_picks(monkeypatch, tmp_path, ba, {a100: tuning.Timings({derived: _timed(2.0), other: _timed(1.0)})})
@@ -227,7 +232,7 @@ def test_a_launch_traced_under_no_mesh_reads_the_default_devices_pick_under_any_
                                "sm80")
     empty = _abstractly(jax.sharding.AbstractMesh((), ()))
     with jax.default_device(host), jax.sharding.use_abstract_mesh(a100), tuning._placed_in(empty):
-        assert tuning._context_kind() == host.device_kind
+        assert tuning._mesh_kind(tuning.Placement.current()) == host.device_kind
         assert tuning._pick(ba).fastest_config == derived
 
 
@@ -245,22 +250,24 @@ def test_a_launch_traced_on_a_concrete_mesh_is_settled_on_its_devices():
                                "sm80")
     with jax.sharding.use_abstract_mesh(a100), tuning._placed_in(placed):
         assert generation.placed_devices() == devices
-        assert tuning._context_kind() == devices[0].device_kind == tuning._mesh_kind(placed)
+        current = tuning.Placement.current()
+        assert tuning._mesh_kind(current) == devices[0].device_kind == tuning._mesh_kind(placed)
 
 
-def test_a_steps_meshes_are_one_gpus_where_they_name_one_model():
-    """The meshes a lowering's reached launches traced under (`tuning._one_gpu`): two of one GPU model, its
-    axes typed otherwise (a region making them explicit), are that GPU's; an A100's beside an H100's are
-    refused, and none is none."""
+def test_a_steps_launches_are_one_gpus_where_their_meshes_name_one_model():
+    """The GPU model a lowering's reached launches key their picks by (`tuning._one_kind` of their
+    placements): two meshes of one GPU model, its axes typed otherwise (a region making them explicit), are
+    that model's; an A100's beside an H100's are refused, and none is none."""
     def placed(name, axis_type):
         return _abstractly(generation.gpu_mesh(jax.make_mesh((1,), ("data",), axis_types=(axis_type,)), name))
 
     explicit = placed("sm80", jax.sharding.AxisType.Explicit)
     auto = placed("sm80", jax.sharding.AxisType.Auto)
-    assert explicit != auto and tuning._one_gpu([explicit, auto]) in (explicit, auto)
-    assert tuning._one_gpu([]) is None
+    assert explicit != auto
+    assert tuning._one_kind([explicit, auto]) == generation.gpu_target("sm80").device_kind
+    assert tuning._one_kind([]) is None
     with pytest.raises(ValueError):
-        tuning._one_gpu([explicit, placed("sm90", jax.sharding.AxisType.Explicit)])
+        tuning._one_kind([explicit, placed("sm90", jax.sharding.AxisType.Explicit)])
 
 
 def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch):
@@ -269,11 +276,11 @@ def test_a_launch_whose_derived_config_lost_names_its_gap(tmp_path, monkeypatch)
     whose derived config won names none."""
     monkeypatch.setattr(_cache, "kernel_picks_path", lambda kind: str(tmp_path / f"{kind}.json"))
     ba, derived, other = _norm_launch_and_two_configs()
-    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(3.0), other: _timed(2.0)}))])
+    _merged_pick("gpu", ba, tuning.Timings({derived: _timed(3.0), other: _timed(2.0)}))
     [gap] = tuning.gaps("gpu")
     assert (gap.derived, gap.picked, gap.derived_ms, gap.picked_ms) == (derived, other, 3.0, 2.0)
     assert gap.gain == 1.5 and gap.key == str(dict(ba.autotuning_cache_key))
-    tuning._store("gpu", [(ba, tuning.Timings({derived: _timed(1.0), other: _timed(2.0)}))])
+    _merged_pick("gpu", ba, tuning.Timings({derived: _timed(1.0), other: _timed(2.0)}))
     assert tuning.gaps("gpu") == []
 
 
@@ -308,7 +315,7 @@ def test_a_launch_of_numpy_descriptors_keys_and_round_trips_as_jaxs():
                                                                     interpret=True))(q, q, v, g, beta, h0)
     # The rule's launches as `KernelOp.keyed` gives them from the NumPy descriptors (`fla_gdn.sequences`),
     # which JSON has no form for unless they key as shapes.
-    keyed = [ba for _, ba in found]
+    keyed = [observed.keyed for observed in found]
     assert keyed
     again = stored(keyed)
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
@@ -458,11 +465,11 @@ def test_a_stored_hooked_launch_is_kept_as_written_and_replaced_by_its_newer_tim
     path = _cache.kernel_picks_path("gpu")
     op = _DerivedFromHooks(prologue=_scaled_hook)
     first, other = (op.keyed(op.bind(TILE, _Hooks(_scaled_hook, axes))) for axes in ((0,), ()))
-    tuning._store("gpu", [(first, tuning.Timings({1: _timed(2.0), 2: _timed(1.0)}))])
+    _merged_pick("gpu", first, tuning.Timings({1: _timed(2.0), 2: _timed(1.0)}))
     [written] = tuning._stored(path)
-    tuning._store("gpu", [(other, tuning.Timings({1: _timed(1.0)}))])
+    _merged_pick("gpu", other, tuning.Timings({1: _timed(1.0)}))
     assert written in tuning._stored(path) and len(tuning._stored(path)) == 2
-    tuning._store("gpu", [(first, tuning.Timings({2: _timed(0.5)}))])
+    _merged_pick("gpu", first, tuning.Timings({2: _timed(0.5)}))
     read, _ = tuning._read(path)
     assert len(tuning._stored(path)) == 2
     assert {key: {config: timing.median_evaluation_time_ms for config, timing in timings.items()}

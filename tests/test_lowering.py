@@ -437,8 +437,8 @@ def test_a_step_lowered_for_a_gpus_own_sku_traces_its_launches_for_that_model():
     gh200 = gpu_target("NVIDIA GH200 480GB")
     with tuning.seen() as traced:
         lowered = _step_lowered(gh200)
-    assert lowered.generation == "sm90" and traced.placed
-    assert {tuning._mesh_kind(placed) for placed in traced.placed} == {gh200.device_kind}
+    assert lowered.generation == "sm90" and traced
+    assert {tuning._mesh_kind(observed.placed) for observed in traced} == {gh200.device_kind}
 
 
 @pytest.mark.usefixtures("scanned_stacks")
