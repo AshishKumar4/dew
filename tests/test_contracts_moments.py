@@ -36,7 +36,8 @@ each runs a leaf at a time (`result_leaf`), its program the leaf's own."""
 
 
 @pytest.mark.parametrize(("orders", "placement"),
-                         [case for case in _ORDERS if case.id != "grad of grad-local" and case.id not in _SECOND])
+                         [case for case in _ORDERS
+                          if case.id != "grad of grad-local" and case.id not in _SECOND])
 def test_the_weighted_moments_walk_holds_every_order(orders, placement):
     _weighted_contract(orders, placement, EDGES)
 
