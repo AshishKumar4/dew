@@ -313,10 +313,18 @@ def _maker(instruction, index: tuple[int, ...], instructions,
             return made, index, getter
 
 
+_SCRATCHED = frozenset(("__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8",
+                        "__cublas$lt$matmul$mx", "__cublas$lt$groupedMatmul", "__cublas$triangularSolve"))
+"""The cuBLAS calls of the pinned XLA (xla/service/gpu/cublas_cudnn.h), each a tuple of its result first and
+its scratch last (the gemm rewriter's workspace, `triangular_solve_rewriter.cc`'s temp bytes), the call
+carrying the frontend attributes of the instruction it replaced; a call of any other target lays out no such
+tuple."""
+
+
 def _cublas(maker) -> bool:
-    """Whether `maker` is a cuBLAS GEMM (`_GEMMS`), whose result leads a tuple its gemm rewriter appends a
-    workspace to; another `__cublas$` call (a triangular solve) lays out no such tuple."""
-    return maker.opcode == "custom-call" and maker.custom_call_target in _GEMMS
+    """Whether `maker` is a cuBLAS call of the pinned XLA (`_SCRATCHED`), its result leading its tuple and its
+    scratch last."""
+    return maker.opcode == "custom-call" and maker.custom_call_target in _SCRATCHED
 
 
 def _names_output(maker, index: tuple[int, ...]) -> bool:

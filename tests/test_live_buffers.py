@@ -36,7 +36,7 @@ from live_buffers_support import (
     read,
 )
 
-from dew.training.live_buffers import peak_live
+from dew.training.live_buffers import LiveBuffer, peak_live
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live_buffers"
 """The HLO modules these read, each as XLA's text writes it."""
@@ -156,20 +156,20 @@ def test_a_fusion_output_a_named_getter_selects_keeps_the_getters_name():
 TUPLED = (FIXTURES / "tupled.hlo").read_text()
 
 
-@pytest.mark.parametrize("call", ["pair", "__cublas$triangularSolve"])
-def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call):
+@pytest.mark.parametrize(("call", "solved"), [("pair", False), ("__cublas$triangularSolve", True)])
+def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call, solved):
     """Dew's decoder: a gemm fusion's root is its cuBLAS call, a tuple of its result and its 32 MiB
     workspace, named by the checkpoint its dot is in. The name is the result's alone (the call's first
-    element); the workspace, and every element of another instruction's tuple, keep the op_name and take no
-    name, another cuBLAS call's (a triangular solve, no GEMM) among them. The workspace says so (its role),
-    apart from an unnamed value, which a memory planner frees none of by recomputing
-    (`dew.training.memory.LiveSet`)."""
+    element); the workspace keeps the op_name and takes no name, and says so (its role), apart from an
+    unnamed value, which a memory planner frees none of by recomputing (`dew.training.memory.LiveSet`). A
+    triangular solve's call lays out its result and its temp bytes alike (`triangular_solve_rewriter.cc`); a
+    call of a target the pinned XLA makes no cuBLAS call of names none of its tuple and states no scratch."""
     module = module_bytes(TUPLED.replace("CALL", call))
     defined = instruction_ids(module, "e")
     assignment: Any = empty_assignment()
     assignment.buffer_allocations.add(index=0, size=2 * 33554432 + 16)
     peak = assignment.peak_buffers.add(index=0)
-    made = (("f", [0], 2097152), ("f", [1], 33554432), ("g", [0], 8), ("g", [1], 8))
+    made = (("f", [0], 2097152), ("f", [1], 33554432), ("g", [0], 8), ("g", [1], 2))
     for buffer_id, (name, index, size) in enumerate(made):
         buffer = assignment.logical_buffers.add(id=buffer_id, size=size)
         buffer.defined_at.instruction_id = defined[name].id
@@ -179,11 +179,11 @@ def test_a_tuple_makers_name_is_its_result_alone_not_its_workspace(call):
     assert [(each.shape, each.op_name, each.names, each.role) for each in live] == [
         ((8192, 64), "jit(f)/down_proj/dot_general", ("down_proj",), ""),
         ((33554432,), "jit(f)/down_proj/dot_general", (), "workspace"),
-        ((2,), "jit(f)/pair", (), ""),
-        ((2,), "jit(f)/pair", (), "")]
+        ((2,), "jit(f)/pair", ("paired",) if solved else (), ""),
+        ((2,), "jit(f)/pair", (), "workspace" if solved else "")]
 
 
-def _saved_hidden(step) -> list:
+def _saved_hidden(step) -> tuple[LiveBuffer, ...]:
     """The buffers live at the peak of `step`'s weight gradient, checkpointed saving the "hidden" residual
     alone, over 2048 rows of 256."""
     saved = jax.checkpoint(step, policy=jax.checkpoint_policies.save_only_these_names("hidden"))
