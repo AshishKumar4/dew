@@ -1137,7 +1137,7 @@ def _encoded_codes(
             "libraries' packing would spill or clamp; save dense instead, with "
             "dataclasses.replace(pretrained, "
             "config={k: v for k, v in pretrained.config.items() if k != 'quantization_config'}, "
-            "quantized_tensors=()).save(directory)"
+            "quantized={}).save(directory)"
         )
     return codes.astype(np.int32)
 
@@ -1983,11 +1983,13 @@ def _encode_inkling2(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
     # float16's and float32's values alike (NumPy joins no two 16-bit floats); no copy where they match.
     common = np.dtype(np.float64 if np.float64 in (kept_as, given.dtype) else np.float32)
 
+    bits = np.dtype(f"uint{8 * common.itemsize}")
+
     def unchanged(decoded) -> np.ndarray:
-        # Each value as given against its code's decode as the load kept it, its sign a zero's among it.
+        # Each value as given against its code's decode as the load kept it, bit for bit in the one dtype: a
+        # zero's sign and a NaN's payload (an E8M0 0xff scale's group decodes to NaN) among them.
         as_loaded = np.asarray(decoded, np.float32).astype(kept_as, copy=False).astype(common, copy=False)
-        held = given.astype(common, copy=False)
-        return (as_loaded == held) & (np.signbit(as_loaded) == np.signbit(held))
+        return as_loaded.view(bits) == given.astype(common, copy=False).view(bits)
 
     if grid is not None and name + "_amax" in grid:
         scale, amax, denominator, original = _gridded(

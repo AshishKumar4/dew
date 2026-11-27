@@ -393,3 +393,21 @@ def test_a_zero_under_a_zero_nvfp4_scale_takes_the_code_of_its_sign():
     signed[0, 0, 2] = 1.0
     with pytest.raises(ValueError):
         codec.encode(name, signed)
+
+
+def test_an_mxfp8_group_whose_scale_is_nan_writes_back_as_it_was_loaded():
+    """An MXFP8 group under the E8M0 scale `0xff`, which decodes every code of it to NaN, writes its codes
+    back as stored when its training left it as loaded: compared bit for bit, a NaN its own payload (train
+    1398's review: compared by value, a NaN never equal, `0x38` became E4M3's NaN code)."""
+    import ml_dtypes
+
+    from dew.interop.codecs import inkling2_experts
+
+    name = 'model.llm.layers.2.mlp.experts.down_proj'
+    codes = np.full((1, 2, 32), 1.0, ml_dtypes.float8_e4m3fn)
+    stored = {name: codes, name + '_scale': np.asarray([[[0xff], [127]]], np.uint8)}
+    for dtype in ('float32', 'bfloat16'):
+        codec = inkling2_experts(stored, {name: dtype})
+        held = np.asarray(codec.decode(stored, name), np.float32).astype(np.dtype(dtype))
+        assert np.isnan(np.asarray(held, np.float32)[0, 0]).all()
+        np.testing.assert_array_equal(codec.encode(name, held)[name].view(np.uint8), codes.view(np.uint8))
