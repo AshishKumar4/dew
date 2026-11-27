@@ -521,7 +521,8 @@ def test_a_configured_resume_reads_its_saved_data_position_once(tmp_path, monkey
 
     Tagged.on_restore.append(replaced)
     run(tmp_path / "a", 3).train(Regression(), dataset(Tagged), name="tagged")
-    assert Tagged.restored and set(Tagged.restored) == {"A"}, Tagged.restored
+    # Restored twice, by its admission and by its fit, each from the position its admission read.
+    assert Tagged.restored == ["A", "A"], Tagged.restored
 
 
 def test_a_launch_into_a_weights_only_directory_under_another_precision_keeps_its_record(tmp_path):
