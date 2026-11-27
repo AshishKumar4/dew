@@ -68,3 +68,17 @@ def test_a_compiles_block_that_closes_waits_for_the_events_already_told_to_it():
     closer.join()
     compiler.join()
     assert closed == [1] and [program.kind for program in compiles.programs] == ["traced"]
+
+
+def test_a_program_heard_names_the_first_caller_outside_jax():
+    """Each program a block hears names where outside JAX its trace and compile were asked: this test's
+    line, not JAX's own frames or the block's, read without loading any source line (row 5556)."""
+    import traceback
+
+    def double(value):
+        return value * 2
+
+    with Compiles(None) as heard:
+        line = traceback.extract_stack(limit=1)[0].lineno + 1
+        jax.jit(double)(jnp.arange(4.0))
+    assert {program.where for program in heard.programs} == {f"{__file__}:{line}"}, heard.programs
