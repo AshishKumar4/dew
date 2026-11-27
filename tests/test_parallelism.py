@@ -723,9 +723,8 @@ def test_a_window_pooling_other_statistics_is_refused_as_the_step_compiles():
     """A held window pooling other statistics than the step traces, its batches laid out alike (a window an
     earlier Dew saved, before its objective's statistics gained a term: an indexer's KL beside its
     prediction, row 13705), is refused as the step over it compiles (`empty_window`'s `refuse_unpooled`),
-    by its shapes alone, not reused and failing the step's pooling, while it holds microbatches; emptied, as
-    a ramp's stage boundary clears it before a batch that changes the statistics' shapes, it is replaced;
-    the window as the step pools it is taken."""
+    by its shapes alone, whatever it holds, not reused and failing the step's pooling; the window as the
+    step pools it is taken."""
     trainer = make_accumulating(accumulation=4)
     batch = next(batches())
     state = trainer.initial_state()
@@ -737,6 +736,7 @@ def test_a_window_pooling_other_statistics_is_refused_as_the_step_compiles():
     with pytest.raises(ValueError):
         make_accumulating(accumulation=4).compile(stale, batch)
     make_accumulating(accumulation=4).compile(state, batch)
-    # Emptied, as a stage's boundary clears it, the stale window is the step's to replace.
+    # Emptied, its batches still the step's, it is refused all the same: the step would take it as its own.
     cleared = stale.with_window(dataclasses.replace(stale.window, fill=jnp.zeros_like(window.fill)))
-    make_accumulating(accumulation=4).compile(cleared, batch)
+    with pytest.raises(ValueError):
+        make_accumulating(accumulation=4).compile(cleared, batch)

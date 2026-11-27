@@ -154,18 +154,13 @@ def _laid_alike(held, compiled) -> bool:
         for mine, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(compiled), strict=True))
 
 
-def refuse_unpooled(held: Accumulation) -> None:
-    """Refuse a held window pooling other statistics than the step (`Accumulation.pools`) where it holds
-    microbatches, whose sums no step of this one continues: a resumed one pooled by an earlier Dew (an
-    objective whose statistics gained a term since: an indexer's KL beside its prediction, row 13705). Its
-    occupancy is read where it is concrete; one of shapes alone is a checkpoint's, which keeps a window only
-    while it holds microbatches, and is refused as one. A window a stage's boundary cleared holds none, and
-    is the step's to replace (a ramp's batch, whose growth can change the statistics' shapes)."""
-    from jax.core import Tracer
-
-    fill = held.fill
-    abstract = fill is None or isinstance(fill, jax.ShapeDtypeStruct | Tracer)
-    if abstract or occupied(held):
+def refuse_unpooled(held: Accumulation | None, pending: Accumulation) -> None:
+    """Refuse a held window that replays the step's batches (`Accumulation.replays`) but pools other
+    statistics (`Accumulation.pools`), whatever it holds, by its shapes alone: a window the step would take
+    as its own (`kept_window`) and fail to pool into, a resumed one pooled by an earlier Dew (an objective
+    whose statistics gained a term since: an indexer's KL beside its prediction, row 13705). A window
+    replaying other batches is the step's to replace, as a ramp's boundary's (`kept_window`)."""
+    if held is not None and held.replays(pending) and not held.pools(pending):
         raise ValueError("the state's accumulation window holds batches or statistics of other shapes than "
                          "the step's, which it cannot replay or pool: resume from a step that closed its "
                          "window, or with the Dew that wrote it")

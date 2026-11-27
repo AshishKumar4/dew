@@ -98,13 +98,11 @@ def empty_window[LossT, EffectsT](windowing: Windowing, state: TrainState, batch
             fill=jnp.zeros((), jnp.int32))
 
     pending = jax.eval_shape(allocate)
-    # A held window pooling other statistics than the step traces is refused where it holds microbatches
-    # (`refuse_unpooled`) and replaced where it holds none, as one replaying other batches is.
-    pools = state.accumulation is None or state.accumulation.pools(pending)
-    if not pools:
-        refuse_unpooled(state.accumulation)
+    # A held window the step would take as its own but pools other statistics in is refused
+    # (`refuse_unpooled`), before its reuse.
+    refuse_unpooled(state.accumulation, pending)
     # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
-    if pools and kept_window(state.accumulation, pending, read=not shape_only):
+    if kept_window(state.accumulation, pending, read=not shape_only):
         return state
     if not shape_only:
         placement = windowing.shardings(dataclasses.replace(state, accumulation=pending)).accumulation
